@@ -830,7 +830,7 @@ impl OpenRouterProvider {
                 anyhow::ensure!(
                     crate::continuation::retention(state)
                         != crate::continuation::Retention::Unsupported,
-                    "OpenRouter opaque native replay unsupported: upstream prefix/account authority is not exposed by this Chat transport"
+                    "OpenRouter reasoning history has an unrecognized or malformed representation"
                 );
             }
         }
@@ -2483,7 +2483,7 @@ mod tests {
                         rendered
                             .unwrap_err()
                             .to_string()
-                            .contains("opaque native replay unsupported")
+                            .contains("unrecognized or malformed representation")
                     );
                 } else {
                     assert_eq!(
@@ -2504,7 +2504,48 @@ mod tests {
     }
 
     #[test]
-    fn unknown_encrypted_relay_state_is_preserved_but_refused_before_native_send() {
+    fn muse_final_response_can_continue_after_persistence_without_tool_calls() {
+        let native: ApiChatResponse = serde_json::from_value(serde_json::json!({
+            "id":"fixture-generation", "model":"meta/muse-spark-1.3-contributor",
+            "choices":[{"finish_reason":"stop", "message":{
+                "content":"First answer", "reasoning_details":[{
+                    "type":"reasoning.encrypted", "data":"opaque-fixture",
+                    "format":"meta-responses-v1", "id":null, "index":0,
+                    "signature":null
+                }]
+            }}]
+        }))
+        .unwrap();
+        let message = &native.choices[0].message;
+        let details = message.reasoning_details.clone().unwrap();
+        let mut state = OpenRouterProvider::reasoning_details_state(details.clone()).unwrap();
+        state.model = native._model.clone();
+        let mut assistant = ChatMessage::assistant(message.effective_content());
+        assistant.provider_replay_state = Some(state);
+        let assistant: ChatMessage =
+            serde_json::from_value(serde_json::to_value(assistant).unwrap()).unwrap();
+        let provider = OpenRouterProvider::new("fixture");
+        let prepared = prepare_messages_for_provider_model(
+            provider.name(),
+            native._model.as_deref().unwrap(),
+            &provider.capabilities(),
+            &[
+                ChatMessage::user("First question"),
+                assistant,
+                ChatMessage::user("Next question"),
+            ],
+        )
+        .unwrap();
+        let wire =
+            serde_json::to_value(OpenRouterProvider::convert_messages(&prepared).unwrap()).unwrap();
+        assert_eq!(wire[1]["reasoning_details"], serde_json::json!(details));
+        assert_eq!(wire[1]["content"], "First answer");
+        assert_eq!(wire[2]["content"], "Next question");
+        assert!(wire[1].get("tool_calls").is_none());
+    }
+
+    #[test]
+    fn encrypted_relay_state_is_replayed_without_upstream_account_attestation() {
         let reasoning_details = serde_json::json!([
             {
                 "type": "reasoning.encrypted",
@@ -2542,7 +2583,11 @@ mod tests {
             &[assistant],
         )
         .unwrap();
-        assert!(OpenRouterProvider::convert_messages(&prepared).is_err());
+        let rendered = OpenRouterProvider::convert_messages(&prepared).unwrap();
+        assert_eq!(
+            serde_json::to_value(rendered[0].reasoning_details.as_ref().unwrap()).unwrap(),
+            reasoning_details
+        );
         assert_eq!(
             prepared.messages[0]
                 .provider_replay_state

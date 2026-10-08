@@ -53,6 +53,73 @@ fn canonical_tool_rounds_keep_native_block_ids_and_object_inputs() {
 }
 
 #[test]
+fn native_replay_keeps_two_parallel_tool_rounds_separate_after_storage() {
+    let provider = AnthropicProvider::new("fixture");
+    let model = "claude-sonnet-4-5";
+    let mut history = vec![ChatMessage::user("inspect two things")];
+    for round in 0..2 {
+        let blocks: Vec<_> = (0..2)
+            .map(|index| {
+                serde_json::json!({
+                    "type":"tool_use", "id":format!("call_{round}_{index}"),
+                    "name":"inspect", "input":{"round":round, "index":index}
+                })
+            })
+            .collect();
+        let response = AnthropicProvider::parse_response(
+            serde_json::from_value(serde_json::json!({
+                "content":blocks, "stop_reason":"tool_use"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let calls = response.tool_calls.clone();
+        let mut state = response.provider_replay_state.unwrap();
+        state.model = Some(model.into());
+        let assistant = ChatMessage::assistant_tool_calls_with_provider_state(
+            Some(response.text),
+            response.reasoning_content,
+            calls.clone(),
+            Some(state),
+        );
+        let assistant: ChatMessage =
+            serde_json::from_value(serde_json::to_value(assistant).unwrap()).unwrap();
+        history.push(assistant);
+        history.extend(
+            calls
+                .iter()
+                .map(|call| ChatMessage::tool_result(&call.id, &call.name, "ok")),
+        );
+    }
+    let prepared = prepare_messages_for_provider_model(
+        provider.name(),
+        model,
+        &provider.capabilities(),
+        &history,
+    )
+    .unwrap();
+    let (_, messages) = AnthropicProvider::prepare_messages(&prepared).unwrap();
+    let wire = serde_json::to_value(messages).unwrap();
+    assert_eq!(wire.as_array().unwrap().len(), 5);
+    for round in 0..2 {
+        let assistant = &wire[1 + 2 * round];
+        let results = &wire[2 + 2 * round];
+        assert_eq!(assistant["role"], "assistant");
+        assert_eq!(results["role"], "user");
+        assert_eq!(assistant["content"].as_array().unwrap().len(), 2);
+        assert_eq!(results["content"].as_array().unwrap().len(), 2);
+        for index in 0..2 {
+            assert_eq!(assistant["content"][index]["type"], "tool_use");
+            assert_eq!(results["content"][index]["type"], "tool_result");
+            assert_eq!(
+                results["content"][index]["tool_use_id"],
+                assistant["content"][index]["id"]
+            );
+        }
+    }
+}
+
+#[test]
 fn canonical_stream_start_and_json_delta_use_same_tool_schema() {
     let event: StreamEvent = serde_json::from_str(r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"forecast_1","name":"forecast","input":{}}}"#).unwrap();
     let block = event.content_block.unwrap();

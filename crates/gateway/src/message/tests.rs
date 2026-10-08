@@ -80420,6 +80420,127 @@ async fn auxiliary_chat_keeps_native_usage_before_application_validation() {
 }
 
 #[tokio::test]
+async fn auxiliary_terminal_stream_accepts_late_usage_without_reopening_the_attempt() {
+    use futures_util::StreamExt;
+    struct LateUsage {
+        fail_after_usage: bool,
+    }
+    #[async_trait::async_trait]
+    impl pioneer_provider::Provider for LateUsage {
+        fn name(&self) -> &str {
+            "fixture"
+        }
+        async fn chat(&self, _: ChatRequest) -> anyhow::Result<pioneer_provider::ChatResponse> {
+            anyhow::bail!("unexpected non-stream fixture")
+        }
+        async fn stream_chat(
+            &self,
+            _: ChatRequest,
+        ) -> anyhow::Result<futures_util::stream::BoxStream<'static, anyhow::Result<StreamChunk>>>
+        {
+            let mut chunks = vec![
+                Ok(StreamChunk::final_chunk_with(
+                    pioneer_provider::ProviderTermination::Complete,
+                )),
+                Ok(StreamChunk::usage(pioneer_provider::TokenUsage {
+                    input_tokens: Some(10),
+                    output_tokens: Some(2),
+                    ..Default::default()
+                })),
+            ];
+            if self.fail_after_usage {
+                chunks.push(Err(anyhow::anyhow!("late native stream failure")));
+            }
+            Ok(Box::pin(futures_util::stream::iter(chunks)))
+        }
+    }
+    let (_, store, workspace) =
+        setup_execution_window_terminal_turn("thr_aux_late", "turn_aux_late").await;
+    let background = store.with_maintenance_access();
+    let provider = crate::usage_journal::observe(
+        Arc::new(LateUsage {
+            fail_after_usage: false,
+        }),
+        &background,
+        &workspace,
+        "memory_extraction",
+        "late-owner",
+    );
+    let mut stream = provider
+        .stream_chat(ChatRequest {
+            model: "fixture".into(),
+            messages: vec![],
+            temperature: None,
+            max_tokens: None,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            reasoning: None,
+            compiled_prompt: None,
+        })
+        .await
+        .unwrap();
+    assert!(stream.next().await.unwrap().unwrap().is_final);
+    assert_eq!(
+        stream
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .usage
+            .unwrap()
+            .input_tokens,
+        Some(10)
+    );
+    assert!(stream.next().await.is_none());
+    let rows = background
+        .provider_usage_page(&workspace, "late-owner", "", 100)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].status, "completed");
+    let retained: pioneer_provider::TokenUsage = serde_json::from_str(&rows[0].usage_json).unwrap();
+    assert_eq!(retained.input_tokens, Some(10));
+    assert_eq!(retained.output_tokens, Some(2));
+    let failed = crate::usage_journal::observe(
+        Arc::new(LateUsage {
+            fail_after_usage: true,
+        }),
+        &background,
+        &workspace,
+        "memory_extraction",
+        "late-failed-owner",
+    );
+    let mut stream = failed
+        .stream_chat(ChatRequest {
+            model: "fixture".into(),
+            messages: vec![],
+            temperature: None,
+            max_tokens: None,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            reasoning: None,
+            compiled_prompt: None,
+        })
+        .await
+        .unwrap();
+    assert!(stream.next().await.unwrap().unwrap().is_final);
+    assert!(stream.next().await.unwrap().is_ok());
+    assert!(stream.next().await.unwrap().is_err());
+    assert!(stream.next().await.is_none());
+    let rows = background
+        .provider_usage_page(&workspace, "late-failed-owner", "", 100)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].status, "failed");
+    let retained: pioneer_provider::TokenUsage = serde_json::from_str(&rows[0].usage_json).unwrap();
+    assert_eq!(retained.input_tokens, Some(10));
+    assert_eq!(retained.output_tokens, Some(2));
+}
+
+#[tokio::test]
 async fn auxiliary_stream_partial_usage_survives_drop_and_retry_without_holding_database_capacity()
 {
     use futures_util::StreamExt;

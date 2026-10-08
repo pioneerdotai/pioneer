@@ -551,16 +551,6 @@ fn chat_fields_with_model(
             "DeepSeek thinking mode (including server default) does not support temperature"
         );
     }
-    // https://docs.siliconflow.cn/cn/api-reference/chat-completions/chat-completions
-    // max_tokens excludes thoughts. NativeRequestProjection reserves one total
-    // generation cap and has no independently selected thinking budget. Until
-    // that product control exists, never promise the reserve bounds thinking.
-    if provider == "siliconflow" && request.max_tokens.is_some() {
-        ensure!(
-            selected_off(request.reasoning) || model.is_some_and(|m| !m.reasoning),
-            "SiliconFlow max_tokens bounds visible output only; thinking with a prepared total reserve requires a separately budgeted thinking cap (unsupported)"
-        );
-    }
     let mut fields = Fields::new();
     // Compatible is a protocol profile, not OpenAI model identity. In particular
     // a hosted DeepSeek/GLM model is not the direct vendor contract.
@@ -573,6 +563,23 @@ fn chat_fields_with_model(
     );
     if let Some(cap) = request.max_tokens {
         fields.insert(cap_field.into(), json!(cap));
+        // SiliconFlow counts visible output and thoughts separately. Split the
+        // already admitted total reserve instead of rejecting every normal
+        // request to a reasoning model. The server default thinking mode stays
+        // unchanged; only its documented numeric upper bound is supplied.
+        // https://docs.siliconflow.cn/docs/api/chat-completions-post
+        if provider == "siliconflow"
+            && !selected_off(request.reasoning)
+            && model.is_some_and(|m| m.reasoning)
+        {
+            ensure!(
+                cap >= 129,
+                "SiliconFlow total generation reserve must allow at least 128 thinking tokens and one output token"
+            );
+            let thinking = 4096.min((cap / 2).max(128));
+            fields.insert("thinking_budget".into(), json!(thinking));
+            fields.insert(cap_field.into(), json!(cap - thinking));
+        }
     }
     if let Some(t) = request.temperature {
         ensure!(

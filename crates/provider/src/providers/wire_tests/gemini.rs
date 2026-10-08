@@ -127,6 +127,69 @@ fn canonical_tool_rounds_parse_and_replay_native_parts() {
 }
 
 #[test]
+fn unsigned_native_tool_rounds_survive_storage_for_older_models_and_aliases() {
+    for model in ["gemini-2.0-flash", "gemini-2.5-flash", "deployment-alias"] {
+        let provider = GeminiProvider::new("fixture");
+        let mut history = vec![ChatMessage::user("Use both tools")];
+        let mut originals = Vec::new();
+        for round in 0..2 {
+            let response: ApiGenerateResponse = serde_json::from_value(serde_json::json!({
+                "candidates": [{"content": {"role":"model", "parts":[{
+                    "functionCall":{"id":format!("call_{round}"),"name":"clock","args":{}}
+                }]}, "finishReason":"STOP"}]
+            }))
+            .unwrap();
+            let calls = GeminiProvider::extract_tool_calls(&response);
+            let mut state = GeminiProvider::extract_provider_replay_state(&response).unwrap();
+            state.model = Some(model.into());
+            originals.push(state.payload["parts"].clone());
+            assert_ne!(
+                crate::continuation::retention(&state),
+                crate::continuation::Retention::Unsupported
+            );
+            history.push(ChatMessage::assistant_tool_calls_with_provider_state(
+                None::<String>,
+                None::<String>,
+                calls.clone(),
+                Some(state),
+            ));
+            history.push(ChatMessage::tool_result(&calls[0].id, &calls[0].name, "{}"));
+            // Exercise the persisted message representation before request projection.
+            history = serde_json::from_value(serde_json::to_value(&history).unwrap()).unwrap();
+            let mut request = request(history.clone());
+            request.model = model.into();
+            request.max_tokens = None;
+            let prepared = prepare_messages_for_provider_model(
+                provider.name(),
+                model,
+                &provider.capabilities(),
+                &request.messages,
+            )
+            .unwrap();
+            let wire = serde_json::to_value(
+                GeminiProvider::build_request_from_prepared(&request, &prepared).unwrap(),
+            )
+            .unwrap();
+            for previous in 0..=round {
+                assert_eq!(
+                    wire["contents"][1 + previous * 2]["parts"],
+                    originals[previous]
+                );
+                assert!(
+                    wire["contents"][1 + previous * 2]["parts"][0]
+                        .get("thoughtSignature")
+                        .is_none()
+                );
+                assert_eq!(
+                    wire["contents"][2 + previous * 2]["parts"][0]["functionResponse"]["id"],
+                    format!("call_{previous}")
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn canonical_optional_and_unknown_parts_do_not_hide_calls() {
     let response: ApiGenerateResponse = serde_json::from_value(serde_json::json!({
         "candidates": [{"content": {"role":null, "parts": [

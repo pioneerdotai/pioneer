@@ -1002,6 +1002,7 @@ async fn collect_post_turn_extractor_stream(
     request_attempt: &'static str,
 ) -> HookResult<String> {
     let mut text = String::new();
+    let mut completed = false;
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|error| {
             if pioneer_provider::failure::provider_stream_incomplete(&error).is_some() {
@@ -1036,6 +1037,31 @@ async fn collect_post_turn_extractor_stream(
             );
             classified
         })?;
+        if completed {
+            // Drain usage and transport completion so the auxiliary journal
+            // can finalize the physical attempt. Completion cannot admit more
+            // generated content or change the accepted termination.
+            if !chunk.delta.is_empty()
+                || chunk
+                    .reasoning_delta
+                    .as_ref()
+                    .is_some_and(|value| !value.is_empty())
+                || !chunk.tool_calls.is_empty()
+                || chunk.provider_replay_state.is_some()
+                || chunk
+                    .termination
+                    .as_ref()
+                    .is_some_and(|value| *value != ProviderTermination::Complete)
+            {
+                return Err(extractor_completion_error(
+                    provider.name(),
+                    model,
+                    ExtractorCompletionFailure::AfterCompletion,
+                    chunk.termination.as_ref(),
+                ));
+            }
+            continue;
+        }
         if !chunk.tool_calls.is_empty() {
             return Err(extractor_completion_error(
                 provider.name(),
@@ -1060,8 +1086,11 @@ async fn collect_post_turn_extractor_stream(
         )?;
         text.push_str(&chunk.delta);
         if chunk.is_final {
-            return Ok(text);
+            completed = true;
         }
+    }
+    if completed {
+        return Ok(text);
     }
     Err(extractor_completion_error(
         provider.name(),
@@ -1143,6 +1172,7 @@ fn memory_response_format_error(
 
 #[derive(Clone, Copy)]
 enum ExtractorCompletionFailure {
+    AfterCompletion,
     StreamEof,
     Length,
     ContentFiltered,
@@ -1158,6 +1188,7 @@ enum ExtractorCompletionFailure {
 impl ExtractorCompletionFailure {
     fn as_str(self) -> &'static str {
         match self {
+            Self::AfterCompletion => "payload_after_completion",
             Self::StreamEof => "stream_truncated",
             Self::Length => "length",
             Self::ContentFiltered => "content_filtered",
@@ -3013,6 +3044,60 @@ mod tests {
 
     struct CompatibilityFallbackProvider {
         requests: Arc<Mutex<Vec<ChatRequest>>>,
+    }
+
+    #[tokio::test]
+    async fn memory_extractor_drains_terminal_usage_and_rejects_late_failure() {
+        let provider = CompatibilityFallbackProvider::new();
+        let make_prefix = || -> Vec<anyhow::Result<StreamChunk>> {
+            vec![
+                Ok(StreamChunk::delta("{\"facts\":[]}")),
+                Ok(StreamChunk::final_chunk_with(ProviderTermination::Complete)),
+            ]
+        };
+        let mut chunks = make_prefix();
+        let mut usage = StreamChunk::delta(String::new());
+        usage.usage = Some(pioneer_provider::TokenUsage {
+            input_tokens: Some(10),
+            output_tokens: Some(2),
+            ..Default::default()
+        });
+        chunks.push(Ok(usage));
+        assert_eq!(
+            collect_post_turn_extractor_stream(
+                Box::pin(stream::iter(chunks)),
+                &provider,
+                "memory-model",
+                "initial"
+            )
+            .await
+            .unwrap(),
+            "{\"facts\":[]}"
+        );
+        let mut chunks = make_prefix();
+        chunks.push(Err(anyhow!("provider stream failed after terminal")));
+        assert!(
+            collect_post_turn_extractor_stream(
+                Box::pin(stream::iter(chunks)),
+                &provider,
+                "memory-model",
+                "initial"
+            )
+            .await
+            .is_err()
+        );
+        let mut chunks = make_prefix();
+        chunks.push(Ok(StreamChunk::delta("late content")));
+        assert!(
+            collect_post_turn_extractor_stream(
+                Box::pin(stream::iter(chunks)),
+                &provider,
+                "memory-model",
+                "initial"
+            )
+            .await
+            .is_err()
+        );
     }
 
     impl CompatibilityFallbackProvider {

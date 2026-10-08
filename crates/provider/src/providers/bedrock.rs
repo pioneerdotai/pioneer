@@ -40,10 +40,28 @@ struct BedrockRequest {
     additional_model_request_fields: Option<serde_json::Value>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 struct BedrockMessage {
     role: String,
     content: Vec<BedrockContentBlock>,
+    native_content: Option<Vec<serde_json::Value>>,
+}
+
+impl Serialize for BedrockMessage {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut message = serializer.serialize_struct("BedrockMessage", 2)?;
+        message.serialize_field("role", &self.role)?;
+        if let Some(content) = &self.native_content {
+            message.serialize_field("content", content)?;
+        } else {
+            message.serialize_field("content", &self.content)?;
+        }
+        message.end()
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -163,16 +181,18 @@ struct BedrockResponseMessage {
     content: Vec<BedrockResponseContent>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct BedrockResponseContent {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     text: Option<String>,
     /// Reasoning/thinking content from models that support extended thinking.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     reasoning_content: Option<BedrockReasoningContent>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     tool_use: Option<BedrockToolUse>,
+    #[serde(flatten)]
+    extra: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -452,7 +472,7 @@ impl BedrockProvider {
         timeout_policy: ProviderTimeoutPolicy,
     ) -> Self {
         Self {
-            replay_authority: pioneer_protocol::generate_id(32),
+            replay_authority: String::new(),
             access_key_id: access_key_id.into(),
             secret_access_key: secret_access_key.into(),
             session_token: None,
@@ -460,6 +480,7 @@ impl BedrockProvider {
             timeout_policy,
             client: crate::http::build_client(timeout_policy),
         }
+        .with_stable_replay_authority()
     }
 
     pub fn with_session_token(
@@ -485,7 +506,7 @@ impl BedrockProvider {
         timeout_policy: ProviderTimeoutPolicy,
     ) -> Self {
         Self {
-            replay_authority: pioneer_protocol::generate_id(32),
+            replay_authority: String::new(),
             access_key_id: access_key_id.into(),
             secret_access_key: secret_access_key.into(),
             session_token: Some(session_token.into()),
@@ -493,6 +514,7 @@ impl BedrockProvider {
             timeout_policy,
             client: crate::http::build_client(timeout_policy),
         }
+        .with_stable_replay_authority()
     }
 
     /// Create a `BedrockProvider` from standard AWS environment variables.
@@ -512,16 +534,22 @@ impl BedrockProvider {
         let region = Self::environment_region();
 
         let provider = Self {
-            replay_authority: pioneer_protocol::generate_id(32),
+            replay_authority: String::new(),
             access_key_id,
             secret_access_key,
             session_token,
             region,
             timeout_policy,
             client: crate::http::build_client(timeout_policy),
-        };
+        }
+        .with_stable_replay_authority();
         provider.validate_connection()?;
         Ok(provider)
+    }
+
+    fn with_stable_replay_authority(mut self) -> Self {
+        self.replay_authority = crate::continuation::replay_authority("bedrock", &[&self.region]);
+        self
     }
 
     fn list_foundation_models_url(&self) -> String {
@@ -715,6 +743,29 @@ impl BedrockProvider {
                                 let blocks = payload.get("blocks").cloned().ok_or_else(|| {
                                     anyhow!("bedrock replay state is missing `blocks`")
                                 })?;
+                                if let Some(native) = payload.get("native_content") {
+                                    let native = native
+                                        .as_array()
+                                        .ok_or_else(|| anyhow!("invalid Bedrock native content"))?;
+                                    for block in native {
+                                        anyhow::ensure!(
+                                            block.as_object().is_some_and(|block| block.len() == 1),
+                                            "invalid Bedrock content union"
+                                        );
+                                        if let Some(tool) = block.get("toolUse") {
+                                            anyhow::ensure!(
+                                                tool["input"].is_object(),
+                                                "Bedrock tool input must be a JSON object"
+                                            );
+                                        }
+                                    }
+                                    bedrock_messages.push(BedrockMessage {
+                                        role: role.to_owned(),
+                                        content: vec![],
+                                        native_content: Some(native.clone()),
+                                    });
+                                    continue;
+                                }
                                 for reasoning_content in serde_json::from_value::<
                                     Vec<BedrockReasoningContent>,
                                 >(blocks)
@@ -779,6 +830,7 @@ impl BedrockProvider {
                     bedrock_messages.push(BedrockMessage {
                         role: role.to_string(),
                         content,
+                        native_content: None,
                     });
                 }
             }
@@ -913,8 +965,10 @@ impl BedrockProvider {
         let mut reasoning_parts = Vec::new();
         let mut tool_calls = Vec::new();
         let mut replay_blocks = Vec::new();
+        let mut native_content = Vec::new();
 
         for block in api_response.output.message.content {
+            native_content.push(serde_json::to_value(&block)?);
             if let Some(t) = block.text {
                 text_parts.push(t);
             }
@@ -942,12 +996,12 @@ impl BedrockProvider {
         } else {
             Some(reasoning_parts.join(""))
         };
-        let provider_replay_state = if replay_blocks.is_empty() {
+        let provider_replay_state = if native_content.is_empty() {
             None
         } else {
             Some(ProviderReplayState::new(
                 "bedrock",
-                serde_json::json!({ "blocks": replay_blocks }),
+                serde_json::json!({ "blocks": replay_blocks, "native_content":native_content }),
             ))
         };
 
@@ -1969,8 +2023,8 @@ mod tests {
                     0 => changed.messages[1].content = "summary replaces previous message".into(),
                     1 => changed.messages[0].content = "retry system refresh".into(),
                     2 => {
-                        changed.tools.as_mut().unwrap()[0].parameters =
-                            serde_json::json!({"type":"string"})
+                        changed.tools.as_mut().unwrap()[0].description =
+                            "updated tool instructions".into();
                     }
                     _ => {
                         changed.messages[2]
@@ -1983,9 +2037,17 @@ mod tests {
                             .remove("prefix_proof");
                     }
                 }
-                assert!(build(&provider, &changed).is_err());
+                assert_eq!(build(&provider, &changed).is_err(), change == 0);
             }
-            assert!(build(&BedrockProvider::new("AKID", "SECRET", "us-east-1"), &next).is_err());
+            assert!(build(&BedrockProvider::new("AKID", "SECRET", "us-east-1"), &next).is_ok());
+            assert!(
+                build(
+                    &BedrockProvider::new("ROTATED", "OTHER", "us-east-1"),
+                    &next
+                )
+                .is_ok()
+            );
+            assert!(build(&BedrockProvider::new("AKID", "SECRET", "us-west-2"), &next).is_err());
         }
     }
 
@@ -2710,6 +2772,7 @@ mod tests {
         let request = BedrockRequest {
             messages: vec![BedrockMessage {
                 role: "user".into(),
+                native_content: None,
                 content: vec![BedrockContentBlock {
                     text: Some("Hello".into()),
                     image: None,
@@ -2746,6 +2809,7 @@ mod tests {
         let request = BedrockRequest {
             messages: vec![BedrockMessage {
                 role: "user".into(),
+                native_content: None,
                 content: vec![BedrockContentBlock {
                     text: Some("Hello".into()),
                     image: None,

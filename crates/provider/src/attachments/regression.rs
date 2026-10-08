@@ -1252,6 +1252,45 @@ async fn confirmed_elementary_audio_limits_and_mp4_edit_admission() {
                 2376,
                 false,
             ));
+            for bytes in super::media_fixtures::unproven_mp3_trims(magic)
+                .into_iter()
+                .chain([super::media_fixtures::encoder_trim_mp3_mpeg2(
+                    magic,
+                    b"LAME3.100",
+                    576,
+                    1152,
+                )])
+            {
+                for (limit, allowed) in [(2400, true), (2399, false)] {
+                    cases.push((
+                        InputContentType::Audio,
+                        "audio/mpeg",
+                        bytes.clone(),
+                        limit,
+                        allowed,
+                    ));
+                }
+            }
+        }
+        cases.push((
+            InputContentType::Audio,
+            "audio/mpeg",
+            mp3().to_vec(),
+            60_000,
+            true,
+        ));
+        for encoder in [b"Lavf62.11", b"Lavc62.11"] {
+            let mut bytes =
+                super::media_fixtures::encoder_trim_mp3(b"Info", encoder, 100, 576, 576);
+            bytes[33 + 34] ^= 1;
+            cases.push((
+                InputContentType::Audio,
+                "audio/mpeg",
+                bytes.clone(),
+                2400,
+                true,
+            ));
+            cases.push((InputContentType::Audio, "audio/mpeg", bytes, 2399, false));
         }
         if name != "openai" {
             cases.extend([
@@ -1390,17 +1429,13 @@ async fn confirmed_elementary_audio_limits_and_mp4_edit_admission() {
                 assert_eq!(replay.media.len(), 1);
             }
         }
-        let mut bad_crc = mp3().to_vec();
-        bad_crc[0xb9 + 5] ^= 1;
+        let mut bad_crc = super::media_fixtures::trimmed_xing_mp3(b"Info");
+        bad_crc[33 + 10] ^= 1;
         for bytes in super::media_fixtures::rejected_mp3_tag_candidates()
             .into_iter()
             .chain([bad_crc])
-            .chain(super::media_fixtures::unproven_mp3_trims(b"Info"))
-            .chain(super::media_fixtures::unproven_mp3_trims(b"Xing"))
-            .chain([
-                super::media_fixtures::encoder_trim_mp3_mpeg2(b"Info", b"LAME3.100", 576, 1152),
-                super::media_fixtures::encoder_trim_mp3_mpeg2(b"Xing", b"LAME3.100", 576, 1152),
-            ])
+            .chain(super::media_fixtures::invalid_mp3_trims(b"Info"))
+            .chain(super::media_fixtures::invalid_mp3_trims(b"Xing"))
         {
             let req = request(
                 "media",

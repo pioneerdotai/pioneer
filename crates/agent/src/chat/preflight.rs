@@ -15,7 +15,7 @@ use pioneer_promt::{
 use pioneer_protocol::{ProviderFailureClass, ProviderFailureStage, ThreadMode};
 use pioneer_provider::{
     ChatMessage, ChatRequest, Provider, ProviderRegistry, ProviderResponseLimits,
-    ProviderResponseTooLarge, ReasoningConfig,
+    ProviderResponseTooLarge,
 };
 use pioneer_tools::{BuiltinToolDomain, PreflightToolIndex};
 use serde::de::{self, Error as _, Visitor};
@@ -965,7 +965,9 @@ fn turn_preflight_chat_request(model: &str, prompt: String) -> ChatRequest {
         tools: None,
         tool_choice: None,
         parallel_tool_calls: None,
-        reasoning: Some(ReasoningConfig::disabled()),
+        // Preflight must also work on mandatory-thinking models. Leave the
+        // model's default intact rather than requesting an unsupported off.
+        reasoning: None,
         compiled_prompt: None,
     }
 }
@@ -3487,7 +3489,7 @@ mod tests {
         assert!(request.tool_choice.is_none());
         assert_eq!(request.parallel_tool_calls, None);
         assert_eq!(request.compiled_prompt, None);
-        assert_eq!(request.reasoning, Some(ReasoningConfig::disabled()));
+        assert_eq!(request.reasoning, None);
     }
 
     #[tokio::test]

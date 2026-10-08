@@ -15,7 +15,7 @@ pub enum Retention {
     Ordinary,
     ActiveTurn,
     Prefix,
-    /// Opaque relay/unknown contract: retain, and refuse replay without a supported proof path.
+    /// Unrecognized required native representation: retain, but refuse replay.
     Unsupported,
 }
 impl Retention {
@@ -28,9 +28,14 @@ impl Retention {
 // inherit them. Unknown/new generations are deliberately not declared unbound.
 fn claude_prefix_rule(model: Option<&str>) -> Option<bool> {
     let model = model?.to_ascii_lowercase().replace('.', "-");
-    if model.starts_with("claude-fable-5-1")
-        || model.starts_with("claude-opus-5-5")
-        || model.starts_with("claude-sonnet-5-5")
+    if [
+        "claude-fable-5-1",
+        "claude-opus-5-5",
+        "claude-sonnet-5-5",
+        "claude-haiku-5-5",
+    ]
+    .iter()
+    .any(|family| model == *family || model.starts_with(&format!("{family}-")))
     {
         return Some(true);
     }
@@ -50,24 +55,10 @@ fn claude_prefix_rule(model: Option<&str>) -> Option<bool> {
 
 pub fn retention(state: &ProviderReplayState) -> Retention {
     let p = &state.payload;
-    if p["api_profile"] == "unverified-relay" {
-        return Retention::Unsupported;
-    }
-    // Consume the existing catalog API identity when available; it cannot
-    // weaken an observed signed/native requirement (reasoning=false may be stale).
-    if let (Some(model), Ok(catalog)) = (state.model.as_deref(), crate::catalog::model_catalog()) {
-        if let Some(entry) = catalog.model(&state.provider, model) {
-            let matches_route = match state.provider.as_str() {
-                "anthropic" => entry.api == "anthropic-messages",
-                "bedrock" => entry.api.starts_with("bedrock-converse"),
-                "gemini" => entry.api == "google-generative-ai",
-                _ => true,
-            };
-            if !matches_route {
-                return Retention::Unsupported;
-            }
-        }
-    }
+    // Older clients stamped configured Messages proxies as unverified relays.
+    // An endpoint override alone does not alter the accepted native schema.
+    // The producing adapter owns the native representation. A refreshed
+    // catalog's preferred API must not invalidate already accepted history.
     match state.provider.as_str() {
         "anthropic" => {
             let Some(blocks) = p["blocks"].as_array() else {
@@ -89,7 +80,10 @@ pub fn retention(state: &ProviderReplayState) -> Retention {
             match claude_prefix_rule(state.model.as_deref()) {
                 Some(false) => Retention::ActiveTurn,
                 Some(true) => Retention::Prefix,
-                None => Retention::Unsupported,
+                // An unknown alias may use a prefix-bound generation. Keep
+                // the prefix through compaction; native signatures still work
+                // without an optional client-issued proof.
+                None => Retention::Prefix,
             }
         }
         "bedrock" => {
@@ -97,6 +91,13 @@ pub fn retention(state: &ProviderReplayState) -> Retention {
             // messages; redacted bytes are opaque and must not be assumed unsigned.
             if p["blocks"].as_array().is_some_and(|b| !b.is_empty()) {
                 Retention::Prefix
+            } else if p["native_content"].as_array().is_some_and(|blocks| {
+                !blocks.is_empty()
+                    && blocks
+                        .iter()
+                        .all(|block| block.is_object() && block.get("reasoningContent").is_none())
+            }) {
+                Retention::Ordinary
             } else {
                 Retention::Unsupported
             }
@@ -109,26 +110,32 @@ pub fn retention(state: &ProviderReplayState) -> Retention {
                 {
                     return Retention::ActiveTurn;
                 }
-                // A proven GenerateContent 2.5 unsigned response has no prefix
-                // binding. Gemini 3 calls require signatures; unknown families
-                // are not promoted to ordinary by an unsigned container.
-                if state
-                    .model
-                    .as_deref()
-                    .is_some_and(|m| m.starts_with("gemini-2.5-"))
-                    && parts.iter().all(|part| {
-                        part.get("text").is_some() || part.get("functionCall").is_some()
-                    })
+                // Unsigned function calls are valid for non-thinking models
+                // and Gemini 2.5. A deployment alias is not evidence that an
+                // accepted response is invalid. Keep unclassified tool rounds
+                // intact and let GenerateContent enforce its signature rules;
+                // never synthesize a signature or omit native parts.
+                if parts
+                    .iter()
+                    .all(|part| part.get("text").is_some() || part.get("functionCall").is_some())
                 {
-                    Retention::Ordinary
-                } else if parts.iter().all(|part| part.get("text").is_some()) {
-                    Retention::Ordinary
+                    if parts.iter().all(|part| part.get("text").is_some())
+                        || state.model.as_deref().is_some_and(|m| {
+                            m.starts_with("gemini-1.5-")
+                                || m.starts_with("gemini-2.0-")
+                                || m.starts_with("gemini-2.5-")
+                        })
+                    {
+                        Retention::Ordinary
+                    } else {
+                        Retention::ActiveTurn
+                    }
                 } else {
                     Retention::Unsupported
                 }
             } else if p["function_call_signatures"]
                 .as_array()
-                .is_some_and(|s| s.iter().any(|s| s.is_string()))
+                .is_some_and(|s| s.iter().all(|s| s.is_null() || s.is_string()))
             {
                 Retention::ActiveTurn
             } else {
@@ -144,54 +151,42 @@ pub fn retention(state: &ProviderReplayState) -> Retention {
             if details.is_empty() {
                 return Retention::Ordinary;
             }
-            // Positively identify documented readable variants, not merely the
-            // absence of a known encrypted marker. Format/model names cannot
-            // prove upstream authority. Unknown/opaque details remain stored.
+            // OpenRouter documents replay of encrypted and signed details as
+            // well as readable ones. Preserve the original objects and order;
+            // the client is not required to decrypt or attest upstream accounts.
             // https://openrouter.ai/docs/guides/best-practices/reasoning-tokens#reasoning-detail-types
             if details.iter().all(|detail| {
                 let Some(object) = detail.as_object() else {
                     return false;
                 };
-                if object
-                    .get("signature")
-                    .is_some_and(|value| !value.is_null())
-                {
-                    return false;
-                }
-                // Additional opaque extension fields are not a proven readable
-                // contract either; common metadata is preserved, not authority.
-                if object.keys().any(|key| {
-                    !matches!(
-                        key.as_str(),
-                        "type" | "text" | "summary" | "signature" | "id" | "format" | "index"
-                    )
-                }) {
-                    return false;
-                }
                 if !object
                     .get("id")
                     .is_none_or(|value| value.is_null() || value.is_string())
-                    || !object.get("format").is_none_or(Value::is_string)
-                    || !object.get("index").is_none_or(Value::is_number)
+                    || !object
+                        .get("format")
+                        .is_none_or(|value| value.is_null() || value.is_string())
+                    || !object
+                        .get("index")
+                        .is_none_or(|value| value.is_null() || value.is_number())
+                    || !object
+                        .get("signature")
+                        .is_none_or(|value| value.is_null() || value.is_string())
                 {
                     return false;
                 }
                 match object.get("type").and_then(Value::as_str) {
-                    Some("reasoning.text") => {
-                        object.get("text").is_some_and(Value::is_string)
-                            && !object.contains_key("summary")
-                    }
+                    Some("reasoning.text") => object.get("text").is_some_and(Value::is_string),
                     Some("reasoning.summary") => {
                         object.get("summary").is_some_and(Value::is_string)
-                            && !object.contains_key("text")
                     }
+                    Some("reasoning.encrypted") => object.get("data").is_some_and(Value::is_string),
                     _ => false,
                 }
             }) {
                 Retention::ActiveTurn
             } else {
-                // Chat exposes neither original upstream prefix nor account
-                // authority for encrypted/signed or an unknown native contract.
+                // Malformed or unrecognized representations remain stored;
+                // do not silently discard required continuation data.
                 Retention::Unsupported
             }
         }
@@ -251,11 +246,16 @@ pub(crate) struct PrefixProof {
     version: u32,
     provider: String,
     model: String,
-    // Random instance authority: same immutable credential/endpoint object.
-    // No credential, account ID or raw system/tools/text is persisted.
+    // Stable digest of the protocol endpoint. Credential rotation is handled
+    // by the registry; native account/signature ownership is checked by the API.
+    // Legacy v1 records used an instance nonce.
     authority: String,
     messages: usize,
     prefix_sha256: String,
+    /// Converse binds previous messages. Its request-level system/toolConfig
+    /// are not part of that documented message signature contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    messages_sha256: Option<String>,
     response_sha256: String,
 }
 fn sorted(value: &Value) -> Value {
@@ -274,6 +274,19 @@ fn hash(value: &Value) -> Result<String> {
         value,
     ))?)))
 }
+
+/// Stable local transport identity. Recreating an adapter with the same
+/// endpoint must not invalidate a durable native signature. API key/session
+/// token rotation does not establish a different provider account.
+pub(crate) fn replay_authority(provider: &str, components: &[&str]) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"pioneer-native-replay-authority-v2");
+    for component in std::iter::once(provider).chain(components.iter().copied()) {
+        digest.update((component.len() as u64).to_be_bytes());
+        digest.update(component.as_bytes());
+    }
+    hex::encode(digest.finalize())
+}
 fn prefix(body: &Value, count: usize) -> Result<Value> {
     let messages = body["messages"]
         .as_array()
@@ -283,8 +296,144 @@ fn prefix(body: &Value, count: usize) -> Result<Value> {
         serde_json::json!({"system":body.get("system"),"tools":body.get("tools"),"toolConfig":body.get("toolConfig"),"messages":&messages[..count]}),
     )
 }
+
+fn message_prefix(body: &Value, count: usize) -> Result<Value> {
+    let messages = body["messages"]
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("native prefix lacks messages"))?;
+    ensure!(count <= messages.len(), "native prefix shortened");
+    Ok(Value::Array(messages[..count].to_vec()))
+}
+
+/// Claude's prefix-bound generations support operator instructions and tool
+/// changes appended to messages. Save/reconstruct their actual wire positions,
+/// rather than overwriting the system/tools preceding already signed answers.
+/// This metadata contains request instructions, never credentials.
+pub(crate) fn stabilize_anthropic_prefix(
+    body: &mut Value,
+    states: &[ProviderReplayState],
+) -> Result<bool> {
+    let Some(context) = states.iter().rev().find_map(|state| {
+        (retention(state) == Retention::Prefix)
+            .then(|| state.payload.get("prefix_context"))
+            .flatten()
+    }) else {
+        return Ok(false);
+    };
+    let requested_system = body.get("system").cloned().unwrap_or(Value::Null);
+    let requested_tools = body.get("tools").cloned().unwrap_or(Value::Null);
+    let root_system = context.get("system").cloned().unwrap_or(Value::Null);
+    let root_tools = context.get("tools").cloned().unwrap_or(Value::Null);
+    let mut effective_system = root_system.clone();
+    let mut effective_tools = root_tools.as_array().cloned().unwrap_or_default();
+    let mut requires_tools_beta = false;
+    let messages = body["messages"]
+        .as_array_mut()
+        .ok_or_else(|| anyhow::anyhow!("native prefix lacks messages"))?;
+    let insertions = context["insertions"]
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("invalid native prefix context"))?;
+    for insertion in insertions {
+        let index = insertion["index"]
+            .as_u64()
+            .and_then(|index| usize::try_from(index).ok())
+            .ok_or_else(|| anyhow::anyhow!("invalid native prefix position"))?;
+        let message = &insertion["message"];
+        ensure!(
+            index <= messages.len() && message["role"] == "system",
+            "native prefix shortened or malformed"
+        );
+        let blocks = message["content"]
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("invalid native system content"))?;
+        for block in blocks {
+            match block["type"].as_str() {
+                Some("text") => effective_system = block["text"].clone(),
+                Some("tool_removal") => {
+                    requires_tools_beta = true;
+                    ensure!(
+                        block["tool"]["type"] == "tool_reference"
+                            && block["tool"]["name"].is_string(),
+                        "invalid native tool removal"
+                    );
+                    effective_tools.retain(|tool| tool["name"] != block["tool"]["name"]);
+                }
+                Some("tool_addition") => {
+                    requires_tools_beta = true;
+                    let definition = &block["tool"]["definition"];
+                    ensure!(
+                        block["tool"]["type"] == "tool_definition"
+                            && definition["name"].is_string(),
+                        "invalid native tool addition"
+                    );
+                    effective_tools.retain(|tool| tool["name"] != definition["name"]);
+                    effective_tools.push(definition.clone());
+                }
+                _ => anyhow::bail!("invalid native prefix context block"),
+            }
+        }
+        messages.insert(index, message.clone());
+    }
+    let mut updates = Vec::new();
+    if requested_system != effective_system {
+        updates.push(
+            serde_json::json!({"type":"text", "text": requested_system.as_str().unwrap_or("")}),
+        );
+    }
+    let wanted = requested_tools.as_array().cloned().unwrap_or_default();
+    for tool in &effective_tools {
+        if !wanted.iter().any(|wanted| wanted["name"] == tool["name"]) {
+            updates.push(serde_json::json!({"type":"tool_removal", "tool":{"type":"tool_reference", "name":tool["name"]}}));
+            requires_tools_beta = true;
+        }
+    }
+    for tool in &wanted {
+        if !effective_tools.iter().any(|old| old == tool) {
+            updates.push(serde_json::json!({"type":"tool_addition", "tool":{"type":"tool_definition", "definition":tool}}));
+            requires_tools_beta = true;
+        }
+    }
+    if !updates.is_empty() {
+        ensure!(
+            messages.last().is_some_and(|m| m["role"] == "user"),
+            "native system update must follow user input or tool results"
+        );
+        messages.push(serde_json::json!({"role":"system", "content":updates}));
+    }
+    for (key, value) in [("system", root_system), ("tools", root_tools)] {
+        if value.is_null() {
+            body.as_object_mut().unwrap().remove(key);
+        } else {
+            body[key] = value;
+        }
+    }
+    Ok(requires_tools_beta)
+}
+
+pub(crate) fn anthropic_inline_tools(body: &Value) -> bool {
+    body["messages"].as_array().is_some_and(|messages| {
+        messages.iter().any(|message| {
+            message["role"] == "system"
+                && message["content"].as_array().is_some_and(|blocks| {
+                    blocks.iter().any(|block| {
+                        matches!(
+                            block["type"].as_str(),
+                            Some("tool_addition" | "tool_removal")
+                        )
+                    })
+                })
+        })
+    })
+}
 fn response_content(state: &ProviderReplayState) -> &Value {
-    &state.payload["blocks"]
+    if state.provider == "bedrock" {
+        state
+            .payload
+            .get("native_content")
+            .unwrap_or(&state.payload["blocks"])
+    } else {
+        &state.payload["blocks"]
+    }
 }
 
 pub(crate) fn bind_prefix(
@@ -295,6 +444,13 @@ pub(crate) fn bind_prefix(
 ) -> Result<()> {
     state.model = Some(model.into());
     if retention(state) != Retention::Prefix {
+        return Ok(());
+    }
+    if state.provider == "anthropic" && claude_prefix_rule(Some(model)).is_none() {
+        // Native signatures are valid for unlisted aliases too. An unlisted
+        // alias does not prove support for our inline-system/tools transport.
+        // Preserve conservatively during compaction and defer signature
+        // verification to Messages without inventing an API restriction.
         return Ok(());
     }
     let count = body["messages"]
@@ -308,8 +464,24 @@ pub(crate) fn bind_prefix(
         authority: authority.into(),
         messages: count,
         prefix_sha256: hash(&prefix(body, count)?)?,
+        messages_sha256: (state.provider == "bedrock")
+            .then(|| hash(&message_prefix(body, count)?))
+            .transpose()?,
         response_sha256: hash(response_content(state))?,
     };
+    if state.provider == "anthropic" {
+        let insertions: Vec<_> = body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .enumerate()
+            .filter(|(_, message)| message["role"] == "system")
+            .map(|(index, message)| serde_json::json!({"index":index, "message":message}))
+            .collect();
+        state.payload["prefix_context"] = serde_json::json!({
+            "system":body.get("system"), "tools":body.get("tools"), "insertions":insertions,
+        });
+    }
     state.payload["prefix_proof"] = serde_json::to_value(proof)?;
     Ok(())
 }
@@ -326,25 +498,44 @@ pub(crate) fn validate_prefix(
                 "native replay unsupported: selected API/model or upstream binding authority is unproven"
             ),
             Retention::Prefix => {
-                let proof: PrefixProof = serde_json::from_value(
-                    state.payload["prefix_proof"].clone(),
-                )
-                .map_err(|_| {
-                    anyhow::anyhow!(
-                        "native replay lacks durable outbound prefix proof (legacy/restart)"
-                    )
-                })?;
+                // Native APIs validate their signatures. Old accepted records
+                // did not contain our optional local proof; its absence is not
+                // an API capability failure and must not strand those sessions.
+                let Some(raw_proof) = state.payload.get("prefix_proof") else {
+                    continue;
+                };
+                let proof: PrefixProof = serde_json::from_value(raw_proof.clone())?;
                 ensure!(
                     proof.version == 1
                         && proof.provider == state.provider
                         && proof.model == model
                         && state.model.as_deref() == Some(model)
-                        && proof.authority == authority,
-                    "native replay authority changed: credential/endpoint instance or model; restart/fork requires verified authority"
+                        // Version-1 records used a random 32-character instance
+                        // nonce. It cannot establish a credential change. Keep
+                        // their prefix/content checks and native validation.
+                        && (proof.authority.len() == 32 || proof.authority == authority),
+                    "native replay authority changed: endpoint or model"
                 );
-                ensure!(
+                // Legacy Messages proofs did not retain the request root or
+                // native positions. They cannot reconstruct dynamic runtime
+                // instructions and must not invent stricter rules than the
+                // vendor for accounts that accepted this durable history.
+                let reconstructed =
+                    state.provider != "anthropic" || state.payload.get("prefix_context").is_some();
+                let prefix_matches = if state.provider == "bedrock" {
+                    // Old proofs mixed mutable system/toolConfig into their
+                    // digest. They cannot prove a previous-message rewrite;
+                    // native Converse still validates the supplied signature.
                     proof.messages == index
-                        && proof.prefix_sha256 == hash(&prefix(body, index)?)?
+                        && match &proof.messages_sha256 {
+                            Some(digest) => *digest == hash(&message_prefix(body, index)?)?,
+                            None => true,
+                        }
+                } else {
+                    proof.messages == index && proof.prefix_sha256 == hash(&prefix(body, index)?)?
+                };
+                ensure!(
+                    (!reconstructed || prefix_matches)
                         && proof.response_sha256 == hash(response_content(&state))?,
                     "native replay prefix changed: system/tools/previous messages or thinking sequence"
                 );
@@ -376,15 +567,15 @@ pub(crate) mod tests {
             ),
             (
                 json!([{"type":"reasoning.encrypted","data":"opaque"}]),
-                Retention::Unsupported,
+                Retention::ActiveTurn,
             ),
             (
                 json!([{"type":"reasoning.text","text":"signed","signature":"opaque"}]),
-                Retention::Unsupported,
+                Retention::ActiveTurn,
             ),
             (
                 json!([{"type":"reasoning.text","text":"signed","signature":""}]),
-                Retention::Unsupported,
+                Retention::ActiveTurn,
             ),
             (
                 json!([{"type":"reasoning.summary","summary":"known"},{"type":"reasoning.native-v-next","data":"opaque"}]),
@@ -405,7 +596,7 @@ pub(crate) mod tests {
             ),
             (
                 json!([{"type":"reasoning.text","text":"known","opaque_extension":"unknown"}]),
-                Retention::Unsupported,
+                Retention::ActiveTurn,
             ),
             (
                 json!([{"type":"reasoning.text","text":"known","id":{"opaque":"unknown"}}]),
@@ -413,7 +604,11 @@ pub(crate) mod tests {
             ),
             (
                 json!([{"type":"reasoning.summary","summary":"known","text":{"opaque":"unknown"}}]),
-                Retention::Unsupported,
+                Retention::ActiveTurn,
+            ),
+            (
+                json!([{"type":"reasoning.text","text":"native","summary":null,"format":null,"index":null}]),
+                Retention::ActiveTurn,
             ),
             (json!([]), Retention::Ordinary),
         ]
@@ -453,6 +648,24 @@ pub(crate) mod tests {
             assert_eq!(state, original);
         }
     }
+    #[test]
+    fn gemini_legacy_unsigned_tool_state_is_preserved_for_native_validation() {
+        for model in ["gemini-2.0-flash", "gemini-2.5-flash", "deployment-alias"] {
+            let state = ProviderReplayState::for_model(
+                "gemini",
+                model,
+                serde_json::json!({"schema_version":1,"function_call_signatures":[null]}),
+            );
+            assert_eq!(retention(&state), Retention::ActiveTurn);
+        }
+        let malformed = ProviderReplayState::for_model(
+            "gemini",
+            "deployment-alias",
+            serde_json::json!({"schema_version":1,"function_call_signatures":[42]}),
+        );
+        assert_eq!(retention(&malformed), Retention::Unsupported);
+    }
+
     #[test]
     fn every_registry_profile_uses_actual_state_without_a_brand_only_retention_rule() {
         for profile in crate::provider_definitions() {

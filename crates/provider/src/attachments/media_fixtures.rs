@@ -483,6 +483,11 @@ pub(crate) fn unproven_mp3_trims(magic: &[u8; 4]) -> Vec<Vec<u8>> {
     }
     cases.push(encoder_trim_mp3(magic, b"LAME3.100", 100, 100, 576));
     cases.push(encoder_trim_mp3(magic, b"LAME3.099", 100, 576, 576));
+    cases
+}
+
+pub(crate) fn invalid_mp3_trims(magic: &[u8; 4]) -> Vec<Vec<u8>> {
+    let mut cases = Vec::new();
     // Valid domain but more trim than raw1152samples -> checked subtraction.
     cases.push(encoder_trim_mp3(magic, b"LAME3.100", 1, 576, 1152));
     cases.push(encoder_trim_mp3(magic, b"LAME3.100", 1, 576, 576)); // zero span

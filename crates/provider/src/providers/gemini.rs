@@ -466,7 +466,7 @@ impl GeminiProvider {
                             == crate::continuation::Retention::Unsupported
                         {
                             anyhow::bail!(
-                                "Gemini native continuation profile/signature requirement is unproven; unsigned required state cannot be replayed"
+                                "Gemini native continuation contains an unrecognized or malformed representation"
                             );
                         }
                         let payload = state

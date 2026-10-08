@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use pioneer_crud::CrudStore;
-use pioneer_provider::{ChatMessage, ChatRequest, ProviderRegistry, ReasoningConfig};
+use pioneer_provider::{ChatMessage, ChatRequest, ProviderRegistry};
 use tracing::debug;
 
 pub struct SummaryConfig {
@@ -65,7 +65,9 @@ fn title_generation_chat_request(model: &str, prompt: String) -> ChatRequest {
         tools: None,
         tool_choice: None,
         parallel_tool_calls: None,
-        reasoning: Some(ReasoningConfig::disabled()),
+        // Service calls inherit the model default. Explicit off is a user
+        // control and is rejected by mandatory-thinking models.
+        reasoning: None,
         compiled_prompt: None,
     }
 }
@@ -117,7 +119,6 @@ mod tests {
         build_title_prompt, normalize_generated_title, title_generation_chat_request,
         truncate_utf8_bytes,
     };
-    use pioneer_provider::ReasoningConfig;
 
     #[test]
     fn title_normalization_trims_quotes_and_whitespace() {
@@ -138,9 +139,9 @@ mod tests {
     }
 
     #[test]
-    fn title_generation_request_disables_reasoning() {
+    fn title_generation_request_preserves_model_default_reasoning() {
         let request = title_generation_chat_request("openrouter/model", "title me".to_owned());
-        assert_eq!(request.reasoning, Some(ReasoningConfig::disabled()));
+        assert_eq!(request.reasoning, None);
         assert!(request.tools.is_none());
     }
 
