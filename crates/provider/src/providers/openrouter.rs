@@ -1734,7 +1734,13 @@ const OPENROUTER_GATEWAY_REASONING_EFFORTS: &[&str] =
 
 fn provider_model_from_openrouter_model_entry(m: OpenRouterModelEntry) -> ProviderModelInfo {
     let pricing = m.pricing.map(|p| {
-        let parse = |s: &Option<String>| s.as_ref().and_then(|v| v.parse::<f64>().ok());
+        // Native discovery remains available without catalog enrichment. Its
+        // unknown/dynamic tariffs must not surface as negative or free prices.
+        let parse = |s: &Option<String>| {
+            s.as_ref()
+                .and_then(|v| v.parse::<f64>().ok())
+                .filter(|rate| rate.is_finite() && *rate >= 0.)
+        };
         ProviderModelPricing {
             input_token: parse(&p.prompt),
             output_token: parse(&p.completion),
@@ -1980,6 +1986,33 @@ pub(crate) async fn render_chat_request_mode_for_test(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn native_unknown_router_prices_remain_unknown_and_explicit_zero_remains_free() {
+        for (raw, expected) in [
+            ("-1", None),
+            ("-2", None),
+            ("NaN", None),
+            ("inf", None),
+            ("not-a-rate", None),
+            ("0", Some(0.)),
+            ("0.000001", Some(0.000001)),
+        ] {
+            let body = serde_json::json!({"data":[{
+                "id":"typesafe/jev-router", "name":"Jev Router",
+                "supported_parameters":["tools"],
+                "pricing":{"prompt":raw,"completion":raw,"image":raw,"request":raw}
+            }]})
+            .to_string();
+            let models = super::models_from_native_discovery_fixture(&body);
+            assert_eq!(models[0].id, "typesafe/jev-router");
+            assert_eq!(models[0].capabilities.tool_calling, Some(true));
+            let price = models[0].pricing.as_ref().unwrap();
+            assert_eq!(price.input_token, expected);
+            assert_eq!(price.output_token, expected);
+            assert_eq!(price.image, expected);
+            assert_eq!(price.request, expected);
+        }
+    }
     #[test]
     fn router_default_off_effort_and_mandatory_models_reach_both_bodies() {
         let catalog = crate::catalog::ModelCatalog::parse(

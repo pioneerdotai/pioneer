@@ -965,8 +965,9 @@ pub(super) fn vercel(data: &Value) -> Vec<Candidate> {
 /// Dedicated endpoint listings override models.dev only with explicit evidence.
 pub(super) fn tool_capabilities(snapshot: &SourceSnapshot) -> super::super::ToolCapabilities {
     let mut result = super::super::ToolCapabilities::new();
-    for (provider, data) in snapshot.sources[SOURCE_URLS[0]]
-        .body
+    for (provider, data) in snapshot
+        .source_body(SOURCE_URLS[0])
+        .unwrap_or(&Value::Null)
         .as_object()
         .into_iter()
         .flatten()
@@ -990,7 +991,7 @@ pub(super) fn tool_capabilities(snapshot: &SourceSnapshot) -> super::super::Tool
         ),
         (SOURCE_URLS[2], "vercel-ai-gateway", "tags", "tool-use"),
     ] {
-        for model in snapshot.sources[url].body["data"]
+        for model in snapshot.source_body(url).unwrap_or(&Value::Null)["data"]
             .as_array()
             .into_iter()
             .flatten()

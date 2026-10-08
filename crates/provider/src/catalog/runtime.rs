@@ -75,7 +75,7 @@ impl SavedCatalog {
     }
 }
 
-fn load_cache(directory: &Path) -> Result<Option<ModelCatalog>> {
+fn load_saved_cache(directory: &Path) -> Result<Option<SavedCatalog>> {
     let file = match fs::File::open(directory.join(CACHE_FILE)) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -92,7 +92,14 @@ fn load_cache(directory: &Path) -> Result<Option<ModelCatalog>> {
         "model catalog cache too large"
     );
     let saved: SavedCatalog = serde_json::from_slice(&bytes)?;
-    saved.validate().map(Some)
+    saved.validate()?;
+    Ok(Some(saved))
+}
+
+fn load_cache(directory: &Path) -> Result<Option<ModelCatalog>> {
+    load_saved_cache(directory)?
+        .map(|saved| saved.validate())
+        .transpose()
 }
 
 fn validate_saved_bytes(bytes: &[u8]) -> Result<ModelCatalog> {
@@ -154,10 +161,29 @@ fn restore_cache(store: &CatalogStore, directory: &Path) -> Result<()> {
 // All transforms and filesystem work finish on one bounded blocking task. The
 // owner awaits it during shutdown; no detached writer can publish after exit.
 fn prepare_update(directory: &Path, snapshot: generator::SourceSnapshot) -> Result<ModelCatalog> {
+    let mut generated = generator::generate(&snapshot, false)?;
+    if generator::SOURCE_URLS
+        .iter()
+        .any(|url| snapshot.source_body(url).is_none())
+    {
+        match load_saved_cache(directory) {
+            Ok(Some(previous)) => {
+                retain_unavailable_sources(&mut generated, previous.catalog, &snapshot)
+            }
+            Ok(None) => {}
+            Err(_) => {
+                tracing::warn!("previous model catalog cache invalid; using available sources")
+            }
+        }
+    }
+    if !generated.diagnostics.is_empty() {
+        tracing::warn!(diagnostics = ?generated.diagnostics,
+            "model catalog refresh isolated unavailable sources or invalid records");
+    }
     let saved = SavedCatalog {
         version: 1,
         updated_at: snapshot.captured_at.clone(),
-        catalog: generator::generate(&snapshot, false)?,
+        catalog: generated,
     };
     let catalog = saved.validate()?;
     let bytes = serde_json::to_vec(&saved)?;
@@ -167,6 +193,79 @@ fn prepare_update(directory: &Path, snapshot: generator::SourceSnapshot) -> Resu
     );
     persist_bytes(directory, &bytes)?;
     Ok(catalog)
+}
+
+/// Keep last-good evidence only for sources that actually failed. Successful
+/// native listings (including capability removals) replace their old evidence.
+/// Retained entries keep their original pricing timestamp and provenance.
+fn retain_unavailable_sources(
+    current: &mut generator::GeneratedCatalog,
+    previous: generator::GeneratedCatalog,
+    snapshot: &generator::SourceSnapshot,
+) {
+    use generator::SOURCE_URLS;
+    for (provider, models) in previous.models {
+        for (id, model) in models {
+            let source = model["pricingSource"]["url"].as_str();
+            let unavailable = source.is_some_and(|url| {
+                SOURCE_URLS.contains(&url) && snapshot.source_body(url).is_none()
+            }) || provider == "nvidia"
+                && snapshot.source_body(SOURCE_URLS[3]).is_none();
+            if !unavailable {
+                continue;
+            }
+            if provider == "nvidia"
+                && let Some(native) = snapshot.source_body(SOURCE_URLS[3])
+                && !native["data"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .any(|model| model["id"] == id)
+            {
+                // models.dev can fail while the native NVIDIA inventory
+                // succeeds. Its removals still govern last-good supplements.
+                continue;
+            }
+            let Some(origins) = previous
+                .provenance
+                .get(&provider)
+                .and_then(|models| models.get(&id))
+            else {
+                continue;
+            };
+            current
+                .models
+                .entry(provider.clone())
+                .or_default()
+                .insert(id.clone(), model);
+            current
+                .provenance
+                .entry(provider.clone())
+                .or_default()
+                .insert(id, origins.clone());
+        }
+    }
+    let capabilities = current
+        .tool_capabilities
+        .get_or_insert_with(Default::default);
+    for (provider, models) in previous.tool_capabilities.unwrap_or_default() {
+        let native_failed = match provider.as_str() {
+            "openrouter" => snapshot.source_body(SOURCE_URLS[1]).is_none(),
+            "vercel-ai-gateway" => snapshot.source_body(SOURCE_URLS[2]).is_none(),
+            _ => false,
+        };
+        if native_failed {
+            capabilities.insert(provider, models);
+        } else if !matches!(provider.as_str(), "openrouter" | "vercel-ai-gateway")
+            && (snapshot.source_body(SOURCE_URLS[0]).is_none()
+                || provider == "nvidia" && snapshot.source_body(SOURCE_URLS[3]).is_none())
+        {
+            let entries = capabilities.entry(provider).or_default();
+            for (id, supported) in models {
+                entries.entry(id).or_insert(supported);
+            }
+        }
+    }
 }
 
 /// Release-pipeline entry point. Network access happens only when this is
@@ -313,6 +412,89 @@ mod tests {
             .clone()
     }
     #[test]
+    fn partial_refresh_preserves_failed_source_evidence_and_updates_healthy_sources() {
+        for failed_url in generator::SOURCE_URLS {
+            let dir = tempfile::tempdir().unwrap();
+            let source = super::super::tool_tests::source_snapshot();
+            prepare_update(dir.path(), source.clone()).unwrap();
+            let before = load_saved_cache(dir.path()).unwrap().unwrap();
+            let mut newer = source;
+            newer.captured_at = "2026-10-08T12:00:00Z".into();
+            newer.sources.get_mut(failed_url).unwrap().status = 503;
+            newer
+                .sources
+                .get_mut(generator::SOURCE_URLS[0])
+                .unwrap()
+                .body["openai"]["models"]["gpt-5-nano"]["name"] =
+                serde_json::json!("healthy update");
+            let catalog = prepare_update(dir.path(), newer).unwrap();
+            let after = load_saved_cache(dir.path()).unwrap().unwrap();
+            after.validate().unwrap();
+            for (provider, models) in &before.catalog.models {
+                for (id, model) in models {
+                    if model["pricingSource"]["url"] == failed_url
+                        || provider == "nvidia" && failed_url == generator::SOURCE_URLS[3]
+                    {
+                        assert_eq!(&after.catalog.models[provider][id], model);
+                        assert_eq!(
+                            after.catalog.provenance[provider][id],
+                            before.catalog.provenance[provider][id]
+                        );
+                    }
+                }
+            }
+            assert_eq!(
+                catalog.tool_support("openrouter", "g03-negative"),
+                Some(false)
+            );
+            assert_eq!(catalog.tool_support("openai", "g03-negative"), Some(false));
+            if failed_url != generator::SOURCE_URLS[0] {
+                assert_eq!(
+                    catalog.model("openai", "gpt-5-nano").unwrap().name,
+                    "healthy update"
+                );
+            }
+            assert!(
+                after
+                    .catalog
+                    .diagnostics
+                    .iter()
+                    .any(|d| d.source == failed_url && d.code == "source_unavailable")
+            );
+            assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+        }
+    }
+
+    #[test]
+    fn cold_partial_catalog_and_healthy_native_removals_do_not_require_failed_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut source = super::super::tool_tests::source_snapshot();
+        source.sources.remove(generator::SOURCE_URLS[0]);
+        let catalog = prepare_update(dir.path(), source.clone()).unwrap();
+        assert_eq!(
+            catalog.tool_support("openrouter", "g03-negative"),
+            Some(false)
+        );
+        assert!(
+            !load_saved_cache(dir.path())
+                .unwrap()
+                .unwrap()
+                .catalog
+                .models["openrouter"]
+                .is_empty()
+        );
+        source
+            .sources
+            .get_mut(generator::SOURCE_URLS[1])
+            .unwrap()
+            .body["data"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|model| model["id"] != "g03-negative");
+        let catalog = prepare_update(dir.path(), source).unwrap();
+        assert_eq!(catalog.tool_support("openrouter", "g03-negative"), None);
+    }
+    #[test]
     fn capability_supplement_round_trips_and_refresh_replaces_snapshot_atomically() {
         let dir = tempfile::tempdir().unwrap();
         let store = CatalogStore::default();
@@ -351,11 +533,9 @@ mod tests {
             Some(false)
         );
         let saved_bytes = fs::read(dir.path().join(CACHE_FILE)).unwrap();
-        newer
-            .sources
-            .get_mut(generator::SOURCE_URLS[0])
-            .unwrap()
-            .status = 503;
+        for response in newer.sources.values_mut() {
+            response.status = 503;
+        }
         assert!(prepare_update(dir.path(), newer).is_err());
         assert_eq!(fs::read(dir.path().join(CACHE_FILE)).unwrap(), saved_bytes);
         let mut legacy: serde_json::Value = serde_json::from_slice(&saved_bytes).unwrap();
@@ -395,11 +575,9 @@ mod tests {
         );
         let bytes = fs::read(dir.path().join(CACHE_FILE)).unwrap();
         let mut invalid = snapshot("bad update");
-        invalid
-            .sources
-            .get_mut(generator::SOURCE_URLS[1])
-            .unwrap()
-            .status = 503;
+        for response in invalid.sources.values_mut() {
+            response.status = 503;
+        }
         assert!(prepare_update(dir.path(), invalid).is_err());
         assert_eq!(fs::read(dir.path().join(CACHE_FILE)).unwrap(), bytes);
         let restarted = CatalogStore::default();

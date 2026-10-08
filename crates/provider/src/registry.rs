@@ -331,6 +331,11 @@ impl AuthorityBoundProvider {
         catalog: &crate::catalog::ModelCatalog,
         models: &mut [ProviderModelInfo],
     ) {
+        self.remember_discovery(models);
+        catalog.enrich_for_tool_scope(self.inner.name(), models, self.use_public_catalog);
+    }
+
+    fn remember_discovery(&self, models: &[ProviderModelInfo]) {
         // Keep raw media evidence before any catalog enrichment, in this same
         // authority instance. A refresh replaces both capability snapshots.
         self.input_admission.replace_discovery(models.to_vec());
@@ -353,7 +358,6 @@ impl AuthorityBoundProvider {
                     .map(|r| (m.id.clone(), r.native.clone()))
             })
             .collect();
-        catalog.enrich_for_tool_scope(self.inner.name(), models, self.use_public_catalog);
     }
 
     fn discovery_reasoning_snapshot(&self) -> BTreeMap<String, crate::generation::NativeReasoning> {
@@ -563,9 +567,14 @@ impl Provider for AuthorityBoundProvider {
 
     async fn list_models(&self) -> Result<Vec<ProviderModelInfo>> {
         self.ensure_not_revoked()?;
-        let catalog = crate::catalog::model_catalog()?;
         let mut models = self.public_result(self.inner.list_models().await)?;
-        self.enrich_discovery(&catalog, &mut models);
+        if let Ok(catalog) = crate::catalog::model_catalog() {
+            self.enrich_discovery(&catalog, &mut models);
+        } else {
+            // Native discovery is usable before bootstrap and during catalog
+            // outages. Keep authority-local evidence even without enrichment.
+            self.remember_discovery(&models);
+        }
         Ok(models)
     }
 
@@ -1291,12 +1300,114 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn discovery_requires_loaded_catalog_but_direct_chat_does_not() {
-        let registry = ProviderRegistry::with_provider("echo", Arc::new(EchoProvider::new()));
-        let provider = registry.get_or_create("echo").unwrap();
-        let error = provider.list_models().await.unwrap_err();
-        assert!(error.to_string().contains("Model catalog is not loaded"));
-        assert!(provider.chat(chat_request()).await.is_ok());
+    async fn native_discovery_and_direct_chat_do_not_require_a_loaded_catalog() {
+        let registry = ProviderRegistry::with_provider("openai", Arc::new(ToolDiscoveryProvider));
+        let provider = registry.get_or_create("openai").unwrap();
+        let models = provider.list_models().await.unwrap();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "g03-positive");
+        assert_eq!(models[0].capabilities.tool_calling, Some(false));
+        assert!(!provider.model_tool_calling("g03-positive"));
+        let echo = ProviderRegistry::with_provider("echo", Arc::new(EchoProvider::new()));
+        assert!(
+            echo.get_or_create("echo")
+                .unwrap()
+                .chat(chat_request())
+                .await
+                .is_ok()
+        );
+        // Native errors are also preserved rather than replaced by a catalog
+        // bootstrap error. Echo intentionally has no native model listing.
+        let error = echo
+            .get_or_create("echo")
+            .unwrap()
+            .list_models()
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("does not support listing models")
+        );
+    }
+
+    struct NativeListFixture(&'static str);
+    #[async_trait]
+    impl Provider for NativeListFixture {
+        fn name(&self) -> &str {
+            self.0
+        }
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                tool_calling: true,
+                ..Default::default()
+            }
+        }
+        async fn list_models(&self) -> Result<Vec<ProviderModelInfo>> {
+            let mut model =
+                crate::catalog::tool_tests::discovered("fixture-native-model", Some(false));
+            model.provider = self.0.into();
+            model.capabilities.reasoning =
+                Some(pioneer_protocol::ProviderModelReasoningCapabilities {
+                    native: BTreeMap::from([("supported".into(), Some(false))]),
+                    ..Default::default()
+                });
+            Ok(vec![model])
+        }
+        async fn chat(&self, _request: ChatRequest) -> Result<ChatResponse> {
+            anyhow::bail!("fixture model boundary")
+        }
+        async fn stream_chat(
+            &self,
+            _request: ChatRequest,
+        ) -> Result<BoxStream<'static, Result<StreamChunk>>> {
+            anyhow::bail!("fixture model boundary")
+        }
+    }
+    #[tokio::test]
+    async fn shared_discovery_boundary_keeps_native_evidence_for_every_active_provider() {
+        // Inventory coverage of the common authority wrapper, not a claim that
+        // mocked transports certify each vendor's Models API.
+        for definition in crate::definition::provider_definitions() {
+            if definition.retirement_reason().is_some() {
+                continue;
+            }
+            let wrapper = AuthorityBoundProvider {
+                inner: Arc::new(NativeListFixture(definition.name)),
+                authority_fingerprint: ProviderAuthorityFingerprint(definition.name.into()),
+                revoked: Arc::new(AtomicBool::new(false)),
+                redact_endpoint_errors: false,
+                input_admission: Arc::new(Default::default()),
+                use_public_catalog: true,
+                discovery_tools: RwLock::new(BTreeMap::new()),
+                discovery_reasoning: RwLock::new(BTreeMap::new()),
+            };
+            let models = wrapper.list_models().await.unwrap();
+            assert_eq!(models[0].provider, definition.name);
+            assert_eq!(models[0].capabilities.tool_calling, Some(false));
+            assert!(!wrapper.model_tool_calling_with_catalog("fixture-native-model", None));
+            assert_eq!(
+                wrapper.discovery_reasoning_snapshot()["fixture-native-model"]["supported"],
+                Some(false)
+            );
+            assert_eq!(
+                wrapper
+                    .input_admission
+                    .model("fixture-native-model")
+                    .unwrap()
+                    .capabilities
+                    .tool_calling,
+                Some(false)
+            );
+            wrapper.revoked.store(true, Ordering::Release);
+            assert!(
+                wrapper
+                    .list_models()
+                    .await
+                    .unwrap_err()
+                    .is::<ProviderAuthorityRevoked>()
+            );
+        }
     }
 
     struct RouterReasoningFixture {

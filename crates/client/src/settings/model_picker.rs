@@ -545,10 +545,7 @@ impl ClientCore {
         }
         let mut next = (*session.value).clone();
         if work.models {
-            match result.and_then(|p| {
-                p.models_response()
-                    .map_err(|_| "provider_models_unavailable".into())
-            }) {
+            match result.and_then(|p| p.models_response().map_err(|error| error.to_string())) {
                 Ok(response) => {
                     next.selector.apply_provider_models_success(response);
                 }
@@ -576,8 +573,9 @@ impl ClientCore {
             }
         } else {
             match result.and_then(|p| {
-                p.catalog_response()
-                    .map_err(|_| "provider_catalog_unavailable".into())
+                p.catalog_response().map_err(|error| {
+                    pioneer_protocol::sanitize_runtime_diagnostic_line(&error.to_string())
+                })
             }) {
                 Ok(response) => next.selector.apply_provider_list_success(response),
                 Err(error) => next.selector.apply_provider_list_error(error),
@@ -708,7 +706,7 @@ impl ClientCore {
                     let Some(core) = weak.upgrade() else { return; };
                     if !core.settings_model_picker_work_current(&work) { continue; }
                     let read = core.read_provider_collection(work.key.clone(), true); drop(core);
-                    let result = read.and_then(|read| read.wait_while(|| weak.upgrade().is_some_and(|core| core.settings_model_picker_work_current(&work)))).map_err(|_| "provider_catalog_unavailable".into());
+                    let result = read.and_then(|read| read.wait_while(|| weak.upgrade().is_some_and(|core| core.settings_model_picker_work_current(&work)))).map_err(|error| pioneer_protocol::sanitize_runtime_diagnostic_line(&error.to_string()));
                     if let Some(core) = weak.upgrade() { core.complete_settings_model_picker(work, result); }
                 }
             });
@@ -777,6 +775,28 @@ mod tests {
             Ok(ProviderCollectionPublication::for_test(
                 work.key, providers, models,
             )),
+        );
+    }
+    #[test]
+    fn model_picker_displays_the_failed_collection_cause() {
+        let (core, mut requests) = fixture();
+        open(&core, ProviderModelSelectorMode::Embeddings);
+        let catalog = requests.try_recv().unwrap();
+        let models = requests.try_recv().unwrap();
+        assert!(!catalog.models);
+        assert!(models.models);
+        complete(&core, catalog);
+        let failed = ProviderCollectionPublication::failed_for_test(
+            models.key.clone(),
+            "provider HTTP 401: invalid API key",
+        );
+        core.complete_settings_model_picker(models, Ok(failed));
+        assert_eq!(
+            core.settings_model_picker("picker")
+                .unwrap()
+                .selector
+                .error(),
+            Some("provider HTTP 401: invalid API key")
         );
     }
     #[test]

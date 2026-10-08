@@ -129,6 +129,8 @@ pub struct ProviderCollectionPublication {
     key: ProviderCollectionKey,
     revision: u64,
     request: ProviderLoadState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    failure: Option<String>,
     providers: Vec<Arc<ProviderCatalogRow>>,
     definitions: Vec<ProviderDefinition>,
     models: Vec<Arc<ProviderModelRow>>,
@@ -155,9 +157,9 @@ impl ProviderCollectionPublication {
         &self.models
     }
     pub fn catalog_response(&self) -> anyhow::Result<ProviderListResponse> {
+        self.ensure_ready("provider_catalog_unavailable")?;
         anyhow::ensure!(
-            self.request == ProviderLoadState::Ready
-                && matches!(self.key.collection, ProviderCollection::Catalog),
+            matches!(self.key.collection, ProviderCollection::Catalog),
             "provider_catalog_unavailable"
         );
         Ok(ProviderListResponse {
@@ -172,20 +174,14 @@ impl ProviderCollectionPublication {
     pub fn runtime_models_response(
         &self,
     ) -> anyhow::Result<pioneer_protocol::CLIRuntimeListModelsResponse> {
-        anyhow::ensure!(
-            self.request == ProviderLoadState::Ready,
-            "provider_models_unavailable"
-        );
+        self.ensure_ready("provider_models_unavailable")?;
         self.runtime_models
             .as_deref()
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("provider_models_unavailable"))
     }
     pub fn models_response(&self) -> anyhow::Result<ProviderListModelsResponse> {
-        anyhow::ensure!(
-            self.request == ProviderLoadState::Ready,
-            "provider_models_unavailable"
-        );
+        self.ensure_ready("provider_models_unavailable")?;
         let ProviderCollection::Models { provider, .. } = &self.key.collection else {
             anyhow::bail!("provider_collection_mismatch")
         };
@@ -193,6 +189,14 @@ impl ProviderCollectionPublication {
             provider: provider.clone(),
             models: self.models.iter().map(|row| row.model.clone()).collect(),
         })
+    }
+    fn ensure_ready(&self, fallback: &str) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.request == ProviderLoadState::Ready,
+            "{}",
+            self.failure.as_deref().unwrap_or(fallback)
+        );
+        Ok(())
     }
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -419,6 +423,7 @@ impl ClientCore {
                     key: key.clone(),
                     revision: 0,
                     request: ProviderLoadState::Idle,
+                    failure: None,
                     providers: vec![],
                     definitions: vec![],
                     models: vec![],
@@ -442,6 +447,7 @@ impl ClientCore {
             state.request = None;
             let mut next = (*state.publication).clone();
             next.request = ProviderLoadState::Forbidden;
+            next.failure = None;
             next.providers.clear();
             next.definitions.clear();
             next.models.clear();
@@ -481,6 +487,7 @@ impl ClientCore {
         } else {
             ProviderLoadState::Failed
         };
+        next.failure = (!queued).then(|| "provider_request_queue_unavailable".into());
         self.publish_provider_collection(state, next)
     }
     fn cancel_unused_provider_collection(&self, state: &mut Collection) -> ClientTransition {
@@ -490,6 +497,7 @@ impl ClientCore {
         state.request = None;
         let mut next = (*state.publication).clone();
         next.request = ProviderLoadState::Cancelled;
+        next.failure = None;
         self.publish_provider_collection(state, next)
     }
     pub fn read_provider_collection(
@@ -595,12 +603,26 @@ impl ClientCore {
         };
         if !allowed {
             next.request = ProviderLoadState::Forbidden;
+            next.failure = None;
             next.providers.clear();
             next.definitions.clear();
             next.models.clear();
             next.runtime_models = None;
         } else {
             next.request = ProviderLoadState::Failed;
+            next.failure = Some(match result.as_ref() {
+                Err(error) => {
+                    // Gateway provider errors are already authority-redacted.
+                    // Keep the typed public RPC cause; never expose an arbitrary
+                    // local error chain or response body to the picker.
+                    crate::rpc::json_rpc_response_error(error)
+                        .map(|error| {
+                            pioneer_protocol::sanitize_runtime_diagnostic_line(&error.to_string())
+                        })
+                        .unwrap_or_else(|| "provider_request_failed".into())
+                }
+                Ok(_) => "provider_response_invalid".into(),
+            });
             match (result, &request.key.collection) {
                 (Ok(Response::Catalog(response)), ProviderCollection::Catalog) => {
                     next.definitions = response.definitions;
@@ -635,6 +657,7 @@ impl ClientCore {
                             })
                             .collect();
                         next.request = ProviderLoadState::Ready;
+                        next.failure = None;
                     }
                 }
                 (
@@ -669,6 +692,7 @@ impl ClientCore {
                             })
                             .collect();
                         next.request = ProviderLoadState::Ready;
+                        next.failure = None;
                     }
                 }
                 _ => {}
@@ -688,6 +712,7 @@ impl ClientCore {
             next.models.clear();
             next.runtime_models = None;
             next.request = ProviderLoadState::Cancelled;
+            next.failure = None;
             self.publish_provider_collection(state, next);
         }
     }
@@ -1028,6 +1053,43 @@ mod tests {
         );
     }
     #[test]
+    fn native_model_failure_keeps_safe_rpc_cause_and_retry_clears_it() {
+        for provider in ["deepseek", "openrouter", "openai", "anthropic"] {
+            let (core, requests) = fixture();
+            let key = ProviderCollectionKey::models("workspace", provider, ProviderModelKind::Chat);
+            let read = core.read_provider_collection(key.clone(), false).unwrap();
+            let error = crate::rpc::JsonRpcResponseError::server(
+                Some(-32000),
+                "provider HTTP 401: invalid API key; api_key=fixture-secret",
+                None,
+            );
+            core.complete_provider_collection(requests.try_recv().unwrap(), Err(error.into()));
+            let failed = read.wait().unwrap();
+            let cause = failed.models_response().unwrap_err().to_string();
+            assert!(cause.contains("HTTP 401"));
+            assert!(!cause.contains("fixture-secret"));
+            assert_ne!(cause, "provider_models_unavailable");
+            assert_eq!(failed.failure.as_deref(), Some(cause.as_str()));
+            let retry = core.read_provider_collection(key.clone(), true).unwrap();
+            assert!(
+                core.provider_collection_snapshot(&key)
+                    .unwrap()
+                    .failure
+                    .is_none()
+            );
+            core.complete_provider_collection(
+                requests.try_recv().unwrap(),
+                Ok(models(provider, &["native-model"])),
+            );
+            let ready = retry.wait().unwrap();
+            assert!(ready.failure.is_none());
+            assert_eq!(
+                ready.models_response().unwrap().models[0].id,
+                "native-model"
+            );
+        }
+    }
+    #[test]
     fn model_purpose_and_workspace_partitions_preserve_sibling_identity() {
         let (core, requests) = fixture();
         let a = ProviderCollectionKey::models("one", "openai", ProviderModelKind::Chat);
@@ -1138,6 +1200,13 @@ mod tests {
 
 #[cfg(test)]
 impl ProviderCollectionPublication {
+    pub(crate) fn failed_for_test(key: ProviderCollectionKey, failure: &str) -> Arc<Self> {
+        let mut publication = Self::for_test(key, vec![], vec![]);
+        let value = Arc::make_mut(&mut publication);
+        value.request = ProviderLoadState::Failed;
+        value.failure = Some(pioneer_protocol::sanitize_runtime_diagnostic_line(failure));
+        publication
+    }
     pub(crate) fn for_test(
         key: ProviderCollectionKey,
         providers: Vec<ProviderSummary>,
@@ -1147,6 +1216,7 @@ impl ProviderCollectionPublication {
             key,
             revision: 1,
             request: ProviderLoadState::Ready,
+            failure: None,
             providers: providers
                 .into_iter()
                 .map(|provider| {
