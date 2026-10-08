@@ -21,6 +21,7 @@ mod m20261004_000008_task_event_fanout_pending;
 mod m20261004_000009_skills_watch_indexes;
 mod m20261005_000001_native_cancellation_context;
 mod m20261006_000001_retire_compaction_publication_fences;
+mod m20261006_000001_thread_episodic_job_access;
 pub use sea_orm_migration::prelude::*;
 
 pub struct Migrator;
@@ -181,6 +182,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261005_000001_native_cancellation_context::Migration),
             Box::new(m20261006_000001_retire_compaction_publication_fences::Migration),
             Box::new(m20261004_000009_skills_watch_indexes::Migration),
+            Box::new(m20261006_000001_thread_episodic_job_access::Migration),
         ]
     }
 }

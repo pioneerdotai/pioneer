@@ -251,6 +251,8 @@ struct Signals {
     #[cfg(test)]
     snapshot_failure_page: StdMutex<Option<usize>>,
     #[cfg(test)]
+    snapshot_failed: Notify,
+    #[cfg(test)]
     backend_unavailable: AtomicBool,
     #[cfg(test)]
     native_events_disabled: AtomicBool,
@@ -1377,6 +1379,8 @@ async fn run_with_signals(
                     applied_revision = None;
                     snapshot_attempts = snapshot_attempts.saturating_add(1).min(16);
                     snapshot_retry = Instant::now() + retry_delay(snapshot_attempts);
+                    #[cfg(test)]
+                    signals.snapshot_failed.notify_one();
                     warn!("skills Workspace snapshot failed; retry is retained");
                 }
             }
