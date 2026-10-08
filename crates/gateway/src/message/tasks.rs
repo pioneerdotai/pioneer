@@ -1,5 +1,5 @@
 use super::*;
-use anyhow::{Result, bail};
+use anyhow::Result;
 use pioneer_crud::TaskEventContext;
 use pioneer_crud::{
     TaskRunOccurrenceClaimDeferral, TaskRunOccurrenceClaimFailure,

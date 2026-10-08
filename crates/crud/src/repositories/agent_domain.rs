@@ -4952,7 +4952,7 @@ struct AgentActionOutboxId {
 }
 
 // Keep these predicates literally aligned with the partial indexes in
-// m20261004_000007_agent_action_outbox_ranges. Only clocks and limits are binds.
+// m20261008_000002_background_access_indexes. Only clocks and limits are binds.
 async fn discover_agent_action_outbox<C: ConnectionTrait>(
     db: &C,
     now: DateTimeWithTimeZone,

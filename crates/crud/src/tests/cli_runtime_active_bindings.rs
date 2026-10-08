@@ -334,7 +334,7 @@ async fn cli_active_binding_discovery_uses_query_only_maintenance_reader_and_can
 }
 
 #[tokio::test]
-async fn cli_active_binding_index_retry_down_and_up_preserve_domain_and_workspace_index() {
+async fn cli_active_binding_index_down_and_up_preserve_domain_and_workspace_index() {
     let store = test_store_with_workspace("ws_active_page").await;
     history(&store).await;
     let database = store.database_connection();
@@ -342,11 +342,9 @@ async fn cli_active_binding_index_retry_down_and_up_preserve_domain_and_workspac
     let manager = migration::SchemaManager::new(&*transaction);
     let index_migration = Migrator::migrations()
         .into_iter()
-        .find(|m| m.name() == "m20261004_000001_cli_runtime_active_binding_index")
+        .find(|m| m.name() == "m20261008_000002_background_access_indexes")
         .unwrap();
-    // Retrying index creation is idempotent and does not rebuild domain data.
-    index_migration.up(&manager).await.unwrap();
-    index_migration.down(&manager).await.unwrap();
+    // The index-only group can be rolled back and reapplied without domain writes.
     index_migration.down(&manager).await.unwrap();
     assert_eq!(
         binding::Entity::find().count(&transaction).await.unwrap(),

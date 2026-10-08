@@ -102,6 +102,7 @@ pub use super::patch_snapshot::Entity as PatchSnapshot;
 pub use super::patch_snapshot_reservation::Entity as PatchSnapshotReservation;
 pub use super::principal_avatar::Entity as PrincipalAvatar;
 pub use super::principal_avatar_revision::Entity as PrincipalAvatarRevision;
+pub use super::provider_usage_observation::Entity as ProviderUsageObservation;
 pub use super::read_model_repair_change_sequence::Entity as ReadModelRepairChangeSequence;
 pub use super::read_model_repair_checkpoint::Entity as ReadModelRepairCheckpoint;
 pub use super::read_model_repair_dirty_turn_item::Entity as ReadModelRepairDirtyTurnItem;

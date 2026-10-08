@@ -180,13 +180,13 @@ struct ApiToolCallFunction {
 
 #[derive(Debug, Deserialize)]
 struct ApiChatResponse {
-    #[serde(default)]
-    model: Option<String>,
-    #[serde(default)]
-    id: Option<String>,
+    #[serde(default, rename = "model")]
+    _model: Option<String>,
+    #[serde(default, rename = "id")]
+    _id: Option<String>,
     choices: Vec<ApiChoice>,
-    #[serde(default)]
-    usage: Option<ApiUsage>,
+    #[serde(default, rename = "usage")]
+    _usage: Option<ApiUsage>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1098,6 +1098,7 @@ impl OpenRouterProvider {
         Self::decode_stream_with_diagnostics(byte_stream, None, Default::default()).stream
     }
 
+    #[cfg(test)]
     fn decode_stream_with_diagnostics(
         byte_stream: BoxStream<'static, Result<bytes::Bytes>>,
         request_id: Option<String>,
@@ -2848,7 +2849,7 @@ mod tests {
             "usage": {"prompt_tokens": 42, "completion_tokens": 15}
         }"#;
         let response: ApiChatResponse = serde_json::from_str(json).unwrap();
-        let usage = response.usage.unwrap().normalized();
+        let usage = response._usage.unwrap().normalized();
         assert_eq!(usage.input_tokens, Some(42));
         assert_eq!(usage.output_tokens, Some(15));
     }

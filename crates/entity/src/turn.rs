@@ -62,6 +62,8 @@ pub struct Model {
     pub compaction_task_outputs: HasMany<super::compaction_task_output::Entity>,
     #[sea_orm(has_one)]
     pub compaction_turn_creation: HasOne<super::compaction_turn_creation::Entity>,
+    #[sea_orm(has_one)]
+    pub native_cancellation_context: HasOne<super::native_cancellation_context::Entity>,
     #[sea_orm(has_many)]
     pub native_terminal_effect_outboxes: HasMany<super::native_terminal_effect_outbox::Entity>,
     #[sea_orm(has_many)]

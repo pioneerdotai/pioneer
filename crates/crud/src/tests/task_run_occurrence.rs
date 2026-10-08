@@ -19,7 +19,7 @@ struct TrackerFixtureMigrator;
 
 impl MigratorTrait for TrackerFixtureMigrator {
     fn migrations() -> Vec<Box<dyn migration::MigrationTrait>> {
-        migrations_through("m20261005_000001_native_cancellation_context")
+        migrations_through("m20261008_000008_native_cancellation_context")
     }
 }
 

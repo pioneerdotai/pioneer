@@ -1689,13 +1689,13 @@ async fn native_cancellation_production_upgrade_and_latest_down() {
     const OLD_NAME: &str = "m20261001_000001_native_cancellation_context";
     const LATER_MAIN: [&str; 4] = [
         "m20261002_000001_task_run_occurrence_reconcile",
-        "m20261004_000001_task_occurrence_reconcile",
-        "m20261004_000004_compaction_lifecycle_pending",
-        "m20261004_000007_agent_action_outbox_ranges",
+        "m20261008_000002_background_access_indexes",
+        "m20261008_000003_task_occurrence_reconcile",
+        "m20261008_000004_compaction_lifecycle_pending",
     ];
     let cancellation = cancellation_migration_name();
     // Upgrade and down(1) exercise the production registry through cancellation.
-    assert_eq!(cancellation, "m20261005_000001_native_cancellation_context");
+    assert_eq!(cancellation, "m20261008_000008_native_cancellation_context");
     assert_ne!(cancellation, OLD_NAME);
     assert!(cancellation.as_str() > *LATER_MAIN.last().unwrap());
     assert_eq!(

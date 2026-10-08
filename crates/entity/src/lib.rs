@@ -104,6 +104,7 @@ pub mod patch_snapshot;
 pub mod patch_snapshot_reservation;
 pub mod principal_avatar;
 pub mod principal_avatar_revision;
+pub mod provider_usage_observation;
 pub mod read_model_repair_change_sequence;
 pub mod read_model_repair_checkpoint;
 pub mod read_model_repair_dirty_turn_item;

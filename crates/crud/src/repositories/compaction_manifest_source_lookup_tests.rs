@@ -3332,7 +3332,7 @@ async fn retired_publication_fence_triggers_are_removed_and_migration_is_idempot
         let migration = Migrator::migrations()
             .into_iter()
             .find(|migration| {
-                migration.name() == "m20261006_000001_retire_compaction_publication_fences"
+                migration.name() == "m20261008_000009_retire_compaction_publication_fences"
             })
             .expect("publication fence retirement migration is registered");
         for _ in 0..2 {

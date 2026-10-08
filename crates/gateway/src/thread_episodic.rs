@@ -4242,6 +4242,7 @@ impl ThreadEpisodicIndexExecutor {
             let _ = started.send(());
             let _ = release.await;
         }
+        #[cfg(test)]
         let job_id = job.id.clone();
         let outcome = self
             .process_claimed_job(job, now_unix, config, ownership)

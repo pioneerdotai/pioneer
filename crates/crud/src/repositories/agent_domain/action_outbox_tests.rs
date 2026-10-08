@@ -438,7 +438,7 @@ async fn action_outbox_rollback_preserves_source_and_partial_index_membership() 
 
 #[tokio::test]
 async fn action_outbox_index_migration_and_marker_rollback_and_retry_are_atomic() {
-    const MIGRATION: &str = "m20261004_000007_agent_action_outbox_ranges";
+    const MIGRATION: &str = "m20261008_000002_background_access_indexes";
     let migrations = Migrator::migrations();
     let target = migrations
         .iter()
