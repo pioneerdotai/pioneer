@@ -2047,6 +2047,36 @@ mod regression_tests {
         }
     }
 
+    fn run_stage<F: std::future::Future>(
+        key: Option<String>,
+        guard: Option<StageGuard>,
+        future: F,
+    ) -> Staged<F> {
+        let mut phase = staged(key, None, Box::pin(future));
+        phase.guard = guard;
+        phase
+    }
+
+    #[test]
+    fn phase_wrapper_size_does_not_include_the_inner_future_state() {
+        fn large_future() -> impl std::future::Future<Output = ()> {
+            async {
+                let payload = [0_u8; 64 * 1024];
+                std::future::pending::<()>().await;
+                std::hint::black_box(payload);
+            }
+        }
+
+        let work = large_future();
+        assert!(std::mem::size_of_val(&work) >= 64 * 1024);
+        let large = scope_current_stage(Stage::HistoryFreeze, work);
+        let small = scope_current_stage(Stage::HistoryFreeze, std::future::ready(()));
+        let keyed = scope_stage(None, Stage::HistoryFreeze, large_future());
+        assert_eq!(std::mem::size_of_val(&large), std::mem::size_of_val(&small));
+        assert_eq!(std::mem::size_of_val(&keyed), std::mem::size_of_val(&small));
+        assert!(std::mem::size_of_val(&large) < 1024);
+    }
+
     #[test]
     fn nested_phase_and_alias_parent_survive_an_owned_worker_future() {
         use opentelemetry::trace::TracerProvider;
@@ -2092,13 +2122,14 @@ mod regression_tests {
                 .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
                 .is_ready()
         );
-        drop(future);
         registry()
             .lock()
             .unwrap()
             .retain(|key, _| !matches!(key.as_str(), "phase-parent" | "phase-child"));
         provider.force_flush().unwrap();
         let spans = capture.0.lock().unwrap();
+        // Ready closes the phase even while its completed future is retained.
+        assert_eq!(spans.len(), 2);
         let child = spans
             .iter()
             .find(|s| s.name == Stage::HistoryMetadata.name())
@@ -2127,6 +2158,9 @@ mod regression_tests {
                 .attributes
                 .contains(&KeyValue::new("stage.work.quanta", 3_i64))
         );
+        drop(spans);
+        drop(future);
+        assert_eq!(capture.0.lock().unwrap().len(), 2);
         assert!(current_key().is_none());
     }
 
@@ -2235,10 +2269,20 @@ mod regression_tests {
             .get::<Diagnostics>()
             .unwrap()
             .clone();
+        struct PendingDb(Diagnostics);
+        impl Drop for PendingDb {
+            fn drop(&mut self) {
+                self.0.record_db(Stage::DbExecute, Duration::from_millis(7));
+            }
+        }
+        let work = PendingDb(diagnostics.clone());
         let mut future = Box::pin(run_stage(
             Some("cancel-phase".into()),
             Some(phase),
-            std::future::pending::<()>(),
+            async move {
+                let _work = work;
+                std::future::pending::<()>().await;
+            },
         ));
         assert!(
             future
@@ -2252,11 +2296,16 @@ mod regression_tests {
         assert!(
             diagnostics
                 .finish()
-                .contains(&KeyValue::new("stage.db.execute.count", 0_i64))
+                .contains(&KeyValue::new("stage.db.execute.count", 1_i64))
         );
         provider.force_flush().unwrap();
         let spans = capture.0.lock().unwrap();
         assert_eq!(spans.len(), 1);
+        assert!(
+            spans[0]
+                .attributes
+                .contains(&KeyValue::new("stage.db.execute_ms", 7.))
+        );
         assert!(
             spans[0]
                 .attributes
@@ -2266,40 +2315,83 @@ mod regression_tests {
     }
 }
 
+/// Boxes work at construction; phase timing starts on its first poll.
 /// Nested stage parentage is installed per poll, so concurrent turns cannot inherit it.
-pub async fn scope_stage<F: std::future::Future>(
+pub fn scope_stage<F: std::future::Future>(
     key: Option<String>,
     name: Stage,
     future: F,
-) -> F::Output {
-    let guard = key.as_deref().map(|key| stage(key, name));
-    run_stage(key, guard, future).await
+) -> impl std::future::Future<Output = F::Output> {
+    staged(key, Some(name), Box::pin(future))
 }
 
-async fn run_stage<F: std::future::Future>(
+// Accept only the pointer here: carrying F through async forwarding functions
+// embeds the complete, potentially large state machine in their own state.
+fn staged<F: std::future::Future>(
     key: Option<String>,
-    mut guard: Option<StageGuard>,
-    future: F,
-) -> F::Output {
-    if let Some(guard) = guard.as_mut() {
-        guard.completion = Some(false);
+    name: Option<Stage>,
+    future: std::pin::Pin<Box<F>>,
+) -> Staged<F> {
+    Staged {
+        inner: Some(Scoped {
+            key,
+            parent: None,
+            inner: future,
+        }),
+        name,
+        guard: None,
+        initialized: false,
     }
-    let parent = guard
-        .as_ref()
-        .and_then(|g| g.inner.as_ref().map(|(cx, _, _)| cx.clone()))
-        .or_else(|| {
-            shares_observation(current_key().as_deref(), key.as_deref()).then(Context::current)
-        });
-    let result = Scoped {
-        key,
-        parent,
-        inner: Box::pin(future),
+}
+
+struct Staged<F> {
+    // Drop work before closing its phase so child DB guards can finish their
+    // summaries on cancellation. Work is also released immediately on Ready.
+    inner: Option<Scoped<F>>,
+    name: Option<Stage>,
+    guard: Option<StageGuard>,
+    initialized: bool,
+}
+
+impl<F: std::future::Future> std::future::Future for Staged<F> {
+    type Output = F::Output;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let this = self.get_mut();
+        let inner = this
+            .inner
+            .as_mut()
+            .expect("startup phase polled after completion");
+        if !this.initialized {
+            if let Some(name) = this.name.take() {
+                this.guard = inner.key.as_deref().map(|key| stage(key, name));
+            }
+            if let Some(guard) = this.guard.as_mut() {
+                guard.completion = Some(false);
+            }
+            inner.parent = this
+                .guard
+                .as_ref()
+                .and_then(|g| g.inner.as_ref().map(|(cx, _, _)| cx.clone()))
+                .or_else(|| {
+                    shares_observation(current_key().as_deref(), inner.key.as_deref())
+                        .then(Context::current)
+                });
+            this.initialized = true;
+        }
+        let result = std::future::Future::poll(std::pin::Pin::new(inner), cx);
+        if result.is_ready() {
+            drop(this.inner.take());
+            if let Some(guard) = this.guard.as_mut() {
+                guard.completion = Some(true);
+            }
+            drop(this.guard.take());
+        }
+        result
     }
-    .await;
-    if let Some(guard) = guard.as_mut() {
-        guard.completion = Some(true);
-    }
-    result
 }
 
 /// Measures a phase in the current startup and installs its parent per poll.
@@ -2308,7 +2400,7 @@ pub fn scope_current_stage<F: std::future::Future>(
     name: Stage,
     future: F,
 ) -> impl std::future::Future<Output = F::Output> {
-    scope_stage(current_key(), name, future)
+    staged(current_key(), Some(name), Box::pin(future))
 }
 
 /// Adds a bounded numeric work count to the current phase's span only.
