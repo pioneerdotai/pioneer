@@ -5602,7 +5602,7 @@ async fn later_admission_resumes_deadline_progress_without_replaying_saved_porti
             .unwrap();
         let operation_before = if origin.is_some() {
             let operation = pioneer_entity::compaction_operation::Entity::find_by_id("operation")
-                .one(f.store.database_connection())
+                .one(&f.store.database_connection())
                 .await
                 .unwrap()
                 .unwrap();
@@ -5712,7 +5712,7 @@ async fn later_admission_resumes_deadline_progress_without_replaying_saved_porti
             if case == "receipt" {
                 assert_eq!(
                     pioneer_entity::compaction_operation::Entity::find_by_id("operation")
-                        .one(f.store.database_connection())
+                        .one(&f.store.database_connection())
                         .await
                         .unwrap()
                         .unwrap(),
