@@ -41,10 +41,37 @@ Gateway переносит контекст в task executor по исходно
 - Gateway: dispatch, admission, сохранение терна; отдельно DB admission, SQLx pool acquire, execution и commit. Scheduling classes и границы транзакций остаются прежними.
 - Native: history, artifacts, skills, security, environment, context; preflight и отдельные фазы hooks; ожидание compaction coordinator и выполнение compaction; provider connect и ожидание первого вывода.
 - CLI: ожидание session lock/lease, получение сессии, process spawn, initialize handshake, thread start/resume, readiness и MCP, dispatch и ожидание первого модельного события. `session.state` различает `new`, `reused`, `replaced` на gateway.
-- Voice: finalize, извлечение аудиобуфера, VAD, ожидание transcriber mutex, inference и преобразование transcript в input. Текущий production путь распознавания вызывает supervisor синхронно; отдельной worker queue в этом пути нет, поэтому её время не выдумывается.
+- Voice: finalize, извлечение аудиобуфера, VAD, ожидание transcriber mutex, inference и преобразование transcript в input. В версии 0.57 распознавание запускается через `spawn_blocking`; `voice.worker.wait` измеряет фактическое ожидание первого запуска blocking worker. `gateway.worker.wait` отдельно измеряет ожидание owned async worker.
 - Delivery: projection/persistence, fanout, outbound queue именно соединения-инициатора, socket write; затем Rust event queue/apply и наблюдения JS/GPUI/React.
 
 `startup.unattributed_ms` на завершённом span и `unattributed.duration` показывают время вне измеренных интервалов **внутри одного процесса**. Интервалы объединяются и обрезаются по границам startup: вложенные/параллельные spans считаются один раз. Это покрытие верхнего уровня, не exclusive CPU time; большой родительский span всё равно нужно раскрывать до вложенных ожиданий. Время JS и Rust не вычитается друг из друга. Процентили стадий нельзя складывать.
+
+### Фазы подготовки child, истории и CLI
+
+Дополнительные фазы раскрывают долгий `task.child.prepare` и используются также в прямом запуске, где вызываются те же helpers:
+
+| Участок | Фазы |
+| --- | --- |
+| Task child | `task.child.authority`, `reserve`, `parent`, `locks`, `occurrence`, `action_binding`, `thread`, `security`, `graph`, `persist`, `link`, `validate`, `activate` с префиксом `task.child.` |
+| Composer handoff | `task.composer.prepare`, `task.composer.materialize` |
+| История TaskRun | `task.history.prepare`, `task.history.snapshot.publish`, `task.history.snapshot.restore` |
+| Подготовка истории | `history.authority`, `history.outputs.authorize`, `history.metadata.prepare`, `history.capture`, `history.load` |
+| Восстановление и композиция | `history.basis.restore`, `history.basis.hydrate`, `history.outputs.restore`, `history.compose`, `history.checkpoint.project`, `history.checkpoint.compatible`, `history.restore`, `history.restore.model` |
+| Frozen snapshot | `history.freeze` → `history.freeze.build`, `history.freeze.verify`, `history.freeze.persist` |
+| CLI admission и materialization | `task.cli.prepare`, `cli.prepare`, `cli.admission`, `cli.turn.prepare`, `cli.materialize`, `cli.persist`, `cli.transition.wait` |
+| CLI preflight | `cli.preflight`, `cli.mcp.resolve`, `cli.skills.plan`, `cli.skills.install`, `cli.security` |
+| CLI context и continuation | `cli.history.capture`, `cli.history.compact`, `cli.context.delivery_plan`, `cli.context.build`, `cli.context.validate`, `cli.context.revalidate`, `cli.continuation.prepare`, `cli.continuation.fork` |
+| Общие helpers и native | `turn.skills.normalize`, `turn.security.resolve`, `history.artifacts.materialize`, `native.preflight.provider` |
+
+Фазы вложены по фактическому вызову. Owned async worker сохраняет текущий parent span даже при переходе с parent key на delegated child alias. Контекст устанавливается на каждый poll и снимается перед `Pending`; параллельные терны не наследуют чужую фазу. Runtime уточняется по выбранному backend до подготовки child history. У стадий, начавшихся раньше выбора backend, допустим `runtime.kind=unknown`.
+
+Обвязка фазы размещает future операции в heap при создании, а span открывает при первом poll. Её собственный размер не зависит от размера state machine операции: между helpers передаётся только `Pin<Box<F>>`, без дополнительных async-функций, хранящих `F` по значению. При завершении или отмене обвязка освобождает future операции до закрытия фазы, чтобы вложенные DB guards успели обновить сводку. Размеры стеков Gateway и тестов остаются прежними.
+
+На spans фаз добавлена DB-сводка: `stage.db.admission.count` / `stage.db.admission_ms`, `stage.db.pool.count` / `stage.db.pool_ms`, `stage.db.execute.count` / `stage.db.execute_ms`, `stage.db.commit.count` / `stage.db.commit_ms`. Она включает вложенные фазы и продолжает обновляться после лимита 24 отдельных DB spans и после лимита подробных стадий, пока родительская фаза открыта. DB-интервалы могут пересекаться: например, execution включает pool acquire. Эти суммы нельзя складывать между фазами или вычитать из duration как CPU time. SQL и идентификаторы запросов не собираются.
+
+Числовые `stage.work.quanta`, `stage.work.pages`, `stage.work.messages`, `stage.work.branches` показывают объём работы ближайшей измеряемой фазы: кванты подготовки metadata, страницы загрузки/проверки/сохранения, сообщения и обработанные output branches. Это выполненная работа, а не уникальные сущности; повторное чтение считается повторно. Work counts и DB-сводки являются атрибутами traces, не dimensions гистограмм. Новые стадии используют существующую `stage.duration`.
+
+`stage.completion=returned|dropped` у scoped фаз различает возврат из helper и прерывание future (включая отмену или unwind). `returned` также возможен для `Result::Err`; бизнес-исход остаётся на startup span. Ограничения 128 stage observations и 24 DB observations сохранены. На больших DAG часть подробных spans может не попасть в trace; сверяйте `observation.losses`, DB-сводку измеренного родителя и work counts. Отсутствующий дочерний span после лимита не означает нулевую стоимость.
 
 ## Корреляция и ограничения объёма
 
@@ -66,7 +93,7 @@ Gateway удаляет расширение **до** типизированно�
 
 Каждый RPC несёт собственный контекст. Для futures контекст устанавливается только на время одного poll, для spawned work передаётся явно. Завершённый startup остаётся доступным локально для первого текста/presentation. Локальные composer/turn/connection IDs не экспортируются.
 
-Ограничения: 1024 ключа registry с учётом aliases, 128 обычных stage observations на startup, до 24 DB observations, TTL 15 минут. JS registry ограничен 128 операциями. TTL — предел хранения наблюдений, не deadline модельного терна. При opt-out registry очищается; epoch-fence исключает экспорт поздно завершившихся startup spans после повторного opt-in. Внутренний epoch-маркер удаляется перед экспортом. Consent выключает запись/экспорт; новые настройки доступа к Axiom не нужны. Конфигурация `pioneer-tracing/collector/config.yaml` пересылает OTLP traces и metrics без фильтра по имени; развёрнутую конфигурацию нужно сверить при rollout.
+Ограничения: 1024 ключа registry с учётом aliases, 128 stage observations всего на startup, из них до 24 DB observations, TTL 15 минут. JS registry ограничен 128 операциями. TTL — предел хранения наблюдений, не deadline модельного терна. При opt-out registry очищается; epoch-fence исключает экспорт поздно завершившихся startup spans после повторного opt-in. Внутренний epoch-маркер удаляется перед экспортом. Consent выключает запись/экспорт; новые настройки доступа к Axiom не нужны. Конфигурация `pioneer-tracing/collector/config.yaml` пересылает OTLP traces и metrics без фильтра по имени; развёрнутую конфигурацию нужно сверить при rollout.
 
 `model.family`, `reasoning.effort`, `runtime.kind`, `runtime.family`, `client.platform`, `input.kind`, `session.state` — ограниченные наборы. Произвольные model IDs, thread IDs, SQL, prompt, transcript, файлы, команды и тексты ошибок в новых атрибутах отсутствуют. `session.state=unknown` у клиента нормален: решение о reuse принимает gateway.
 
@@ -86,6 +113,7 @@ Gateway удаляет расширение **до** типизированно�
 - `runtime.mpl`, `stages.mpl`, `unattributed.mpl` — разложение.
 - `outcomes.mpl`, `correlation.mpl`, `losses.mpl` — исходы/полнота.
 - `slow-starts.apl` → выбранный `trace_id` → `trace.apl` — конкретный waterfall.
+- `phase-details.apl` — вложенные фазы выбранного trace с DB-сводкой и work counts; `phase-costs.apl` — сравнение фаз в выбранном окне. Средние/процентили здесь относятся к sampled traces; повторяющиеся helpers дают несколько observations на startup.
 
 Фильтр environment в файлах — `production`; для проверки измените его на окружение тестового запуска. Версии оставлены группировкой, поскольку версии mobile, desktop и gateway могут различаться. Для сравнения регрессии выбирайте согласованные версии каждого сервиса и одинаковые cohorts input/runtime/model/session.
 
