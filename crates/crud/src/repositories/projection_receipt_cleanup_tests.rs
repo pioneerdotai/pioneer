@@ -409,8 +409,15 @@ async fn discovery_migration_only_adds_its_index_and_down_preserves_existing_dat
         .unwrap();
     let schema_before = schema_objects(&db).await;
 
-    DiscoveryFixtureMigrator::up(&db, None).await.unwrap();
-    DiscoveryFixtureMigrator::up(&db, None).await.unwrap();
+    // Each invocation commits through the scoped writer. SeaORM's migrator
+    // accepts the underlying transaction rather than the database wrapper.
+    for _ in 0..2 {
+        let transaction = db.begin().await.unwrap();
+        DiscoveryFixtureMigrator::up(&*transaction, None)
+            .await
+            .unwrap();
+        transaction.commit().await.unwrap();
+    }
     let mut schema_after = schema_objects(&db).await;
     let index = schema_after
         .iter()
@@ -424,7 +431,11 @@ async fn discovery_migration_only_adds_its_index_and_down_preserves_existing_dat
     assert_eq!(schema_after, schema_before);
     assert_eq!(discovered_turn(&db, None).await.as_deref(), Some("turn"));
 
-    DiscoveryFixtureMigrator::down(&db, Some(1)).await.unwrap();
+    let transaction = db.begin().await.unwrap();
+    DiscoveryFixtureMigrator::down(&*transaction, Some(1))
+        .await
+        .unwrap();
+    transaction.commit().await.unwrap();
     assert_eq!(schema_objects(&db).await, schema_before);
     assert_eq!(
         streams::find(&db, "turn").await.unwrap().unwrap(),
@@ -446,7 +457,11 @@ async fn discovery_migration_only_adds_its_index_and_down_preserves_existing_dat
             .unwrap(),
         events_before
     );
-    DiscoveryFixtureMigrator::up(&db, None).await.unwrap();
+    let transaction = db.begin().await.unwrap();
+    DiscoveryFixtureMigrator::up(&*transaction, None)
+        .await
+        .unwrap();
+    transaction.commit().await.unwrap();
     assert_eq!(discovered_turn(&db, None).await.as_deref(), Some("turn"));
 }
 
