@@ -5,7 +5,7 @@ use super::*;
 use crate::{CrudStore, ProjectionMetaRecord, upsert_projection_meta};
 use migration::{Migrator, MigratorTrait};
 use pioneer_entity::turn_event;
-use sea_orm::{Database, DbBackend, PaginatorTrait, QueryTrait, TransactionTrait};
+use sea_orm::{Database, DbBackend, PaginatorTrait, TransactionTrait};
 
 const COMPACTED_HISTORY_TURNS: u64 = 20_000;
 
@@ -170,10 +170,9 @@ async fn discovery_seeks_only_work_in_keyset_order_and_uses_the_partial_index() 
         })
     };
 
-    // Prepared for execution after review. Explain the actual production
-    // builder, preserving its bind values, for both initial and keyset pages.
+    // Explain both production statements with their original bind values.
     for after in [None, Some(candidates[0])] {
-        let mut statement = discovery_query(after).build(DbBackend::Sqlite);
+        let mut statement = discovery_statement(after);
         assert!(statement.sql.contains("status = 'healthy'"));
         statement.sql = format!("EXPLAIN QUERY PLAN {}", statement.sql);
         let plan = db

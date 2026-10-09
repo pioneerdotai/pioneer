@@ -5,7 +5,7 @@ use pioneer_entity::{
 use sea_orm::sea_query::Expr;
 use sea_orm::{
     ColumnTrait, ConnectionTrait, DatabaseTransaction, EntityTrait, FromQueryResult, QueryFilter,
-    QueryOrder, QuerySelect, Statement,
+    QuerySelect, Statement,
 };
 
 #[cfg(test)]
@@ -73,24 +73,36 @@ pub(crate) async fn next_stream<C: ConnectionTrait>(
     db: &C,
     after_turn_id: Option<&str>,
 ) -> Result<Option<CleanupStream>> {
-    discovery_query(after_turn_id)
-        .into_model::<CleanupStream>()
+    CleanupStream::find_by_statement(discovery_statement(after_turn_id))
         .one(db)
         .await
         .context("failed to discover receipt cleanup stream")
 }
 
-fn discovery_query(after_turn_id: Option<&str>) -> sea_orm::Select<stream::Entity> {
-    // Keep identical to idx_turn_event_projection_stream_cleanup_work. Literal
-    // comparisons let SQLite prove partial-index eligibility for either page.
-    let mut query = stream_query().filter(Expr::cust(
-        "status = 'healthy' AND receipts_compacted_through_sequence >= 0 \
-         AND projected_through_sequence > receipts_compacted_through_sequence",
-    ));
-    if let Some(after) = after_turn_id {
-        query = query.filter(stream::Column::TurnId.gt(after.to_owned()));
-    }
-    query.order_by_asc(stream::Column::TurnId).limit(1)
+fn discovery_statement(after_turn_id: Option<&str>) -> Statement {
+    // Require the work index: SQLite may otherwise choose the status index
+    // and sort healthy history before LIMIT. Keep this predicate identical to
+    // the partial index, with literal comparisons for either keyset page.
+    let mut values = Vec::new();
+    let seek = if let Some(after) = after_turn_id {
+        values.push(after.to_owned().into());
+        " AND turn_id > ?"
+    } else {
+        ""
+    };
+    Statement::from_sql_and_values(
+        sea_orm::DbBackend::Sqlite,
+        format!(
+            "SELECT turn_id, thread_id, status, projected_through_sequence, \
+             receipts_compacted_through_sequence \
+             FROM turn_event_projection_stream_state \
+             INDEXED BY idx_turn_event_projection_stream_cleanup_work \
+             WHERE status = 'healthy' AND receipts_compacted_through_sequence >= 0 \
+             AND projected_through_sequence > receipts_compacted_through_sequence{seek} \
+             ORDER BY turn_id LIMIT 1"
+        ),
+        values,
+    )
 }
 
 fn stream_query() -> sea_orm::Select<stream::Entity> {
