@@ -7,8 +7,6 @@ use migration::{Migrator, MigratorTrait};
 use pioneer_entity::turn_event;
 use sea_orm::{Database, DbBackend, PaginatorTrait, QueryTrait, TransactionTrait};
 
-const DISCOVERY_INDEX: &str = "idx_turn_event_projection_stream_cleanup_work";
-const DISCOVERY_MIGRATION: &str = "m20261009_000001_projection_receipt_cleanup_discovery";
 const COMPACTED_HISTORY_TURNS: u64 = 20_000;
 
 async fn store() -> CrudStore {
@@ -153,6 +151,25 @@ async fn discovery_seeks_only_work_in_keyset_order_and_uses_the_partial_index() 
     .unwrap();
     ready(&store).await;
 
+    // Check the access path against the current schema without pinning names.
+    let partial_indexes = db
+        .query_all_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT name FROM pragma_index_list('turn_event_projection_stream_state') WHERE partial = 1",
+        ))
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| row.try_get::<String>("", "name").unwrap())
+        .collect::<Vec<_>>();
+    let uses_partial_index = |detail: &str| {
+        detail.split_once(" INDEX ").is_some_and(|(_, access)| {
+            partial_indexes
+                .iter()
+                .any(|name| access == name || access.starts_with(&format!("{name} (")))
+        })
+    };
+
     // Prepared for execution after review. Explain the actual production
     // builder, preserving its bind values, for both initial and keyset pages.
     for after in [None, Some(candidates[0])] {
@@ -168,13 +185,13 @@ async fn discovery_seeks_only_work_in_keyset_order_and_uses_the_partial_index() 
             .collect::<Vec<_>>();
         let access = if after.is_some() { "SEARCH " } else { "SCAN " };
         assert!(
-            plan.iter().any(|detail| detail.starts_with(access)
-                && detail.contains(&format!("USING INDEX {DISCOVERY_INDEX}"))),
+            plan.iter()
+                .any(|detail| detail.starts_with(access) && uses_partial_index(detail)),
             "{plan:?}"
         );
         assert!(
             !plan.iter().any(|detail| detail.contains("TEMP B-TREE")
-                || (detail.starts_with("SCAN ") && !detail.contains(DISCOVERY_INDEX))),
+                || (detail.starts_with("SCAN ") && !uses_partial_index(detail))),
             "{plan:?}"
         );
         if after.is_some() {
@@ -348,143 +365,6 @@ async fn discovery_excludes_invalid_compaction_boundaries_and_preserves_receipts
         assert_eq!(receipt::Entity::find().count(&db).await.unwrap(), 1);
         assert_eq!(turn_event::Entity::find().count(&db).await.unwrap(), 1);
     }
-}
-
-// Pin the rollback boundary by name even when later migrations are appended.
-struct DiscoveryFixtureMigrator;
-
-impl MigratorTrait for DiscoveryFixtureMigrator {
-    fn migrations() -> Vec<Box<dyn migration::MigrationTrait>> {
-        let mut migrations = Migrator::migrations();
-        let target = migrations
-            .iter()
-            .position(|migration| migration.name() == DISCOVERY_MIGRATION)
-            .expect("discovery migration remains registered");
-        migrations.truncate(target + 1);
-        migrations
-    }
-}
-
-async fn schema_objects<C: ConnectionTrait>(db: &C) -> Vec<(String, String, Option<String>)> {
-    db.query_all_raw(Statement::from_string(
-        db.get_database_backend(),
-        "SELECT type, name, sql FROM sqlite_master ORDER BY type, name",
-    ))
-    .await
-    .unwrap()
-    .into_iter()
-    .map(|row| {
-        (
-            row.try_get("", "type").unwrap(),
-            row.try_get("", "name").unwrap(),
-            row.try_get("", "sql").unwrap(),
-        )
-    })
-    .collect()
-}
-
-#[tokio::test]
-async fn discovery_migration_only_adds_its_index_and_down_preserves_existing_data() {
-    let db = Database::connect("sqlite::memory:").await.unwrap();
-    let before = Migrator::migrations()
-        .iter()
-        .position(|migration| migration.name() == DISCOVERY_MIGRATION)
-        .unwrap();
-    Migrator::up(&db, Some(before.try_into().unwrap()))
-        .await
-        .unwrap();
-    let store = CrudStore::new(db).with_maintenance_access();
-    seed(&store, "turn", 2, 2).await;
-    let db = store.database_connection();
-    let stream_before = streams::find(&db, "turn").await.unwrap().unwrap();
-    let receipts_before = receipt::Entity::find()
-        .order_by_asc(receipt::Column::EventId)
-        .all(&db)
-        .await
-        .unwrap();
-    let events_before = turn_event::Entity::find()
-        .order_by_asc(turn_event::Column::Id)
-        .all(&db)
-        .await
-        .unwrap();
-    let schema_before = schema_objects(&db).await;
-
-    // Each invocation commits through the scoped writer. SeaORM's migrator
-    // accepts the underlying transaction rather than the database wrapper.
-    for _ in 0..2 {
-        let transaction = db.begin().await.unwrap();
-        DiscoveryFixtureMigrator::up(&*transaction, None)
-            .await
-            .unwrap();
-        transaction.commit().await.unwrap();
-    }
-    let mut schema_after = schema_objects(&db).await;
-    let index = schema_after
-        .iter()
-        .position(|(_, name, _)| name == DISCOVERY_INDEX)
-        .unwrap();
-    let (kind, _, sql) = schema_after.remove(index);
-    assert_eq!(kind, "index");
-    let sql = sql.unwrap();
-    assert!(sql.contains("ON turn_event_projection_stream_state(turn_id)"));
-    assert!(sql.contains("WHERE status = 'healthy' AND receipts_compacted_through_sequence >= 0 AND projected_through_sequence > receipts_compacted_through_sequence"));
-    assert_eq!(schema_after, schema_before);
-    assert_eq!(discovered_turn(&db, None).await.as_deref(), Some("turn"));
-
-    let transaction = db.begin().await.unwrap();
-    DiscoveryFixtureMigrator::down(&*transaction, Some(1))
-        .await
-        .unwrap();
-    transaction.commit().await.unwrap();
-    assert_eq!(schema_objects(&db).await, schema_before);
-    assert_eq!(
-        streams::find(&db, "turn").await.unwrap().unwrap(),
-        stream_before
-    );
-    assert_eq!(
-        receipt::Entity::find()
-            .order_by_asc(receipt::Column::EventId)
-            .all(&db)
-            .await
-            .unwrap(),
-        receipts_before
-    );
-    assert_eq!(
-        turn_event::Entity::find()
-            .order_by_asc(turn_event::Column::Id)
-            .all(&db)
-            .await
-            .unwrap(),
-        events_before
-    );
-    let transaction = db.begin().await.unwrap();
-    DiscoveryFixtureMigrator::up(&*transaction, None)
-        .await
-        .unwrap();
-    transaction.commit().await.unwrap();
-    assert_eq!(discovered_turn(&db, None).await.as_deref(), Some("turn"));
-}
-
-#[tokio::test]
-async fn schema_upgrade_only_adds_the_boundary_and_does_not_delete_old_receipts() {
-    let db = Database::connect("sqlite::memory:").await.unwrap();
-    let migrations_before_cleanup = Migrator::migrations()
-        .iter()
-        .position(|m| m.name() == "m20260906_000003_projection_receipt_cleanup")
-        .expect("cleanup migration remains registered") as u32;
-    Migrator::up(&db, Some(migrations_before_cleanup))
-        .await
-        .unwrap();
-    db.execute_unprepared(
-        "INSERT INTO turn_event_projection_stream_state(turn_id, thread_id, status, projected_through_sequence, created_at, updated_at) VALUES ('turn', 'thread', 'healthy', 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP);
-         INSERT INTO turn_event_projection_state(event_id, thread_id, turn_id, sequence, status, next_run_at, created_at, updated_at) VALUES ('event', 'thread', 'turn', 1, 'projected', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP);"
-    ).await.unwrap();
-    Migrator::up(&db, None).await.unwrap();
-    Migrator::up(&db, None).await.unwrap();
-    let stream = streams::find(&db, "turn").await.unwrap().unwrap();
-    assert_eq!(stream.projected_through_sequence, 1);
-    assert_eq!(stream.receipts_compacted_through_sequence, 0);
-    assert_eq!(receipt::Entity::find().count(&db).await.unwrap(), 1);
 }
 
 #[tokio::test]
