@@ -1725,7 +1725,7 @@ mod tests {
                 let result =
                     provider.build_chat_request_with_catalog(request, stream, prepared, None);
                 if profile["default_supported"] == false {
-                    assert!(result.is_err());
+                    assert!(result.is_err(), "{}", profile["provider"]);
                     continue;
                 }
                 let body = serde_json::to_value(result.unwrap()).unwrap();
@@ -1734,6 +1734,7 @@ mod tests {
                 assert_eq!(body["messages"][0]["content"], "Hello");
                 assert!(body.get("reasoning_effort").is_none());
                 assert!(body.get("thinking").is_none());
+                assert!(body.get("thinking_budget").is_none());
             }
             for reasoning in [
                 ReasoningConfig::Disabled,

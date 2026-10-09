@@ -1630,7 +1630,7 @@ async fn gemini_aggregate_counts_ordinary_ancillary_collisions_as_audio() {
 }
 
 #[tokio::test]
-async fn gemini_aggregate_requires_source_backed_encoder_trim_domain() {
+async fn gemini_aggregate_uses_confirmed_trim_or_scanned_upper_bound() {
     use crate::Provider;
     let provider = crate::providers::GeminiProvider::new("unused");
     for magic in [b"Info", b"Xing"] {
@@ -1676,32 +1676,50 @@ async fn gemini_aggregate_requires_source_backed_encoder_trim_domain() {
             for padding in [0, 200, 528] {
                 let bytes =
                     super::media_fixtures::encoder_trim_mp3(magic, encoder, 100, 100, padding);
-                let req = request(
-                    "media",
-                    vec![
-                        part(InputContentType::Audio, "audio/wav", &wav()),
-                        part(InputContentType::Audio, "audio/mpeg", &bytes),
-                    ],
-                );
-                let s = Arc::new(state("gemini", "media", json!({})));
-                assert!(
-                    scoped(s.clone(), provider.prepare_input_budget(req.clone()))
-                        .await
-                        .is_err()
-                );
-                let error = scoped(
-                    s,
-                    super::prepare_messages_for_provider_async(
-                        "gemini",
+                // Unproven trim retains all 100*1152/48000=2.4s of audio.
+                // 4_274_700/125 +2.4 =34200s; one PCM sample exceeds the
+                // aggregate limit by 8ms. Trusting the trim would admit both.
+                for (pcm_frames, allowed) in [(4_274_700, true), (4_274_701, false)] {
+                    let req = request(
                         "media",
-                        &provider.capabilities(),
-                        &req.messages,
-                    ),
-                )
-                .await
-                .unwrap_err();
-                assert!(error.downcast_ref::<super::MediaInputRejection>().is_some());
-                assert!(!error.to_string().contains(&STANDARD.encode(&bytes)));
+                        vec![
+                            part(
+                                InputContentType::Audio,
+                                "audio/wav",
+                                &wav_frames(pcm_frames, 125),
+                            ),
+                            part(InputContentType::Audio, "audio/mpeg", &bytes),
+                        ],
+                    );
+                    let s = Arc::new(state("gemini", "media", json!({})));
+                    assert_eq!(
+                        scoped(s.clone(), provider.prepare_input_budget(req.clone()))
+                            .await
+                            .is_ok(),
+                        allowed,
+                        "budget: {magic:?}, {encoder:?}, padding={padding}, pcm={pcm_frames}"
+                    );
+                    let admission = scoped(
+                        s,
+                        super::prepare_messages_for_provider_async(
+                            "gemini",
+                            "media",
+                            &provider.capabilities(),
+                            &req.messages,
+                        ),
+                    )
+                    .await;
+                    assert_eq!(
+                        admission.is_ok(),
+                        allowed,
+                        "admission: {magic:?}, {encoder:?}, padding={padding}, pcm={pcm_frames}"
+                    );
+                    if !allowed {
+                        let error = admission.unwrap_err();
+                        assert!(error.downcast_ref::<super::MediaInputRejection>().is_some());
+                        assert!(!error.to_string().contains(&STANDARD.encode(&bytes)));
+                    }
+                }
             }
         }
     }
