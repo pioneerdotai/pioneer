@@ -1252,6 +1252,45 @@ async fn confirmed_elementary_audio_limits_and_mp4_edit_admission() {
                 2376,
                 false,
             ));
+            for bytes in super::media_fixtures::unproven_mp3_trims(magic)
+                .into_iter()
+                .chain([super::media_fixtures::encoder_trim_mp3_mpeg2(
+                    magic,
+                    b"LAME3.100",
+                    576,
+                    1152,
+                )])
+            {
+                for (limit, allowed) in [(2400, true), (2399, false)] {
+                    cases.push((
+                        InputContentType::Audio,
+                        "audio/mpeg",
+                        bytes.clone(),
+                        limit,
+                        allowed,
+                    ));
+                }
+            }
+        }
+        cases.push((
+            InputContentType::Audio,
+            "audio/mpeg",
+            mp3().to_vec(),
+            60_000,
+            true,
+        ));
+        for encoder in [b"Lavf62.11", b"Lavc62.11"] {
+            let mut bytes =
+                super::media_fixtures::encoder_trim_mp3(b"Info", encoder, 100, 576, 576);
+            bytes[33 + 34] ^= 1;
+            cases.push((
+                InputContentType::Audio,
+                "audio/mpeg",
+                bytes.clone(),
+                2400,
+                true,
+            ));
+            cases.push((InputContentType::Audio, "audio/mpeg", bytes, 2399, false));
         }
         if name != "openai" {
             cases.extend([
@@ -1390,17 +1429,13 @@ async fn confirmed_elementary_audio_limits_and_mp4_edit_admission() {
                 assert_eq!(replay.media.len(), 1);
             }
         }
-        let mut bad_crc = mp3().to_vec();
-        bad_crc[0xb9 + 5] ^= 1;
+        let mut bad_crc = super::media_fixtures::trimmed_xing_mp3(b"Info");
+        bad_crc[33 + 10] ^= 1;
         for bytes in super::media_fixtures::rejected_mp3_tag_candidates()
             .into_iter()
             .chain([bad_crc])
-            .chain(super::media_fixtures::unproven_mp3_trims(b"Info"))
-            .chain(super::media_fixtures::unproven_mp3_trims(b"Xing"))
-            .chain([
-                super::media_fixtures::encoder_trim_mp3_mpeg2(b"Info", b"LAME3.100", 576, 1152),
-                super::media_fixtures::encoder_trim_mp3_mpeg2(b"Xing", b"LAME3.100", 576, 1152),
-            ])
+            .chain(super::media_fixtures::invalid_mp3_trims(b"Info"))
+            .chain(super::media_fixtures::invalid_mp3_trims(b"Xing"))
         {
             let req = request(
                 "media",
@@ -1595,7 +1630,7 @@ async fn gemini_aggregate_counts_ordinary_ancillary_collisions_as_audio() {
 }
 
 #[tokio::test]
-async fn gemini_aggregate_requires_source_backed_encoder_trim_domain() {
+async fn gemini_aggregate_uses_confirmed_trim_or_scanned_upper_bound() {
     use crate::Provider;
     let provider = crate::providers::GeminiProvider::new("unused");
     for magic in [b"Info", b"Xing"] {
@@ -1641,32 +1676,50 @@ async fn gemini_aggregate_requires_source_backed_encoder_trim_domain() {
             for padding in [0, 200, 528] {
                 let bytes =
                     super::media_fixtures::encoder_trim_mp3(magic, encoder, 100, 100, padding);
-                let req = request(
-                    "media",
-                    vec![
-                        part(InputContentType::Audio, "audio/wav", &wav()),
-                        part(InputContentType::Audio, "audio/mpeg", &bytes),
-                    ],
-                );
-                let s = Arc::new(state("gemini", "media", json!({})));
-                assert!(
-                    scoped(s.clone(), provider.prepare_input_budget(req.clone()))
-                        .await
-                        .is_err()
-                );
-                let error = scoped(
-                    s,
-                    super::prepare_messages_for_provider_async(
-                        "gemini",
+                // Unproven trim retains all 100*1152/48000=2.4s of audio.
+                // 4_274_700/125 +2.4 =34200s; one PCM sample exceeds the
+                // aggregate limit by 8ms. Trusting the trim would admit both.
+                for (pcm_frames, allowed) in [(4_274_700, true), (4_274_701, false)] {
+                    let req = request(
                         "media",
-                        &provider.capabilities(),
-                        &req.messages,
-                    ),
-                )
-                .await
-                .unwrap_err();
-                assert!(error.downcast_ref::<super::MediaInputRejection>().is_some());
-                assert!(!error.to_string().contains(&STANDARD.encode(&bytes)));
+                        vec![
+                            part(
+                                InputContentType::Audio,
+                                "audio/wav",
+                                &wav_frames(pcm_frames, 125),
+                            ),
+                            part(InputContentType::Audio, "audio/mpeg", &bytes),
+                        ],
+                    );
+                    let s = Arc::new(state("gemini", "media", json!({})));
+                    assert_eq!(
+                        scoped(s.clone(), provider.prepare_input_budget(req.clone()))
+                            .await
+                            .is_ok(),
+                        allowed,
+                        "budget: {magic:?}, {encoder:?}, padding={padding}, pcm={pcm_frames}"
+                    );
+                    let admission = scoped(
+                        s,
+                        super::prepare_messages_for_provider_async(
+                            "gemini",
+                            "media",
+                            &provider.capabilities(),
+                            &req.messages,
+                        ),
+                    )
+                    .await;
+                    assert_eq!(
+                        admission.is_ok(),
+                        allowed,
+                        "admission: {magic:?}, {encoder:?}, padding={padding}, pcm={pcm_frames}"
+                    );
+                    if !allowed {
+                        let error = admission.unwrap_err();
+                        assert!(error.downcast_ref::<super::MediaInputRejection>().is_some());
+                        assert!(!error.to_string().contains(&STANDARD.encode(&bytes)));
+                    }
+                }
             }
         }
     }

@@ -179,7 +179,7 @@ impl Provider for JournalProvider {
         };
         let diagnostics = response.diagnostics;
         let stream = Box::pin(futures_util::stream::unfold(
-            (response.stream, call, usage, false),
+            (response.stream, call, usage, None::<bool>),
             |(mut stream, call, mut usage, mut terminal)| async move {
                 match stream.next().await {
                     Some(result) => {
@@ -189,10 +189,15 @@ impl Provider for JournalProvider {
                                     usage.update(snapshot);
                                 }
                                 if chunk.is_final {
-                                    terminal = true;
-                                    "completed"
-                                } else {
-                                    "started"
+                                    terminal = terminal.or(Some(true));
+                                }
+                                // Usage (or a protocol error) may follow a
+                                // final chunk. Commit success after draining
+                                // the native stream, keeping partial evidence
+                                // durable without reopening a terminal row.
+                                match terminal {
+                                    Some(false) => "failed",
+                                    _ => "started",
                                 }
                             }
                             Err(error) => {
@@ -200,7 +205,7 @@ impl Provider for JournalProvider {
                                 {
                                     usage.update(snapshot);
                                 }
-                                terminal = true;
+                                terminal = Some(false);
                                 "failed"
                             }
                         };
@@ -208,15 +213,20 @@ impl Provider for JournalProvider {
                         if !matches!(&result, Ok(chunk) if chunk.usage.is_none() && !chunk.is_final)
                         {
                             if let Err(error) = call.record(status, &usage).await {
-                                return Some((Err(error), (stream, call, usage, true)));
+                                return Some((Err(error), (stream, call, usage, Some(false))));
                             }
                         }
                         Some((result, (stream, call, usage, terminal)))
                     }
                     None => {
-                        if !terminal {
-                            if let Err(error) = call.record("failed", &usage).await {
-                                return Some((Err(error), (stream, call, usage, true)));
+                        if terminal != Some(false) {
+                            let status = if terminal == Some(true) {
+                                "completed"
+                            } else {
+                                "failed"
+                            };
+                            if let Err(error) = call.record(status, &usage).await {
+                                return Some((Err(error), (stream, call, usage, Some(false))));
                             }
                         }
                         None

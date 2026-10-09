@@ -911,6 +911,11 @@ async fn one_need_rescan_recovers_once_and_returns_the_real_worker_to_idle() {
 async fn recovery_signal_is_consumed_and_a_signal_during_recreation_gets_its_own_round() {
     let harness = harness().await;
     let signals = Arc::new(Signals::default());
+    // Inject both recovery signals explicitly. Real directory callbacks from
+    // reconciliation must not add unrelated invalidations or retry delays.
+    signals
+        .native_events_disabled
+        .store(true, Ordering::Release);
     let stop = CancellationToken::new();
     let worker = tokio::spawn(run_with_signals(
         harness.processor.clone(),
@@ -919,11 +924,14 @@ async fn recovery_signal_is_consumed_and_a_signal_during_recreation_gets_its_own
     ));
     settled(&signals).await;
     assert_eq!(signals.backend_creations.load(Ordering::Acquire), 1);
-    signals.event(Err(notify::Error::generic("one backend failure")));
+    // Arm the constructor hook before waking the worker for the first failure.
     signals
         .signal_during_recovery
         .store(true, Ordering::Release);
-    tokio::time::timeout(Duration::from_secs(20), async {
+    signals.event(Err(notify::Error::generic("one backend failure")));
+    // Production backoff is 5s then 10s. Leave scheduling headroom for the
+    // blocking constructor jobs when the full workspace suite is running.
+    tokio::time::timeout(Duration::from_secs(45), async {
         while signals.backend_creations.load(Ordering::Acquire) < 3 {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -931,6 +939,8 @@ async fn recovery_signal_is_consumed_and_a_signal_during_recreation_gets_its_own
     .await
     .expect("new recovery signal must survive the in-progress recreation");
     settled(&signals).await;
+    assert_eq!(signals.backend_creations.load(Ordering::Acquire), 3);
+    assert!(!signals.signal_during_recovery.load(Ordering::Acquire));
     assert!(!signals.recover.load(Ordering::Acquire));
     let creations = signals.backend_creations.load(Ordering::Acquire);
     let rounds = signals.root_rounds.load(Ordering::Acquire);

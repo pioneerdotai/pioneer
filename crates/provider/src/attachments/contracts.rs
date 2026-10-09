@@ -687,7 +687,10 @@ fn validate_endpoint(entry: &CatalogModel, provider: &str, kind: InputContentTyp
     let supported = match provider {
         "anthropic" => entry.api == "anthropic-messages",
         "gemini" => entry.api == "google-generative-ai",
-        "bedrock" => entry.api == "bedrock-converse-stream",
+        "bedrock" => matches!(
+            entry.api.as_str(),
+            "bedrock-converse" | "bedrock-converse-stream"
+        ),
         // OpenRouter's Chat gateway routes these native model profiles itself.
         "openrouter" => matches!(
             entry.api.as_str(),
@@ -735,6 +738,18 @@ mod tests {
     use crate::{InputTypeSupport, MessageAttachment, ProviderInputCapabilities};
     use base64::{Engine, engine::general_purpose::STANDARD};
     use serde_json::json;
+
+    #[test]
+    fn converse_media_contract_accepts_both_native_transport_profiles() {
+        let c = catalog();
+        let mut entry = c.model("openrouter", "vision").unwrap().clone();
+        for api in ["bedrock-converse", "bedrock-converse-stream"] {
+            entry.api = api.into();
+            assert!(validate_endpoint(&entry, "bedrock", InputContentType::Image).is_ok());
+        }
+        entry.api = "anthropic-messages".into();
+        assert!(validate_endpoint(&entry, "bedrock", InputContentType::Image).is_err());
+    }
 
     fn catalog() -> ModelCatalog {
         ModelCatalog::parse(

@@ -1725,7 +1725,7 @@ mod tests {
                 let result =
                     provider.build_chat_request_with_catalog(request, stream, prepared, None);
                 if profile["default_supported"] == false {
-                    assert!(result.is_err());
+                    assert!(result.is_err(), "{}", profile["provider"]);
                     continue;
                 }
                 let body = serde_json::to_value(result.unwrap()).unwrap();
@@ -1734,6 +1734,7 @@ mod tests {
                 assert_eq!(body["messages"][0]["content"], "Hello");
                 assert!(body.get("reasoning_effort").is_none());
                 assert!(body.get("thinking").is_none());
+                assert!(body.get("thinking_budget").is_none());
             }
             for reasoning in [
                 ReasoningConfig::Disabled,
@@ -1756,7 +1757,7 @@ mod tests {
     }
 
     #[test]
-    fn siliconflow_visible_cap_requires_verified_off_or_a_nonreasoning_model() {
+    fn siliconflow_splits_the_prepared_total_reserve_for_default_thinking() {
         use crate::catalog::{
             ModelCatalog,
             generator::{SOURCE_URLS, SourceSnapshot, generate},
@@ -1804,12 +1805,19 @@ mod tests {
                         Some(&catalog),
                     );
                     let off = crate::generation::selected_off(reasoning);
-                    let supported = (id == "toggle" && off)
+                    let supported = reasoning.is_none()
+                        || (id == "toggle" && off)
                         || (id == "instruct" && (off || reasoning.is_none()));
                     if supported {
                         let body = serde_json::to_value(result.unwrap()).unwrap();
-                        assert_eq!(body["max_tokens"], 1024);
-                        if id == "toggle" {
+                        if id != "instruct" && reasoning.is_none() {
+                            assert_eq!(body["thinking_budget"], 512);
+                            assert_eq!(body["max_tokens"], 512);
+                        } else {
+                            assert_eq!(body["max_tokens"], 1024);
+                            assert!(body.get("thinking_budget").is_none());
+                        }
+                        if id == "toggle" && off {
                             assert_eq!(body["enable_thinking"], false);
                         } else {
                             assert!(body.get("enable_thinking").is_none());

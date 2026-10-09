@@ -1,33 +1,6 @@
-mod m20260910_000001_context_compaction;
-mod m20260913_000001_remove_compaction_item_capture_order;
-mod m20260913_000002_compaction_logical_payload_updates;
-mod m20260914_000001_compaction_history_preparation;
-mod m20260914_000002_tool_output_chunk;
-mod m20260914_000003_shared_frozen_ranges;
-mod m20260914_000004_history_check_outcomes;
-mod m20260919_000001_native_event_cleanup_queue;
-mod m20260919_000002_compaction_publication_fence;
-mod m20260920_000001_independent_compaction_summaries;
-mod m20260930_000001_recovery_diagnostic;
-mod m20261001_000001_delivery_authority_spec_indexes;
-mod m20261001_000002_provider_usage_observation;
-mod m20261002_000001_task_run_occurrence_reconcile;
-mod m20261004_000001_task_occurrence_reconcile;
-mod m20261004_000004_compaction_lifecycle_pending;
-mod m20261004_000005_terminal_effect_gates;
-mod m20261004_000006_task_delivery_recovery;
-mod m20261004_000007_agent_action_outbox_ranges;
-mod m20261004_000008_task_event_fanout_pending;
-mod m20261004_000009_skills_watch_indexes;
-mod m20261005_000001_native_cancellation_context;
-mod m20261006_000001_retire_compaction_publication_fences;
-mod m20261006_000001_thread_episodic_job_access;
 pub use sea_orm_migration::prelude::*;
 
 pub struct Migrator;
-
-mod m20260906_000001_self_improvement_reasoning;
-mod m20260906_000002_self_improvement_history_backfill;
 
 pub mod stable_skill_id;
 
@@ -89,9 +62,33 @@ mod m20260902_000002_turn_event_projection_watermark;
 mod m20260902_000003_turn_work_owner;
 mod m20260904_000001_recovery_episode_invariant;
 mod m20260905_000001_memory_identity;
+mod m20260906_000001_self_improvement_reasoning;
+mod m20260906_000002_self_improvement_history_backfill;
 mod m20260906_000003_projection_receipt_cleanup;
+mod m20260910_000001_context_compaction;
+mod m20260913_000001_remove_compaction_item_capture_order;
+mod m20260913_000002_compaction_logical_payload_updates;
+mod m20260914_000001_compaction_history_preparation;
+mod m20260914_000002_tool_output_chunk;
+mod m20260914_000003_shared_frozen_ranges;
+mod m20260914_000004_history_check_outcomes;
+mod m20260919_000001_native_event_cleanup_queue;
+mod m20260919_000002_compaction_publication_fence;
+mod m20260920_000001_independent_compaction_summaries;
+mod m20260930_000001_recovery_diagnostic;
+mod m20261001_000001_delivery_authority_spec_indexes;
+mod m20261002_000001_task_run_occurrence_reconcile;
 
-mod m20261004_000001_cli_runtime_active_binding_index;
+// Unreleased 0.57.0 migrations: unique names, appended after the 0.56.0 chain.
+mod m20261008_000001_provider_usage_observation;
+mod m20261008_000002_background_access_indexes;
+mod m20261008_000003_task_occurrence_reconcile;
+mod m20261008_000004_compaction_lifecycle_pending;
+mod m20261008_000005_terminal_effect_gates;
+mod m20261008_000006_task_delivery_recovery;
+mod m20261008_000007_task_event_fanout_pending;
+mod m20261008_000008_native_cancellation_context;
+mod m20261008_000009_retire_compaction_publication_fences;
 
 #[async_trait::async_trait]
 impl MigratorTrait for Migrator {
@@ -170,19 +167,17 @@ impl MigratorTrait for Migrator {
             Box::new(m20260920_000001_independent_compaction_summaries::Migration),
             Box::new(m20260930_000001_recovery_diagnostic::Migration),
             Box::new(m20261001_000001_delivery_authority_spec_indexes::Migration),
-            Box::new(m20261001_000002_provider_usage_observation::Migration),
             Box::new(m20261002_000001_task_run_occurrence_reconcile::Migration),
-            Box::new(m20261004_000001_cli_runtime_active_binding_index::Migration),
-            Box::new(m20261004_000001_task_occurrence_reconcile::Migration),
-            Box::new(m20261004_000004_compaction_lifecycle_pending::Migration),
-            Box::new(m20261004_000005_terminal_effect_gates::Migration),
-            Box::new(m20261004_000006_task_delivery_recovery::Migration),
-            Box::new(m20261004_000007_agent_action_outbox_ranges::Migration),
-            Box::new(m20261004_000008_task_event_fanout_pending::Migration),
-            Box::new(m20261005_000001_native_cancellation_context::Migration),
-            Box::new(m20261006_000001_retire_compaction_publication_fences::Migration),
-            Box::new(m20261004_000009_skills_watch_indexes::Migration),
-            Box::new(m20261006_000001_thread_episodic_job_access::Migration),
+            // The released prefix above must never be reordered or renamed.
+            Box::new(m20261008_000001_provider_usage_observation::Migration),
+            Box::new(m20261008_000002_background_access_indexes::Migration),
+            Box::new(m20261008_000003_task_occurrence_reconcile::Migration),
+            Box::new(m20261008_000004_compaction_lifecycle_pending::Migration),
+            Box::new(m20261008_000005_terminal_effect_gates::Migration),
+            Box::new(m20261008_000006_task_delivery_recovery::Migration),
+            Box::new(m20261008_000007_task_event_fanout_pending::Migration),
+            Box::new(m20261008_000008_native_cancellation_context::Migration),
+            Box::new(m20261008_000009_retire_compaction_publication_fences::Migration),
         ]
     }
 }

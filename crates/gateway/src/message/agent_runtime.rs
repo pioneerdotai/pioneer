@@ -10214,8 +10214,9 @@ impl MessageProcessor {
         user_text: &str,
         fallback_title: Option<&str>,
     ) -> Result<TitleAttemptOutcome> {
+        let background = self.crud_store.with_maintenance_access();
         let generated_title = summary::generate_thread_title(
-            &self.crud_store,
+            &background,
             &self.provider_registry,
             thread_id,
             user_text,

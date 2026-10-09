@@ -718,12 +718,20 @@ impl ClientCore {
                         RequestKind::Providers => ModelPickerResult::Providers(
                             publication
                                 .and_then(|p| p.catalog_response())
-                                .map_err(|_| "provider_catalog_unavailable".into()),
+                                .map_err(|error| {
+                                    pioneer_protocol::sanitize_runtime_diagnostic_line(
+                                        &error.to_string(),
+                                    )
+                                }),
                         ),
                         RequestKind::Models(_) => ModelPickerResult::Models(
                             publication
                                 .and_then(|p| p.models_response())
-                                .map_err(|_| "provider_models_unavailable".into()),
+                                .map_err(|error| {
+                                    pioneer_protocol::sanitize_runtime_diagnostic_line(
+                                        &error.to_string(),
+                                    )
+                                }),
                         ),
                     };
                     let Some(core) = weak.upgrade() else {

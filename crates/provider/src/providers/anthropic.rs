@@ -366,10 +366,12 @@ impl AnthropicProvider {
         base_url: impl Into<String>,
         timeout_policy: ProviderTimeoutPolicy,
     ) -> Self {
+        let api_key = api_key.into();
+        let base_url = base_url.into().trim_end_matches('/').to_owned();
         Self {
-            replay_authority: pioneer_protocol::generate_id(32),
-            api_key: api_key.into(),
-            base_url: base_url.into().trim_end_matches('/').to_owned(),
+            replay_authority: crate::continuation::replay_authority("anthropic", &[&base_url]),
+            api_key,
+            base_url,
             timeout_policy,
             client: crate::http::build_client(timeout_policy),
         }
@@ -478,30 +480,43 @@ impl AnthropicProvider {
         request: &ChatRequest,
         prepared: &PreparedProviderMessages,
         stream: bool,
-    ) -> Result<ApiChatRequest> {
-        if self.base_url != BASE_URL
-            && prepared.messages.iter().any(|message| {
-                message.provider_replay_state.as_ref().is_some_and(|state| {
-                    crate::continuation::retention(state)
-                        != crate::continuation::Retention::Ordinary
-                })
-            })
-        {
-            anyhow::bail!(
-                "native thinking replay through a custom Messages relay lacks documented prefix/account authority"
-            );
-        }
+    ) -> Result<serde_json::Value> {
         let (system, messages) = Self::prepare_messages(prepared)?;
         let mut body = Self::build_chat_request(request, system, messages, stream)?;
         body.cache_control = crate::usage::anthropic_cache_control(&self.base_url, &request.model);
+        let mut body = serde_json::to_value(body)?;
+        let states: Vec<_> = prepared
+            .messages
+            .iter()
+            .filter_map(|message| message.provider_replay_state.clone())
+            .collect();
+        crate::continuation::stabilize_anthropic_prefix(&mut body, &states)?;
+        // Parallel tool results are merged into one native user message, and
+        // native system updates add wire messages. Canonical indices therefore
+        // cannot serve as positions in the signed native prefix.
+        let mut search_from = 0;
+        let positions: Vec<_> = states
+            .into_iter()
+            .map(|state| {
+                let index = body["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .enumerate()
+                    .skip(search_from)
+                    .find(|(_, message)| {
+                        message["role"] == "assistant"
+                            && message["content"] == state.payload["blocks"]
+                    })
+                    .map(|(index, _)| index)
+                    .unwrap_or(search_from);
+                search_from = index + 1;
+                (index, state)
+            })
+            .collect();
         crate::continuation::validate_prefix(
-            &serde_json::to_value(&body)?,
-            prepared
-                .messages
-                .iter()
-                .filter(|m| m.role != Role::System)
-                .enumerate()
-                .filter_map(|(i, m)| m.provider_replay_state.clone().map(|s| (i, s))),
+            &body,
+            positions.into_iter(),
             &request.model,
             &self.replay_authority,
         )?;
@@ -602,6 +617,7 @@ impl AnthropicProvider {
                                 role: role.to_owned(),
                                 content,
                             });
+                            previous_tool = false;
                             continue;
                         }
                         content.extend(
@@ -799,7 +815,6 @@ impl PendingToolUse {
 struct StreamReplayContext {
     model: String,
     authority: String,
-    unverified_relay: bool,
     prefix_body: serde_json::Value,
 }
 
@@ -1095,13 +1110,6 @@ impl AnthropicProvider {
                                     // Decoder-only fixtures have no request prefix authority.
                                     // HTTP always supplies the exact body and adapter instance.
                                     if let Some(context) = &replay_context {
-                                        if context.unverified_relay
-                                            && crate::continuation::retention(&state)
-                                                != crate::continuation::Retention::Ordinary
-                                        {
-                                            state.payload["api_profile"] =
-                                                serde_json::json!("unverified-relay");
-                                        }
                                         if let Err(error) = crate::continuation::bind_prefix(
                                             &mut state,
                                             &context.model,
@@ -1383,13 +1391,16 @@ impl crate::traits::Provider for AnthropicProvider {
         let prefix_body = serde_json::to_value(&api_request)?;
 
         crate::attachments::validate_inline_payload("anthropic", &api_request)?;
-        let request_builder = self
+        let mut request_builder = self
             .client
             .post(self.messages_url())
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", ANTHROPIC_VERSION)
             .header("content-type", "application/json")
             .json(&api_request);
+        if crate::continuation::anthropic_inline_tools(&api_request) {
+            request_builder = request_builder.header("anthropic-beta", "inline-tools-2026-09-15");
+        }
         let response = crate::http::non_stream_request(request_builder, self.timeout_policy)
             .send()
             .await?;
@@ -1416,11 +1427,6 @@ impl crate::traits::Provider for AnthropicProvider {
             .get_or_insert_with(Default::default)
             .request_id = crate::usage::native_id(native_request_id.as_deref());
         if let Some(state) = response.provider_replay_state.as_mut() {
-            if self.base_url != BASE_URL
-                && crate::continuation::retention(state) != crate::continuation::Retention::Ordinary
-            {
-                state.payload["api_profile"] = serde_json::json!("unverified-relay");
-            }
             crate::continuation::bind_prefix(
                 state,
                 &request.model,
@@ -1449,13 +1455,16 @@ impl crate::traits::Provider for AnthropicProvider {
         let prefix_body = serde_json::to_value(&api_request)?;
 
         crate::attachments::validate_inline_payload("anthropic", &api_request)?;
-        let request_builder = self
+        let mut request_builder = self
             .client
             .post(self.messages_url())
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", ANTHROPIC_VERSION)
             .header("content-type", "application/json")
             .json(&api_request);
+        if crate::continuation::anthropic_inline_tools(&api_request) {
+            request_builder = request_builder.header("anthropic-beta", "inline-tools-2026-09-15");
+        }
         let response =
             crate::http::send_stream_request(request_builder, self.timeout_policy).await?;
 
@@ -1480,7 +1489,6 @@ impl crate::traits::Provider for AnthropicProvider {
             Some(StreamReplayContext {
                 model: request.model.clone(),
                 authority: self.replay_authority.clone(),
-                unverified_relay: self.base_url != BASE_URL,
                 prefix_body,
             }),
             native_request_id,
@@ -2200,7 +2208,7 @@ mod tests {
 
     // Synthetic signatures exercise our policy, never vendor cryptography.
     #[test]
-    fn production_native_body_enforces_durable_prefix_and_instance_authority() {
+    fn production_native_body_preserves_prefix_across_updates_and_restart() {
         use super::super::history_test_support::request;
         let provider = AnthropicProvider::new("test-key");
         let mut req = request(vec![ChatMessage::user("first")]);
@@ -2280,15 +2288,52 @@ mod tests {
                         .remove("prefix_proof");
                 }
             }
-            assert!(
-                build(&provider, &changed).is_err(),
-                "changed timestamp/system/tools/retry/legacy {change}"
-            );
+            let result = build(&provider, &changed);
+            if change == 3 {
+                assert!(
+                    result.is_err(),
+                    "rewritten historical user input must be rejected"
+                );
+            } else {
+                let body = result.unwrap();
+                assert_eq!(body["system"], sent["system"]);
+                assert_eq!(body["tools"], sent["tools"]);
+                if change < 3 {
+                    assert_eq!(
+                        body["messages"].as_array().unwrap().last().unwrap()["role"],
+                        "system"
+                    );
+                }
+            }
         }
         let restarted = AnthropicProvider::new("test-key");
         assert!(
-            build(&restarted, &req).is_err(),
-            "restart/fork has no verified account authority"
+            build(&restarted, &req).is_ok(),
+            "reconstructed adapters retain the configured transport identity"
+        );
+        assert!(build(&AnthropicProvider::new("rotated-key"), &req).is_ok());
+        assert!(
+            build(
+                &AnthropicProvider::with_base_url("test-key", "https://other.example"),
+                &req
+            )
+            .is_err()
+        );
+        let mut legacy = req.clone();
+        let payload = legacy.messages[1]
+            .provider_replay_state
+            .as_mut()
+            .unwrap()
+            .payload
+            .as_object_mut()
+            .unwrap();
+        payload.remove("prefix_context");
+        payload.get_mut("prefix_proof").unwrap()["authority"] =
+            serde_json::json!("0123456789abcdef0123456789abcdef");
+        legacy.compiled_prompt.as_mut().unwrap().full_system_text = "rules time=two".into();
+        assert!(
+            build(&restarted, &legacy).is_ok(),
+            "legacy instance proofs must defer native binding validation to Messages"
         );
         let mut foreign = req.clone();
         foreign.model = "claude-opus-4-6".into();
@@ -2319,6 +2364,82 @@ mod tests {
             build(&provider, &unbound).is_ok(),
             "documented old generation does not bind prefix"
         );
+    }
+
+    #[test]
+    fn signed_prefix_reconstruction_replays_prior_updates_and_parallel_results() {
+        use super::super::history_test_support::request;
+        let provider = AnthropicProvider::new("fixture");
+        let mut req = request(vec![
+            ChatMessage::system("rules time=1"),
+            ChatMessage::user("inspect"),
+        ]);
+        req.model = "claude-sonnet-5-5".into();
+        req.tools = Some(vec![crate::ToolDefinition {
+            name: "inspect".into(),
+            description: "inspect".into(),
+            parameters: serde_json::json!({"type":"object"}),
+        }]);
+        let build = |request: &ChatRequest, stream| {
+            let prepared = prepare_messages_for_provider_model(
+                provider.name(),
+                &request.model,
+                &provider.capabilities(),
+                &request.rendered_messages_with_compiled_prompt(),
+            )
+            .unwrap();
+            provider
+                .build_native_request(request, &prepared, stream)
+                .unwrap()
+        };
+        let mut previous_wire = build(&req, false);
+        for round in 0..3 {
+            let blocks: Vec<_> = (0..2).map(|index| serde_json::json!({
+                "type":"tool_use", "id":format!("call_{round}_{index}"), "name":"inspect", "input":{}
+            })).collect();
+            let response = AnthropicProvider::decode_response(serde_json::from_value(serde_json::json!({
+                "content":[{"type":"thinking", "thinking":"reason", "signature":format!("synthetic_{round}")},
+                    blocks[0], blocks[1]], "stop_reason":"tool_use"
+            })).unwrap()).unwrap();
+            let calls = response.tool_calls.clone();
+            let mut state = response.provider_replay_state.unwrap();
+            crate::continuation::bind_prefix(
+                &mut state,
+                &req.model,
+                &provider.replay_authority,
+                &previous_wire,
+            )
+            .unwrap();
+            let message = ChatMessage::assistant_tool_calls_with_provider_state(
+                Some(response.text),
+                response.reasoning_content,
+                calls.clone(),
+                Some(state),
+            );
+            req.messages
+                .push(serde_json::from_value(serde_json::to_value(message).unwrap()).unwrap());
+            req.messages.extend(
+                calls
+                    .iter()
+                    .map(|call| ChatMessage::tool_result(&call.id, &call.name, "ok")),
+            );
+            req.messages[0].content = format!("rules time={}", round + 2);
+            let wire = build(&req, false);
+            let mut stream_wire = build(&req, true);
+            stream_wire.as_object_mut().unwrap().remove("stream");
+            assert_eq!(stream_wire, wire);
+            assert_eq!(wire["system"], "rules time=1");
+            let preceding = previous_wire["messages"].as_array().unwrap();
+            assert_eq!(
+                &wire["messages"].as_array().unwrap()[..preceding.len()],
+                preceding
+            );
+            assert_eq!(
+                wire["messages"].as_array().unwrap().last().unwrap()["role"],
+                "system"
+            );
+            previous_wire = wire;
+        }
     }
 
     #[test]
@@ -2489,7 +2610,6 @@ mod tests {
             Some(StreamReplayContext {
                 model: req.model.clone(),
                 authority: provider.replay_authority.clone(),
-                unverified_relay: false,
                 prefix_body: sent.clone(),
             }),
             Some("native-header-request".into()),

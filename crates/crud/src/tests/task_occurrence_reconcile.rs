@@ -15,7 +15,7 @@ use sea_orm::{ActiveModelTrait, FromQueryResult, IntoActiveModel};
 
 const NOW: i64 = 4_000_000_000;
 const AT: i64 = 1_700_000_000;
-const MIGRATION: &str = "m20261004_000001_task_occurrence_reconcile";
+const MIGRATION: &str = "m20261008_000003_task_occurrence_reconcile";
 
 // Pin migration fixtures to the schema under test so later, irreversible
 // migrations do not participate in its rollback or installation checks.
@@ -872,7 +872,7 @@ async fn migration_objects_and_marker_rollback_on_trigger_installation_failure()
     tx.rollback().await.unwrap();
     for query in [
         "SELECT name FROM sqlite_master WHERE name IN ('task_occurrence_reconcile_pending','task_occurrence_reconcile_scope','task_occurrence_reconcile_seed','task_occurrence_reconcile_sequence','idx_task_occurrence_reconcile_due','idx_task_run_task_id','idx_task_run_status_id','task_occurrence_reconcile_task_run_insert')",
-        "SELECT version FROM seaql_migrations WHERE version='m20261004_000001_task_occurrence_reconcile'",
+        "SELECT version FROM seaql_migrations WHERE version='m20261008_000003_task_occurrence_reconcile'",
     ] {
         assert!(
             store

@@ -12,7 +12,7 @@ use pioneer_entity::{
 use sea_orm::TransactionTrait;
 use sea_orm::sea_query::Expr;
 const NOW: i64 = 4_000_000_000;
-const MIGRATION: &str = "m20261004_000008_task_event_fanout_pending";
+const MIGRATION: &str = "m20261008_000007_task_event_fanout_pending";
 async fn store() -> CrudStore {
     let db = Database::connect("sqlite::memory:").await.unwrap();
     Migrator::up(&db, None).await.unwrap();

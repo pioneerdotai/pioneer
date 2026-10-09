@@ -158,7 +158,7 @@
     "model": "unknown-contract-fixture",
     "cap_field": "max_tokens",
     "cap": 1024,
-    "default_supported": false
+    "default_supported": true
   },
   {
     "provider": "aihubmix",

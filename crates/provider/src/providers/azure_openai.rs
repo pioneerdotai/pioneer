@@ -820,6 +820,7 @@ impl AzureOpenAiProvider {
 
 // The same decoder is used by HTTP transport and in-memory regression fixtures.
 impl AzureOpenAiProvider {
+    #[cfg(test)]
     pub(super) fn decode_stream(
         byte_stream: BoxStream<'static, Result<bytes::Bytes>>,
     ) -> BoxStream<'static, Result<StreamChunk>> {

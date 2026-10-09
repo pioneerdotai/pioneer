@@ -17,7 +17,7 @@ impl MigratorTrait for FanoutCutoverFixtureMigrator {
         let target = migrations
             .iter()
             .position(|migration| {
-                migration.name() == "m20261005_000001_native_cancellation_context"
+                migration.name() == "m20261008_000008_native_cancellation_context"
             })
             .expect("cancellation migration remains registered");
         migrations.truncate(target + 1);
@@ -640,7 +640,7 @@ async fn cutover_quantum_never_reads_history_and_only_delivers_post_install_even
     let migrations = FanoutCutoverFixtureMigrator::migrations();
     let boundary = migrations
         .iter()
-        .position(|m| m.name() == "m20261004_000008_task_event_fanout_pending")
+        .position(|m| m.name() == "m20261008_000007_task_event_fanout_pending")
         .unwrap();
     let tx = store
         .with_maintenance_access()

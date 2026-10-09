@@ -47,21 +47,87 @@ fn build_client(proxy_url: Option<&str>) -> Result<reqwest::Client> {
 
 pub(super) async fn fetch_snapshot(proxy_url: Option<&str>) -> Result<SourceSnapshot> {
     let client = build_client(proxy_url)?;
+    fetch_snapshot_from_urls(&client, SOURCE_URLS).await
+}
+
+async fn fetch_snapshot_from_urls(
+    client: &reqwest::Client,
+    urls: [&str; 4],
+) -> Result<SourceSnapshot> {
     let mut sources = BTreeMap::new();
-    for url in SOURCE_URLS {
-        sources.insert(url.to_owned(), fetch_source(&client, url).await?);
+    for (source_url, request_url) in SOURCE_URLS.into_iter().zip(urls) {
+        let response = match fetch_source(client, request_url).await {
+            Ok(response) => response,
+            Err(error) => {
+                let status = error
+                    .downcast_ref::<reqwest::Error>()
+                    .and_then(|error| error.status())
+                    .map_or(0, |status| status.as_u16());
+                // Never log reqwest's URL/error chain: a configured proxy can
+                // carry credentials. The public source and HTTP status suffice.
+                tracing::warn!(
+                    source = source_url,
+                    status,
+                    "model catalog source fetch failed"
+                );
+                SourceResponse {
+                    status,
+                    body: Value::Null,
+                    error: Some("source_fetch_failed".into()),
+                }
+            }
+        };
+        sources.insert(source_url.to_owned(), response);
     }
     let snapshot = SourceSnapshot {
         captured_at: chrono::Utc::now().to_rfc3339(),
         sources,
     };
-    snapshot.validate()?;
     Ok(snapshot)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn failed_first_source_does_not_prevent_remaining_sources_from_being_fetched() {
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            net::TcpListener,
+        };
+        let server = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = server.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            for index in 0..4 {
+                let (mut socket, _) = server.accept().await.unwrap();
+                let mut request = [0; 4096];
+                let count = socket.read(&mut request).await.unwrap();
+                assert!(
+                    !String::from_utf8_lossy(&request[..count])
+                        .to_lowercase()
+                        .contains("authorization:")
+                );
+                let (status, body) = if index == 0 {
+                    ("503 Unavailable", "{}")
+                } else {
+                    ("200 OK", r#"{"data":[{"id":"fixture"}]}"#)
+                };
+                socket.write_all(format!("HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            }
+        });
+        let url = format!("http://{address}/models");
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let snapshot = fetch_snapshot_from_urls(&client, [&url; 4]).await.unwrap();
+        assert_eq!(snapshot.sources[SOURCE_URLS[0]].status, 503);
+        assert_eq!(
+            snapshot.sources[SOURCE_URLS[0]].error.as_deref(),
+            Some("source_fetch_failed")
+        );
+        for source in &SOURCE_URLS[1..] {
+            assert!(snapshot.source_body(source).is_some());
+        }
+        task.await.unwrap();
+    }
     #[tokio::test]
     async fn public_source_transport_handles_json_and_http_failure_without_credentials() {
         use tokio::{

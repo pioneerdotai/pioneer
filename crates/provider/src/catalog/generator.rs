@@ -37,6 +37,39 @@ pub struct SourceResponse {
     pub error: Option<String>,
 }
 impl SourceSnapshot {
+    /// Only structurally usable, successful public sources participate in a
+    /// refresh. A failed source must not masquerade as an empty native listing.
+    pub(super) fn source_body(&self, url: &str) -> Option<&Value> {
+        let source = self.sources.get(url)?;
+        if source.status != 200 || source.error.is_some() || !source.body.is_object() {
+            return None;
+        }
+        let valid = if url == SOURCE_URLS[0] {
+            source.body.as_object().is_some_and(|providers| {
+                providers
+                    .values()
+                    .any(|provider| provider["models"].is_object())
+            })
+        } else {
+            source.body["data"]
+                .as_array()
+                .is_some_and(|models| !models.is_empty())
+        };
+        valid.then_some(&source.body)
+    }
+
+    fn validate_available(&self) -> Result<()> {
+        chrono::DateTime::parse_from_rfc3339(&self.captured_at)
+            .context("invalid source capture timestamp")?;
+        ensure!(
+            SOURCE_URLS
+                .iter()
+                .any(|url| self.source_body(url).is_some()),
+            "no usable model catalog sources"
+        );
+        Ok(())
+    }
+
     pub fn validate(&self) -> Result<()> {
         chrono::DateTime::parse_from_rfc3339(&self.captured_at)
             .context("invalid source capture timestamp")?;
@@ -75,6 +108,17 @@ pub struct GeneratedCatalog {
     pub provenance: BTreeMap<String, BTreeMap<String, Value>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_capabilities: Option<super::ToolCapabilities>,
+    /// Bounded public-source diagnostics; never contain credentials or raw bodies.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<CatalogDiagnostic>,
+}
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogDiagnostic {
+    pub source: String,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub code: String,
 }
 impl GeneratedCatalog {
     pub fn validate(&self) -> Result<()> {
@@ -267,25 +311,24 @@ fn base(
 /// Full pinned-reference transformation, including dynamic entries not present
 /// in the saved fixture. First source wins identity collisions, as in Pi.
 pub fn generate(snapshot: &SourceSnapshot, strict: bool) -> Result<GeneratedCatalog> {
-    snapshot.validate()?;
-    let (mut candidates, specialized) = sources::models_dev(
-        &snapshot.sources[SOURCE_URLS[0]].body,
-        &snapshot.sources[SOURCE_URLS[3]].body,
-        strict,
-    )?;
-    candidates.extend(sources::openrouter(&snapshot.sources[SOURCE_URLS[1]].body));
-    candidates.extend(sources::vercel(&snapshot.sources[SOURCE_URLS[2]].body));
+    if strict {
+        snapshot.validate()?;
+    } else {
+        snapshot.validate_available()?;
+    }
+    let body = |url| snapshot.source_body(url).unwrap_or(&Value::Null);
+    let (mut candidates, specialized) =
+        sources::models_dev(body(SOURCE_URLS[0]), body(SOURCE_URLS[3]), strict)?;
+    candidates.extend(sources::openrouter(body(SOURCE_URLS[1])));
+    candidates.extend(sources::vercel(body(SOURCE_URLS[2])));
     candidates.retain(|m| {
         !(m.provider() == "xai" && rules::XAI_BUILTIN_EXCLUDED_MODEL_IDS.contains(&m.id())
             || matches!(m.provider(), "opencode" | "opencode-go")
                 && m.id() == "gpt-5.3-codex-spark")
     });
     overrides::apply(&mut candidates)?;
-    let supplements = sources::registered_supplements(
-        &snapshot.sources[SOURCE_URLS[0]].body,
-        &specialized,
-        &candidates,
-    );
+    let supplements =
+        sources::registered_supplements(body(SOURCE_URLS[0]), &specialized, &candidates);
     candidates.extend(supplements);
     for model in &mut candidates {
         compatibility::apply(model);
@@ -302,12 +345,25 @@ pub fn generate(snapshot: &SourceSnapshot, strict: bool) -> Result<GeneratedCata
         models: BTreeMap::new(),
         provenance: BTreeMap::new(),
         tool_capabilities: Some(sources::tool_capabilities(snapshot)),
+        diagnostics: SOURCE_URLS
+            .iter()
+            .filter(|url| snapshot.source_body(url).is_none())
+            .map(|url| CatalogDiagnostic {
+                source: (*url).into(),
+                provider: None,
+                model: None,
+                code: "source_unavailable".into(),
+            })
+            .collect(),
     };
     for candidate in candidates {
         let provider = candidate.provider().to_owned();
         let id = candidate.id().to_owned();
-        let entries = output.models.entry(provider.clone()).or_default();
-        if entries.contains_key(&id) {
+        if output
+            .models
+            .get(&provider)
+            .is_some_and(|entries| entries.contains_key(&id))
+        {
             continue;
         }
         let mut origins =
@@ -326,12 +382,73 @@ pub fn generate(snapshot: &SourceSnapshot, strict: bool) -> Result<GeneratedCata
                 },
             })?;
         }
+        // Validate each record through the same parser and pricing checks used
+        // for persisted catalogs. One malformed remote record cannot poison
+        // unrelated models, while strict fixture validation still fails closed.
+        let record = GeneratedCatalog {
+            models: BTreeMap::from([(
+                provider.clone(),
+                BTreeMap::from([(id.clone(), candidate.model.clone())]),
+            )]),
+            provenance: BTreeMap::from([(
+                provider.clone(),
+                BTreeMap::from([(id.clone(), origins.clone())]),
+            )]),
+            tool_capabilities: None,
+            diagnostics: vec![],
+        };
+        if let Err(error) = record.validate() {
+            if strict {
+                return Err(error.context("invalid catalog model record"));
+            }
+            // Cap diagnostic volume independently of the source byte budget.
+            if output.diagnostics.len() < 256 {
+                output.diagnostics.push(CatalogDiagnostic {
+                    source: candidate.model["pricingSource"]["url"]
+                        .as_str()
+                        .filter(|url| SOURCE_URLS.contains(url))
+                        .unwrap_or("unknown")
+                        .into(),
+                    provider: Some(provider.chars().take(256).collect()),
+                    model: Some(id.chars().take(256).collect()),
+                    code: "invalid_model_record".into(),
+                });
+            }
+            continue;
+        }
         output
             .provenance
-            .entry(provider)
+            .entry(provider.clone())
             .or_default()
             .insert(id.clone(), origins);
-        entries.insert(id, candidate.model);
+        output
+            .models
+            .entry(provider)
+            .or_default()
+            .insert(id, candidate.model);
+    }
+    // Fallback annotations were derived before quarantine. Do not retain a
+    // route (and its tariff) pointing at a rejected record.
+    let identities: std::collections::BTreeSet<_> = output
+        .models
+        .iter()
+        .flat_map(|(provider, models)| models.keys().map(move |id| (provider.clone(), id.clone())))
+        .collect();
+    for models in output.models.values_mut() {
+        for model in models.values_mut() {
+            if let Some(fallbacks) = model
+                .get_mut("compat")
+                .and_then(|compat| compat.get_mut("allowedFallbackModels"))
+                .and_then(Value::as_array_mut)
+            {
+                fallbacks.retain(|fallback| {
+                    identities.contains(&(
+                        text(&fallback["provider"]).into(),
+                        text(&fallback["model"]).into(),
+                    ))
+                });
+            }
+        }
     }
     output.validate()?;
     Ok(output)
@@ -754,11 +871,24 @@ mod behavior_tests {
         for url in SOURCE_URLS {
             let mut source = snapshot();
             source.sources.get_mut(url).unwrap().status = 503;
-            assert!(generate(&source, false).is_err());
+            assert!(generate(&source, true).is_err());
+            let output = generate(&source, false).unwrap();
+            assert!(
+                output
+                    .diagnostics
+                    .iter()
+                    .any(|d| d.source == url && d.code == "source_unavailable")
+            );
             let mut source = snapshot();
             source.sources.get_mut(url).unwrap().body = json!({});
-            assert!(generate(&source, false).is_err());
+            assert!(generate(&source, true).is_err());
+            assert!(generate(&source, false).is_ok());
+            source.sources.remove(url);
+            assert!(generate(&source, false).is_ok());
         }
+        let mut source = snapshot();
+        source.sources.clear();
+        assert!(generate(&source, false).is_err());
     }
     #[test]
     fn source_filters_aliases_and_endpoint_routing_are_dynamic() {
@@ -815,6 +945,35 @@ mod behavior_tests {
 mod validation_tests {
     use super::*;
     #[test]
+    fn quarantine_removes_fallback_routes_to_invalid_models() {
+        let mut snapshot: SourceSnapshot =
+            serde_json::from_str(include_str!("../../tests/fixtures/catalog/sources.json"))
+                .unwrap();
+        let models = snapshot.sources.get_mut(SOURCE_URLS[0]).unwrap().body["anthropic"]["models"]
+            .as_object_mut()
+            .unwrap();
+        let mut template = models
+            .values()
+            .find(|model| model["tool_call"] == true)
+            .unwrap()
+            .clone();
+        template["cost"]["input"] = json!(1.);
+        models.insert("claude-fable-5".into(), template.clone());
+        template["cost"]["input"] = json!(true);
+        models.insert("claude-opus-4-8".into(), template);
+        let output = generate(&snapshot, false).unwrap();
+        assert!(!output.models["anthropic"].contains_key("claude-opus-4-8"));
+        let fallbacks =
+            &output.models["anthropic"]["claude-fable-5"]["compat"]["allowedFallbackModels"];
+        assert!(
+            !fallbacks
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|entry| entry["model"] == "claude-opus-4-8")
+        );
+    }
+    #[test]
     fn malformed_source_cost_is_rejected_instead_of_coerced_to_zero() {
         for invalid in [json!(true), json!("bad-price"), json!([1])] {
             let mut snapshot: SourceSnapshot =
@@ -832,6 +991,36 @@ mod dynamic_pricing_regressions {
     use super::*;
     fn pinned() -> SourceSnapshot {
         serde_json::from_str(include_str!("../../tests/fixtures/catalog/sources.json")).unwrap()
+    }
+    #[test]
+    fn jev_router_unknown_tariff_does_not_poison_other_providers() {
+        let mut source = pinned();
+        let entries = source.sources.get_mut(SOURCE_URLS[1]).unwrap().body["data"]
+            .as_array_mut()
+            .unwrap();
+        let mut router = entries
+            .iter()
+            .find(|model| model["id"] == "openrouter/auto")
+            .unwrap()
+            .clone();
+        router["id"] = json!("typesafe/jev-router");
+        router["name"] = json!("Jev Router");
+        // Actual outage shape: a new router with -1 input/output tariffs.
+        entries.push(router);
+        let output = generate(&source, false).unwrap();
+        output.validate().unwrap();
+        assert!(output.models["openai"].contains_key("gpt-5-nano"));
+        assert!(!output.models["deepseek"].is_empty());
+        assert!(output.models["openrouter"].contains_key("openrouter/auto"));
+        assert!(!output.models["openrouter"].contains_key("typesafe/jev-router"));
+        assert!(
+            output
+                .diagnostics
+                .iter()
+                .any(|d| d.model.as_deref() == Some("typesafe/jev-router")
+                    && d.code == "invalid_model_record")
+        );
+        assert!(generate(&source, true).is_err());
     }
     #[test]
     fn full_pinned_generation_accepts_documented_auto_unknown_at_both_strictness_levels() {
@@ -877,7 +1066,14 @@ mod dynamic_pricing_regressions {
                     .find(|m| m["id"] == "openrouter/auto")
                     .unwrap();
                 auto["pricing"]["prompt"] = value;
-                assert!(generate(&source, strict).is_err());
+                if strict {
+                    assert!(generate(&source, true).is_err());
+                } else {
+                    let output = generate(&source, false).unwrap();
+                    assert!(!output.diagnostics.is_empty());
+                    assert!(!output.models["openrouter"].contains_key("openrouter/auto"));
+                    assert!(!output.models["openai"].is_empty());
+                }
             }
             let mut source = pinned();
             let entries = source.sources.get_mut(SOURCE_URLS[1]).unwrap().body["data"]
@@ -891,7 +1087,18 @@ mod dynamic_pricing_regressions {
             let mut unsupported = auto;
             unsupported["id"] = json!("fixture/unknown-sentinel");
             entries.push(unsupported);
-            assert!(generate(&source, strict).is_err());
+            if strict {
+                assert!(generate(&source, true).is_err());
+            } else {
+                let output = generate(&source, false).unwrap();
+                assert!(!output.models["openrouter"].contains_key("fixture/unknown-sentinel"));
+                assert!(
+                    output
+                        .diagnostics
+                        .iter()
+                        .any(|d| d.model.as_deref() == Some("fixture/unknown-sentinel"))
+                );
+            }
         }
     }
     #[test]
@@ -905,7 +1112,9 @@ mod dynamic_pricing_regressions {
             .find(|m| m["id"] == "openrouter/auto")
             .unwrap();
         auto["pricing"]["input_cache_read"] = json!("-1");
-        assert!(generate(&source, false).is_err());
+        assert!(generate(&source, true).is_err());
+        let output = generate(&source, false).unwrap();
+        assert!(!output.models["openrouter"].contains_key("openrouter/auto"));
         let mut source = pinned();
         let entries = source.sources.get_mut(SOURCE_URLS[2]).unwrap().body["data"]
             .as_array_mut()
@@ -922,7 +1131,9 @@ mod dynamic_pricing_regressions {
         model["id"] = json!("fixture/negative-vercel");
         model["pricing"]["input"] = json!("-1");
         entries.push(model);
-        assert!(generate(&source, false).is_err());
+        assert!(generate(&source, true).is_err());
+        let output = generate(&source, false).unwrap();
+        assert!(!output.models["vercel-ai-gateway"].contains_key("fixture/negative-vercel"));
     }
     #[test]
     fn explicit_free_zero_preserves_entire_nonpricing_contract() {

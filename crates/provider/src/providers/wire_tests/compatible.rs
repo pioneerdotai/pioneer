@@ -75,27 +75,18 @@ fn canonical_chat_rounds_keep_nested_arguments_and_ids_for_each_profile() {
                 compiled_prompt: None,
             };
             for stream in [false, true] {
-                // SiliconFlow's cap covers visible output only. This unknown
-                // fixture has no verified thinking-off control or separate
-                // thinking reserve, so assert the restriction before checking
-                // the tools-only wire shape with the server's default cap.
-                let mut request = request.clone();
-                if definition.name == "siliconflow" {
-                    let error = provider
+                // An unknown model keeps the ordinary cap and server defaults.
+                // SiliconFlow's separate thinking reserve requires catalog
+                // evidence, covered by the model-aware generation regressions.
+                let wire = serde_json::to_value(
+                    provider
                         .build_chat_request(request.clone(), stream)
-                        .unwrap_err();
-                    assert!(error.to_string().contains("visible output only"));
-                    request.max_tokens = None;
-                }
-                let wire =
-                    serde_json::to_value(provider.build_chat_request(request, stream).unwrap())
-                        .unwrap();
+                        .unwrap(),
+                )
+                .unwrap();
                 assert_eq!(wire["stream"], stream);
-                if definition.name == "siliconflow" {
-                    assert!(wire.get("max_tokens").is_none());
-                } else {
-                    assert_eq!(wire["max_tokens"], 128);
-                }
+                assert_eq!(wire["max_tokens"], 128, "{}", definition.name);
+                assert!(wire.get("thinking_budget").is_none());
                 assert!(wire.get("temperature").is_none());
                 assert_eq!(wire["messages"][0]["role"], "system");
                 for previous in 0..=round {

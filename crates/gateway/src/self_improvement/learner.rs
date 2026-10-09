@@ -1127,7 +1127,9 @@ impl<'a> LearnerReviewerClient<'a> {
                     ChatMessage::system(system_prompt),
                     ChatMessage::user(untrusted_data),
                 ],
-                temperature: Some(0.0),
+                // The selected model may prohibit temperature, including 0.
+                // This helper has no user-selected sampling override.
+                temperature: None,
                 max_tokens: None,
                 tools: None,
                 tool_choice: None,
@@ -2199,6 +2201,7 @@ mod tests {
         assert_eq!(provider.requests().len(), 4);
         assert!(provider.requests().iter().all(|request| {
             request.model == "learner-model"
+                && request.temperature.is_none()
                 && request.messages[0].content == SYNTHESIS_SYSTEM_PROMPT
                 && serde_json::from_str::<serde_json::Value>(request.messages[1].content.as_str())
                     .ok()
@@ -2837,6 +2840,7 @@ mod tests {
                 .requests()
                 .iter()
                 .all(|request| request.model == "one-model"
+                    && request.temperature.is_none()
                     && request.max_tokens.is_none()
                     && request.reasoning
                         == Some(ReasoningConfig::effort(

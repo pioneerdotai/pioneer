@@ -146,6 +146,15 @@ impl NativeRequestProjection {
             }
             messages.push(message.clone());
             let mut budget_message = message.clone();
+            // Local replay proofs and reconstructed prefix metadata are not
+            // assistant content on the wire. Budget the latest native prefix
+            // once below, rather than charging its snapshots on every round.
+            if let Some(state) = budget_message.provider_replay_state.as_mut()
+                && let Some(payload) = state.payload.as_object_mut()
+            {
+                payload.remove("prefix_proof");
+                payload.remove("prefix_context");
+            }
             let mut message_media = 0_u64;
             for (part_index, part) in budget_message.content_parts.iter_mut().enumerate() {
                 let attachment = match part {
@@ -180,13 +189,22 @@ impl NativeRequestProjection {
                     .saturating_add(*media))
             })
             .collect::<Result<Vec<_>>>()?;
-        let input = serde_json::json!({
+        let native_prefix_context = request
+            .messages
+            .iter()
+            .rev()
+            .filter_map(|message| message.provider_replay_state.as_ref())
+            .find_map(|state| state.payload.get("prefix_context"));
+        let mut input = serde_json::json!({
             "model":request.model,"messages":budget_messages,"tools":request.tools,
             "tool_choice":request.tool_choice,"parallel_tool_calls":request.parallel_tool_calls,
             "temperature":request.temperature,"max_tokens":request.max_tokens,
             "reasoning":request.reasoning.map(|value|format!("{value:?}")),
             "system_sections":request.compiled_prompt.as_ref().map(|value|value.system_sections()),
         });
+        if let Some(context) = native_prefix_context {
+            input["native_prefix_context"] = context.clone();
+        }
         let estimated_input_tokens = text_tokens(&input.to_string()).saturating_add(media_tokens);
         let fixed_media_tokens = request
             .messages
@@ -222,6 +240,27 @@ impl NativeRequestProjection {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn local_replay_proofs_are_not_charged_as_provider_input() {
+        let mut req = request();
+        req.messages = replay_round("call");
+        let budget = ModelBudget::new(Some(32768), None, None);
+        let baseline =
+            NativeRequestProjection::full(req.clone(), vec![], budget.clone(), false).unwrap();
+        let state = req.messages[0].provider_replay_state.as_mut().unwrap();
+        state.payload["prefix_proof"] = serde_json::json!({"local_only":"proof ".repeat(10000)});
+        let with_proof = NativeRequestProjection::full(req.clone(), vec![], budget, false).unwrap();
+        assert_eq!(
+            baseline.estimated_input_tokens,
+            with_proof.estimated_input_tokens
+        );
+        assert_eq!(
+            baseline.message_input_tokens,
+            with_proof.message_input_tokens
+        );
+        assert_eq!(with_proof.request.messages, req.messages);
+    }
+
     fn replay_round(id: &str) -> Vec<ChatMessage> {
         let state = pioneer_provider::ProviderReplayState::for_model(
             "deepseek",
