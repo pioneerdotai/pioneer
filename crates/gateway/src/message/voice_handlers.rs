@@ -1091,8 +1091,13 @@ impl MessageProcessor {
         // Capture while the request's async dispatcher scope is installed. The
         // blocking thread has independent thread-local state; keep None intact.
         let startup_key = pioneer_observability::turn_startup::current_key();
+        let startup_queued_at = std::time::Instant::now();
         tokio::task::spawn_blocking(move || {
             pioneer_observability::turn_startup::scope_sync(startup_key, || {
+                pioneer_observability::turn_startup::record_current_duration(
+                    pioneer_observability::turn_startup::Stage::VoiceWorkerWait,
+                    startup_queued_at.elapsed(),
+                );
                 let signal_stats = VoiceSignalStats::from_samples(audio.normalized_samples.as_slice());
                 debug!(
                     session_id = %session_id,

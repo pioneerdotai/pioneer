@@ -1,6 +1,7 @@
 //! Source-aware canonical line loading. All database reads release Maintenance
 //! capacity before decoding. A shared fence can freeze several related lines.
 use super::*;
+use pioneer_observability::turn_startup::{Stage, Work, record_work, scope_current_stage};
 
 use pioneer_agent::compaction::composition::{ExactInputClaims, ScopedHistorySource};
 use pioneer_crud::{
@@ -247,13 +248,20 @@ pub(crate) async fn prepare_history(
     workspace: &str,
     thread: &str,
 ) -> Result<()> {
-    while !store
-        .compaction_prepare_history_quantum(workspace, thread)
-        .await?
-    {
-        tokio::task::yield_now().await;
-    }
-    Ok(())
+    scope_current_stage(Stage::HistoryMetadata, async {
+        loop {
+            let finished = store
+                .compaction_prepare_history_quantum(workspace, thread)
+                .await?;
+            record_work(Work::Quanta, 1);
+            if finished {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        Ok(())
+    })
+    .await
 }
 
 pub(crate) async fn source_payload(
@@ -309,6 +317,7 @@ async fn take_source_payload_batch(
     let (consumed, payloads) = store
         .compaction_reference_payload_batch(workspace, thread, &references)
         .await?;
+    record_work(Work::Pages, 1);
     ensure!(
         consumed > 0 && consumed == payloads.len(),
         "history payload batch made no progress"
@@ -433,6 +442,7 @@ async fn metadata(
                 capture_order,
             )
             .await?;
+        record_work(Work::Pages, 1);
         ensure!(
             page.next_sequence > after,
             "history discovery lost its captured boundary"
@@ -476,6 +486,7 @@ pub(crate) async fn final_response_aliases(
                 fence.event_order,
             )
             .await?;
+        record_work(Work::Pages, 1);
         events.extend(page.entries.into_iter().filter(|event| {
             event
                 .item_id
@@ -1601,762 +1612,770 @@ async fn load_line_history_inner(
     causal_task_context: bool,
     selection: HistorySelection<'_>,
 ) -> Result<Vec<ChatMessage>> {
-    let (
-        selected,
-        selected_turns,
-        covered,
-        exact_replay_aliases,
-        covered_item_aliases,
-        covered_event_input_evidence,
-        through_turn,
-    ) = match selection {
-        HistorySelection::All => (None, None, None, None, None, None, None),
-        HistorySelection::Turns(turns) => (None, Some(turns), None, None, None, None, None),
-        HistorySelection::AllExcept {
+    scope_current_stage(Stage::HistoryLoad, async {
+        let (
+            selected,
+            selected_turns,
             covered,
             exact_replay_aliases,
             covered_item_aliases,
             covered_event_input_evidence,
-        } => (
-            None,
-            None,
-            Some(covered),
-            Some(exact_replay_aliases),
-            Some(covered_item_aliases),
-            Some(covered_event_input_evidence),
-            None,
-        ),
-        #[cfg(test)]
-        HistorySelection::Sources(sources) => (Some(sources), None, None, None, None, None, None),
-        HistorySelection::ThroughTurn(turn) => (None, None, None, None, None, None, Some(turn)),
-    };
-    // `Sources` is test-only, so production builds otherwise have no `Some`
-    // branch from which to infer the collection behind `selected`.
-    let selected: Option<&BTreeSet<SourceRef>> = selected;
-    let covered_identities = covered.map(|covered| {
-        covered
-            .iter()
-            .filter(|source| source.thread == thread)
-            .map(|source| (source.source.scope.clone(), source.source.id.clone()))
-            .collect::<BTreeSet<_>>()
-    });
-    let covered_item_alias_index = covered_item_aliases.map(|aliases| {
-        let mut index = BTreeMap::<&str, BTreeMap<&str, BTreeSet<&str>>>::new();
-        for (source_thread, source_turn, item) in aliases {
-            index
-                .entry(source_thread)
-                .or_default()
-                .entry(source_turn)
-                .or_default()
-                .insert(item);
-        }
-        index
-    });
-    let is_covered = |source: &SourceRef| {
-        covered_identities
-            .as_ref()
-            .is_some_and(|covered| covered.contains(&(source.scope.clone(), source.id.clone())))
-            || exact_replay_aliases.is_some_and(|aliases| {
-                aliases.contains(&ScopedHistorySource {
-                    thread: thread.to_owned(),
-                    source: source.clone(),
-                })
-            })
-    };
-    // A checkpoint may replace an event-input while leaving its UI copy in the
-    // uncovered tail. Preserve the exact, captured relationship before raw
-    // filtering. The revision table retains the last decoded exact revision
-    // after the covered event body is physically removed.
-    let covered_event_projections = if let Some(covered) = covered {
-        historical_event_projections(
-            store,
-            workspace,
-            thread,
+            through_turn,
+        ) = match selection {
+            HistorySelection::All => (None, None, None, None, None, None, None),
+            HistorySelection::Turns(turns) => (None, Some(turns), None, None, None, None, None),
+            HistorySelection::AllExcept {
+                covered,
+                exact_replay_aliases,
+                covered_item_aliases,
+                covered_event_input_evidence,
+            } => (
+                None,
+                None,
+                Some(covered),
+                Some(exact_replay_aliases),
+                Some(covered_item_aliases),
+                Some(covered_event_input_evidence),
+                None,
+            ),
+            #[cfg(test)]
+            HistorySelection::Sources(sources) => (Some(sources), None, None, None, None, None, None),
+            HistorySelection::ThroughTurn(turn) => (None, None, None, None, None, None, Some(turn)),
+        };
+        // `Sources` is test-only, so production builds otherwise have no `Some`
+        // branch from which to infer the collection behind `selected`.
+        let selected: Option<&BTreeSet<SourceRef>> = selected;
+        let covered_identities = covered.map(|covered| {
             covered
                 .iter()
                 .filter(|source| source.thread == thread)
-                .map(|source| source.source.clone()),
-        )
-        .await?
-    } else {
-        Vec::new()
-    };
-    let mut covered_event_input_turns = covered_event_input_evidence
-        .into_iter()
-        .flat_map(|evidence| evidence.iter())
-        .filter(|(source, role)| {
-            source.thread == thread && matches!(role.as_str(), "authoritative" | "deleted")
-        })
-        .filter_map(|(source, _)| source_turn(&source.source).map(str::to_owned))
-        .collect::<BTreeSet<_>>();
-    covered_event_input_turns.extend(
-        covered_event_projections
-            .iter()
-            .filter(|projection| {
-                matches!(
-                    projection.projection_kind.as_str(),
-                    "input" | "input_revision" | "input_deleted"
-                )
+                .map(|source| (source.source.scope.clone(), source.source.id.clone()))
+                .collect::<BTreeSet<_>>()
+        });
+        let covered_item_alias_index = covered_item_aliases.map(|aliases| {
+            let mut index = BTreeMap::<&str, BTreeMap<&str, BTreeSet<&str>>>::new();
+            for (source_thread, source_turn, item) in aliases {
+                index
+                    .entry(source_thread)
+                    .or_default()
+                    .entry(source_turn)
+                    .or_default()
+                    .insert(item);
+            }
+            index
+        });
+        let is_covered = |source: &SourceRef| {
+            covered_identities
+                .as_ref()
+                .is_some_and(|covered| covered.contains(&(source.scope.clone(), source.id.clone())))
+                || exact_replay_aliases.is_some_and(|aliases| {
+                    aliases.contains(&ScopedHistorySource {
+                        thread: thread.to_owned(),
+                        source: source.clone(),
+                    })
+                })
+        };
+        // A checkpoint may replace an event-input while leaving its UI copy in the
+        // uncovered tail. Preserve the exact, captured relationship before raw
+        // filtering. The revision table retains the last decoded exact revision
+        // after the covered event body is physically removed.
+        let covered_event_projections = if let Some(covered) = covered {
+            historical_event_projections(
+                store,
+                workspace,
+                thread,
+                covered
+                    .iter()
+                    .filter(|source| source.thread == thread)
+                    .map(|source| source.source.clone()),
+            )
+            .await?
+        } else {
+            Vec::new()
+        };
+        let mut covered_event_input_turns = covered_event_input_evidence
+            .into_iter()
+            .flat_map(|evidence| evidence.iter())
+            .filter(|(source, role)| {
+                source.thread == thread && matches!(role.as_str(), "authoritative" | "deleted")
             })
-            .filter_map(|projection| source_turn(&projection.reference).map(str::to_owned))
-            .collect::<BTreeSet<_>>(),
-    );
-    let mut covered_authoritative_event_input_turns = covered_event_input_evidence
-        .into_iter()
-        .flat_map(|evidence| evidence.iter())
-        .filter(|(source, role)| source.thread == thread && role.as_str() == "authoritative")
-        .filter_map(|(source, _)| source_turn(&source.source).map(str::to_owned))
-        .collect::<BTreeSet<_>>();
-    covered_authoritative_event_input_turns.extend(
-        covered_event_projections
-            .iter()
-            .filter(|projection| {
-                matches!(
-                    projection.projection_kind.as_str(),
-                    "input" | "input_revision"
-                )
-            })
-            .filter_map(|projection| source_turn(&projection.reference).map(str::to_owned))
-            .collect::<BTreeSet<_>>(),
-    );
-    let mut turns = Vec::new();
-    if let Some(selected) = selected_turns {
-        let mut batch = Vec::new();
-        let mut bytes = 0_usize;
-        for id in selected {
-            ensure!(
-                id.len() <= pioneer_crud::compaction::SOURCE_PAGE_BYTES,
-                "selected history turn ID exceeds metadata page bound"
-            );
-            if !batch.is_empty()
-                && (batch.len() == 64
-                    || bytes.saturating_add(id.len()) > pioneer_crud::compaction::SOURCE_PAGE_BYTES)
-            {
+            .filter_map(|(source, _)| source_turn(&source.source).map(str::to_owned))
+            .collect::<BTreeSet<_>>();
+        covered_event_input_turns.extend(
+            covered_event_projections
+                .iter()
+                .filter(|projection| {
+                    matches!(
+                        projection.projection_kind.as_str(),
+                        "input" | "input_revision" | "input_deleted"
+                    )
+                })
+                .filter_map(|projection| source_turn(&projection.reference).map(str::to_owned))
+                .collect::<BTreeSet<_>>(),
+        );
+        let mut covered_authoritative_event_input_turns = covered_event_input_evidence
+            .into_iter()
+            .flat_map(|evidence| evidence.iter())
+            .filter(|(source, role)| source.thread == thread && role.as_str() == "authoritative")
+            .filter_map(|(source, _)| source_turn(&source.source).map(str::to_owned))
+            .collect::<BTreeSet<_>>();
+        covered_authoritative_event_input_turns.extend(
+            covered_event_projections
+                .iter()
+                .filter(|projection| {
+                    matches!(
+                        projection.projection_kind.as_str(),
+                        "input" | "input_revision"
+                    )
+                })
+                .filter_map(|projection| source_turn(&projection.reference).map(str::to_owned))
+                .collect::<BTreeSet<_>>(),
+        );
+        let mut turns = Vec::new();
+        if let Some(selected) = selected_turns {
+            let mut batch = Vec::new();
+            let mut bytes = 0_usize;
+            for id in selected {
+                ensure!(
+                    id.len() <= pioneer_crud::compaction::SOURCE_PAGE_BYTES,
+                    "selected history turn ID exceeds metadata page bound"
+                );
+                if !batch.is_empty()
+                    && (batch.len() == 64
+                        || bytes.saturating_add(id.len()) > pioneer_crud::compaction::SOURCE_PAGE_BYTES)
+                {
+                    turns.extend(
+                        store
+                            .compaction_history_selected_turn_page(workspace, thread, &batch, fence)
+                            .await?,
+                    );
+                    record_work(Work::Pages, 1);
+                    batch.clear();
+                    bytes = 0;
+                }
+                bytes += id.len();
+                batch.push(id.clone());
+            }
+            if !batch.is_empty() {
                 turns.extend(
                     store
                         .compaction_history_selected_turn_page(workspace, thread, &batch, fence)
                         .await?,
                 );
-                batch.clear();
-                bytes = 0;
+                record_work(Work::Pages, 1);
             }
-            bytes += id.len();
-            batch.push(id.clone());
+            turns.retain(|turn| Some(turn.id.as_str()) != excluded_turn);
+        } else {
+            let mut after = String::new();
+            loop {
+                let page = store
+                    .compaction_history_turn_page(workspace, thread, &after, fence)
+                    .await?;
+                record_work(Work::Pages, 1);
+                let Some(last) = page.last() else { break };
+                ensure!(last.id > after, "history turn page made no progress");
+                after = last.id.clone();
+                turns.extend(
+                    page.into_iter()
+                        .filter(|turn| Some(turn.id.as_str()) != excluded_turn),
+                );
+            }
         }
-        if !batch.is_empty() {
-            turns.extend(
-                store
-                    .compaction_history_selected_turn_page(workspace, thread, &batch, fence)
-                    .await?,
+        // IDs do not encode chronology. In particular, a detached Task answer may
+        // share its parent's creation second and sort before its source request.
+        turns.sort_by(|a, b| {
+            (
+                &a.created_at,
+                a.creation_order,
+                a.legacy_creation_order,
+                &a.id,
+            )
+                .cmp(&(
+                    &b.created_at,
+                    b.creation_order,
+                    b.legacy_creation_order,
+                    &b.id,
+                ))
+        });
+        if let Some(through_turn) = through_turn {
+            let end = turns
+                .iter()
+                .position(|turn| turn.id == through_turn)
+                .ok_or_else(|| anyhow::anyhow!("completed output turn is outside its history fence"))?;
+            ensure!(
+                turns[end].status == "completed",
+                "output turn is not completed"
             );
+            turns.truncate(end + 1);
         }
-        turns.retain(|turn| Some(turn.id.as_str()) != excluded_turn);
-    } else {
-        let mut after = String::new();
-        loop {
-            let page = store
-                .compaction_history_turn_page(workspace, thread, &after, fence)
-                .await?;
-            let Some(last) = page.last() else { break };
-            ensure!(last.id > after, "history turn page made no progress");
-            after = last.id.clone();
-            turns.extend(
-                page.into_iter()
-                    .filter(|turn| Some(turn.id.as_str()) != excluded_turn),
-            );
+        // Refresh relationship metadata before deciding whether earlier Task
+        // commands are closed by later occurrence/delivery turns. A cold cache
+        // must not drop a command merely because its outcome sorts after it.
+        if let Some(selected) = selected {
+            let source_turns = selected
+                .iter()
+                .filter_map(|source| source.scope.split_once(':').map(|(_, turn)| turn))
+                .collect::<BTreeSet<_>>();
+            turns.retain(|turn| source_turns.contains(turn.id.as_str()));
         }
-    }
-    // IDs do not encode chronology. In particular, a detached Task answer may
-    // share its parent's creation second and sort before its source request.
-    turns.sort_by(|a, b| {
-        (
-            &a.created_at,
-            a.creation_order,
-            a.legacy_creation_order,
-            &a.id,
-        )
-            .cmp(&(
-                &b.created_at,
-                b.creation_order,
-                b.legacy_creation_order,
-                &b.id,
-            ))
-    });
-    if let Some(through_turn) = through_turn {
-        let end = turns
-            .iter()
-            .position(|turn| turn.id == through_turn)
-            .ok_or_else(|| anyhow::anyhow!("completed output turn is outside its history fence"))?;
-        ensure!(
-            turns[end].status == "completed",
-            "output turn is not completed"
-        );
-        turns.truncate(end + 1);
-    }
-    // Refresh relationship metadata before deciding whether earlier Task
-    // commands are closed by later occurrence/delivery turns. A cold cache
-    // must not drop a command merely because its outcome sorts after it.
-    if let Some(selected) = selected {
-        let source_turns = selected
-            .iter()
-            .filter_map(|source| source.scope.split_once(':').map(|(_, turn)| turn))
-            .collect::<BTreeSet<_>>();
-        turns.retain(|turn| source_turns.contains(turn.id.as_str()));
-    }
-    if let Some(selected_turns) = selected_turns {
-        turns.retain(|turn| selected_turns.contains(&turn.id));
-    }
-    let mut events_by_turn = Vec::with_capacity(turns.len());
-    for turn in &turns {
-        let covered_turn_items = covered_item_alias_index
-            .as_ref()
-            .and_then(|threads| threads.get(thread))
-            .and_then(|turns| turns.get(turn.id.as_str()));
-        let mut events = metadata(
-            &store,
-            workspace,
-            thread,
-            &turn.id,
-            PagedSource::Event,
-            turn.event_high_water,
-            fence,
-        )
-        .await?;
-        let mut has_event_input = covered_event_input_turns.contains(&turn.id)
-            || events.iter().any(|row| {
+        if let Some(selected_turns) = selected_turns {
+            turns.retain(|turn| selected_turns.contains(&turn.id));
+        }
+        let mut events_by_turn = Vec::with_capacity(turns.len());
+        for turn in &turns {
+            let covered_turn_items = covered_item_alias_index
+                .as_ref()
+                .and_then(|threads| threads.get(thread))
+                .and_then(|turns| turns.get(turn.id.as_str()));
+            let mut events = metadata(
+                &store,
+                workspace,
+                thread,
+                &turn.id,
+                PagedSource::Event,
+                turn.event_high_water,
+                fence,
+            )
+            .await?;
+            let mut has_event_input = covered_event_input_turns.contains(&turn.id)
+                || events.iter().any(|row| {
+                    matches!(
+                        row.projection_kind.as_deref(),
+                        Some("input" | "input_revision" | "input_deleted")
+                    )
+                });
+            let mut has_authoritative_event_input = covered_authoritative_event_input_turns
+                .contains(&turn.id)
+                || events.iter().any(|row| {
+                    matches!(
+                        row.projection_kind.as_deref(),
+                        Some("input" | "input_revision")
+                    )
+                });
+            // Exact relationship discovery may use all captured metadata, even
+            // when the selected view excludes the UI copy's payload.
+            let mut alias_events = events.clone();
+            events.retain(|event| {
+                !is_covered(&event.reference)
+                    && !event.item_id.as_ref().is_some_and(|item| {
+                        covered_turn_items.is_some_and(|items| items.contains(item.as_str()))
+                    })
+                    && selected.is_none_or(|sources| sources.contains(&event.reference))
+            });
+            for event in &mut events {
+                use pioneer_protocol::constants::events as kinds;
+                let structural_kind = match event.source_type.as_str() {
+                    kinds::TURN_STARTED => Some("input"),
+                    kinds::TURN_MESSAGE_EDITED => Some("input_revision"),
+                    kinds::TURN_MESSAGE_DELETED => Some("input_deleted"),
+                    _ => None,
+                };
+                // Older cached model classifications must not erase structural
+                // message mutations. Refresh only the few source types whose
+                // lifecycle meaning is known from their trusted event type; all
+                // other warm rows retain the bounded metadata-only path.
+                if event.projection_kind.is_none()
+                    || structural_kind
+                        .is_some_and(|kind| event.projection_kind.as_deref() != Some(kind))
+                {
+                    let payload = source_payload(&store, workspace, thread, event).await?;
+                    let parsed: Event = serde_json::from_str(&payload)?;
+                    ensure!(
+                        store
+                            .compaction_record_event_projection(
+                                workspace,
+                                thread,
+                                &event.reference,
+                                &parsed
+                            )
+                            .await?,
+                        "canonical event changed while refreshing history metadata"
+                    );
+                    let (item, kind) = pioneer_crud::compaction::event_projection_metadata(&parsed);
+                    event.item_id = item;
+                    event.projection_kind = Some(kind.into());
+                    // Relationship discovery retains metadata only. Bodies that
+                    // survive the later projection filters are loaded on demand.
+                    event.payload = None;
+                    event.incomplete = true;
+                }
+            }
+            has_event_input |= events.iter().any(|row| {
                 matches!(
                     row.projection_kind.as_deref(),
                     Some("input" | "input_revision" | "input_deleted")
                 )
             });
-        let mut has_authoritative_event_input = covered_authoritative_event_input_turns
-            .contains(&turn.id)
-            || events.iter().any(|row| {
+            has_authoritative_event_input |= events.iter().any(|row| {
                 matches!(
                     row.projection_kind.as_deref(),
                     Some("input" | "input_revision")
                 )
             });
-        // Exact relationship discovery may use all captured metadata, even
-        // when the selected view excludes the UI copy's payload.
-        let mut alias_events = events.clone();
-        events.retain(|event| {
-            !is_covered(&event.reference)
-                && !event.item_id.as_ref().is_some_and(|item| {
-                    covered_turn_items.is_some_and(|items| items.contains(item.as_str()))
-                })
-                && selected.is_none_or(|sources| sources.contains(&event.reference))
-        });
-        for event in &mut events {
-            use pioneer_protocol::constants::events as kinds;
-            let structural_kind = match event.source_type.as_str() {
-                kinds::TURN_STARTED => Some("input"),
-                kinds::TURN_MESSAGE_EDITED => Some("input_revision"),
-                kinds::TURN_MESSAGE_DELETED => Some("input_deleted"),
-                _ => None,
-            };
-            // Older cached model classifications must not erase structural
-            // message mutations. Refresh only the few source types whose
-            // lifecycle meaning is known from their trusted event type; all
-            // other warm rows retain the bounded metadata-only path.
-            if event.projection_kind.is_none()
-                || structural_kind
-                    .is_some_and(|kind| event.projection_kind.as_deref() != Some(kind))
-            {
-                let payload = source_payload(&store, workspace, thread, event).await?;
-                let parsed: Event = serde_json::from_str(&payload)?;
-                ensure!(
-                    store
-                        .compaction_record_event_projection(
-                            workspace,
-                            thread,
-                            &event.reference,
-                            &parsed
-                        )
-                        .await?,
-                    "canonical event changed while refreshing history metadata"
-                );
-                let (item, kind) = pioneer_crud::compaction::event_projection_metadata(&parsed);
-                event.item_id = item;
-                event.projection_kind = Some(kind.into());
-                // Relationship discovery retains metadata only. Bodies that
-                // survive the later projection filters are loaded on demand.
-                event.payload = None;
-                event.incomplete = true;
-            }
-        }
-        has_event_input |= events.iter().any(|row| {
-            matches!(
-                row.projection_kind.as_deref(),
-                Some("input" | "input_revision" | "input_deleted")
-            )
-        });
-        has_authoritative_event_input |= events.iter().any(|row| {
-            matches!(
-                row.projection_kind.as_deref(),
-                Some("input" | "input_revision")
-            )
-        });
-        let refreshed: BTreeMap<_, _> = events
-            .iter()
-            .map(|event| (event.reference.clone(), event))
-            .collect();
-        for original in &mut alias_events {
-            if let Some(event) = refreshed.get(&original.reference) {
-                original.item_id = event.item_id.clone();
-                original.projection_kind = event.projection_kind.clone();
-            }
-        }
-        events_by_turn.push((
-            events,
-            alias_events,
-            has_event_input,
-            has_authoritative_event_input,
-        ));
-    }
-    let mut history = Vec::new();
-    for (turn, (events, alias_events, has_event_input, has_authoritative_event_input)) in
-        turns.into_iter().zip(events_by_turn)
-    {
-        // A later terminal transition cannot expose the pending portion of an
-        // active parent's already captured snapshot. Use only events below its
-        // fence; mutable turn.status is not a historical boundary.
-        let captured_active = events
-            .iter()
-            .filter_map(|event| {
-                use pioneer_protocol::constants::events as kinds;
-                match event.source_type.as_str() {
-                    kinds::TURN_COMPLETED | kinds::TURN_FAILED | kinds::TURN_BLOCKED => Some(false),
-                    kinds::TURN_STARTED
-                    | kinds::TURN_EXECUTION_WINDOW_STARTED
-                    | kinds::TURN_EXECUTION_WINDOW_CONTINUED => Some(true),
-                    kinds::ITEM_STARTED if event.projection_kind.as_deref() == Some("start") => {
-                        Some(true)
-                    }
-                    _ => None,
+            let refreshed: BTreeMap<_, _> = events
+                .iter()
+                .map(|event| (event.reference.clone(), event))
+                .collect();
+            for original in &mut alias_events {
+                if let Some(event) = refreshed.get(&original.reference) {
+                    original.item_id = event.item_id.clone();
+                    original.projection_kind = event.projection_kind.clone();
                 }
-            })
-            .next_back()
-            .unwrap_or(true);
-        let failure_sequences = events
-            .iter()
-            .filter(|row| {
-                matches!(
-                    row.source_type.as_str(),
-                    pioneer_protocol::constants::events::TURN_FAILED
-                        | pioneer_protocol::constants::events::TURN_BLOCKED
-                )
-            })
-            .map(|row| row.sequence)
-            .collect::<BTreeSet<_>>();
-        let delivery_outcome_sequences = events
-            .iter()
-            .filter(|row| {
-                row.source_type == pioneer_protocol::constants::events::ITEM_COMPLETED
-                    && row
-                        .item_id
-                        .as_deref()
-                        .and_then(pioneer_protocol::task_delivery_id_from_result_item_id)
-                        .is_some()
-            })
-            .map(|row| row.sequence)
-            .collect::<BTreeSet<_>>();
-        let starts = events
-            .iter()
-            .filter(|row| row.projection_kind.as_deref() == Some("start"))
-            .filter_map(|row| row.item_id.as_ref().map(|id| (id.clone(), row.sequence)))
-            .collect::<BTreeMap<_, _>>();
-        let mut contexts = metadata(
-            &store,
-            workspace,
-            thread,
-            &turn.id,
-            PagedSource::ProviderContext,
-            turn.context_high_water,
-            fence,
-        )
-        .await?;
-        // Covered provider rows are removed before payload reads, but their
-        // durable item relationship must still suppress the corresponding UI
-        // event copy. This is metadata-only and does not make an unrelated
-        // event or item part of checkpoint coverage.
-        let context_aliases = contexts
-            .iter()
-            .filter(|row| row.source_type == "tool_result_v2" && is_covered(&row.reference))
-            .filter_map(|row| row.item_id.clone())
-            .collect::<BTreeSet<_>>();
-        if covered.is_some() {
-            let mut uncovered = Vec::with_capacity(contexts.len());
-            for row in contexts {
-                if is_covered(&row.reference) {
-                    continue;
-                }
-                if row.source_type == "tool_result_v2" {
-                    let item_covered = if let Some(item) = row.item_id.as_deref() {
-                        match store
-                            .compaction_tool_item_reference(workspace, thread, &turn.id, item)
-                            .await?
-                        {
-                            Some(reference) => is_covered(&reference),
-                            // Published checkpoint metadata records the exact
-                            // replay row as a covered alias. Without that saved
-                            // link, a missing item is not guessed to be covered.
-                            None => false,
+            }
+            events_by_turn.push((
+                events,
+                alias_events,
+                has_event_input,
+                has_authoritative_event_input,
+            ));
+        }
+        let mut history = Vec::new();
+        for (turn, (events, alias_events, has_event_input, has_authoritative_event_input)) in
+            turns.into_iter().zip(events_by_turn)
+        {
+            // A later terminal transition cannot expose the pending portion of an
+            // active parent's already captured snapshot. Use only events below its
+            // fence; mutable turn.status is not a historical boundary.
+            let captured_active = events
+                .iter()
+                .filter_map(|event| {
+                    use pioneer_protocol::constants::events as kinds;
+                    match event.source_type.as_str() {
+                        kinds::TURN_COMPLETED | kinds::TURN_FAILED | kinds::TURN_BLOCKED => Some(false),
+                        kinds::TURN_STARTED
+                        | kinds::TURN_EXECUTION_WINDOW_STARTED
+                        | kinds::TURN_EXECUTION_WINDOW_CONTINUED => Some(true),
+                        kinds::ITEM_STARTED if event.projection_kind.as_deref() == Some("start") => {
+                            Some(true)
                         }
-                    } else {
-                        false
-                    };
-                    if item_covered {
-                        continue;
+                        _ => None,
                     }
-                }
-                uncovered.push(row);
-            }
-            contexts = uncovered;
-        }
-        if let Some(selected) = selected {
-            let mut exact = Vec::new();
-            for row in contexts {
-                let keep = if selected.contains(&row.reference) {
-                    true
-                } else if row.source_type == "tool_result_v2" {
-                    if let Some(item) = row.item_id.as_deref() {
-                        store
-                            .compaction_tool_item_reference(workspace, thread, &turn.id, item)
-                            .await?
-                            .is_some_and(|reference| selected.contains(&reference))
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                };
-                if keep {
-                    exact.push(row);
-                }
-            }
-            contexts = exact;
-        }
-        let mut aliases = covered_item_alias_index
-            .as_ref()
-            .and_then(|threads| threads.get(thread))
-            .and_then(|turns| turns.get(turn.id.as_str()))
-            .into_iter()
-            .flat_map(|items| items.iter().copied())
-            .map(str::to_owned)
-            .collect::<BTreeSet<_>>();
-        aliases.extend(context_aliases);
-        aliases.extend(
-            contexts
+                })
+                .next_back()
+                .unwrap_or(true);
+            let failure_sequences = events
                 .iter()
-                .filter(|row| row.source_type == "tool_result_v2")
-                .filter_map(|row| row.item_id.clone()),
-        );
-        let mut ordered = Vec::<(i64, Vec<ChatMessage>)>::new();
-        let use_input_rows = if let Some(selected) = selected {
-            selected
+                .filter(|row| {
+                    matches!(
+                        row.source_type.as_str(),
+                        pioneer_protocol::constants::events::TURN_FAILED
+                            | pioneer_protocol::constants::events::TURN_BLOCKED
+                    )
+                })
+                .map(|row| row.sequence)
+                .collect::<BTreeSet<_>>();
+            let delivery_outcome_sequences = events
                 .iter()
-                .any(|source| source.scope == format!("input:{}", turn.id))
-        } else {
-            turn.input_high_water > 0
-                && (matches!(turn.send_mode.as_deref(), Some("agent" | "chat")) || !has_event_input)
-        };
-        if use_input_rows {
-            let mut rows = metadata(
+                .filter(|row| {
+                    row.source_type == pioneer_protocol::constants::events::ITEM_COMPLETED
+                        && row
+                            .item_id
+                            .as_deref()
+                            .and_then(pioneer_protocol::task_delivery_id_from_result_item_id)
+                            .is_some()
+                })
+                .map(|row| row.sequence)
+                .collect::<BTreeSet<_>>();
+            let starts = events
+                .iter()
+                .filter(|row| row.projection_kind.as_deref() == Some("start"))
+                .filter_map(|row| row.item_id.as_ref().map(|id| (id.clone(), row.sequence)))
+                .collect::<BTreeMap<_, _>>();
+            let mut contexts = metadata(
                 &store,
                 workspace,
                 thread,
                 &turn.id,
-                PagedSource::Input,
-                turn.input_high_water,
+                PagedSource::ProviderContext,
+                turn.context_high_water,
                 fence,
             )
             .await?;
-            rows.retain(|row| {
-                !is_covered(&row.reference)
-                    && selected.is_none_or(|sources| sources.contains(&row.reference))
-            });
-            let mut inputs = Vec::new();
-            let mut sources = Vec::new();
-            let mut rows = VecDeque::from(rows);
-            while !rows.is_empty() {
-                for (row, payload) in
-                    take_source_payload_batch(store, workspace, thread, &mut rows).await?
-                {
-                    inputs.push(serde_json::from_str::<pioneer_protocol::UserInput>(
-                        &payload,
-                    )?);
-                    sources.push(row.reference);
+            // Covered provider rows are removed before payload reads, but their
+            // durable item relationship must still suppress the corresponding UI
+            // event copy. This is metadata-only and does not make an unrelated
+            // event or item part of checkpoint coverage.
+            let context_aliases = contexts
+                .iter()
+                .filter(|row| row.source_type == "tool_result_v2" && is_covered(&row.reference))
+                .filter_map(|row| row.item_id.clone())
+                .collect::<BTreeSet<_>>();
+            if covered.is_some() {
+                let mut uncovered = Vec::with_capacity(contexts.len());
+                for row in contexts {
+                    if is_covered(&row.reference) {
+                        continue;
+                    }
+                    if row.source_type == "tool_result_v2" {
+                        let item_covered = if let Some(item) = row.item_id.as_deref() {
+                            match store
+                                .compaction_tool_item_reference(workspace, thread, &turn.id, item)
+                                .await?
+                            {
+                                Some(reference) => is_covered(&reference),
+                                // Published checkpoint metadata records the exact
+                                // replay row as a covered alias. Without that saved
+                                // link, a missing item is not guessed to be covered.
+                                None => false,
+                            }
+                        } else {
+                            false
+                        };
+                        if item_covered {
+                            continue;
+                        }
+                    }
+                    uncovered.push(row);
+                }
+                contexts = uncovered;
+            }
+            if let Some(selected) = selected {
+                let mut exact = Vec::new();
+                for row in contexts {
+                    let keep = if selected.contains(&row.reference) {
+                        true
+                    } else if row.source_type == "tool_result_v2" {
+                        if let Some(item) = row.item_id.as_deref() {
+                            store
+                                .compaction_tool_item_reference(workspace, thread, &turn.id, item)
+                                .await?
+                                .is_some_and(|reference| selected.contains(&reference))
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+                    if keep {
+                        exact.push(row);
+                    }
+                }
+                contexts = exact;
+            }
+            let mut aliases = covered_item_alias_index
+                .as_ref()
+                .and_then(|threads| threads.get(thread))
+                .and_then(|turns| turns.get(turn.id.as_str()))
+                .into_iter()
+                .flat_map(|items| items.iter().copied())
+                .map(str::to_owned)
+                .collect::<BTreeSet<_>>();
+            aliases.extend(context_aliases);
+            aliases.extend(
+                contexts
+                    .iter()
+                    .filter(|row| row.source_type == "tool_result_v2")
+                    .filter_map(|row| row.item_id.clone()),
+            );
+            let mut ordered = Vec::<(i64, Vec<ChatMessage>)>::new();
+            let use_input_rows = if let Some(selected) = selected {
+                selected
+                    .iter()
+                    .any(|source| source.scope == format!("input:{}", turn.id))
+            } else {
+                turn.input_high_water > 0
+                    && (matches!(turn.send_mode.as_deref(), Some("agent" | "chat")) || !has_event_input)
+            };
+            if use_input_rows {
+                let mut rows = metadata(
+                    &store,
+                    workspace,
+                    thread,
+                    &turn.id,
+                    PagedSource::Input,
+                    turn.input_high_water,
+                    fence,
+                )
+                .await?;
+                rows.retain(|row| {
+                    !is_covered(&row.reference)
+                        && selected.is_none_or(|sources| sources.contains(&row.reference))
+                });
+                let mut inputs = Vec::new();
+                let mut sources = Vec::new();
+                let mut rows = VecDeque::from(rows);
+                while !rows.is_empty() {
+                    for (row, payload) in
+                        take_source_payload_batch(store, workspace, thread, &mut rows).await?
+                    {
+                        inputs.push(serde_json::from_str::<pioneer_protocol::UserInput>(
+                            &payload,
+                        )?);
+                        sources.push(row.reference);
+                    }
+                }
+                if !inputs.is_empty() {
+                    let mut message = input_message(&inputs)?;
+                    message.provenance =
+                        Some(origin(workspace, thread, &turn.id, "user-input", sources));
+                    ordered.push((0, vec![message]));
                 }
             }
-            if !inputs.is_empty() {
-                let mut message = input_message(&inputs)?;
-                message.provenance =
-                    Some(origin(workspace, thread, &turn.id, "user-input", sources));
-                ordered.push((0, vec![message]));
-            }
-        }
-        let mut pending: Option<Round> = None;
-        let mut contexts = VecDeque::from(contexts);
-        while !contexts.is_empty() {
-            for (row, payload) in
-                take_source_payload_batch(store, workspace, thread, &mut contexts).await?
-            {
-                match row.source_type.as_str() {
-                    "assistant_round" => {
-                        if let Some(round) = pending.take() {
-                            finish_round(
-                                workspace,
-                                thread,
-                                &turn.id,
-                                round,
-                                captured_active,
-                                &mut ordered,
-                            )?;
-                        }
-                        if let Ok(envelope) =
-                            serde_json::from_str::<CanonicalProviderRoundEnvelope>(&payload)
-                        {
-                            aliases.extend(
-                                envelope.calls.iter().map(|call| call.turn_item_id.clone()),
-                            );
-                            // Native content owns the model history. Suppress its
-                            // exact reasoning/final UI copies, keeping stored events.
-                            aliases.insert(envelope.round_id.clone());
-                            if let Some(item) = row.item_id.as_ref() {
-                                aliases.insert(item.clone());
-                            }
-                            let evidence = if envelope.calls.is_empty() {
-                                final_response_evidence_at_fence(
-                                    store,
+            let mut pending: Option<Round> = None;
+            let mut contexts = VecDeque::from(contexts);
+            while !contexts.is_empty() {
+                for (row, payload) in
+                    take_source_payload_batch(store, workspace, thread, &mut contexts).await?
+                {
+                    match row.source_type.as_str() {
+                        "assistant_round" => {
+                            if let Some(round) = pending.take() {
+                                finish_round(
                                     workspace,
                                     thread,
                                     &turn.id,
-                                    &row.reference,
-                                    &envelope.round_id,
-                                    row.item_id.as_deref(),
-                                    &alias_events,
-                                )
-                                .await?
-                            } else {
-                                FinalResponseAliasEvidence {
-                                    aliases: Vec::new(),
-                                    ready: true,
+                                    round,
+                                    captured_active,
+                                    &mut ordered,
+                                )?;
+                            }
+                            if let Ok(envelope) =
+                                serde_json::from_str::<CanonicalProviderRoundEnvelope>(&payload)
+                            {
+                                aliases.extend(
+                                    envelope.calls.iter().map(|call| call.turn_item_id.clone()),
+                                );
+                                // Native content owns the model history. Suppress its
+                                // exact reasoning/final UI copies, keeping stored events.
+                                aliases.insert(envelope.round_id.clone());
+                                if let Some(item) = row.item_id.as_ref() {
+                                    aliases.insert(item.clone());
                                 }
-                            };
-                            pending = Some(Round {
-                                sequence: starts
-                                    .get(&envelope.round_id)
-                                    .copied()
-                                    .unwrap_or(row.sequence),
-                                response_copies_ready: evidence.ready,
-                                response_aliases: evidence.aliases,
-                                assistant_source: row.reference,
-                                envelope,
-                                results: BTreeMap::new(),
-                            });
-                        } else {
-                            // Legacy assistant tool calls require old tool_result
-                            // rows, which are excluded from new history. Drop the
-                            // whole sequence; never send an unanswered call.
-                            let legacy: ChatMessage = serde_json::from_str(&payload)?;
-                            ensure!(
-                                legacy.role == Role::Assistant
-                                    && legacy
-                                        .tool_calls
-                                        .as_ref()
-                                        .is_some_and(|calls| !calls.is_empty()),
-                                "invalid legacy assistant round"
-                            );
-                        }
-                    }
-                    "tool_result_v2" => {
-                        let round = pending
-                            .as_mut()
-                            .ok_or_else(|| anyhow::anyhow!("canonical tool result has no round"))?;
-                        let item = row.item_id.ok_or_else(|| {
-                            anyhow::anyhow!("tool result has no durable item identity")
-                        })?;
-                        let view: pioneer_tools::ToolResultView = serde_json::from_str(&payload)?;
-                        let pioneer_tools::ToolResultView::Json {
-                            value,
-                            truncated: false,
-                        } = view
-                        else {
-                            anyhow::bail!("canonical result is incomplete")
-                        };
-                        let full: ChatMessage = serde_json::from_value(value)?;
-                        let reference = serde_json::json!({"workspace_id":workspace,"thread_id":thread,"turn_id":turn.id,"item_id":item}).to_string();
-                        let message = pioneer_agent::compaction::restored_tool_result_message(
-                            &full, &reference,
-                        )?;
-                        let source = store
-                            .compaction_tool_item_reference(workspace, thread, &turn.id, &item)
-                            .await?
-                            .unwrap_or(row.reference);
-                        ensure!(
-                            round.results.insert(item, (source, message)).is_none(),
-                            "duplicate canonical tool result"
-                        );
-                    }
-                    _ => anyhow::bail!("unsupported model history context source"),
-                }
-            }
-        }
-        if let Some(round) = pending {
-            finish_round(
-                workspace,
-                thread,
-                &turn.id,
-                round,
-                captured_active,
-                &mut ordered,
-            )?;
-        }
-        let latest_input = events
-            .iter()
-            .filter(|row| {
-                matches!(
-                    row.projection_kind.as_deref(),
-                    Some("input" | "input_revision" | "input_deleted")
-                )
-            })
-            .map(|row| row.sequence)
-            .max();
-        let last_input_revision = events
-            .iter()
-            .filter(|row| {
-                matches!(
-                    row.projection_kind.as_deref(),
-                    Some("input_revision" | "input_deleted")
-                )
-            })
-            .map(|row| row.sequence)
-            .max();
-        let mut last_attachment_copies = BTreeMap::<String, i64>::new();
-        for row in &events {
-            if row.projection_kind.as_deref() == Some("input_copy")
-                && let Some(item) = &row.item_id
-            {
-                last_attachment_copies
-                    .entry(item.clone())
-                    .and_modify(|sequence| *sequence = (*sequence).max(row.sequence))
-                    .or_insert(row.sequence);
-            }
-        }
-        let mut selected_events = events.into_iter().filter(|row| {
-            let kind = row.projection_kind.as_deref().unwrap_or("observation");
-            let superseded_copy = kind == "input_copy"
-                && (last_input_revision.is_some_and(|revision| row.sequence <= revision)
-                    || row.item_id.as_ref().is_some_and(|item| {
-                        last_attachment_copies.get(item) != Some(&row.sequence)
-                    }));
-            let metadata_only = matches!(kind, "start" | "technical")
-                || row.item_id.as_ref().is_some_and(|id| aliases.contains(id));
-            let superseded_input = matches!(kind, "input" | "input_revision" | "input_deleted")
-                && (use_input_rows || Some(row.sequence) != latest_input);
-            !superseded_copy && !metadata_only && !superseded_input
-        });
-        loop {
-            let mut page = selected_events
-                .by_ref()
-                .take(pioneer_crud::compaction::SOURCE_PAGE_ROWS as usize)
-                .collect::<Vec<_>>();
-            if page.is_empty() {
-                break;
-            }
-            while !page.is_empty() {
-                let references = page
-                    .iter()
-                    .map(|row| row.reference.clone())
-                    .collect::<Vec<_>>();
-                let (consumed, payloads) = store
-                    .compaction_reference_payload_batch(workspace, thread, &references)
-                    .await?;
-                ensure!(
-                    consumed > 0 && consumed == payloads.len(),
-                    "event payload batch made no progress"
-                );
-                let ready = page.drain(..consumed).collect::<Vec<_>>();
-                for (row, payload) in ready.into_iter().zip(payloads) {
-                    let event: Event = serde_json::from_str(&payload)?;
-                    ensure!(
-                        event.workspace_id() == workspace
-                            && event.thread_id() == thread
-                            && event.turn_id() == turn.id,
-                        "canonical event scope mismatch"
-                    );
-                    let Some(mut message) = event_message_with_input_copy_policy(
-                        event.clone(),
-                        (use_input_rows || has_authoritative_event_input)
-                            && row.projection_kind.as_deref() == Some("input_copy"),
-                        true,
-                        false,
-                    )?
-                    else {
-                        if row.projection_kind.as_deref() != Some("technical")
-                            && pioneer_crud::compaction::event_projection_metadata(&event).1
-                                == "technical"
-                        {
-                            ensure!(
-                                store
-                                    .compaction_record_event_projection(
+                                let evidence = if envelope.calls.is_empty() {
+                                    final_response_evidence_at_fence(
+                                        store,
                                         workspace,
                                         thread,
+                                        &turn.id,
                                         &row.reference,
-                                        &event,
+                                        &envelope.round_id,
+                                        row.item_id.as_deref(),
+                                        &alias_events,
                                     )
-                                    .await?,
-                                "canonical event changed while caching model exclusion"
+                                    .await?
+                                } else {
+                                    FinalResponseAliasEvidence {
+                                        aliases: Vec::new(),
+                                        ready: true,
+                                    }
+                                };
+                                pending = Some(Round {
+                                    sequence: starts
+                                        .get(&envelope.round_id)
+                                        .copied()
+                                        .unwrap_or(row.sequence),
+                                    response_copies_ready: evidence.ready,
+                                    response_aliases: evidence.aliases,
+                                    assistant_source: row.reference,
+                                    envelope,
+                                    results: BTreeMap::new(),
+                                });
+                            } else {
+                                // Legacy assistant tool calls require old tool_result
+                                // rows, which are excluded from new history. Drop the
+                                // whole sequence; never send an unanswered call.
+                                let legacy: ChatMessage = serde_json::from_str(&payload)?;
+                                ensure!(
+                                    legacy.role == Role::Assistant
+                                        && legacy
+                                            .tool_calls
+                                            .as_ref()
+                                            .is_some_and(|calls| !calls.is_empty()),
+                                    "invalid legacy assistant round"
+                                );
+                            }
+                        }
+                        "tool_result_v2" => {
+                            let round = pending
+                                .as_mut()
+                                .ok_or_else(|| anyhow::anyhow!("canonical tool result has no round"))?;
+                            let item = row.item_id.ok_or_else(|| {
+                                anyhow::anyhow!("tool result has no durable item identity")
+                            })?;
+                            let view: pioneer_tools::ToolResultView = serde_json::from_str(&payload)?;
+                            let pioneer_tools::ToolResultView::Json {
+                                value,
+                                truncated: false,
+                            } = view
+                            else {
+                                anyhow::bail!("canonical result is incomplete")
+                            };
+                            let full: ChatMessage = serde_json::from_value(value)?;
+                            let reference = serde_json::json!({"workspace_id":workspace,"thread_id":thread,"turn_id":turn.id,"item_id":item}).to_string();
+                            let message = pioneer_agent::compaction::restored_tool_result_message(
+                                &full, &reference,
+                            )?;
+                            let source = store
+                                .compaction_tool_item_reference(workspace, thread, &turn.id, &item)
+                                .await?
+                                .unwrap_or(row.reference);
+                            ensure!(
+                                round.results.insert(item, (source, message)).is_none(),
+                                "duplicate canonical tool result"
                             );
                         }
-                        continue;
-                    };
-                    message.provenance = Some(origin(
-                        workspace,
-                        thread,
-                        &turn.id,
-                        &row.reference.id,
-                        vec![row.reference.clone()],
-                    ));
-                    ordered.push((row.sequence, vec![message]));
-                }
-            }
-        }
-        if causal_task_context {
-            let boundary = store
-                .compaction_history_causal_boundary(workspace, thread, &turn.id, fence)
-                .await?;
-            let completed_work = ordered
-                .iter()
-                .flat_map(|(_, messages)| messages)
-                .any(|message| matches!(message.role, Role::Assistant | Role::Tool));
-            if boundary.delegated_command
-                && !completed_work
-                && failure_sequences.is_empty()
-                && !boundary.delivered_outcome
-            {
-                // An unfinished sibling command is not the next Task's input.
-                continue;
-            }
-            if boundary.task_transport {
-                // Task cards/occurrence inputs are UI transport copies. Keep
-                // the acknowledged outcome and actual failures, with their own
-                // source IDs, instead of copying the command from the card.
-                for (sequence, messages) in &mut ordered {
-                    if !failure_sequences.contains(sequence)
-                        && !delivery_outcome_sequences.contains(sequence)
-                    {
-                        messages
-                            .retain(|message| matches!(message.role, Role::Assistant | Role::Tool));
+                        _ => anyhow::bail!("unsupported model history context source"),
                     }
                 }
             }
+            if let Some(round) = pending {
+                finish_round(
+                    workspace,
+                    thread,
+                    &turn.id,
+                    round,
+                    captured_active,
+                    &mut ordered,
+                )?;
+            }
+            let latest_input = events
+                .iter()
+                .filter(|row| {
+                    matches!(
+                        row.projection_kind.as_deref(),
+                        Some("input" | "input_revision" | "input_deleted")
+                    )
+                })
+                .map(|row| row.sequence)
+                .max();
+            let last_input_revision = events
+                .iter()
+                .filter(|row| {
+                    matches!(
+                        row.projection_kind.as_deref(),
+                        Some("input_revision" | "input_deleted")
+                    )
+                })
+                .map(|row| row.sequence)
+                .max();
+            let mut last_attachment_copies = BTreeMap::<String, i64>::new();
+            for row in &events {
+                if row.projection_kind.as_deref() == Some("input_copy")
+                    && let Some(item) = &row.item_id
+                {
+                    last_attachment_copies
+                        .entry(item.clone())
+                        .and_modify(|sequence| *sequence = (*sequence).max(row.sequence))
+                        .or_insert(row.sequence);
+                }
+            }
+            let mut selected_events = events.into_iter().filter(|row| {
+                let kind = row.projection_kind.as_deref().unwrap_or("observation");
+                let superseded_copy = kind == "input_copy"
+                    && (last_input_revision.is_some_and(|revision| row.sequence <= revision)
+                        || row.item_id.as_ref().is_some_and(|item| {
+                            last_attachment_copies.get(item) != Some(&row.sequence)
+                        }));
+                let metadata_only = matches!(kind, "start" | "technical")
+                    || row.item_id.as_ref().is_some_and(|id| aliases.contains(id));
+                let superseded_input = matches!(kind, "input" | "input_revision" | "input_deleted")
+                    && (use_input_rows || Some(row.sequence) != latest_input);
+                !superseded_copy && !metadata_only && !superseded_input
+            });
+            loop {
+                let mut page = selected_events
+                    .by_ref()
+                    .take(pioneer_crud::compaction::SOURCE_PAGE_ROWS as usize)
+                    .collect::<Vec<_>>();
+                if page.is_empty() {
+                    break;
+                }
+                while !page.is_empty() {
+                    let references = page
+                        .iter()
+                        .map(|row| row.reference.clone())
+                        .collect::<Vec<_>>();
+                    let (consumed, payloads) = store
+                        .compaction_reference_payload_batch(workspace, thread, &references)
+                        .await?;
+                        record_work(Work::Pages, 1);
+                    ensure!(
+                        consumed > 0 && consumed == payloads.len(),
+                        "event payload batch made no progress"
+                    );
+                    let ready = page.drain(..consumed).collect::<Vec<_>>();
+                    for (row, payload) in ready.into_iter().zip(payloads) {
+                        let event: Event = serde_json::from_str(&payload)?;
+                        ensure!(
+                            event.workspace_id() == workspace
+                                && event.thread_id() == thread
+                                && event.turn_id() == turn.id,
+                            "canonical event scope mismatch"
+                        );
+                        let Some(mut message) = event_message_with_input_copy_policy(
+                            event.clone(),
+                            (use_input_rows || has_authoritative_event_input)
+                                && row.projection_kind.as_deref() == Some("input_copy"),
+                            true,
+                            false,
+                        )?
+                        else {
+                            if row.projection_kind.as_deref() != Some("technical")
+                                && pioneer_crud::compaction::event_projection_metadata(&event).1
+                                    == "technical"
+                            {
+                                ensure!(
+                                    store
+                                        .compaction_record_event_projection(
+                                            workspace,
+                                            thread,
+                                            &row.reference,
+                                            &event,
+                                        )
+                                        .await?,
+                                    "canonical event changed while caching model exclusion"
+                                );
+                            }
+                            continue;
+                        };
+                        message.provenance = Some(origin(
+                            workspace,
+                            thread,
+                            &turn.id,
+                            &row.reference.id,
+                            vec![row.reference.clone()],
+                        ));
+                        ordered.push((row.sequence, vec![message]));
+                    }
+                }
+            }
+            if causal_task_context {
+                let boundary = store
+                    .compaction_history_causal_boundary(workspace, thread, &turn.id, fence)
+                    .await?;
+                let completed_work = ordered
+                    .iter()
+                    .flat_map(|(_, messages)| messages)
+                    .any(|message| matches!(message.role, Role::Assistant | Role::Tool));
+                if boundary.delegated_command
+                    && !completed_work
+                    && failure_sequences.is_empty()
+                    && !boundary.delivered_outcome
+                {
+                    // An unfinished sibling command is not the next Task's input.
+                    continue;
+                }
+                if boundary.task_transport {
+                    // Task cards/occurrence inputs are UI transport copies. Keep
+                    // the acknowledged outcome and actual failures, with their own
+                    // source IDs, instead of copying the command from the card.
+                    for (sequence, messages) in &mut ordered {
+                        if !failure_sequences.contains(sequence)
+                            && !delivery_outcome_sequences.contains(sequence)
+                        {
+                            messages
+                                .retain(|message| matches!(message.role, Role::Assistant | Role::Tool));
+                        }
+                    }
+                }
+            }
+            ordered.sort_by_key(|(sequence, _)| *sequence);
+            history.extend(ordered.into_iter().flat_map(|(_, messages)| messages));
         }
-        ordered.sort_by_key(|(sequence, _)| *sequence);
-        history.extend(ordered.into_iter().flat_map(|(_, messages)| messages));
-    }
-    Ok(history)
+        record_work(Work::Messages, history.len() as u64);
+        Ok(history)
+    })
+    .await
 }
 
 /// Failed partial output remains historical data, including readable provider

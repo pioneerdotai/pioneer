@@ -12,6 +12,7 @@ use pioneer_crud::{
     PrepareClaudeProviderSessionBinding, PreparedClaudeProviderSessionMode,
     deserialize_cli_runtime_json, serialize_cli_runtime_json,
 };
+use pioneer_observability::turn_startup::{Stage, scope_current_stage};
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use std::time::Duration;
 use uuid::Uuid;
@@ -42,124 +43,127 @@ pub(crate) async fn prepare_claude_provider_session(
     store: &CrudStore,
     request: ClaudeProviderSessionPrepareRequest,
 ) -> Result<CliProviderContinuation> {
-    for (label, value) in [
-        ("workspace_id", request.workspace_id.as_str()),
-        ("thread_id", request.thread_id.as_str()),
-        ("runtime_id", request.runtime_id.as_str()),
-        ("cwd", request.cwd.as_str()),
-    ] {
-        if value.trim().is_empty() {
-            bail!("Claude provider session request `{label}` cannot be empty");
+    scope_current_stage(Stage::CliContinuation, async {
+        for (label, value) in [
+            ("workspace_id", request.workspace_id.as_str()),
+            ("thread_id", request.thread_id.as_str()),
+            ("runtime_id", request.runtime_id.as_str()),
+            ("cwd", request.cwd.as_str()),
+        ] {
+            if value.trim().is_empty() {
+                bail!("Claude provider session request `{label}` cannot be empty");
+            }
         }
-    }
-    let requested_fork = request.fork.clone();
-    let proposed_provider_session_id = Uuid::new_v4();
-    let (root, cursor) = if let Some(fork) = request.fork.as_ref() {
-        if request.force_new
-            || fork.source_session_id.is_nil()
-            || fork.boundary_message_uuid.is_nil()
-        {
-            bail!("Claude fork preparation has an invalid source or replacement mode");
+        let requested_fork = request.fork.clone();
+        let proposed_provider_session_id = Uuid::new_v4();
+        let (root, cursor) = if let Some(fork) = request.fork.as_ref() {
+            if request.force_new
+                || fork.source_session_id.is_nil()
+                || fork.boundary_message_uuid.is_nil()
+            {
+                bail!("Claude fork preparation has an invalid source or replacement mode");
+            }
+            (
+                Some(fork.source_session_id.to_string()),
+                serialize_cli_runtime_json(&serde_json::json!({
+                    "forkSourceTurnId": fork.source_turn_id,
+                    "forkBoundaryMessageUuid": fork.boundary_message_uuid,
+                }))?,
+            )
+        } else {
+            (
+                None,
+                serialize_cli_runtime_json(&serde_json::json!({
+                    "provider": "claude",
+                    "providerSessionId": "<redacted>"
+                }))?,
+            )
+        };
+        let prepared = store
+            .prepare_claude_provider_session_binding(PrepareClaudeProviderSessionBinding {
+                thread_binding: NewCliRuntimeThreadBinding {
+                    thread_id: request.thread_id,
+                    workspace_id: request.workspace_id,
+                    runtime_id: request.runtime_id,
+                    runtime_kind: "claude".to_owned(),
+                    native_thread_id: proposed_provider_session_id.to_string(),
+                    native_session_id: Some(proposed_provider_session_id.to_string()),
+                    native_root_thread_id: root,
+                    native_cwd: Some(request.cwd),
+                    native_model: request.model,
+                    resume_cursor_json: cursor,
+                    status: "active".to_owned(),
+                    created_at: request.prepared_at,
+                    updated_at: request.prepared_at,
+                },
+                proposed_provider_session_id: proposed_provider_session_id.to_string(),
+                force_new: request.force_new,
+            })
+            .await
+            .context("failed to prepare durable Claude provider session binding")?;
+        let provider = prepared
+            .binding
+            .provider_session
+            .context("prepared Claude binding is missing provider session metadata")?;
+        let provider_session_id = Uuid::parse_str(provider.provider_session_id.as_str())
+            .context("durable Claude provider session identity is not a UUID")?;
+        if provider_session_id.is_nil() {
+            bail!("durable Claude provider session identity cannot be nil");
         }
-        (
-            Some(fork.source_session_id.to_string()),
-            serialize_cli_runtime_json(&serde_json::json!({
-                "forkSourceTurnId": fork.source_turn_id,
-                "forkBoundaryMessageUuid": fork.boundary_message_uuid,
-            }))?,
-        )
-    } else {
-        (
-            None,
-            serialize_cli_runtime_json(&serde_json::json!({
-                "provider": "claude",
-                "providerSessionId": "<redacted>"
-            }))?,
-        )
-    };
-    let prepared = store
-        .prepare_claude_provider_session_binding(PrepareClaudeProviderSessionBinding {
-            thread_binding: NewCliRuntimeThreadBinding {
-                thread_id: request.thread_id,
-                workspace_id: request.workspace_id,
-                runtime_id: request.runtime_id,
-                runtime_kind: "claude".to_owned(),
-                native_thread_id: proposed_provider_session_id.to_string(),
-                native_session_id: Some(proposed_provider_session_id.to_string()),
-                native_root_thread_id: root,
-                native_cwd: Some(request.cwd),
-                native_model: request.model,
-                resume_cursor_json: cursor,
-                status: "active".to_owned(),
-                created_at: request.prepared_at,
-                updated_at: request.prepared_at,
-            },
-            proposed_provider_session_id: proposed_provider_session_id.to_string(),
-            force_new: request.force_new,
-        })
-        .await
-        .context("failed to prepare durable Claude provider session binding")?;
-    let provider = prepared
-        .binding
-        .provider_session
-        .context("prepared Claude binding is missing provider session metadata")?;
-    let provider_session_id = Uuid::parse_str(provider.provider_session_id.as_str())
-        .context("durable Claude provider session identity is not a UUID")?;
-    if provider_session_id.is_nil() {
-        bail!("durable Claude provider session identity cannot be nil");
-    }
-    if let Some(expected) = requested_fork.as_ref() {
-        let cursor = deserialize_cli_runtime_json::<CliRuntimeResumeCursor>(
-            prepared.binding.resume_cursor_json.as_str(),
-        )?;
-        anyhow::ensure!(
-            prepared.binding.native_root_thread_id.as_deref()
-                == Some(expected.source_session_id.to_string().as_str())
-                && cursor
-                    .provider_fields
-                    .get("forkSourceTurnId")
-                    .and_then(serde_json::Value::as_str)
-                    == Some(expected.source_turn_id.as_str())
-                && cursor
-                    .provider_fields
-                    .get("forkBoundaryMessageUuid")
-                    .and_then(serde_json::Value::as_str)
-                    == Some(expected.boundary_message_uuid.to_string().as_str()),
-            "concurrent Claude session preparation changed the accepted fork source or boundary"
-        );
-    }
-    Ok(match prepared.mode {
-        PreparedClaudeProviderSessionMode::New => {
+        if let Some(expected) = requested_fork.as_ref() {
             let cursor = deserialize_cli_runtime_json::<CliRuntimeResumeCursor>(
                 prepared.binding.resume_cursor_json.as_str(),
             )?;
-            if let Some(boundary) = cursor
-                .provider_fields
-                .get("forkBoundaryMessageUuid")
-                .and_then(serde_json::Value::as_str)
-            {
-                CliProviderContinuation::ClaudeFork {
-                    source_session_id: Uuid::parse_str(
-                        prepared
-                            .binding
-                            .native_root_thread_id
-                            .as_deref()
-                            .context("Claude fork has no source session ID")?,
-                    )?,
-                    boundary_message_uuid: Uuid::parse_str(boundary)
-                        .context("Claude fork boundary is not a message UUID")?,
-                    provider_session_id,
-                }
-            } else {
-                CliProviderContinuation::ClaudeNew {
-                    provider_session_id,
+            anyhow::ensure!(
+                prepared.binding.native_root_thread_id.as_deref()
+                    == Some(expected.source_session_id.to_string().as_str())
+                    && cursor
+                        .provider_fields
+                        .get("forkSourceTurnId")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(expected.source_turn_id.as_str())
+                    && cursor
+                        .provider_fields
+                        .get("forkBoundaryMessageUuid")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(expected.boundary_message_uuid.to_string().as_str()),
+                "concurrent Claude session preparation changed the accepted fork source or boundary"
+            );
+        }
+        Ok(match prepared.mode {
+            PreparedClaudeProviderSessionMode::New => {
+                let cursor = deserialize_cli_runtime_json::<CliRuntimeResumeCursor>(
+                    prepared.binding.resume_cursor_json.as_str(),
+                )?;
+                if let Some(boundary) = cursor
+                    .provider_fields
+                    .get("forkBoundaryMessageUuid")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    CliProviderContinuation::ClaudeFork {
+                        source_session_id: Uuid::parse_str(
+                            prepared
+                                .binding
+                                .native_root_thread_id
+                                .as_deref()
+                                .context("Claude fork has no source session ID")?,
+                        )?,
+                        boundary_message_uuid: Uuid::parse_str(boundary)
+                            .context("Claude fork boundary is not a message UUID")?,
+                        provider_session_id,
+                    }
+                } else {
+                    CliProviderContinuation::ClaudeNew {
+                        provider_session_id,
+                    }
                 }
             }
-        }
-        PreparedClaudeProviderSessionMode::Resume => CliProviderContinuation::ClaudeResume {
-            provider_session_id,
-        },
+            PreparedClaudeProviderSessionMode::Resume => CliProviderContinuation::ClaudeResume {
+                provider_session_id,
+            },
+        })
     })
+    .await
 }
 
 const CONTEXT_RECEIPT_VERSION: u32 = 4;

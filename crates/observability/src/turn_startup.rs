@@ -17,6 +17,9 @@ use std::{
 
 const LIMIT: usize = 1024;
 const STAGE_LIMIT: usize = 128;
+mod diagnostics;
+use diagnostics::Diagnostics;
+pub use diagnostics::Work;
 const TTL: Duration = Duration::from_secs(15 * 60);
 const BOUNDS: &[f64] = &[
     5., 10., 25., 50., 100., 250., 500., 1000., 2000., 3000., 5000., 8000., 10000., 15000., 30000.,
@@ -88,12 +91,72 @@ macro_rules! stages { ($($variant:ident => $name:literal),* $(,)?) => {
     impl Stage { pub fn name(self)-> &'static str { match self { $(Self::$variant=>$name),* } } }
 }; }
 stages! {
+ ComposerPrepare=>"task.composer.prepare",
+ ComposerMaterialize=>"task.composer.materialize",
+ SkillsNormalize=>"turn.skills.normalize",
+ SecurityResolve=>"turn.security.resolve",
+ HistoryArtifacts=>"history.artifacts.materialize",
+ CliTransitionWait=>"cli.transition.wait",
+ GatewayWorkerWait=>"gateway.worker.wait",
+ TaskCliPrepare=>"task.cli.prepare",
+ CliTurnPrepare=>"cli.turn.prepare",
+ CliMaterialize=>"cli.materialize",
+ PreflightProvider=>"native.preflight.provider",
  ClientPrepare=>"client.prepare", ClientSessionWait=>"client.session.wait", ClientUpload=>"client.attachments.upload", ClientQueue=>"client.transport.queue", ClientWrite=>"client.transport.write", ClientBridge=>"client.bridge", ClientApply=>"client.apply", ClientEventQueue=>"client.events.queue", ClientWorkerWait=>"client.worker.wait",
  VoiceFinish=>"voice.capture.finish", VoiceFinalize=>"voice.finalize", VoiceVad=>"voice.vad", VoiceWorkerWait=>"voice.worker.wait", VoiceTranscriberWait=>"voice.transcriber.wait", VoiceTranscribe=>"voice.transcribe", VoiceInput=>"voice.transcript_to_input",
  DelegationCreate=>"task.create", DelegationWait=>"task.handoff.wait", ChildPrepare=>"task.child.prepare",
  GatewayDispatch=>"gateway.dispatch", Admission=>"turn.admission", Persist=>"turn.persist", History=>"turn.history", Artifacts=>"turn.artifacts", Skills=>"turn.skills", Security=>"turn.security", Environment=>"turn.environment",
  NativePrepare=>"native.prepare", ContextPrepare=>"native.context.prepare", Preflight=>"native.preflight", Hooks=>"native.hooks", HookPolicy=>"native.hooks.policy", HookContext=>"native.hooks.context", HookPostPreflight=>"native.hooks.post_preflight", HookCompile=>"native.hooks.compile", HookTools=>"native.hooks.tools", CompactionWait=>"native.compaction.wait", CompactionWork=>"native.compaction.work", ProviderConnect=>"native.provider.connect", RuntimeFirstOutput=>"runtime.wait_first_output",
  CliSessionWait=>"cli.session.wait", CliAcquire=>"cli.session.acquire", CliInitialize=>"cli.session.start", CliSpawn=>"cli.process.spawn", CliHandshake=>"cli.initialize", CliThread=>"cli.thread.start_resume", CliMcp=>"cli.mcp.prepare", CliDispatch=>"cli.dispatch", ReadinessWait=>"runtime.readiness.wait",
+ ChildAuthority=>"task.child.authority",
+ ChildReserve=>"task.child.reserve",
+ ChildParent=>"task.child.parent",
+ ChildLocks=>"task.child.locks",
+ ChildOccurrence=>"task.child.occurrence",
+ ChildAction=>"task.child.action_binding",
+ ChildThread=>"task.child.thread",
+ ChildSecurity=>"task.child.security",
+ ChildGraph=>"task.child.graph",
+ ChildPersist=>"task.child.persist",
+ ChildLink=>"task.child.link",
+ ChildValidate=>"task.child.validate",
+ ChildActivate=>"task.child.activate",
+ TaskHistory=>"task.history.prepare",
+ TaskSnapshotPublish=>"task.history.snapshot.publish",
+ TaskSnapshotRestore=>"task.history.snapshot.restore",
+ HistoryAuthority=>"history.authority",
+ HistoryOutputs=>"history.outputs.authorize",
+ HistoryMetadata=>"history.metadata.prepare",
+ HistoryCapture=>"history.capture",
+ HistoryLoad=>"history.load",
+ HistoryBasis=>"history.basis.restore",
+ HistoryCompose=>"history.compose",
+ HistoryOutputsRestore=>"history.outputs.restore",
+ HistoryCheckpoint=>"history.checkpoint.project",
+ HistoryFreeze=>"history.freeze",
+ HistoryFreezeBuild=>"history.freeze.build",
+ HistoryFreezeVerify=>"history.freeze.verify",
+ HistoryFreezePersist=>"history.freeze.persist",
+ HistoryRestore=>"history.restore",
+ HistoryRestoreModel=>"history.restore.model",
+ HistoryBasisHydrate=>"history.basis.hydrate",
+ HistoryCheckpointCompatible=>"history.checkpoint.compatible",
+ CliPrepare=>"cli.prepare",
+ CliAdmission=>"cli.admission",
+ CliPreflight=>"cli.preflight",
+ CliMcpResolve=>"cli.mcp.resolve",
+ CliSkillsPlan=>"cli.skills.plan",
+ CliSkillsInstall=>"cli.skills.install",
+ CliSecurity=>"cli.security",
+ CliPersist=>"cli.persist",
+ CliHistory=>"cli.history.capture",
+ CliDeliveryPlan=>"cli.context.delivery_plan",
+ CliContextBuild=>"cli.context.build",
+ CliContextValidate=>"cli.context.validate",
+ CliContextRevalidate=>"cli.context.revalidate",
+ CliContinuation=>"cli.continuation.prepare",
+ CliFork=>"cli.continuation.fork",
+ CliCompaction=>"cli.history.compact",
  Projection=>"first_output.projection", Fanout=>"first_output.fanout", SocketWrite=>"first_output.socket_write", OutboundQueue=>"first_output.outbound.queue", DbAdmission=>"db.admission.wait", DbAcquire=>"db.pool.acquire", DbExecute=>"db.execute", DbCommit=>"db.commit"
 }
 
@@ -1055,16 +1118,33 @@ pub struct StageGuard {
     inner: Option<(Context, Instant, Vec<KeyValue>)>,
     coverage: Option<(std::sync::Weak<Mutex<Observation>>, usize)>,
     consent_epoch: u64,
+    db: Option<(Stage, Instant, Diagnostics)>,
+    completion: Option<bool>,
 }
 pub fn stage(key: &str, stage: Stage) -> StageGuard {
     let mut coverage = None;
     let mut consent_epoch = crate::telemetry_consent_snapshot().1;
+    let mut db = None;
+    let inherits = shares_observation(current_key().as_deref(), Some(key));
     let inner = (|| {
         let e = get(key)?;
         let mut o = e.lock().ok()?;
         consent_epoch = o.consent_epoch;
         if o.closed {
             return None;
+        }
+        let parent = if inherits && Context::current().span().span_context().is_valid() {
+            Context::current()
+        } else {
+            o.cx.clone()
+        };
+        // Keep accumulating DB work even after the individual DB span budget
+        // is exhausted. No SQL, fingerprints or local identifiers are retained.
+        if diagnostics::is_db(stage) {
+            db = parent
+                .get::<Diagnostics>()
+                .cloned()
+                .map(|d| (stage, Instant::now(), d));
         }
         if o.stages >= STAGE_LIMIT {
             if o.stages == STAGE_LIMIT {
@@ -1089,24 +1169,30 @@ pub fn stage(key: &str, stage: Stage) -> StageGuard {
         let span = build_span_with_consent(
             &crate::telemetry::state()?.tracer,
             SpanBuilder::from_name(stage.name()).with_attributes(attrs.clone()),
-            &if current_key().as_deref() == Some(key)
-                && Context::current().span().span_context().is_valid()
-            {
-                Context::current()
-            } else {
-                o.cx.clone()
-            },
+            &parent,
         );
-        Some((Context::new().with_span(span), Instant::now(), attrs))
+        let diagnostics = Diagnostics::new(parent.get::<Diagnostics>().cloned());
+        Some((
+            parent.with_span(span).with_value(diagnostics),
+            Instant::now(),
+            attrs,
+        ))
     })();
     StageGuard {
         inner,
         coverage,
         consent_epoch,
+        db,
+        completion: None,
     }
 }
 impl Drop for StageGuard {
     fn drop(&mut self) {
+        if crate::telemetry_consent_snapshot() == (true, self.consent_epoch) {
+            if let Some((stage, start, diagnostics)) = self.db.take() {
+                diagnostics.record_db(stage, start.elapsed());
+            }
+        }
         if let Some((entry, index)) = self.coverage.take() {
             if let Some(entry) = entry.upgrade() {
                 if let Ok(mut o) = entry.lock() {
@@ -1117,6 +1203,15 @@ impl Drop for StageGuard {
             }
         }
         if let Some((cx, start, attrs)) = self.inner.take() {
+            if let Some(diagnostics) = cx.get::<Diagnostics>() {
+                cx.span().set_attributes(diagnostics.finish());
+            }
+            if let Some(returned) = self.completion {
+                cx.span().set_attribute(KeyValue::new(
+                    "stage.completion",
+                    if returned { "returned" } else { "dropped" },
+                ));
+            }
             if crate::telemetry_consent_snapshot() == (true, self.consent_epoch) {
                 if let Some(m) = METRICS.get() {
                     m.stage
@@ -1293,7 +1388,22 @@ pub fn current_stage(stage_name: Stage) -> StageGuard {
             inner: None,
             coverage: None,
             consent_epoch: crate::telemetry_consent_snapshot().1,
+            db: None,
+            completion: None,
         })
+}
+// Alias-aware: parent and delegated child share a recorder but have different
+// local keys. Comparing registry pointers never exports either key.
+fn shares_observation(first: Option<&str>, second: Option<&str>) -> bool {
+    match (first, second) {
+        (Some(first), Some(second)) if first == second => true,
+        (Some(first), Some(second)) => registry().lock().is_ok_and(|map| {
+            map.get(first)
+                .zip(map.get(second))
+                .is_some_and(|(a, b)| Arc::ptr_eq(a, b))
+        }),
+        _ => false,
+    }
 }
 struct CurrentGuard(Option<String>);
 impl CurrentGuard {
@@ -1309,8 +1419,8 @@ impl Drop for CurrentGuard {
 /// Installs context only for a single poll; Pending never leaks a thread-local guard.
 pub fn scope<F: std::future::Future>(key: Option<String>, future: F) -> Scoped<F> {
     Scoped {
+        parent: shares_observation(current_key().as_deref(), key.as_deref()).then(Context::current),
         key,
-        parent: None,
         inner: Box::pin(future),
     }
 }
@@ -1337,7 +1447,7 @@ impl<F: std::future::Future> std::future::Future for Scoped<F> {
     }
 }
 pub fn scope_sync<T>(key: Option<String>, work: impl FnOnce() -> T) -> T {
-    let parent = if current_key() == key {
+    let parent = if shares_observation(current_key().as_deref(), key.as_deref()) {
         Context::current()
     } else {
         key.as_deref()
@@ -1382,6 +1492,11 @@ pub fn record_current_duration(stage_name: Stage, elapsed: Duration) {
         let Ok(mut o) = entry.lock() else {
             return;
         };
+        if !o.closed && diagnostics::is_db(stage_name) {
+            if let Some(diagnostics) = Context::current().get::<Diagnostics>() {
+                diagnostics.record_db(stage_name, elapsed);
+            }
+        }
         if o.closed
             || o.stages >= STAGE_LIMIT
             || (stage_name.name().starts_with("db.") && o.db_stages >= 24)
@@ -1407,10 +1522,18 @@ pub fn record_current_duration(stage_name: Stage, elapsed: Duration) {
             SpanBuilder::from_name(stage_name.name())
                 .with_start_time(start)
                 .with_attributes(attrs.clone()),
-            &o.cx,
+            &if shares_observation(current_key().as_deref(), Some(&key)) {
+                Context::current()
+            } else {
+                o.cx.clone()
+            },
         );
         use opentelemetry::trace::Span as _;
         let mut span = span;
+        span.set_attribute(KeyValue::new(
+            "stage.duration_ms",
+            elapsed.as_secs_f64() * 1000.,
+        ));
         span.end_with_timestamp(end);
         if let Some(m) = METRICS.get() {
             m.stage.record(elapsed.as_secs_f64() * 1000., &attrs);
@@ -1903,6 +2026,244 @@ mod regression_tests {
         let attrs = format!("{:?}", o.attrs());
         assert!(!attrs.contains("private-turn") && !attrs.contains("123"));
     }
+
+    fn captured_phase(
+        tracer: &opentelemetry_sdk::trace::SdkTracer,
+        name: Stage,
+        parent: &Context,
+    ) -> StageGuard {
+        let span = tracer.build_with_context(SpanBuilder::from_name(name.name()), parent);
+        let diagnostics = Diagnostics::new(parent.get::<Diagnostics>().cloned());
+        StageGuard {
+            inner: Some((
+                parent.with_span(span).with_value(diagnostics),
+                Instant::now(),
+                vec![],
+            )),
+            coverage: None,
+            consent_epoch: crate::telemetry_consent_snapshot().1,
+            db: None,
+            completion: None,
+        }
+    }
+
+    #[test]
+    fn nested_phase_and_alias_parent_survive_an_owned_worker_future() {
+        use opentelemetry::trace::TracerProvider;
+        use std::future::Future;
+        let _lock = crate::telemetry::tests::TELEMETRY_TEST_LOCK.lock().unwrap();
+        let capture = Capture::default();
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_simple_exporter(capture.clone())
+            .build();
+        let tracer = provider.tracer("startup-phase-test");
+        let entry = Arc::new(Mutex::new(observation()));
+        registry().lock().unwrap().extend([
+            ("phase-parent".into(), entry.clone()),
+            ("phase-child".into(), entry),
+        ]);
+        let outer = captured_phase(&tracer, Stage::ChildPrepare, &Context::new());
+        let mut future = Box::pin(run_stage(Some("phase-parent".into()), Some(outer), async {
+            let tracer = tracer.clone();
+            let worker = scope(Some("phase-child".into()), async move {
+                let guard = captured_phase(&tracer, Stage::HistoryMetadata, &Context::current());
+                run_stage(Some("phase-child".into()), Some(guard), async {
+                    let diagnostics = Context::current().get::<Diagnostics>().unwrap().clone();
+                    diagnostics.record_db(Stage::DbExecute, Duration::from_millis(12));
+                    diagnostics.record_work(Work::Quanta, 3);
+                })
+                .await;
+            });
+            std::thread::spawn(move || {
+                assert!(
+                    Box::pin(worker)
+                        .as_mut()
+                        .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
+                        .is_ready()
+                );
+                assert!(current_key().is_none());
+            })
+            .join()
+            .unwrap();
+        }));
+        assert!(
+            future
+                .as_mut()
+                .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
+                .is_ready()
+        );
+        drop(future);
+        registry()
+            .lock()
+            .unwrap()
+            .retain(|key, _| !matches!(key.as_str(), "phase-parent" | "phase-child"));
+        provider.force_flush().unwrap();
+        let spans = capture.0.lock().unwrap();
+        let child = spans
+            .iter()
+            .find(|s| s.name == Stage::HistoryMetadata.name())
+            .unwrap();
+        let outer = spans
+            .iter()
+            .find(|s| s.name == Stage::ChildPrepare.name())
+            .unwrap();
+        assert_eq!(child.parent_span_id, outer.span_context.span_id());
+        for span in [child, outer] {
+            assert!(
+                span.attributes
+                    .contains(&KeyValue::new("stage.db.execute.count", 1_i64))
+            );
+            assert!(
+                span.attributes
+                    .contains(&KeyValue::new("stage.db.execute_ms", 12.))
+            );
+            assert!(
+                span.attributes
+                    .contains(&KeyValue::new("stage.completion", "returned"))
+            );
+        }
+        assert!(
+            child
+                .attributes
+                .contains(&KeyValue::new("stage.work.quanta", 3_i64))
+        );
+        assert!(current_key().is_none());
+    }
+
+    #[test]
+    fn db_summary_continues_after_both_span_limits_without_extra_observations() {
+        use opentelemetry::trace::TracerProvider;
+        let _lock = crate::telemetry::tests::TELEMETRY_TEST_LOCK.lock().unwrap();
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder().build();
+        let tracer = provider.tracer("startup-db-cap-test");
+        for stages in [24, STAGE_LIMIT] {
+            let diagnostics = Diagnostics::default();
+            let mut o = observation();
+            o.stages = stages;
+            o.db_stages = 24;
+            o.cx = Context::new()
+                .with_span(tracer.start("phase"))
+                .with_value(diagnostics.clone());
+            let entry = Arc::new(Mutex::new(o));
+            registry()
+                .lock()
+                .unwrap()
+                .insert("phase-db-cap".into(), entry.clone());
+            scope_sync(Some("phase-db-cap".into()), || {
+                for _ in 0..40 {
+                    let guard = current_stage(Stage::DbExecute);
+                    assert!(guard.inner.is_none());
+                    drop(guard);
+                    record_current_duration(Stage::DbAcquire, Duration::from_millis(2));
+                }
+            });
+            let attrs = diagnostics.finish();
+            assert!(attrs.contains(&KeyValue::new("stage.db.execute.count", 40_i64)));
+            assert!(attrs.contains(&KeyValue::new("stage.db.pool.count", 40_i64)));
+            assert!(attrs.contains(&KeyValue::new("stage.db.pool_ms", 80.)));
+            assert_eq!(entry.lock().unwrap().db_stages, 24);
+            assert!(entry.lock().unwrap().intervals.is_empty());
+            registry().lock().unwrap().remove("phase-db-cap");
+        }
+    }
+
+    #[test]
+    fn suppressed_phase_keeps_the_nearest_parent_summary() {
+        use opentelemetry::trace::TracerProvider;
+        use std::future::Future;
+        let _lock = crate::telemetry::tests::TELEMETRY_TEST_LOCK.lock().unwrap();
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder().build();
+        let tracer = provider.tracer("startup-suppressed-phase-test");
+        let mut o = observation();
+        o.stages = STAGE_LIMIT;
+        registry()
+            .lock()
+            .unwrap()
+            .insert("suppressed-phase".into(), Arc::new(Mutex::new(o)));
+        let outer = captured_phase(&tracer, Stage::ChildPrepare, &Context::new());
+        let diagnostics = outer
+            .inner
+            .as_ref()
+            .unwrap()
+            .0
+            .get::<Diagnostics>()
+            .unwrap()
+            .clone();
+        let mut future = Box::pin(run_stage(
+            Some("suppressed-phase".into()),
+            Some(outer),
+            async {
+                scope_current_stage(Stage::HistoryLoad, async {
+                    record_current_duration(Stage::DbAcquire, Duration::from_millis(7));
+                })
+                .await;
+            },
+        ));
+        assert!(
+            future
+                .as_mut()
+                .poll(&mut std::task::Context::from_waker(
+                    std::task::Waker::noop(),
+                ))
+                .is_ready()
+        );
+        drop(future);
+        registry().lock().unwrap().remove("suppressed-phase");
+        assert!(
+            diagnostics
+                .finish()
+                .contains(&KeyValue::new("stage.db.pool_ms", 7.))
+        );
+        assert!(current_key().is_none());
+    }
+
+    #[test]
+    fn dropping_a_pending_phase_closes_its_span_and_restores_the_callers_context() {
+        use opentelemetry::trace::TracerProvider;
+        use std::future::Future;
+        let capture = Capture::default();
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_simple_exporter(capture.clone())
+            .build();
+        let tracer = provider.tracer("startup-cancel-test");
+        let phase = captured_phase(&tracer, Stage::HistoryCapture, &Context::new());
+        let diagnostics = phase
+            .inner
+            .as_ref()
+            .unwrap()
+            .0
+            .get::<Diagnostics>()
+            .unwrap()
+            .clone();
+        let mut future = Box::pin(run_stage(
+            Some("cancel-phase".into()),
+            Some(phase),
+            std::future::pending::<()>(),
+        ));
+        assert!(
+            future
+                .as_mut()
+                .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
+                .is_pending()
+        );
+        assert!(current_key().is_none());
+        drop(future);
+        diagnostics.record_db(Stage::DbExecute, Duration::from_secs(1));
+        assert!(
+            diagnostics
+                .finish()
+                .contains(&KeyValue::new("stage.db.execute.count", 0_i64))
+        );
+        provider.force_flush().unwrap();
+        let spans = capture.0.lock().unwrap();
+        assert_eq!(spans.len(), 1);
+        assert!(
+            spans[0]
+                .attributes
+                .contains(&KeyValue::new("stage.completion", "dropped"))
+        );
+        assert!(current_key().is_none());
+    }
 }
 
 /// Nested stage parentage is installed per poll, so concurrent turns cannot inherit it.
@@ -1912,15 +2273,76 @@ pub async fn scope_stage<F: std::future::Future>(
     future: F,
 ) -> F::Output {
     let guard = key.as_deref().map(|key| stage(key, name));
+    run_stage(key, guard, future).await
+}
+
+async fn run_stage<F: std::future::Future>(
+    key: Option<String>,
+    mut guard: Option<StageGuard>,
+    future: F,
+) -> F::Output {
+    if let Some(guard) = guard.as_mut() {
+        guard.completion = Some(false);
+    }
     let parent = guard
         .as_ref()
-        .and_then(|g| g.inner.as_ref().map(|(cx, _, _)| cx.clone()));
-    Scoped {
+        .and_then(|g| g.inner.as_ref().map(|(cx, _, _)| cx.clone()))
+        .or_else(|| {
+            shares_observation(current_key().as_deref(), key.as_deref()).then(Context::current)
+        });
+    let result = Scoped {
         key,
         parent,
         inner: Box::pin(future),
     }
-    .await
+    .await;
+    if let Some(guard) = guard.as_mut() {
+        guard.completion = Some(true);
+    }
+    result
+}
+
+/// Measures a phase in the current startup and installs its parent per poll.
+/// Outside startup (or after first output/opt-out) this creates no observation.
+pub fn scope_current_stage<F: std::future::Future>(
+    name: Stage,
+    future: F,
+) -> impl std::future::Future<Output = F::Output> {
+    scope_stage(current_key(), name, future)
+}
+
+/// Adds a bounded numeric work count to the current phase's span only.
+pub fn record_work(work: Work, count: u64) {
+    if !active() {
+        return;
+    }
+    let Some(entry) = current_key().as_deref().and_then(get) else {
+        return;
+    };
+    if entry.lock().is_ok_and(|o| !o.closed) {
+        if let Some(diagnostics) = Context::current().get::<Diagnostics>() {
+            diagnostics.record_work(work, count);
+        }
+    }
+}
+
+/// Synchronous CPU/filesystem preparation gets its own phase without attaching
+/// an OpenTelemetry context across an await point.
+pub fn stage_sync<T>(name: Stage, work: impl FnOnce() -> T) -> T {
+    let key = current_key();
+    let mut guard = key.as_deref().map(|key| stage(key, name));
+    if let Some(guard) = guard.as_mut() {
+        guard.completion = Some(false);
+    }
+    let parent = guard
+        .as_ref()
+        .and_then(|g| g.inner.as_ref().map(|(cx, _, _)| cx.clone()));
+    let _parent = parent.map(|parent| parent.attach());
+    let result = work();
+    if let Some(guard) = guard.as_mut() {
+        guard.completion = Some(true);
+    }
+    result
 }
 /// The queue marker is local monotonic time, never an RPC timestamp.
 pub fn client_write(payload: &str, connection: u64) -> Option<StageGuard> {
@@ -2194,6 +2616,8 @@ pub fn client_apply(key: &str) -> Option<StageGuard> {
         inner: Some((Context::new().with_span(span), Instant::now(), attrs)),
         coverage: None,
         consent_epoch: o.consent_epoch,
+        db: None,
+        completion: None,
     })
 }
 

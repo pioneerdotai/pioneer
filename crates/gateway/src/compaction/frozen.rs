@@ -7,6 +7,7 @@ use pioneer_compaction::frozen::{
     FrozenHistoryRef, FrozenInputAliasConflict, FrozenMessageRef, FrozenSourceAlias,
 };
 use pioneer_crud::compaction::{DeliveryCheckpointImportSource, PreparedFrozenImport};
+use pioneer_observability::turn_startup::{Stage, Work, record_work, scope_current_stage};
 use pioneer_provider::{
     CanonicalProviderRoundEnvelope, ChatMessage, MessageProvenance, MessageSourceAlias,
     MessageSourceIdentity, MessageSourceRef,
@@ -208,6 +209,7 @@ async fn accepted_history_scopes_prepared(
                 ordinal,
             )
             .await?;
+        record_work(Work::Pages, 1);
         ensure!(
             !page.is_empty(),
             "accepted Task manifest lost its reference page"
@@ -293,101 +295,104 @@ async fn hydrate_accepted_own_view(
     messages: &mut [ChatMessage],
     view: AcceptedHydrationView,
 ) -> Result<()> {
-    if history_json.trim_start().starts_with('[') {
-        return Ok(());
-    }
-    ensure!(
-        !execution_thread.is_empty(),
-        "missing accepted execution context"
-    );
-    let descriptor: FrozenHistoryRef = serde_json::from_str(history_json)?;
-    let (_, references) =
-        frozen_manifest_references(store, workspace, Some(parent), &descriptor, None).await?;
-    let mut checkpoint_graphs = super::coverage::CheckpointGraphResolver::default();
-    let accepted = read_accepted_imports(
-        store,
-        workspace,
-        parent,
-        &descriptor,
-        &references,
-        Some(execution_thread),
-        &mut checkpoint_graphs,
-    )
-    .await?;
-    if accepted.is_empty() {
-        return Ok(());
-    }
-
-    if matches!(view, AcceptedHydrationView::Literal) {
+    scope_current_stage(Stage::HistoryBasisHydrate, async {
+        if history_json.trim_start().starts_with('[') {
+            return Ok(());
+        }
         ensure!(
-            messages.len() == references.len(),
-            "accepted Task basis identity mismatch"
+            !execution_thread.is_empty(),
+            "missing accepted execution context"
         );
-        return hydrate_visible_messages(
-            messages,
+        let descriptor: FrozenHistoryRef = serde_json::from_str(history_json)?;
+        let (_, references) =
+            frozen_manifest_references(store, workspace, Some(parent), &descriptor, None).await?;
+        let mut checkpoint_graphs = super::coverage::CheckpointGraphResolver::default();
+        let accepted = read_accepted_imports(
+            store,
+            workspace,
+            parent,
+            &descriptor,
             &references,
-            &(0..references.len()).collect::<Vec<_>>(),
-            &accepted,
-            execution_thread,
-        );
-    }
+            Some(execution_thread),
+            &mut checkpoint_graphs,
+        )
+        .await?;
+        if accepted.is_empty() {
+            return Ok(());
+        }
 
-    // Provenance is not a per-message key: legacy task-basis arrays assign
-    // the same source/unit identity to every message. Reconstruct the visible
-    // ordinal sequence once, preserving gaps left by today's typed policy,
-    // then pair that sequence positionally with the already restored history.
-    // This is linear, accepts duplicate identities, and never guesses which
-    // duplicate an accepted import belongs to.
-    let mut allowed = BTreeSet::from([parent.to_owned()]);
-    for reference in &references {
-        allowed.insert(reference.source_thread.clone());
-        allowed.extend(reference.context_thread.clone());
-    }
-    let mut visible_ordinals = Vec::with_capacity(messages.len());
-    let mut restore_state = FrozenExecutionRestoreState::from_references(
-        store,
-        workspace,
-        &allowed,
-        &references,
-        &mut checkpoint_graphs,
-    )
-    .await?;
-    for (page_index, page) in references
-        .chunks(pioneer_crud::compaction::SOURCE_PAGE_ROWS as usize)
-        .enumerate()
-    {
-        let restored = restore_execution_entries_page(
+        if matches!(view, AcceptedHydrationView::Literal) {
+            ensure!(
+                messages.len() == references.len(),
+                "accepted Task basis identity mismatch"
+            );
+            return hydrate_visible_messages(
+                messages,
+                &references,
+                &(0..references.len()).collect::<Vec<_>>(),
+                &accepted,
+                execution_thread,
+            );
+        }
+
+        // Provenance is not a per-message key: legacy task-basis arrays assign
+        // the same source/unit identity to every message. Reconstruct the visible
+        // ordinal sequence once, preserving gaps left by today's typed policy,
+        // then pair that sequence positionally with the already restored history.
+        // This is linear, accepts duplicate identities, and never guesses which
+        // duplicate an accepted import belongs to.
+        let mut allowed = BTreeSet::from([parent.to_owned()]);
+        for reference in &references {
+            allowed.insert(reference.source_thread.clone());
+            allowed.extend(reference.context_thread.clone());
+        }
+        let mut visible_ordinals = Vec::with_capacity(messages.len());
+        let mut restore_state = FrozenExecutionRestoreState::from_references(
             store,
             workspace,
             &allowed,
-            page,
+            &references,
             &mut checkpoint_graphs,
-            &mut restore_state,
         )
         .await?;
+        for (page_index, page) in references
+            .chunks(pioneer_crud::compaction::SOURCE_PAGE_ROWS as usize)
+            .enumerate()
+        {
+            let restored = restore_execution_entries_page(
+                store,
+                workspace,
+                &allowed,
+                page,
+                &mut checkpoint_graphs,
+                &mut restore_state,
+            )
+            .await?;
+            ensure!(
+                restored.len() == page.len(),
+                "frozen history count mismatch"
+            );
+            let page_start = page_index * pioneer_crud::compaction::SOURCE_PAGE_ROWS as usize;
+            visible_ordinals.extend(
+                restored
+                    .into_iter()
+                    .enumerate()
+                    .filter_map(|(page_ordinal, entry)| entry.map(|_| page_start + page_ordinal)),
+            );
+        }
         ensure!(
-            restored.len() == page.len(),
-            "frozen history count mismatch"
+            messages.len() == visible_ordinals.len(),
+            "accepted Task basis identity mismatch"
         );
-        let page_start = page_index * pioneer_crud::compaction::SOURCE_PAGE_ROWS as usize;
-        visible_ordinals.extend(
-            restored
-                .into_iter()
-                .enumerate()
-                .filter_map(|(page_ordinal, entry)| entry.map(|_| page_start + page_ordinal)),
-        );
-    }
-    ensure!(
-        messages.len() == visible_ordinals.len(),
-        "accepted Task basis identity mismatch"
-    );
-    hydrate_visible_messages(
-        messages,
-        &references,
-        &visible_ordinals,
-        &accepted,
-        execution_thread,
-    )
+        hydrate_visible_messages(
+            messages,
+            &references,
+            &visible_ordinals,
+            &accepted,
+            execution_thread,
+        )
+    })
+    .await
 }
 
 fn hydrate_visible_messages(
@@ -479,6 +484,7 @@ async fn read_accepted_imports(
         let page = store
             .compaction_frozen_import_page(workspace, parent, &descriptor.manifest_id, ordinal)
             .await?;
+        record_work(Work::Pages, 1);
         ensure!(!page.is_empty(), "accepted Task import metadata has a gap");
         for record in page {
             let bytes = serde_json::to_vec(&record)?;
@@ -896,660 +902,686 @@ pub(super) async fn capture_execution_basis_prepared_with_outputs(
     policy: Option<&pioneer_protocol::TaskAgentContextPolicy>,
     outputs: Option<&super::delivered::AuthorizedOutputSet>,
 ) -> Result<PreparedHistory> {
-    let mut checkpoint_graphs = super::coverage::CheckpointGraphResolver::default();
-    if let Some(outputs) = outputs {
-        ensure!(
-            outputs.workspace == workspace && outputs.destination == thread,
-            "accepted outputs belong to another context"
-        );
-    }
-    let omits_history = policy.is_some_and(|policy| {
-        matches!(
-            policy.mode,
-            pioneer_protocol::TaskAgentContextMode::Empty
-                | pioneer_protocol::TaskAgentContextMode::Custom
-        ) || (policy.mode == pioneer_protocol::TaskAgentContextMode::SummaryOnly
-            && !policy.include_parent_summary)
-    });
-    let includes_parent_summary = policy.is_none_or(|policy| {
-        policy.include_parent_summary
-            && !matches!(
+    scope_current_stage(Stage::HistoryCapture, async {
+        let mut checkpoint_graphs = super::coverage::CheckpointGraphResolver::default();
+        if let Some(outputs) = outputs {
+            ensure!(
+                outputs.workspace == workspace && outputs.destination == thread,
+                "accepted outputs belong to another context"
+            );
+        }
+        let omits_history = policy.is_some_and(|policy| {
+            matches!(
                 policy.mode,
                 pioneer_protocol::TaskAgentContextMode::Empty
                     | pioneer_protocol::TaskAgentContextMode::Custom
-            )
-    });
-    if !omits_history && outputs.is_none() {
-        super::history::prepare_history(&store, workspace, thread).await?;
-    }
-    let epoch = match outputs {
-        Some(outputs) => *outputs
-            .source_epochs
-            .get(thread)
-            .ok_or_else(|| anyhow::anyhow!("accepted outputs lost their destination epoch"))?,
-        None => {
-            store
-                .compaction_projection_version(workspace, thread)
-                .await?
+            ) || (policy.mode == pioneer_protocol::TaskAgentContextMode::SummaryOnly
+                && !policy.include_parent_summary)
+        });
+        let includes_parent_summary = policy.is_none_or(|policy| {
+            policy.include_parent_summary
+                && !matches!(
+                    policy.mode,
+                    pioneer_protocol::TaskAgentContextMode::Empty
+                        | pioneer_protocol::TaskAgentContextMode::Custom
+                )
+        });
+        if !omits_history && outputs.is_none() {
+            super::history::prepare_history(&store, workspace, thread).await?;
         }
-    };
-    let owner = super::native::native_owner(workspace, thread);
-    let captured_head = if !omits_history && includes_parent_summary {
-        Some(match outputs {
-            Some(outputs) => outputs.checkpoint.clone(),
-            None => store.compaction_head(&owner).await?,
-        })
-    } else {
-        None
-    };
-    // Capture the head before the raw append fence. A checkpoint published
-    // after this point cannot be substituted into this preparation; appends
-    // between these reads remain ordinary uncovered tail history.
-    let fence = match outputs {
-        Some(outputs) => outputs.fence.clone(),
-        None => store.compaction_history_read_fence().await?,
-    };
-    let projection_head = if let Some(Some(head)) = captured_head.as_ref() {
-        Some(
-            select_captured_head_before_excluded_turn(
-                store,
-                workspace,
-                thread,
-                &owner,
-                head,
-                excluded_turn,
-                &mut checkpoint_graphs,
-            )
-            .await?,
-        )
-    } else {
-        captured_head.clone()
-    };
-    let mut covered_history = BTreeSet::new();
-    let mut primary_covered_history = BTreeSet::new();
-    let mut external_graph = None;
-    let mut exact_replay_aliases = BTreeSet::new();
-    let mut covered_item_aliases = BTreeSet::new();
-    let mut covered_event_input_evidence = BTreeMap::new();
-    if let Some(Some(head)) = &projection_head
-        && let Some(root) = store
-            .compaction_checkpoint_source(workspace, thread, head)
-            .await?
-        && let Some(graph) = checkpoint_graphs
-            .resolve(&store, workspace, None, &root)
-            .await?
-    {
-        external_graph = Some(graph.clone());
-        primary_covered_history.extend(graph.leaves.iter().cloned());
-        covered_history.extend(graph.leaves.iter().cloned());
-        covered_history.extend(
-            graph
-                .replay_aliases
-                .keys()
-                .filter(|replay| !graph.input_replay_aliases.contains(*replay))
-                .cloned(),
-        );
-        covered_item_aliases.extend(graph.replay_aliases.iter().filter_map(
-            |(replay, covered_source)| {
-                let turn = covered_source.source.scope.strip_prefix("item:")?;
-                (replay.thread == covered_source.thread).then(|| {
-                    (
-                        covered_source.thread.clone(),
-                        turn.to_owned(),
-                        covered_source.source.id.clone(),
-                    )
-                })
-            },
-        ));
-        covered_item_aliases.extend(graph.replay_item_aliases.iter().cloned());
-        covered_event_input_evidence.extend(
-            graph
-                .event_input_evidence
-                .iter()
-                .map(|(source, role)| (source.clone(), role.clone())),
-        );
-        exact_replay_aliases.extend(
-            graph
-                .replay_aliases
-                .keys()
-                .filter(|alias| {
-                    alias.thread == thread && !graph.input_replay_aliases.contains(*alias)
-                })
-                .cloned(),
-        );
-    }
-    let mut messages = if omits_history {
-        Vec::new()
-    } else if covered_history.iter().any(|leaf| leaf.thread == thread)
-        || !exact_replay_aliases.is_empty()
-    {
-        super::history::load_task_line_history_excluding(
-            &store,
-            workspace,
-            thread,
-            excluded_turn,
-            &fence,
-            super::history::HistoryCoverageSelection {
-                sources: &primary_covered_history,
-                exact_replay_aliases: &exact_replay_aliases,
-                item_aliases: &covered_item_aliases,
-                event_input_evidence: &covered_event_input_evidence,
-            },
-        )
-        .await?
-    } else {
-        super::history::load_task_line_history(&store, workspace, thread, excluded_turn, &fence)
-            .await?
-    };
-    let mut allowed = BTreeSet::from([thread.to_owned()]);
-    let mut epochs = outputs
-        .map(|outputs| outputs.source_epochs.clone())
-        .unwrap_or_else(|| BTreeMap::from([(thread.to_owned(), epoch)]));
-    let mut accepted_turn = basis_turn.map(str::to_owned);
-    let mut imports = BTreeMap::<ScopedHistorySource, Vec<PreparedFrozenImport>>::new();
-    let mut external_input_evidence = None;
-    let basis = if omits_history {
-        None
-    } else {
-        let exact = if let Some(turn) = basis_turn {
-            store
-                .compaction_task_basis_snapshot(workspace, thread, turn)
-                .await?
+        let epoch = match outputs {
+            Some(outputs) => *outputs
+                .source_epochs
+                .get(thread)
+                .ok_or_else(|| anyhow::anyhow!("accepted outputs lost their destination epoch"))?,
+            None => {
+                store
+                    .compaction_projection_version(workspace, thread)
+                    .await?
+            }
+        };
+        let owner = super::native::native_owner(workspace, thread);
+        let captured_head = if !omits_history && includes_parent_summary {
+            Some(match outputs {
+                Some(outputs) => outputs.checkpoint.clone(),
+                None => store.compaction_head(&owner).await?,
+            })
         } else {
             None
         };
-        if exact.is_some() {
-            exact
-        } else if let Some(turn) = store
-            .compaction_latest_task_basis_turn(workspace, thread, &fence)
-            .await?
+        // Capture the head before the raw append fence. A checkpoint published
+        // after this point cannot be substituted into this preparation; appends
+        // between these reads remain ordinary uncovered tail history.
+        let fence = match outputs {
+            Some(outputs) => outputs.fence.clone(),
+            None => store.compaction_history_read_fence().await?,
+        };
+        let projection_head = if let Some(Some(head)) = captured_head.as_ref() {
+            Some(
+                select_captured_head_before_excluded_turn(
+                    store,
+                    workspace,
+                    thread,
+                    &owner,
+                    head,
+                    excluded_turn,
+                    &mut checkpoint_graphs,
+                )
+                .await?,
+            )
+        } else {
+            captured_head.clone()
+        };
+        let mut covered_history = BTreeSet::new();
+        let mut primary_covered_history = BTreeSet::new();
+        let mut external_graph = None;
+        let mut exact_replay_aliases = BTreeSet::new();
+        let mut covered_item_aliases = BTreeSet::new();
+        let mut covered_event_input_evidence = BTreeMap::new();
+        if let Some(Some(head)) = &projection_head
+            && let Some(root) = store
+                .compaction_checkpoint_source(workspace, thread, head)
+                .await?
+            && let Some(graph) = checkpoint_graphs
+                .resolve(&store, workspace, None, &root)
+                .await?
         {
-            accepted_turn = Some(turn.clone());
-            store
-                .compaction_task_basis_snapshot(workspace, thread, &turn)
-                .await?
-        } else {
-            None
+            external_graph = Some(graph.clone());
+            primary_covered_history.extend(graph.leaves.iter().cloned());
+            covered_history.extend(graph.leaves.iter().cloned());
+            covered_history.extend(
+                graph
+                    .replay_aliases
+                    .keys()
+                    .filter(|replay| !graph.input_replay_aliases.contains(*replay))
+                    .cloned(),
+            );
+            covered_item_aliases.extend(graph.replay_aliases.iter().filter_map(
+                |(replay, covered_source)| {
+                    let turn = covered_source.source.scope.strip_prefix("item:")?;
+                    (replay.thread == covered_source.thread).then(|| {
+                        (
+                            covered_source.thread.clone(),
+                            turn.to_owned(),
+                            covered_source.source.id.clone(),
+                        )
+                    })
+                },
+            ));
+            covered_item_aliases.extend(graph.replay_item_aliases.iter().cloned());
+            covered_event_input_evidence.extend(
+                graph
+                    .event_input_evidence
+                    .iter()
+                    .map(|(source, role)| (source.clone(), role.clone())),
+            );
+            exact_replay_aliases.extend(
+                graph
+                    .replay_aliases
+                    .keys()
+                    .filter(|alias| {
+                        alias.thread == thread && !graph.input_replay_aliases.contains(*alias)
+                    })
+                    .cloned(),
+            );
         }
-    };
-    if let Some(basis) = basis {
-        let basis_scopes = accepted_history_scopes_prepared(
-            &store,
-            workspace,
-            &basis.parent_thread,
-            &basis.history_json,
-        )
-        .await?;
-        allowed.extend(basis_scopes);
-        for source_thread in &allowed {
-            if !epochs.contains_key(source_thread) {
-                epochs.insert(
-                    source_thread.clone(),
-                    store
-                        .compaction_projection_version(workspace, source_thread)
-                        .await?,
-                );
-            }
-        }
-        let legacy_basis = basis.history_json.trim_start().starts_with('[');
-        let mut retained_imports = None;
-        let mut projected_imports = Vec::new();
-        let mut inherited = if legacy_basis {
-            crate::turn_runtime_snapshot::restore_history_json(
+        let mut messages = if omits_history {
+            Vec::new()
+        } else if covered_history.iter().any(|leaf| leaf.thread == thread)
+            || !exact_replay_aliases.is_empty()
+        {
+            super::history::load_task_line_history_excluding(
                 &store,
                 workspace,
-                &allowed,
-                &basis.history_json,
+                thread,
+                excluded_turn,
+                &fence,
+                super::history::HistoryCoverageSelection {
+                    sources: &primary_covered_history,
+                    exact_replay_aliases: &exact_replay_aliases,
+                    item_aliases: &covered_item_aliases,
+                    event_input_evidence: &covered_event_input_evidence,
+                },
             )
             .await?
         } else {
-            let descriptor: FrozenHistoryRef = serde_json::from_str(&basis.history_json)?;
-            let restored = restore_accepted_execution_basis_prepared(
-                &store,
-                workspace,
-                &basis.parent_thread,
-                thread,
-                &allowed,
-                &descriptor,
-                &covered_history,
-                external_graph.as_deref(),
-                projection_head.as_ref().and_then(|head| head.as_deref()),
-                policy,
-                &messages,
-                outputs,
-                &covered_history,
-                &mut checkpoint_graphs,
-            )
-            .await?;
-            retained_imports = Some(restored.retained_imports);
-            projected_imports = restored.projected_imports;
-            external_input_evidence = Some(restored.external_evidence);
-            messages = messages
-                .into_iter()
-                .enumerate()
-                .filter_map(|(index, message)| {
-                    (!restored.excluded_following.contains(&index)).then_some(message)
-                })
-                .collect();
-            restored.messages
-        };
-        if legacy_basis {
-            let reference = store
-                .compaction_legacy_task_basis_source(workspace, &basis.parent_thread, &basis.run_id)
+            super::history::load_task_line_history(&store, workspace, thread, excluded_turn, &fence)
                 .await?
-                .ok_or_else(|| anyhow::anyhow!("accepted legacy Task basis disappeared"))?;
-            let body = super::history::reference_payload(
-                &store,
-                workspace,
-                &basis.parent_thread,
-                &reference,
-            )
-            .await?;
-            ensure!(
-                body == basis.history_json,
-                "accepted legacy Task basis changed during capture"
-            );
-            // Retain the exact accepted messages as one opaque inherited unit.
-            // No original-turn boundaries are inferred from the legacy array.
-            for message in &mut inherited {
-                message.provenance = Some(MessageProvenance {
-                    logical_turn_id: None,
-                    workspace_id: workspace.into(),
-                    thread_id: basis.parent_thread.clone(),
-                    context_thread: None,
-                    unit_id: format!("legacy-task-basis:{}", basis.run_id),
-                    sources: vec![MessageSourceRef {
-                        scope: reference.scope.clone(),
-                        id: reference.id.clone(),
-                        version: reference.version.clone(),
-                    }],
-                    source_aliases: vec![],
-                    ambiguous_input_aliases: vec![],
-                    complete: true,
-                    protected_input: false,
-                    inherited: true,
-                });
+        };
+        let mut allowed = BTreeSet::from([thread.to_owned()]);
+        let mut epochs = outputs
+            .map(|outputs| outputs.source_epochs.clone())
+            .unwrap_or_else(|| BTreeMap::from([(thread.to_owned(), epoch)]));
+        let mut accepted_turn = basis_turn.map(str::to_owned);
+        let mut imports = BTreeMap::<ScopedHistorySource, Vec<PreparedFrozenImport>>::new();
+        let mut external_input_evidence = None;
+        let basis = if omits_history {
+            None
+        } else {
+            let exact = if let Some(turn) = basis_turn {
+                store
+                    .compaction_task_basis_snapshot(workspace, thread, turn)
+                    .await?
+            } else {
+                None
+            };
+            if exact.is_some() {
+                exact
+            } else if let Some(turn) = store
+                .compaction_latest_task_basis_turn(workspace, thread, &fence)
+                .await?
+            {
+                accepted_turn = Some(turn.clone());
+                store
+                    .compaction_task_basis_snapshot(workspace, thread, &turn)
+                    .await?
+            } else {
+                None
             }
-        }
-        if legacy_basis {
-            hydrate_accepted_own(
-                &store,
-                workspace,
-                &basis.parent_thread,
-                &basis.history_json,
-                thread,
-                &mut inherited,
-            )
-            .await?;
-        }
-        // Hydration promotes only explicitly accepted own imports. Preserve
-        // that evidence when recapturing the child; provenance alone is not a grant.
-        if !legacy_basis {
-            let turn = accepted_turn
-                .as_deref()
-                .ok_or_else(|| anyhow::anyhow!("accepted execution turn missing"))?;
-            for retained in retained_imports.take().expect("nonlegacy basis imports") {
-                if let Some(target) = retained.checkpoint_target {
-                    let prepared = store
-                        .compaction_prepare_accepted_checkpoint_imports(
-                            workspace,
-                            thread,
-                            turn,
-                            &retained.import_ordinals,
-                            &target.thread,
-                            &target.source,
-                        )
-                        .await?;
-                    imports.entry(target).or_default().extend(prepared);
+        };
+        if let Some(basis) = basis {
+            messages = scope_current_stage(Stage::HistoryBasis, async {
+                let basis_scopes = accepted_history_scopes_prepared(
+                    &store,
+                    workspace,
+                    &basis.parent_thread,
+                    &basis.history_json,
+                )
+                .await?;
+                allowed.extend(basis_scopes);
+                for source_thread in &allowed {
+                    if !epochs.contains_key(source_thread) {
+                        epochs.insert(
+                            source_thread.clone(),
+                            store
+                                .compaction_projection_version(workspace, source_thread)
+                                .await?,
+                        );
+                    }
+                }
+                let legacy_basis = basis.history_json.trim_start().starts_with('[');
+                let mut retained_imports = None;
+                let mut projected_imports = Vec::new();
+                let mut inherited = if legacy_basis {
+                    crate::turn_runtime_snapshot::restore_history_json(
+                        &store,
+                        workspace,
+                        &allowed,
+                        &basis.history_json,
+                    )
+                    .await?
                 } else {
-                    for ordinal in retained.import_ordinals {
+                    let descriptor: FrozenHistoryRef = serde_json::from_str(&basis.history_json)?;
+                    let restored = restore_accepted_execution_basis_prepared(
+                        &store,
+                        workspace,
+                        &basis.parent_thread,
+                        thread,
+                        &allowed,
+                        &descriptor,
+                        &covered_history,
+                        external_graph.as_deref(),
+                        projection_head.as_ref().and_then(|head| head.as_deref()),
+                        policy,
+                        &messages,
+                        outputs,
+                        &covered_history,
+                        &mut checkpoint_graphs,
+                    )
+                    .await?;
+                    retained_imports = Some(restored.retained_imports);
+                    projected_imports = restored.projected_imports;
+                    external_input_evidence = Some(restored.external_evidence);
+                    messages = messages
+                        .into_iter()
+                        .enumerate()
+                        .filter_map(|(index, message)| {
+                            (!restored.excluded_following.contains(&index)).then_some(message)
+                        })
+                        .collect();
+                    restored.messages
+                };
+                if legacy_basis {
+                    let reference = store
+                        .compaction_legacy_task_basis_source(
+                            workspace,
+                            &basis.parent_thread,
+                            &basis.run_id,
+                        )
+                        .await?
+                        .ok_or_else(|| anyhow::anyhow!("accepted legacy Task basis disappeared"))?;
+                    let body = super::history::reference_payload(
+                        &store,
+                        workspace,
+                        &basis.parent_thread,
+                        &reference,
+                    )
+                    .await?;
+                    ensure!(
+                        body == basis.history_json,
+                        "accepted legacy Task basis changed during capture"
+                    );
+                    // Retain the exact accepted messages as one opaque inherited unit.
+                    // No original-turn boundaries are inferred from the legacy array.
+                    for message in &mut inherited {
+                        message.provenance = Some(MessageProvenance {
+                            logical_turn_id: None,
+                            workspace_id: workspace.into(),
+                            thread_id: basis.parent_thread.clone(),
+                            context_thread: None,
+                            unit_id: format!("legacy-task-basis:{}", basis.run_id),
+                            sources: vec![MessageSourceRef {
+                                scope: reference.scope.clone(),
+                                id: reference.id.clone(),
+                                version: reference.version.clone(),
+                            }],
+                            source_aliases: vec![],
+                            ambiguous_input_aliases: vec![],
+                            complete: true,
+                            protected_input: false,
+                            inherited: true,
+                        });
+                    }
+                }
+                if legacy_basis {
+                    hydrate_accepted_own(
+                        &store,
+                        workspace,
+                        &basis.parent_thread,
+                        &basis.history_json,
+                        thread,
+                        &mut inherited,
+                    )
+                    .await?;
+                }
+                // Hydration promotes only explicitly accepted own imports. Preserve
+                // that evidence when recapturing the child; provenance alone is not a grant.
+                if !legacy_basis {
+                    let turn = accepted_turn
+                        .as_deref()
+                        .ok_or_else(|| anyhow::anyhow!("accepted execution turn missing"))?;
+                    for retained in retained_imports.take().expect("nonlegacy basis imports") {
+                        if let Some(target) = retained.checkpoint_target {
+                            let prepared = store
+                                .compaction_prepare_accepted_checkpoint_imports(
+                                    workspace,
+                                    thread,
+                                    turn,
+                                    &retained.import_ordinals,
+                                    &target.thread,
+                                    &target.source,
+                                )
+                                .await?;
+                            imports.entry(target).or_default().extend(prepared);
+                        } else {
+                            for ordinal in retained.import_ordinals {
+                                let prepared = store
+                                    .compaction_prepare_accepted_import(
+                                        workspace, thread, turn, ordinal,
+                                    )
+                                    .await?;
+                                imports
+                                    .entry(ScopedHistorySource {
+                                        thread: prepared.source_thread().into(),
+                                        source: prepared.source().clone(),
+                                    })
+                                    .or_default()
+                                    .push(prepared);
+                            }
+                        }
+                    }
+                    for projected in projected_imports {
                         let prepared = store
-                            .compaction_prepare_accepted_import(workspace, thread, turn, ordinal)
+                            .compaction_prepare_accepted_checkpoint_imports(
+                                workspace,
+                                thread,
+                                turn,
+                                &projected.import_ordinals,
+                                &projected.target.thread,
+                                &projected.target.source,
+                            )
                             .await?;
                         imports
-                            .entry(ScopedHistorySource {
-                                thread: prepared.source_thread().into(),
-                                source: prepared.source().clone(),
-                            })
+                            .entry(projected.target.clone())
                             .or_default()
-                            .push(prepared);
+                            .extend(prepared);
+                    }
+                }
+                messages = compose_frozen_basis_with_resolver(
+                    &store,
+                    workspace,
+                    thread,
+                    &allowed,
+                    &inherited,
+                    &messages,
+                    &mut checkpoint_graphs,
+                )
+                .await?;
+                Ok::<_, anyhow::Error>(messages)
+            })
+            .await?;
+        }
+        let mut own_outputs = BTreeMap::<ScopedHistorySource, (usize, u64)>::new();
+        // Only roots produced while projecting a delivered output may consume its
+        // delivery grants. Parent summaries and accepted-basis checkpoints have
+        // independent provenance, even when their historical leaves overlap.
+        let mut delivery_replacements = BTreeMap::<
+            ScopedHistorySource,
+            BTreeMap<usize, Vec<DeliveryCheckpointImportSource>>,
+        >::new();
+        if !omits_history && let Some(outputs) = outputs {
+            messages = scope_current_stage(Stage::HistoryOutputsRestore, async {
+                record_work(Work::Branches, outputs.branches.len() as u64);
+                for (branch_index, branch) in outputs.branches.iter().enumerate() {
+                    allowed.extend(branch.source_threads.iter().cloned());
+                    let RestoredFrozenSelection {
+                        messages: mut imported,
+                        original_ordinals,
+                        boundary_messages,
+                        boundary_original_ordinals,
+                        model_ordinals,
+                    } = restore_authorized_output_branch(
+                        &store,
+                        workspace,
+                        thread,
+                        &allowed,
+                        branch,
+                        FrozenCoverageSelection {
+                            sources: &covered_history,
+                            event_input_evidence: &covered_event_input_evidence,
+                        },
+                        &mut checkpoint_graphs,
+                    )
+                    .await?;
+                    ensure!(
+                        imported.len() == original_ordinals.len(),
+                        "filtered Task output lost its immutable ordinals"
+                    );
+                    ensure!(
+                        boundary_messages.len() == boundary_original_ordinals.len(),
+                        "Task output boundary lost its immutable ordinals"
+                    );
+                    let layout =
+                        pioneer_agent::compaction::history::NativeHistoryLayout::from_messages(
+                            workspace,
+                            thread,
+                            &boundary_messages,
+                            &vec![0; boundary_messages.len()],
+                        )?;
+                    for (unit, indexes) in layout.units.iter().zip(&layout.message_indexes) {
+                        if unit.role != pioneer_compaction::SourceRole::Own
+                            || !unit.complete
+                            || unit.protected_input
+                        {
+                            continue;
+                        }
+                        for index in indexes {
+                            let origin = boundary_messages[*index]
+                                .provenance
+                                .as_ref()
+                                .ok_or_else(|| anyhow::anyhow!("output origin is missing"))?;
+                            for reference in &origin.sources {
+                                let reference = source(reference);
+                                let key = ScopedHistorySource {
+                                    thread: origin.thread_id.clone(),
+                                    source: reference,
+                                };
+                                own_outputs
+                                    .entry(key.clone())
+                                    .or_insert((branch_index, boundary_original_ordinals[*index]));
+                            }
+                        }
+                    }
+                    let mut projected_replacements = BTreeMap::new();
+                    super::checkpoint::project_accepted_checkpoints_with_boundary_evidence(
+                        &store,
+                        workspace,
+                        thread,
+                        &allowed,
+                        &mut imported,
+                        Some(super::checkpoint::ProjectionBoundaryEvidence {
+                            messages: &boundary_messages,
+                            model_ordinals: &model_ordinals,
+                        }),
+                        Some(&mut projected_replacements),
+                        &mut checkpoint_graphs,
+                    )
+                    .await?;
+                    for (root, selected) in projected_replacements {
+                        let mut grants = BTreeSet::new();
+                        for index in selected {
+                            let origin =
+                                boundary_messages[index]
+                                    .provenance
+                                    .as_ref()
+                                    .ok_or_else(|| {
+                                        anyhow::anyhow!("projected output lost its source origin")
+                                    })?;
+                            for reference in &origin.sources {
+                                grants.insert((
+                                    boundary_original_ordinals[index],
+                                    origin.thread_id.clone(),
+                                    source(reference),
+                                ));
+                            }
+                        }
+                        delivery_replacements.entry(root).or_default().insert(
+                            branch_index,
+                            grants
+                                .into_iter()
+                                .map(|(output_ordinal, source_thread, source)| {
+                                    DeliveryCheckpointImportSource {
+                                        output_ordinal,
+                                        source_thread,
+                                        source,
+                                    }
+                                })
+                                .collect(),
+                        );
+                    }
+                    // The delivered text is the transport copy of this exact output.
+                    // Denied branches never reach here and retain that disclosed text.
+                    messages = remove_delivered_projection_with_resolver(
+                        &store,
+                        workspace,
+                        thread,
+                        &allowed,
+                        messages,
+                        &branch.acknowledgements,
+                        &mut checkpoint_graphs,
+                    )
+                    .await?;
+                    messages = compose_frozen_basis_with_resolver(
+                        &store,
+                        workspace,
+                        thread,
+                        &allowed,
+                        &messages,
+                        &imported,
+                        &mut checkpoint_graphs,
+                    )
+                    .await?;
+                }
+                Ok::<_, anyhow::Error>(messages)
+            })
+            .await?;
+        }
+        if includes_parent_summary
+            && let Some(head) = projection_head.as_ref().and_then(|head| head.clone())
+        {
+            let selected_head = super::checkpoint::project_compatible_checkpoint_with_resolver(
+                &store,
+                super::checkpoint::ProjectionContext {
+                    workspace,
+                    context_thread: thread,
+                    source_thread: thread,
+                    owner: &owner,
+                    allowed: &allowed,
+                    allow_historical_gaps: projection_head.is_some(),
+                },
+                head.as_str(),
+                &mut messages,
+                &mut checkpoint_graphs,
+            )
+            .await?;
+            if let (Some(selected_head), Some(evidence)) =
+                (selected_head, external_input_evidence.take())
+            {
+                let checkpoint_source = store
+                    .compaction_checkpoint_source(workspace, thread, &selected_head)
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("selected external checkpoint disappeared"))?;
+                let graph = checkpoint_graphs
+                    .resolve(&store, workspace, Some(&allowed), &checkpoint_source)
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("selected external graph disappeared"))?;
+                let carrier = messages.iter_mut().find(|message| {
+                    message.provenance.as_ref().is_some_and(|origin| {
+                        origin.thread_id == thread
+                            && origin.sources.len() == 1
+                            && source(&origin.sources[0]) == checkpoint_source
+                    })
+                });
+                let origin = carrier
+                    .and_then(|message| message.provenance.as_mut())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("selected external checkpoint has no carrier")
+                    })?;
+                let aliases = origin.source_aliases.iter().chain(evidence.aliases.iter());
+                let ambiguous = origin
+                    .ambiguous_input_aliases
+                    .iter()
+                    .chain(evidence.ambiguous.iter());
+                let merged = super::checkpoint::transferred_input_evidence(
+                    &graph.leaves,
+                    aliases,
+                    ambiguous,
+                );
+                origin.source_aliases = merged.aliases;
+                origin.ambiguous_input_aliases = merged.ambiguous;
+            }
+        }
+        order_history_by_creation(&store, workspace, &mut messages).await?;
+        if let Some(policy) = policy {
+            select_task_history(&mut messages, policy)?;
+        }
+        // Selection defines the available context. Normalize only inside that
+        // boundary so an older representation cannot consume the sole selected
+        // copy and then be discarded by the policy.
+        super::history::normalize_task_input_copies(&store, workspace, &mut messages).await?;
+        if let Some(outputs) = outputs {
+            for message in &messages {
+                let origin = message
+                    .provenance
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("accepted history lost its source origin"))?;
+                if origin.inherited {
+                    continue;
+                }
+                for reference in &origin.sources {
+                    let key = ScopedHistorySource {
+                        thread: origin.thread_id.clone(),
+                        source: source(reference),
+                    };
+                    if let Some(grant) = own_outputs.get(&key) {
+                        let (branch_index, ordinal) = *grant;
+                        let branch = &outputs.branches[branch_index];
+                        let prepared = store
+                            .compaction_prepare_frozen_import(
+                                workspace,
+                                thread,
+                                &branch.snapshot.delivery_id,
+                                &branch.acknowledgement,
+                                ordinal,
+                                &key.thread,
+                                &key.source,
+                            )
+                            .await?;
+                        imports.entry(key).or_default().push(prepared);
+                    } else if let Some(branches) = delivery_replacements.get(&key)
+                        && !imports.contains_key(&key)
+                    {
+                        let graph = checkpoint_graphs
+                            .resolve(&store, workspace, Some(&allowed), &key.source)
+                            .await?
+                            .ok_or_else(|| anyhow::anyhow!("checkpoint root is unavailable"))?;
+                        ensure!(
+                            !graph.leaves.is_empty(),
+                            "checkpoint replacement has no delivered output leaves"
+                        );
+                        let mut selected_branch = None;
+                        for (branch_index, sources) in branches {
+                            let mut represented = BTreeSet::new();
+                            for grant in sources {
+                                let scoped = ScopedHistorySource {
+                                    thread: grant.source_thread.clone(),
+                                    source: grant.source.clone(),
+                                };
+                                if grant.source.scope.starts_with("checkpoint:") {
+                                    let granted_graph = checkpoint_graphs
+                                        .resolve(&store, workspace, Some(&allowed), &grant.source)
+                                        .await?
+                                        .ok_or_else(|| {
+                                            anyhow::anyhow!("granted checkpoint is unavailable")
+                                        })?;
+                                    represented.extend(granted_graph.leaves.iter().cloned());
+                                } else {
+                                    represented.insert(scoped);
+                                }
+                            }
+                            if represented == graph.leaves {
+                                selected_branch = Some((*branch_index, sources));
+                                break;
+                            }
+                        }
+                        let (branch_index, sources) = selected_branch.ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "checkpoint replacement exceeds each accepted Task delivery"
+                            )
+                        })?;
+                        let branch = &outputs.branches[branch_index];
+                        let prepared = store
+                            .compaction_prepare_delivery_checkpoint_imports(
+                                workspace,
+                                thread,
+                                &branch.snapshot.delivery_id,
+                                &branch.acknowledgement,
+                                sources,
+                                &key.thread,
+                                &key.source,
+                            )
+                            .await?;
+                        imports.entry(key).or_default().extend(prepared);
                     }
                 }
             }
-            for projected in projected_imports {
-                let prepared = store
-                    .compaction_prepare_accepted_checkpoint_imports(
-                        workspace,
-                        thread,
-                        turn,
-                        &projected.import_ordinals,
-                        &projected.target.thread,
-                        &projected.target.source,
-                    )
-                    .await?;
-                imports
-                    .entry(projected.target.clone())
-                    .or_default()
-                    .extend(prepared);
-            }
         }
-        messages = compose_frozen_basis_with_resolver(
+        let mut prepared = capture_with_imports_prepared(
             &store,
             workspace,
             thread,
             &allowed,
-            &inherited,
             &messages,
-            &mut checkpoint_graphs,
+            &imports,
+            checkpoint_graphs,
         )
         .await?;
-    }
-    let mut own_outputs = BTreeMap::<ScopedHistorySource, (usize, u64)>::new();
-    // Only roots produced while projecting a delivered output may consume its
-    // delivery grants. Parent summaries and accepted-basis checkpoints have
-    // independent provenance, even when their historical leaves overlap.
-    let mut delivery_replacements =
-        BTreeMap::<ScopedHistorySource, BTreeMap<usize, Vec<DeliveryCheckpointImportSource>>>::new(
-        );
-    if !omits_history && let Some(outputs) = outputs {
-        for (branch_index, branch) in outputs.branches.iter().enumerate() {
-            allowed.extend(branch.source_threads.iter().cloned());
-            let RestoredFrozenSelection {
-                messages: mut imported,
-                original_ordinals,
-                boundary_messages,
-                boundary_original_ordinals,
-                model_ordinals,
-            } = restore_authorized_output_branch(
-                &store,
-                workspace,
-                thread,
-                &allowed,
-                branch,
-                FrozenCoverageSelection {
-                    sources: &covered_history,
-                    event_input_evidence: &covered_event_input_evidence,
-                },
-                &mut checkpoint_graphs,
-            )
-            .await?;
-            ensure!(
-                imported.len() == original_ordinals.len(),
-                "filtered Task output lost its immutable ordinals"
-            );
-            ensure!(
-                boundary_messages.len() == boundary_original_ordinals.len(),
-                "Task output boundary lost its immutable ordinals"
-            );
-            let layout = pioneer_agent::compaction::history::NativeHistoryLayout::from_messages(
-                workspace,
-                thread,
-                &boundary_messages,
-                &vec![0; boundary_messages.len()],
-            )?;
-            for (unit, indexes) in layout.units.iter().zip(&layout.message_indexes) {
-                if unit.role != pioneer_compaction::SourceRole::Own
-                    || !unit.complete
-                    || unit.protected_input
-                {
-                    continue;
-                }
-                for index in indexes {
-                    let origin = boundary_messages[*index]
-                        .provenance
-                        .as_ref()
-                        .ok_or_else(|| anyhow::anyhow!("output origin is missing"))?;
-                    for reference in &origin.sources {
-                        let reference = source(reference);
-                        let key = ScopedHistorySource {
-                            thread: origin.thread_id.clone(),
-                            source: reference,
-                        };
-                        own_outputs
-                            .entry(key.clone())
-                            .or_insert((branch_index, boundary_original_ordinals[*index]));
-                    }
-                }
-            }
-            let mut projected_replacements = BTreeMap::new();
-            super::checkpoint::project_accepted_checkpoints_with_boundary_evidence(
-                &store,
-                workspace,
-                thread,
-                &allowed,
-                &mut imported,
-                Some(super::checkpoint::ProjectionBoundaryEvidence {
-                    messages: &boundary_messages,
-                    model_ordinals: &model_ordinals,
-                }),
-                Some(&mut projected_replacements),
-                &mut checkpoint_graphs,
-            )
-            .await?;
-            for (root, selected) in projected_replacements {
-                let mut grants = BTreeSet::new();
-                for index in selected {
-                    let origin = boundary_messages[index]
-                        .provenance
-                        .as_ref()
-                        .ok_or_else(|| {
-                            anyhow::anyhow!("projected output lost its source origin")
-                        })?;
-                    for reference in &origin.sources {
-                        grants.insert((
-                            boundary_original_ordinals[index],
-                            origin.thread_id.clone(),
-                            source(reference),
-                        ));
-                    }
-                }
-                delivery_replacements.entry(root).or_default().insert(
-                    branch_index,
-                    grants
-                        .into_iter()
-                        .map(|(output_ordinal, source_thread, source)| {
-                            DeliveryCheckpointImportSource {
-                                output_ordinal,
-                                source_thread,
-                                source,
-                            }
-                        })
-                        .collect(),
-                );
-            }
-            // The delivered text is the transport copy of this exact output.
-            // Denied branches never reach here and retain that disclosed text.
-            messages = remove_delivered_projection_with_resolver(
-                &store,
-                workspace,
-                thread,
-                &allowed,
-                messages,
-                &branch.acknowledgements,
-                &mut checkpoint_graphs,
-            )
-            .await?;
-            messages = compose_frozen_basis_with_resolver(
-                &store,
-                workspace,
-                thread,
-                &allowed,
-                &messages,
-                &imported,
-                &mut checkpoint_graphs,
-            )
-            .await?;
-        }
-    }
-    if includes_parent_summary
-        && let Some(head) = projection_head.as_ref().and_then(|head| head.clone())
-    {
-        let selected_head = super::checkpoint::project_compatible_checkpoint_with_resolver(
-            &store,
-            super::checkpoint::ProjectionContext {
-                workspace,
-                context_thread: thread,
-                source_thread: thread,
-                owner: &owner,
-                allowed: &allowed,
-                allow_historical_gaps: projection_head.is_some(),
-            },
-            head.as_str(),
-            &mut messages,
-            &mut checkpoint_graphs,
-        )
-        .await?;
-        if let (Some(selected_head), Some(evidence)) =
-            (selected_head, external_input_evidence.take())
-        {
-            let checkpoint_source = store
-                .compaction_checkpoint_source(workspace, thread, &selected_head)
-                .await?
-                .ok_or_else(|| anyhow::anyhow!("selected external checkpoint disappeared"))?;
-            let graph = checkpoint_graphs
-                .resolve(&store, workspace, Some(&allowed), &checkpoint_source)
-                .await?
-                .ok_or_else(|| anyhow::anyhow!("selected external graph disappeared"))?;
-            let carrier = messages.iter_mut().find(|message| {
-                message.provenance.as_ref().is_some_and(|origin| {
-                    origin.thread_id == thread
-                        && origin.sources.len() == 1
-                        && source(&origin.sources[0]) == checkpoint_source
-                })
-            });
-            let origin = carrier
-                .and_then(|message| message.provenance.as_mut())
-                .ok_or_else(|| anyhow::anyhow!("selected external checkpoint has no carrier"))?;
-            let aliases = origin.source_aliases.iter().chain(evidence.aliases.iter());
-            let ambiguous = origin
-                .ambiguous_input_aliases
-                .iter()
-                .chain(evidence.ambiguous.iter());
-            let merged =
-                super::checkpoint::transferred_input_evidence(&graph.leaves, aliases, ambiguous);
-            origin.source_aliases = merged.aliases;
-            origin.ambiguous_input_aliases = merged.ambiguous;
-        }
-    }
-    order_history_by_creation(&store, workspace, &mut messages).await?;
-    if let Some(policy) = policy {
-        select_task_history(&mut messages, policy)?;
-    }
-    // Selection defines the available context. Normalize only inside that
-    // boundary so an older representation cannot consume the sole selected
-    // copy and then be discarded by the policy.
-    super::history::normalize_task_input_copies(&store, workspace, &mut messages).await?;
-    if let Some(outputs) = outputs {
-        for message in &messages {
-            let origin = message
-                .provenance
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("accepted history lost its source origin"))?;
-            if origin.inherited {
-                continue;
-            }
-            for reference in &origin.sources {
-                let key = ScopedHistorySource {
-                    thread: origin.thread_id.clone(),
-                    source: source(reference),
-                };
-                if let Some(grant) = own_outputs.get(&key) {
-                    let (branch_index, ordinal) = *grant;
-                    let branch = &outputs.branches[branch_index];
-                    let prepared = store
-                        .compaction_prepare_frozen_import(
-                            workspace,
-                            thread,
-                            &branch.snapshot.delivery_id,
-                            &branch.acknowledgement,
-                            ordinal,
-                            &key.thread,
-                            &key.source,
-                        )
-                        .await?;
-                    imports.entry(key).or_default().push(prepared);
-                } else if let Some(branches) = delivery_replacements.get(&key)
-                    && !imports.contains_key(&key)
-                {
-                    let graph = checkpoint_graphs
-                        .resolve(&store, workspace, Some(&allowed), &key.source)
-                        .await?
-                        .ok_or_else(|| anyhow::anyhow!("checkpoint root is unavailable"))?;
-                    ensure!(
-                        !graph.leaves.is_empty(),
-                        "checkpoint replacement has no delivered output leaves"
-                    );
-                    let mut selected_branch = None;
-                    for (branch_index, sources) in branches {
-                        let mut represented = BTreeSet::new();
-                        for grant in sources {
-                            let scoped = ScopedHistorySource {
-                                thread: grant.source_thread.clone(),
-                                source: grant.source.clone(),
-                            };
-                            if grant.source.scope.starts_with("checkpoint:") {
-                                let granted_graph = checkpoint_graphs
-                                    .resolve(&store, workspace, Some(&allowed), &grant.source)
-                                    .await?
-                                    .ok_or_else(|| {
-                                        anyhow::anyhow!("granted checkpoint is unavailable")
-                                    })?;
-                                represented.extend(granted_graph.leaves.iter().cloned());
-                            } else {
-                                represented.insert(scoped);
-                            }
-                        }
-                        if represented == graph.leaves {
-                            selected_branch = Some((*branch_index, sources));
-                            break;
-                        }
-                    }
-                    let (branch_index, sources) = selected_branch.ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "checkpoint replacement exceeds each accepted Task delivery"
-                        )
-                    })?;
-                    let branch = &outputs.branches[branch_index];
-                    let prepared = store
-                        .compaction_prepare_delivery_checkpoint_imports(
-                            workspace,
-                            thread,
-                            &branch.snapshot.delivery_id,
-                            &branch.acknowledgement,
-                            sources,
-                            &key.thread,
-                            &key.source,
-                        )
-                        .await?;
-                    imports.entry(key).or_default().extend(prepared);
-                }
-            }
-        }
-    }
-    let mut prepared = capture_with_imports_prepared(
-        &store,
-        workspace,
-        thread,
-        &allowed,
-        &messages,
-        &imports,
-        checkpoint_graphs,
-    )
-    .await?;
 
-    for (source_thread, expected) in &epochs {
-        ensure!(
-            store
-                .compaction_projection_version(workspace, source_thread)
-                .await?
-                == *expected,
-            "parent history changed while freezing the accepted context"
-        );
-    }
-    prepared.source_epochs = prepared_source_epochs(&prepared.accepted_scopes, &epochs)?;
-    prepared.expected_checkpoint = captured_head.flatten();
-    prepared.checkpoint = projection_head.flatten();
-    Ok(prepared)
+        for (source_thread, expected) in &epochs {
+            ensure!(
+                store
+                    .compaction_projection_version(workspace, source_thread)
+                    .await?
+                    == *expected,
+                "parent history changed while freezing the accepted context"
+            );
+        }
+        prepared.source_epochs = prepared_source_epochs(&prepared.accepted_scopes, &epochs)?;
+        prepared.expected_checkpoint = captured_head.flatten();
+        prepared.checkpoint = projection_head.flatten();
+        Ok(prepared)
+    })
+    .await
 }
 
 /// A head captured before the append fence is temporally bounded, but a caller
@@ -1789,107 +1821,110 @@ async fn compose_frozen_basis_with_resolver(
     own: &[ChatMessage],
     checkpoint_graphs: &mut super::coverage::CheckpointGraphResolver,
 ) -> Result<Vec<ChatMessage>> {
-    use pioneer_agent::compaction::composition::{
-        AcceptedContextBranch, ScopedHistorySource, compose_context,
-    };
-    let mut checkpoints = BTreeMap::new();
-    let mut checkpoint_domains = BTreeMap::new();
-    let mut checkpoint_evidence = BTreeMap::new();
-    for message in inherited.iter().chain(own) {
-        let origin = message.provenance.as_ref().ok_or_else(|| {
-            anyhow::anyhow!("accepted Task basis has no canonical source identity")
-        })?;
-        for reference in &origin.sources {
-            if reference.scope.starts_with("checkpoint:") {
-                let source = source(reference);
-                let key = ScopedHistorySource {
-                    thread: origin.thread_id.clone(),
-                    source: source.clone(),
-                };
-                if !checkpoints.contains_key(&key) {
-                    let graph = checkpoint_graphs
-                        .resolve(store, workspace, Some(allowed), &source)
-                        .await?
-                        .ok_or_else(|| anyhow::anyhow!("checkpoint root is unavailable"))?;
-                    let metadata = checkpoint_graphs
-                        .projection_metadata(store, workspace, &graph)
-                        .await?;
-                    checkpoint_domains.insert(key.clone(), metadata.coverage_domain);
-                    checkpoints.insert(key.clone(), graph.leaves.clone());
-                    checkpoint_evidence.insert(key, graph);
+    scope_current_stage(Stage::HistoryCompose, async {
+        use pioneer_agent::compaction::composition::{
+            AcceptedContextBranch, ScopedHistorySource, compose_context,
+        };
+        let mut checkpoints = BTreeMap::new();
+        let mut checkpoint_domains = BTreeMap::new();
+        let mut checkpoint_evidence = BTreeMap::new();
+        for message in inherited.iter().chain(own) {
+            let origin = message.provenance.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("accepted Task basis has no canonical source identity")
+            })?;
+            for reference in &origin.sources {
+                if reference.scope.starts_with("checkpoint:") {
+                    let source = source(reference);
+                    let key = ScopedHistorySource {
+                        thread: origin.thread_id.clone(),
+                        source: source.clone(),
+                    };
+                    if !checkpoints.contains_key(&key) {
+                        let graph = checkpoint_graphs
+                            .resolve(store, workspace, Some(allowed), &source)
+                            .await?
+                            .ok_or_else(|| anyhow::anyhow!("checkpoint root is unavailable"))?;
+                        let metadata = checkpoint_graphs
+                            .projection_metadata(store, workspace, &graph)
+                            .await?;
+                        checkpoint_domains.insert(key.clone(), metadata.coverage_domain);
+                        checkpoints.insert(key.clone(), graph.leaves.clone());
+                        checkpoint_evidence.insert(key, graph);
+                    }
                 }
             }
         }
-    }
-    let mut inherited = inherited.to_vec();
-    let mut own = own.to_vec();
-    for message in inherited.iter_mut().chain(own.iter_mut()) {
-        let origin = message.provenance.as_mut().expect("accepted origin");
-        let [source] = origin.sources.as_slice() else {
-            continue;
-        };
-        if !source.scope.starts_with("checkpoint:") {
-            continue;
+        let mut inherited = inherited.to_vec();
+        let mut own = own.to_vec();
+        for message in inherited.iter_mut().chain(own.iter_mut()) {
+            let origin = message.provenance.as_mut().expect("accepted origin");
+            let [source] = origin.sources.as_slice() else {
+                continue;
+            };
+            if !source.scope.starts_with("checkpoint:") {
+                continue;
+            }
+            let key = ScopedHistorySource {
+                thread: origin.thread_id.clone(),
+                source: self::source(source),
+            };
+            let graph = checkpoint_evidence
+                .get(&key)
+                .ok_or_else(|| anyhow::anyhow!("checkpoint graph evidence disappeared"))?;
+            super::checkpoint::merge_graph_input_evidence(origin, graph);
         }
-        let key = ScopedHistorySource {
-            thread: origin.thread_id.clone(),
-            source: self::source(source),
-        };
-        let graph = checkpoint_evidence
-            .get(&key)
-            .ok_or_else(|| anyhow::anyhow!("checkpoint graph evidence disappeared"))?;
-        super::checkpoint::merge_graph_input_evidence(origin, graph);
-    }
-    loop {
-        let result = compose_context(
-            workspace,
-            thread,
-            &[
-                AcceptedContextBranch {
-                    thread,
-                    messages: &inherited,
-                    checkpoints: &checkpoints,
-                    checkpoint_domains: &checkpoint_domains,
-                },
-                AcceptedContextBranch {
-                    thread,
-                    messages: &own,
-                    checkpoints: &checkpoints,
-                    checkpoint_domains: &checkpoint_domains,
-                },
-            ],
-        );
-        let Err(error) = result else {
-            return result;
-        };
-        let Some(overlap) =
-            error.downcast_ref::<pioneer_agent::compaction::composition::SplitRawInputsRequired>()
-        else {
-            return Err(error);
-        };
-        let split_inherited = super::compatible::split_raw_overlap(
-            store,
-            workspace,
-            allowed,
-            &inherited,
-            &overlap.affected,
-        )
-        .await?;
-        let split_own = super::compatible::split_raw_overlap(
-            store,
-            workspace,
-            allowed,
-            &own,
-            &overlap.affected,
-        )
-        .await?;
-        ensure!(
-            split_inherited != inherited || split_own != own,
-            "overlapping raw units cannot be normalized as canonical inputs"
-        );
-        inherited = split_inherited;
-        own = split_own;
-    }
+        loop {
+            let result = compose_context(
+                workspace,
+                thread,
+                &[
+                    AcceptedContextBranch {
+                        thread,
+                        messages: &inherited,
+                        checkpoints: &checkpoints,
+                        checkpoint_domains: &checkpoint_domains,
+                    },
+                    AcceptedContextBranch {
+                        thread,
+                        messages: &own,
+                        checkpoints: &checkpoints,
+                        checkpoint_domains: &checkpoint_domains,
+                    },
+                ],
+            );
+            let Err(error) = result else {
+                return result;
+            };
+            let Some(overlap) = error
+                .downcast_ref::<pioneer_agent::compaction::composition::SplitRawInputsRequired>()
+            else {
+                return Err(error);
+            };
+            let split_inherited = super::compatible::split_raw_overlap(
+                store,
+                workspace,
+                allowed,
+                &inherited,
+                &overlap.affected,
+            )
+            .await?;
+            let split_own = super::compatible::split_raw_overlap(
+                store,
+                workspace,
+                allowed,
+                &own,
+                &overlap.affected,
+            )
+            .await?;
+            ensure!(
+                split_inherited != inherited || split_own != own,
+                "overlapping raw units cannot be normalized as canonical inputs"
+            );
+            inherited = split_inherited;
+            own = split_own;
+        }
+    })
+    .await
 }
 
 /// Order messages by the creation time of their original rows.
@@ -2474,410 +2509,434 @@ async fn capture_with_imports_prepared_using_renderer(
     imports: &BTreeMap<ScopedHistorySource, Vec<PreparedFrozenImport>>,
     renderer: CaptureRenderer,
 ) -> Result<PreparedHistory> {
-    let mut checkpoint_graphs = renderer.checkpoint_graphs;
-    ensure!(
-        allowed_threads.contains(owner_thread),
-        "frozen history owner is not authorized"
-    );
-    for message in messages {
-        let origin = message.provenance.as_ref().ok_or_else(|| {
-            anyhow::anyhow!("new frozen history requires canonical source identities")
-        })?;
-        authorize(workspace, allowed_threads, origin)?;
-    }
-    let mut references = Vec::with_capacity(messages.len());
-    let mut digest = Sha256::new();
-    for message in messages {
-        let origin = message.provenance.as_ref().ok_or_else(|| {
-            anyhow::anyhow!("new frozen history requires canonical source identities")
-        })?;
-        let mut reference = FrozenMessageRef {
-            logical_turn_id: origin.logical_turn_id.clone(),
-            source_thread: origin.thread_id.clone(),
-            context_thread: origin.context_thread.clone(),
-            unit_id: origin.unit_id.clone(),
-            sources: origin.sources.iter().map(source).collect(),
-            event_input_role: None,
-            source_aliases: origin
-                .source_aliases
-                .iter()
-                .map(|alias| FrozenSourceAlias {
-                    represented_thread: alias.represented_thread_id.clone(),
-                    represented_source: source(&alias.represented_source),
-                    source_thread: alias.thread_id.clone(),
-                    source: source(&alias.source),
-                })
-                .collect(),
-            ambiguous_input_aliases: origin
-                .ambiguous_input_aliases
-                .iter()
-                .map(|alias| FrozenInputAliasConflict {
-                    source_thread: alias.thread_id.clone(),
-                    source: source(&alias.source),
-                })
-                .collect(),
-            publication_aliases: None,
-            inherited: origin.inherited,
-            complete: origin.complete,
-            protected_input: origin.protected_input,
-            wire_sha256: wire_digest(message)?,
-            replay_source: None,
-            tool_item_id: None,
-            tool_call_id: message.tool_call_id.clone(),
-            tool_name: message.name.clone(),
-        };
-        if let [checkpoint] = reference.sources.as_slice()
-            && checkpoint.scope.starts_with("checkpoint:")
-        {
-            let graph = checkpoint_graphs
-                .resolve(store, workspace, Some(allowed_threads), checkpoint)
-                .await?
-                .ok_or_else(|| anyhow::anyhow!("frozen checkpoint graph is unavailable"))?;
-            reference.publication_aliases =
-                Some(pioneer_compaction::frozen::FrozenPublicationAliases {
-                    source_aliases: reference
+    scope_current_stage(Stage::HistoryFreeze, async {
+        record_work(Work::Messages, messages.len() as u64);
+        let mut checkpoint_graphs = renderer.checkpoint_graphs;
+        ensure!(
+            allowed_threads.contains(owner_thread),
+            "frozen history owner is not authorized"
+        );
+        for message in messages {
+            let origin = message.provenance.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("new frozen history requires canonical source identities")
+            })?;
+            authorize(workspace, allowed_threads, origin)?;
+        }
+        let (references, digest) = scope_current_stage(Stage::HistoryFreezeBuild, async {
+            let mut references = Vec::with_capacity(messages.len());
+            let mut digest = Sha256::new();
+            for message in messages {
+                let origin = message.provenance.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("new frozen history requires canonical source identities")
+                })?;
+                let mut reference = FrozenMessageRef {
+                    logical_turn_id: origin.logical_turn_id.clone(),
+                    source_thread: origin.thread_id.clone(),
+                    context_thread: origin.context_thread.clone(),
+                    unit_id: origin.unit_id.clone(),
+                    sources: origin.sources.iter().map(source).collect(),
+                    event_input_role: None,
+                    source_aliases: origin
                         .source_aliases
                         .iter()
-                        .filter(|alias| {
-                            let copy = ScopedHistorySource {
-                                thread: alias.source_thread.clone(),
-                                source: alias.source.clone(),
-                            };
-                            let represented = ScopedHistorySource {
-                                thread: alias.represented_thread.clone(),
-                                source: alias.represented_source.clone(),
-                            };
-                            graph.replay_aliases.get(&copy) != Some(&represented)
+                        .map(|alias| FrozenSourceAlias {
+                            represented_thread: alias.represented_thread_id.clone(),
+                            represented_source: source(&alias.represented_source),
+                            source_thread: alias.thread_id.clone(),
+                            source: source(&alias.source),
                         })
-                        .cloned()
                         .collect(),
-                    ambiguous_input_aliases: reference
+                    ambiguous_input_aliases: origin
                         .ambiguous_input_aliases
                         .iter()
-                        .filter(|marker| {
-                            !graph
-                                .ambiguous_input_aliases
-                                .contains(&ScopedHistorySource {
-                                    thread: marker.source_thread.clone(),
-                                    source: marker.source.clone(),
-                                })
+                        .map(|alias| FrozenInputAliasConflict {
+                            source_thread: alias.thread_id.clone(),
+                            source: source(&alias.source),
                         })
-                        .cloned()
                         .collect(),
-                });
-        }
-        reference.validate()?;
-        if let [full_source] = reference.sources.as_slice()
-            && let Some(turn) = full_source.scope.strip_prefix("item:")
-        {
-            super::history::prepare_references(
-                store,
-                workspace,
-                &reference.source_thread,
-                std::slice::from_ref(full_source),
-            )
-            .await?;
-            let payload = super::history::reference_payload(
-                &store,
-                workspace,
-                &reference.source_thread,
-                full_source,
-            )
-            .await?;
-            let item: pioneer_protocol::TurnItem = serde_json::from_str(&payload)?;
-            reference.tool_item_id = Some(item.item_id().to_owned());
-            reference.replay_source = store
-                .compaction_context_reference_for_item(
+                    publication_aliases: None,
+                    inherited: origin.inherited,
+                    complete: origin.complete,
+                    protected_input: origin.protected_input,
+                    wire_sha256: wire_digest(message)?,
+                    replay_source: None,
+                    tool_item_id: None,
+                    tool_call_id: message.tool_call_id.clone(),
+                    tool_name: message.name.clone(),
+                };
+                if let [checkpoint] = reference.sources.as_slice()
+                    && checkpoint.scope.starts_with("checkpoint:")
+                {
+                    let graph = checkpoint_graphs
+                        .resolve(store, workspace, Some(allowed_threads), checkpoint)
+                        .await?
+                        .ok_or_else(|| anyhow::anyhow!("frozen checkpoint graph is unavailable"))?;
+                    reference.publication_aliases =
+                        Some(pioneer_compaction::frozen::FrozenPublicationAliases {
+                            source_aliases: reference
+                                .source_aliases
+                                .iter()
+                                .filter(|alias| {
+                                    let copy = ScopedHistorySource {
+                                        thread: alias.source_thread.clone(),
+                                        source: alias.source.clone(),
+                                    };
+                                    let represented = ScopedHistorySource {
+                                        thread: alias.represented_thread.clone(),
+                                        source: alias.represented_source.clone(),
+                                    };
+                                    graph.replay_aliases.get(&copy) != Some(&represented)
+                                })
+                                .cloned()
+                                .collect(),
+                            ambiguous_input_aliases: reference
+                                .ambiguous_input_aliases
+                                .iter()
+                                .filter(|marker| {
+                                    !graph
+                                        .ambiguous_input_aliases
+                                        .contains(&ScopedHistorySource {
+                                            thread: marker.source_thread.clone(),
+                                            source: marker.source.clone(),
+                                        })
+                                })
+                                .cloned()
+                                .collect(),
+                        });
+                }
+                reference.validate()?;
+                if let [full_source] = reference.sources.as_slice()
+                    && let Some(turn) = full_source.scope.strip_prefix("item:")
+                {
+                    super::history::prepare_references(
+                        store,
+                        workspace,
+                        &reference.source_thread,
+                        std::slice::from_ref(full_source),
+                    )
+                    .await?;
+                    let payload = super::history::reference_payload(
+                        &store,
+                        workspace,
+                        &reference.source_thread,
+                        full_source,
+                    )
+                    .await?;
+                    let item: pioneer_protocol::TurnItem = serde_json::from_str(&payload)?;
+                    reference.tool_item_id = Some(item.item_id().to_owned());
+                    reference.replay_source = store
+                        .compaction_context_reference_for_item(
+                            workspace,
+                            &reference.source_thread,
+                            turn,
+                            item.item_id(),
+                            "tool_result_v2",
+                        )
+                        .await?;
+                }
+                references.push(reference);
+            }
+            if renderer.event_input_roles {
+                let mut event_projections = BTreeMap::new();
+                let mut event_sources = BTreeMap::<String, BTreeSet<SourceRef>>::new();
+                for reference in &references {
+                    if let [source] = reference.sources.as_slice()
+                        && source.scope.starts_with("event:")
+                    {
+                        event_sources
+                            .entry(reference.source_thread.clone())
+                            .or_default()
+                            .insert(source.clone());
+                    }
+                }
+                for (thread, sources) in event_sources {
+                    for projection in super::history::historical_event_projections(
+                        store, workspace, &thread, sources,
+                    )
+                    .await?
+                    {
+                        let role = match projection.projection_kind.as_str() {
+                            "input" | "input_revision" => {
+                                pioneer_compaction::frozen::FrozenEventInputRole::Authoritative
+                            }
+                            "input_deleted" => {
+                                pioneer_compaction::frozen::FrozenEventInputRole::Deleted
+                            }
+                            "input_copy" => {
+                                pioneer_compaction::frozen::FrozenEventInputRole::InputCopy
+                            }
+                            _ => continue,
+                        };
+                        event_projections.insert((thread.clone(), projection.reference), role);
+                    }
+                }
+                for reference in &mut references {
+                    if let [source] = reference.sources.as_slice() {
+                        reference.event_input_role = event_projections
+                            .get(&(reference.source_thread.clone(), source.clone()))
+                            .copied();
+                    }
+                }
+            }
+            // Validate both render and replay dependencies before restore reads any
+            // context payload, and before a manifest can be created. Existing frozen
+            // histories retain their independent legacy restore rules.
+            let mut context_sources = BTreeMap::<String, BTreeSet<SourceRef>>::new();
+            for reference in &references {
+                for source in reference
+                    .sources
+                    .iter()
+                    .chain(reference.replay_source.iter())
+                {
+                    if source.scope.starts_with("context:") {
+                        context_sources
+                            .entry(reference.source_thread.clone())
+                            .or_default()
+                            .insert(source.clone());
+                    }
+                }
+            }
+            for (thread, sources) in context_sources {
+                let sources = sources.into_iter().collect::<Vec<_>>();
+                for page in bounded_context_source_pages(&sources)? {
+                    super::history::prepare_references(store, workspace, &thread, page).await?;
+                    ensure!(
+                        store
+                            .compaction_model_context_sources_current(workspace, &thread, page)
+                            .await?,
+                        "new frozen history contains an inadmissible context source"
+                    );
+                }
+            }
+            for reference in &references {
+                reference.validate()?;
+                digest_entry(&mut digest, reference)?;
+            }
+            Ok::<_, anyhow::Error>((references, digest))
+        })
+        .await?;
+        let (verified_messages, accepted_scopes) =
+            scope_current_stage(Stage::HistoryFreezeVerify, async {
+                let mut verified_messages = Vec::with_capacity(messages.len());
+                let mut restore_state = FrozenExecutionRestoreState::from_references(
+                    store,
                     workspace,
-                    &reference.source_thread,
-                    turn,
-                    item.item_id(),
-                    "tool_result_v2",
+                    allowed_threads,
+                    &references,
+                    &mut checkpoint_graphs,
                 )
                 .await?;
-        }
-        references.push(reference);
-    }
-    if renderer.event_input_roles {
-        let mut event_projections = BTreeMap::new();
-        let mut event_sources = BTreeMap::<String, BTreeSet<SourceRef>>::new();
-        for reference in &references {
-            if let [source] = reference.sources.as_slice()
-                && source.scope.starts_with("event:")
-            {
-                event_sources
-                    .entry(reference.source_thread.clone())
-                    .or_default()
-                    .insert(source.clone());
+                for page in references.chunks(pioneer_crud::compaction::SOURCE_PAGE_ROWS as usize) {
+                    record_work(Work::Pages, 1);
+                    let authenticated = restore_entries_page(
+                        store,
+                        workspace,
+                        allowed_threads,
+                        page,
+                        &mut checkpoint_graphs,
+                    )
+                    .await?;
+                    ensure!(
+                        authenticated.len() == page.len(),
+                        "frozen history count mismatch"
+                    );
+                    let restored = restore_execution_entries_page(
+                        store,
+                        workspace,
+                        allowed_threads,
+                        page,
+                        &mut checkpoint_graphs,
+                        &mut restore_state,
+                    )
+                    .await?;
+                    ensure!(
+                        restored.iter().all(Option::is_some),
+                        "new frozen history contains a non-model event"
+                    );
+                    verified_messages.extend(restored.into_iter().flatten());
+                }
+                let accepted_scopes = prepared_manifest_scopes(
+                    store,
+                    workspace,
+                    owner_thread,
+                    &references,
+                    &mut checkpoint_graphs,
+                )
+                .await?;
+                Ok::<_, anyhow::Error>((verified_messages, accepted_scopes))
+            })
+            .await?;
+        let mut accepted = Vec::new();
+        for (ordinal, reference) in references.iter().enumerate() {
+            for source in &reference.sources {
+                if let Some(prepared) = imports.get(&ScopedHistorySource {
+                    thread: reference.source_thread.clone(),
+                    source: source.clone(),
+                }) {
+                    accepted.extend(
+                        prepared
+                            .iter()
+                            .cloned()
+                            .map(|prepared| (ordinal as u64, prepared)),
+                    );
+                }
             }
         }
-        for (thread, sources) in event_sources {
-            for projection in
-                super::history::historical_event_projections(store, workspace, &thread, sources)
-                    .await?
-            {
-                let role = match projection.projection_kind.as_str() {
-                    "input" | "input_revision" => {
-                        pioneer_compaction::frozen::FrozenEventInputRole::Authoritative
-                    }
-                    "input_deleted" => pioneer_compaction::frozen::FrozenEventInputRole::Deleted,
-                    "input_copy" => pioneer_compaction::frozen::FrozenEventInputRole::InputCopy,
-                    _ => continue,
-                };
-                event_projections.insert((thread.clone(), projection.reference), role);
-            }
-        }
-        for reference in &mut references {
-            if let [source] = reference.sources.as_slice() {
-                reference.event_input_role = event_projections
-                    .get(&(reference.source_thread.clone(), source.clone()))
-                    .copied();
-            }
-        }
-    }
-    // Validate both render and replay dependencies before restore reads any
-    // context payload, and before a manifest can be created. Existing frozen
-    // histories retain their independent legacy restore rules.
-    let mut context_sources = BTreeMap::<String, BTreeSet<SourceRef>>::new();
-    for reference in &references {
-        for source in reference
-            .sources
-            .iter()
-            .chain(reference.replay_source.iter())
-        {
-            if source.scope.starts_with("context:") {
-                context_sources
-                    .entry(reference.source_thread.clone())
-                    .or_default()
-                    .insert(source.clone());
-            }
-        }
-    }
-    for (thread, sources) in context_sources {
-        let sources = sources.into_iter().collect::<Vec<_>>();
-        for page in bounded_context_source_pages(&sources)? {
-            super::history::prepare_references(store, workspace, &thread, page).await?;
-            ensure!(
-                store
-                    .compaction_model_context_sources_current(workspace, &thread, page)
-                    .await?,
-                "new frozen history contains an inadmissible context source"
-            );
-        }
-    }
-    for reference in &references {
-        reference.validate()?;
-        digest_entry(&mut digest, reference)?;
-    }
-    let mut verified_messages = Vec::with_capacity(messages.len());
-    let mut restore_state = FrozenExecutionRestoreState::from_references(
-        store,
-        workspace,
-        allowed_threads,
-        &references,
-        &mut checkpoint_graphs,
-    )
-    .await?;
-    for page in references.chunks(pioneer_crud::compaction::SOURCE_PAGE_ROWS as usize) {
-        let authenticated = restore_entries_page(
-            store,
-            workspace,
-            allowed_threads,
-            page,
-            &mut checkpoint_graphs,
-        )
-        .await?;
-        ensure!(
-            authenticated.len() == page.len(),
-            "frozen history count mismatch"
-        );
-        let restored = restore_execution_entries_page(
-            store,
-            workspace,
-            allowed_threads,
-            page,
-            &mut checkpoint_graphs,
-            &mut restore_state,
-        )
-        .await?;
-        ensure!(
-            restored.iter().all(Option::is_some),
-            "new frozen history contains a non-model event"
-        );
-        verified_messages.extend(restored.into_iter().flatten());
-    }
-    let accepted_scopes = prepared_manifest_scopes(
-        store,
-        workspace,
-        owner_thread,
-        &references,
-        &mut checkpoint_graphs,
-    )
-    .await?;
-    let mut accepted = Vec::new();
-    for (ordinal, reference) in references.iter().enumerate() {
-        for source in &reference.sources {
-            if let Some(prepared) = imports.get(&ScopedHistorySource {
-                thread: reference.source_thread.clone(),
-                source: source.clone(),
-            }) {
-                accepted.extend(
-                    prepared
-                        .iter()
-                        .cloned()
-                        .map(|prepared| (ordinal as u64, prepared)),
-                );
-            }
-        }
-    }
-    let import_digest = pioneer_crud::compaction::frozen_import_identity(&accepted)?;
-    let identity_sha256 = hex::encode(digest.finalize());
-    let capture_key = serde_json::to_vec(&(
-        1_u32,
-        workspace,
-        owner_thread,
-        &identity_sha256,
-        references.len(),
-        &import_digest,
-        accepted.len(),
-    ))?;
-    let descriptor = FrozenHistoryRef {
-        format: 1,
-        manifest_id: format!("fh_{}", hex::encode(Sha256::digest(&capture_key))),
-        messages: references.len() as u64,
-        identity_sha256,
-    };
-    if let Some(existing) = store
-        .compaction_equivalent_frozen_history(
+        let import_digest = pioneer_crud::compaction::frozen_import_identity(&accepted)?;
+        let identity_sha256 = hex::encode(digest.finalize());
+        let capture_key = serde_json::to_vec(&(
+            1_u32,
             workspace,
             owner_thread,
-            &descriptor,
-            accepted.len() as u64,
+            &identity_sha256,
+            references.len(),
             &import_digest,
-        )
-        .await?
-    {
-        if existing == descriptor {
-            return Ok(PreparedHistory {
-                descriptor: existing,
+            accepted.len(),
+        ))?;
+        let descriptor = FrozenHistoryRef {
+            format: 1,
+            manifest_id: format!("fh_{}", hex::encode(Sha256::digest(&capture_key))),
+            messages: references.len() as u64,
+            identity_sha256,
+        };
+        scope_current_stage(Stage::HistoryFreezePersist, async {
+            if let Some(existing) = store
+                .compaction_equivalent_frozen_history(
+                    workspace,
+                    owner_thread,
+                    &descriptor,
+                    accepted.len() as u64,
+                    &import_digest,
+                )
+                .await?
+            {
+                if existing == descriptor {
+                    return Ok(PreparedHistory {
+                        descriptor: existing,
+                        messages: verified_messages,
+                        accepted_scopes,
+                        source_epochs: BTreeMap::new(),
+                        expected_checkpoint: None,
+                        checkpoint: None,
+                        checkpoint_graphs,
+                    });
+                }
+                let messages = restore_model_with_resolver(
+                    store,
+                    workspace,
+                    allowed_threads,
+                    &existing,
+                    &mut checkpoint_graphs,
+                )
+                .await?;
+                return Ok(PreparedHistory {
+                    descriptor: existing,
+                    messages,
+                    accepted_scopes,
+                    source_epochs: BTreeMap::new(),
+                    expected_checkpoint: None,
+                    checkpoint: None,
+                    checkpoint_graphs,
+                });
+            }
+            store
+                .compaction_begin_frozen_history_with_imports(
+                    workspace,
+                    owner_thread,
+                    &descriptor,
+                    accepted.len() as u64,
+                    &import_digest,
+                )
+                .await?;
+            let (message_prefix, import_prefix) = store
+                .compaction_share_frozen_prefix(
+                    workspace,
+                    owner_thread,
+                    &descriptor.manifest_id,
+                    &references,
+                    &accepted,
+                )
+                .await?;
+            let mut start = usize::try_from(message_prefix)?;
+            while start < references.len() {
+                let mut end = start;
+                let mut bytes = 0;
+                while end < references.len()
+                    && end - start < pioneer_crud::compaction::SOURCE_PAGE_ROWS as usize
+                {
+                    let size = serde_json::to_vec(&references[end])?.len();
+                    ensure!(
+                        size <= pioneer_crud::compaction::SOURCE_PAGE_BYTES,
+                        "single frozen message reference exceeds storage quantum"
+                    );
+                    if bytes + size > pioneer_crud::compaction::SOURCE_PAGE_BYTES {
+                        break;
+                    }
+                    bytes += size;
+                    end += 1;
+                }
+                store
+                    .compaction_append_frozen_history(
+                        workspace,
+                        owner_thread,
+                        &descriptor.manifest_id,
+                        start as u64,
+                        &references[start..end],
+                    )
+                    .await?;
+                record_work(Work::Pages, 1);
+                start = end;
+            }
+            let mut start = usize::try_from(import_prefix)?;
+            while start < accepted.len() {
+                let mut end = start;
+                let mut bytes = 0;
+                while end < accepted.len()
+                    && end - start < pioneer_crud::compaction::SOURCE_PAGE_ROWS as usize
+                {
+                    let (ordinal, prepared) = &accepted[end];
+                    let size = prepared.estimated_write_bytes(&references[*ordinal as usize])?;
+                    ensure!(
+                        size <= pioneer_crud::compaction::FROZEN_IMPORT_PAGE_BYTES,
+                        "single import proof exceeds its metadata quantum"
+                    );
+                    if bytes + size > pioneer_crud::compaction::FROZEN_IMPORT_PAGE_BYTES {
+                        break;
+                    }
+                    bytes += size;
+                    end += 1;
+                }
+                store
+                    .compaction_append_frozen_imports(
+                        workspace,
+                        owner_thread,
+                        &descriptor.manifest_id,
+                        start as u64,
+                        &accepted[start..end],
+                    )
+                    .await?;
+                record_work(Work::Pages, 1);
+                start = end;
+            }
+            ensure!(
+                store
+                    .compaction_finish_frozen_history(workspace, owner_thread, &descriptor)
+                    .await?,
+                "frozen history publication failed"
+            );
+            Ok(PreparedHistory {
+                descriptor,
                 messages: verified_messages,
                 accepted_scopes,
                 source_epochs: BTreeMap::new(),
                 expected_checkpoint: None,
                 checkpoint: None,
                 checkpoint_graphs,
-            });
-        }
-        let messages = restore_model_with_resolver(
-            store,
-            workspace,
-            allowed_threads,
-            &existing,
-            &mut checkpoint_graphs,
-        )
-        .await?;
-        return Ok(PreparedHistory {
-            descriptor: existing,
-            messages,
-            accepted_scopes,
-            source_epochs: BTreeMap::new(),
-            expected_checkpoint: None,
-            checkpoint: None,
-            checkpoint_graphs,
-        });
-    }
-    store
-        .compaction_begin_frozen_history_with_imports(
-            workspace,
-            owner_thread,
-            &descriptor,
-            accepted.len() as u64,
-            &import_digest,
-        )
-        .await?;
-    let (message_prefix, import_prefix) = store
-        .compaction_share_frozen_prefix(
-            workspace,
-            owner_thread,
-            &descriptor.manifest_id,
-            &references,
-            &accepted,
-        )
-        .await?;
-    let mut start = usize::try_from(message_prefix)?;
-    while start < references.len() {
-        let mut end = start;
-        let mut bytes = 0;
-        while end < references.len()
-            && end - start < pioneer_crud::compaction::SOURCE_PAGE_ROWS as usize
-        {
-            let size = serde_json::to_vec(&references[end])?.len();
-            ensure!(
-                size <= pioneer_crud::compaction::SOURCE_PAGE_BYTES,
-                "single frozen message reference exceeds storage quantum"
-            );
-            if bytes + size > pioneer_crud::compaction::SOURCE_PAGE_BYTES {
-                break;
-            }
-            bytes += size;
-            end += 1;
-        }
-        store
-            .compaction_append_frozen_history(
-                workspace,
-                owner_thread,
-                &descriptor.manifest_id,
-                start as u64,
-                &references[start..end],
-            )
-            .await?;
-        start = end;
-    }
-    let mut start = usize::try_from(import_prefix)?;
-    while start < accepted.len() {
-        let mut end = start;
-        let mut bytes = 0;
-        while end < accepted.len()
-            && end - start < pioneer_crud::compaction::SOURCE_PAGE_ROWS as usize
-        {
-            let (ordinal, prepared) = &accepted[end];
-            let size = prepared.estimated_write_bytes(&references[*ordinal as usize])?;
-            ensure!(
-                size <= pioneer_crud::compaction::FROZEN_IMPORT_PAGE_BYTES,
-                "single import proof exceeds its metadata quantum"
-            );
-            if bytes + size > pioneer_crud::compaction::FROZEN_IMPORT_PAGE_BYTES {
-                break;
-            }
-            bytes += size;
-            end += 1;
-        }
-        store
-            .compaction_append_frozen_imports(
-                workspace,
-                owner_thread,
-                &descriptor.manifest_id,
-                start as u64,
-                &accepted[start..end],
-            )
-            .await?;
-        start = end;
-    }
-    ensure!(
-        store
-            .compaction_finish_frozen_history(workspace, owner_thread, &descriptor)
-            .await?,
-        "frozen history publication failed"
-    );
-    Ok(PreparedHistory {
-        descriptor,
-        messages: verified_messages,
-        accepted_scopes,
-        source_epochs: BTreeMap::new(),
-        expected_checkpoint: None,
-        checkpoint: None,
-        checkpoint_graphs,
+            })
+        })
+        .await
     })
+    .await
 }
 
 async fn prepared_manifest_scopes(
@@ -2947,6 +3006,7 @@ async fn frozen_manifest_references(
                 references.len() as u64,
             )
             .await?;
+        record_work(Work::Pages, 1);
         ensure!(
             !page.is_empty(),
             "frozen history lost an immutable reference page"
@@ -5291,43 +5351,46 @@ async fn restore_with_resolver(
     descriptor: &FrozenHistoryRef,
     checkpoint_graphs: &mut super::coverage::CheckpointGraphResolver,
 ) -> Result<Vec<ChatMessage>> {
-    #[cfg(test)]
-    if let Some(state) = STORE_RESTORE_CALLS
-        .lock()
-        .unwrap()
-        .get(&(
-            store.database_connection().runtime_identity(),
-            workspace.to_owned(),
-        ))
-        .and_then(std::sync::Weak::upgrade)
-    {
-        state.descriptors.lock().unwrap().push(descriptor.clone());
-    }
-    let (owner, references) =
-        frozen_manifest_references(store, workspace, None, descriptor, Some(allowed_threads))
-            .await?;
-    let mut restored = Vec::with_capacity(references.len());
-    for page in references.chunks(pioneer_crud::compaction::SOURCE_PAGE_ROWS as usize) {
-        restored.extend(
-            restore_entries_page(store, workspace, allowed_threads, &page, checkpoint_graphs)
-                .await?,
+    scope_current_stage(Stage::HistoryRestore, async {
+        #[cfg(test)]
+        if let Some(state) = STORE_RESTORE_CALLS
+            .lock()
+            .unwrap()
+            .get(&(
+                store.database_connection().runtime_identity(),
+                workspace.to_owned(),
+            ))
+            .and_then(std::sync::Weak::upgrade)
+        {
+            state.descriptors.lock().unwrap().push(descriptor.clone());
+        }
+        let (owner, references) =
+            frozen_manifest_references(store, workspace, None, descriptor, Some(allowed_threads))
+                .await?;
+        let mut restored = Vec::with_capacity(references.len());
+        for page in references.chunks(pioneer_crud::compaction::SOURCE_PAGE_ROWS as usize) {
+            restored.extend(
+                restore_entries_page(store, workspace, allowed_threads, &page, checkpoint_graphs)
+                    .await?,
+            );
+        }
+        ensure!(
+            restored.len() == references.len(),
+            "frozen history count mismatch"
         );
-    }
-    ensure!(
-        restored.len() == references.len(),
-        "frozen history count mismatch"
-    );
-    let _ = read_accepted_imports(
-        &store,
-        workspace,
-        &owner,
-        descriptor,
-        &references,
-        None,
-        checkpoint_graphs,
-    )
-    .await?;
-    Ok(restored)
+        let _ = read_accepted_imports(
+            &store,
+            workspace,
+            &owner,
+            descriptor,
+            &references,
+            None,
+            checkpoint_graphs,
+        )
+        .await?;
+        Ok(restored)
+    })
+    .await
 }
 
 async fn restore_model_with_resolver(
@@ -5337,44 +5400,47 @@ async fn restore_model_with_resolver(
     descriptor: &FrozenHistoryRef,
     checkpoint_graphs: &mut super::coverage::CheckpointGraphResolver,
 ) -> Result<Vec<ChatMessage>> {
-    let (owner, references) =
-        frozen_manifest_references(store, workspace, None, descriptor, Some(allowed_threads))
-            .await?;
-    let _ = read_accepted_imports(
-        store,
-        workspace,
-        &owner,
-        descriptor,
-        &references,
-        None,
-        checkpoint_graphs,
-    )
-    .await?;
-    let mut state = FrozenExecutionRestoreState::from_references(
-        store,
-        workspace,
-        allowed_threads,
-        &references,
-        checkpoint_graphs,
-    )
-    .await?;
-    let mut messages = Vec::with_capacity(references.len());
-    for page in references.chunks(pioneer_crud::compaction::SOURCE_PAGE_ROWS as usize) {
-        messages.extend(
-            restore_execution_entries_page(
-                store,
-                workspace,
-                allowed_threads,
-                page,
-                checkpoint_graphs,
-                &mut state,
-            )
-            .await?
-            .into_iter()
-            .flatten(),
-        );
-    }
-    Ok(messages)
+    scope_current_stage(Stage::HistoryRestoreModel, async {
+        let (owner, references) =
+            frozen_manifest_references(store, workspace, None, descriptor, Some(allowed_threads))
+                .await?;
+        let _ = read_accepted_imports(
+            store,
+            workspace,
+            &owner,
+            descriptor,
+            &references,
+            None,
+            checkpoint_graphs,
+        )
+        .await?;
+        let mut state = FrozenExecutionRestoreState::from_references(
+            store,
+            workspace,
+            allowed_threads,
+            &references,
+            checkpoint_graphs,
+        )
+        .await?;
+        let mut messages = Vec::with_capacity(references.len());
+        for page in references.chunks(pioneer_crud::compaction::SOURCE_PAGE_ROWS as usize) {
+            messages.extend(
+                restore_execution_entries_page(
+                    store,
+                    workspace,
+                    allowed_threads,
+                    page,
+                    checkpoint_graphs,
+                    &mut state,
+                )
+                .await?
+                .into_iter()
+                .flatten(),
+            );
+        }
+        Ok(messages)
+    })
+    .await
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
