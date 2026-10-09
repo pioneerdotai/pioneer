@@ -64,6 +64,7 @@ fn tool_rounds(native_ids: bool) {
             prepare_messages_for_provider(provider.name(), &provider.capabilities(), &history)
                 .unwrap();
         let wire = serde_json::to_value(OllamaChatRequest {
+            think: None,
             model: "qwen3".into(),
             messages: OllamaProvider::convert_messages(&prepared).unwrap(),
             stream: false,

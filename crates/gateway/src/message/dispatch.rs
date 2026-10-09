@@ -7836,6 +7836,9 @@ impl MessageProcessor {
                         self.crud_store.clone(),
                         workspace_thread_episodic_settings.enabled
                             && workspace_thread_episodic_settings.indexing_enabled,
+                        crate::thread_episodic_runtime_config_from_gateway_settings(
+                            &workspace_thread_episodic_settings,
+                        ).index_executor,
                         self.thread_episodic_storage_root.clone(),
                         workspace_id.to_owned(),
                         workspace_thread_episodic_settings.vector_search,
@@ -7853,6 +7856,10 @@ impl MessageProcessor {
                         self.crud_store.clone(),
                         thread_episodic_settings.enabled
                             && thread_episodic_settings.indexing_enabled,
+                        crate::thread_episodic_runtime_config_from_gateway_settings(
+                            &thread_episodic_settings,
+                        )
+                        .index_executor,
                         self.thread_episodic_storage_root.clone(),
                         thread_episodic_settings.vector_search.clone(),
                         workspace_vector_search_configs,

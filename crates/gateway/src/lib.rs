@@ -62,6 +62,7 @@ mod transport;
 mod turn_mcp;
 mod turn_runtime_snapshot;
 mod turn_security;
+mod usage_journal;
 mod view_grants;
 mod voice;
 mod workspace;
@@ -386,6 +387,15 @@ async fn run_gateway_until_shutdown_inner(
     database::startup::enforce_execution_authority_integrity(crud_store.as_ref())
         .await
         .context("Gateway execution authority integrity gate failed")?;
+    // No MessageProcessor, listener or resilience worker exists yet. Every
+    // running episodic claim belongs to the previous runtime, regardless of
+    // timestamps (including claims in this same Unix second).
+    database::startup::recover_inherited_thread_episodic_jobs(
+        crud_store.as_ref(),
+        config.gateway.thread_episodic.max_attempts,
+    )
+    .await
+    .context("failed to recover inherited episodic index claims before runtime admission")?;
     let thread_manager = Arc::new(ThreadManager::from_app_config(&config));
 
     let maintenance_workspace_manager = workspace_manager.with_database(database.maintenance());
@@ -839,6 +849,9 @@ async fn run_gateway_until_shutdown_inner(
         config.gateway.thread_episodic.vector_search.clone();
     let startup_thread_episodic_indexing_enabled =
         config.gateway.thread_episodic.enabled && config.gateway.thread_episodic.indexing_enabled;
+    let startup_thread_episodic_index_executor_config =
+        thread_episodic_runtime_config_from_gateway_config(&config.gateway.thread_episodic)
+            .index_executor;
     let telemetry_shutdown_timeout =
         Duration::from_millis(config.gateway.telemetry.export_timeout_ms);
     services_prepare_stage.succeed();
@@ -1043,21 +1056,23 @@ async fn run_gateway_until_shutdown_inner(
                     // cooperative. It runs only after the operational runtime
                     // exists and is the sole owner of periodic database
                     // maintenance afterwards.
-                    let maintenance = tokio::select! {
-                        _ = cancellation.cancelled() => return,
-                        result = database::startup::run(
-                            post_crud_store.clone(),
-                            startup_thread_episodic_indexing_enabled,
-                            post_thread_episodic_storage_root,
-                            startup_thread_episodic_vector_search_config,
-                            post_workspace_vector_search_configs,
-                            post_provider_registry,
-                            post_runtime_home,
-                            Some(post_message_processor.thread_episodic_vector_refill_status_sender()),
-                            post_message_processor.thread_episodic_workspace_refill_supervisor(),
-                            cancellation.clone(),
-                        ) => result,
-                    };
+                    // Poll cooperative maintenance through its FS join. Dropping
+                    // this future on cancellation would finish the refill lease
+                    // while its blocking capsule write is still running.
+                    let maintenance = database::startup::run(
+                        post_crud_store.clone(),
+                        startup_thread_episodic_indexing_enabled,
+                        startup_thread_episodic_index_executor_config,
+                        post_thread_episodic_storage_root,
+                        startup_thread_episodic_vector_search_config,
+                        post_workspace_vector_search_configs,
+                        post_provider_registry,
+                        post_runtime_home,
+                        Some(post_message_processor.thread_episodic_vector_refill_status_sender()),
+                        post_message_processor.thread_episodic_workspace_refill_supervisor(),
+                        cancellation.clone(),
+                    )
+                    .await;
                     if let Err(error) = maintenance {
                         if cancellation.is_cancelled() {
                             return;
@@ -1082,6 +1097,9 @@ async fn run_gateway_until_shutdown_inner(
 
     info!("gateway daemon stopping with telemetry snapshot");
     handle.set_readiness(GatewayReadinessStatus::Starting);
+    message_processor
+        .shutdown_thread_episodic_index_runner()
+        .await;
     if let Some(post_startup) = post_startup.as_mut() {
         post_startup.shutdown().await;
     }

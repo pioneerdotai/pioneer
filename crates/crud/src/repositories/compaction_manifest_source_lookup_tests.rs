@@ -3327,7 +3327,12 @@ async fn retired_publication_fence_triggers_are_removed_and_migration_is_idempot
             "turn_event"
         };
         db.execute_unprepared(&format!("CREATE TRIGGER compaction_publication_test AFTER UPDATE ON {table} BEGIN UPDATE compaction_publication_fence SET structural_generation=structural_generation+1 WHERE singleton=1; END")).await.unwrap();
-        let migration = Migrator::migrations().pop().unwrap();
+        let migration = Migrator::migrations()
+            .into_iter()
+            .find(|migration| {
+                migration.name() == "m20261006_000001_retire_compaction_publication_fences"
+            })
+            .expect("publication fence retirement migration is registered");
         for _ in 0..2 {
             // Reapply through the supported serialized migration executor.
             db.execute_raw(Statement::from_sql_and_values(

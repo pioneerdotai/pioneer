@@ -432,11 +432,10 @@ impl TurnProjector {
                 Ok(())
             }),
             TurnEventPayload::ItemUpdated(_payload) => project_future(async move {
-                turn::upsert_prepared_turn_item(
-                    db,
-                    item_projection.context("item/updated projection was not prepared")?,
-                )
-                .await
+                let mut item =
+                    item_projection.context("item/updated projection was not prepared")?;
+                item.preserve_uncommitted_source_status(db).await?;
+                turn::upsert_prepared_turn_item(db, item).await
             }),
             TurnEventPayload::ItemTimeoutDetected(_)
             | TurnEventPayload::ItemRecoveryOpened(_)

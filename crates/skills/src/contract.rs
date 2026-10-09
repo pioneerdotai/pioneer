@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
 use std::fs;
+use std::io::Read;
 use std::path::Path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -734,15 +735,8 @@ fn normalize_owner(input: &str) -> String {
     normalize_skill_slug(input)
 }
 
-fn parse_sidecar_meta(skill_dir: &Path) -> Result<ParsedSidecarMeta> {
-    let meta_file = skill_dir.join("_meta.json");
-    if !meta_file.is_file() {
-        return Ok(ParsedSidecarMeta::default());
-    }
-
-    let raw = fs::read_to_string(meta_file.as_path())
-        .with_context(|| format!("failed to read `_meta.json` at `{}`", meta_file.display()))?;
-    let json = serde_json::from_str::<JsonValue>(raw.as_str())
+fn parse_sidecar_text(raw: &str, meta_file: &Path) -> Result<ParsedSidecarMeta> {
+    let json = serde_json::from_str::<JsonValue>(raw)
         .with_context(|| format!("failed to parse `_meta.json` at `{}`", meta_file.display()))?;
     let Some(map) = json.as_object() else {
         bail!(
@@ -931,6 +925,42 @@ pub fn parse_skill_markdown(
     Ok(definition)
 }
 
+/// The bytes and sidecar facts of one physical file. IDs, source semantics and
+/// policy decisions are applied separately; the watcher owns this for one round.
+#[derive(Debug)]
+pub(crate) struct SkillFileInput {
+    raw: String,
+    largest_input: usize,
+    pub(crate) input_bytes_read: usize,
+    context: SkillMarkdownParseContext,
+    revision: SkillInputRevision,
+}
+
+/// Exact bytes used to derive package metadata. None distinguishes an absent
+/// sidecar from an empty one; SKILL.md's domain fingerprint alone is insufficient.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillInputRevision {
+    pub skill: [u8; 32],
+    pub sidecar: Option<[u8; 32]>,
+}
+impl SkillFileInput {
+    pub(crate) fn revision(&self) -> &SkillInputRevision {
+        &self.revision
+    }
+    pub(crate) fn len(&self) -> usize {
+        self.largest_input
+    }
+    pub(crate) fn parse(
+        &self,
+        skill_id: SkillId,
+        source_kind: SkillSourceKind,
+    ) -> Result<SkillDefinition> {
+        let mut context = self.context.clone();
+        context.skill_id = skill_id;
+        context.source_kind = source_kind;
+        parse_skill_markdown(&self.raw, context)
+    }
+}
 pub fn parse_skill_from_file(
     skill_id: SkillId,
     skill_file: &Path,
@@ -938,46 +968,319 @@ pub fn parse_skill_from_file(
     source_root: &Path,
     max_file_bytes: usize,
 ) -> Result<SkillDefinition> {
-    let metadata = fs::metadata(skill_file)
-        .with_context(|| format!("failed to stat skill file `{}`", skill_file.display()))?;
-    let file_size = usize::try_from(metadata.len()).unwrap_or(usize::MAX);
-    if file_size > max_file_bytes {
-        bail!(
-            "skill file `{}` exceeds size limit: {} > {}",
-            skill_file.display(),
-            file_size,
-            max_file_bytes
-        );
+    read_skill_file_input(
+        skill_id.clone(),
+        skill_file,
+        source_kind,
+        source_root,
+        max_file_bytes,
+    )?
+    .parse(skill_id, source_kind)
+}
+// Exactly two inputs, with owned file handles advanced by the watcher's
+// existing blocking quanta. No stat-then-unlimited-read and no new size cap.
+pub(crate) struct SkillFileInputRead {
+    skill_id: SkillId,
+    kind: SkillSourceKind,
+    root: std::path::PathBuf,
+    skill_file: std::path::PathBuf,
+    max: usize,
+    sidecar_max: usize,
+    pub(crate) follow_links: bool,
+    index: usize,
+    file: Option<(fs::File, fs::Metadata, Sha256)>,
+    buffers: [Option<Vec<u8>>; 2],
+    hashes: [Option<[u8; 32]>; 2],
+    #[cfg(test)]
+    read_bytes: usize,
+}
+impl SkillFileInputRead {
+    pub(crate) fn new(
+        skill_id: SkillId,
+        skill_file: &Path,
+        kind: SkillSourceKind,
+        root: &Path,
+        max: usize,
+    ) -> Self {
+        Self {
+            skill_id,
+            kind,
+            root: root.to_path_buf(),
+            skill_file: skill_file.to_path_buf(),
+            max,
+            sidecar_max: max,
+            follow_links: false,
+            index: 0,
+            file: None,
+            buffers: [None, None],
+            hashes: [None, None],
+            #[cfg(test)]
+            read_bytes: 0,
+        }
+    }
+    pub(crate) fn step(&mut self, bytes_budget: usize) -> Result<bool> {
+        let mut remaining = bytes_budget.max(1).min(256 * 1024);
+        while self.index < 2 {
+            if self.file.is_none() {
+                let path = if self.index == 0 {
+                    self.skill_file.clone()
+                } else {
+                    self.skill_file.with_file_name("_meta.json")
+                };
+                let metadata = match if self.follow_links {
+                    fs::metadata(&path)
+                } else {
+                    fs::symlink_metadata(&path)
+                } {
+                    Err(error)
+                        if self.index == 1 && error.kind() == std::io::ErrorKind::NotFound =>
+                    {
+                        self.index += 1;
+                        continue;
+                    }
+                    Err(error) => return Err(error.into()),
+                    Ok(metadata) => metadata,
+                };
+                if self.follow_links && self.index == 1 && !metadata.is_file() {
+                    self.index += 1;
+                    continue;
+                }
+                if !metadata.is_file() || metadata.file_type().is_symlink() {
+                    bail!("skill input is not a regular file");
+                }
+                let limit = if self.index == 0 {
+                    self.max
+                } else {
+                    self.sidecar_max
+                };
+                if metadata.len() > limit as u64 {
+                    bail!("skill input exceeds max_install_file_bytes");
+                }
+                let mut options = fs::OpenOptions::new();
+                options.read(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    if !self.follow_links {
+                        options.custom_flags(libc::O_NOFOLLOW);
+                    }
+                }
+                let file = options.open(path)?;
+                let initial = file.metadata()?;
+                if initial.len() > limit as u64 {
+                    bail!("skill input exceeds max_install_file_bytes");
+                }
+                self.file = Some((file, initial, Sha256::new()));
+                self.buffers[self.index] = Some(Vec::new());
+            }
+            let bytes = self.buffers[self.index]
+                .as_mut()
+                .expect("open input buffer");
+            let (file, initial, digest) = self.file.as_mut().expect("open input");
+            // At most one overflow byte is read, regardless of growth after stat.
+            let limit = if self.index == 0 {
+                self.max
+            } else {
+                self.sidecar_max
+            };
+            let allowance = limit.saturating_sub(bytes.len()).saturating_add(1);
+            let mut chunk = vec![0; remaining.min(64 * 1024).min(allowance)];
+            let read = file.read(&mut chunk)?;
+            #[cfg(test)]
+            {
+                self.read_bytes += read;
+            }
+            if read == 0 {
+                let after = file.metadata()?;
+                if after.len() != initial.len() || after.modified().ok() != initial.modified().ok()
+                {
+                    bail!("skill input changed while reading");
+                }
+                self.hashes[self.index] = Some(digest.clone().finalize().into());
+                self.file = None;
+                self.index += 1;
+                continue;
+            }
+            if read > limit.saturating_sub(bytes.len()) {
+                bail!("skill input grew past max_install_file_bytes");
+            }
+            digest.update(&chunk[..read]);
+            bytes.extend_from_slice(&chunk[..read]);
+            remaining -= read;
+            if remaining == 0 {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+    pub(crate) fn finish(self) -> Result<SkillFileInput> {
+        if self.index != 2 {
+            bail!("skill input read is incomplete");
+        }
+        let [skill, sidecar] = self.buffers;
+        let skill = skill.context("missing SKILL.md bytes")?;
+        let revision = SkillInputRevision {
+            skill: self.hashes[0].context("missing skill input hash")?,
+            sidecar: self.hashes[1],
+        };
+        let sidecar_bytes = sidecar.as_ref().map_or(0, Vec::len);
+        let input_bytes_read = skill.len().saturating_add(sidecar_bytes);
+        let largest_input = skill.len().max(sidecar_bytes);
+        let raw = String::from_utf8(skill).context("SKILL.md is not UTF-8")?;
+        let skill_dir = self
+            .skill_file
+            .parent()
+            .context("skill file does not have a parent directory")?;
+        let meta = match sidecar {
+            Some(bytes) => {
+                parse_sidecar_text(std::str::from_utf8(&bytes)?, &skill_dir.join("_meta.json"))?
+            }
+            None => ParsedSidecarMeta::default(),
+        };
+        Ok(SkillFileInput {
+            raw,
+            largest_input,
+            input_bytes_read,
+            revision,
+            context: SkillMarkdownParseContext {
+                skill_id: self.skill_id,
+                source_kind: self.kind,
+                source_root: self.root.display().to_string(),
+                skill_dir: skill_dir.display().to_string(),
+                skill_file: self.skill_file.display().to_string(),
+                parent_directory_name: skill_dir
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("skill")
+                    .to_owned(),
+                identity_owner_override: meta.owner,
+                identity_slug_override: meta.slug,
+                version_hint_override: meta.version_hint,
+                display_name_override: meta.display_name,
+            },
+        })
+    }
+}
+pub(crate) fn read_skill_file_input(
+    skill_id: SkillId,
+    skill_file: &Path,
+    source_kind: SkillSourceKind,
+    source_root: &Path,
+    max_file_bytes: usize,
+) -> Result<SkillFileInput> {
+    let mut read = SkillFileInputRead::new(
+        skill_id,
+        skill_file,
+        source_kind,
+        source_root,
+        max_file_bytes,
+    );
+    // Public catalog/CLI parsing historically accepts contained links and has
+    // no sidecar cap. Watcher preparation uses the policy-bounded constructor.
+    read.follow_links = true;
+    read.sidecar_max = usize::MAX;
+    while !read.step(256 * 1024)? {}
+    read.finish()
+}
+
+#[cfg(test)]
+mod bounded_input_tests {
+    use super::*;
+    #[test]
+    fn growth_after_open_stat_reads_at_most_limit_plus_one_and_never_finishes_input() {
+        for sidecar in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let skill = directory.path().join("SKILL.md");
+            fs::write(&skill, "abcd").unwrap();
+            if sidecar {
+                fs::write(directory.path().join("_meta.json"), "{}").unwrap();
+            }
+            let limit = 64;
+            let mut read = SkillFileInputRead::new(
+                SkillId::new("R".repeat(21)).unwrap(),
+                &skill,
+                SkillSourceKind::User,
+                directory.path(),
+                limit,
+            );
+            assert!(!read.step(if sidecar { 5 } else { 1 }).unwrap());
+            assert_eq!(read.index, usize::from(sidecar));
+            assert!(read.file.is_some(), "the stat and open must precede growth");
+            let growing = if sidecar {
+                directory.path().join("_meta.json")
+            } else {
+                skill
+            };
+            fs::write(growing, vec![b'x'; limit * 100]).unwrap();
+            loop {
+                let before = read.read_bytes;
+                let result = read.step(17);
+                assert!(
+                    read.read_bytes - before <= 17,
+                    "actual FS reads obey the quantum"
+                );
+                if result.is_err() {
+                    break;
+                }
+                assert!(!result.unwrap());
+            }
+            assert_eq!(read.read_bytes, limit + 1 + if sidecar { 4 } else { 0 });
+            assert!(read.finish().is_err());
+        }
     }
 
-    let raw = fs::read_to_string(skill_file)
-        .with_context(|| format!("failed to read skill file `{}`", skill_file.display()))?;
+    #[test]
+    fn foreground_sidecar_contract_does_not_borrow_the_watchers_install_size_policy() {
+        let directory = tempfile::tempdir().unwrap();
+        let skill = directory.path().join("SKILL.md");
+        fs::write(&skill, "---\nname: Test\n---\nBody").unwrap();
+        fs::write(
+            directory.path().join("_meta.json"),
+            format!("{{\"displayName\":\"{}\"}}", "a".repeat(1024)),
+        )
+        .unwrap();
+        let id = SkillId::new("R".repeat(21)).unwrap();
+        assert!(
+            parse_skill_from_file(
+                id.clone(),
+                &skill,
+                SkillSourceKind::User,
+                directory.path(),
+                64
+            )
+            .is_ok()
+        );
+        let mut watcher =
+            SkillFileInputRead::new(id, &skill, SkillSourceKind::User, directory.path(), 64);
+        assert!(watcher.step(256 * 1024).is_err());
+    }
 
-    let skill_dir = skill_file
-        .parent()
-        .context("skill file does not have a parent directory")?;
-    let sidecar_meta = parse_sidecar_meta(skill_dir)?;
-    let parent_directory_name = skill_dir
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("skill")
-        .to_owned();
-
-    parse_skill_markdown(
-        raw.as_str(),
-        SkillMarkdownParseContext {
-            skill_id,
-            source_kind,
-            source_root: source_root.display().to_string(),
-            skill_dir: skill_dir.display().to_string(),
-            skill_file: skill_file.display().to_string(),
-            parent_directory_name,
-            identity_owner_override: sidecar_meta.owner,
-            identity_slug_override: sidecar_meta.slug,
-            version_hint_override: sidecar_meta.version_hint,
-            display_name_override: sidecar_meta.display_name,
-        },
-    )
+    #[cfg(unix)]
+    #[test]
+    fn foreground_input_links_remain_supported_while_the_watcher_never_follows_them() {
+        let directory = tempfile::tempdir().unwrap();
+        let skill = directory.path().join("SKILL.md");
+        fs::write(
+            directory.path().join("content.md"),
+            "---\nname: Test\n---\nBody",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("content.md", &skill).unwrap();
+        let id = SkillId::new("R".repeat(21)).unwrap();
+        assert!(
+            parse_skill_from_file(
+                id.clone(),
+                &skill,
+                SkillSourceKind::User,
+                directory.path(),
+                1024
+            )
+            .is_ok()
+        );
+        let mut watcher =
+            SkillFileInputRead::new(id, &skill, SkillSourceKind::User, directory.path(), 1024);
+        assert!(watcher.step(256 * 1024).is_err());
+    }
 }
 
 #[cfg(test)]

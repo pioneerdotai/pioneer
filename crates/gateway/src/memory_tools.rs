@@ -826,6 +826,15 @@ impl AgentMemoryPostTurnExtractorProvider for GatewayMemoryProvider {
                     ProviderFailureClassification::new(class),
                 )
             })?;
+        // Extraction is post-turn work: never inherit an interactive handle.
+        let usage_store = processor.crud_store.with_maintenance_access();
+        let provider = crate::usage_journal::observe(
+            provider,
+            &usage_store,
+            context.workspace_id.as_str(),
+            "memory_extraction",
+            context.workspace_id.as_str(),
+        );
         let raw_json =
             request_post_turn_extractor_json(provider.as_ref(), model, request.render_prompt())
                 .await?;
@@ -1295,7 +1304,9 @@ fn memory_provider_request_error(
 ) -> HookError {
     let classification = provider.classify_failure(error).unwrap_or_else(|| {
         ProviderFailureClassification::new(pioneer_agent::classify_provider_failure_message(
-            error.to_string().as_str(),
+            pioneer_provider::usage::classification_source(error)
+                .to_string()
+                .as_str(),
             stage,
         ))
     });

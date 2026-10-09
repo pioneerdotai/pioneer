@@ -47,6 +47,7 @@ pub mod policy;
 pub(crate) mod policy_generation;
 pub(crate) mod principal_avatar;
 pub(crate) mod projection_receipt_cleanup;
+pub mod provider_usage;
 pub(crate) mod read_model_repair;
 pub mod recovery_job;
 pub mod recovery_terminalization_outbox;

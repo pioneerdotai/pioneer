@@ -10,6 +10,7 @@ mod m20260919_000002_compaction_publication_fence;
 mod m20260920_000001_independent_compaction_summaries;
 mod m20260930_000001_recovery_diagnostic;
 mod m20261001_000001_delivery_authority_spec_indexes;
+mod m20261001_000002_provider_usage_observation;
 mod m20261002_000001_task_run_occurrence_reconcile;
 mod m20261004_000001_task_occurrence_reconcile;
 mod m20261004_000004_compaction_lifecycle_pending;
@@ -17,8 +18,10 @@ mod m20261004_000005_terminal_effect_gates;
 mod m20261004_000006_task_delivery_recovery;
 mod m20261004_000007_agent_action_outbox_ranges;
 mod m20261004_000008_task_event_fanout_pending;
+mod m20261004_000009_skills_watch_indexes;
 mod m20261005_000001_native_cancellation_context;
 mod m20261006_000001_retire_compaction_publication_fences;
+mod m20261006_000001_thread_episodic_job_access;
 mod m20261008_000001_frozen_history_proofs;
 pub use sea_orm_migration::prelude::*;
 
@@ -168,6 +171,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260920_000001_independent_compaction_summaries::Migration),
             Box::new(m20260930_000001_recovery_diagnostic::Migration),
             Box::new(m20261001_000001_delivery_authority_spec_indexes::Migration),
+            Box::new(m20261001_000002_provider_usage_observation::Migration),
             Box::new(m20261002_000001_task_run_occurrence_reconcile::Migration),
             Box::new(m20261004_000001_cli_runtime_active_binding_index::Migration),
             Box::new(m20261004_000001_task_occurrence_reconcile::Migration),
@@ -178,6 +182,8 @@ impl MigratorTrait for Migrator {
             Box::new(m20261004_000008_task_event_fanout_pending::Migration),
             Box::new(m20261005_000001_native_cancellation_context::Migration),
             Box::new(m20261006_000001_retire_compaction_publication_fences::Migration),
+            Box::new(m20261004_000009_skills_watch_indexes::Migration),
+            Box::new(m20261006_000001_thread_episodic_job_access::Migration),
             Box::new(m20261008_000001_frozen_history_proofs::Migration),
         ]
     }

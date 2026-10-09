@@ -653,6 +653,26 @@ async fn wait_for_episodic_ingestor_calls(
     .expect("optional episodic outbox delivery should complete");
 }
 
+async fn wait_for_episodic_ingestor_item(
+    ingestor: &RecordingThreadEpisodicIngestor,
+    thread_id: &str,
+    turn_id: &str,
+    item_id: &str,
+) {
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if ingestor.calls.lock().await.iter().any(|call| {
+                call.thread_id == thread_id && call.turn_id == turn_id && call.item_id == item_id
+            }) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("committed item should reach the durable episodic consumer");
+}
+
 #[derive(Default)]
 struct RecordingCliRuntimeSession {
     thread_starts: TokioMutex<Vec<CLIAgentRuntimeThreadOpenParams>>,
@@ -3971,7 +3991,14 @@ impl Provider for CaptureSummaryProvider {
                 limits: Default::default(),
                 capabilities: pioneer_protocol::ProviderModelCapabilities {
                     vision: Some(true),
-                    input_modalities: Some(vec!["text".into(), "image".into(), "pdf".into()]),
+                    // The catalog's o4-mini contract is text/image only. Keep
+                    // PDF on the synthetic model used for native CLI history;
+                    // discovery cannot widen a catalog-known negative.
+                    input_modalities: Some(if id == "test-model" {
+                        vec!["text".into(), "image".into(), "pdf".into()]
+                    } else {
+                        vec!["text".into(), "image".into()]
+                    }),
                     output_modalities: Some(vec!["text".into()]),
                     ..Default::default()
                 },
@@ -4179,6 +4206,7 @@ impl Provider for PromptParityCaptureProvider {
                 tool_calling: Some(true),
                 thinking: Some(true),
                 reasoning: Some(pioneer_protocol::ProviderModelReasoningCapabilities {
+                    native: Default::default(),
                     supported: Some(true),
                     effort_options: vec![
                         "minimal".to_owned(),
@@ -12669,15 +12697,24 @@ async fn discover_native_capture_models(
         .await
         .unwrap();
     assert_eq!(models.len(), 2);
-    assert!(models.iter().all(|model| {
-        model
+    for id in ["test-model", "o4-mini"] {
+        let model = models.iter().find(|model| model.id == id).unwrap();
+        let input = model
             .capabilities
             .input_modalities
             .as_ref()
-            .is_some_and(|input| {
-                input.iter().any(|kind| kind == "image") && input.iter().any(|kind| kind == "pdf")
-            })
-    }));
+            .expect("native capture model must retain explicit input capabilities");
+        assert!(input.iter().any(|kind| kind == "text"));
+        assert!(input.iter().any(|kind| kind == "image"));
+        assert_eq!(model.capabilities.vision, Some(true));
+        assert_eq!(
+            input
+                .iter()
+                .any(|kind| matches!(kind.as_str(), "pdf" | "file" | "document")),
+            id == "test-model",
+            "{id} must retain its own document contract after discovery"
+        );
+    }
 }
 
 async fn materialize_artifact_api_thread(
@@ -13158,11 +13195,14 @@ async fn followup_history_preserves_typed_recorded_artifact_version() {
         )
         .await;
     let _first_response = recv_response_by_id(&mut rx, first_request_id.as_str()).await;
-    let first_status = wait_for_turn_status(
-        processor.crud_store.clone(),
-        thread.thread.id.as_str(),
-        first_turn_id,
-        TurnStatus::Completed,
+    let first_status = drain_test_notifications_while(
+        &mut rx,
+        wait_for_turn_status(
+            processor.crud_store.clone(),
+            thread.thread.id.as_str(),
+            first_turn_id,
+            TurnStatus::Completed,
+        ),
     )
     .await;
     let first_persisted = processor
@@ -13199,11 +13239,14 @@ async fn followup_history_preserves_typed_recorded_artifact_version() {
         .await;
     let _second_response = recv_response_by_id(&mut rx, second_request_id.as_str()).await;
     assert_eq!(
-        wait_for_turn_status(
-            processor.crud_store.clone(),
-            thread.thread.id.as_str(),
-            second_turn_id,
-            TurnStatus::Completed,
+        drain_test_notifications_while(
+            &mut rx,
+            wait_for_turn_status(
+                processor.crud_store.clone(),
+                thread.thread.id.as_str(),
+                second_turn_id,
+                TurnStatus::Completed,
+            )
         )
         .await,
         TurnStatus::Completed,
@@ -13332,11 +13375,14 @@ async fn followup_history_rejects_unavailable_accepted_artifact_before_provider(
         )
         .await;
     let _first_response = recv_response_by_id(&mut rx, first_request_id.as_str()).await;
-    let first_status = wait_for_turn_status(
-        processor.crud_store.clone(),
-        thread.thread.id.as_str(),
-        first_turn_id,
-        TurnStatus::Completed,
+    let first_status = drain_test_notifications_while(
+        &mut rx,
+        wait_for_turn_status(
+            processor.crud_store.clone(),
+            thread.thread.id.as_str(),
+            first_turn_id,
+            TurnStatus::Completed,
+        ),
     )
     .await;
     let first_persisted = processor
@@ -13378,11 +13424,14 @@ async fn followup_history_rejects_unavailable_accepted_artifact_before_provider(
         )
         .await;
     let _second_response = recv_response_by_id(&mut rx, second_request_id.as_str()).await;
-    let second_status = wait_for_turn_status(
-        processor.crud_store.clone(),
-        thread.thread.id.as_str(),
-        second_turn_id,
-        TurnStatus::Blocked,
+    let second_status = drain_test_notifications_while(
+        &mut rx,
+        wait_for_turn_status(
+            processor.crud_store.clone(),
+            thread.thread.id.as_str(),
+            second_turn_id,
+            TurnStatus::Blocked,
+        ),
     )
     .await;
     let failed = processor
@@ -23995,6 +24044,13 @@ async fn immediate_detached_task_runs_after_parent_and_delivers_to_occurrence_tu
         delivered_message_index < completed_card_index,
         "the complete AgentMessage must be committed before the parent Task card becomes completed"
     );
+    wait_for_episodic_ingestor_item(
+        &delivery_ingestor,
+        parent_thread_id,
+        &run.id,
+        delivered_message_id,
+    )
+    .await;
     let ingestion_calls = delivery_ingestor.calls.lock().await;
     // Child events may still be indexed after the recorder is installed.
     // Only calls for the committed parent message belong to this assertion.
@@ -31757,10 +31813,13 @@ async fn detached_composer_work_matches_parent_llm_prompts_end_to_end_impl() {
     )
     .await;
     assert!(
-        wait_for_prompt_parity_request_count(
-            provider.as_ref(),
-            PromptParityRequestKind::PostTurnExtractor,
-            2,
+        drain_test_notifications_while(
+            &mut harness.rx,
+            wait_for_prompt_parity_request_count(
+                provider.as_ref(),
+                PromptParityRequestKind::PostTurnExtractor,
+                2,
+            )
         )
         .await,
         "both seed turns should finish post-turn extraction before comparison"
@@ -31778,10 +31837,13 @@ async fn detached_composer_work_matches_parent_llm_prompts_end_to_end_impl() {
         exact_user_text,
     )
     .await;
-    if !wait_for_prompt_parity_request_count(
-        provider.as_ref(),
-        PromptParityRequestKind::PostTurnExtractor,
-        1,
+    if !drain_test_notifications_while(
+        &mut harness.rx,
+        wait_for_prompt_parity_request_count(
+            provider.as_ref(),
+            PromptParityRequestKind::PostTurnExtractor,
+            1,
+        ),
     )
     .await
     {
@@ -31844,10 +31906,13 @@ async fn detached_composer_work_matches_parent_llm_prompts_end_to_end_impl() {
     let task = create_task_for_test(&harness.processor, params)
         .await
         .expect("detached prompt parity task should start");
-    let task_status = wait_for_task_status(
-        harness.crud_store.clone(),
-        task.task.id.as_str(),
-        TaskStatus::Completed,
+    let task_status = drain_test_notifications_while(
+        &mut harness.rx,
+        wait_for_task_status(
+            harness.crud_store.clone(),
+            task.task.id.as_str(),
+            TaskStatus::Completed,
+        ),
     )
     .await;
     if task_status != TaskStatus::Completed {
@@ -31862,10 +31927,13 @@ async fn detached_composer_work_matches_parent_llm_prompts_end_to_end_impl() {
             failed.task.error, failed.runs
         );
     }
-    if !wait_for_prompt_parity_request_count(
-        provider.as_ref(),
-        PromptParityRequestKind::PostTurnExtractor,
-        1,
+    if !drain_test_notifications_while(
+        &mut harness.rx,
+        wait_for_prompt_parity_request_count(
+            provider.as_ref(),
+            PromptParityRequestKind::PostTurnExtractor,
+            1,
+        ),
     )
     .await
     {
@@ -32039,10 +32107,13 @@ async fn detached_composer_work_matches_full_parent_llm_request_end_to_end_impl(
     )
     .await;
     assert!(
-        wait_for_prompt_parity_request_count(
-            provider.as_ref(),
-            PromptParityRequestKind::PostTurnExtractor,
-            2,
+        drain_test_notifications_while(
+            &mut harness.rx,
+            wait_for_prompt_parity_request_count(
+                provider.as_ref(),
+                PromptParityRequestKind::PostTurnExtractor,
+                2,
+            )
         )
         .await,
         "both full-parity seed turns should finish post-turn extraction"
@@ -32140,10 +32211,13 @@ async fn detached_composer_work_matches_full_parent_llm_request_end_to_end_impl(
         )];
     direct_launch.agent_launch = Some(exact_agent_launch.clone());
     run_memory_e2e_turn_with_params(&mut harness, &direct_launch).await;
-    if !wait_for_prompt_parity_request_count(
-        provider.as_ref(),
-        PromptParityRequestKind::PostTurnExtractor,
-        1,
+    if !drain_test_notifications_while(
+        &mut harness.rx,
+        wait_for_prompt_parity_request_count(
+            provider.as_ref(),
+            PromptParityRequestKind::PostTurnExtractor,
+            1,
+        ),
     )
     .await
     {
@@ -32250,10 +32324,13 @@ async fn detached_composer_work_matches_full_parent_llm_request_end_to_end_impl(
     let task = create_task_for_test(&harness.processor, params)
         .await
         .expect("full prompt parity task should start");
-    let task_status = wait_for_task_status(
-        harness.crud_store.clone(),
-        task.task.id.as_str(),
-        TaskStatus::Completed,
+    let task_status = drain_test_notifications_while(
+        &mut harness.rx,
+        wait_for_task_status(
+            harness.crud_store.clone(),
+            task.task.id.as_str(),
+            TaskStatus::Completed,
+        ),
     )
     .await;
     if task_status != TaskStatus::Completed {
@@ -32319,10 +32396,13 @@ async fn detached_composer_work_matches_full_parent_llm_request_end_to_end_impl(
             }),
         "the detached child must not inherit the direct Turn's private artifact-output root"
     );
-    if !wait_for_prompt_parity_request_count(
-        provider.as_ref(),
-        PromptParityRequestKind::PostTurnExtractor,
-        1,
+    if !drain_test_notifications_while(
+        &mut harness.rx,
+        wait_for_prompt_parity_request_count(
+            provider.as_ref(),
+            PromptParityRequestKind::PostTurnExtractor,
+            1,
+        ),
     )
     .await
     {
@@ -34956,9 +35036,35 @@ async fn task_delivery_worker_uses_lineage_parent_turn_for_origin_thread_impl() 
             } if text == "delivered scheduled result"
         )
     }));
+    let delivered_item_id = items
+        .events
+        .iter()
+        .find_map(|event| match &event.payload {
+            TurnItemEventPayload::ItemCompleted {
+                item: TurnItem::AgentMessage { id, text, .. },
+                ..
+            } if text == "delivered scheduled result" => Some(id.as_str()),
+            _ => None,
+        })
+        .unwrap();
+    wait_for_episodic_ingestor_item(
+        &delivery_ingestor,
+        origin_thread_id,
+        &run.id,
+        delivered_item_id,
+    )
+    .await;
     let ingestion_calls = delivery_ingestor.calls.lock().await;
-    assert_eq!(ingestion_calls.len(), 1);
-    let delivered_call = &ingestion_calls[0];
+    let delivered_calls: Vec<_> = ingestion_calls
+        .iter()
+        .filter(|call| {
+            call.thread_id == origin_thread_id
+                && call.turn_id == run.id
+                && call.item_id == delivered_item_id
+        })
+        .collect();
+    assert_eq!(delivered_calls.len(), 1);
+    let delivered_call = delivered_calls[0];
     assert_eq!(delivered_call.workspace_id, workspace_id);
     assert_eq!(delivered_call.thread_id, origin_thread_id);
     assert_eq!(delivered_call.turn_id, run.id);
@@ -37714,6 +37820,920 @@ async fn thread_episodic_store_ingestor_creates_items_and_jobs_idempotently() {
             && job.graph_enrichment_state
                 == pioneer_crud::ThreadEpisodicGraphEnrichmentState::NotSupported
     }));
+}
+
+// Exercise canonical commit -> durable episodic delivery -> ingestion -> the
+// production wake caller, including its ACK. No test calls run_once to drain.
+async fn save_and_deliver_episodic_wake_for_test(
+    processor: &MessageProcessor,
+    store: &CrudStore,
+    workspace: &str,
+    item_id: &str,
+) -> (pioneer_crud::ThreadEpisodicIndexJobRecord, String) {
+    store
+        .materialize_item_completed(
+            ItemCompletedNotification {
+                workspace_id: workspace.to_owned(),
+                thread_id: "wake_thread".to_owned(),
+                turn_id: "wake_turn".to_owned(),
+                item: TurnItem::AgentMessage {
+                    id: item_id.to_owned(),
+                    text: format!("durable source {item_id}"),
+                    phase: pioneer_protocol::AgentMessagePhase::FinalAnswer,
+                    markdown: None,
+                    markdown_version: None,
+                },
+            },
+            chrono::Utc::now().timestamp(),
+        )
+        .await
+        .unwrap();
+    let delivery = store
+        .claim_due_turn_event_deliveries(
+            pioneer_crud::NATIVE_TURN_EVENT_EPISODIC_CONSUMER,
+            chrono::Utc::now().timestamp(),
+            1,
+        )
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    processor
+        .process_claimed_native_turn_event_delivery(delivery.clone())
+        .await;
+    let ack = pioneer_entity::turn_event_delivery::Entity::find_by_id(delivery.id.clone())
+        .one(&store.database_connection())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(ack.status, "delivered");
+    assert!(ack.delivered_at.is_some());
+    let source = store
+        .list_thread_episodic_items_for_thread(workspace, "wake_thread", 100)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|item| item.item_id == item_id)
+        .unwrap();
+    (
+        store
+            .find_thread_episodic_index_job_by_item(&source.id)
+            .await
+            .unwrap()
+            .unwrap(),
+        delivery.id,
+    )
+}
+
+#[tokio::test]
+async fn production_episodic_wakes_drain_batches_and_survive_busy_idle_race_and_delivery_cancellation()
+ {
+    use crate::database::startup::thread_episodic_workspace_capsule_refill as refill;
+    use crate::thread_episodic::{
+        RuntimeVectorThreadEpisodicIndexPayloadProvider,
+        SharedThreadEpisodicIndexEmbeddingProviderResolver,
+        StoreThreadEpisodicIndexPayloadProvider, ThreadEpisodicIndexExecutor,
+        ThreadEpisodicIndexExecutorConfig,
+    };
+    let (workspace_manager, store, workspace) = setup_workspace_manager().await;
+    let root = tempfile::tempdir().unwrap();
+    let mut processor = MessageProcessor::with_agent_manager(
+        Arc::new(ThreadManager::new("test-model", "openai")),
+        Arc::new(AgentManager::new(test_provider(), test_tool_loop_config())),
+        Arc::new(SessionManager::new()),
+        workspace_manager,
+        store.clone(),
+    );
+    let resolver = Arc::new(SharedThreadEpisodicIndexEmbeddingProviderResolver::new());
+    let executor = Arc::new(
+        ThreadEpisodicIndexExecutor::new(
+            store.clone(),
+            Arc::new(pioneer_memory::MemvidThreadEpisodicBackend::new()),
+            Arc::new(RuntimeVectorThreadEpisodicIndexPayloadProvider::new(
+                Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(
+                    store.clone(),
+                    pioneer_memory::thread_episodic_storage_uri_from_path(root.path()),
+                )),
+                resolver.clone(),
+                store.clone(),
+            )),
+        )
+        .with_projection_runtime(
+            root.path().to_owned(),
+            resolver,
+            processor
+                .thread_episodic_workspace_refill_supervisor
+                .clone(),
+        ),
+    );
+    executor.apply_config(ThreadEpisodicIndexExecutorConfig {
+        batch_limit: 1,
+        ..Default::default()
+    });
+    processor.thread_episodic_index_executor = executor.clone();
+    let processor = Arc::new(processor);
+    refill::refill_once_with_workspace_projection(
+        store.clone(),
+        root.path(),
+        &workspace,
+        refill::ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::lexical_only(),
+        None,
+    )
+    .await
+    .unwrap();
+    materialize_thread_episodic_ingest_turn(&store, &workspace, "wake_thread", "wake_turn").await;
+    let (claimed_tx, claimed_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    executor
+        .pause_after_claim_for_test(claimed_tx, release_rx)
+        .await;
+    let (a, _) =
+        save_and_deliver_episodic_wake_for_test(&processor, &store, &workspace, "wake_a").await;
+    timeout(Duration::from_secs(5), claimed_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    let a_claim = store
+        .find_thread_episodic_index_job(&a.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        a_claim.status,
+        pioneer_crud::ThreadEpisodicIndexJobStatus::Running
+    );
+    assert_eq!(a_claim.attempt_count, 1);
+    // B's caller completes its durable delivery while A owns the workspace.
+    // Canceling that caller afterwards cannot cancel the executor-owned runner.
+    let (b_tx, b_rx) = tokio::sync::oneshot::channel();
+    let delivery_caller = tokio::spawn({
+        let processor = processor.clone();
+        let store = store.clone();
+        let workspace = workspace.clone();
+        async move {
+            let (b, _) =
+                save_and_deliver_episodic_wake_for_test(&processor, &store, &workspace, "wake_b")
+                    .await;
+            b_tx.send(b).unwrap();
+            std::future::pending::<()>().await;
+        }
+    });
+    let b = timeout(Duration::from_secs(5), b_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(b.status, pioneer_crud::ThreadEpisodicIndexJobStatus::Queued);
+    assert_eq!(b.attempt_count, 0);
+    delivery_caller.abort();
+    assert!(delivery_caller.await.unwrap_err().is_cancelled());
+    let mut backlog = vec![a, b];
+    for index in 0..5 {
+        backlog.push(
+            save_and_deliver_episodic_wake_for_test(
+                &processor,
+                &store,
+                &workspace,
+                &format!("wake_backlog_{index}"),
+            )
+            .await
+            .0,
+        );
+    }
+    let (idle_tx, idle_rx) = tokio::sync::oneshot::channel();
+    let (idle_release_tx, idle_release_rx) = tokio::sync::oneshot::channel();
+    executor
+        .pause_before_idle_for_test(idle_tx, idle_release_rx)
+        .await;
+    release_tx.send(()).unwrap();
+    for job in &backlog {
+        let completed = timeout(
+            Duration::from_secs(5),
+            executor.wait_for_completed_job_for_test(&job.id),
+        )
+        .await
+        .unwrap();
+        assert_eq!(completed.attempt_count, 1);
+    }
+    timeout(Duration::from_secs(5), idle_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    // Wake arrives after the last empty scheduling read, before idle waiting.
+    let c = save_and_deliver_episodic_wake_for_test(&processor, &store, &workspace, "wake_at_idle")
+        .await
+        .0;
+    idle_release_tx.send(()).unwrap();
+    assert_eq!(
+        timeout(
+            Duration::from_secs(5),
+            executor.wait_for_completed_job_for_test(&c.id)
+        )
+        .await
+        .unwrap()
+        .attempt_count,
+        1
+    );
+    // A refill's lease holds admission. The durable wake waits for lease release,
+    // rather than polling or relying on another event/restart/manual run_once.
+    let ownership = pioneer_memory::lock_thread_episodic_workspace(&workspace).await;
+    let d = save_and_deliver_episodic_wake_for_test(
+        &processor,
+        &store,
+        &workspace,
+        "wake_during_refill",
+    )
+    .await
+    .0;
+    timeout(
+        Duration::from_secs(5),
+        executor.wait_for_busy_workspace_for_test(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        store
+            .find_thread_episodic_index_job(&d.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .attempt_count,
+        0
+    );
+    drop(ownership);
+    assert_eq!(
+        timeout(
+            Duration::from_secs(5),
+            executor.wait_for_completed_job_for_test(&d.id)
+        )
+        .await
+        .unwrap()
+        .attempt_count,
+        1
+    );
+    assert!(
+        store
+            .list_thread_episodic_index_jobs_for_thread(&workspace, "wake_thread", 100)
+            .await
+            .unwrap()
+            .iter()
+            .all(
+                |job| job.status == pioneer_crud::ThreadEpisodicIndexJobStatus::Completed
+                    && job.attempt_count == 1
+            )
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn production_snapshot_save_wakes_idle_runner_and_preserves_draft_unchanged_and_rollback() {
+    use crate::thread_episodic::{
+        StoreThreadEpisodicIndexPayloadProvider, ThreadEpisodicIndexExecutor,
+    };
+    let (workspace_manager, store, workspace) = setup_workspace_manager().await;
+    let root = tempfile::tempdir().unwrap();
+    let session_manager = Arc::new(SessionManager::new());
+    let (tx, mut rx) = mpsc::channel(64);
+    let connection = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
+    let mut processor = MessageProcessor::new(
+        Arc::new(ThreadManager::new("o4-mini", "openai")),
+        test_provider(),
+        session_manager,
+        workspace_manager,
+        store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_tool_loop_config(),
+    );
+    let executor = Arc::new(ThreadEpisodicIndexExecutor::new(
+        store.clone(),
+        Arc::new(pioneer_memory::MemvidThreadEpisodicBackend::new()),
+        Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(
+            store.clone(),
+            pioneer_memory::thread_episodic_storage_uri_from_path(root.path()),
+        )),
+    ));
+    processor.thread_episodic_index_executor = executor.clone();
+    let thread = "snapshot_wake_thread";
+    let turn = "snapshot_wake_turn";
+    start_loaded_thread_and_turn_for_cli_runtime_test(
+        &processor, connection, &mut rx, &workspace, thread, turn,
+    )
+    .await;
+    // Use the real authorization lease; do not bypass the handler's guard.
+    drop(processor.guard_execution_commit(turn).await.unwrap());
+    let item = |id: &str, text: &str| TurnItem::AgentMessage {
+        id: id.to_owned(),
+        text: text.to_owned(),
+        phase: pioneer_protocol::AgentMessagePhase::FinalAnswer,
+        markdown: None,
+        markdown_version: None,
+    };
+    let complete = ItemCompletedNotification {
+        workspace_id: workspace.clone(),
+        thread_id: thread.to_owned(),
+        turn_id: turn.to_owned(),
+        item: item("snapshot_source", "A"),
+    };
+    store
+        .materialize_item_completed(complete.clone(), chrono::Utc::now().timestamp())
+        .await
+        .unwrap();
+    processor
+        .ingest_committed_thread_item_with_result(&complete)
+        .await
+        .unwrap();
+    let initial = store
+        .list_thread_episodic_items_for_thread(&workspace, thread, 100)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|row| row.item_id == "snapshot_source")
+        .unwrap();
+    executor
+        .wait_for_completed_source_for_test(&initial.id)
+        .await;
+    let (idle_tx, idle_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    executor
+        .pause_before_idle_for_test(idle_tx, release_rx)
+        .await;
+    executor.wake();
+    idle_rx.await.unwrap();
+    release_tx.send(()).unwrap();
+    let snapshot = |id: &str, text: &str, workspace: &str| ItemUpdatedNotification {
+        workspace_id: workspace.to_owned(),
+        thread_id: thread.to_owned(),
+        turn_id: turn.to_owned(),
+        item: item(id, text),
+    };
+    processor
+        .handle_snapshot_agent_event(
+            crate::cli_runtime::projector::AgentSnapshotEvent::ItemUpdated {
+                notification: snapshot("snapshot_source", "B", &workspace),
+            },
+        )
+        .await;
+    let changed = store
+        .list_thread_episodic_items_for_thread(&workspace, thread, 100)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|row| {
+            row.item_id == "snapshot_source"
+                && row.id != initial.id
+                && row.status != pioneer_crud::ThreadEpisodicItemStatus::Superseded
+        })
+        .unwrap();
+    let completed = executor
+        .wait_for_completed_source_for_test(&changed.id)
+        .await;
+    assert_eq!(
+        completed.status,
+        pioneer_crud::ThreadEpisodicIndexJobStatus::Completed
+    );
+    assert_eq!(completed.attempt_count, 1);
+    assert_ne!(changed.text_hash, initial.text_hash);
+    let jobs = store
+        .list_thread_episodic_index_jobs_for_thread(&workspace, thread, 100)
+        .await
+        .unwrap();
+    processor
+        .handle_snapshot_agent_event(
+            crate::cli_runtime::projector::AgentSnapshotEvent::ItemUpdated {
+                notification: snapshot("snapshot_source", "B", &workspace),
+            },
+        )
+        .await;
+    assert_eq!(
+        store
+            .list_thread_episodic_index_jobs_for_thread(&workspace, thread, 100)
+            .await
+            .unwrap(),
+        jobs
+    );
+    store
+        .materialize_item_started(
+            pioneer_protocol::ItemStartedNotification {
+                workspace_id: workspace.clone(),
+                thread_id: thread.to_owned(),
+                turn_id: turn.to_owned(),
+                item: item("draft_source", "draft"),
+            },
+            chrono::Utc::now().timestamp(),
+        )
+        .await
+        .unwrap();
+    processor
+        .handle_snapshot_agent_event(
+            crate::cli_runtime::projector::AgentSnapshotEvent::ItemUpdated {
+                notification: snapshot("draft_source", "updated draft", &workspace),
+            },
+        )
+        .await;
+    assert!(
+        store
+            .list_thread_episodic_items_for_thread(&workspace, thread, 100)
+            .await
+            .unwrap()
+            .iter()
+            .all(|row| row.item_id != "draft_source")
+    );
+    assert_eq!(
+        store
+            .list_thread_episodic_index_jobs_for_thread(&workspace, thread, 100)
+            .await
+            .unwrap(),
+        jobs
+    );
+    let canonical = store
+        .get_turn_item(turn, "snapshot_source")
+        .await
+        .unwrap()
+        .unwrap();
+    let sources = store
+        .list_thread_episodic_items_for_thread(&workspace, thread, 100)
+        .await
+        .unwrap();
+    store.database_connection().execute_unprepared("CREATE TRIGGER reject_snapshot_job BEFORE INSERT ON thread_episodic_index_jobs BEGIN SELECT RAISE(ABORT, 'controlled snapshot bookkeeping failure'); END").await.unwrap();
+    processor
+        .handle_snapshot_agent_event(
+            crate::cli_runtime::projector::AgentSnapshotEvent::ItemUpdated {
+                notification: snapshot("snapshot_source", "must rollback", &workspace),
+            },
+        )
+        .await;
+    assert_eq!(
+        store
+            .get_turn_item(turn, "snapshot_source")
+            .await
+            .unwrap()
+            .unwrap(),
+        canonical
+    );
+    assert_eq!(
+        store
+            .list_thread_episodic_items_for_thread(&workspace, thread, 100)
+            .await
+            .unwrap(),
+        sources
+    );
+    assert_eq!(
+        store
+            .list_thread_episodic_index_jobs_for_thread(&workspace, thread, 100)
+            .await
+            .unwrap(),
+        jobs
+    );
+    store
+        .database_connection()
+        .execute_unprepared("DROP TRIGGER reject_snapshot_job")
+        .await
+        .unwrap();
+    executor.shutdown().await;
+}
+
+struct WakeProjectionEmbeddingProvider {
+    model: &'static str,
+    dimension: usize,
+}
+impl pioneer_memory::ThreadEpisodicEmbeddingProvider for WakeProjectionEmbeddingProvider {
+    fn provider_id(&self) -> &str {
+        "openrouter"
+    }
+    fn model(&self) -> &str {
+        self.model
+    }
+    fn dimension(&self) -> usize {
+        self.dimension
+    }
+    fn normalized(&self) -> bool {
+        true
+    }
+    fn embed_text(
+        &self,
+        _text: &str,
+    ) -> std::result::Result<Vec<f32>, pioneer_memory::ThreadEpisodicEmbeddingError> {
+        Ok(vec![0.1; self.dimension])
+    }
+}
+
+struct WakeProjectionResolver {
+    provider: std::sync::RwLock<Option<Arc<dyn pioneer_memory::ThreadEpisodicEmbeddingProvider>>>,
+    unavailable_signal: TokioMutex<Option<tokio::sync::oneshot::Sender<()>>>,
+}
+#[async_trait]
+impl crate::thread_episodic::ThreadEpisodicIndexEmbeddingProviderResolver
+    for WakeProjectionResolver
+{
+    async fn resolve_active_embedding_provider(
+        &self,
+        _workspace: &str,
+    ) -> std::result::Result<
+        Option<Arc<dyn pioneer_memory::ThreadEpisodicEmbeddingProvider>>,
+        crate::thread_episodic::ThreadEpisodicIndexResolutionError,
+    > {
+        let provider = self.provider.read().unwrap().clone();
+        if provider.is_none() {
+            if let Some(signal) = self.unavailable_signal.lock().await.take() {
+                let _ = signal.send(());
+            }
+            return Err(
+                crate::thread_episodic::ThreadEpisodicIndexResolutionError::retryable(
+                    "controlled resolution failure",
+                ),
+            );
+        }
+        Ok(provider)
+    }
+}
+
+#[tokio::test]
+async fn production_settings_recovery_transitions_projection_before_new_source_capsule_write() {
+    use crate::database::startup::thread_episodic_workspace_capsule_refill as refill;
+    use crate::thread_episodic::{
+        RuntimeVectorThreadEpisodicIndexPayloadProvider, StoreThreadEpisodicIndexPayloadProvider,
+        ThreadEpisodicIndexExecutor, ThreadEpisodicRuntimeConfig,
+    };
+    use pioneer_memory::ThreadEpisodicEmbeddingProvider;
+    let (workspace_manager, store, workspace) = setup_workspace_manager().await;
+    let root = tempfile::tempdir().unwrap();
+    let mut processor = MessageProcessor::with_agent_manager(
+        Arc::new(ThreadManager::new("test-model", "openai")),
+        Arc::new(AgentManager::new(test_provider(), test_tool_loop_config())),
+        Arc::new(SessionManager::new()),
+        workspace_manager,
+        store.clone(),
+    );
+    let model_a: Arc<dyn ThreadEpisodicEmbeddingProvider> =
+        Arc::new(WakeProjectionEmbeddingProvider {
+            model: "vendor/a",
+            dimension: 3,
+        });
+    let resolver = Arc::new(WakeProjectionResolver {
+        provider: std::sync::RwLock::new(Some(model_a.clone())),
+        unavailable_signal: TokioMutex::new(None),
+    });
+    let executor = Arc::new(
+        ThreadEpisodicIndexExecutor::new(
+            store.clone(),
+            Arc::new(pioneer_memory::MemvidThreadEpisodicBackend::new()),
+            Arc::new(RuntimeVectorThreadEpisodicIndexPayloadProvider::new(
+                Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(
+                    store.clone(),
+                    pioneer_memory::thread_episodic_storage_uri_from_path(root.path()),
+                )),
+                resolver.clone(),
+                store.clone(),
+            )),
+        )
+        .with_projection_runtime(
+            root.path().to_owned(),
+            resolver.clone(),
+            processor
+                .thread_episodic_workspace_refill_supervisor
+                .clone(),
+        ),
+    );
+    processor.thread_episodic_index_executor = executor.clone();
+    materialize_thread_episodic_ingest_turn(&store, &workspace, "wake_thread", "wake_turn").await;
+    let a = save_and_deliver_episodic_wake_for_test(&processor, &store, &workspace, "projection_a")
+        .await
+        .0;
+    timeout(
+        Duration::from_secs(5),
+        executor.wait_for_completed_source_for_test(&a.index_item_id),
+    )
+    .await
+    .unwrap();
+    // Same dimension/different model, followed by a real dimension change.
+    for (model, dimension, item_id) in [
+        ("vendor/b", 3, "projection_b"),
+        ("vendor/c", 4, "projection_c"),
+    ] {
+        let old_items = store
+            .list_thread_episodic_items_for_thread(&workspace, "wake_thread", 100)
+            .await
+            .unwrap();
+        let old_jobs = store
+            .list_thread_episodic_index_jobs_for_thread(&workspace, "wake_thread", 100)
+            .await
+            .unwrap();
+        let old_capsules = store
+            .list_all_thread_episodic_capsules_for_workspace(&workspace)
+            .await
+            .unwrap();
+        let old_bytes =
+            std::fs::read(old_capsules[0].storage_uri.strip_prefix("file://").unwrap()).unwrap();
+        *resolver.provider.write().unwrap() = None;
+        let config = pioneer_config::GatewayThreadEpisodicVectorSearchConfig {
+            enabled: true,
+            provider: Some(pioneer_config::GatewayThreadEpisodicVectorProviderConfig::OpenRouter),
+            model: Some(model.to_owned()),
+            embedding_normalized: true,
+            ..Default::default()
+        };
+        let runtime_config = ThreadEpisodicRuntimeConfig {
+            vector_search_enabled: true,
+            vector_search: config.clone(),
+            ..Default::default()
+        };
+        // The production setters used by settings dispatch update the selection.
+        processor
+            .apply_thread_episodic_runtime_config(runtime_config.clone())
+            .await;
+        processor.apply_thread_episodic_workspace_vector_search_configs(
+            std::collections::BTreeMap::from([(workspace.clone(), config.clone())]),
+        );
+        let selected =
+            refill::ThreadEpisodicWorkspaceCapsuleRefillProjectionTarget::from_vector_search_config(
+                &config,
+            );
+        assert!(
+            refill::refill_once_with_projection_resolver(
+                store.clone(),
+                root.path(),
+                &workspace,
+                selected.clone(),
+                Some(resolver.clone()),
+                None
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            !refill::projection_reset_is_pending(&store, &workspace)
+                .await
+                .unwrap()
+        );
+        let (unavailable_tx, unavailable_rx) = tokio::sync::oneshot::channel();
+        *resolver.unavailable_signal.lock().await = Some(unavailable_tx);
+        let pending =
+            save_and_deliver_episodic_wake_for_test(&processor, &store, &workspace, item_id)
+                .await
+                .0;
+        timeout(Duration::from_secs(5), unavailable_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store
+                .find_thread_episodic_index_job(&pending.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .attempt_count,
+            0
+        );
+        assert_eq!(
+            std::fs::read(old_capsules[0].storage_uri.strip_prefix("file://").unwrap()).unwrap(),
+            old_bytes
+        );
+        for old in &old_jobs {
+            assert_eq!(
+                store
+                    .find_thread_episodic_index_job(&old.id)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                *old
+            );
+        }
+        for old in &old_items {
+            assert_eq!(
+                store
+                    .find_thread_episodic_item(&old.id)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                *old
+            );
+        }
+        // Provider recovery plus a production config wake enters the existing
+        // refill before claims, without consuming retries while unavailable.
+        *resolver.provider.write().unwrap() = Some(Arc::new(WakeProjectionEmbeddingProvider {
+            model,
+            dimension,
+        }));
+        processor
+            .apply_thread_episodic_runtime_config(runtime_config)
+            .await;
+        processor.apply_thread_episodic_workspace_vector_search_configs(
+            std::collections::BTreeMap::from([(workspace.clone(), config)]),
+        );
+        let completed = timeout(
+            Duration::from_secs(5),
+            executor.wait_for_completed_source_for_test(&pending.index_item_id),
+        )
+        .await
+        .unwrap();
+        assert_ne!(completed.id, pending.id);
+        assert_eq!(completed.attempt_count, 1);
+        assert!(
+            store
+                .find_thread_episodic_index_job(&pending.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        for old in old_jobs {
+            assert!(
+                store
+                    .find_thread_episodic_index_job(&old.id)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        let current_items = store
+            .list_thread_episodic_items_for_thread(&workspace, "wake_thread", 100)
+            .await
+            .unwrap();
+        let capsules = store
+            .list_all_thread_episodic_capsules_for_workspace(&workspace)
+            .await
+            .unwrap();
+        let capsule = memvid_core::Memvid::open_read_only(
+            capsules[0].storage_uri.strip_prefix("file://").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            capsule.effective_vec_index_dimension().unwrap(),
+            Some(u32::try_from(dimension).unwrap())
+        );
+        for source in current_items {
+            let frame = capsule
+                .frame_by_uri(source.frame_uri.as_deref().unwrap())
+                .unwrap();
+            assert_eq!(
+                frame
+                    .extra_metadata
+                    .get("pioneer.thread_episodic.embedding.model")
+                    .map(String::as_str),
+                Some(model)
+            );
+            let job = store
+                .find_thread_episodic_index_job_by_item(&source.id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(job.attempt_count, 1);
+            assert_eq!(
+                job.status,
+                pioneer_crud::ThreadEpisodicIndexJobStatus::Completed
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn episodic_completed_and_updated_deliveries_ack_only_after_reconciliation() {
+    let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
+    let processor = MessageProcessor::with_agent_manager(
+        Arc::new(ThreadManager::new("test-model", "openai")),
+        Arc::new(AgentManager::new(test_provider(), test_tool_loop_config())),
+        Arc::new(SessionManager::new()),
+        workspace_manager,
+        crud_store.clone(),
+    );
+    processor
+        .apply_thread_episodic_runtime_config(crate::thread_episodic::ThreadEpisodicRuntimeConfig {
+            indexing_enabled: false,
+            ..Default::default()
+        })
+        .await;
+    let thread_id = "episodic_delivery_thread";
+    let turn_id = "episodic_delivery_turn";
+    materialize_thread_episodic_ingest_turn(&crud_store, &workspace_id, thread_id, turn_id).await;
+    let item = |text: &str| TurnItem::AgentMessage {
+        id: "delivery_source".to_owned(),
+        text: text.to_owned(),
+        phase: pioneer_protocol::AgentMessagePhase::FinalAnswer,
+        markdown: None,
+        markdown_version: None,
+    };
+    crud_store
+        .materialize_item_completed(
+            ItemCompletedNotification {
+                workspace_id: workspace_id.clone(),
+                thread_id: thread_id.to_owned(),
+                turn_id: turn_id.to_owned(),
+                item: item("old"),
+            },
+            1_700_000_001,
+        )
+        .await
+        .unwrap();
+    crud_store
+        .materialize_item_updated(
+            ItemUpdatedNotification {
+                workspace_id: workspace_id.clone(),
+                thread_id: thread_id.to_owned(),
+                turn_id: turn_id.to_owned(),
+                item: item("current"),
+            },
+            1_700_000_002,
+        )
+        .await
+        .unwrap();
+    let now = chrono::Utc::now().timestamp();
+    let first = crud_store
+        .claim_due_turn_event_deliveries(pioneer_crud::NATIVE_TURN_EVENT_EPISODIC_CONSUMER, now, 8)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    processor
+        .set_thread_episodic_ingestor_for_test(Arc::new(RecordingThreadEpisodicIngestor {
+            fail: true,
+            ..Default::default()
+        }))
+        .await;
+    processor
+        .process_claimed_native_turn_event_delivery(first.clone())
+        .await;
+    let failed = pioneer_entity::turn_event_delivery::Entity::find_by_id(first.id.clone())
+        .one(&crud_store.database_connection())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(failed.status, "failed");
+    assert!(failed.delivered_at.is_none());
+    assert!(
+        crud_store
+            .list_thread_episodic_items_for_thread(&workspace_id, thread_id, 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    // Recovered processor uses the real helper; indexing may remain disabled.
+    processor
+        .set_thread_episodic_ingestor_for_test(Arc::new(StoreThreadEpisodicIngestor::with_config(
+            crud_store.clone(),
+            false,
+        )))
+        .await;
+    let retry = crud_store
+        .claim_due_turn_event_deliveries(
+            pioneer_crud::NATIVE_TURN_EVENT_EPISODIC_CONSUMER,
+            now + 3600,
+            8,
+        )
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(retry.id, first.id);
+    processor
+        .process_claimed_native_turn_event_delivery(retry.clone())
+        .await;
+    let job = crud_store
+        .list_thread_episodic_index_jobs_for_thread(&workspace_id, thread_id, 10)
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    // A repeated delivery reconciles idempotently and cannot ACK an old lease.
+    processor
+        .process_claimed_native_turn_event_delivery(retry)
+        .await;
+    let updated = crud_store
+        .claim_due_turn_event_deliveries(
+            pioneer_crud::NATIVE_TURN_EVENT_EPISODIC_CONSUMER,
+            now + 3600,
+            8,
+        )
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert!(matches!(
+        updated.event.payload,
+        pioneer_crud::CanonicalTurnEventPayload::ItemUpdated(_)
+    ));
+    let updated_id = updated.id.clone();
+    processor
+        .process_claimed_native_turn_event_delivery(updated)
+        .await;
+    let delivered = pioneer_entity::turn_event_delivery::Entity::find_by_id(updated_id)
+        .one(&crud_store.database_connection())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(delivered.status, "delivered");
+    assert!(delivered.delivered_at.is_some());
+    let jobs = crud_store
+        .list_thread_episodic_index_jobs_for_thread(&workspace_id, thread_id, 10)
+        .await
+        .unwrap();
+    assert_eq!(jobs, vec![job]);
+    let sources = crud_store
+        .list_thread_episodic_items_for_thread(&workspace_id, thread_id, 10)
+        .await
+        .unwrap();
+    assert_eq!(sources.len(), 1);
+    assert_eq!(
+        sources[0].source_text_hash,
+        pioneer_crud::thread_episodic_source::source_text_hash("current")
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -55533,15 +56553,17 @@ async fn turn_cancel_allows_authorized_non_subscribed_collaborator_user() {
     session_manager
         .set_connection_workspace(foreign_connection_id, Some(workspace_id.clone()))
         .await;
+    let provider_entered = Arc::new(Notify::new());
+    let provider_release = Arc::new(Notify::new());
     let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
         "delayed",
-        Arc::new(DelayedProvider {
-            delay: Duration::from_secs(30),
-            text: "too late".to_owned(),
+        Arc::new(CancellationBarrierProvider {
+            entered: provider_entered.clone(),
+            release: provider_release.clone(),
         }),
     ));
     let processor = MessageProcessor::new(
-        thread_manager,
+        thread_manager.clone(),
         provider_registry,
         session_manager,
         workspace_manager,
@@ -55586,8 +56608,34 @@ async fn turn_cancel_allows_authorized_non_subscribed_collaborator_user() {
         .process_request_for_connection(owner_connection_id, &turn_start_request.to_string())
         .await;
     let _ = recv_response_by_id(&mut rx_owner, turn_start_request_id.as_str()).await;
+    // turn/start acknowledges admission before the actor durably registers its
+    // immutable cancellation context. Test collaborator authorization against a
+    // running turn, holding the provider at a barrier instead of racing startup
+    // or a timer-driven completion. Drain the owner's startup notifications so
+    // websocket backpressure cannot prevent the actor from reaching the barrier.
+    timeout(
+        Duration::from_secs(30),
+        drain_test_notifications_while(&mut rx_owner, provider_entered.notified()),
+    )
+    .await
+    .expect("collaborator cancellation provider should enter after context registration");
+    assert!(
+        crud_store
+            .native_cancellation_context(TURN_ID)
+            .await
+            .expect("native cancellation context should load")
+            .is_some(),
+        "running turn must have its durable cancellation context"
+    );
     materialize_test_member_collaborator(crud_store.as_ref(), workspace_id.as_str(), THREAD_ID)
         .await;
+    assert!(
+        !thread_manager
+            .subscribed_connection_ids(THREAD_ID)
+            .await
+            .contains(&foreign_connection_id),
+        "authorized collaborator must remain unsubscribed"
+    );
 
     let cancel_request_id = generate_test_request_id("turncancelforeign", "stop");
     let cancel_request = json!({
@@ -55607,7 +56655,25 @@ async fn turn_cancel_allows_authorized_non_subscribed_collaborator_user() {
     let response = recv_response_by_id(&mut rx_foreign, cancel_request_id.as_str()).await;
     let response: TurnCancelResponse =
         serde_json::from_value(response.result).expect("authorized cancel response should decode");
+    assert_eq!(response.thread_id, THREAD_ID);
+    assert_eq!(response.turn.id, TURN_ID);
     assert_eq!(response.turn.status, TurnStatus::Interrupted);
+    assert_eq!(response.turn.error.as_deref(), Some("foreign stop"));
+    let (_, persisted_turn) = crud_store
+        .get_turn(THREAD_ID, TURN_ID)
+        .await
+        .expect("cancelled turn should load")
+        .expect("cancelled turn should remain persisted");
+    assert_eq!(persisted_turn.status, TurnStatus::Interrupted);
+    assert_eq!(persisted_turn.error.as_deref(), Some("foreign stop"));
+    assert!(
+        crud_store
+            .native_cancellation_was_accepted(TURN_ID)
+            .await
+            .expect("native cancellation receipt should load")
+    );
+    processor.agent_manager.remove_thread(THREAD_ID).await;
+    provider_release.notify_one();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -72797,6 +73863,25 @@ async fn wait_for_run_status(
         .status
 }
 
+/// Keep client notification backpressure out of waits for durable background work.
+/// Call only after receiving the RPC response; the caller still checks the result.
+async fn drain_test_notifications_while<T>(
+    rx: &mut mpsc::Receiver<Message>,
+    completion: impl std::future::Future<Output = T>,
+) -> T {
+    tokio::pin!(completion);
+    loop {
+        tokio::select! {
+            result = &mut completion => return result,
+            notification = rx.recv() => {
+                if notification.is_none() {
+                    return completion.await;
+                }
+            }
+        }
+    }
+}
+
 async fn wait_for_turn_status(
     crud_store: Arc<CrudStore>,
     thread_id: &str,
@@ -77930,7 +79015,9 @@ async fn background_deepseek_effort_matches_provider_preflight_and_token_boundar
     let mut enabled_budget = None;
     let mut enabled_reserve = None;
     for (effort, reasoning, thinking) in [
-        (None, None, false),
+        // V4's server default enables thinking; only explicit off keeps this
+        // completed non-thinking tool round native instead of portable.
+        (None, None, true),
         (Some("none"), Some(ReasoningConfig::Disabled), false),
         (
             Some("high"),
@@ -79114,6 +80201,713 @@ mod task_delivery_cancellation;
 
 #[path = "tests/memory_post_turn_recovery.rs"]
 mod memory_post_turn_recovery;
+
+#[tokio::test]
+async fn provider_usage_items_persist_idempotently_without_entering_llm_history() {
+    let thread = "thr_usage_ledger";
+    let turn = "turn_usage_ledger";
+    let (processor, store, workspace) = setup_execution_window_terminal_turn(thread, turn).await;
+    start_terminal_test_execution_window(&processor, &workspace, thread, turn, "win_usage_ledger")
+        .await;
+    let make_item = |id: &str, input: Option<u64>, output: Option<u64>, complete: bool| {
+        TurnItem::SystemEvent {
+            id: id.into(),
+            level: pioneer_protocol::SystemEventLevel::Info,
+            message: "Provider usage observation".into(),
+            code: Some("provider_usage".into()),
+            details: Some(
+                json!({"schema_version":1,"nativeMethod":"provider/usage/observed",
+            "physical_attempt_id":id,"provider":"openrouter","model":"fixture","api":"chat_completions",
+            "complete":complete,"usage":{"input_tokens":input,"output_tokens":output,
+                "generation_id":"gen-header","request_id":"req-distinct","reported_model":"returned-model",
+                "cache_read_input_tokens":80,"raw_usage":{"prompt_tokens":input,"completion_tokens":output},
+                "accounting":{"reported_cost":{"amount":0.01,"currency":"credits","provenance":"provider_response_usage.cost"},"estimated_cost":null}}}),
+            ),
+        }
+    };
+    let mut restored = Vec::new();
+    for (id, input, output, complete) in [
+        ("usage-failed", Some(100), Some(2), false),
+        ("usage-retry", Some(120), Some(0), true),
+        ("usage-missing", None, None, false),
+    ] {
+        let item = make_item(id, input, output, complete);
+        let started = AgentDurableEvent::ItemStarted {
+            notification: ItemStartedNotification {
+                workspace_id: workspace.clone(),
+                thread_id: thread.into(),
+                turn_id: turn.into(),
+                item: make_item(id, None, None, false),
+            },
+        };
+        assert!(processor.handle_durable_agent_event(started).await);
+        let event = AgentDurableEvent::ItemCompleted {
+            notification: ItemCompletedNotification {
+                workspace_id: workspace.clone(),
+                thread_id: thread.into(),
+                turn_id: turn.into(),
+                item: item.clone(),
+            },
+        };
+        assert!(processor.handle_durable_agent_event(event.clone()).await);
+        assert!(processor.handle_durable_agent_event(event).await);
+        let persisted = store.get_turn_item(turn, id).await.unwrap().unwrap();
+        assert_eq!(persisted, item);
+        restored.push(persisted);
+    }
+    let totals = pioneer_protocol::observed_provider_usage_totals(&restored);
+    assert_eq!(totals.attempts, 3);
+    assert_eq!(totals.known_input_tokens, 220);
+    assert_eq!(totals.known_output_tokens, 2);
+    assert_eq!(totals.missing_input_attempts, 1);
+    let context = store
+        .compaction_source_page(
+            &workspace,
+            thread,
+            turn,
+            pioneer_crud::compaction::PagedSource::ProviderContext,
+            0,
+        )
+        .await
+        .unwrap();
+    assert!(
+        context.entries.is_empty(),
+        "accounting is not provider replay/history"
+    );
+}
+
+#[tokio::test]
+async fn auxiliary_usage_journal_is_scoped_idempotent_bounded_and_restart_readable() {
+    use pioneer_crud::ProviderUsageObservation;
+    let (_, store, workspace) =
+        setup_execution_window_terminal_turn("thr_aux_usage", "turn_aux_usage").await;
+    let background = store.with_maintenance_access();
+    assert_eq!(
+        background.database_connection().read_class(),
+        pioneer_sqlite::SqliteReadClass::Maintenance
+    );
+    assert_eq!(
+        background.database_connection().write_class(),
+        pioneer_sqlite::SqliteWriteClass::Maintenance
+    );
+    assert_eq!(
+        store.database_connection().write_class(),
+        pioneer_sqlite::SqliteWriteClass::Interactive
+    );
+    let mut partial = ProviderUsageObservation {
+        id: "aux-1".into(),
+        workspace_id: workspace.clone(),
+        operation_kind: "self_improvement".into(),
+        owner_id: "run-usage".into(),
+        status: "started".into(),
+        usage_json: json!({"input_tokens":100,"cache_read_input_tokens":80,"output_tokens":null})
+            .to_string(),
+        started_at: 1,
+        updated_at: 1,
+    };
+    background
+        .record_provider_usage(partial.clone())
+        .await
+        .unwrap();
+    partial.status = "failed".into();
+    partial.updated_at = 2;
+    background
+        .record_provider_usage(partial.clone())
+        .await
+        .unwrap();
+    background
+        .record_provider_usage(partial.clone())
+        .await
+        .unwrap();
+    let mut stale = partial.clone();
+    stale.status = "started".into();
+    stale.updated_at = 3;
+    assert!(background.record_provider_usage(stale).await.is_err());
+    let mut cross_workspace = partial.clone();
+    cross_workspace.workspace_id = "unrelated-workspace".into();
+    assert!(
+        background
+            .record_provider_usage(cross_workspace)
+            .await
+            .is_err()
+    );
+    let mut invalid = partial.clone();
+    invalid.id = "poison".into();
+    invalid.usage_json = "x".repeat(32769);
+    assert!(background.record_provider_usage(invalid).await.is_err());
+    let mut retry = partial.clone();
+    retry.id = "aux-2".into();
+    retry.status = "completed".into();
+    retry.usage_json = json!({"input_tokens":120,"output_tokens":0}).to_string();
+    let (write, read) = tokio::join!(
+        store.record_provider_usage(retry.clone()),
+        background.provider_usage_page(&workspace, "run-usage", "", 1)
+    );
+    write.unwrap();
+    assert_eq!(read.unwrap().len(), 1);
+    let restarted = pioneer_crud::CrudStore::new(background.database_connection());
+    let rows = restarted
+        .provider_usage_page(&workspace, "run-usage", "", 100)
+        .await
+        .unwrap();
+    assert_eq!(rows, vec![partial, retry]);
+    assert!(
+        restarted
+            .provider_usage_page(&workspace, "run-usage", "", 101)
+            .await
+            .is_err()
+    );
+    assert!(
+        restarted
+            .provider_usage_page(&workspace, "another-run", "", 100)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        store
+            .compaction_source_page(
+                &workspace,
+                "thr_aux_usage",
+                "turn_aux_usage",
+                pioneer_crud::compaction::PagedSource::ProviderContext,
+                0
+            )
+            .await
+            .unwrap()
+            .entries
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn auxiliary_chat_keeps_native_usage_before_application_validation() {
+    let (_, store, workspace) =
+        setup_execution_window_terminal_turn("thr_aux_chat", "turn_aux_chat").await;
+    let registry = test_provider();
+    let provider = crate::usage_journal::observe(
+        registry
+            .get_or_create_for_workspace(&workspace, "openai")
+            .unwrap(),
+        store.as_ref(),
+        &workspace,
+        "title",
+        "thr_aux_chat",
+    );
+    let response = provider
+        .chat(ChatRequest {
+            model: "fixture".into(),
+            messages: vec![ChatMessage::user("fixture prompt")],
+            temperature: None,
+            max_tokens: None,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            reasoning: None,
+            compiled_prompt: None,
+        })
+        .await
+        .unwrap();
+    let rows = store
+        .provider_usage_page(&workspace, "thr_aux_chat", "", 100)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].status, "completed");
+    let retained: pioneer_provider::TokenUsage = serde_json::from_str(&rows[0].usage_json).unwrap();
+    assert_eq!(Some(retained), response.usage);
+    assert!(!rows[0].usage_json.contains("fixture prompt"));
+}
+
+#[tokio::test]
+async fn auxiliary_stream_partial_usage_survives_drop_and_retry_without_holding_database_capacity()
+{
+    use futures_util::StreamExt;
+    struct Partial;
+    #[async_trait::async_trait]
+    impl pioneer_provider::Provider for Partial {
+        fn name(&self) -> &str {
+            "fixture"
+        }
+        async fn chat(&self, _: ChatRequest) -> anyhow::Result<pioneer_provider::ChatResponse> {
+            anyhow::bail!("unexpected non-stream fixture")
+        }
+        async fn stream_chat(
+            &self,
+            _: ChatRequest,
+        ) -> anyhow::Result<futures_util::stream::BoxStream<'static, anyhow::Result<StreamChunk>>>
+        {
+            Ok(Box::pin(futures_util::stream::iter(vec![
+                Ok(StreamChunk::usage(pioneer_provider::TokenUsage {
+                    input_tokens: Some(123),
+                    output_tokens: Some(2),
+                    physical_attempt_id: Some(pioneer_protocol::generate_id(21)),
+                    raw_usage: Some(json!({"prompt_tokens":123,"completion_tokens":2})),
+                    ..Default::default()
+                })),
+                Err(anyhow::anyhow!("fixture interrupted")),
+            ])))
+        }
+    }
+    let (_, store, workspace) =
+        setup_execution_window_terminal_turn("thr_aux_partial", "turn_aux_partial").await;
+    let background = store.with_maintenance_access();
+    let provider = crate::usage_journal::observe(
+        Arc::new(Partial),
+        &background,
+        &workspace,
+        "memory_extraction",
+        "partial-owner",
+    );
+    let request = || ChatRequest {
+        model: "fixture".into(),
+        messages: vec![],
+        temperature: None,
+        max_tokens: None,
+        tools: None,
+        tool_choice: None,
+        parallel_tool_calls: None,
+        reasoning: None,
+        compiled_prompt: None,
+    };
+    let mut first = provider.stream_chat(request()).await.unwrap();
+    assert_eq!(
+        first
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .usage
+            .unwrap()
+            .input_tokens,
+        Some(123)
+    );
+    drop(first);
+    let mut retry = provider.stream_chat(request()).await.unwrap();
+    assert!(retry.next().await.unwrap().is_ok());
+    assert!(retry.next().await.unwrap().is_err());
+    assert!(retry.next().await.is_none());
+    let rows = background
+        .provider_usage_page(&workspace, "partial-owner", "", 100)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    let statuses = rows
+        .iter()
+        .map(|r| r.status.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        statuses,
+        std::collections::BTreeSet::from(["failed", "started"])
+    );
+    let usages = rows
+        .iter()
+        .map(|r| serde_json::from_str::<pioneer_provider::TokenUsage>(&r.usage_json).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        usages.iter().map(|u| u.input_tokens.unwrap()).sum::<u64>(),
+        246
+    );
+    assert_ne!(usages[0].physical_attempt_id, usages[1].physical_attempt_id);
+}
+
+#[tokio::test]
+async fn failed_codex_summary_journal_retains_decoder_numeric_evidence_without_cli() {
+    use pioneer_cli_agent_runtime::{
+        codex::service::decode_exec_completion, service::ObservedServiceUsage,
+    };
+    let (_, store, workspace) =
+        setup_execution_window_terminal_turn("thr_cli_evidence", "turn_cli_evidence").await;
+    let transcript = concat!(
+        "{\"type\":\"thread.started\",\"thread_id\":\"SECRET_SESSION\"}\n",
+        "{\"type\":\"turn.started\"}\n",
+        "{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":100,\"output_tokens\":0,\"cached_input_tokens\":80,\"prompt\":\"SECRET_PROMPT\"}}\n"
+    );
+    let mut observed = pioneer_provider::TokenUsage {
+        provider: Some("codex-cli".into()),
+        ..Default::default()
+    };
+    let call = crate::usage_journal::Call::start(
+        store.as_ref(),
+        &workspace,
+        "summary",
+        "failed-summary-owner",
+        &observed,
+    )
+    .await
+    .unwrap();
+    let error = decode_exec_completion(transcript.as_bytes()).err().unwrap();
+    assert!(format!("{error:#}").contains("no final answer"));
+    // Same production metadata consumer used by the summary error path; no CLI process.
+    crate::compaction::apply_cli_usage(
+        &mut observed,
+        &error.downcast_ref::<ObservedServiceUsage>().unwrap().0,
+    );
+    call.record("failed", &observed).await.unwrap();
+    call.record("failed", &observed).await.unwrap();
+    let rows = store
+        .provider_usage_page(&workspace, "failed-summary-owner", "", 100)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].status, "failed");
+    let retained: pioneer_provider::TokenUsage = serde_json::from_str(&rows[0].usage_json).unwrap();
+    assert_eq!(retained.input_tokens, Some(100));
+    assert_eq!(retained.output_tokens, Some(0));
+    assert_eq!(retained.cache_read_input_tokens, Some(80));
+    assert_eq!(retained.cache_write_input_tokens, None);
+    assert_eq!(retained.physical_attempt_id, None);
+    assert_eq!(retained.generation_id, None);
+    assert_eq!(
+        retained.accounting.as_ref().unwrap()["reported_cost"],
+        serde_json::Value::Null
+    );
+    assert_eq!(
+        retained.accounting.as_ref().unwrap()["estimated_cost"],
+        serde_json::Value::Null
+    );
+    assert!(!rows[0].usage_json.contains("SECRET"));
+    assert!(!rows[0].usage_json.contains("no final answer"));
+}
+
+#[tokio::test]
+async fn auxiliary_metadata_only_header_survives_failure_without_inventing_counts() {
+    struct MetadataOnly;
+    #[async_trait::async_trait]
+    impl pioneer_provider::Provider for MetadataOnly {
+        fn name(&self) -> &str {
+            "openrouter"
+        }
+        async fn chat(&self, _: ChatRequest) -> anyhow::Result<pioneer_provider::ChatResponse> {
+            anyhow::bail!("unexpected chat")
+        }
+        async fn stream_chat(
+            &self,
+            _: ChatRequest,
+        ) -> anyhow::Result<futures_util::stream::BoxStream<'static, anyhow::Result<StreamChunk>>>
+        {
+            let snapshot = pioneer_provider::TokenUsage {
+                generation_id: Some("gen-header".into()),
+                reported_model: Some("actual-model".into()),
+                physical_attempt_id: Some("physical-header-attempt".into()),
+                ..Default::default()
+            };
+            Ok(Box::pin(futures_util::stream::iter(vec![
+                Ok(StreamChunk::usage(snapshot.clone())),
+                Ok(StreamChunk::usage(snapshot)),
+                Err(anyhow::anyhow!("SECRET transport diagnostic")),
+            ])))
+        }
+    }
+    use futures_util::StreamExt;
+    let (_, store, workspace) =
+        setup_execution_window_terminal_turn("thr_header_evidence", "turn_header_evidence").await;
+    let provider = crate::usage_journal::observe(
+        Arc::new(MetadataOnly),
+        store.as_ref(),
+        &workspace,
+        "title",
+        "header-owner",
+    );
+    let request = ChatRequest {
+        model: "requested".into(),
+        messages: vec![],
+        temperature: None,
+        max_tokens: None,
+        tools: None,
+        tool_choice: None,
+        parallel_tool_calls: None,
+        reasoning: None,
+        compiled_prompt: None,
+    };
+    let mut stream = provider.stream_chat(request).await.unwrap();
+    assert!(stream.next().await.unwrap().is_ok());
+    assert!(stream.next().await.unwrap().is_ok());
+    assert!(stream.next().await.unwrap().is_err());
+    let rows = store
+        .provider_usage_page(&workspace, "header-owner", "", 100)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].status, "failed");
+    let retained: pioneer_provider::TokenUsage = serde_json::from_str(&rows[0].usage_json).unwrap();
+    assert_eq!(retained.generation_id.as_deref(), Some("gen-header"));
+    assert_eq!(retained.reported_model.as_deref(), Some("actual-model"));
+    assert_eq!(retained.input_tokens, None);
+    assert_eq!(retained.output_tokens, None);
+    assert!(!rows[0].usage_json.contains("SECRET"));
+}
+
+#[tokio::test]
+async fn cli_exit_and_reasoning_evidence_reaches_summary_consumer_and_failed_journal_once() {
+    use pioneer_cli_agent_runtime::{
+        claude::service::ensure_process_outcome,
+        codex::service::decode_exec_outcome,
+        service::{ObservedServiceUsage, ServiceFailure},
+    };
+    let (_, store, workspace) =
+        setup_execution_window_terminal_turn("thr_cli_exit_reasoning", "turn_cli_exit_reasoning")
+            .await;
+    let prefix = concat!(
+        "{\"type\":\"thread.started\",\"thread_id\":\"SECRET_SESSION\"}\n",
+        "{\"type\":\"turn.started\"}\n",
+    );
+    let answer = "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"SECRET_SUMMARY\"}}\n";
+    for (index, (native, legacy, count, reject)) in [
+        (
+            serde_json::json!(7),
+            serde_json::json!(null),
+            Some(100_u64),
+            "success",
+        ),
+        (
+            serde_json::json!(7),
+            serde_json::json!(null),
+            Some(100),
+            "nonzero",
+        ),
+        (
+            serde_json::json!(0),
+            serde_json::json!(null),
+            Some(0),
+            "nonzero",
+        ),
+        (
+            serde_json::json!(null),
+            serde_json::json!(null),
+            None,
+            "nonzero",
+        ),
+        (
+            serde_json::json!("7"),
+            serde_json::json!(null),
+            Some(100),
+            "nonzero",
+        ),
+        (
+            serde_json::json!(-7),
+            serde_json::json!(null),
+            Some(100),
+            "no_answer",
+        ),
+        (
+            serde_json::json!(7),
+            serde_json::json!(null),
+            Some(100),
+            "no_answer",
+        ),
+        (
+            serde_json::json!(7),
+            serde_json::json!(null),
+            Some(100),
+            "trailing",
+        ),
+        (
+            serde_json::json!(7),
+            serde_json::json!(null),
+            Some(100),
+            "malformed",
+        ),
+        (
+            serde_json::json!(0),
+            serde_json::json!(9),
+            Some(100),
+            "nonzero",
+        ),
+        (
+            serde_json::json!(null),
+            serde_json::json!(9),
+            Some(100),
+            "success",
+        ),
+        (
+            serde_json::json!("invalid"),
+            serde_json::json!(9),
+            Some(100),
+            "nonzero",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut usage = serde_json::json!({"reasoning_output_tokens":native,"reasoning_tokens":legacy,"secret":"SECRET_PROMPT","arbitrary_id":"SECRET_ID"});
+        if let Some(count) = count {
+            usage["input_tokens"] = count.into();
+            usage["output_tokens"] = if count == 0 { 0 } else { 13 }.into();
+            usage["cached_input_tokens"] = if count == 0 { 0 } else { 80 }.into();
+        }
+        let terminal = serde_json::json!({"type":"turn.completed","usage":usage});
+        let transcript = format!(
+            "{prefix}{}{terminal}\n{}",
+            if reject == "no_answer" { "" } else { answer },
+            match reject {
+                "trailing" => "{\"type\":\"turn.started\"}\n",
+                "malformed" => "invalid SECRET\n",
+                _ => "",
+            },
+        );
+        let result = decode_exec_outcome(transcript.as_bytes(), reject != "nonzero");
+        let failed = reject != "success";
+        assert_eq!(result.is_err(), failed);
+        let owner = format!("codex-exit-reasoning-{index}");
+        let mut observed = pioneer_provider::TokenUsage {
+            provider: Some("codex-cli".into()),
+            ..Default::default()
+        };
+        let call = crate::usage_journal::Call::start(
+            store.as_ref(),
+            &workspace,
+            "summary",
+            &owner,
+            &observed,
+        )
+        .await
+        .unwrap();
+        // Actual CLI summary consumer, fed by the production exit/decoder path.
+        match result {
+            Ok(completion) => {
+                crate::compaction::apply_cli_usage(&mut observed, &completion.observed_usage)
+            }
+            Err(error) => {
+                assert!(!format!("{error:#?}").contains("SECRET"));
+                if let Some(metadata) = error.downcast_ref::<ObservedServiceUsage>() {
+                    crate::compaction::apply_cli_usage(&mut observed, &metadata.0);
+                }
+            }
+        }
+        let status = if failed { "failed" } else { "completed" };
+        call.record(status, &observed).await.unwrap();
+        call.record(status, &observed).await.unwrap();
+        let rows = store
+            .provider_usage_page(&workspace, &owner, "", 100)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, status);
+        let retained: pioneer_provider::TokenUsage =
+            serde_json::from_str(&rows[0].usage_json).unwrap();
+        assert_eq!(retained.input_tokens, count);
+        assert_eq!(
+            retained.output_tokens,
+            count.map(|count| if count == 0 { 0 } else { 13 })
+        );
+        assert_eq!(
+            retained.cache_read_input_tokens,
+            count.map(|count| if count == 0 { 0 } else { 80 })
+        );
+        assert_eq!(
+            retained.reasoning_tokens,
+            native.as_u64().or_else(|| legacy.as_u64())
+        );
+        assert_eq!(retained.cache_write_input_tokens, None);
+        assert_eq!(retained.request_id, None);
+        assert_eq!(retained.generation_id, None);
+        if let Some(accounting) = &retained.accounting {
+            assert_eq!(accounting["reported_cost"], serde_json::Value::Null);
+            assert_eq!(accounting["estimated_cost"], serde_json::Value::Null);
+            assert_eq!(accounting["sdk_estimated_cost"], serde_json::Value::Null);
+            if native.as_u64().is_some() {
+                assert_eq!(
+                    accounting["reasoning_source"],
+                    "codex_exec.usage.reasoning_output_tokens"
+                );
+            }
+            if native.as_u64().is_some() && legacy.as_u64().is_some() {
+                assert_eq!(accounting["reasoning_alias_conflict"], native != legacy);
+            }
+        }
+        assert!(!rows[0].usage_json.contains("SECRET"));
+        assert!(!rows[0].usage_json.contains("process failed"));
+    }
+    for (index, (input, output, read, write, cost)) in [
+        (
+            Some(20_u64),
+            Some(11_u64),
+            Some(7_u64),
+            Some(3_u64),
+            Some(0.2),
+        ),
+        (Some(0), Some(0), Some(0), Some(0), Some(0.0)),
+        (None, None, None, None, None),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut terminal = serde_json::json!({"type":"result","subtype":"error_during_execution","error":{"type":"overloaded_error","message":"SECRET_ERROR"},"session_id":"SECRET_SESSION","usage":{"reasoning_output_tokens":99,"prompt":"SECRET_PROMPT"}});
+        for (key, value) in [
+            ("input_tokens", input),
+            ("output_tokens", output),
+            ("cache_read_input_tokens", read),
+            ("cache_creation_input_tokens", write),
+        ] {
+            if let Some(value) = value {
+                terminal["usage"][key] = value.into();
+            }
+        }
+        if let Some(cost) = cost {
+            terminal["total_cost_usd"] = serde_json::json!(cost);
+        }
+        let error = ensure_process_outcome(terminal.to_string().as_bytes(), false)
+            .err()
+            .unwrap();
+        assert_eq!(
+            error.downcast_ref::<ServiceFailure>().unwrap().class,
+            pioneer_protocol::ProviderFailureClass::Provider5xx
+        );
+        let owner = format!("claude-exit-{index}");
+        let mut observed = pioneer_provider::TokenUsage {
+            provider: Some("claude-cli".into()),
+            ..Default::default()
+        };
+        let call = crate::usage_journal::Call::start(
+            store.as_ref(),
+            &workspace,
+            "summary",
+            &owner,
+            &observed,
+        )
+        .await
+        .unwrap();
+        if let Some(metadata) = error.downcast_ref::<ObservedServiceUsage>() {
+            crate::compaction::apply_cli_usage(&mut observed, &metadata.0);
+        }
+        call.record("failed", &observed).await.unwrap();
+        call.record("failed", &observed).await.unwrap();
+        let rows = store
+            .provider_usage_page(&workspace, &owner, "", 100)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, "failed");
+        let retained: pioneer_provider::TokenUsage =
+            serde_json::from_str(&rows[0].usage_json).unwrap();
+        assert_eq!(
+            retained.input_tokens,
+            input.map(|input| input + read.unwrap_or(0) + write.unwrap_or(0))
+        );
+        assert_eq!(retained.output_tokens, output);
+        assert_eq!(retained.cache_read_input_tokens, read);
+        assert_eq!(retained.cache_write_input_tokens, write);
+        assert_eq!(retained.reasoning_tokens, None);
+        assert_eq!(retained.generation_id, None);
+        if let Some(accounting) = &retained.accounting {
+            assert_eq!(accounting["sdk_estimated_cost"]["amount"].as_f64(), cost);
+            assert_eq!(accounting["sdk_estimated_cost"]["currency"], "USD");
+            assert_eq!(
+                accounting["sdk_estimated_cost"]["provenance"],
+                "cli_sdk_price_table_estimate"
+            );
+            assert_eq!(
+                accounting["sdk_estimated_cost"]["sdk_version"],
+                serde_json::Value::Null
+            );
+            assert_eq!(accounting["reported_cost"], serde_json::Value::Null);
+            assert_eq!(accounting["estimated_cost"], serde_json::Value::Null);
+        }
+        assert!(!rows[0].usage_json.contains("SECRET"));
+        assert!(!rows[0].usage_json.contains("overloaded_error"));
+    }
+}
 
 async fn fanout_test_processor() -> (Arc<MessageProcessor>, String) {
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;

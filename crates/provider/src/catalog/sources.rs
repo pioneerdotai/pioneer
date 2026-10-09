@@ -56,6 +56,12 @@ pub(super) fn models_dev(
             "https://api.openai.com/v1",
         ),
         (
+            "deepseek",
+            "deepseek",
+            "openai-completions",
+            "https://api.deepseek.com",
+        ),
+        (
             "groq",
             "groq",
             "openai-completions",
@@ -176,15 +182,36 @@ pub(super) fn models_dev(
                 m
             };
             let mut candidate = base(provider, id, api, url, effective, (4096, 4096));
+            if matches!(provider, "google" | "google-vertex")
+                && let Some(resolved) = alias.filter(|a| data[source]["models"].get(*a).is_some())
+            {
+                // Retain the identity of the existing source alias resolution;
+                // effort names alone do not identify a budget/level protocol.
+                candidate.model["sourceGeneration"]["resolvedModelId"] = json!(resolved);
+            }
             candidate.model["name"] =
                 json!(m["name"].as_str().filter(|s| !s.is_empty()).unwrap_or(id));
+            if matches!(provider, "glm" | "zai-standard") {
+                // These are native CN/global GLM endpoints, not hosted relays.
+                // Use the same documented controls as the coding profiles,
+                // with each profile's own updateable source options and limits.
+                // https://docs.z.ai/guides/llm/glm-5.3
+                candidate.compat(json!({"supportsDeveloperRole":false,"thinkingFormat":"zai"}));
+                if let Some(mut map) = effort_map(&m["reasoning_options"]) {
+                    if matches!(id.as_str(), "glm-5.2" | "glm-5.2-highspeed") {
+                        map["off"] = json!("none");
+                    }
+                    candidate.thinking(map);
+                    candidate.compat(json!({"supportsReasoningEffort":true}));
+                }
+            }
             match provider {
                 "amazon-bedrock"=>{if id.starts_with("eu."){candidate.model["baseUrl"]=json!("https://bedrock-runtime.eu-central-1.amazonaws.com");}
 if m["structured_output"]==true {candidate.compat(json!({"supportsStrictMode":true}));}},
                 "google-vertex"=>{candidate.model["cost"]["cacheWrite"]=json!(0);if id=="gemini-2.5-flash"{candidate.model["cost"]["cacheRead"]=json!(0.03);}},
                 "cloudflare-workers-ai"=>candidate.compat(json!({"sendSessionAffinityHeaders":true})),
                 "xai"=>candidate.compat(json!({"supportsLongCacheRetention":false})),
-                "mistral"=>{if m["cost"]["cache_read"].is_null(){candidate.model["cost"]["cacheRead"]=json!(round(number(&m["cost"]["input"])*0.1));}},
+                "mistral"=>{if m["cost"]["cache_read"].is_null(){candidate.model["cost"]["cacheRead"]=m["cost"]["input"].as_f64().map(|v|json!(round(v*0.1))).unwrap_or(Value::Null);}},
                 "huggingface"=>candidate.compat(json!({"supportsDeveloperRole":false})),
                 p if p.starts_with("xiaomi")=>candidate.compat(json!({"requiresReasoningContentOnAssistantMessages":true,"thinkingFormat":"deepseek"})),
                 _=>{}
@@ -712,9 +739,9 @@ pub(super) fn registered_supplements(
             };
             *source
         };
-        for (id, m) in entries(data, source) {
-            if m["tool_call"] != true
-                || m["status"] == "deprecated"
+        for (id, model) in entries(data, source) {
+            if model["tool_call"] != true
+                || model["status"] == "deprecated"
                 || result
                     .iter()
                     .chain(existing.iter())
@@ -722,17 +749,65 @@ pub(super) fn registered_supplements(
             {
                 continue;
             }
-            result.push(base(
+            let mut candidate = base(provider, id, "openai-completions", url, model, (4096, 4096));
+            // A list of effort names alone does not establish a wire format.
+            // These profiles document the standard Chat effort field.
+            // Sources: each vendor's Chat schema, recorded in G04 coverage.
+            if !matches!(
                 provider,
-                id,
-                "openai-completions",
-                url,
-                m,
-                (4096, 4096),
-            ));
+                "deepinfra" | "friendli" | "venice" | "synthetic" | "nebius" | "cohere"
+            ) {
+                candidate.compat(json!({"supportsReasoningEffort":false}));
+            }
+            candidate.compat(json!({"maxTokensField":"max_tokens"}));
+            if provider == "cohere" && model["reasoning"] == true {
+                // Compatibility API documents only none/high, corresponding
+                // to off/on, including toggle-only source entries.
+                candidate.thinking(json!({"off":"none","minimal":null,"low":null,
+                    "medium":null,"high":"high","xhigh":null,"max":null}));
+                candidate.compat(
+                    json!({"generationSource":"https://docs.cohere.com/docs/compatibility-api"}),
+                );
+            }
+            if provider == "novita" {
+                // Official Chat schema documents the switch for these families;
+                // a generic toggle in source metadata does not prove this field.
+                let supports_off = matches!(
+                    id.as_str(),
+                    "zai-org/glm-4.5"
+                        | "deepseek/deepseek-v3.1"
+                        | "deepseek/deepseek-v3.1-terminus"
+                        | "deepseek/deepseek-v3.2-exp"
+                );
+                candidate.compat(json!({"thinkingFormat":"novita","supportsThinkingToggle":supports_off,
+                    "generationSource":"https://docs.novita.ai/api-reference/model-apis-llm-create-chat-completion"}));
+            }
+            if provider == "siliconflow" {
+                candidate.compat(json!({"thinkingFormat":"siliconflow",
+                    "supportsThinkingToggle":model["reasoning_options"].as_array().is_some_and(|o| o.iter().any(|o| o["type"] == "toggle")),
+                    "generationCapIncludesThinking":false,
+                    "generationSource":"https://docs.siliconflow.cn/docs/api/chat-completions-post"}));
+            }
+            result.push(candidate);
         }
     }
     result
+}
+
+// Shared source-unit conversion, not a tariff table. Invalid known values
+// remain invalid through validation instead of overflow serializing as null.
+fn per_token_rate(value: &Value) -> Value {
+    let converted = value
+        .as_str()
+        .and_then(|s| s.parse::<f64>().ok())
+        .or_else(|| value.as_f64())
+        .filter(|v| v.is_finite() && *v >= 0.)
+        .map(|v| round(v * 1_000_000.));
+    match converted {
+        Some(v) if v.is_finite() => json!(v),
+        Some(_) => json!("invalid_scaled_source_rate"),
+        None => value.clone(),
+    }
 }
 
 pub(super) fn openrouter(data: &Value) -> Vec<Candidate> {
@@ -792,7 +867,35 @@ pub(super) fn openrouter(data: &Value) -> Vec<Candidate> {
                 ("cacheRead", "input_cache_read"),
                 ("cacheWrite", "input_cache_write"),
             ] {
-                c.model["cost"][key] = json!(round(number(&m["pricing"][source]) * 1_000_000.));
+                c.model["cost"][key] = match &m["pricing"][source] {
+                    Value::Null => Value::Null,
+                    // The pinned Models API snapshot uses -1 for Auto Router's
+                    // dynamic selected-model tariff, not a negative/free rate.
+                    // Contract: https://openrouter.ai/docs/guides/routing/routers/auto-router
+                    // Scope this exception to documented auto slugs and token
+                    // input/output fields; other negative/malformed rates fail validation.
+                    value
+                        if matches!(id, "openrouter/auto" | "openrouter/auto-beta")
+                            && matches!(source, "prompt" | "completion")
+                            && (value.as_str() == Some("-1") || value.as_f64() == Some(-1.)) =>
+                    {
+                        Value::Null
+                    }
+                    value => per_token_rate(value),
+                };
+            }
+            c.model["pricingSource"] =
+                json!({"url":SOURCE_URLS[1],"units":"USD_per_token","raw":m["pricing"]});
+            if matches!(id, "openrouter/auto" | "openrouter/auto-beta")
+                && ["prompt", "completion"].iter().any(|key| {
+                    m["pricing"][key].as_str() == Some("-1")
+                        || m["pricing"][key].as_f64() == Some(-1.)
+                })
+            {
+                c.model["pricingSource"]["unknownRateContract"] = json!({
+                    "reason":"dynamic_selected_model_tariff", "sentinel":-1,
+                    "url":"https://openrouter.ai/docs/guides/routing/routers/auto-router"
+                });
             }
             let reasoning = &m["reasoning"];
             let mandatory = reasoning["mandatory"] == true;
@@ -828,6 +931,8 @@ pub(super) fn vercel(data: &Value) -> Vec<Candidate> {
                 m,
                 (4096, 4096),
             );
+            c.model["pricingSource"] =
+                json!({"url":SOURCE_URLS[2],"units":"USD_per_token","raw":m["pricing"]});
             c.model["reasoning"] = json!(has(&m["tags"], "reasoning"));
             c.tool_calling = Some(has(&m["tags"], "tool-use"));
             c.model["input"] = m["input_modalities"].as_array().map(|v| json!(v))
@@ -845,7 +950,10 @@ pub(super) fn vercel(data: &Value) -> Vec<Candidate> {
                 ("cacheRead", "input_cache_read"),
                 ("cacheWrite", "input_cache_write"),
             ] {
-                c.model["cost"][key] = json!(round(number(&m["pricing"][source]) * 1_000_000.));
+                c.model["cost"][key] = match &m["pricing"][source] {
+                    Value::Null => Value::Null,
+                    value => per_token_rate(value),
+                };
             }
             c
         })

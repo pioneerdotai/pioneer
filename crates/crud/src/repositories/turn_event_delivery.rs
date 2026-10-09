@@ -30,11 +30,15 @@ pub async fn insert_pending_for_event<C: ConnectionTrait>(
     db: &C,
     event: &AppendedTurnEvent,
     created_at: DateTimeWithTimeZone,
+    include_live: bool,
 ) -> Result<()> {
-    if event_requires_live_delivery(&event.payload) {
+    if include_live && event_requires_live_delivery(&event.payload) {
         insert_pending(db, event, CONSUMER_LIVE_NOTIFICATION, created_at).await?;
     }
-    if matches!(event.payload, TurnEventPayload::ItemCompleted(_)) {
+    if matches!(
+        event.payload,
+        TurnEventPayload::ItemCompleted(_) | TurnEventPayload::ItemUpdated(_)
+    ) {
         insert_pending(db, event, CONSUMER_THREAD_EPISODIC, created_at).await?;
     }
     Ok(())
@@ -86,12 +90,35 @@ pub async fn claim_due<C: ConnectionTrait>(
         .add(turn_event_delivery::Column::Consumer.eq(consumer.to_owned()))
         .add(turn_event_delivery::Column::Status.eq(DELIVERY_STATUS_DELIVERING))
         .add(turn_event_delivery::Column::ClaimExpiresAt.lte(now));
+    // Canonical append can commit before its read-model projection. An
+    // episodic consumer must not ACK an absent/old item during that crash window.
+    let projection_ready = if consumer == CONSUMER_THREAD_EPISODIC {
+        use pioneer_entity::turn_event_projection_state as projection;
+        Expr::exists(
+            Query::select()
+                .expr(Expr::val(1_i64))
+                .from(projection::Entity)
+                .and_where(
+                    Expr::col((projection::Entity, projection::Column::EventId)).eq(Expr::col((
+                        turn_event_delivery::Entity,
+                        turn_event_delivery::Column::EventId,
+                    ))),
+                )
+                .and_where(projection::Column::Status.eq(
+                    crate::repositories::turn_event_projection_state::PROJECTION_STATUS_PROJECTED,
+                ))
+                .to_owned(),
+        )
+    } else {
+        Expr::val(true).into()
+    };
     let no_pending_predecessor = no_pending_predecessor();
     let candidates = turn_event_delivery::Entity::find()
         .filter(Condition::any().add(due.clone()).add(expired.clone()))
         // Apply causal eligibility before LIMIT so a blocked turn's backlog
         // cannot consume all slots and starve independent turns.
         .filter(no_pending_predecessor.clone())
+        .filter(projection_ready.clone())
         .order_by_asc(turn_event_delivery::Column::TurnId)
         .order_by_asc(turn_event_delivery::Column::Sequence)
         .limit(limit)
@@ -124,6 +151,7 @@ pub async fn claim_due<C: ConnectionTrait>(
             // Candidate discovery does not replace the claim's state guard.
             // Revalidate causal eligibility in the same UPDATE as its lease.
             .filter(no_pending_predecessor.clone())
+            .filter(projection_ready.clone())
             .exec(db)
             .await
             .context("failed to claim turn event delivery")?

@@ -2460,6 +2460,8 @@ impl MessageProcessor {
                     return;
                 }
 
+                // Source/job is already committed atomically; wake only advances execution.
+                self.spawn_thread_episodic_index_run();
                 self.send_notification_to_thread_subscribers(
                     notification.thread_id.as_str(),
                     events::ITEM_UPDATED,
@@ -2478,22 +2480,7 @@ impl MessageProcessor {
         }
     }
 
-    pub(super) async fn ingest_committed_thread_item(
-        &self,
-        notification: &pioneer_protocol::ItemCompletedNotification,
-    ) {
-        if let Err(error) = self
-            .ingest_committed_thread_item_with_result(notification)
-            .await
-        {
-            warn!(
-                error = %format!("{error:#}"),
-                "thread episodic ingestion failed after committed item persistence"
-            );
-        }
-    }
-
-    async fn ingest_committed_thread_item_with_result(
+    pub(super) async fn ingest_committed_thread_item_with_result(
         &self,
         notification: &pioneer_protocol::ItemCompletedNotification,
     ) -> Result<()> {
@@ -3233,7 +3220,7 @@ impl MessageProcessor {
         }
     }
 
-    async fn process_claimed_native_turn_event_delivery(
+    pub(super) async fn process_claimed_native_turn_event_delivery(
         &self,
         delivery: pioneer_crud::ClaimedTurnEventDeliveryRecord,
     ) {
@@ -3297,15 +3284,21 @@ impl MessageProcessor {
                     .await
             }
             pioneer_crud::NATIVE_TURN_EVENT_EPISODIC_CONSUMER => {
-                let pioneer_crud::CanonicalTurnEventPayload::ItemCompleted(notification) =
-                    &delivery.event.payload
-                else {
-                    bail!(
-                        "episodic delivery `{}` references non-completed event",
-                        delivery.id
-                    );
+                let notification = match &delivery.event.payload {
+                    pioneer_crud::CanonicalTurnEventPayload::ItemCompleted(notification) => {
+                        notification.clone()
+                    }
+                    pioneer_crud::CanonicalTurnEventPayload::ItemUpdated(notification) => {
+                        pioneer_protocol::ItemCompletedNotification {
+                            workspace_id: notification.workspace_id.clone(),
+                            thread_id: notification.thread_id.clone(),
+                            turn_id: notification.turn_id.clone(),
+                            item: notification.item.clone(),
+                        }
+                    }
+                    _ => bail!("episodic delivery references unsupported event"),
                 };
-                self.ingest_committed_thread_item_with_result(notification)
+                self.ingest_committed_thread_item_with_result(&notification)
                     .await
             }
             consumer => bail!("unknown native turn-event delivery consumer `{consumer}`"),
@@ -3575,21 +3568,14 @@ impl MessageProcessor {
     }
 
     fn spawn_thread_episodic_index_run(&self) {
-        let executor = self.thread_episodic_index_executor.clone();
-        tokio::spawn(async move {
-            let now_unix = chrono::Utc::now().timestamp();
-            if let Err(error) = crate::database::attribution::scope_database_workload_result(
-                pioneer_observability::DatabaseWorkload::EpisodicMaintenance,
-                executor.run_once(now_unix),
-            )
-            .await
-            {
-                warn!(
-                    error = %format!("{error:#}"),
-                    "thread episodic index run failed"
-                );
-            }
-        });
+        if self
+            .thread_episodic_runtime_config
+            .read()
+            .is_ok_and(|config| !config.enabled || !config.indexing_enabled)
+        {
+            return;
+        }
+        self.thread_episodic_index_executor.wake();
     }
 
     fn persist_durable_agent_event_with_cli_blocked_guard<'a>(

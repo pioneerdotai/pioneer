@@ -67,16 +67,7 @@ impl<'a> FailureTarget<'a> {
 
 fn total_token_usage(usage: Option<&TokenUsage>) -> Option<u64> {
     let usage = usage?;
-    if usage.input_tokens.is_none() && usage.output_tokens.is_none() {
-        return None;
-    }
-
-    Some(
-        usage
-            .input_tokens
-            .unwrap_or_default()
-            .saturating_add(usage.output_tokens.unwrap_or_default()),
-    )
+    usage.input_tokens?.checked_add(usage.output_tokens?)
 }
 
 fn bind_replay_to_response_target(
@@ -166,7 +157,7 @@ async fn persist_failed_provider_observation(
     .await
 }
 
-pub(super) async fn request_agent_round(
+async fn request_agent_round_observed(
     provider: &Arc<dyn Provider>,
     request: ChatRequest,
     workspace_id: &str,
@@ -176,6 +167,7 @@ pub(super) async fn request_agent_round(
     force_non_stream: bool,
     provider_timeout_policy: ProviderTimeoutPolicy,
     event_tx: &AgentEventHub,
+    observation: &ProviderAttemptObservation,
 ) -> Result<AgentRoundResponse, ChatTurnError> {
     pioneer_observability::turn_startup::dispatched(turn_id);
     let mut lifecycle_metric = NativeProviderRoundMetric::start();
@@ -196,6 +188,7 @@ pub(super) async fn request_agent_round(
                 .stream_chat_with_diagnostics(request)
                 .await
                 .map_err(|error| {
+                    observation.observe_error(&error);
                     adapter_error_for_target(
                         target,
                         provider.as_ref(),
@@ -226,6 +219,7 @@ pub(super) async fn request_agent_round(
                 provider,
                 model_name.as_str(),
                 provider_timeout_policy,
+                observation,
             )
             .await?
             {
@@ -241,6 +235,7 @@ pub(super) async fn request_agent_round(
                 }
                 if let Some(snapshot) = &chunk.usage {
                     usage.get_or_insert_with(Default::default).update(snapshot);
+                    observation.observe(snapshot);
                 }
                 if chunk.provider_replay_state.is_some() {
                     provider_replay_state = chunk.provider_replay_state.take();
@@ -365,6 +360,7 @@ pub(super) async fn request_agent_round(
     let model_name = request.model.clone();
 
     let mut response = provider.chat(request).await.map_err(|error| {
+        observation.observe_error(&error);
         adapter_error_for_target(
             FailureTarget::new(thinking_item_id, TurnItemType::Reasoning),
             provider.as_ref(),
@@ -375,6 +371,9 @@ pub(super) async fn request_agent_round(
             &error,
         )
     })?;
+    if let Some(usage) = &response.usage {
+        observation.observe(usage);
+    }
     bind_replay_to_response_target(
         &mut response.provider_replay_state,
         provider.name(),
@@ -452,7 +451,7 @@ pub(super) async fn request_agent_round(
     })
 }
 
-pub(super) async fn stream_provider_response(
+async fn stream_provider_response_observed(
     provider: &Arc<dyn Provider>,
     request: ChatRequest,
     workspace_id: &str,
@@ -462,6 +461,7 @@ pub(super) async fn stream_provider_response(
     message_item_id: &str,
     provider_timeout_policy: ProviderTimeoutPolicy,
     event_tx: &AgentEventHub,
+    observation: &ProviderAttemptObservation,
 ) -> Result<(String, Option<pioneer_provider::TokenUsage>), ChatTurnError> {
     pioneer_observability::turn_startup::dispatched(turn_id);
     let mut lifecycle_metric = NativeProviderRoundMetric::start();
@@ -481,6 +481,7 @@ pub(super) async fn stream_provider_response(
             .stream_chat_with_diagnostics(request)
             .await
             .map_err(|error| {
+                observation.observe_error(&error);
                 adapter_error_for_target(
                     connect_target,
                     provider.as_ref(),
@@ -512,6 +513,7 @@ pub(super) async fn stream_provider_response(
             provider,
             model_name.as_str(),
             provider_timeout_policy,
+            observation,
         )
         .await?
         {
@@ -537,6 +539,7 @@ pub(super) async fn stream_provider_response(
 
             if let Some(snapshot) = &chunk_usage {
                 usage.get_or_insert_with(Default::default).update(snapshot);
+                observation.observe(snapshot);
             }
             if chunk_replay.is_some() {
                 provider_replay_state = chunk_replay;
@@ -835,7 +838,7 @@ pub(super) async fn stream_provider_response(
     Ok((assistant_text, usage))
 }
 
-pub(super) async fn non_stream_provider_response(
+async fn non_stream_provider_response_observed(
     provider: &Arc<dyn Provider>,
     request: ChatRequest,
     workspace_id: &str,
@@ -844,12 +847,14 @@ pub(super) async fn non_stream_provider_response(
     thinking_item_id: &str,
     message_item_id: &str,
     event_tx: &AgentEventHub,
+    observation: &ProviderAttemptObservation,
 ) -> Result<(String, Option<pioneer_provider::TokenUsage>), ChatTurnError> {
     pioneer_observability::turn_startup::dispatched(turn_id);
     let mut lifecycle_metric = NativeProviderRoundMetric::start();
     let model_name = request.model.clone();
 
     let mut response = provider.chat(request).await.map_err(|error| {
+        observation.observe_error(&error);
         adapter_error_for_target(
             FailureTarget::new(thinking_item_id, TurnItemType::Reasoning),
             provider.as_ref(),
@@ -861,6 +866,9 @@ pub(super) async fn non_stream_provider_response(
         )
     })?;
 
+    if let Some(usage) = &response.usage {
+        observation.observe(usage);
+    }
     bind_replay_to_response_target(
         &mut response.provider_replay_state,
         provider.name(),
@@ -1033,6 +1041,15 @@ fn adapter_error_for_target(
     } else {
         provider.classify_failure(error)
     };
+    // Usage context has a safe fixed Display. Classify the original cause
+    // privately, then persist only the safe outer diagnostic and typed hints.
+    let inferred = infer_failure_classification(
+        &format!(
+            "{prefix}: {}",
+            pioneer_provider::usage::classification_source(error)
+        ),
+        stage,
+    );
     provider_failure_error_with_classification(
         target.item_id,
         target.item_type,
@@ -1041,7 +1058,7 @@ fn adapter_error_for_target(
         transport,
         stage,
         format!("{prefix}: {error}"),
-        classification,
+        Some(merge_failure_classification(classification, inferred)),
     )
 }
 
@@ -1263,6 +1280,7 @@ async fn read_next_stream_chunk<S>(
     provider: &Arc<dyn Provider>,
     model_name: &str,
     provider_timeout_policy: ProviderTimeoutPolicy,
+    observation: &ProviderAttemptObservation,
 ) -> Result<Option<StreamChunk>, ChatTurnError>
 where
     S: Stream<Item = anyhow::Result<StreamChunk>> + Unpin,
@@ -1279,7 +1297,37 @@ where
         provider_timeout_policy.first_chunk_timeout
     };
 
-    let next_chunk = timeout(wait, stream.next()).await.map_err(|_| {
+    let next_chunk = timeout(wait, async {
+        loop {
+            let next = stream.next().await;
+            if let Some(Ok(chunk)) = &next {
+                let identity_only = !chunk.is_final
+                    && chunk.delta.is_empty()
+                    && chunk.reasoning_delta.is_none()
+                    && chunk.tool_calls.is_empty()
+                    && chunk.provider_replay_state.is_none()
+                    && chunk.termination.is_none()
+                    && chunk.usage.as_ref().is_some_and(|usage| {
+                        usage.input_tokens.is_none()
+                            && usage.output_tokens.is_none()
+                            && usage.uncached_input_tokens.is_none()
+                            && usage.cache_read_input_tokens.is_none()
+                            && usage.cache_write_input_tokens.is_none()
+                            && usage.reasoning_tokens.is_none()
+                            && usage.reported_total_tokens.is_none()
+                    });
+                if identity_only {
+                    // Correlation evidence must survive without resetting the
+                    // request's first/inter-chunk deadline or counting as progress.
+                    observation.observe(chunk.usage.as_ref().expect("identity usage"));
+                    continue;
+                }
+            }
+            break next;
+        }
+    })
+    .await
+    .map_err(|_| {
         let mut classification =
             ProviderFailureClassification::new(ProviderFailureClass::StreamStall);
         classification.request_id = diagnostics.request_id();
@@ -1302,6 +1350,7 @@ where
     *seen_any_chunk = true;
 
     let chunk = chunk_result.map_err(|error| {
+        observation.observe_error(&error);
         adapter_error_for_target(
             target,
             provider.as_ref(),
@@ -1348,29 +1397,19 @@ fn provider_failure_error_with_classification(
     error_message: String,
     classification: Option<ProviderFailureClassification>,
 ) -> ChatTurnError {
-    let error_reason = classification.as_ref().and_then(|value| value.error_reason);
-    let request_id = classification
-        .as_ref()
-        .and_then(|value| value.request_id.clone());
-    let lower = error_message.to_ascii_lowercase();
-    let inferred_http_status = extract_http_status(error_message.as_str());
-    let inferred_retry_after_ms = extract_retry_after_ms(lower.as_str());
-    let inferred_provider_code = extract_provider_code(error_message.as_str());
-    let inferred_class = classify_provider_failure_message(error_message.as_str(), stage);
-    let (class, http_status, provider_code, retry_after_ms) = match classification {
-        Some(classification) => (
-            classification.class,
-            classification.http_status.or(inferred_http_status),
-            classification.provider_code.or(inferred_provider_code),
-            classification.retry_after_ms.or(inferred_retry_after_ms),
-        ),
-        None => (
-            inferred_class,
-            inferred_http_status,
-            inferred_provider_code,
-            inferred_retry_after_ms,
-        ),
-    };
+    let classification = merge_failure_classification(
+        classification,
+        infer_failure_classification(&error_message, stage),
+    );
+    let ProviderFailureClassification {
+        is_network_error: _,
+        error_reason,
+        request_id,
+        class,
+        http_status,
+        provider_code,
+        retry_after_ms,
+    } = classification;
     let is_recoverable_hint = provider_failure_class_is_recoverable(class);
 
     ChatTurnError::ProviderFailure {
@@ -1390,6 +1429,39 @@ fn provider_failure_error_with_classification(
             is_recoverable_hint,
             message: Some(error_message),
         },
+    }
+}
+
+fn infer_failure_classification(
+    message: &str,
+    stage: ProviderFailureStage,
+) -> ProviderFailureClassification {
+    ProviderFailureClassification {
+        is_network_error: false,
+        error_reason: None,
+        request_id: None,
+        class: classify_provider_failure_message(message, stage),
+        http_status: extract_http_status(message),
+        provider_code: extract_provider_code(message),
+        retry_after_ms: extract_retry_after_ms(&message.to_ascii_lowercase()),
+    }
+}
+
+fn merge_failure_classification(
+    classification: Option<ProviderFailureClassification>,
+    inferred: ProviderFailureClassification,
+) -> ProviderFailureClassification {
+    match classification {
+        Some(classification) => ProviderFailureClassification {
+            is_network_error: classification.is_network_error,
+            error_reason: classification.error_reason,
+            request_id: classification.request_id,
+            class: classification.class,
+            http_status: classification.http_status.or(inferred.http_status),
+            provider_code: classification.provider_code.or(inferred.provider_code),
+            retry_after_ms: classification.retry_after_ms.or(inferred.retry_after_ms),
+        },
+        None => inferred,
     }
 }
 
@@ -1442,6 +1514,288 @@ fn extract_http_status(message: &str) -> Option<u16> {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn registry_usage_metadata_is_transparent_to_production_failure_translation() {
+        struct Failing {
+            message: &'static str,
+            classification: Option<ProviderFailureClassification>,
+        }
+        #[async_trait::async_trait]
+        impl Provider for Failing {
+            fn name(&self) -> &str {
+                "openrouter"
+            }
+            fn classify_failure(&self, _: &anyhow::Error) -> Option<ProviderFailureClassification> {
+                self.classification.clone()
+            }
+            async fn chat(&self, _: ChatRequest) -> anyhow::Result<pioneer_provider::ChatResponse> {
+                Err(anyhow::anyhow!(self.message))
+            }
+            async fn stream_chat(
+                &self,
+                _: ChatRequest,
+            ) -> anyhow::Result<futures_util::stream::BoxStream<'static, anyhow::Result<StreamChunk>>>
+            {
+                let snapshot = TokenUsage {
+                    generation_id: Some("gen-header".into()),
+                    input_tokens: None,
+                    output_tokens: Some(0),
+                    cache_read_input_tokens: Some(8),
+                    ..Default::default()
+                };
+                Ok(Box::pin(futures_util::stream::iter(vec![
+                    Ok(StreamChunk::usage(snapshot.clone())),
+                    Ok(StreamChunk::usage(snapshot)),
+                    Err(anyhow::anyhow!(self.message)),
+                ])))
+            }
+        }
+        let request = || ChatRequest {
+            model: "fixture".into(),
+            messages: vec![],
+            temperature: None,
+            max_tokens: None,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            reasoning: None,
+            compiled_prompt: None,
+        };
+        for (message, stage, class, typed) in [
+            (
+                "OpenRouter API error 429: {\"code\":\"rate_limit_exceeded\"} retry-after: 2",
+                ProviderFailureStage::Connect,
+                ProviderFailureClass::RateLimit,
+                false,
+            ),
+            (
+                "OpenRouter API error 503: unavailable",
+                ProviderFailureStage::Connect,
+                ProviderFailureClass::Provider5xx,
+                false,
+            ),
+            (
+                "connection reset by peer",
+                ProviderFailureStage::MidStream,
+                ProviderFailureClass::NetworkTransient,
+                false,
+            ),
+            (
+                "provider API error 400: invalid request",
+                ProviderFailureStage::MidStream,
+                ProviderFailureClass::ProviderRejected,
+                false,
+            ),
+            (
+                "provider returned empty response",
+                ProviderFailureStage::Finalize,
+                ProviderFailureClass::EmptyResponse,
+                true,
+            ),
+            (
+                "opaque adapter failure",
+                ProviderFailureStage::FirstChunk,
+                ProviderFailureClass::RateLimit,
+                true,
+            ),
+        ] {
+            let inner = Arc::new(Failing {
+                message,
+                classification: typed.then(|| ProviderFailureClassification {
+                    is_network_error: false,
+                    error_reason: None,
+                    request_id: None,
+                    class,
+                    http_status: (class == ProviderFailureClass::RateLimit).then_some(429),
+                    provider_code: (class == ProviderFailureClass::RateLimit)
+                        .then(|| "native_rate_limit".into()),
+                    retry_after_ms: (class == ProviderFailureClass::RateLimit).then_some(7000),
+                }),
+            });
+            let plain = inner.chat(request()).await.err().unwrap();
+            let registry = pioneer_provider::ProviderRegistry::new(|_| String::new());
+            registry.insert("openrouter", inner.clone()).unwrap();
+            let wrapped = registry.get_or_create("openrouter").unwrap();
+            let mut stream = wrapped.stream_chat(request()).await.unwrap();
+            let observation = ProviderAttemptObservation::new(wrapped.as_ref(), "fixture");
+            for _ in 0..2 {
+                observation.observe(&stream.next().await.unwrap().unwrap().usage.unwrap());
+            }
+            let enriched = stream.next().await.unwrap().err().unwrap();
+            observation.observe_error(&enriched);
+            observation.observe_error(&enriched);
+            let translate = |provider: &dyn Provider, error: &anyhow::Error| {
+                let ChatTurnError::ProviderFailure { failure, .. } = adapter_error_for_target(
+                    FailureTarget::new("item", TurnItemType::Reasoning),
+                    provider,
+                    "fixture",
+                    ProviderTransportKind::Stream,
+                    stage,
+                    "provider error",
+                    error,
+                ) else {
+                    panic!("expected failure")
+                };
+                failure
+            };
+            let before = translate(inner.as_ref(), &plain);
+            let after = translate(wrapped.as_ref(), &enriched);
+            assert_eq!(after.class, class);
+            assert_eq!(after.class, before.class);
+            assert_eq!(after.http_status, before.http_status);
+            assert_eq!(after.provider_code, before.provider_code);
+            assert_eq!(after.retry_after_ms, before.retry_after_ms);
+            if message.starts_with("OpenRouter API error 429") {
+                assert_eq!(after.http_status, Some(429));
+                assert_eq!(after.provider_code.as_deref(), Some("rate_limit_exceeded"));
+                assert_eq!(after.retry_after_ms, Some(2000));
+            }
+            if message.starts_with("OpenRouter API error 503") {
+                assert_eq!(after.http_status, Some(503));
+            }
+            assert_eq!(after.is_recoverable_hint, before.is_recoverable_hint);
+            assert_eq!(after.stage, before.stage);
+            assert_eq!(after.transport, before.transport);
+            assert!(!after.message.unwrap().contains(message));
+            let observed = observation.usage.lock().unwrap();
+            assert_eq!(observed.generation_id.as_deref(), Some("gen-header"));
+            assert_eq!(observed.input_tokens, None);
+            assert_eq!(observed.output_tokens, Some(0));
+            assert_eq!(observed.cache_read_input_tokens, Some(8));
+        }
+    }
+
+    #[tokio::test]
+    async fn native_openrouter_header_errors_keep_http_and_retry_hints_without_redaction_override()
+    {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        for (status, class) in [
+            (429, ProviderFailureClass::RateLimit),
+            (503, ProviderFailureClass::Provider5xx),
+        ] {
+            for streaming in [false, true] {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let url = format!("http://{}", listener.local_addr().unwrap());
+                let server = tokio::spawn(async move {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    // Read the complete request before closing the connection. Closing
+                    // with unread request bytes can reset the socket on Linux, obscuring
+                    // the response failure this fixture is intended to exercise.
+                    let mut request = Vec::new();
+                    loop {
+                        let mut buffer = [0u8; 2048];
+                        let count = socket.read(&mut buffer).await.unwrap();
+                        assert!(count > 0, "fixture request ended before its body");
+                        assert!(request.len() + count <= 8192, "fixture request too large");
+                        request.extend_from_slice(&buffer[..count]);
+                        if let Some(start) =
+                            request.windows(4).position(|bytes| bytes == b"\r\n\r\n")
+                        {
+                            let header = std::str::from_utf8(&request[..start]).unwrap();
+                            let length = header
+                                .lines()
+                                .find_map(|line| {
+                                    let (name, value) = line.split_once(':')?;
+                                    name.eq_ignore_ascii_case("content-length")
+                                        .then(|| value.trim().parse::<usize>().unwrap())
+                                })
+                                .expect("fixture request Content-Length");
+                            if request.len() >= start + 4 + length {
+                                break;
+                            }
+                        }
+                    }
+
+                    let body = r#"{"error":{"code":"native_rejection","message":"SECRET_BODY retry-after: 2"}}"#;
+                    socket.write_all(format!("HTTP/1.1 {status} Error\r\nContent-Type: application/json\r\nX-Generation-Id: gen-native-header\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+                });
+                // Native adapter + normal registry wrapper; no endpoint override
+                // resolver, so the default non-redacting error path is exercised.
+                let registry = pioneer_provider::ProviderRegistry::new(|_| String::new());
+                registry
+                    .insert(
+                        "openrouter",
+                        Arc::new(
+                            pioneer_provider::providers::OpenRouterProvider::with_base_url(
+                                "key", url,
+                            ),
+                        ),
+                    )
+                    .unwrap();
+                let provider = registry.get_or_create("openrouter").unwrap();
+                let request = ChatRequest {
+                    model: "fixture".into(),
+                    messages: vec![],
+                    temperature: None,
+                    max_tokens: None,
+                    tools: None,
+                    tool_choice: None,
+                    parallel_tool_calls: None,
+                    reasoning: None,
+                    compiled_prompt: None,
+                };
+                let error = if streaming {
+                    provider.stream_chat(request).await.err().unwrap()
+                } else {
+                    provider.chat(request).await.err().unwrap()
+                };
+                server.await.unwrap();
+                let classification = provider.classify_failure(&error).unwrap();
+                assert_eq!(classification.http_status, Some(status));
+                let transport = if streaming {
+                    ProviderTransportKind::Stream
+                } else {
+                    ProviderTransportKind::NonStream
+                };
+                let translate = |error: &anyhow::Error| {
+                    let ChatTurnError::ProviderFailure { failure, .. } = adapter_error_for_target(
+                        FailureTarget::new("item", TurnItemType::Reasoning),
+                        provider.as_ref(),
+                        "fixture",
+                        transport,
+                        ProviderFailureStage::Connect,
+                        "provider error",
+                        error,
+                    ) else {
+                        panic!("expected provider failure")
+                    };
+                    failure
+                };
+                let ChatTurnError::ProviderFailure {
+                    failure: before, ..
+                } = provider_failure_error_with_classification(
+                    "item",
+                    TurnItemType::Reasoning,
+                    provider.name(),
+                    "fixture",
+                    transport,
+                    ProviderFailureStage::Connect,
+                    pioneer_provider::usage::classification_source(&error).to_string(),
+                    Some(classification),
+                )
+                else {
+                    panic!("expected failure")
+                };
+                let after = translate(&error);
+                assert_eq!(after.class, class);
+                assert_eq!(after.http_status, Some(status));
+                assert_eq!(after.provider_code, None);
+                assert_eq!(after.retry_after_ms, Some(2000));
+                assert_eq!(after.class, before.class);
+                assert_eq!(after.http_status, before.http_status);
+                assert_eq!(after.provider_code, before.provider_code);
+                assert_eq!(after.retry_after_ms, before.retry_after_ms);
+                assert_eq!(after.is_recoverable_hint, before.is_recoverable_hint);
+                assert!(!after.message.unwrap().contains("SECRET_BODY"));
+                let usage = pioneer_provider::usage::error_usage(&error).unwrap();
+                assert_eq!(usage.generation_id.as_deref(), Some("gen-native-header"));
+                assert_eq!(usage.input_tokens, None);
+                assert_eq!(usage.output_tokens, None);
+            }
+        }
+    }
+
     async fn failure_from_overridden_endpoint(
         provider_name: &'static str,
         status: u16,
@@ -1459,6 +1813,11 @@ mod tests {
         stream_request: bool,
         response_body: Option<String>,
     ) -> ProviderFailureDetails {
+        let headers = if provider_name == "openrouter" && response_body.is_none() {
+            "X-Generation-Id: gen-private-header\r\n"
+        } else {
+            ""
+        };
         failure_from_local_endpoint(
             provider_name,
             status,
@@ -1466,7 +1825,7 @@ mod tests {
             stream_request,
             response_body,
             true,
-            "",
+            headers,
             false,
         )
         .await
@@ -1639,12 +1998,18 @@ mod tests {
             provider.chat(request).await.err().unwrap()
         };
         server.await.unwrap();
-        assert!(
-            error
-                .chain()
-                .skip(1)
-                .all(|cause| { cause.is::<pioneer_provider::failure::ProviderStreamIncomplete>() })
-        );
+        if provider_name == "openrouter" && headers.contains("gen-private-header") {
+            let usage = pioneer_provider::usage::error_usage(&error).unwrap();
+            assert_eq!(usage.generation_id.as_deref(), Some("gen-private-header"));
+            assert_eq!(usage.input_tokens, None);
+        }
+        // Anyhow wraps usage in a context whose standard Error type differs
+        // from the metadata type. Check the original adapter cause chain.
+        let mut source = pioneer_provider::usage::classification_source(&error).source();
+        while let Some(cause) = source {
+            assert!(cause.is::<pioneer_provider::failure::ProviderStreamIncomplete>());
+            source = cause.source();
+        }
         assert!(!error.chain().any(
             |cause| cause.is::<std::string::FromUtf8Error>() || cause.is::<serde_json::Error>()
         ));
@@ -2287,6 +2652,22 @@ mod tests {
                 false,
             ),
             (
+                "openrouter",
+                503,
+                "temporary upstream failure",
+                false,
+                ProviderFailureClass::Provider5xx,
+                true,
+            ),
+            (
+                "openrouter",
+                429,
+                "rate limit; retry-after: 3",
+                true,
+                ProviderFailureClass::RateLimit,
+                true,
+            ),
+            (
                 "openai",
                 429,
                 "rate limit; retry-after: 3",
@@ -2759,6 +3140,14 @@ mod partial_observation_tests {
         ) -> anyhow::Result<futures_util::stream::BoxStream<'static, anyhow::Result<StreamChunk>>>
         {
             Ok(futures_util::stream::iter(vec![
+                Ok(StreamChunk::usage(TokenUsage {
+                    generation_id: Some("gen-header".into()),
+                    request_id: Some("req-distinct".into()),
+                    reported_model: Some("actual-returned".into()),
+                    input_tokens: Some(10),
+                    output_tokens: Some(2),
+                    ..Default::default()
+                })),
                 Ok(StreamChunk::reasoning("reasoning actually received")),
                 Ok(StreamChunk::delta("partial answer actually received")),
                 Ok(StreamChunk::provider_replay_state(
@@ -2795,21 +3184,40 @@ mod partial_observation_tests {
                 compiled_prompt: None,
             };
             let receive = async {
+                let mut history = None;
                 loop {
                     let event = events.recv().await.unwrap();
                     assert!(!matches!(
                         event,
                         AgentDurableEvent::TurnFinalizationPrepared { .. }
                     ));
-                    let observation = match event {
+                    let usage = match event {
                         AgentDurableEvent::TurnProviderHistoryAppended { payload, .. } => {
-                            Some(payload)
+                            history = Some(payload);
+                            None
+                        }
+                        AgentDurableEvent::ItemCompleted { notification } => {
+                            match notification.item {
+                                TurnItem::SystemEvent { code, details, .. }
+                                    if code.as_deref() == Some("provider_usage") =>
+                                {
+                                    details
+                                }
+                                _ => None,
+                            }
                         }
                         _ => None,
                     };
                     events.acknowledge_last(Ok(()));
-                    if let Some(payload) = observation {
-                        break payload;
+                    if let Some(details) = usage {
+                        assert_eq!(details["status"], "failed");
+                        assert_eq!(details["usage"]["generation_id"], "gen-header");
+                        assert_eq!(details["usage"]["request_id"], "req-distinct");
+                        assert_eq!(details["usage"]["reported_model"], "actual-returned");
+                        assert_eq!(details["usage"]["input_tokens"], 10);
+                        assert_eq!(details["usage"]["output_tokens"], 2);
+                        assert!(!details.to_string().contains("request\""));
+                        break history.expect("partial history precedes failure");
                     }
                 }
             };
@@ -2889,6 +3297,205 @@ fn observe_startup_chunk(turn_id: &str, chunk: &pioneer_provider::StreamChunk) {
     }
 }
 
+/// One item per physical chat dispatch; snapshots are never additional charges.
+/// Start records survive cancellation. Only provider-reported partial counters
+/// survive error; no usage is invented for a failed connect or missing terminal.
+pub(super) struct ProviderAttemptObservation {
+    id: String,
+    provider: String,
+    model: String,
+    api: String,
+    route: Option<String>,
+    usage: std::sync::Mutex<TokenUsage>,
+}
+impl ProviderAttemptObservation {
+    pub(super) fn new(provider: &dyn Provider, model: &str) -> Self {
+        Self {
+            id: super::generate_id(super::TURN_ITEM_ID_LEN),
+            provider: provider.name().to_owned(),
+            model: model.to_owned(),
+            api: provider.usage_api().to_owned(),
+            route: provider.usage_route(),
+            usage: std::sync::Mutex::new(TokenUsage::default()),
+        }
+    }
+    pub(super) fn observe(&self, snapshot: &TokenUsage) {
+        self.usage
+            .lock()
+            .expect("usage observation")
+            .update(snapshot);
+    }
+    pub(super) fn observe_error(&self, error: &anyhow::Error) {
+        if let Some(snapshot) = pioneer_provider::usage::error_usage(error) {
+            self.observe(snapshot);
+        }
+    }
+    pub(super) async fn publish(
+        &self,
+        events: &AgentEventHub,
+        workspace: &str,
+        thread: &str,
+        turn: &str,
+        completed: Option<bool>,
+    ) -> Result<(), ChatTurnError> {
+        let mut usage = self.usage.lock().expect("usage observation").clone();
+        if let Some(raw) = &usage.raw_usage {
+            usage.raw_usage = Some(pioneer_provider::usage::bounded_usage(raw));
+        }
+        let item = TurnItem::SystemEvent {
+            id: self.id.clone(),
+            level: pioneer_protocol::SystemEventLevel::Info,
+            message: "Provider usage observation".into(),
+            code: Some("provider_usage".into()),
+            details: Some(serde_json::json!({"schema_version":1,
+                "nativeMethod":"provider/usage/observed", "observation_id":self.id,
+                "physical_attempt_id":usage.physical_attempt_id,
+                "request_sent":serde_json::Value::Null,
+                "provider":self.provider,"model":self.model,"api":self.api,"route":self.route,
+                "status":match completed {None=>"started",Some(true)=>"completed",Some(false)=>"failed"},
+                "complete":completed == Some(true),"usage":usage})),
+        };
+        let event = if completed.is_none() {
+            AgentDurableEvent::ItemStarted {
+                notification: ItemStartedNotification {
+                    workspace_id: workspace.into(),
+                    thread_id: thread.into(),
+                    turn_id: turn.into(),
+                    item,
+                },
+            }
+        } else {
+            AgentDurableEvent::ItemCompleted {
+                notification: ItemCompletedNotification {
+                    workspace_id: workspace.into(),
+                    thread_id: thread.into(),
+                    turn_id: turn.into(),
+                    item,
+                },
+            }
+        };
+        super::emit_durable_event(events, event).await
+    }
+}
+
+pub(super) async fn request_agent_round(
+    provider: &Arc<dyn Provider>,
+    request: ChatRequest,
+    workspace_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+    thinking_item_id: &str,
+    force_non_stream: bool,
+    provider_timeout_policy: ProviderTimeoutPolicy,
+    event_tx: &AgentEventHub,
+) -> Result<AgentRoundResponse, ChatTurnError> {
+    let observation = ProviderAttemptObservation::new(provider.as_ref(), &request.model);
+    observation
+        .publish(event_tx, workspace_id, thread_id, turn_id, None)
+        .await?;
+    let result = request_agent_round_observed(
+        provider,
+        request,
+        workspace_id,
+        thread_id,
+        turn_id,
+        thinking_item_id,
+        force_non_stream,
+        provider_timeout_policy,
+        event_tx,
+        &observation,
+    )
+    .await;
+    observation
+        .publish(
+            event_tx,
+            workspace_id,
+            thread_id,
+            turn_id,
+            Some(result.is_ok()),
+        )
+        .await?;
+    result
+}
+
+pub(super) async fn stream_provider_response(
+    provider: &Arc<dyn Provider>,
+    request: ChatRequest,
+    workspace_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+    thinking_item_id: &str,
+    message_item_id: &str,
+    provider_timeout_policy: ProviderTimeoutPolicy,
+    event_tx: &AgentEventHub,
+) -> Result<(String, Option<pioneer_provider::TokenUsage>), ChatTurnError> {
+    let observation = ProviderAttemptObservation::new(provider.as_ref(), &request.model);
+    observation
+        .publish(event_tx, workspace_id, thread_id, turn_id, None)
+        .await?;
+    let result = stream_provider_response_observed(
+        provider,
+        request,
+        workspace_id,
+        thread_id,
+        turn_id,
+        thinking_item_id,
+        message_item_id,
+        provider_timeout_policy,
+        event_tx,
+        &observation,
+    )
+    .await;
+    observation
+        .publish(
+            event_tx,
+            workspace_id,
+            thread_id,
+            turn_id,
+            Some(result.is_ok()),
+        )
+        .await?;
+    result
+}
+
+pub(super) async fn non_stream_provider_response(
+    provider: &Arc<dyn Provider>,
+    request: ChatRequest,
+    workspace_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+    thinking_item_id: &str,
+    message_item_id: &str,
+    event_tx: &AgentEventHub,
+) -> Result<(String, Option<pioneer_provider::TokenUsage>), ChatTurnError> {
+    let observation = ProviderAttemptObservation::new(provider.as_ref(), &request.model);
+    observation
+        .publish(event_tx, workspace_id, thread_id, turn_id, None)
+        .await?;
+    let result = non_stream_provider_response_observed(
+        provider,
+        request,
+        workspace_id,
+        thread_id,
+        turn_id,
+        thinking_item_id,
+        message_item_id,
+        event_tx,
+        &observation,
+    )
+    .await;
+    observation
+        .publish(
+            event_tx,
+            workspace_id,
+            thread_id,
+            turn_id,
+            Some(result.is_ok()),
+        )
+        .await?;
+    result
+}
+
 #[cfg(test)]
 mod terminal_boundary_tests {
     use super::*;
@@ -2943,6 +3550,25 @@ mod terminal_boundary_tests {
             compiled_prompt: None,
         }
     }
+
+    async fn acknowledge_round_events(hub: &AgentEventHub) -> Vec<AgentDurableEvent> {
+        let mut receiver = hub.take_durable_receiver().await.unwrap();
+        let mut events = Vec::new();
+        loop {
+            let event = receiver.recv().await.unwrap();
+            let usage_completed = matches!(&event,
+                AgentDurableEvent::ItemCompleted { notification }
+                    if matches!(&notification.item,
+                        TurnItem::SystemEvent { code, .. }
+                            if code.as_deref() == Some("provider_usage")));
+            receiver.acknowledge_last(Ok(()));
+            events.push(event);
+            if usage_completed {
+                return events;
+            }
+        }
+    }
+
     #[tokio::test]
     async fn failed_partial_call_never_becomes_executable_round_or_automatic_retry() {
         let attempts = Arc::new(AtomicUsize::new(0));
@@ -2956,36 +3582,43 @@ mod terminal_boundary_tests {
             attempts: attempts.clone(),
         });
         let hub = AgentEventHub::new();
-        let mut receiver = hub.take_durable_receiver().await.unwrap();
-        let acknowledgement = tokio::spawn(async move {
-            let event = receiver.recv().await.unwrap();
-            let AgentDurableEvent::TurnProviderHistoryAppended { payload, .. } = event else {
-                panic!("expected failed observation")
-            };
+        let (result, events) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(
+                request_agent_round(
+                    &provider,
+                    request(),
+                    "ws",
+                    "thread",
+                    "turn",
+                    "item",
+                    false,
+                    ProviderTimeoutPolicy::default(),
+                    &hub,
+                ),
+                acknowledge_round_events(&hub),
+            )
+        })
+        .await
+        .expect("provider round and all durable acknowledgements must finish");
+        let history = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentDurableEvent::TurnProviderHistoryAppended { payload, .. } => Some(payload),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(history.len(), 1, "expected one failed observation");
+        for payload in history {
             let envelope: pioneer_provider::CanonicalProviderRoundEnvelope =
-                serde_json::from_value(payload).unwrap();
+                serde_json::from_value(payload.clone()).unwrap();
             assert_eq!(envelope.termination, ProviderTermination::ProviderError);
             assert!(
                 envelope.calls.is_empty(),
                 "failed observations must not retain executable identities"
             );
-            receiver.acknowledge_last(Ok(()));
-        });
-        let result = request_agent_round(
-            &provider,
-            request(),
-            "ws",
-            "thread",
-            "turn",
-            "item",
-            false,
-            ProviderTimeoutPolicy::default(),
-            &hub,
-        )
-        .await;
+        }
         assert!(matches!(result, Err(ChatTurnError::ProviderFailure { .. })));
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
-        acknowledgement.await.unwrap();
     }
     #[tokio::test]
     async fn final_chunk_payload_is_accumulated_before_terminal_validation() {
@@ -2996,19 +3629,26 @@ mod terminal_boundary_tests {
             fail: false,
             attempts: Arc::new(AtomicUsize::new(0)),
         });
-        let result = request_agent_round(
-            &provider,
-            request(),
-            "ws",
-            "thread",
-            "turn",
-            "item",
-            false,
-            ProviderTimeoutPolicy::default(),
-            &AgentEventHub::new(),
-        )
+        let hub = AgentEventHub::new();
+        let (result, _) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(
+                request_agent_round(
+                    &provider,
+                    request(),
+                    "ws",
+                    "thread",
+                    "turn",
+                    "item",
+                    false,
+                    ProviderTimeoutPolicy::default(),
+                    &hub,
+                ),
+                acknowledge_round_events(&hub),
+            )
+        })
         .await
-        .unwrap();
+        .expect("provider round and all durable acknowledgements must finish");
+        let result = result.unwrap();
         assert_eq!(result.text, "terminal text");
     }
 }

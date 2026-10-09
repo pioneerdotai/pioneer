@@ -6,6 +6,7 @@ mod turn_event_projection_stream_state_backfill;
 mod turn_permission_profile_backfill;
 mod zstd_payload_compression;
 
+use crate::thread_episodic::ThreadEpisodicIndexExecutorConfig;
 use pioneer_config::GatewayThreadEpisodicVectorSearchConfig;
 use pioneer_crud::CrudStore;
 use pioneer_provider::ProviderRegistry;
@@ -58,6 +59,7 @@ fn is_maintenance_cancelled(error: &anyhow::Error) -> bool {
 #[derive(Default)]
 pub(crate) struct ThreadEpisodicWorkspaceRefillSupervisor {
     operation: Mutex<()>,
+    runtime_slot: Arc<Mutex<()>>,
     global_operation: Mutex<()>,
     active: Mutex<HashMap<String, ActiveWorkspaceRefill>>,
     active_global_settings_refill: Mutex<Option<ActiveWorkspaceRefill>>,
@@ -65,6 +67,7 @@ pub(crate) struct ThreadEpisodicWorkspaceRefillSupervisor {
     shutting_down: AtomicBool,
 }
 
+#[derive(Clone)]
 struct ActiveWorkspaceRefill {
     cancellation: CancellationToken,
     completed: watch::Receiver<bool>,
@@ -79,6 +82,7 @@ enum RefillOwner {
 pub(crate) struct ThreadEpisodicWorkspaceRefillLease {
     cancellation: CancellationToken,
     completed: Option<watch::Sender<bool>>,
+    runtime_slot: Option<tokio::sync::OwnedMutexGuard<()>>,
 }
 
 /// Completes the mandatory execution-authority integrity gate before any
@@ -91,7 +95,92 @@ pub(crate) async fn enforce_execution_authority_integrity(
     execution_authority_integrity::run(&crud_store).await
 }
 
+/// Startup admission boundary: call only before constructing the runtime that
+/// can claim episodic work. Late maintenance must never perform this recovery.
+/// Cancellation drops the current bounded DB quantum; a later startup can
+/// finish the remaining running jobs before admitting any new claims.
+pub(crate) async fn recover_inherited_thread_episodic_jobs(
+    crud_store: &CrudStore,
+    max_attempts: i64,
+) -> anyhow::Result<u64> {
+    let crud_store = crud_store.with_maintenance_access();
+    let mut recovered = 0_u64;
+    for workspace_id in crud_store
+        .list_thread_episodic_refill_workspace_ids()
+        .await?
+    {
+        recovered = recovered.saturating_add(
+            crud_store
+                .requeue_running_thread_episodic_index_jobs_for_workspace(
+                    &workspace_id,
+                    chrono::Utc::now().timestamp(),
+                    max_attempts,
+                )
+                .await?,
+        );
+    }
+    Ok(recovered)
+}
+
 impl ThreadEpisodicWorkspaceRefillSupervisor {
+    // Executor recovery uses the current resolver selection, not an old startup
+    // snapshot. Do not supersede an active refill; newer settings can cancel and
+    // join this lease through the existing generation protocol.
+    pub(crate) async fn begin_runtime(
+        &self,
+        workspace_id: &str,
+    ) -> Option<ThreadEpisodicWorkspaceRefillLease> {
+        let slot = self.runtime_slot.clone().try_lock_owned().ok()?;
+        let Ok(_operation) = self.operation.try_lock() else {
+            return None;
+        };
+        if self.shutting_down.load(Ordering::Acquire) {
+            return None;
+        }
+        if self
+            .active
+            .lock()
+            .await
+            .get(workspace_id)
+            .is_some_and(|active| !*active.completed.borrow())
+        {
+            return None;
+        }
+        let mut lease = self.insert_active(workspace_id).await;
+        lease.runtime_slot = Some(slot);
+        Some(lease)
+    }
+
+    // Owned by this supervisor's generation lease and joined by settings/shutdown.
+    // At most one ordinary-runtime transition is admitted; settings/startup keep
+    // their existing ownership. This is not a task per source or per wake.
+    pub(crate) async fn spawn_runtime<F, Fut>(self: &Arc<Self>, workspace: &str, run: F) -> bool
+    where
+        F: FnOnce(CancellationToken) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let Some(lease) = self.begin_runtime(workspace).await else {
+            return false;
+        };
+        tokio::spawn(async move {
+            run(lease.cancellation()).await;
+            drop(lease);
+        });
+        true
+    }
+
+    // Keep the retiring generation visible until its actual FS completion.
+    // Ordinary candidates check this under workspace ownership.
+    pub(crate) async fn workspace_refill_is_active(&self, workspace: &str) -> bool {
+        self.shutting_down.load(Ordering::Acquire)
+            || self
+                .active
+                .lock()
+                .await
+                .get(workspace)
+                .is_some_and(|active| !*active.completed.borrow())
+    }
+
     pub(crate) async fn begin_settings(
         &self,
         workspace_id: &str,
@@ -156,6 +245,7 @@ impl ThreadEpisodicWorkspaceRefillSupervisor {
         ThreadEpisodicWorkspaceRefillLease {
             cancellation,
             completed: Some(completed_tx),
+            runtime_slot: None,
         }
     }
 
@@ -230,7 +320,7 @@ impl ThreadEpisodicWorkspaceRefillSupervisor {
     }
 
     async fn cancel_and_wait_locked(&self, workspace_id: &str) {
-        let active = self.active.lock().await.remove(workspace_id);
+        let active = self.active.lock().await.get(workspace_id).cloned();
         let Some(mut active) = active else {
             return;
         };
@@ -241,6 +331,7 @@ impl ThreadEpisodicWorkspaceRefillSupervisor {
                 break;
             }
         }
+        self.active.lock().await.remove(workspace_id);
     }
 }
 
@@ -259,6 +350,7 @@ fn cancelled_refill_lease() -> ThreadEpisodicWorkspaceRefillLease {
     ThreadEpisodicWorkspaceRefillLease {
         cancellation,
         completed: None,
+        runtime_slot: None,
     }
 }
 
@@ -279,6 +371,7 @@ impl Drop for ThreadEpisodicWorkspaceRefillLease {
 pub(crate) async fn run(
     crud_store: Arc<CrudStore>,
     thread_episodic_indexing_enabled: bool,
+    executor_config: ThreadEpisodicIndexExecutorConfig,
     thread_episodic_storage_root: PathBuf,
     thread_episodic_vector_search_config: GatewayThreadEpisodicVectorSearchConfig,
     thread_episodic_workspace_vector_search_configs: BTreeMap<
@@ -297,6 +390,7 @@ pub(crate) async fn run(
             run_inner(
                 crud_store,
                 thread_episodic_indexing_enabled,
+                executor_config,
                 thread_episodic_storage_root,
                 thread_episodic_vector_search_config,
                 thread_episodic_workspace_vector_search_configs,
@@ -312,6 +406,7 @@ pub(crate) async fn run(
 async fn run_inner(
     crud_store: Arc<CrudStore>,
     thread_episodic_indexing_enabled: bool,
+    executor_config: ThreadEpisodicIndexExecutorConfig,
     thread_episodic_storage_root: PathBuf,
     thread_episodic_vector_search_config: GatewayThreadEpisodicVectorSearchConfig,
     thread_episodic_workspace_vector_search_configs: BTreeMap<
@@ -324,7 +419,6 @@ async fn run_inner(
     refill_supervisor: Arc<ThreadEpisodicWorkspaceRefillSupervisor>,
 ) -> anyhow::Result<()> {
     let crud_store = Arc::new(crud_store.with_maintenance_access());
-    let interrupted_before_unix = chrono::Utc::now().timestamp();
     let trace = pioneer_observability::GatewayOperationTrace::start(
         pioneer_observability::GatewayOperation::DatabaseStartupMaintenance,
     );
@@ -336,7 +430,12 @@ async fn run_inner(
                 return Err(error);
             }
             let stage = trace.stage($stage);
-            if let Err(error) = $future.await {
+            let cancellation = maintenance_cancellation();
+            let result = tokio::select! { biased;
+                _ = cancellation.cancelled() => Err(StartupMaintenanceCancelled.into()),
+                result = $future => result,
+            };
+            if let Err(error) = result {
                 if is_maintenance_cancelled(&error) {
                     stage.cancel();
                     trace.finish_cancelled();
@@ -377,6 +476,7 @@ async fn run_inner(
     run_thread_episodic_workspace_capsule_refill(
         crud_store,
         thread_episodic_indexing_enabled,
+        executor_config,
         thread_episodic_storage_root,
         thread_episodic_vector_search_config,
         thread_episodic_workspace_vector_search_configs,
@@ -384,7 +484,6 @@ async fn run_inner(
         runtime_home,
         refill_status_sender,
         refill_supervisor,
-        Some(interrupted_before_unix),
         RefillOwner::Startup,
         refill_cancellation.clone(),
     )
@@ -407,6 +506,7 @@ async fn run_inner(
 pub(crate) async fn spawn_thread_episodic_workspace_capsule_refill(
     crud_store: Arc<CrudStore>,
     thread_episodic_indexing_enabled: bool,
+    executor_config: ThreadEpisodicIndexExecutorConfig,
     thread_episodic_storage_root: PathBuf,
     thread_episodic_vector_search_config: GatewayThreadEpisodicVectorSearchConfig,
     thread_episodic_workspace_vector_search_configs: BTreeMap<
@@ -424,6 +524,7 @@ pub(crate) async fn spawn_thread_episodic_workspace_capsule_refill(
             run_thread_episodic_workspace_capsule_refill(
                 crud_store,
                 thread_episodic_indexing_enabled,
+                executor_config,
                 thread_episodic_storage_root,
                 thread_episodic_vector_search_config,
                 thread_episodic_workspace_vector_search_configs,
@@ -431,7 +532,6 @@ pub(crate) async fn spawn_thread_episodic_workspace_capsule_refill(
                 runtime_home,
                 refill_status_sender,
                 task_refill_supervisor,
-                None,
                 RefillOwner::Settings,
                 cancellation,
             )
@@ -443,6 +543,7 @@ pub(crate) async fn spawn_thread_episodic_workspace_capsule_refill(
 pub(crate) async fn spawn_thread_episodic_workspace_capsule_refill_for_workspace(
     crud_store: Arc<CrudStore>,
     thread_episodic_indexing_enabled: bool,
+    executor_config: ThreadEpisodicIndexExecutorConfig,
     thread_episodic_storage_root: PathBuf,
     workspace_id: String,
     workspace_vector_search_config: GatewayThreadEpisodicVectorSearchConfig,
@@ -468,6 +569,7 @@ pub(crate) async fn spawn_thread_episodic_workspace_capsule_refill_for_workspace
         run_thread_episodic_workspace_capsule_refill_for_workspace(
             crud_store,
             thread_episodic_indexing_enabled,
+            executor_config,
             thread_episodic_storage_root,
             workspace_id,
             workspace_vector_search_config,
@@ -485,6 +587,7 @@ pub(crate) async fn spawn_thread_episodic_workspace_capsule_refill_for_workspace
 async fn run_thread_episodic_workspace_capsule_refill(
     crud_store: Arc<CrudStore>,
     thread_episodic_indexing_enabled: bool,
+    executor_config: ThreadEpisodicIndexExecutorConfig,
     thread_episodic_storage_root: PathBuf,
     thread_episodic_vector_search_config: GatewayThreadEpisodicVectorSearchConfig,
     thread_episodic_workspace_vector_search_configs: BTreeMap<
@@ -495,13 +598,13 @@ async fn run_thread_episodic_workspace_capsule_refill(
     runtime_home: PathBuf,
     refill_status_sender: Option<ThreadEpisodicWorkspaceCapsuleRefillStatusSender>,
     refill_supervisor: Arc<ThreadEpisodicWorkspaceRefillSupervisor>,
-    interrupted_before_unix: Option<i64>,
     owner: RefillOwner,
     cancellation: CancellationToken,
 ) {
     thread_episodic_workspace_capsule_refill::run(
         crud_store,
         thread_episodic_indexing_enabled,
+        executor_config,
         thread_episodic_storage_root,
         thread_episodic_vector_search_config,
         thread_episodic_workspace_vector_search_configs,
@@ -509,7 +612,6 @@ async fn run_thread_episodic_workspace_capsule_refill(
         runtime_home,
         refill_status_sender,
         refill_supervisor,
-        interrupted_before_unix,
         owner,
         cancellation,
     )
@@ -519,6 +621,7 @@ async fn run_thread_episodic_workspace_capsule_refill(
 async fn run_thread_episodic_workspace_capsule_refill_for_workspace(
     crud_store: Arc<CrudStore>,
     thread_episodic_indexing_enabled: bool,
+    executor_config: ThreadEpisodicIndexExecutorConfig,
     thread_episodic_storage_root: PathBuf,
     workspace_id: String,
     workspace_vector_search_config: GatewayThreadEpisodicVectorSearchConfig,
@@ -535,6 +638,7 @@ async fn run_thread_episodic_workspace_capsule_refill_for_workspace(
     thread_episodic_workspace_capsule_refill::run_workspace(
         crud_store,
         thread_episodic_indexing_enabled,
+        executor_config,
         thread_episodic_storage_root,
         workspace_id,
         workspace_vector_search_config,
@@ -543,7 +647,6 @@ async fn run_thread_episodic_workspace_capsule_refill_for_workspace(
         provider_registry,
         runtime_home,
         refill_status_sender,
-        None,
         cancellation,
     )
     .await;

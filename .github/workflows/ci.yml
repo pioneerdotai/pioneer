@@ -15,7 +15,7 @@ jobs:
   lint-test-build:
     name: ci-${{ matrix.os }}-${{ matrix.target }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 120
+    timeout-minutes: ${{ matrix.timeout_minutes }}
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
       CARGO_BUILD_JOBS: 2
@@ -26,12 +26,16 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             run_tests: "true"
+            # Include cold workspace compilation and the complete test suite.
+            timeout_minutes: 180
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             run_tests: "false"
+            timeout_minutes: 120
           - os: macos-14
             target: aarch64-apple-darwin
             run_tests: "false"
+            timeout_minutes: 120
 
     steps:
       - uses: actions/checkout@v5
@@ -58,11 +62,19 @@ jobs:
 
       - name: install-linux-build-dependencies
         if: matrix.os == 'ubuntu-latest'
+        timeout-minutes: 10
         shell: bash
         run: |
           set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y \
+          # Keep the runner's official Ubuntu fallbacks; its Azure mirror stalled CI.
+          sudo sed -i '/azure\.archive\.ubuntu\.com/d' /etc/apt/apt-mirrors.txt
+          apt_options=(
+            -o Acquire::Retries=3
+            -o Acquire::http::Timeout=30
+            -o Acquire::https::Timeout=30
+          )
+          sudo apt-get "${apt_options[@]}" -o APT::Update::Error-Mode=any update
+          sudo apt-get "${apt_options[@]}" install -y \
             pkg-config \
             libasound2-dev \
             libegl1-mesa-dev \
@@ -88,9 +100,19 @@ jobs:
           set -euo pipefail
           cargo check --locked --workspace
 
+      - name: cargo-test-pr-regressions
+        if: matrix.run_tests == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p pioneer-gateway --lib failed_snapshot_update_keeps_live_roots_and_root_failure_is_isolated -- --nocapture
+          cargo test --locked -p pioneer-gateway --lib cli_native_terminal_consumer_acks_delivery_and_retains_ownership_after_publisher_cancel -- --nocapture
+          cargo test --locked -p pioneer-gateway --lib refill_confirmed_prefix_survives_poison_and_unknown_commit_without_replay -- --nocapture
+          cargo test --locked -p pioneer-gateway --lib thread_episodic -- --nocapture
+
       - name: cargo-test-workspace
         if: matrix.run_tests == 'true'
         shell: bash
         run: |
           set -euo pipefail
-          cargo test --locked
+          cargo test --locked -- --nocapture

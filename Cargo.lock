@@ -9801,6 +9801,7 @@ name = "pioneer-gateway"
 version = "0.56.0"
 dependencies = [
  "anyhow",
+ "async-stream",
  "async-trait",
  "axum",
  "base64 0.23.1",
@@ -9818,6 +9819,7 @@ dependencies = [
  "markdown",
  "memvid-core",
  "mime_guess",
+ "notify 8.2.0",
  "pioneer-agent",
  "pioneer-artifacts",
  "pioneer-cli-agent-runtime",
@@ -9849,6 +9851,7 @@ dependencies = [
  "schemars 1.2.2",
  "sea-orm",
  "sentry",
+ "same-file",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -10093,6 +10096,7 @@ dependencies = [
  "anyhow",
  "hex",
  "icu_collator",
+ "libc",
  "pioneer-protocol",
  "serde",
  "serde_json",

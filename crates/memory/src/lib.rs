@@ -86,9 +86,11 @@ pub use thread_episodic::{
     ThreadEpisodicMemvidSearchOutput, ThreadEpisodicMemvidSearchRequest,
     ThreadEpisodicMemvidSearchSegment, ThreadEpisodicMemvidStats, ThreadEpisodicRankedSearchHit,
     ThreadEpisodicRankingContext, ThreadEpisodicSearchDiagnostics, ThreadEpisodicSearchProfile,
-    ThreadEpisodicSearchProfileKind, filter_thread_episodic_search_candidates,
-    rank_thread_episodic_search_hits, thread_episodic_memvid_metadata,
-    thread_episodic_storage_uri_from_path,
+    ThreadEpisodicSearchProfileKind, ThreadEpisodicWorkspaceOwnership,
+    filter_thread_episodic_search_candidates, lock_thread_episodic_workspace,
+    rank_thread_episodic_search_hits, remove_thread_episodic_capsule_file,
+    thread_episodic_memvid_metadata, thread_episodic_storage_uri_from_path,
+    thread_episodic_workspace_releases, try_lock_thread_episodic_workspace,
 };
 pub use thread_episodic_embedding::{
     ThreadEpisodicEmbeddingDiagnostic, ThreadEpisodicEmbeddingError,
