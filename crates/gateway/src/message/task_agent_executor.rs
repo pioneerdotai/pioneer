@@ -6832,41 +6832,51 @@ async fn load_task_execution_conversation_scope(
             .get_task_run_conversation_snapshot(retry_of_run_id)
             .await?
     {
-        restore_task_run_conversation_snapshot(
-            &history_store,
-            &snapshot,
-            task,
-            parent,
-            source_turn_id,
-            execution_thread_id,
-        )
-        .await?;
-        let persisted = processor
-            .crud_store
-            .insert_task_run_conversation_snapshot_if_absent(
-                pioneer_crud::NewTaskRunConversationSnapshot {
-                    run_id: run.id.clone(),
-                    task_id: task.id.clone(),
-                    workspace_id: task.workspace_id.clone(),
-                    conversation_thread_id: parent.parent_thread_id.clone(),
-                    source_turn_id: source_turn_id.map(str::to_owned),
-                    // Retain the accepted snapshot descriptor verbatim across
-                    // retries; materialization must never create a new history.
-                    history_json: snapshot.history_json.clone(),
-                    created_at: chrono::Utc::now().fixed_offset(),
-                },
+        let retry_use = history_store
+            .compaction_pin_task_snapshot(&snapshot)
+            .await?;
+        let result = async {
+            restore_task_run_conversation_snapshot(
+                &history_store,
+                &snapshot,
+                task,
+                parent,
+                source_turn_id,
+                execution_thread_id,
             )
             .await?;
-        let projection = restore_task_run_conversation_snapshot(
-            &history_store,
-            &persisted,
-            task,
-            parent,
-            source_turn_id,
-            execution_thread_id,
-        )
-        .await?;
-        return Ok((expected_hook_context, projection.messages));
+            let persisted = processor
+                .crud_store
+                .insert_task_run_conversation_snapshot_if_absent(
+                    pioneer_crud::NewTaskRunConversationSnapshot {
+                        run_id: run.id.clone(),
+                        task_id: task.id.clone(),
+                        workspace_id: task.workspace_id.clone(),
+                        conversation_thread_id: parent.parent_thread_id.clone(),
+                        source_turn_id: source_turn_id.map(str::to_owned),
+                        // Retain the accepted snapshot descriptor verbatim across
+                        // retries; materialization must never create a new history.
+                        history_json: snapshot.history_json.clone(),
+                        created_at: chrono::Utc::now().fixed_offset(),
+                    },
+                )
+                .await?;
+            let projection = restore_task_run_conversation_snapshot(
+                &history_store,
+                &persisted,
+                task,
+                parent,
+                source_turn_id,
+                execution_thread_id,
+            )
+            .await?;
+            Ok((expected_hook_context, projection.messages))
+        }
+        .await;
+        return match retry_use {
+            Some(guard) => guard.complete(result).await,
+            None => result,
+        };
     }
     let composer = task
         .metadata
@@ -6962,22 +6972,25 @@ where
     B: FnOnce() -> F,
     F: std::future::Future<Output = Result<()>>,
 {
-    let history_json = serde_json::to_string(&prepared_history.descriptor)?;
-    before_insert().await?;
-    let persisted = store
-        .insert_task_run_conversation_snapshot_if_absent(
-            pioneer_crud::NewTaskRunConversationSnapshot {
-                run_id: run_id.to_owned(),
-                task_id: task_id.to_owned(),
-                workspace_id: workspace.to_owned(),
-                conversation_thread_id: conversation_thread.to_owned(),
-                source_turn_id: source_turn_id.map(str::to_owned),
-                history_json: history_json.clone(),
-                created_at: chrono::Utc::now().fixed_offset(),
-            },
-        )
-        .await?;
-    let history = select_accepted_task_snapshot(
+    let mut winner_use = None;
+    let result = async {
+        let history_json = serde_json::to_string(&prepared_history.descriptor)?;
+        before_insert().await?;
+        let persisted = store
+            .insert_task_run_conversation_snapshot_if_absent(
+                pioneer_crud::NewTaskRunConversationSnapshot {
+                    run_id: run_id.to_owned(),
+                    task_id: task_id.to_owned(),
+                    workspace_id: workspace.to_owned(),
+                    conversation_thread_id: conversation_thread.to_owned(),
+                    source_turn_id: source_turn_id.map(str::to_owned),
+                    history_json: history_json.clone(),
+                    created_at: chrono::Utc::now().fixed_offset(),
+                },
+            )
+            .await?;
+        winner_use = store.compaction_pin_task_snapshot(&persisted).await?;
+        let history = select_accepted_task_snapshot(
         &persisted.history_json,
         &history_json,
         async {
@@ -7029,14 +7042,21 @@ where
         },
     )
     .await?;
-    let descriptor = serde_json::from_str(&persisted.history_json)?;
-    let direct_sources = crate::compaction::frozen::frozen_history_direct_sources(
-        history_store,
-        workspace,
-        &descriptor,
-    )
-    .await?;
-    Ok((history, persisted.history_json, direct_sources))
+        let descriptor = serde_json::from_str(&persisted.history_json)?;
+        let direct_sources = crate::compaction::frozen::frozen_history_direct_sources(
+            history_store,
+            workspace,
+            &descriptor,
+        )
+        .await?;
+        Ok((history, persisted.history_json, direct_sources))
+    }
+    .await;
+    let result = match winner_use {
+        Some(guard) => guard.complete(result).await,
+        None => result,
+    };
+    prepared_history.guard.complete(result).await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -7049,38 +7069,46 @@ async fn restore_task_run_conversation_snapshot_literal_fields(
     source_turn_id: Option<&str>,
     execution_thread_id: &str,
 ) -> Result<Vec<pioneer_provider::ChatMessage>> {
-    ensure_task_run_snapshot_identity_fields(
-        snapshot,
-        task_id,
-        workspace,
-        conversation_thread,
-        source_turn_id,
-    )?;
-    let allowed = crate::compaction::frozen::accepted_history_scopes(
-        store,
-        &snapshot.workspace_id,
-        &snapshot.conversation_thread_id,
-        &snapshot.history_json,
-    )
-    .await?;
-    let mut history = crate::turn_runtime_snapshot::restore_history_json(
-        store,
-        &snapshot.workspace_id,
-        &allowed,
-        &snapshot.history_json,
-    )
-    .await
-    .context("failed to restore accepted concurrent Task snapshot")?;
-    crate::compaction::frozen::hydrate_accepted_own_literal(
-        store,
-        &snapshot.workspace_id,
-        &snapshot.conversation_thread_id,
-        &snapshot.history_json,
-        execution_thread_id,
-        &mut history,
-    )
-    .await?;
-    Ok(history)
+    let carrier_use = store.compaction_pin_task_snapshot(snapshot).await?;
+    let result = async {
+        ensure_task_run_snapshot_identity_fields(
+            snapshot,
+            task_id,
+            workspace,
+            conversation_thread,
+            source_turn_id,
+        )?;
+        let allowed = crate::compaction::frozen::accepted_history_scopes(
+            store,
+            &snapshot.workspace_id,
+            &snapshot.conversation_thread_id,
+            &snapshot.history_json,
+        )
+        .await?;
+        let mut history = crate::turn_runtime_snapshot::restore_history_json(
+            store,
+            &snapshot.workspace_id,
+            &allowed,
+            &snapshot.history_json,
+        )
+        .await
+        .context("failed to restore accepted concurrent Task snapshot")?;
+        crate::compaction::frozen::hydrate_accepted_own_literal(
+            store,
+            &snapshot.workspace_id,
+            &snapshot.conversation_thread_id,
+            &snapshot.history_json,
+            execution_thread_id,
+            &mut history,
+        )
+        .await?;
+        Ok(history)
+    }
+    .await;
+    match carrier_use {
+        Some(guard) => guard.complete(result).await,
+        None => result,
+    }
 }
 
 async fn select_accepted_task_snapshot<P, R>(
@@ -7190,6 +7218,10 @@ mod prepared_snapshot_tests {
         .await
         .unwrap();
         crate::compaction::frozen::PreparedHistory {
+            guard: store
+                .compaction_acquire_frozen_use(workspace, &descriptor, Some("parent"))
+                .await
+                .unwrap(),
             descriptor,
             messages,
             accepted_scopes: BTreeSet::from(["parent".to_owned()]),
@@ -7299,6 +7331,7 @@ mod prepared_snapshot_tests {
             .unwrap();
         assert_eq!(persisted.history_json, winner_json);
         assert_eq!(persisted.task_id, "race-task");
+        winner.guard.close().await.unwrap();
     }
 
     #[tokio::test]
@@ -7434,7 +7467,7 @@ mod prepared_snapshot_tests {
             messages: references.len() as u64,
             identity_sha256,
         };
-        store
+        let legacy_capture = store
             .compaction_begin_frozen_history_with_imports(
                 "race-legacy-ws",
                 "parent",
@@ -7460,6 +7493,8 @@ mod prepared_snapshot_tests {
                 .await
                 .unwrap()
         );
+        winner.guard.close().await.unwrap();
+        winner.guard = legacy_capture;
         let winner_json = serde_json::to_string(&winner.descriptor).unwrap();
 
         // Model the already published legacy import metadata. Production
@@ -7823,6 +7858,8 @@ mod prepared_snapshot_tests {
                 .iter()
                 .all(|message| !message.content.contains("Thread status changed"))
         );
+        winner.guard.close().await.unwrap();
+        b.guard.close().await.unwrap();
     }
 }
 
@@ -7856,30 +7893,38 @@ async fn restore_task_run_conversation_snapshot_fields(
     source_turn_id: Option<&str>,
     execution_thread_id: &str,
 ) -> Result<crate::compaction::frozen::RestoredAcceptedHistory> {
-    ensure_task_run_snapshot_identity_fields(
-        snapshot,
-        task_id,
-        workspace,
-        conversation_thread,
-        source_turn_id,
-    )?;
-    let allowed = crate::compaction::frozen::accepted_history_scopes(
-        store,
-        &snapshot.workspace_id,
-        &snapshot.conversation_thread_id,
-        &snapshot.history_json,
-    )
-    .await?;
-    crate::compaction::frozen::restore_accepted_history_for_execution(
-        store,
-        &snapshot.workspace_id,
-        Some(&snapshot.conversation_thread_id),
-        execution_thread_id,
-        &allowed,
-        &snapshot.history_json,
-    )
-    .await
-    .context("failed to restore frozen Task conversation history")
+    let carrier_use = store.compaction_pin_task_snapshot(snapshot).await?;
+    let result = async {
+        ensure_task_run_snapshot_identity_fields(
+            snapshot,
+            task_id,
+            workspace,
+            conversation_thread,
+            source_turn_id,
+        )?;
+        let allowed = crate::compaction::frozen::accepted_history_scopes(
+            store,
+            &snapshot.workspace_id,
+            &snapshot.conversation_thread_id,
+            &snapshot.history_json,
+        )
+        .await?;
+        crate::compaction::frozen::restore_accepted_history_for_execution(
+            store,
+            &snapshot.workspace_id,
+            Some(&snapshot.conversation_thread_id),
+            execution_thread_id,
+            &allowed,
+            &snapshot.history_json,
+        )
+        .await
+        .context("failed to restore frozen Task conversation history")
+    }
+    .await;
+    match carrier_use {
+        Some(guard) => guard.complete(result).await,
+        None => result,
+    }
 }
 
 fn ensure_task_run_snapshot_identity_fields(

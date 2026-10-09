@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskRunConversationSnapshotSeed {
+    pub frozen_use: Option<pioneer_crud::FrozenUseGuard>,
     pub conversation_thread_id: String,
     pub source_turn_id: Option<String>,
     pub history_json: String,
@@ -78,6 +79,19 @@ pub struct TaskCreateContext {
     /// Gateway adapter. Task Service never derives or edits this actor-bound
     /// receipt; CRUD commits it with the Task aggregate.
     pub agent_action_commit: Option<pioneer_crud::AgentCommitInput>,
+}
+
+impl TaskCreateContext {
+    pub async fn close_frozen_use(&mut self) -> anyhow::Result<()> {
+        if let Some(guard) = self
+            .conversation_snapshot
+            .as_mut()
+            .and_then(|seed| seed.frozen_use.take())
+        {
+            guard.close().await?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Default)]

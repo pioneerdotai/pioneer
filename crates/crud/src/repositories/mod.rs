@@ -124,3 +124,17 @@ pub(crate) mod task_event_fanout;
 pub(crate) mod task_run_occurrence_reconcile;
 
 pub(crate) mod task_occurrence_reconcile;
+
+pub(crate) mod compaction_frozen_use;
+
+pub(crate) mod compaction_frozen_verify;
+
+pub(crate) mod compaction_frozen_root;
+
+pub(crate) mod compaction_checkpoint_proof;
+
+pub(crate) mod compaction_frozen_maintenance;
+
+pub(crate) mod compaction_frozen_reclaim;
+
+pub(crate) mod compaction_frozen_cleanup;

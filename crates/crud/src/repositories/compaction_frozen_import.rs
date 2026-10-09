@@ -14,7 +14,7 @@ use pioneer_entity::{
     compaction_frozen_import_data, compaction_task_output, task_delivery, turn_event,
 };
 use sea_orm::sea_query::{Alias, BinOper, Expr, ExprTrait, JoinType, OnConflict};
-use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect};
+use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QuerySelect};
 use sea_orm::{ConnectionTrait, TransactionTrait};
 use sha2::{Digest, Sha256};
 
@@ -116,6 +116,7 @@ pub struct DeliveryCheckpointImportSource {
 /// Fields are private: callers cannot mint an own claim from a delivery ID.
 #[derive(Clone, Debug)]
 pub struct PreparedFrozenImport {
+    frozen_use: crate::FrozenUseGuard,
     workspace: String,
     destination: String,
     output_digest: String,
@@ -141,6 +142,12 @@ struct AcceptedImportBasis {
     proof_json: String,
 }
 impl PreparedFrozenImport {
+    pub async fn complete<T>(self, result: Result<T>) -> Result<T> {
+        self.frozen_use.complete(result).await
+    }
+    pub async fn close(self) -> Result<()> {
+        self.frozen_use.close().await
+    }
     pub fn source(&self) -> &SourceRef {
         &self.record.source
     }
@@ -189,160 +196,176 @@ pub(crate) async fn compaction_prepare_frozen_import(
         .compaction_delivery_output(workspace, delivery)
         .await?
         .ok_or_else(|| anyhow::anyhow!("accepted output binding is unavailable"))?;
-    let acknowledged = task_delivery::Entity::find_by_id(delivery)
-        .select_only()
-        .column(task_delivery::Column::Id)
-        .join(
-            JoinType::InnerJoin,
-            task_delivery::Entity::belongs_to(turn_event::Entity)
-                .from(task_delivery::Column::DeliveredTurnId)
-                .to(turn_event::Column::TurnId)
-                .into(),
-        )
-        .join(
-            JoinType::InnerJoin,
-            turn_event::Entity::belongs_to(compaction_event_revision::Entity)
-                .from(turn_event::Column::Id)
-                .to(compaction_event_revision::Column::SourceId)
-                .into(),
-        )
-        .filter(task_delivery::Column::WorkspaceId.eq(workspace))
-        .filter(task_delivery::Column::TargetThreadId.eq(destination))
-        .filter(task_delivery::Column::Status.eq("delivered"))
-        .filter(
-            Expr::col((turn_event::Entity, turn_event::Column::ThreadId)).eq(Expr::col((
-                task_delivery::Entity,
-                task_delivery::Column::TargetThreadId,
-            ))),
-        )
-        .filter(
-            Expr::col((
-                compaction_event_revision::Entity,
-                compaction_event_revision::Column::TurnId,
-            ))
-            .eq(Expr::col((turn_event::Entity, turn_event::Column::TurnId))),
-        )
-        .filter(compaction_event_revision::Column::Present.eq(1_i64))
-        .filter(
-            Expr::col((
-                compaction_event_revision::Entity,
-                compaction_event_revision::Column::ProjectionRevision,
-            ))
-            .eq(Expr::col((
-                compaction_event_revision::Entity,
-                compaction_event_revision::Column::Revision,
-            ))),
-        )
-        .filter(turn_event::Column::Id.eq(acknowledgement.id.clone()))
-        .filter(
-            Expr::val("event:")
-                .binary(
-                    BinOper::Custom("||"),
-                    Expr::col((turn_event::Entity, turn_event::Column::TurnId)),
-                )
-                .eq(acknowledgement.scope.clone()),
-        )
-        .filter(
-            Expr::val("event-revision:")
-                .binary(
-                    BinOper::Custom("||"),
-                    Expr::col((
-                        compaction_event_revision::Entity,
-                        compaction_event_revision::Column::Revision,
-                    )),
-                )
-                .eq(acknowledgement.version.clone()),
-        )
-        .filter(
-            turn_event::Column::EventType.eq(pioneer_protocol::constants::events::ITEM_COMPLETED),
-        )
-        .filter(
-            compaction_event_revision::Column::ItemId
-                .eq(pioneer_protocol::task_delivery_result_item_id(delivery)),
-        )
-        .into_tuple::<String>()
-        .one(&store.connection)
-        .await?
-        .is_some();
-    ensure!(
-        acknowledged,
-        "output has no exact acknowledged destination binding"
-    );
-    let original_json = compaction_frozen_message::Entity::find()
-        .inner_join(compaction_frozen_history::Entity)
-        .select_only()
-        .column(compaction_frozen_message::Column::ReferenceJson)
-        .filter(
-            compaction_frozen_history::Column::Id.eq(snapshot.output.history.manifest_id.clone()),
-        )
-        .filter(compaction_frozen_history::Column::WorkspaceId.eq(workspace))
-        .filter(
-            compaction_frozen_history::Column::OwnerThread
-                .eq(snapshot.output.source_thread.clone()),
-        )
-        .filter(compaction_frozen_history::Column::Ready.eq(1_i64))
-        .filter(
-            compaction_frozen_history::Column::IdentitySha256.eq(snapshot
-                .output
-                .history
-                .identity_sha256
-                .clone()),
-        )
-        .filter(compaction_frozen_message::Column::Ordinal.eq(i64::try_from(output_ordinal)?))
-        .filter(compaction_frozen_message::Column::Bytes.lte(SOURCE_PAGE_BYTES as i64))
-        .into_tuple::<String>()
-        .one(&store.connection)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("output origin reference is unavailable"))?;
-    let original: FrozenMessageRef = serde_json::from_str(&original_json)?;
-    original.validate()?;
-    ensure!(
-        !original.inherited
-            && original.complete
-            && !original.protected_input
-            && original
-                .context_thread
-                .as_deref()
-                .unwrap_or(&original.source_thread)
-                == snapshot.output.source_thread,
-        "inherited or unfinished work cannot become accepted own work"
-    );
-    // An independently published summary is the imported source, not a grant
-    // to extract arbitrary raw leaves from its historical coverage. Direct raw
-    // references remain exact-current.
-    let mut found = false;
-    for reference in &original.sources {
-        let thread = store
-            .compaction_reference_thread(workspace, reference)
+    let guard = store
+        .compaction_pin_delivery_output(workspace, &snapshot)
+        .await?;
+    let result = async {
+        let acknowledged = task_delivery::Entity::find_by_id(delivery)
+            .select_only()
+            .column(task_delivery::Column::Id)
+            .join(
+                JoinType::InnerJoin,
+                task_delivery::Entity::belongs_to(turn_event::Entity)
+                    .from(task_delivery::Column::DeliveredTurnId)
+                    .to(turn_event::Column::TurnId)
+                    .into(),
+            )
+            .join(
+                JoinType::InnerJoin,
+                turn_event::Entity::belongs_to(compaction_event_revision::Entity)
+                    .from(turn_event::Column::Id)
+                    .to(compaction_event_revision::Column::SourceId)
+                    .into(),
+            )
+            .filter(task_delivery::Column::WorkspaceId.eq(workspace))
+            .filter(task_delivery::Column::TargetThreadId.eq(destination))
+            .filter(task_delivery::Column::Status.eq("delivered"))
+            .filter(
+                Expr::col((turn_event::Entity, turn_event::Column::ThreadId)).eq(Expr::col((
+                    task_delivery::Entity,
+                    task_delivery::Column::TargetThreadId,
+                ))),
+            )
+            .filter(
+                Expr::col((
+                    compaction_event_revision::Entity,
+                    compaction_event_revision::Column::TurnId,
+                ))
+                .eq(Expr::col((turn_event::Entity, turn_event::Column::TurnId))),
+            )
+            .filter(compaction_event_revision::Column::Present.eq(1_i64))
+            .filter(
+                Expr::col((
+                    compaction_event_revision::Entity,
+                    compaction_event_revision::Column::ProjectionRevision,
+                ))
+                .eq(Expr::col((
+                    compaction_event_revision::Entity,
+                    compaction_event_revision::Column::Revision,
+                ))),
+            )
+            .filter(turn_event::Column::Id.eq(acknowledgement.id.clone()))
+            .filter(
+                Expr::val("event:")
+                    .binary(
+                        BinOper::Custom("||"),
+                        Expr::col((turn_event::Entity, turn_event::Column::TurnId)),
+                    )
+                    .eq(acknowledgement.scope.clone()),
+            )
+            .filter(
+                Expr::val("event-revision:")
+                    .binary(
+                        BinOper::Custom("||"),
+                        Expr::col((
+                            compaction_event_revision::Entity,
+                            compaction_event_revision::Column::Revision,
+                        )),
+                    )
+                    .eq(acknowledgement.version.clone()),
+            )
+            .filter(
+                turn_event::Column::EventType
+                    .eq(pioneer_protocol::constants::events::ITEM_COMPLETED),
+            )
+            .filter(
+                compaction_event_revision::Column::ItemId
+                    .eq(pioneer_protocol::task_delivery_result_item_id(delivery)),
+            )
+            .into_tuple::<String>()
+            .one(&store.connection)
             .await?
-            .ok_or_else(|| anyhow::anyhow!("output source changed"))?;
+            .is_some();
         ensure!(
-            thread == original.source_thread,
-            "output source changed ownership"
+            acknowledged,
+            "output has no exact acknowledged destination binding"
         );
-        if reference == source && thread == source_thread {
-            found = true;
+        guard.validate().await?;
+        let original_json = compaction_frozen_message::Entity::find()
+            .inner_join(compaction_frozen_history::Entity)
+            .select_only()
+            .column(compaction_frozen_message::Column::ReferenceJson)
+            .filter(
+                compaction_frozen_history::Column::Id.eq(snapshot
+                    .output
+                    .history
+                    .manifest_id
+                    .clone()),
+            )
+            .filter(compaction_frozen_history::Column::WorkspaceId.eq(workspace))
+            .filter(
+                compaction_frozen_history::Column::OwnerThread
+                    .eq(snapshot.output.source_thread.clone()),
+            )
+            .filter(compaction_frozen_history::Column::Ready.eq(1_i64))
+            .filter(compaction_frozen_history::Column::Availability.eq("resident"))
+            .filter(
+                compaction_frozen_history::Column::IdentitySha256.eq(snapshot
+                    .output
+                    .history
+                    .identity_sha256
+                    .clone()),
+            )
+            .filter(compaction_frozen_message::Column::Ordinal.eq(i64::try_from(output_ordinal)?))
+            .filter(compaction_frozen_message::Column::Bytes.lte(SOURCE_PAGE_BYTES as i64))
+            .into_tuple::<String>()
+            .one(&store.connection)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("output origin reference is unavailable"))?;
+        guard.validate().await?;
+        let original: FrozenMessageRef = serde_json::from_str(&original_json)?;
+        original.validate()?;
+        ensure!(
+            !original.inherited
+                && original.complete
+                && !original.protected_input
+                && original
+                    .context_thread
+                    .as_deref()
+                    .unwrap_or(&original.source_thread)
+                    == snapshot.output.source_thread,
+            "inherited or unfinished work cannot become accepted own work"
+        );
+        // An independently published summary is the imported source, not a grant
+        // to extract arbitrary raw leaves from its historical coverage. Direct raw
+        // references remain exact-current.
+        let mut found = false;
+        for reference in &original.sources {
+            let thread = store
+                .compaction_reference_thread(workspace, reference)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("output source changed"))?;
+            ensure!(
+                thread == original.source_thread,
+                "output source changed ownership"
+            );
+            if reference == source && thread == source_thread {
+                found = true;
+            }
         }
+        ensure!(found, "source is outside the accepted own output message");
+        Ok(PreparedFrozenImport {
+            frozen_use: guard.clone(),
+            workspace: workspace.into(),
+            destination: destination.into(),
+            accepted_basis: None,
+            target_checkpoint: None,
+            output_digest: snapshot.output.history.identity_sha256,
+            original_json,
+            record: FrozenImportRecord {
+                message_ordinal: 0,
+                source_thread: source_thread.into(),
+                source: source.clone(),
+                delivery_id: delivery.into(),
+                candidate_id: snapshot.candidate_id,
+                output_manifest: snapshot.output.history.manifest_id,
+                output_ordinal,
+                acknowledgement: acknowledgement.clone(),
+            },
+        })
     }
-    ensure!(found, "source is outside the accepted own output message");
-    Ok(PreparedFrozenImport {
-        workspace: workspace.into(),
-        destination: destination.into(),
-        accepted_basis: None,
-        target_checkpoint: None,
-        output_digest: snapshot.output.history.identity_sha256,
-        original_json,
-        record: FrozenImportRecord {
-            message_ordinal: 0,
-            source_thread: source_thread.into(),
-            source: source.clone(),
-            delivery_id: delivery.into(),
-            candidate_id: snapshot.candidate_id,
-            output_manifest: snapshot.output.history.manifest_id,
-            output_ordinal,
-            acknowledgement: acknowledgement.clone(),
-        },
-    })
+    .await;
+    guard.complete(result).await
 }
 
 /// Attach exact immutable grants from one delivered Task output to the
@@ -383,46 +406,59 @@ pub(crate) async fn compaction_prepare_delivery_checkpoint_imports(
         "delivery checkpoint imports are duplicated"
     );
     let mut prepared = Vec::with_capacity(sources.len());
-    for source in sources {
-        prepared.push(
-            compaction_prepare_frozen_import(
+    let result = async {
+        for source in sources {
+            prepared.push(
+                compaction_prepare_frozen_import(
+                    store,
+                    workspace,
+                    destination,
+                    delivery,
+                    acknowledgement,
+                    source.output_ordinal,
+                    &source.source_thread,
+                    &source.source,
+                )
+                .await?,
+            );
+        }
+        let wanted = prepared
+            .iter()
+            .map(|import| {
+                (
+                    import.record.source_thread.clone(),
+                    import.record.source.clone(),
+                )
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        ensure!(
+            checkpoint_historically_contains(
                 store,
                 workspace,
-                destination,
-                delivery,
-                acknowledgement,
-                source.output_ordinal,
-                &source.source_thread,
-                &source.source,
+                checkpoint_thread,
+                checkpoint,
+                &wanted,
+                true,
             )
             .await?,
+            "delivery checkpoint exceeds its accepted output grants"
         );
+        for import in &mut prepared {
+            import.target_checkpoint = Some((checkpoint_thread.into(), checkpoint.clone()));
+        }
+        Ok(())
     }
-    let wanted = prepared
-        .iter()
-        .map(|import| {
-            (
-                import.record.source_thread.clone(),
-                import.record.source.clone(),
-            )
-        })
-        .collect::<std::collections::BTreeSet<_>>();
-    ensure!(
-        checkpoint_historically_contains(
-            store,
-            workspace,
-            checkpoint_thread,
-            checkpoint,
-            &wanted,
-            true,
-        )
-        .await?,
-        "delivery checkpoint exceeds its accepted output grants"
-    );
-    for import in &mut prepared {
-        import.target_checkpoint = Some((checkpoint_thread.into(), checkpoint.clone()));
+    .await;
+    match result {
+        Ok(()) => Ok(prepared),
+        Err(error) => {
+            let mut result = Err(error);
+            for import in prepared {
+                result = import.complete(result).await;
+            }
+            result
+        }
     }
-    Ok(prepared)
 }
 
 /// Forward only evidence from the exact TaskRun basis accepted by this child.
@@ -437,11 +473,18 @@ pub(crate) async fn compaction_prepare_accepted_import(
     ordinal: u64,
 ) -> Result<PreparedFrozenImport> {
     let prepared = prepare_accepted_import(store, workspace, destination, turn, ordinal).await?;
-    ensure!(
-        accepted_import_current(&store.connection, &prepared).await?,
-        "accepted import binding changed"
-    );
-    Ok(prepared)
+    let validation = async {
+        ensure!(
+            accepted_import_current(&store.connection, &prepared).await?,
+            "accepted import binding changed"
+        );
+        Ok(())
+    }
+    .await;
+    match validation {
+        Ok(()) => Ok(prepared),
+        Err(error) => prepared.complete(Err(error)).await,
+    }
 }
 
 /// Carry an immutable accepted raw grant onto the checkpoint that replaces it.
@@ -495,39 +538,54 @@ pub(crate) async fn compaction_prepare_accepted_checkpoint_imports(
         "checkpoint import ordinals are duplicated"
     );
     let mut prepared = Vec::with_capacity(ordinals.len());
-    for ordinal in ordinals {
-        let import = prepare_accepted_import(store, workspace, destination, turn, *ordinal).await?;
+    let result = async {
+        for ordinal in ordinals {
+            let import =
+                prepare_accepted_import(store, workspace, destination, turn, *ordinal).await?;
+            prepared.push(import);
+            ensure!(
+                accepted_import_binding_current(&store.connection, prepared.last().unwrap())
+                    .await?,
+                "accepted checkpoint replacement binding changed"
+            );
+        }
+        let wanted = prepared
+            .iter()
+            .map(|import| {
+                (
+                    import.record.source_thread.clone(),
+                    import.record.source.clone(),
+                )
+            })
+            .collect::<std::collections::BTreeSet<_>>();
         ensure!(
-            accepted_import_binding_current(&store.connection, &import).await?,
+            checkpoint_historically_contains(
+                store,
+                workspace,
+                checkpoint_thread,
+                checkpoint,
+                &wanted,
+                false,
+            )
+            .await?,
             "accepted checkpoint replacement binding changed"
         );
-        prepared.push(import);
+        for import in &mut prepared {
+            import.target_checkpoint = Some((checkpoint_thread.into(), checkpoint.clone()));
+        }
+        Ok(())
     }
-    let wanted = prepared
-        .iter()
-        .map(|import| {
-            (
-                import.record.source_thread.clone(),
-                import.record.source.clone(),
-            )
-        })
-        .collect::<std::collections::BTreeSet<_>>();
-    ensure!(
-        checkpoint_historically_contains(
-            store,
-            workspace,
-            checkpoint_thread,
-            checkpoint,
-            &wanted,
-            false,
-        )
-        .await?,
-        "accepted checkpoint replacement binding changed"
-    );
-    for import in &mut prepared {
-        import.target_checkpoint = Some((checkpoint_thread.into(), checkpoint.clone()));
+    .await;
+    match result {
+        Ok(()) => Ok(prepared),
+        Err(error) => {
+            let mut result = Err(error);
+            for import in prepared {
+                result = import.complete(result).await;
+            }
+            result
+        }
     }
-    Ok(prepared)
 }
 
 async fn prepare_accepted_import(
@@ -543,43 +601,54 @@ async fn prepare_accepted_import(
         .ok_or_else(|| anyhow::anyhow!("accepted Task basis is unavailable"))?;
     let descriptor: pioneer_compaction::frozen::FrozenHistoryRef =
         serde_json::from_str(&basis.history_json)?;
-    let (import_count, imports_digest) = store
-        .compaction_frozen_import_state(workspace, &basis.parent_thread, &descriptor.manifest_id)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("accepted import manifest is not ready"))?;
-    ensure!(
-        ordinal < import_count,
-        "accepted import ordinal is outside the manifest"
-    );
-    let ordinal = i64::try_from(ordinal)?;
-    let proof_json =
-        compaction_frozen_import::Entity::find_by_id((descriptor.manifest_id.clone(), ordinal))
-            .select_only()
-            .column(compaction_frozen_import::Column::ProofJson)
-            .filter(compaction_frozen_import::Column::Bytes.lte(SOURCE_PAGE_BYTES as i64))
-            .into_tuple::<String>()
-            .one(&store.connection)
+    let guard = store
+        .compaction_pin_task_basis(workspace, destination, turn, &basis, &descriptor)
+        .await?;
+    let result = async {
+        let (import_count, imports_digest) = store
+            .compaction_frozen_import_state(
+                workspace,
+                &basis.parent_thread,
+                &descriptor.manifest_id,
+            )
             .await?
-            .ok_or_else(|| anyhow::anyhow!("accepted import is unavailable"))?;
-    let record: FrozenImportRecord = serde_json::from_str(&proof_json)?;
-    Ok(PreparedFrozenImport {
-        workspace: workspace.into(),
-        destination: destination.into(),
-        output_digest: String::new(),
-        original_json: String::new(),
-        record,
-        accepted_basis: Some(AcceptedImportBasis {
-            turn: turn.into(),
-            history_json: basis.history_json,
-            manifest: descriptor.manifest_id,
-            digest: descriptor.identity_sha256,
-            imports_digest,
-            import_count,
-            ordinal,
-            proof_json,
-        }),
-        target_checkpoint: None,
-    })
+            .ok_or_else(|| anyhow::anyhow!("accepted import manifest is not ready"))?;
+        ensure!(
+            ordinal < import_count,
+            "accepted import ordinal is outside the manifest"
+        );
+        let ordinal = i64::try_from(ordinal)?;
+        let proof_json =
+            super::compaction_frozen_verify::rows(&store.connection, &guard, 1, ordinal, true)
+                .await?
+                .into_iter()
+                .next()
+                .filter(|(actual, _)| *actual == ordinal)
+                .ok_or_else(|| anyhow::anyhow!("accepted import is unavailable"))?
+                .1;
+        let record: FrozenImportRecord = serde_json::from_str(&proof_json)?;
+        Ok(PreparedFrozenImport {
+            frozen_use: guard.clone(),
+            workspace: workspace.into(),
+            destination: destination.into(),
+            output_digest: String::new(),
+            original_json: String::new(),
+            record,
+            accepted_basis: Some(AcceptedImportBasis {
+                turn: turn.into(),
+                history_json: basis.history_json,
+                manifest: descriptor.manifest_id,
+                digest: descriptor.identity_sha256,
+                imports_digest,
+                import_count,
+                ordinal,
+                proof_json,
+            }),
+            target_checkpoint: None,
+        })
+    }
+    .await;
+    guard.complete(result).await
 }
 
 async fn accepted_import_current<C: ConnectionTrait>(
@@ -676,7 +745,7 @@ async fn checkpoint_historically_contains(
         ensure!(visiting.insert(key), "cyclic checkpoint coverage");
         #[cfg(any(test, feature = "test-support"))]
         observe_checkpoint_import_graph_read(store, workspace);
-        let edges = compaction_checkpoint_edges(&store.connection, &source.id)
+        let edges = compaction_checkpoint_edges(store, &source.id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("checkpoint coverage node disappeared"))?;
         ensure!(
@@ -691,7 +760,7 @@ async fn checkpoint_historically_contains(
         if let Some(previous) = edges.previous {
             #[cfg(any(test, feature = "test-support"))]
             observe_checkpoint_import_graph_read(store, workspace);
-            let previous_edges = compaction_checkpoint_edges(&store.connection, &previous)
+            let previous_edges = compaction_checkpoint_edges(store, &previous)
                 .await?
                 .ok_or_else(|| anyhow::anyhow!("previous checkpoint disappeared"))?;
             ensure!(
@@ -912,7 +981,13 @@ pub(crate) async fn compaction_append_frozen_imports(
     manifest: &str,
     start: u64,
     imports: &[(u64, PreparedFrozenImport)],
+    guard: &crate::FrozenUseGuard,
 ) -> Result<()> {
+    ensure!(
+        guard.workspace() == workspace && guard.owner() == owner && guard.header().id == manifest,
+        "frozen import use scope mismatch"
+    );
+    guard.validate_in(&store.connection, false).await?;
     ensure!(
         imports.len() as u64 <= SOURCE_PAGE_ROWS,
         "import batch row limit"
@@ -920,6 +995,8 @@ pub(crate) async fn compaction_append_frozen_imports(
     let mut batch = Vec::new();
     let mut bytes = 0;
     for (index, (message, prepared)) in imports.iter().enumerate() {
+        prepared.frozen_use.validate_store(store)?;
+        prepared.frozen_use.validate().await?;
         ensure!(
             prepared.workspace == workspace && prepared.destination == owner,
             "import preparation scope mismatch"
@@ -937,6 +1014,7 @@ pub(crate) async fn compaction_append_frozen_imports(
             .one(&store.connection)
             .await?
             .ok_or_else(|| anyhow::anyhow!("target reference is unavailable"))?;
+        guard.validate_in(&store.connection, false).await?;
         let target: FrozenMessageRef = serde_json::from_str(&target_json)?;
         target.validate()?;
         let target_matches =
@@ -979,6 +1057,10 @@ pub(crate) async fn compaction_append_frozen_imports(
         ));
     }
     let tx = store.connection.begin().await?;
+    for (_, prepared) in imports {
+        prepared.frozen_use.validate_in(&tx, true).await?;
+    }
+    guard.validate_in(&tx, false).await?;
     let row = compaction_frozen_history::Entity::find_by_id(manifest)
         .filter(compaction_frozen_history::Column::WorkspaceId.eq(workspace))
         .filter(compaction_frozen_history::Column::OwnerThread.eq(owner))
@@ -1435,6 +1517,7 @@ pub(crate) async fn compaction_append_frozen_imports(
             .exec(&tx)
             .await?;
     }
+    guard.validate_in(&tx, false).await?;
     tx.commit().await?;
     Ok(())
 }
@@ -1450,6 +1533,7 @@ pub(crate) async fn compaction_frozen_import_state<C: ConnectionTrait>(
         .filter(compaction_frozen_history::Column::WorkspaceId.eq(workspace))
         .filter(compaction_frozen_history::Column::OwnerThread.eq(owner))
         .filter(compaction_frozen_history::Column::Ready.eq(1_i64))
+        .filter(compaction_frozen_history::Column::Availability.eq("resident"))
         .filter(
             Expr::col(compaction_frozen_history::Column::ImportCount)
                 .eq(Expr::col(compaction_frozen_history::Column::NextImport)),
@@ -1460,57 +1544,23 @@ pub(crate) async fn compaction_frozen_import_state<C: ConnectionTrait>(
         .transpose()
 }
 
-pub(crate) async fn compaction_frozen_import_page<C: ConnectionTrait>(
-    db: &C,
-    workspace: &str,
-    owner: &str,
-    manifest: &str,
-    start: u64,
-) -> Result<Vec<FrozenImportRecord>> {
-    let scoped = compaction_frozen_import::Entity::find()
-        .inner_join(compaction_frozen_history::Entity)
-        .filter(compaction_frozen_history::Column::Id.eq(manifest))
-        .filter(compaction_frozen_history::Column::WorkspaceId.eq(workspace))
-        .filter(compaction_frozen_history::Column::OwnerThread.eq(owner))
-        .filter(compaction_frozen_history::Column::Ready.eq(1_i64))
-        .filter(compaction_frozen_import::Column::Ordinal.gte(i64::try_from(start)?));
-    let rows = scoped
-        .clone()
-        .select_only()
-        .column(compaction_frozen_import::Column::Ordinal)
-        .column(compaction_frozen_import::Column::Bytes)
-        .order_by_asc(compaction_frozen_import::Column::Ordinal)
-        .limit(128)
-        .into_tuple::<(i64, i64)>()
-        .all(db)
-        .await?;
-    let mut end = start;
-    let mut bytes = 0;
-    for (ordinal, size) in rows {
-        let size = usize::try_from(size)?;
-        ensure!(size <= SOURCE_PAGE_BYTES, "invalid import metadata size");
-        if bytes + size > SOURCE_PAGE_BYTES {
-            break;
-        }
-        ensure!(u64::try_from(ordinal)? == end, "import ordinal gap");
-        bytes += size;
-        end += 1;
-    }
-    let rows = scoped
-        .select_only()
-        .column(compaction_frozen_import::Column::ProofJson)
-        .filter(compaction_frozen_import::Column::Ordinal.lt(i64::try_from(end)?))
-        .order_by_asc(compaction_frozen_import::Column::Ordinal)
-        .into_tuple::<String>()
-        .all(db)
-        .await?;
-    rows.into_iter()
-        .map(|json| Ok(serde_json::from_str(&json)?))
-        .collect()
-}
-
 use super::compaction_live_sources;
 
 #[cfg(test)]
 #[path = "compaction_frozen_import_tests.rs"]
 mod tests;
+
+impl CrudStore {
+    /// Retain imported source uses through the final publication of this capture.
+    pub fn compaction_retain_frozen_import_uses(
+        &self,
+        capture: &crate::FrozenUseGuard,
+        imports: &[(u64, PreparedFrozenImport)],
+    ) -> Result<()> {
+        capture.validate_store(self)?;
+        for (_, import) in imports {
+            import.frozen_use.validate_store(self)?;
+        }
+        capture.retain_dependencies(imports.iter().map(|(_, import)| import.frozen_use.clone()))
+    }
+}

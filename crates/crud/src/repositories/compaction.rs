@@ -212,6 +212,17 @@ pub struct SourcePage {
     pub next_sequence: i64,
 }
 
+/// A saved Commit may be retried with its original generation/budget/deadline.
+/// This reports only local proof accounting invalidation, never source staleness.
+#[derive(Debug)]
+pub struct FrozenProofReadinessInvalidated;
+impl std::fmt::Display for FrozenProofReadinessInvalidated {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("frozen proof readiness was invalidated")
+    }
+}
+impl std::error::Error for FrozenProofReadinessInvalidated {}
+
 #[derive(Clone, Debug)]
 pub struct SourceAssertion {
     pub revision: Option<i64>,
@@ -942,6 +953,77 @@ pub(crate) async fn compaction_admit_for_turn(
     snapshot: &OperationSnapshot,
     execution_turn: Option<&str>,
 ) -> Result<OperationRecord> {
+    compaction_admit_with_intent(
+        store,
+        workspace,
+        thread,
+        snapshot,
+        execution_turn,
+        AdmissionIntent::AssertionCompatible,
+    )
+    .await
+}
+
+pub(crate) enum AdmissionIntent<'a> {
+    AssertionCompatible,
+    NativeFrozen(&'a crate::FrozenUseGuard),
+}
+impl AdmissionIntent<'_> {
+    fn contract(&self) -> &'static str {
+        match self {
+            Self::AssertionCompatible => "assertion_compat",
+            Self::NativeFrozen(_) => "native_frozen",
+        }
+    }
+}
+
+pub(crate) async fn validate_admission_intent_in<C: ConnectionTrait>(
+    db: &C,
+    operation: &str,
+    intent: &AdmissionIntent<'_>,
+) -> Result<()> {
+    let row = compaction_operation::Entity::find_by_id(operation)
+        .one(db)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("admission operation unavailable"))?;
+    ensure!(
+        row.frozen_publication_contract == "legacy_unknown"
+            || row.frozen_publication_contract == intent.contract(),
+        "incompatible frozen publication intent"
+    );
+    if let AdmissionIntent::NativeFrozen(guard) = intent {
+        guard.validate_in(db, true).await?;
+        let bound=db.query_one_raw(sqlite_specific_sql("SELECT identity_sha256,imports_sha256,import_count FROM compaction_operation_projection WHERE operation_id=?",[operation.into()])).await?;
+        if let Some(bound) = bound {
+            ensure!(
+                bound.try_get::<String>("", "identity_sha256")? == guard.header().identity_sha256
+                    && bound.try_get::<String>("", "imports_sha256")?
+                        == guard.header().imports_sha256
+                    && bound.try_get::<i64>("", "import_count")? == guard.header().import_count,
+                "native admission origin identity changed"
+            );
+        }
+    }
+    Ok(())
+}
+
+pub(crate) async fn compaction_admit_with_intent(
+    store: &CrudStore,
+    workspace: &str,
+    thread: &str,
+    snapshot: &OperationSnapshot,
+    execution_turn: Option<&str>,
+    intent: AdmissionIntent<'_>,
+) -> Result<OperationRecord> {
+    if let AdmissionIntent::NativeFrozen(guard) = &intent {
+        guard.validate_store(store)?;
+        ensure!(
+            guard.workspace() == workspace,
+            "native admission workspace mismatch"
+        );
+    }
+    let live = matches!(intent, AdmissionIntent::NativeFrozen(_))
+        && store.frozen_history_protocol_enabled();
     let snapshot_json = serde_json::to_string(snapshot)?;
     ensure!(
         snapshot_json.len() <= SOURCE_PAGE_BYTES,
@@ -951,6 +1033,9 @@ pub(crate) async fn compaction_admit_for_turn(
     // Preparation reads no mutable DB state. Owner and format are revalidated inside the write boundary.
     store.run_serialized_write(|| async {
             let txn = store.connection.begin().await?;
+            if let AdmissionIntent::NativeFrozen(guard)=&intent { guard.validate_in(&txn,true).await?; }
+            let domain=txn.query_one_raw(sqlite_specific_sql("SELECT t.id FROM thread t JOIN workspace w ON w.id=t.workspace_id WHERE t.id=? AND t.workspace_id=?",[thread.into(),workspace.into()])).await?;
+            ensure!(domain.is_some(),"admission domain unavailable");
             compaction_context::Entity::insert(compaction_context::ActiveModel {workspace_id: sea_orm::Set((workspace).to_owned()), thread_id: sea_orm::Set((thread).to_owned()), owner: sea_orm::Set((snapshot.owner.clone()).to_owned()), ..Default::default() }).on_conflict(OnConflict::columns([compaction_context::Column::Owner]).do_nothing().to_owned()).exec_without_returning(&txn).await?;
             let valid = compaction_context::Entity::find()
             .select_only()
@@ -1007,22 +1092,27 @@ pub(crate) async fn compaction_admit_for_turn(
                         .to_owned()), fingerprint: sea_orm::Set((snapshot.plan.fingerprint.clone())
                         .to_owned()), status: sea_orm::Set(("running")
                         .to_owned()), snapshot: sea_orm::Set((snapshot_json.clone())
-                        .to_owned()), deadline_ms: sea_orm::Set(deadline), expected_head: sea_orm::Set(snapshot.expected_checkpoint.clone()), execution_turn: sea_orm::Set(execution_turn.map(str::to_owned)), ..Default::default() })
+                        .to_owned()), deadline_ms: sea_orm::Set(deadline), expected_head: sea_orm::Set(snapshot.expected_checkpoint.clone()), execution_turn: sea_orm::Set(execution_turn.map(str::to_owned)),
+                frozen_publication_contract:sea_orm::Set(intent.contract().into()),
+                frozen_accounting_mode:sea_orm::Set(if live { "live_known" } else { "legacy_bound" }.into()),
+                frozen_inventory_state:sea_orm::Set(if live { "known" } else { "unknown" }.into()),
+                frozen_checkpoint_count:sea_orm::Set(if live { Some(0) } else { None }),
+                frozen_prepared_checkpoint_count:sea_orm::Set(if live { Some(0) } else { None }),
+                frozen_proof_state:sea_orm::Set(if live { "pending" } else { "legacy" }.into()),
+                ..Default::default() })
             .on_conflict(OnConflict::columns([compaction_operation::Column::Owner, compaction_operation::Column::Fingerprint])
                 .do_nothing()
                 .to_owned())
             .exec_without_returning(&txn)
             .await?;
+            let winner=compaction_operation::Entity::find()
+                .filter(compaction_operation::Column::Owner.eq(&snapshot.owner))
+                .filter(compaction_operation::Column::Fingerprint.eq(&snapshot.plan.fingerprint))
+                .one(&txn).await?.ok_or_else(||anyhow::anyhow!("admitted operation missing"))?;
+            validate_admission_intent_in(&txn,&winner.id,&intent).await?;
             txn.commit().await?;
-            Ok(())
-        }).await?;
-    compaction_operation::Entity::find()
-        .filter(compaction_operation::Column::Owner.eq(snapshot.owner.clone()))
-        .filter(compaction_operation::Column::Fingerprint.eq(snapshot.plan.fingerprint.clone()))
-        .into_model::<OperationRecord>()
-        .one(&store.connection)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("admitted operation missing"))
+            Ok(OperationRecord::from(winner))
+        }).await
 }
 
 pub(crate) async fn compaction_operation_for_plan<C: ConnectionTrait>(
@@ -1536,28 +1626,37 @@ pub(crate) async fn compaction_save_candidate(
                 .one(&txn)
                 .await?;
             ensure!(running.is_some(), "operation is not running");
-            compaction_checkpoint::Entity::insert(compaction_checkpoint::ActiveModel {
-                id: sea_orm::Set((checkpoint.id.clone()).to_owned()),
-                operation_id: sea_orm::Set((checkpoint.operation_id.clone()).to_owned()),
-                owner: sea_orm::Set((checkpoint.owner.clone()).to_owned()),
-                previous: sea_orm::Set(checkpoint.previous.clone()),
-                portion: sea_orm::Set(portion),
-                summary: sea_orm::Set((checkpoint.summary.clone()).to_owned()),
-                selection: sea_orm::Set((selection.clone()).to_owned()),
-                projection_version: sea_orm::Set(projection),
-                format_version: sea_orm::Set(i64::from(FORMAT_VERSION)),
-                identity_sha256: sea_orm::Set((identity.clone()).to_owned()),
-                status: sea_orm::Set(("candidate").to_owned()),
-            })
-            .on_conflict(
-                OnConflict::columns([
-                    compaction_checkpoint::Column::OperationId,
-                    compaction_checkpoint::Column::Portion,
-                ])
-                .do_nothing()
-                .to_owned(),
+            let inserted =
+                compaction_checkpoint::Entity::insert(compaction_checkpoint::ActiveModel {
+                    id: sea_orm::Set((checkpoint.id.clone()).to_owned()),
+                    operation_id: sea_orm::Set((checkpoint.operation_id.clone()).to_owned()),
+                    owner: sea_orm::Set((checkpoint.owner.clone()).to_owned()),
+                    previous: sea_orm::Set(checkpoint.previous.clone()),
+                    portion: sea_orm::Set(portion),
+                    summary: sea_orm::Set((checkpoint.summary.clone()).to_owned()),
+                    selection: sea_orm::Set((selection.clone()).to_owned()),
+                    projection_version: sea_orm::Set(projection),
+                    format_version: sea_orm::Set(i64::from(FORMAT_VERSION)),
+                    identity_sha256: sea_orm::Set((identity.clone()).to_owned()),
+                    status: sea_orm::Set(("candidate").to_owned()),
+                    ..Default::default()
+                })
+                .on_conflict(
+                    OnConflict::columns([
+                        compaction_checkpoint::Column::OperationId,
+                        compaction_checkpoint::Column::Portion,
+                    ])
+                    .do_nothing()
+                    .to_owned(),
+                )
+                .exec_without_returning(&txn)
+                .await?;
+            super::compaction_checkpoint_proof::account_insert(
+                &txn,
+                &checkpoint.operation_id,
+                &checkpoint.id,
+                inserted,
             )
-            .exec_without_returning(&txn)
             .await?;
             // Idempotency is exact, never silently accept a different result for the same portion.
             let exact = compaction_checkpoint::Entity::find()
@@ -1635,9 +1734,10 @@ async fn checkpoint_coverage<C: ConnectionTrait>(db: &C, id: &str) -> Result<Vec
 
 /// Coverage discovery must not read summary text before source authorization.
 pub(crate) async fn compaction_checkpoint_edges(
-    db: &pioneer_sqlite::SqliteDatabase,
+    store: &CrudStore,
     id: &str,
 ) -> Result<Option<CheckpointEdges>> {
+    let db = &store.connection;
     let Some(row) = CheckpointEdgesRow::find_by_statement(sqlite_specific_sql(
         "SELECT p.owner,c.workspace_id,c.thread_id,p.identity_sha256,p.previous,p.format_version,p.operation_id,projection.manifest_id FROM compaction_checkpoint p JOIN compaction_context c ON c.owner=p.owner LEFT JOIN compaction_operation_projection projection ON projection.operation_id=p.operation_id WHERE p.id=? LIMIT 1",
         [id.into()],
@@ -1647,23 +1747,14 @@ pub(crate) async fn compaction_checkpoint_edges(
     else {
         return Ok(None);
     };
-    let coverage = HistoricalCoverageRow::find_by_statement(sqlite_specific_sql(
-        "SELECT DISTINCT v.source_scope,v.source_id,v.source_version,m.source_thread FROM compaction_coverage v JOIN compaction_manifest m ON m.operation_id=? AND m.reference_only=0 AND m.source_scope=v.source_scope AND m.source_id=v.source_id AND m.source_version=v.source_version WHERE v.checkpoint_id=? ORDER BY v.source_scope,v.source_id,m.source_thread LIMIT ?",
-        [
-            row.operation_id.clone().into(),
-            id.into(),
-            i64::try_from(CHECKPOINT_SOURCE_LIMIT + 1)?.into(),
-        ],
-    ))
-    .all(db)
-    .await?;
-    let exact_coverage = checkpoint_coverage(db, id).await?;
-    let exact_coverage = exact_coverage
-        .into_iter()
-        .collect::<std::collections::BTreeSet<_>>();
+    let coverage = checkpoint_historical_coverage(db, id, &row.operation_id).await?;
     let mut ownership =
         std::collections::BTreeMap::<SourceRef, std::collections::BTreeSet<String>>::new();
     for covered in coverage {
+        ensure!(
+            covered.owners == 1,
+            "checkpoint coverage lost its historical manifest ownership"
+        );
         ownership
             .entry(SourceRef {
                 scope: covered.source_scope,
@@ -1674,16 +1765,11 @@ pub(crate) async fn compaction_checkpoint_edges(
             .insert(covered.source_thread);
     }
     ensure!(
-        ownership
-            .keys()
-            .cloned()
-            .collect::<std::collections::BTreeSet<_>>()
-            == exact_coverage
-            && ownership.values().all(|threads| threads.len() == 1),
+        ownership.values().all(|threads| threads.len() == 1),
         "checkpoint coverage lost its historical manifest ownership"
     );
     let (replay_aliases, event_input_evidence) =
-        checkpoint_projection_metadata(db, &row, &ownership).await?;
+        checkpoint_projection_metadata(store, id, &row, &ownership).await?;
     Ok(Some(CheckpointEdges {
         owner: row.owner,
         workspace_id: row.workspace_id,
@@ -1751,32 +1837,105 @@ struct CheckpointEdgesRow {
 
 #[derive(FromQueryResult)]
 struct HistoricalCoverageRow {
+    owners: i64,
     source_scope: String,
     source_id: String,
     source_version: String,
     source_thread: String,
 }
 
-#[derive(PartialEq, Eq, PartialOrd, Ord)]
-struct HistoricalReplayAliasRow {
-    covered_thread: String,
-    replay_thread: String,
-    covered_scope: String,
-    covered_id: String,
-    covered_version: String,
-    replay_scope: String,
-    replay_id: String,
-    replay_version: String,
-    tool_item_id: Option<String>,
+async fn checkpoint_historical_coverage<C: ConnectionTrait>(
+    db: &C,
+    id: &str,
+    operation: &str,
+) -> Result<Vec<HistoricalCoverageRow>> {
+    let mut rows = Vec::new();
+    let mut after: Option<SourceRef> = None;
+    loop {
+        // Per-checkpoint coverage is bounded by the unchanged source limit. Byte
+        // prefixes additionally bound each returned page, including opaque versions.
+        let mut values: Vec<sea_orm::Value> = vec![id.into(), operation.into()];
+        let (lower, budget) = match &after {
+            None => ("", "?3"),
+            Some(after) => {
+                values.extend([
+                    after.scope.clone().into(),
+                    after.id.clone().into(),
+                    after.version.clone().into(),
+                ]);
+                (
+                    "WHERE (source_scope,source_id,source_version)>(?3,?4,?5)",
+                    "?6",
+                )
+            }
+        };
+        values.push((SOURCE_PAGE_BYTES as i64).into());
+        let page=HistoricalCoverageRow::find_by_statement(sqlite_specific_sql(
+            &format!("WITH selected AS (SELECT v.source_scope,v.source_id,v.source_version,COALESCE(MIN(m.source_thread),'') source_thread,COUNT(DISTINCT m.source_thread) owners \
+             FROM compaction_coverage v LEFT JOIN compaction_manifest m ON m.operation_id=?2 AND m.reference_only=0 AND m.source_scope=v.source_scope AND m.source_id=v.source_id AND m.source_version=v.source_version \
+             WHERE v.checkpoint_id=?1 GROUP BY v.source_scope,v.source_id,v.source_version), \
+             remaining AS (SELECT *,ROW_NUMBER() OVER(ORDER BY source_scope,source_id,source_version) n, \
+             SUM(length(CAST(source_scope AS BLOB))+length(CAST(source_id AS BLOB))+length(CAST(source_version AS BLOB))+length(CAST(source_thread AS BLOB))) \
+             OVER(ORDER BY source_scope,source_id,source_version ROWS UNBOUNDED PRECEDING) page_bytes FROM selected {lower}) \
+             SELECT source_scope,source_id,source_version,source_thread,owners FROM remaining WHERE n<=128 AND page_bytes<={budget} ORDER BY source_scope,source_id,source_version"),values)).all(db).await?;
+        if page.is_empty() {
+            let eof = match &after {
+                None => sqlite_specific_sql(
+                    "SELECT 1 FROM compaction_coverage WHERE checkpoint_id=? LIMIT 1",
+                    [id.into()],
+                ),
+                Some(after) => sqlite_specific_sql(
+                    "SELECT 1 FROM compaction_coverage WHERE checkpoint_id=? AND (source_scope,source_id,source_version)>(?,?,?) LIMIT 1",
+                    [
+                        id.into(),
+                        after.scope.clone().into(),
+                        after.id.clone().into(),
+                        after.version.clone().into(),
+                    ],
+                ),
+            };
+            let more = db.query_one_raw(eof).await?;
+            ensure!(
+                more.is_none(),
+                "checkpoint historical coverage page could not progress"
+            );
+            break;
+        }
+        let last = page.last().unwrap();
+        after = Some(SourceRef {
+            scope: last.source_scope.clone(),
+            id: last.source_id.clone(),
+            version: last.source_version.clone(),
+        });
+        rows.extend(page);
+        ensure!(
+            rows.len() <= CHECKPOINT_SOURCE_LIMIT,
+            "checkpoint coverage exceeds supported quantum"
+        );
+    }
+    Ok(rows)
 }
 
-#[derive(PartialEq, Eq, PartialOrd, Ord)]
-struct HistoricalEventInputEvidenceRow {
-    source_thread: String,
-    source_scope: String,
-    source_id: String,
-    source_version: String,
-    role: String,
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) struct HistoricalReplayAliasRow {
+    pub(super) covered_thread: String,
+    pub(super) replay_thread: String,
+    pub(super) covered_scope: String,
+    pub(super) covered_id: String,
+    pub(super) covered_version: String,
+    pub(super) replay_scope: String,
+    pub(super) replay_id: String,
+    pub(super) replay_version: String,
+    pub(super) tool_item_id: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) struct HistoricalEventInputEvidenceRow {
+    pub(super) source_thread: String,
+    pub(super) source_scope: String,
+    pub(super) source_id: String,
+    pub(super) source_version: String,
+    pub(super) role: String,
 }
 
 // Published operation projections and their logical frozen messages are immutable.
@@ -1786,175 +1945,243 @@ struct HistoricalEventInputEvidenceRow {
 // query stream spans pages: reader capacity is released before references are decoded and
 // the next page is requested.
 async fn checkpoint_projection_metadata(
-    db: &pioneer_sqlite::SqliteDatabase,
+    store: &CrudStore,
+    checkpoint_id: &str,
     checkpoint_row: &CheckpointEdgesRow,
     ownership: &std::collections::BTreeMap<SourceRef, std::collections::BTreeSet<String>>,
 ) -> Result<(
     Vec<HistoricalReplayAliasRow>,
     Vec<HistoricalEventInputEvidenceRow>,
 )> {
+    if let Some(proof) =
+        super::compaction_checkpoint_proof::read_effective(store, checkpoint_id, ownership).await?
+    {
+        return Ok(proof);
+    }
     let Some(manifest) = checkpoint_row.manifest_id.as_deref() else {
         return Ok((Vec::new(), Vec::new()));
     };
-    let mut aliases = std::collections::BTreeSet::new();
-    let mut evidence = std::collections::BTreeSet::new();
-    let mut start = 0_i64;
-    loop {
-        let sizes = db
-            .query_all_raw(checkpoint_projection_page_sizes_statement(manifest, start))
+    let acquisition = async {
+        let descriptor = store
+            .compaction_bound_source_projection(&checkpoint_row.operation_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("checkpoint frozen projection is unavailable"))?;
+        ensure!(
+            descriptor.manifest_id == manifest,
+            "checkpoint frozen projection changed"
+        );
+        let guard = store
+            .compaction_pin_checkpoint_projection(
+                checkpoint_id,
+                &checkpoint_row.operation_id,
+                &checkpoint_row.workspace_id,
+                &descriptor,
+            )
             .await?;
-        if sizes.is_empty() {
-            break;
-        }
-        let mut end = start;
-        let mut bytes = 0_usize;
-        for size in sizes {
-            let ordinal: i64 = size.try_get("", "ordinal")?;
-            let size: i64 = size.try_get("", "bytes")?;
-            ensure!(
-                (0..=SOURCE_PAGE_BYTES as i64).contains(&size),
-                "invalid frozen reference size"
-            );
-            if bytes + size as usize > SOURCE_PAGE_BYTES {
-                break;
-            }
-            ensure!(ordinal == end, "frozen history ordinal gap");
-            bytes += size as usize;
-            end = ordinal
-                .checked_add(1)
-                .ok_or_else(|| anyhow::anyhow!("frozen ordinal overflow"))?;
-        }
-        ensure!(
-            end > start,
-            "frozen projection metadata page made no progress"
-        );
-        let rows = db
-            .query_all_raw(checkpoint_projection_page_statement(manifest, start, end))
-            .await?;
-        #[cfg(test)]
-        checkpoint_projection_page_test_pause(db, manifest).await;
-        ensure!(
-            rows.len() <= SOURCE_PAGE_ROWS as usize,
-            "frozen projection metadata page exceeds row quantum"
-        );
-        let mut loaded_bytes = 0_usize;
-        let mut expected = start;
-        for row in rows {
-            let ordinal: i64 = row.try_get("", "ordinal")?;
-            let json: String = row.try_get("", "reference_json")?;
-            let row_bytes: i64 = row.try_get("", "bytes")?;
-            ensure!(ordinal == expected, "frozen history ordinal gap");
-            ensure!(
-                row_bytes >= 0 && json.len() <= row_bytes as usize,
-                "invalid frozen reference size"
-            );
-            loaded_bytes = loaded_bytes
-                .checked_add(row_bytes as usize)
-                .ok_or_else(|| anyhow::anyhow!("frozen reference byte count overflow"))?;
-            ensure!(
-                loaded_bytes <= SOURCE_PAGE_BYTES,
-                "frozen projection metadata page exceeds byte quantum"
-            );
-            expected += 1;
-
-            // Decode only after the bounded query has released its reader reservation.
-            let reference: FrozenMessageRef = serde_json::from_str(&json)?;
-            reference.validate()?;
-            let selected_sources = reference
-                .sources
-                .iter()
-                .filter(|source| {
-                    ownership.get(*source).is_some_and(|threads| {
-                        threads.len() == 1 && threads.contains(&reference.source_thread)
-                    })
-                })
-                .collect::<Vec<_>>();
-            for source in selected_sources {
-                for edge in reference.publication_edges_for(source) {
-                    aliases.insert(HistoricalReplayAliasRow {
-                        covered_thread: edge.covered_thread,
-                        replay_thread: edge.replay_thread,
-                        covered_scope: edge.covered.scope,
-                        covered_id: edge.covered.id,
-                        covered_version: edge.covered.version,
-                        replay_scope: edge.replay.scope,
-                        replay_id: edge.replay.id,
-                        replay_version: edge.replay.version,
-                        tool_item_id: edge.tool_item_id,
-                    });
-                }
-            }
-            if reference.sources.len() == 1
-                && let Some(role) = reference.event_input_role
-            {
-                let source = &reference.sources[0];
-                if ownership.get(source).is_some_and(|threads| {
-                    threads.len() == 1 && threads.contains(&reference.source_thread)
-                }) {
-                    evidence.insert(HistoricalEventInputEvidenceRow {
-                        source_thread: reference.source_thread.clone(),
-                        source_scope: source.scope.clone(),
-                        source_id: source.id.clone(),
-                        source_version: source.version.clone(),
-                        role: match role {
-                            FrozenEventInputRole::Authoritative => "authoritative",
-                            FrozenEventInputRole::Deleted => "deleted",
-                            FrozenEventInputRole::InputCopy => "input_copy",
-                        }
-                        .to_owned(),
-                    });
-                }
-            }
-        }
-        ensure!(
-            expected == end,
-            "frozen projection metadata page is incomplete"
-        );
-        ensure!(
-            aliases.len() <= CHECKPOINT_SOURCE_LIMIT,
-            "checkpoint replay aliases exceed supported quantum"
-        );
-        ensure!(
-            evidence.len() <= CHECKPOINT_SOURCE_LIMIT,
-            "checkpoint event-input evidence exceeds supported quantum"
-        );
-        #[cfg(test)]
-        record_checkpoint_projection_page_test_read(
-            db,
-            manifest,
-            start,
-            end,
-            usize::try_from(end - start)?,
-            loaded_bytes,
-        );
-        start = end;
+        Ok::<_, anyhow::Error>(guard)
     }
-    let mut aliases = aliases.into_iter().collect::<Vec<_>>();
-    aliases.sort_by(|left, right| {
-        (&left.replay_scope, &left.replay_id, &left.replay_thread).cmp(&(
-            &right.replay_scope,
-            &right.replay_id,
-            &right.replay_thread,
-        ))
-    });
-    let mut evidence = evidence.into_iter().collect::<Vec<_>>();
-    evidence.sort_by(|left, right| {
-        (
-            &left.source_scope,
-            &left.source_id,
-            &left.source_thread,
-            &left.source_version,
-            &left.role,
-        )
-            .cmp(&(
-                &right.source_scope,
-                &right.source_id,
-                &right.source_thread,
-                &right.source_version,
-                &right.role,
+    .await;
+    let guard = match acquisition {
+        Ok(guard) => guard,
+        Err(error) => {
+            // Completion/detach may win after the first selection. Retry only
+            // the metadata policy; never dereference a proof-only body.
+            if let Some(proof) =
+                super::compaction_checkpoint_proof::read_effective(store, checkpoint_id, ownership)
+                    .await?
+            {
+                return Ok(proof);
+            }
+            return Err(error);
+        }
+    };
+    let result = extract_checkpoint_projection_metadata(store, &guard, ownership).await;
+    guard.complete(result).await
+}
+
+pub(super) async fn extract_checkpoint_projection_metadata(
+    store: &CrudStore,
+    guard: &crate::FrozenUseGuard,
+    ownership: &std::collections::BTreeMap<SourceRef, std::collections::BTreeSet<String>>,
+) -> Result<(
+    Vec<HistoricalReplayAliasRow>,
+    Vec<HistoricalEventInputEvidenceRow>,
+)> {
+    let descriptor = guard.descriptor();
+    let manifest = descriptor.manifest_id.as_str();
+    let db = &store.connection;
+    async {
+        let mut aliases = std::collections::BTreeSet::new();
+        let mut evidence = std::collections::BTreeSet::new();
+        let mut start = 0_i64;
+        while start < i64::try_from(descriptor.messages)? {
+            guard.validate().await?;
+            let sizes = db
+                .query_all_raw(checkpoint_projection_page_sizes_statement(manifest, start))
+                .await?;
+            guard.validate().await?;
+            ensure!(
+                !sizes.is_empty(),
+                "checkpoint frozen projection lost a logical page"
+            );
+            let mut end = start;
+            let mut bytes = 0_usize;
+            for size in sizes {
+                let ordinal: i64 = size.try_get("", "ordinal")?;
+                let size: i64 = size.try_get("", "bytes")?;
+                ensure!(
+                    (0..=SOURCE_PAGE_BYTES as i64).contains(&size),
+                    "invalid frozen reference size"
+                );
+                if bytes + size as usize > SOURCE_PAGE_BYTES {
+                    break;
+                }
+                ensure!(ordinal == end, "frozen history ordinal gap");
+                bytes += size as usize;
+                end = ordinal
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow::anyhow!("frozen ordinal overflow"))?;
+            }
+            ensure!(
+                end > start,
+                "frozen projection metadata page made no progress"
+            );
+            guard.validate().await?;
+            let rows = db
+                .query_all_raw(checkpoint_projection_page_statement(manifest, start, end))
+                .await?;
+            guard.validate().await?;
+            #[cfg(test)]
+            checkpoint_projection_page_test_pause(db, manifest).await;
+            ensure!(
+                rows.len() <= SOURCE_PAGE_ROWS as usize,
+                "frozen projection metadata page exceeds row quantum"
+            );
+            let mut loaded_bytes = 0_usize;
+            let mut expected = start;
+            for row in rows {
+                let ordinal: i64 = row.try_get("", "ordinal")?;
+                let json: String = row.try_get("", "reference_json")?;
+                let row_bytes: i64 = row.try_get("", "bytes")?;
+                ensure!(ordinal == expected, "frozen history ordinal gap");
+                ensure!(
+                    row_bytes >= 0 && json.len() <= row_bytes as usize,
+                    "invalid frozen reference size"
+                );
+                loaded_bytes = loaded_bytes
+                    .checked_add(row_bytes as usize)
+                    .ok_or_else(|| anyhow::anyhow!("frozen reference byte count overflow"))?;
+                ensure!(
+                    loaded_bytes <= SOURCE_PAGE_BYTES,
+                    "frozen projection metadata page exceeds byte quantum"
+                );
+                expected += 1;
+
+                // Decode only after the bounded query has released its reader reservation.
+                let reference: FrozenMessageRef = serde_json::from_str(&json)?;
+                reference.validate()?;
+                let selected_sources = reference
+                    .sources
+                    .iter()
+                    .filter(|source| {
+                        ownership.get(*source).is_some_and(|threads| {
+                            threads.len() == 1 && threads.contains(&reference.source_thread)
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                for source in selected_sources {
+                    for edge in reference.publication_edges_for(source) {
+                        aliases.insert(HistoricalReplayAliasRow {
+                            covered_thread: edge.covered_thread,
+                            replay_thread: edge.replay_thread,
+                            covered_scope: edge.covered.scope,
+                            covered_id: edge.covered.id,
+                            covered_version: edge.covered.version,
+                            replay_scope: edge.replay.scope,
+                            replay_id: edge.replay.id,
+                            replay_version: edge.replay.version,
+                            tool_item_id: edge.tool_item_id,
+                        });
+                    }
+                }
+                if reference.sources.len() == 1
+                    && let Some(role) = reference.event_input_role
+                {
+                    let source = &reference.sources[0];
+                    if ownership.get(source).is_some_and(|threads| {
+                        threads.len() == 1 && threads.contains(&reference.source_thread)
+                    }) {
+                        evidence.insert(HistoricalEventInputEvidenceRow {
+                            source_thread: reference.source_thread.clone(),
+                            source_scope: source.scope.clone(),
+                            source_id: source.id.clone(),
+                            source_version: source.version.clone(),
+                            role: match role {
+                                FrozenEventInputRole::Authoritative => "authoritative",
+                                FrozenEventInputRole::Deleted => "deleted",
+                                FrozenEventInputRole::InputCopy => "input_copy",
+                            }
+                            .to_owned(),
+                        });
+                    }
+                }
+            }
+            ensure!(
+                expected == end,
+                "frozen projection metadata page is incomplete"
+            );
+            ensure!(
+                aliases.len() <= CHECKPOINT_SOURCE_LIMIT,
+                "checkpoint replay aliases exceed supported quantum"
+            );
+            ensure!(
+                evidence.len() <= CHECKPOINT_SOURCE_LIMIT,
+                "checkpoint event-input evidence exceeds supported quantum"
+            );
+            #[cfg(test)]
+            record_checkpoint_projection_page_test_read(
+                db,
+                manifest,
+                start,
+                end,
+                usize::try_from(end - start)?,
+                loaded_bytes,
+            );
+            start = end;
+        }
+        let mut aliases = aliases.into_iter().collect::<Vec<_>>();
+        aliases.sort_by(|left, right| {
+            (&left.replay_scope, &left.replay_id, &left.replay_thread).cmp(&(
+                &right.replay_scope,
+                &right.replay_id,
+                &right.replay_thread,
             ))
-    });
-    Ok((aliases, evidence))
+        });
+        let mut evidence = evidence.into_iter().collect::<Vec<_>>();
+        evidence.sort_by(|left, right| {
+            (
+                &left.source_scope,
+                &left.source_id,
+                &left.source_thread,
+                &left.source_version,
+                &left.role,
+            )
+                .cmp(&(
+                    &right.source_scope,
+                    &right.source_id,
+                    &right.source_thread,
+                    &right.source_version,
+                    &right.role,
+                ))
+        });
+        guard.validate().await?;
+        ensure!(
+            start == i64::try_from(descriptor.messages)?,
+            "checkpoint frozen projection count mismatch"
+        );
+        Ok((aliases, evidence))
+    }
+    .await
 }
 
 #[cfg(test)]
@@ -2194,7 +2421,8 @@ pub(super) async fn checkpoint_projection_page_test_pause(
 pub(super) fn checkpoint_projection_page_sizes_statement(manifest: &str, start: i64) -> Statement {
     sqlite_specific_sql(
         "SELECT d.ordinal,d.bytes FROM compaction_frozen_message_data d \
-         WHERE d.manifest_id=? AND d.ordinal>=? \
+         JOIN compaction_frozen_history h ON h.id=d.manifest_id \
+         WHERE h.availability='resident' AND d.ordinal>=0 AND d.ordinal<h.message_count AND d.manifest_id=? AND d.ordinal>=? \
            AND NOT EXISTS (SELECT 1 FROM compaction_frozen_layout l \
                            WHERE l.manifest_id=d.manifest_id AND l.kind=0 AND l.active=1) \
          UNION ALL \
@@ -2203,7 +2431,8 @@ pub(super) fn checkpoint_projection_page_sizes_statement(manifest: &str, start: 
            ON d.manifest_id=s.source_manifest AND d.ordinal>=s.start AND d.ordinal<s.end \
          JOIN compaction_frozen_layout l \
            ON l.manifest_id=s.manifest_id AND l.kind=s.kind AND l.active=1 \
-         WHERE s.manifest_id=? AND s.kind=0 AND d.ordinal>=? \
+         JOIN compaction_frozen_history h ON h.id=s.manifest_id \
+         WHERE h.availability='resident' AND d.ordinal>=0 AND d.ordinal<h.message_count AND s.manifest_id=? AND s.kind=0 AND d.ordinal>=? \
          ORDER BY ordinal LIMIT ?",
         [
             manifest.into(),
@@ -2222,7 +2451,8 @@ pub(super) fn checkpoint_projection_page_statement(
 ) -> Statement {
     sqlite_specific_sql(
         "SELECT d.ordinal,d.reference_json,d.bytes FROM compaction_frozen_message_data d \
-         WHERE d.manifest_id=? AND d.ordinal>=? AND d.ordinal<? \
+         JOIN compaction_frozen_history h ON h.id=d.manifest_id \
+         WHERE h.availability='resident' AND d.ordinal>=0 AND d.ordinal<h.message_count AND d.manifest_id=? AND d.ordinal>=? AND d.ordinal<? \
            AND NOT EXISTS (SELECT 1 FROM compaction_frozen_layout l \
                            WHERE l.manifest_id=d.manifest_id AND l.kind=0 AND l.active=1) \
          UNION ALL \
@@ -2231,7 +2461,8 @@ pub(super) fn checkpoint_projection_page_statement(
            ON d.manifest_id=s.source_manifest AND d.ordinal>=s.start AND d.ordinal<s.end \
          JOIN compaction_frozen_layout l \
            ON l.manifest_id=s.manifest_id AND l.kind=s.kind AND l.active=1 \
-         WHERE s.manifest_id=? AND s.kind=0 AND d.ordinal>=? AND d.ordinal<? \
+         JOIN compaction_frozen_history h ON h.id=s.manifest_id \
+         WHERE h.availability='resident' AND d.ordinal>=0 AND d.ordinal<h.message_count AND s.manifest_id=? AND s.kind=0 AND d.ordinal>=? AND d.ordinal<? \
          ORDER BY ordinal",
         [
             manifest.into(),
@@ -2388,6 +2619,13 @@ pub(crate) async fn compaction_apply(
     expected_head: Option<&str>,
     assertions: &[SourceAssertion],
 ) -> Result<CommitOutcome> {
+    let publication = super::compaction_checkpoint_proof::prepare_publication(
+        store,
+        &checkpoint.operation_id,
+        &checkpoint.id,
+    )
+    .await?;
+    let result = async {
     // The legacy assertion writer has no frozen projection or manifest. Its
     // exact source assertions are the publication proof. If an operation did
     // bind a frozen projection, require its graph to be readable as the runner
@@ -2440,6 +2678,7 @@ pub(crate) async fn compaction_apply(
             let status: String = op.ok_or_else(|| anyhow::anyhow!("operation missing"))?;
             if status == "completed" { txn.rollback().await?; return Ok(CommitOutcome::AlreadyApplied); }
             if status != "running" { txn.rollback().await?; return Ok(CommitOutcome::Cancelled); }
+            if !publication.validate(&txn).await? { txn.rollback().await?; return Ok(CommitOutcome::Stale); }
             let projection_still_matches = txn.query_one_raw(sqlite_specific_sql(
                 "SELECT 1 FROM compaction_operation_projection WHERE operation_id=? LIMIT 1",
                 [checkpoint.operation_id.clone().into()],
@@ -2536,9 +2775,12 @@ CanonicalSource::ToolItem => source_assertion_matches::<_,turn_item::Entity,comp
             if changed.rows_affected != 1 { txn.rollback().await?; return Ok(CommitOutcome::Stale); }
             compaction_checkpoint::Entity::update_many().col_expr(compaction_checkpoint::Column::Status, Expr::val("applied")).filter(Expr::col(compaction_checkpoint::Column::Id).eq(Expr::Value(checkpoint.id.clone().into()))).exec(&txn).await?;
             compaction_operation::Entity::update_many().col_expr(compaction_operation::Column::Status, Expr::val("completed")).col_expr(compaction_operation::Column::Outcome, Expr::val("applied")).filter(Expr::col(compaction_operation::Column::Id).eq(Expr::Value(checkpoint.operation_id.clone().into()))).exec(&txn).await?;
+            publication.seal_complete(&txn).await?;
             txn.commit().await?;
             Ok(CommitOutcome::Applied)
         }).await
+    }.await;
+    publication.complete(result).await
 }
 
 #[derive(Clone, Debug)]

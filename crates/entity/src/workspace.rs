@@ -7,6 +7,10 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "workspace")]
 pub struct Model {
+    #[sea_orm(has_many)]
+    pub compaction_frozen_maintenance_progress:
+        HasMany<super::compaction_frozen_maintenance_progress::Entity>,
+
     #[sea_orm(primary_key, auto_increment = false)]
     pub id: String,
     pub name: String,

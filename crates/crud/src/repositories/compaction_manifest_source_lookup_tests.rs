@@ -275,9 +275,7 @@ async fn set_manifest(db: &SqliteDatabase, source: &SourceCase, reference_only: 
 }
 
 async fn assert_manifest_current(db: &SqliteDatabase, operation: &str, expected: bool, case: &str) {
-    let actual = compaction_manifest_sources_current(db, operation)
-        .await
-        .unwrap();
+    let actual = manifest_sources_current_in(db, operation).await.unwrap();
     assert_eq!(actual, expected, "unexpected result: {case}");
 }
 
@@ -3794,6 +3792,70 @@ async fn checkpoint_projection_metadata_is_paged_deduplicated_and_releases_each_
             ] {
                 db.execute_unprepared(sql).await.unwrap();
             }
+        }
+    }
+}
+
+#[tokio::test]
+async fn checkpoint_projection_sql_binds_logical_target_count_in_both_branches() {
+    let f = fixture().await;
+    let db = f.db();
+    for (id, count) in [("p73-B", 10), ("p73-M", 40), ("p73-zero", 0)] {
+        db.execute_unprepared(&format!("INSERT INTO compaction_frozen_history(id,workspace_id,owner_thread,identity_sha256,message_count) VALUES ('{id}','ws','source-thread','digest',{count})")).await.unwrap();
+    }
+    for ordinal in 0..40 {
+        db.execute_unprepared(&format!(
+            "INSERT INTO compaction_frozen_message_data VALUES ('p73-B',{ordinal},'r',1)"
+        ))
+        .await
+        .unwrap();
+    }
+    for shared in [false, true] {
+        if shared {
+            db.execute_unprepared("INSERT INTO compaction_frozen_layout(manifest_id,kind,active) VALUES ('p73-B',0,1)").await.unwrap();
+            db.execute_unprepared(
+                "INSERT INTO compaction_frozen_span VALUES ('p73-B',0,0,40,'p73-B')",
+            )
+            .await
+            .unwrap();
+        }
+        for statement in [
+            checkpoint_projection_page_sizes_statement("p73-B", 0),
+            checkpoint_projection_page_statement("p73-B", 0, 40),
+        ] {
+            let rows = db.query_all_raw(statement).await.unwrap();
+            assert_eq!(rows.len(), 10);
+            assert_eq!(
+                rows.last().unwrap().try_get::<i64>("", "ordinal").unwrap(),
+                9
+            );
+        }
+    }
+    db.execute_unprepared(
+        "INSERT INTO compaction_frozen_layout(manifest_id,kind,active) VALUES ('p73-M',0,1)",
+    )
+    .await
+    .unwrap();
+    db.execute_unprepared("INSERT INTO compaction_frozen_span VALUES ('p73-M',0,0,40,'p73-B')")
+        .await
+        .unwrap();
+    db.execute_unprepared(
+        "UPDATE compaction_frozen_history SET availability='released' WHERE id='p73-B'",
+    )
+    .await
+    .unwrap();
+    for statement in [
+        checkpoint_projection_page_sizes_statement("p73-M", 0),
+        checkpoint_projection_page_statement("p73-M", 0, 40),
+    ] {
+        assert_eq!(db.query_all_raw(statement).await.unwrap().len(), 40);
+    }
+    for id in ["p73-B", "p73-zero"] {
+        for statement in [
+            checkpoint_projection_page_sizes_statement(id, 0),
+            checkpoint_projection_page_statement(id, 0, 40),
+        ] {
+            assert!(db.query_all_raw(statement).await.unwrap().is_empty());
         }
     }
 }

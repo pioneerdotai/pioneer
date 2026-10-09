@@ -4140,33 +4140,45 @@ impl MessageProcessor {
             if canonical { &[] } else { history },
             agent_skill_overlay,
         )?;
-        if canonical {
-            let allowed = crate::compaction::frozen::execution_history_scopes(
-                self.crud_store.as_ref(),
-                workspace_id,
-                thread_id,
-                turn_id,
-                hook_runtime_context.conversation_thread_id.as_deref(),
-            )
-            .await?;
-            let descriptor = crate::compaction::frozen::capture(
-                self.crud_store.as_ref(),
-                workspace_id,
-                thread_id,
-                &allowed,
-                history,
-            )
-            .await
-            .context("failed to freeze canonical runtime history")?;
-            snapshot.history_json = serde_json::to_string(&descriptor)?;
+        let mut frozen_use = None;
+        let result = async {
+            if canonical {
+                let allowed = crate::compaction::frozen::execution_history_scopes(
+                    self.crud_store.as_ref(),
+                    workspace_id,
+                    thread_id,
+                    turn_id,
+                    hook_runtime_context.conversation_thread_id.as_deref(),
+                )
+                .await?;
+                let prepared = crate::compaction::frozen::capture_prepared(
+                    self.crud_store.as_ref(),
+                    workspace_id,
+                    thread_id,
+                    &allowed,
+                    history,
+                )
+                .await
+                .context("failed to freeze canonical runtime history")?;
+                let descriptor = prepared.descriptor;
+                frozen_use = Some(prepared.guard);
+                snapshot.history_json = serde_json::to_string(&descriptor)?;
+            }
+            // Temporary compatibility for the ordinary legacy loader is removed
+            // when that loader is replaced. Canonical Task histories never enter it.
+            self.crud_store
+                .upsert_turn_runtime_snapshot(snapshot)
+                .await
+                .with_context(|| {
+                    format!("failed to persist runtime snapshot for turn `{turn_id}`")
+                })?;
+            Ok(())
         }
-        // Temporary compatibility for the ordinary legacy loader is removed
-        // when that loader is replaced. Canonical Task histories never enter it.
-        self.crud_store
-            .upsert_turn_runtime_snapshot(snapshot)
-            .await
-            .with_context(|| format!("failed to persist runtime snapshot for turn `{turn_id}`"))?;
-        Ok(())
+        .await;
+        match frozen_use {
+            Some(guard) => guard.complete(result).await,
+            None => result,
+        }
     }
 
     #[allow(clippy::too_many_arguments)]

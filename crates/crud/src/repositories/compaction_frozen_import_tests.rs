@@ -230,8 +230,20 @@ async fn install_checkpoint_and_task_basis(db: &SqliteDatabase) {
         .unwrap();
 }
 
-fn prepared(manifest: &str, source: SourceRef) -> PreparedFrozenImport {
+async fn prepared(db: &SqliteDatabase, manifest: &str, source: SourceRef) -> PreparedFrozenImport {
+    let store = CrudStore::new(db.clone()).with_maintenance_access();
+    let descriptor = pioneer_compaction::frozen::FrozenHistoryRef {
+        format: 1,
+        manifest_id: manifest.into(),
+        messages: 0,
+        identity_sha256: format!("digest-{manifest}"),
+    };
+    let frozen_use = store
+        .compaction_acquire_frozen_use("ws", &descriptor, Some("parent"))
+        .await
+        .unwrap();
     PreparedFrozenImport {
+        frozen_use,
         workspace: "ws".into(),
         destination: "child".into(),
         output_digest: String::new(),
@@ -269,8 +281,6 @@ async fn install_manifest(
     manifest: &str,
     source: &SourceRef,
 ) -> PreparedFrozenImport {
-    let prepared = prepared(manifest, source.clone());
-    let basis = prepared.accepted_basis.as_ref().unwrap();
     db.execute_raw(Statement::from_sql_and_values(
         DbBackend::Sqlite,
         "INSERT INTO compaction_frozen_history(id,workspace_id,owner_thread,identity_sha256,message_count,next_ordinal,import_count,imports_sha256,next_import,ready) VALUES (?,?,?,?,0,0,1,?,1,1)",
@@ -278,8 +288,8 @@ async fn install_manifest(
             manifest.into(),
             "ws".into(),
             "parent".into(),
-            basis.digest.clone().into(),
-            basis.imports_digest.clone().into(),
+            format!("digest-{manifest}").into(),
+            format!("imports-{manifest}").into(),
         ],
     ))
     .await
@@ -297,7 +307,7 @@ async fn install_manifest(
     ))
     .await
     .unwrap();
-    prepared
+    prepared(db, manifest, source.clone()).await
 }
 
 async fn update_import_field(db: &SqliteDatabase, manifest: &str, column: &str, value: &str) {
@@ -421,6 +431,7 @@ async fn accepted_import_current_checks_every_identity_predicate_for_all_six_bra
         .await;
         set_branch_workspace(&db, &branch, "ws").await;
         assert_matches_oracle(&db, &import, true, &format!("{} restored", branch.name)).await;
+        import.close().await.unwrap();
     }
 }
 
@@ -549,6 +560,7 @@ async fn accepted_import_current_checks_each_canonical_liveness_predicate_indepe
             &format!("{} restored canonical turn", canonical.branch.name),
         )
         .await;
+        import.close().await.unwrap();
     }
 }
 
@@ -621,6 +633,7 @@ async fn accepted_import_current_checks_task_basis_revision_and_legacy_json_inde
         "ltrim removes spaces before a JSON array",
     )
     .await;
+    import.close().await.unwrap();
 }
 
 #[tokio::test]
@@ -707,6 +720,7 @@ async fn accepted_import_current_checks_checkpoint_status_format_and_epoch_indep
     .await
     .unwrap();
     assert_matches_oracle(&db, &import, false, "unsupported checkpoint format").await;
+    import.close().await.unwrap();
 }
 
 #[tokio::test]
@@ -774,12 +788,15 @@ async fn accepted_import_current_preserves_every_outer_binding() {
     .await
     .unwrap();
     assert_matches_oracle(&db, &import, false, "incomplete import cursor").await;
+    import.close().await.unwrap();
 }
 
 async fn install_shared_manifest(db: &SqliteDatabase, source: &SourceRef) -> PreparedFrozenImport {
-    let _physical = install_manifest(db, "shared-physical", source).await;
-    let logical = prepared("shared-logical", source.clone());
-    let basis = logical.accepted_basis.as_ref().unwrap();
+    install_manifest(db, "shared-physical", source)
+        .await
+        .close()
+        .await
+        .unwrap();
     db.execute_raw(Statement::from_sql_and_values(
         DbBackend::Sqlite,
         "INSERT INTO compaction_frozen_history(id,workspace_id,owner_thread,identity_sha256,message_count,next_ordinal,import_count,imports_sha256,next_import,ready) VALUES (?,?,?,?,0,0,1,?,1,1)",
@@ -787,8 +804,8 @@ async fn install_shared_manifest(db: &SqliteDatabase, source: &SourceRef) -> Pre
             "shared-logical".into(),
             "ws".into(),
             "parent".into(),
-            basis.digest.clone().into(),
-            basis.imports_digest.clone().into(),
+            "digest-shared-logical".into(),
+            "imports-shared-logical".into(),
         ],
     ))
     .await
@@ -799,7 +816,7 @@ async fn install_shared_manifest(db: &SqliteDatabase, source: &SourceRef) -> Pre
     ] {
         db.execute_unprepared(sql).await.unwrap();
     }
-    logical
+    prepared(db, "shared-logical", source.clone()).await
 }
 
 #[tokio::test]
@@ -821,6 +838,7 @@ async fn accepted_import_current_reads_shared_range_imports_through_the_logical_
         .try_get::<i64>("", "count")
         .unwrap();
     assert_eq!(physical_rows, 1);
+    import.close().await.unwrap();
 }
 
 async fn enable_zstd(db: &SqliteDatabase) {
@@ -882,6 +900,7 @@ async fn accepted_import_current_uses_canonical_sources_with_zstd_storage() {
     for branch in branches().into_iter().take(4) {
         let import = install_manifest(&db, &format!("zstd-{}", branch.name), &branch.source).await;
         assert_matches_oracle(&db, &import, true, &format!("zstd {}", branch.name)).await;
+        import.close().await.unwrap();
     }
 }
 
@@ -1033,10 +1052,444 @@ async fn assert_production_plan(compressed: bool) {
     }
     assert_exact_search(&plan, &["checkpoint"], "id");
     assert_exact_search(&plan, &["basis"], "run_id");
+    import.close().await.unwrap();
 }
 
 #[tokio::test]
 async fn accepted_import_current_plan_keeps_exact_source_key_lookups() {
     assert_production_plan(false).await;
     assert_production_plan(true).await;
+}
+
+// P2 regression sources. These exercise real issuer/domain rows; no fabricated
+// use token or weakened capture receipt is available to a fixture.
+fn p2_empty_descriptor(id: &str) -> pioneer_compaction::frozen::FrozenHistoryRef {
+    use sha2::{Digest, Sha256};
+    pioneer_compaction::frozen::FrozenHistoryRef {
+        format: 1,
+        manifest_id: id.into(),
+        messages: 0,
+        identity_sha256: hex::encode(Sha256::digest([])),
+    }
+}
+async fn p2_use_count(store: &CrudStore, manifest: &str) -> i64 {
+    store
+        .database_connection()
+        .query_one_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "SELECT COUNT(*) AS n FROM compaction_frozen_use WHERE manifest_id=?",
+            [manifest.into()],
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "n")
+        .unwrap()
+}
+async fn p2_ready_zero(store: &CrudStore, id: &str) -> crate::FrozenUseGuard {
+    let descriptor = p2_empty_descriptor(id);
+    let guard = store
+        .compaction_begin_frozen_history("ws", "parent", &descriptor)
+        .await
+        .unwrap();
+    assert!(
+        store
+            .compaction_finish_frozen_history_with_use(&guard)
+            .await
+            .unwrap()
+    );
+    guard
+}
+fn p2_reference() -> FrozenMessageRef {
+    serde_json::from_value(serde_json::json!({
+        "source_thread": "parent", "unit_id": "parent-turn",
+        "logical_turn_id": "parent-turn",
+        "sources": [{"scope":"input:parent-turn", "id":"parent-turn", "version":"opaque/α:release"}],
+        "inherited": false, "complete": true, "protected_input": false,
+        "wire_sha256": "a".repeat(64)
+    })).unwrap()
+}
+fn p2_descriptor(
+    id: &str,
+    reference: &FrozenMessageRef,
+) -> pioneer_compaction::frozen::FrozenHistoryRef {
+    use sha2::{Digest, Sha256};
+    let json = serde_json::to_vec(reference).unwrap();
+    let mut digest = Sha256::new();
+    digest.update((json.len() as u64).to_be_bytes());
+    digest.update(json);
+    pioneer_compaction::frozen::FrozenHistoryRef {
+        format: 1,
+        manifest_id: id.into(),
+        messages: 1,
+        identity_sha256: hex::encode(digest.finalize()),
+    }
+}
+
+#[tokio::test]
+async fn p2_concurrent_final_clone_close_has_one_release_owner() {
+    let f = fixture().await;
+    let guard = p2_ready_zero(&f.store, "p2-concurrent").await;
+    let clone = guard.clone();
+    assert_eq!(p2_use_count(&f.store, "p2-concurrent").await, 1);
+    let (a, b) = tokio::join!(guard.close(), clone.close());
+    a.unwrap();
+    b.unwrap();
+    assert_eq!(p2_use_count(&f.store, "p2-concurrent").await, 0);
+}
+
+#[tokio::test]
+async fn p2_cancelled_clone_keeps_durable_hold_after_other_owner_closes() {
+    let f = fixture().await;
+    let guard = p2_ready_zero(&f.store, "p2-abandoned").await;
+    drop(guard.clone());
+    guard.close().await.unwrap();
+    assert_eq!(p2_use_count(&f.store, "p2-abandoned").await, 1);
+}
+
+#[tokio::test]
+async fn p2_semantic_error_awaits_release_and_preserves_error() {
+    let f = fixture().await;
+    let guard = f
+        .store
+        .compaction_begin_frozen_history("ws", "parent", &p2_empty_descriptor("p2-error"))
+        .await
+        .unwrap();
+    let result = f
+        .store
+        .compaction_append_frozen_history_with_use(&guard, 1, &[])
+        .await;
+    let error = guard.complete(result).await.unwrap_err();
+    assert!(format!("{error:#}").contains("not sequential"));
+    assert_eq!(p2_use_count(&f.store, "p2-error").await, 0);
+}
+
+#[tokio::test]
+async fn p2_raw_finish_cannot_publish_only_from_next_equals_count() {
+    let f = fixture().await;
+    let mut descriptor = p2_empty_descriptor("p2-forged-digest");
+    descriptor.identity_sha256 = "a".repeat(64);
+    let guard = f
+        .store
+        .compaction_begin_frozen_history("ws", "parent", &descriptor)
+        .await
+        .unwrap();
+    let error = f
+        .store
+        .compaction_finish_frozen_history("ws", "parent", &descriptor)
+        .await
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("digest mismatch"));
+    let ready: i64 = f
+        .db()
+        .query_one_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "SELECT ready FROM compaction_frozen_history WHERE id=?",
+            [descriptor.manifest_id.into()],
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "ready")
+        .unwrap();
+    assert_eq!(ready, 0);
+    guard.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn p2_no_share_restart_exact_retry_and_collision_use_same_verifier() {
+    let f = fixture().await;
+    let reference = p2_reference();
+    reference.validate().unwrap();
+    let descriptor = p2_descriptor("p2-restart", &reference);
+    let first = f
+        .store
+        .compaction_begin_frozen_history("ws", "parent", &descriptor)
+        .await
+        .unwrap();
+    f.store
+        .compaction_append_frozen_history_with_use(&first, 0, std::slice::from_ref(&reference))
+        .await
+        .unwrap();
+    first.close().await.unwrap();
+    let restarted = f
+        .store
+        .compaction_begin_frozen_history("ws", "parent", &descriptor)
+        .await
+        .unwrap();
+    f.store
+        .compaction_append_frozen_history_with_use(&restarted, 0, std::slice::from_ref(&reference))
+        .await
+        .unwrap();
+    let mut collision = reference.clone();
+    collision.wire_sha256 = "b".repeat(64);
+    assert!(
+        f.store
+            .compaction_append_frozen_history_with_use(&restarted, 0, &[collision])
+            .await
+            .is_err()
+    );
+    assert!(
+        f.store
+            .compaction_finish_frozen_history_with_use(&restarted)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        f.store
+            .compaction_frozen_history_page_with_use(&restarted, 0)
+            .await
+            .unwrap(),
+        vec![reference]
+    );
+    assert!(
+        f.store
+            .compaction_frozen_history_page_with_use(&restarted, 1)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    restarted.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn p2_fk_off_domain_deletion_is_unavailable_even_at_zero_eof() {
+    let f = fixture().await;
+    let guard = p2_ready_zero(&f.store, "p2-domain").await;
+    f.db()
+        .execute_unprepared("PRAGMA foreign_keys=OFF")
+        .await
+        .unwrap();
+    f.db()
+        .execute_unprepared("DELETE FROM thread WHERE id='parent'")
+        .await
+        .unwrap();
+    let error = f
+        .store
+        .compaction_frozen_history_page_with_use(&guard, 0)
+        .await
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("unavailable"));
+    assert!(
+        f.store
+            .compaction_frozen_import_page_with_use(&guard, 0)
+            .await
+            .is_err()
+    );
+    assert!(guard.close().await.is_err());
+    assert_eq!(p2_use_count(&f.store, "p2-domain").await, 1);
+}
+
+#[tokio::test]
+async fn p2_import_index_corruption_cannot_issue_finish_receipt() {
+    use sha2::{Digest, Sha256};
+    let f = fixture().await;
+    let reference = p2_reference();
+    let descriptor = p2_descriptor("p2-import-index", &reference);
+    let record = FrozenImportRecord {
+        message_ordinal: 0,
+        source_thread: "source-thread".into(),
+        source: SourceRef {
+            scope: "input:source-turn".into(),
+            id: "source-turn".into(),
+            version: "opaque/α:release".into(),
+        },
+        delivery_id: "delivery".into(),
+        candidate_id: "candidate".into(),
+        output_manifest: "output".into(),
+        output_ordinal: 0,
+        acknowledgement: SourceRef {
+            scope: "event:parent-turn".into(),
+            id: "ack".into(),
+            version: "opaque:ack".into(),
+        },
+    };
+    let json = serde_json::to_string(&record).unwrap();
+    let mut digest = Sha256::new();
+    digest.update((json.len() as u64).to_le_bytes());
+    digest.update(json.as_bytes());
+    let guard = f
+        .store
+        .compaction_begin_frozen_history_with_imports(
+            "ws",
+            "parent",
+            &descriptor,
+            1,
+            &hex::encode(digest.finalize()),
+        )
+        .await
+        .unwrap();
+    f.store
+        .compaction_append_frozen_history_with_use(&guard, 0, &[reference])
+        .await
+        .unwrap();
+    f.db().execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+        "INSERT INTO compaction_frozen_import_data(manifest_id,ordinal,message_ordinal,source_thread,source_scope,source_id,source_version,proof_json,bytes) VALUES (?,0,0,?,?,?,?,?,?)",
+        [descriptor.manifest_id.clone().into(), record.source_thread.into(), record.source.scope.into(), record.source.id.into(),
+         "different-index-version".into(), json.clone().into(), (json.len() as i64).into()])).await.unwrap();
+    f.db()
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE compaction_frozen_history SET next_import=1 WHERE id=?",
+            [descriptor.manifest_id.into()],
+        ))
+        .await
+        .unwrap();
+    let error = f
+        .store
+        .compaction_finish_frozen_history_with_use(&guard)
+        .await
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("source index mismatch"));
+    guard.close().await.unwrap();
+}
+
+fn p2_runtime(history: String) -> crate::NewTurnRuntimeSnapshot {
+    let now = crate::utc_now();
+    crate::NewTurnRuntimeSnapshot {
+        turn_id: "parent-turn".into(),
+        thread_id: "parent".into(),
+        workspace_id: "ws".into(),
+        mode_json: "{}".into(),
+        model: "m".into(),
+        provider_name: "p".into(),
+        reasoning_effort: None,
+        agent_skill_versions_json: None,
+        hook_runtime_context_json: "{}".into(),
+        workspace_skill_policies_json: "{}".into(),
+        input_json: "{}".into(),
+        capabilities_json: "{}".into(),
+        resolved_artifacts_json: "[]".into(),
+        runtime_environment_json: "{}".into(),
+        history_json: history,
+        created_at: now,
+        updated_at: now,
+    }
+}
+
+#[tokio::test]
+async fn p2_mult_page_reader_keeps_original_use_when_runtime_root_is_replaced() {
+    use sha2::{Digest, Sha256};
+    let f = fixture().await;
+    let reference = p2_reference();
+    let references = vec![reference.clone(); 129];
+    let bytes = serde_json::to_vec(&reference).unwrap();
+    let mut digest = Sha256::new();
+    for _ in &references {
+        digest.update((bytes.len() as u64).to_be_bytes());
+        digest.update(&bytes);
+    }
+    let descriptor = pioneer_compaction::frozen::FrozenHistoryRef {
+        format: 1,
+        manifest_id: "p2-pages".into(),
+        messages: 129,
+        identity_sha256: hex::encode(digest.finalize()),
+    };
+    let capture = f
+        .store
+        .compaction_begin_frozen_history("ws", "parent", &descriptor)
+        .await
+        .unwrap();
+    for (index, chunk) in references.chunks(128).enumerate() {
+        f.store
+            .compaction_append_frozen_history_with_use(&capture, (index * 128) as u64, chunk)
+            .await
+            .unwrap();
+    }
+    f.store
+        .compaction_finish_frozen_history_with_use(&capture)
+        .await
+        .unwrap();
+    let original = f
+        .store
+        .upsert_turn_runtime_snapshot(p2_runtime(serde_json::to_string(&descriptor).unwrap()))
+        .await
+        .unwrap();
+    let reader = f
+        .store
+        .compaction_pin_runtime_snapshot(&original)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        f.store
+            .compaction_frozen_history_page_with_use(&reader, 0)
+            .await
+            .unwrap()
+            .len(),
+        128
+    );
+    f.store
+        .upsert_turn_runtime_snapshot(p2_runtime("[]".into()))
+        .await
+        .unwrap();
+    assert!(
+        f.store
+            .compaction_pin_runtime_snapshot(&original)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        f.store
+            .compaction_frozen_history_page_with_use(&reader, 128)
+            .await
+            .unwrap(),
+        vec![reference]
+    );
+    assert!(
+        f.store
+            .compaction_frozen_history_page_with_use(&reader, 129)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    capture.close().await.unwrap();
+    assert_eq!(p2_use_count(&f.store, "p2-pages").await, 1);
+    reader.close().await.unwrap();
+    assert_eq!(p2_use_count(&f.store, "p2-pages").await, 0);
+}
+
+#[tokio::test]
+async fn p2_actual_runtime_root_writer_retries_external_sqlite_lock_without_losing_use() {
+    use sea_orm::TransactionTrait;
+    let f = fixture().await;
+    let guard = p2_ready_zero(&f.store, "p2-lock-retry").await;
+    f.db()
+        .execute_unprepared("PRAGMA busy_timeout=0")
+        .await
+        .unwrap();
+    // The external fixture connection represents a competing SQLite process.
+    // It holds no SqliteDatabase reader/writer capacity or production executor.
+    let blocker = Database::connect(format!("sqlite://{}?mode=rw", f._file.0.display()))
+        .await
+        .unwrap();
+    let tx = blocker.begin().await.unwrap();
+    tx.execute_unprepared("UPDATE workspace SET name=name WHERE id='ws'")
+        .await
+        .unwrap();
+    let release = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        tx.commit().await.unwrap();
+    });
+    let snapshot = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        f.store.upsert_turn_runtime_snapshot(p2_runtime(
+            serde_json::to_string(&guard.descriptor()).unwrap(),
+        )),
+    )
+    .await
+    .expect("root publication lock retry timed out")
+    .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), release)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        snapshot.history_json,
+        serde_json::to_string(&guard.descriptor()).unwrap()
+    );
+    guard.validate().await.unwrap();
+    assert_eq!(p2_use_count(&f.store, "p2-lock-retry").await, 1);
+    guard.close().await.unwrap();
+    assert_eq!(p2_use_count(&f.store, "p2-lock-retry").await, 0);
 }

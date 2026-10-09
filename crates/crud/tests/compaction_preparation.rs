@@ -505,9 +505,16 @@ async fn cancelled_preparation_reopens_from_disk_with_a_physical_read_only_pool(
             format: 1,
             manifest_id: id.into(),
             messages: 1,
-            identity_sha256: "b".repeat(64),
+            identity_sha256: {
+                use sha2::{Digest, Sha256};
+                let bytes = serde_json::to_vec(&reference).unwrap();
+                let mut digest = Sha256::new();
+                digest.update((bytes.len() as u64).to_be_bytes());
+                digest.update(bytes);
+                hex::encode(digest.finalize())
+            },
         };
-        store
+        let fixture_capture_1 = store
             .compaction_begin_frozen_history("ws", "thread", &descriptor)
             .await
             .unwrap();
@@ -527,6 +534,7 @@ async fn cancelled_preparation_reopens_from_disk_with_a_physical_read_only_pool(
                 .await
                 .unwrap()
         );
+        fixture_capture_1.close().await.unwrap();
     }
     let held = database.begin().await.unwrap();
     assert!(

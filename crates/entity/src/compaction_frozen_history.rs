@@ -7,6 +7,17 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "compaction_frozen_history")]
 pub struct Model {
+    #[sea_orm(has_many)]
+    pub compaction_frozen_uses: HasMany<super::compaction_frozen_use::Entity>,
+    #[sea_orm(has_many)]
+    pub compaction_frozen_cleanups: HasMany<super::compaction_frozen_cleanup::Entity>,
+
+    #[sea_orm(column_type = "Text")]
+    pub availability: String,
+    pub storage_generation: i64,
+    pub release_kind: i64,
+    pub release_after_span: Option<i64>,
+
     #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub id: String,
     #[sea_orm(column_type = "Text")]

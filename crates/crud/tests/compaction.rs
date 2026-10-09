@@ -1916,12 +1916,13 @@ async fn input_projection_uses_accepted_input_order_instead_of_insertion_order()
 #[tokio::test]
 async fn frozen_history_is_paged_immutable_scoped_and_restart_safe() {
     use pioneer_compaction::frozen::{FrozenHistoryRef, FrozenMessageRef};
-    let store = store().await;
-    let descriptor = FrozenHistoryRef {
+    let statements = RecordedStatements::default();
+    let store = store_recording_statements(Some(statements.clone())).await;
+    let mut descriptor = FrozenHistoryRef {
         format: 1,
         manifest_id: "frozen-manifest".into(),
         messages: 130,
-        identity_sha256: "a".repeat(64),
+        identity_sha256: String::new(),
     };
     let messages = (0..130)
         .map(|i| FrozenMessageRef {
@@ -1948,16 +1949,12 @@ async fn frozen_history_is_paged_immutable_scoped_and_restart_safe() {
             tool_name: None,
         })
         .collect::<Vec<_>>();
-    store
+    descriptor.identity_sha256 = shared_descriptor("frozen-manifest", &messages).identity_sha256;
+    let capture_guard = store
         .compaction_begin_frozen_history("ws", "thread", &descriptor)
         .await
         .unwrap();
-    assert!(
-        !store
-            .compaction_finish_frozen_history("ws", "thread", &descriptor)
-            .await
-            .unwrap()
-    );
+    assert_incomplete_capture(&store, "ws", "thread", &descriptor, 0).await;
     store
         .compaction_append_frozen_history(
             "ws",
@@ -1975,15 +1972,23 @@ async fn frozen_history_is_paged_immutable_scoped_and_restart_safe() {
             .unwrap()
             .is_none()
     );
+    statements.lock().unwrap().clear();
+    let error = store
+        .compaction_frozen_history_page("ws", "thread", &descriptor.manifest_id, 0)
+        .await
+        .unwrap_err();
+    assert_eq!(error.to_string(), "frozen history is incomplete");
     assert!(
-        store
-            .compaction_frozen_history_page("ws", "thread", &descriptor.manifest_id, 0)
-            .await
+        statements
+            .lock()
             .unwrap()
-            .is_empty()
+            .iter()
+            .all(|statement| !statement.sql.contains("reference_json")),
+        "unauthorized page must not fetch body"
     );
+    assert_frozen_cursors(&store, &descriptor, 128, 0, 0, 0).await;
     // Restart retries the same immutable metadata, then finishes the remaining quantum.
-    store
+    let restart_guard = store
         .compaction_begin_frozen_history("ws", "thread", &descriptor)
         .await
         .unwrap();
@@ -2031,13 +2036,21 @@ async fn frozen_history_is_paged_immutable_scoped_and_restart_safe() {
             .unwrap(),
         messages[128..]
     );
+    statements.lock().unwrap().clear();
+    let error = store
+        .compaction_frozen_history_page("other", "thread", &descriptor.manifest_id, 0)
+        .await
+        .unwrap_err();
+    assert_eq!(error.to_string(), "frozen history is unavailable");
     assert!(
-        store
-            .compaction_frozen_history_page("other", "thread", &descriptor.manifest_id, 0)
-            .await
+        statements
+            .lock()
             .unwrap()
-            .is_empty()
+            .iter()
+            .all(|statement| !statement.sql.contains("reference_json")),
+        "wrong workspace must not fetch body"
     );
+    assert_frozen_cursors(&store, &descriptor, 130, 0, 1, 0).await;
     assert!(
         store
             .compaction_frozen_history_owner("other", &descriptor)
@@ -2086,6 +2099,9 @@ async fn frozen_history_is_paged_immutable_scoped_and_restart_safe() {
             .await
             .is_err()
     );
+    restart_guard.close().await.unwrap();
+    capture_guard.close().await.unwrap();
+    assert_eq!(frozen_count(&store, "compaction_frozen_use").await, 0);
 }
 
 #[tokio::test]
@@ -2824,7 +2840,7 @@ async fn task_output_snapshot_is_bound_to_completed_turn_and_never_recaptured() 
         messages: 0,
         identity_sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".into(),
     };
-    store
+    let fixture_capture_1 = store
         .compaction_begin_frozen_history("ws", "thread", &history)
         .await
         .unwrap();
@@ -2860,7 +2876,7 @@ async fn task_output_snapshot_is_bound_to_completed_turn_and_never_recaptured() 
         manifest_id: "later-history".into(),
         ..history.clone()
     };
-    store
+    let fixture_capture_2 = store
         .compaction_begin_frozen_history("ws", "thread", &other)
         .await
         .unwrap();
@@ -2892,6 +2908,8 @@ async fn task_output_snapshot_is_bound_to_completed_turn_and_never_recaptured() 
             .unwrap()
             .is_none()
     );
+    fixture_capture_2.close().await.unwrap();
+    fixture_capture_1.close().await.unwrap();
 }
 
 #[tokio::test]
@@ -2933,7 +2951,7 @@ async fn frozen_own_imports_require_exact_output_membership_and_atomic_publicati
         let mut digest = Sha256::new();
         for message in messages {
             let bytes = serde_json::to_vec(message).unwrap();
-            digest.update((bytes.len() as u64).to_le_bytes());
+            digest.update((bytes.len() as u64).to_be_bytes());
             digest.update(bytes);
         }
         FrozenHistoryRef {
@@ -2943,7 +2961,8 @@ async fn frozen_own_imports_require_exact_output_membership_and_atomic_publicati
             identity_sha256: hex::encode(digest.finalize()),
         }
     }
-    let store = store().await;
+    let statements = RecordedStatements::default();
+    let store = store_recording_statements(Some(statements.clone())).await;
     let db = store.database_connection();
     source(&store, "basis-source", 1, "{}").await;
     let inherited = store
@@ -2997,7 +3016,7 @@ async fn frozen_own_imports_require_exact_output_membership_and_atomic_publicati
         ..own.clone()
     };
     let output = descriptor("output-with-basis", &[own.clone(), basis.clone()]);
-    store
+    let fixture_capture_3 = store
         .compaction_begin_frozen_history("ws", "child", &output)
         .await
         .unwrap();
@@ -3150,7 +3169,7 @@ async fn frozen_own_imports_require_exact_output_membership_and_atomic_publicati
     let context = descriptor("assembled", &context_messages);
     let imports = vec![(1, prepared.clone())];
     let import_digest = frozen_import_identity(&imports).unwrap();
-    store
+    let fixture_capture_4 = store
         .compaction_begin_frozen_history_with_imports("ws", "thread", &context, 1, &import_digest)
         .await
         .unwrap();
@@ -3164,12 +3183,7 @@ async fn frozen_own_imports_require_exact_output_membership_and_atomic_publicati
         )
         .await
         .unwrap();
-    assert!(
-        !store
-            .compaction_finish_frozen_history("ws", "thread", &context)
-            .await
-            .unwrap()
-    );
+    assert_incomplete_capture(&store, "ws", "thread", &context, 2).await;
     assert!(
         store
             .compaction_frozen_history_owner("ws", &context)
@@ -3195,12 +3209,7 @@ async fn frozen_own_imports_require_exact_output_membership_and_atomic_publicati
             .await
             .is_err()
     );
-    assert!(
-        !store
-            .compaction_finish_frozen_history("ws", "thread", &context)
-            .await
-            .unwrap()
-    );
+    assert_incomplete_capture(&store, "ws", "thread", &context, 2).await;
     db.execute_unprepared("DROP TRIGGER abort_frozen_import")
         .await
         .unwrap();
@@ -3236,13 +3245,12 @@ async fn frozen_own_imports_require_exact_output_membership_and_atomic_publicati
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].source, own_source);
     assert_eq!(records[0].delivery_id, "delivery");
-    assert!(
-        store
-            .compaction_frozen_import_page("other", "thread", &context.manifest_id, 0)
-            .await
-            .unwrap()
-            .is_empty()
-    );
+    let error = store
+        .compaction_frozen_import_page("other", "thread", &context.manifest_id, 0)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("unavailable"));
+    assert_frozen_cursors(&store, &context, 2, 1, 1, 1).await;
     for _ in 0..100 {
         if !store.compact_frozen_storage_quantum().await.unwrap() {
             break;
@@ -3252,7 +3260,7 @@ async fn frozen_own_imports_require_exact_output_membership_and_atomic_publicati
         manifest_id: "assembled-shared".into(),
         ..context.clone()
     };
-    store
+    let fixture_capture_5 = store
         .compaction_begin_frozen_history_with_imports("ws", "thread", &shared, 1, &import_digest)
         .await
         .unwrap();
@@ -3292,7 +3300,7 @@ async fn frozen_own_imports_require_exact_output_membership_and_atomic_publicati
     let mut divergent_messages = context_messages.clone();
     divergent_messages[0].wire_sha256 = "d".repeat(64);
     let divergent = descriptor("assembled-divergent", &divergent_messages);
-    store
+    let fixture_capture_6 = store
         .compaction_begin_frozen_history_with_imports("ws", "thread", &divergent, 1, &import_digest)
         .await
         .unwrap();
@@ -3670,7 +3678,7 @@ async fn frozen_own_imports_require_exact_output_membership_and_atomic_publicati
     let forwarded_imports = vec![(0, forwarded)];
     let forwarded_digest =
         pioneer_crud::compaction::frozen_import_identity(&forwarded_imports).unwrap();
-    maintenance
+    let fixture_capture_7 = maintenance
         .compaction_begin_frozen_history_with_imports(
             "ws",
             "context-c",
@@ -3707,12 +3715,7 @@ async fn frozen_own_imports_require_exact_output_membership_and_atomic_publicati
             .await
             .is_err()
     );
-    assert!(
-        !maintenance
-            .compaction_finish_frozen_history("ws", "context-c", &child_context)
-            .await
-            .unwrap()
-    );
+    assert_incomplete_capture(&maintenance, "ws", "context-c", &child_context, 1).await;
     db.execute_raw(Statement::from_sql_and_values(
         DbBackend::Sqlite,
         "UPDATE task_run_conversation_snapshot SET history_json=? WHERE run_id='run-c'",
@@ -3733,12 +3736,7 @@ async fn frozen_own_imports_require_exact_output_membership_and_atomic_publicati
             .await
             .is_err()
     );
-    assert!(
-        !maintenance
-            .compaction_finish_frozen_history("ws", "context-c", &child_context)
-            .await
-            .unwrap()
-    );
+    assert_incomplete_capture(&maintenance, "ws", "context-c", &child_context, 1).await;
     db.execute_unprepared("DROP TRIGGER abort_forwarded_import")
         .await
         .unwrap();
@@ -3782,7 +3780,7 @@ async fn frozen_own_imports_require_exact_output_membership_and_atomic_publicati
     );
     let carried_imports = vec![(0, carried)];
     let carried_digest = frozen_import_identity(&carried_imports).unwrap();
-    maintenance
+    let fixture_capture_8 = maintenance
         .compaction_begin_frozen_history_with_imports(
             "ws",
             "context-c",
@@ -3883,12 +3881,28 @@ async fn frozen_own_imports_require_exact_output_membership_and_atomic_publicati
     )
     .await
     .unwrap();
+    let uses_before = frozen_count(&store, "compaction_frozen_use").await;
+    statements.lock().unwrap().clear();
     assert!(
         !store
             .compaction_manifest_sources_current(&operation.id)
             .await
             .unwrap()
     );
+    assert!(
+        statements
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|statement| !statement.sql.contains("reference_json")
+                && !statement.sql.contains("accepted_imports AS")),
+        "invalid receipt must not reach body predicate"
+    );
+    assert_eq!(
+        frozen_count(&store, "compaction_frozen_use").await,
+        uses_before
+    );
+
     db.execute_raw(Statement::from_sql_and_values(
         DbBackend::Sqlite,
         "UPDATE compaction_frozen_history SET imports_sha256=? WHERE id='assembled'",
@@ -3997,7 +4011,7 @@ async fn frozen_own_imports_require_exact_output_membership_and_atomic_publicati
     let stale_forwarded_digest = frozen_import_identity(&stale_forwarded_imports).unwrap();
     let stale_forwarded_context =
         descriptor("stale-forwarded", std::slice::from_ref(&child_target));
-    maintenance
+    let fixture_capture_9 = maintenance
         .compaction_begin_frozen_history_with_imports(
             "ws",
             "context-c",
@@ -4018,7 +4032,7 @@ async fn frozen_own_imports_require_exact_output_membership_and_atomic_publicati
         .await
         .unwrap();
     let stale = descriptor("stale-assembled", std::slice::from_ref(&target));
-    store
+    let fixture_capture_10 = store
         .compaction_begin_frozen_history_with_imports("ws", "thread", &stale, 1, &import_digest)
         .await
         .unwrap();
@@ -4111,7 +4125,7 @@ async fn frozen_own_imports_require_exact_output_membership_and_atomic_publicati
     );
     let carried_after_delete = vec![(0, carried_after_delete)];
     let carried_after_delete_digest = frozen_import_identity(&carried_after_delete).unwrap();
-    maintenance
+    let fixture_capture_11 = maintenance
         .compaction_begin_frozen_history_with_imports(
             "ws",
             "context-c",
@@ -4198,12 +4212,7 @@ async fn frozen_own_imports_require_exact_output_membership_and_atomic_publicati
         CommitOutcome::Applied
     );
 
-    assert!(
-        !store
-            .compaction_finish_frozen_history("ws", "thread", &stale)
-            .await
-            .unwrap()
-    );
+    assert_incomplete_capture(&store, "ws", "thread", &stale, 1).await;
     assert_eq!(
         store
             .compaction_frozen_import_page("ws", "thread", &context.manifest_id, 0)
@@ -4212,6 +4221,27 @@ async fn frozen_own_imports_require_exact_output_membership_and_atomic_publicati
         records,
         "accepted metadata is retained"
     );
+    for imports in [
+        imports,
+        forwarded_imports,
+        carried_imports,
+        stale_forwarded_imports,
+        carried_after_delete,
+    ] {
+        for (_, prepared) in imports {
+            prepared.close().await.unwrap();
+        }
+    }
+    prepared.close().await.unwrap();
+    fixture_capture_11.close().await.unwrap();
+    fixture_capture_10.close().await.unwrap();
+    fixture_capture_9.close().await.unwrap();
+    fixture_capture_8.close().await.unwrap();
+    fixture_capture_7.close().await.unwrap();
+    fixture_capture_6.close().await.unwrap();
+    fixture_capture_5.close().await.unwrap();
+    fixture_capture_4.close().await.unwrap();
+    fixture_capture_3.close().await.unwrap();
 }
 
 #[tokio::test]
@@ -4224,7 +4254,7 @@ async fn frozen_own_import_treats_published_summary_as_atomic_output() {
         let mut digest = Sha256::new();
         for message in messages {
             let bytes = serde_json::to_vec(message).unwrap();
-            digest.update((bytes.len() as u64).to_le_bytes());
+            digest.update((bytes.len() as u64).to_be_bytes());
             digest.update(bytes);
         }
         FrozenHistoryRef {
@@ -4448,7 +4478,7 @@ async fn frozen_own_import_treats_published_summary_as_atomic_output() {
             "portion-output-manifest",
             std::slice::from_ref(&output_message),
         );
-        store
+        let fixture_capture_12 = store
             .compaction_begin_frozen_history("ws", "portion-child", &output)
             .await
             .unwrap();
@@ -4528,7 +4558,7 @@ async fn frozen_own_import_treats_published_summary_as_atomic_output() {
         );
         let imports = vec![(0, prepared)];
         let imports_digest = frozen_import_identity(&imports).unwrap();
-        store
+        let fixture_capture_13 = store
             .compaction_begin_frozen_history_with_imports(
                 "ws",
                 "thread",
@@ -4678,11 +4708,15 @@ async fn frozen_own_import_treats_published_summary_as_atomic_output() {
             id: &str,
             message: &FrozenMessageRef,
             prepared: PreparedFrozenImport,
-        ) -> (FrozenHistoryRef, Vec<(u64, PreparedFrozenImport)>) {
+        ) -> (
+            FrozenHistoryRef,
+            Vec<(u64, PreparedFrozenImport)>,
+            pioneer_crud::FrozenUseGuard,
+        ) {
             let target = descriptor(id, std::slice::from_ref(message));
             let imports = vec![(0, prepared)];
             let digest = frozen_import_identity(&imports).unwrap();
-            store
+            let guard = store
                 .compaction_begin_frozen_history_with_imports(
                     "ws",
                     "portion-consumer",
@@ -4702,7 +4736,7 @@ async fn frozen_own_import_treats_published_summary_as_atomic_output() {
                 )
                 .await
                 .unwrap();
-            (target, imports)
+            (target, imports, guard)
         }
 
         let unchanged = store
@@ -4716,7 +4750,7 @@ async fn frozen_own_import_treats_published_summary_as_atomic_output() {
             )
             .await
             .expect("raw leaf mutation must not invalidate atomic S evidence");
-        let (unchanged_target, unchanged_imports) =
+        let (unchanged_target, unchanged_imports, unchanged_guard) =
             begin_target(&store, "portion-target-success", &target_message, unchanged).await;
         store
             .compaction_append_frozen_imports(
@@ -4740,7 +4774,7 @@ async fn frozen_own_import_treats_published_summary_as_atomic_output() {
             )
             .await
             .unwrap();
-        let (raced_target, raced_imports) =
+        let (raced_target, raced_imports, raced_guard) =
             begin_target(&store, "portion-target-raced", &target_message, raced).await;
         db.execute_unprepared(if delete_leaf {
             "DELETE FROM compaction_checkpoint WHERE id='portion-k'"
@@ -4773,6 +4807,17 @@ async fn frozen_own_import_treats_published_summary_as_atomic_output() {
             .unwrap();
         assert_eq!(raced_state.try_get::<i64>("", "next_import").unwrap(), 0);
         assert_eq!(raced_state.try_get::<i64>("", "stored").unwrap(), 0);
+        for imports in [imports, unchanged_imports, raced_imports] {
+            for (_, prepared) in imports {
+                prepared.close().await.unwrap();
+            }
+        }
+        prepared_again.close().await.unwrap();
+        prepared_after_leaf_change.close().await.unwrap();
+        unchanged_guard.close().await.unwrap();
+        raced_guard.close().await.unwrap();
+        fixture_capture_13.close().await.unwrap();
+        fixture_capture_12.close().await.unwrap();
     }
 }
 
@@ -6256,7 +6301,7 @@ fn shared_descriptor(
     let mut digest = Sha256::new();
     for r in refs {
         let b = serde_json::to_vec(r).unwrap();
-        digest.update((b.len() as u64).to_le_bytes());
+        digest.update((b.len() as u64).to_be_bytes());
         digest.update(b);
     }
     pioneer_compaction::frozen::FrozenHistoryRef {
@@ -6273,13 +6318,13 @@ async fn shared_capture(
     shared: bool,
 ) -> pioneer_compaction::frozen::FrozenHistoryRef {
     let d = shared_descriptor(id, refs);
-    store
+    let guard = store
         .compaction_begin_frozen_history("ws", "thread", &d)
         .await
         .unwrap();
     let start = if shared {
         store
-            .compaction_share_frozen_prefix("ws", "thread", id, refs, &[])
+            .compaction_share_frozen_prefix_with_use(&guard, refs, &[])
             .await
             .unwrap()
             .0 as usize
@@ -6288,16 +6333,17 @@ async fn shared_capture(
     };
     for (i, page) in refs[start..].chunks(128).enumerate() {
         store
-            .compaction_append_frozen_history("ws", "thread", id, (start + i * 128) as u64, page)
+            .compaction_append_frozen_history_with_use(&guard, (start + i * 128) as u64, page)
             .await
             .unwrap();
     }
     assert!(
         store
-            .compaction_finish_frozen_history("ws", "thread", &d)
+            .compaction_finish_frozen_history_with_use(&guard)
             .await
             .unwrap()
     );
+    guard.close().await.unwrap();
     d
 }
 async fn shared_read(
@@ -6419,13 +6465,26 @@ async fn legacy_frozen_duplicates_convert_incrementally_without_changing_ids_or_
         (300, 0)
     );
 
+    for id in ["a", "b", "c"] {
+        let d = shared_descriptor(id, &refs);
+        p77_root(
+            &store,
+            &format!("keep-{id}"),
+            &serde_json::to_string(&d).unwrap(),
+        )
+        .await;
+    }
+    let store = p77_physical_store(&store).await;
     let mut quanta = 0;
-    while store.compact_frozen_storage_quantum().await.unwrap() {
+    for _ in 0..480 {
+        store.compact_frozen_storage_quantum().await.unwrap();
         quanta += 1;
-        assert!(quanta < 100);
-        for id in ["a", "b", "c"] {
-            assert_eq!(shared_read(&store, id).await, refs);
+        if frozen_count(&store, "compaction_frozen_message_data").await == 300 {
+            break;
         }
+    }
+    for id in ["a", "b", "c"] {
+        assert_eq!(shared_read(&store, id).await, refs);
     }
     assert!(quanta > 10);
     assert_eq!(
@@ -6441,7 +6500,7 @@ async fn legacy_frozen_duplicates_convert_incrementally_without_changing_ids_or_
             .unwrap(),
         Some("thread".into())
     );
-    assert!(!store.compact_frozen_storage_quantum().await.unwrap());
+    assert!(quanta < 480, "bounded diagnostic must reclaim duplicates");
 }
 
 #[tokio::test]
@@ -6449,7 +6508,7 @@ async fn shared_frozen_append_rollback_and_concurrent_retry_preserve_one_sequenc
     let store = store().await;
     let refs = shared_refs(25);
     let d = shared_descriptor("concurrent", &refs);
-    store
+    let guard = store
         .compaction_begin_frozen_history("ws", "thread", &d)
         .await
         .unwrap();
@@ -6471,10 +6530,10 @@ async fn shared_frozen_append_rollback_and_concurrent_retry_preserve_one_sequenc
         0
     );
     assert!(
-        !store
-            .compaction_finish_frozen_history("ws", "thread", &d)
+        store
+            .compaction_finish_frozen_history_with_use(&guard)
             .await
-            .unwrap()
+            .is_err()
     );
     db.execute_unprepared("DROP TRIGGER reject_shared_append")
         .await
@@ -6490,18 +6549,27 @@ async fn shared_frozen_append_rollback_and_concurrent_retry_preserve_one_sequenc
         25
     );
     assert_eq!(frozen_count(&store, "compaction_frozen_span").await, 1);
+    guard.close().await.unwrap();
 }
-
 #[tokio::test]
 async fn shared_frozen_cleanup_rollback_and_poison_row_do_not_lose_other_history() {
     let store = store().await;
     let refs = shared_refs(20);
     shared_capture(&store, "a", &refs, true).await;
     shared_capture(&store, "b", &refs, false).await;
+    for id in ["a", "b"] {
+        p77_root(
+            &store,
+            &format!("keep-cleanup-{id}"),
+            &serde_json::to_string(&shared_descriptor(id, &refs)).unwrap(),
+        )
+        .await;
+    }
+    let store = p77_physical_store(&store).await;
     let db = store.database_connection();
     db.execute_unprepared("CREATE TEMP TRIGGER reject_shared_cleanup BEFORE DELETE ON compaction_frozen_message_data BEGIN SELECT RAISE(ABORT,'fixture cleanup rollback'); END").await.unwrap();
     let mut failed = false;
-    for _ in 0..20 {
+    for _ in 0..240 {
         if store.compact_frozen_storage_quantum().await.is_err() {
             failed = true;
             break;
@@ -6516,8 +6584,9 @@ async fn shared_frozen_cleanup_rollback_and_poison_row_do_not_lose_other_history
     db.execute_unprepared("DROP TRIGGER reject_shared_cleanup")
         .await
         .unwrap();
-    for _ in 0..20 {
-        if !store.compact_frozen_storage_quantum().await.unwrap() {
+    for _ in 0..240 {
+        store.compact_frozen_storage_quantum().await.unwrap();
+        if frozen_count(&store, "compaction_frozen_message_data").await == 20 {
             break;
         }
     }
@@ -6527,15 +6596,23 @@ async fn shared_frozen_cleanup_rollback_and_poison_row_do_not_lose_other_history
     );
     shared_capture(&store, "c-broken", &refs, false).await;
     shared_capture(&store, "d-good", &refs, false).await;
+    for id in ["c-broken", "d-good"] {
+        p77_root(
+            &store,
+            &format!("keep-cleanup-{id}"),
+            &serde_json::to_string(&shared_descriptor(id, &refs)).unwrap(),
+        )
+        .await;
+    }
     db.execute_unprepared(
         "DELETE FROM compaction_frozen_message_data WHERE manifest_id='c-broken' AND ordinal=3",
     )
     .await
     .unwrap();
     let mut rejected = 0;
-    for _ in 0..40 {
+    for _ in 0..320 {
         match store.compact_frozen_storage_quantum().await {
-            Ok(false) => break,
+            Ok(false) => {}
             Ok(true) => {}
             Err(_) => rejected += 1,
         }
@@ -6897,4 +6974,2081 @@ async fn history_check_legacy_pages_discard_superseded_turns_and_make_progress()
             .unwrap()
             .is_empty()
     );
+}
+
+// Proposal 73 P3 regression sources: these are intentionally not executed or
+// compiled during implementation. Real issuer/binding paths build each origin.
+async fn p73_source(store: &CrudStore, id: &str, sequence: i64, payload: &str) -> SourceAssertion {
+    let mut assertion = source(store, id, sequence, payload).await;
+    let page = store
+        .compaction_source_page("ws", "thread", "turn", PagedSource::Event, 0)
+        .await
+        .unwrap();
+    let reference = &page
+        .entries
+        .iter()
+        .find(|r| r.reference.id == id)
+        .unwrap()
+        .reference;
+    assertion.revision = Some(
+        reference
+            .version
+            .strip_prefix("event-revision:")
+            .unwrap()
+            .parse()
+            .unwrap(),
+    );
+    assertion
+}
+fn p73_snapshot(id: &str, reference: SourceRef) -> OperationSnapshot {
+    let selection = ModelSelection {
+        transport: Transport::Api,
+        instance: "p".into(),
+        model: "m".into(),
+        effort: None,
+    };
+    OperationSnapshot {
+        id: id.into(),
+        owner: "owner".into(),
+        expected_checkpoint: None,
+        projection_version: 1,
+        source_epochs: Default::default(),
+        admission: CompactionSettings::default()
+            .admit(&selection, None, 10)
+            .unwrap(),
+        plan: CompactionPlan {
+            mode: CompactionMode::Normal,
+            coverage_domain: CoverageDomain::OwnContribution,
+            compact: vec![0],
+            retain: vec![],
+            coverage: vec![reference],
+            fingerprint: id.into(),
+        },
+    }
+}
+fn p73_reference(assertion: &SourceAssertion) -> frozen::FrozenMessageRef {
+    use sha2::{Digest, Sha256};
+    frozen::FrozenMessageRef {
+        logical_turn_id: Some("turn".into()),
+        source_thread: "thread".into(),
+        context_thread: None,
+        unit_id: "accepted-unit".into(),
+        sources: vec![assertion.reference()],
+        event_input_role: None,
+        source_aliases: vec![],
+        ambiguous_input_aliases: vec![],
+        publication_aliases: None,
+        inherited: false,
+        complete: true,
+        protected_input: false,
+        wire_sha256: hex::encode(Sha256::digest(assertion.payload.as_bytes())),
+        replay_source: None,
+        tool_item_id: None,
+        tool_call_id: None,
+        tool_name: None,
+    }
+}
+async fn p73_capture(
+    store: &CrudStore,
+    id: &str,
+    refs: &[frozen::FrozenMessageRef],
+) -> pioneer_crud::FrozenUseGuard {
+    use sha2::{Digest, Sha256};
+    let mut digest = Sha256::new();
+    for reference in refs {
+        let json = serde_json::to_vec(reference).unwrap();
+        digest.update((json.len() as u64).to_be_bytes());
+        digest.update(json);
+    }
+    let descriptor = frozen::FrozenHistoryRef {
+        format: 1,
+        manifest_id: format!("p73-{id}"),
+        messages: refs.len() as u64,
+        identity_sha256: hex::encode(digest.finalize()),
+    };
+    let guard = store
+        .compaction_begin_frozen_history("ws", "thread", &descriptor)
+        .await
+        .unwrap();
+    for (index, chunk) in refs.chunks(32).enumerate() {
+        store
+            .compaction_append_frozen_history_with_use(&guard, (index * 32) as u64, chunk)
+            .await
+            .unwrap();
+    }
+    store
+        .compaction_finish_frozen_history_with_use(&guard)
+        .await
+        .unwrap();
+    guard
+}
+async fn p73_native_candidate(
+    store: &CrudStore,
+    id: &str,
+    assertion: &SourceAssertion,
+    guard: &pioneer_crud::FrozenUseGuard,
+    bind: bool,
+) -> Checkpoint {
+    let snapshot = p73_snapshot(id, assertion.reference());
+    store
+        .compaction_admit_frozen_for_turn(
+            "ws",
+            "thread",
+            &snapshot,
+            Some("turn"),
+            &guard.descriptor(),
+            guard,
+        )
+        .await
+        .unwrap();
+    if bind {
+        store
+            .compaction_bind_source_projection(id, &guard.descriptor())
+            .await
+            .unwrap();
+    }
+    store
+        .compaction_prepare_runner(id, &ModelBudget::new(None, None, None), 1, 0)
+        .await
+        .unwrap();
+    store
+        .compaction_append_manifest(
+            id,
+            &[ManifestEntry {
+                ordinal: 0,
+                unit: 0,
+                reference_only: false,
+                thread_id: "thread".into(),
+                source: assertion.reference(),
+            }],
+        )
+        .await
+        .unwrap();
+    let initial = pioneer_compaction::runner::RunnerState::new(
+        snapshot.admission.deadline_ms,
+        &ModelBudget::new(None, None, None),
+        1000,
+        None,
+    )
+    .unwrap();
+    if bind {
+        store
+            .compaction_activate_runner(id, &initial)
+            .await
+            .unwrap();
+    }
+    let cp = Checkpoint {
+        id: format!("cp-{id}"),
+        operation_id: id.into(),
+        owner: "owner".into(),
+        previous: None,
+        format_version: 1,
+        coverage: vec![assertion.reference()],
+        summary: "Saved accepted summary".into(),
+        selection: ModelSelection {
+            transport: Transport::Api,
+            instance: "p".into(),
+            model: "m".into(),
+            effort: None,
+        },
+        projection_version: 1,
+    };
+    store.compaction_save_candidate(&cp, 0).await.unwrap();
+    cp
+}
+async fn p73_accounting(
+    store: &CrudStore,
+    id: &str,
+) -> (String, String, Option<i64>, Option<i64>, String) {
+    let row=store.database_connection().query_one_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+        "SELECT frozen_publication_contract,frozen_accounting_mode,frozen_checkpoint_count,frozen_prepared_checkpoint_count,frozen_proof_state FROM compaction_operation WHERE id=?",[id.into()])).await.unwrap().unwrap();
+    (
+        row.try_get("", "frozen_publication_contract").unwrap(),
+        row.try_get("", "frozen_accounting_mode").unwrap(),
+        row.try_get("", "frozen_checkpoint_count").unwrap(),
+        row.try_get("", "frozen_prepared_checkpoint_count").unwrap(),
+        row.try_get("", "frozen_proof_state").unwrap(),
+    )
+}
+
+#[tokio::test]
+async fn p73_explicit_compat_nonempty_no_origin_applies_after_permit_and_remains_legacy() {
+    let base = store().await;
+    let store = base.with_frozen_history_protocol(
+        pioneer_crud::FrozenHistoryProtocolPermit::confirm_all_old_writers_stopped(),
+    );
+    let assertion = p73_source(&store, "p73-compat-source", 1, "{\"accepted\":true}").await;
+    let cp = candidate(&store, "p73-compat", None, &assertion).await;
+    assert_eq!(
+        p73_accounting(&store, "p73-compat").await,
+        (
+            "assertion_compat".into(),
+            "legacy_bound".into(),
+            None,
+            None,
+            "legacy".into()
+        )
+    );
+    assert_eq!(
+        store
+            .compaction_apply(&cp, None, std::slice::from_ref(&assertion))
+            .await
+            .unwrap(),
+        CommitOutcome::Applied
+    );
+    assert_eq!(
+        store
+            .compaction_apply(&cp, None, &[assertion])
+            .await
+            .unwrap(),
+        CommitOutcome::AlreadyApplied
+    );
+    assert!(
+        store
+            .compaction_prepare_checkpoint_proof(&cp.id)
+            .await
+            .is_err()
+    );
+    assert_eq!(p73_accounting(&store, "p73-compat").await.4, "legacy");
+}
+
+#[tokio::test]
+async fn p73_native_before_bind_is_not_assertion_compatible_and_intent_is_immutable() {
+    let store = store().await;
+    let assertion = p73_source(&store, "p73-native-source", 1, "{\"accepted\":true}").await;
+    let guard = p73_capture(&store, "before-bind", &[p73_reference(&assertion)]).await;
+    let cp = p73_native_candidate(&store, "p73-before-bind", &assertion, &guard, false).await;
+    let error = store
+        .compaction_apply(&cp, None, std::slice::from_ref(&assertion))
+        .await
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("no bound origin"));
+    assert_eq!(
+        p73_accounting(&store, "p73-before-bind").await,
+        (
+            "native_frozen".into(),
+            "legacy_bound".into(),
+            None,
+            None,
+            "legacy".into()
+        )
+    );
+    let error = store
+        .compaction_admit(
+            "ws",
+            "thread",
+            &p73_snapshot("p73-before-bind", assertion.reference()),
+        )
+        .await
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("incompatible frozen publication intent"));
+    assert_eq!(
+        store
+            .compaction_operation("p73-before-bind")
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        "running"
+    );
+    store
+        .compaction_bind_source_projection("p73-before-bind", &guard.descriptor())
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .compaction_apply(&cp, None, &[assertion])
+            .await
+            .unwrap(),
+        CommitOutcome::Applied
+    );
+    guard.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn p73_live_insert_conflict_prepare_and_complete_are_exactly_once_for_all_checkpoints() {
+    let base = store().await;
+    let store = base.with_frozen_history_protocol(
+        pioneer_crud::FrozenHistoryProtocolPermit::confirm_all_old_writers_stopped(),
+    );
+    let assertion = p73_source(&store, "p73-count-source", 1, "{\"accepted\":true}").await;
+    let guard = p73_capture(&store, "counts", &[p73_reference(&assertion)]).await;
+    let first = p73_native_candidate(&store, "p73-counts", &assertion, &guard, true).await;
+    store.compaction_save_candidate(&first, 0).await.unwrap();
+    assert_eq!(p73_accounting(&store, "p73-counts").await.2, Some(1));
+    let mut second = first.clone();
+    second.id = "p73-second-before-first-id".into();
+    // A prior unused candidate remains part of the operation inventory.
+    second.previous = None;
+    store.compaction_save_candidate(&second, 1).await.unwrap();
+    store
+        .compaction_prepare_checkpoint_proof(&second.id)
+        .await
+        .unwrap();
+    store
+        .compaction_prepare_checkpoint_proof(&second.id)
+        .await
+        .unwrap();
+    let partial = p73_accounting(&store, "p73-counts").await;
+    assert_eq!(
+        (partial.2, partial.3, partial.4),
+        (Some(2), Some(1), "pending".into())
+    );
+    store
+        .compaction_prepare_checkpoint_proof(&first.id)
+        .await
+        .unwrap();
+    store
+        .compaction_prepare_checkpoint_proof(&first.id)
+        .await
+        .unwrap();
+    assert_eq!(p73_accounting(&store, "p73-counts").await.3, Some(2));
+    assert_eq!(
+        store
+            .compaction_apply(&second, None, &[assertion])
+            .await
+            .unwrap(),
+        CommitOutcome::Applied
+    );
+    assert_eq!(
+        p73_accounting(&store, "p73-counts").await,
+        (
+            "native_frozen".into(),
+            "live_known".into(),
+            Some(2),
+            Some(2),
+            "complete".into()
+        )
+    );
+    guard.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn p73_legacy_shadow_proof_restart_does_not_promote_null_accounting_or_heal_prepared_body() {
+    let store = store().await;
+    let assertion = p73_source(&store, "p73-shadow-source", 1, "{\"accepted\":true}").await;
+    let mut reference = p73_reference(&assertion);
+    reference.source_aliases.push(frozen::FrozenSourceAlias {
+        represented_thread: "thread".into(),
+        represented_source: assertion.reference(),
+        source_thread: "thread".into(),
+        source: SourceRef {
+            scope: "input:turn".into(),
+            id: "accepted-copy".into(),
+            version: "opaque/α:release".into(),
+        },
+    });
+    let guard = p73_capture(&store, "shadow", &[reference]).await;
+    let cp = p73_native_candidate(&store, "p73-shadow", &assertion, &guard, true).await;
+    store
+        .compaction_prepare_checkpoint_proof(&cp.id)
+        .await
+        .unwrap();
+    assert_eq!(
+        p73_accounting(&store, "p73-shadow").await,
+        (
+            "native_frozen".into(),
+            "legacy_bound".into(),
+            None,
+            None,
+            "legacy".into()
+        )
+    );
+    let db = store.database_connection();
+    // Build a valid pending-prefix restart fixture from the verified header
+    // blueprint. This setup is separate from the prepared-corruption oracle.
+    db.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "UPDATE compaction_checkpoint_proof SET state='pending',next_alias=0 WHERE checkpoint_id=?",
+        [cp.id.clone().into()],
+    ))
+    .await
+    .unwrap();
+    db.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "DELETE FROM compaction_checkpoint_replay_proof WHERE checkpoint_id=?",
+        [cp.id.clone().into()],
+    ))
+    .await
+    .unwrap();
+    store
+        .compaction_prepare_checkpoint_proof(&cp.id)
+        .await
+        .unwrap();
+    let row=db.query_one_raw(Statement::from_sql_and_values(DbBackend::Sqlite,"SELECT alias_count,next_alias,state FROM compaction_checkpoint_proof WHERE checkpoint_id=?",[cp.id.clone().into()])).await.unwrap().unwrap();
+    assert_eq!(row.try_get::<i64>("", "alias_count").unwrap(), 1);
+    assert_eq!(row.try_get::<i64>("", "next_alias").unwrap(), 1);
+    assert_eq!(row.try_get::<String>("", "state").unwrap(), "prepared");
+    db.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "DELETE FROM compaction_checkpoint_replay_proof WHERE checkpoint_id=?",
+        [cp.id.clone().into()],
+    ))
+    .await
+    .unwrap();
+    assert!(
+        store
+            .compaction_prepare_checkpoint_proof(&cp.id)
+            .await
+            .is_err()
+    );
+    let rows = db
+        .query_one_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "SELECT COUNT(*) AS n FROM compaction_checkpoint_replay_proof WHERE checkpoint_id=?",
+            [cp.id.into()],
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get::<i64>("", "n")
+        .unwrap();
+    assert_eq!(rows, 0, "prepared corruption was silently healed");
+    guard.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn p73_long_alias_metadata_is_staged_in_pages_with_none_some_empty_and_opaque_versions_preserved()
+ {
+    for explicit_empty in [false, true] {
+        let store = store().await;
+        let assertion = p73_source(&store, "p73-long-source", 1, "{\"accepted\":true}").await;
+        let mut refs = Vec::new();
+        for ordinal in 0..150 {
+            let mut reference = p73_reference(&assertion);
+            reference.unit_id = format!("unit-{ordinal}");
+            reference.source_aliases.push(frozen::FrozenSourceAlias {
+                represented_thread: "thread".into(),
+                represented_source: assertion.reference(),
+                source_thread: "thread".into(),
+                source: SourceRef {
+                    scope: "input:turn".into(),
+                    id: format!("copy-{ordinal:03}"),
+                    version: format!("opaque/α:{}", "v".repeat(4000)),
+                },
+            });
+            if explicit_empty {
+                reference.publication_aliases = Some(frozen::FrozenPublicationAliases {
+                    source_aliases: vec![],
+                    ambiguous_input_aliases: vec![],
+                });
+            }
+            refs.push(reference);
+        }
+        let guard = p73_capture(&store, "long-metadata", &refs).await;
+        let cp = p73_native_candidate(&store, "p73-long-metadata", &assertion, &guard, true).await;
+        store
+            .compaction_prepare_checkpoint_proof(&cp.id)
+            .await
+            .unwrap();
+        let edges = store
+            .compaction_checkpoint_edges(&cp.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            edges.replay_aliases.len(),
+            if explicit_empty { 0 } else { 150 }
+        );
+        if !explicit_empty {
+            assert_eq!(
+                edges.replay_aliases[0].replay.source.version,
+                format!("opaque/α:{}", "v".repeat(4000))
+            );
+        }
+        guard.close().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn p73_reference_digest_corruption_is_not_a_prepared_proof() {
+    let store = store().await;
+    let assertion = p73_source(&store, "p73-corrupt-source", 1, "{\"accepted\":true}").await;
+    let mut reference = p73_reference(&assertion);
+    let guard = p73_capture(&store, "corrupt", std::slice::from_ref(&reference)).await;
+    let cp = p73_native_candidate(&store, "p73-corrupt", &assertion, &guard, true).await;
+    reference.wire_sha256 = "b".repeat(64);
+    let json = serde_json::to_string(&reference).unwrap();
+    store.database_connection().execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+        "UPDATE compaction_frozen_message_data SET reference_json=?,bytes=? WHERE manifest_id=? AND ordinal=0",
+        [json.clone().into(),(json.len() as i64).into(),guard.descriptor().manifest_id.into()])).await.unwrap();
+    let error = store
+        .compaction_prepare_checkpoint_proof(&cp.id)
+        .await
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("digest mismatch"));
+    let n=store.database_connection().query_one_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+        "SELECT COUNT(*) AS n FROM compaction_checkpoint_proof WHERE checkpoint_id=? AND state='prepared'",[cp.id.into()])).await.unwrap().unwrap().try_get::<i64>("","n").unwrap();
+    assert_eq!(n, 0);
+    assert_eq!(p73_accounting(&store, "p73-corrupt").await.3, None);
+    guard.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn p73_conflicting_event_roles_are_preserved_and_fail_graph_publication() {
+    let base = store().await;
+    let store = base.with_frozen_history_protocol(
+        pioneer_crud::FrozenHistoryProtocolPermit::confirm_all_old_writers_stopped(),
+    );
+    let assertion = p73_source(&store, "p73-role-source", 1, "{\"accepted\":true}").await;
+    let refs = [
+        frozen::FrozenEventInputRole::Authoritative,
+        frozen::FrozenEventInputRole::Deleted,
+        frozen::FrozenEventInputRole::InputCopy,
+    ]
+    .into_iter()
+    .map(|role| {
+        let mut reference = p73_reference(&assertion);
+        reference.event_input_role = Some(role);
+        reference
+    })
+    .collect::<Vec<_>>();
+    let guard = p73_capture(&store, "roles", &refs).await;
+    let cp = p73_native_candidate(&store, "p73-roles", &assertion, &guard, true).await;
+    store
+        .compaction_prepare_checkpoint_proof(&cp.id)
+        .await
+        .unwrap();
+    let edges = store
+        .compaction_checkpoint_edges(&cp.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        edges
+            .event_input_evidence
+            .iter()
+            .map(|row| row.role.as_str())
+            .collect::<Vec<_>>(),
+        vec!["authoritative", "deleted", "input_copy"]
+    );
+    let error = store
+        .compaction_apply(&cp, None, &[assertion])
+        .await
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("event-input evidence is ambiguous"));
+    assert_eq!(
+        store
+            .compaction_operation("p73-roles")
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        "running"
+    );
+    guard.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn p73_native_cannot_adopt_assertion_intent_even_with_an_optional_origin() {
+    let store = store().await;
+    let assertion = p73_source(&store, "p73-adopt", 1, "{}").await;
+    let cp = candidate(&store, "p73-assertion-adopt", None, &assertion).await;
+    let guard = p73_capture(&store, "adopt", &[p73_reference(&assertion)]).await;
+    store
+        .compaction_bind_execution_turn(&cp.operation_id, "turn")
+        .await
+        .unwrap();
+    store
+        .compaction_bind_source_projection(&cp.operation_id, &guard.descriptor())
+        .await
+        .unwrap();
+    assert!(
+        store
+            .compaction_admit_frozen_for_turn(
+                "ws",
+                "thread",
+                &p73_snapshot(&cp.operation_id, assertion.reference()),
+                None,
+                &guard.descriptor(),
+                &guard
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        p73_accounting(&store, &cp.operation_id).await.0,
+        "assertion_compat"
+    );
+    guard.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn p73_actual_runner_insert_accounts_once_and_saved_commit_survives_raw_delete() {
+    let base = store().await;
+    let store = base.with_frozen_history_protocol(
+        pioneer_crud::FrozenHistoryProtocolPermit::confirm_all_old_writers_stopped(),
+    );
+    let assertion = p73_source(&store, "p73-runner-source", 1, "{}").await;
+    let guard = p73_capture(&store, "runner", &[p73_reference(&assertion)]).await;
+    let snapshot = p73_snapshot("p73-runner", assertion.reference());
+    store
+        .compaction_admit_frozen_for_turn(
+            "ws",
+            "thread",
+            &snapshot,
+            Some("turn"),
+            &guard.descriptor(),
+            &guard,
+        )
+        .await
+        .unwrap();
+    store
+        .compaction_bind_source_projection(&snapshot.id, &guard.descriptor())
+        .await
+        .unwrap();
+    let commit = ready_operation(
+        &store,
+        &snapshot,
+        &[("thread".into(), assertion.reference())],
+    )
+    .await;
+    assert_eq!(p73_accounting(&store, &snapshot.id).await.2, Some(1));
+    // Already consumed generation cannot produce another actual insert.
+    assert!(
+        !store
+            .compaction_runner_transition(&snapshot.id, commit.generation - 1, &commit, None)
+            .await
+            .unwrap()
+    );
+    assert_eq!(p73_accounting(&store, &snapshot.id).await.2, Some(1));
+    let pioneer_compaction::runner::RunnerPhase::Commit { checkpoint } = &commit.phase else {
+        panic!("actual helper must reach Commit")
+    };
+    store
+        .compaction_prepare_checkpoint_proof(checkpoint)
+        .await
+        .unwrap();
+    store
+        .database_connection()
+        .execute_unprepared("DELETE FROM turn_event WHERE id='p73-runner-source'")
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .compaction_apply_runner(&snapshot.id, &commit, None)
+            .await
+            .unwrap(),
+        CommitOutcome::Applied
+    );
+    assert_eq!(p73_accounting(&store, &snapshot.id).await.4, "complete");
+    assert_eq!(
+        store
+            .compaction_apply_runner(&snapshot.id, &commit, None)
+            .await
+            .unwrap(),
+        CommitOutcome::AlreadyApplied
+    );
+    guard.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn p73_empty_import_digest_corruption_is_not_inferred_as_empty_success() {
+    let store = store().await;
+    let assertion = p73_source(&store, "p73-import-digest-source", 1, "{}").await;
+    let guard = p73_capture(&store, "import-digest", &[p73_reference(&assertion)]).await;
+    let cp = p73_native_candidate(&store, "p73-import-digest", &assertion, &guard, true).await;
+    let db = store.database_connection();
+    // Fault injection changes the private import digest on both sides of the
+    // binding, leaving public reference identity and declared zero count intact.
+    db.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "UPDATE compaction_frozen_history SET imports_sha256=? WHERE id=?",
+        ["b".repeat(64).into(), guard.descriptor().manifest_id.into()],
+    ))
+    .await
+    .unwrap();
+    db.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "UPDATE compaction_operation_projection SET imports_sha256=? WHERE operation_id=?",
+        ["b".repeat(64).into(), cp.operation_id.clone().into()],
+    ))
+    .await
+    .unwrap();
+    let error = store
+        .compaction_prepare_checkpoint_proof(&cp.id)
+        .await
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("digest mismatch"));
+    assert_eq!(
+        p73_accounting(&store, &cp.operation_id).await.4,
+        "quarantined"
+    );
+    guard.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn p73_prepared_proof_allows_unrelated_append_but_preserves_real_source_and_head_staleness() {
+    for mutation in ["unrelated", "raw", "head"] {
+        let base = store().await;
+        let store = base.with_frozen_history_protocol(
+            pioneer_crud::FrozenHistoryProtocolPermit::confirm_all_old_writers_stopped(),
+        );
+        let assertion = p73_source(&store, "p73-boundary-source", 1, "{}").await;
+        let guard = p73_capture(&store, "boundary", &[p73_reference(&assertion)]).await;
+        let cp = p73_native_candidate(&store, "p73-boundary", &assertion, &guard, true).await;
+        store
+            .compaction_prepare_checkpoint_proof(&cp.id)
+            .await
+            .unwrap();
+        match mutation {
+            "unrelated" => {
+                source(&store, "p73-unrelated", 2, "{}").await;
+            }
+            "raw" => {
+                store
+                    .database_connection()
+                    .execute_unprepared(
+                        "UPDATE turn_event SET payload='changed' WHERE id='p73-boundary-source'",
+                    )
+                    .await
+                    .unwrap();
+            }
+            "head" => {
+                let winner = candidate(&store, "p73-winner", None, &assertion).await;
+                assert_eq!(
+                    store
+                        .compaction_apply(&winner, None, std::slice::from_ref(&assertion))
+                        .await
+                        .unwrap(),
+                    CommitOutcome::Applied
+                );
+            }
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            store
+                .compaction_apply(&cp, None, &[assertion])
+                .await
+                .unwrap(),
+            if mutation == "unrelated" {
+                CommitOutcome::Applied
+            } else {
+                CommitOutcome::Stale
+            },
+            "{mutation}"
+        );
+        guard.close().await.unwrap();
+        let remaining = store
+            .database_connection()
+            .query_one_raw(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT COUNT(*) AS n FROM compaction_frozen_use".to_owned(),
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get::<i64>("", "n")
+            .unwrap();
+        assert_eq!(
+            remaining, 0,
+            "ordinary proof/publication errors must close acquired uses"
+        );
+    }
+}
+
+// P4 regression sources, never executed/compiled during implementation.
+async fn p74_task_carrier(store: &CrudStore, run: &str, body: &str) {
+    let task = format!("task-{run}");
+    let db = store.database_connection();
+    db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,"INSERT INTO task(id,workspace_id,owner_kind,owner_id,created_by_thread_id,created_by_turn_id,executor_kind,status,title,goal) VALUES (?,'ws','thread','thread','thread','turn','agent','running','Task','fixture')",[task.clone().into()])).await.unwrap();
+    db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,"INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES (?,?,?,1,1,'running','agent')",[run.into(),task.clone().into(),run.into()])).await.unwrap();
+    // Old writer compatibility: defaults leave the derived scalar unknown.
+    db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,"INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at) VALUES (?,?,'ws','thread',?,CURRENT_TIMESTAMP)",[run.into(),task.into(),body.into()])).await.unwrap();
+}
+async fn p74_quanta(store: &CrudStore, n: usize) {
+    for _ in 0..n {
+        store.compact_frozen_storage_quantum().await.unwrap();
+    }
+}
+async fn p74_root_state(store: &CrudStore, run: &str) -> (Option<String>, String, String) {
+    let row=store.database_connection().query_one_raw(Statement::from_sql_and_values(DbBackend::Sqlite,"SELECT frozen_manifest_id,frozen_root_state,history_json FROM task_run_conversation_snapshot WHERE run_id=?",[run.into()])).await.unwrap().unwrap();
+    (
+        row.try_get("", "frozen_manifest_id").unwrap(),
+        row.try_get("", "frozen_root_state").unwrap(),
+        row.try_get("", "history_json").unwrap(),
+    )
+}
+
+#[tokio::test]
+async fn p74_gate_is_closed_and_fresh_inventory_classifies_original_large_carriers_without_revision_write()
+ {
+    let base = store().await;
+    let body =
+        serde_json::to_string(&serde_json::json!([{"role":"user","content":"α".repeat(160_000)}]))
+            .unwrap();
+    p74_task_carrier(&base, "p74-inline", &body).await;
+    let revision = base
+        .database_connection()
+        .query_one_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT revision FROM compaction_task_basis_revision WHERE run_id='p74-inline'"
+                .to_owned(),
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get::<i64>("", "revision")
+        .unwrap();
+    p74_quanta(&base, 4).await;
+    assert_eq!(p74_root_state(&base, "p74-inline").await.1, "unknown");
+    assert!(
+        !base
+            .compaction_frozen_workspace_inventory_ready("ws")
+            .await
+            .unwrap()
+    );
+    let store = base.with_frozen_history_protocol(
+        pioneer_crud::FrozenHistoryProtocolPermit::confirm_all_old_writers_stopped(),
+    );
+    p74_quanta(&store, 120).await;
+    assert_eq!(
+        p74_root_state(&store, "p74-inline").await,
+        (None, "none".into(), body)
+    );
+    let after = store
+        .database_connection()
+        .query_one_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT revision FROM compaction_task_basis_revision WHERE run_id='p74-inline'"
+                .to_owned(),
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get::<i64>("", "revision")
+        .unwrap();
+    assert_eq!(after, revision);
+    assert!(
+        store
+            .compaction_frozen_workspace_inventory_ready("ws")
+            .await
+            .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn p74_missing_promised_origin_is_blocked_but_valid_orphan_preserves_scalar_id() {
+    let base = store().await;
+    let missing = frozen::FrozenHistoryRef {
+        format: 1,
+        manifest_id: "missing-p74".into(),
+        messages: 0,
+        identity_sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".into(),
+    };
+    let json = serde_json::to_string(&missing).unwrap();
+    p74_task_carrier(&base, "p74-blocked", &json).await;
+    let store = base.with_frozen_history_protocol(
+        pioneer_crud::FrozenHistoryProtocolPermit::confirm_all_old_writers_stopped(),
+    );
+    p74_quanta(&store, 120).await;
+    assert_eq!(
+        p74_root_state(&store, "p74-blocked").await,
+        (None, "blocked".into(), json.clone())
+    );
+    assert!(
+        !store
+            .compaction_frozen_workspace_inventory_ready("ws")
+            .await
+            .unwrap()
+    );
+    // Separate accepted-orphan fixture: domain termination leaves original row
+    // with FK OFF. A fresh pass must preserve the descriptor's durable root.
+    store
+        .database_connection()
+        .execute_unprepared("PRAGMA foreign_keys=OFF")
+        .await
+        .unwrap();
+    store
+        .database_connection()
+        .execute_unprepared("DELETE FROM task_run WHERE id='p74-blocked'")
+        .await
+        .unwrap();
+    store.database_connection().execute_unprepared("UPDATE compaction_frozen_maintenance_progress SET after_key=NULL,state='pending' WHERE workspace_id='ws' AND phase='root_task'").await.unwrap();
+    p74_quanta(&store, 120).await;
+    assert_eq!(
+        p74_root_state(&store, "p74-blocked").await,
+        (Some("missing-p74".into()), "manifest".into(), json)
+    );
+}
+
+#[tokio::test]
+async fn p74_completed_inventory_counts_preprepared_and_id_before_final_once_while_running_and_compat_stay_legacy()
+ {
+    let base = store().await;
+    let assertion = p73_source(&base, "p74-source", 1, "{}").await;
+    let guard = p73_capture(&base, "completed-inventory", &[p73_reference(&assertion)]).await;
+    let final_cp = p73_native_candidate(&base, "p74-completed", &assertion, &guard, true).await;
+    let mut earlier = final_cp.clone();
+    earlier.id = "000-p74-earlier".into();
+    base.compaction_save_candidate(&earlier, 1).await.unwrap();
+    base.compaction_prepare_checkpoint_proof(&earlier.id)
+        .await
+        .unwrap();
+    assert_eq!(p73_accounting(&base, "p74-completed").await.2, None);
+    assert_eq!(
+        base.compaction_apply(&final_cp, None, std::slice::from_ref(&assertion))
+            .await
+            .unwrap(),
+        CommitOutcome::Applied
+    );
+    // Standalone compatibility remains NULL/legacy even completed after permit.
+    let compat = candidate(&base, "p74-compat", Some(&final_cp.id), &assertion).await;
+    assert_eq!(
+        base.compaction_apply(
+            &compat,
+            Some(&final_cp.id),
+            std::slice::from_ref(&assertion)
+        )
+        .await
+        .unwrap(),
+        CommitOutcome::Applied
+    );
+    let mut running_snapshot = p73_snapshot("p74-running", assertion.reference());
+    running_snapshot.expected_checkpoint = Some(compat.id.clone());
+    base.compaction_admit_frozen_for_turn(
+        "ws",
+        "thread",
+        &running_snapshot,
+        Some("turn"),
+        &guard.descriptor(),
+        &guard,
+    )
+    .await
+    .unwrap();
+    base.compaction_bind_source_projection(&running_snapshot.id, &guard.descriptor())
+        .await
+        .unwrap();
+    let store = base.with_frozen_history_protocol(
+        pioneer_crud::FrozenHistoryProtocolPermit::confirm_all_old_writers_stopped(),
+    );
+    p74_quanta(&store, 240).await;
+    assert_eq!(
+        p73_accounting(&store, "p74-completed").await,
+        (
+            "native_frozen".into(),
+            "completed_inventory".into(),
+            Some(2),
+            Some(2),
+            "complete".into()
+        )
+    );
+    assert_eq!(p73_accounting(&store, "p74-running").await.2, None);
+    assert_eq!(p73_accounting(&store, "p74-compat").await.2, None);
+    p74_quanta(&store, 48).await;
+    assert_eq!(p73_accounting(&store, "p74-completed").await.2, Some(2));
+    guard.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn p74_inventory_restarts_from_actual_null_cursor_and_preprepared_flags_without_double_counts()
+ {
+    let base = store().await;
+    let assertion = p73_source(&base, "p74-restart-source", 1, "{}").await;
+    let guard = p73_capture(&base, "restart-inventory", &[p73_reference(&assertion)]).await;
+    let cp = p73_native_candidate(&base, "p74-restart", &assertion, &guard, true).await;
+    base.compaction_prepare_checkpoint_proof(&cp.id)
+        .await
+        .unwrap();
+    assert_eq!(
+        base.compaction_apply(&cp, None, &[assertion])
+            .await
+            .unwrap(),
+        CommitOutcome::Applied
+    );
+    let store = base.with_frozen_history_protocol(
+        pioneer_crud::FrozenHistoryProtocolPermit::confirm_all_old_writers_stopped(),
+    );
+    let mut started = false;
+    for _ in 0..60 {
+        store.compact_frozen_storage_quantum().await.unwrap();
+        if p73_accounting(&store, "p74-restart").await.1 == "completed_inventory" {
+            started = true;
+            break;
+        }
+    }
+    assert!(started, "bounded diagnostic loop must reach start boundary");
+    let row=store.database_connection().query_one_raw(Statement::from_string(DbBackend::Sqlite,"SELECT frozen_inventory_state,frozen_checkpoint_count,frozen_prepared_checkpoint_count,frozen_backfill_after_checkpoint FROM compaction_operation WHERE id='p74-restart'".to_owned())).await.unwrap().unwrap();
+    assert_eq!(
+        row.try_get::<String>("", "frozen_inventory_state").unwrap(),
+        "pending"
+    );
+    assert_eq!(
+        row.try_get::<Option<String>>("", "frozen_backfill_after_checkpoint")
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        row.try_get::<i64>("", "frozen_checkpoint_count").unwrap(),
+        0
+    );
+    assert_eq!(
+        row.try_get::<i64>("", "frozen_prepared_checkpoint_count")
+            .unwrap(),
+        0
+    );
+    // A new store loses only fairness memory; durable cursor/flags are authority.
+    let restarted = CrudStore::new(store.database_connection().clone())
+        .with_maintenance_access()
+        .with_frozen_history_protocol(
+            pioneer_crud::FrozenHistoryProtocolPermit::confirm_all_old_writers_stopped(),
+        );
+    p74_quanta(&restarted, 180).await;
+    assert_eq!(p73_accounting(&restarted, "p74-restart").await.2, Some(1));
+    assert_eq!(p73_accounting(&restarted, "p74-restart").await.3, Some(1));
+    assert_eq!(
+        p73_accounting(&restarted, "p74-restart").await.4,
+        "complete"
+    );
+    guard.close().await.unwrap();
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn p74_root_original_byte_cas_rejects_same_length_race_and_keeps_prefix_uncommitted() {
+    let base = store().await;
+    p74_task_carrier(&base, "p74-byte-race", "[]").await;
+    let store = base.with_frozen_history_protocol(
+        pioneer_crud::FrozenHistoryProtocolPermit::confirm_all_old_writers_stopped(),
+    );
+    let mut hook = arm_publication_test_hook(
+        &store,
+        "p74-byte-race",
+        PublicationTestPause::RootInventoryBeforeWriter,
+    );
+    let participant = store.clone();
+    let task = tokio::spawn(async move {
+        for _ in 0..3 {
+            participant.compact_frozen_storage_quantum().await?;
+        }
+        anyhow::Result::<()>::Ok(())
+    });
+    hook.reached().await;
+    store.database_connection().execute_unprepared("UPDATE task_run_conversation_snapshot SET history_json='{}' WHERE run_id='p74-byte-race'").await.unwrap();
+    hook.release();
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_err()
+    );
+    assert_eq!(
+        p74_root_state(&store, "p74-byte-race").await,
+        (None, "unknown".into(), "{}".into())
+    );
+    let row=store.database_connection().query_one_raw(Statement::from_string(DbBackend::Sqlite,"SELECT after_key FROM compaction_frozen_maintenance_progress WHERE workspace_id='ws' AND phase='root_task'".to_owned())).await.unwrap().unwrap();
+    assert_eq!(
+        row.try_get::<Option<String>>("", "after_key").unwrap(),
+        None
+    );
+    p74_quanta(&store, 120).await;
+    assert_eq!(p74_root_state(&store, "p74-byte-race").await.1, "blocked");
+}
+
+#[tokio::test]
+async fn p74_cleanup_seed_is_finite_and_new_header_before_cursor_gets_both_durable_jobs() {
+    let base = store().await;
+    let guard = p73_capture(&base, "seed-z", &[]).await;
+    guard.close().await.unwrap();
+    let store = base.with_frozen_history_protocol(
+        pioneer_crud::FrozenHistoryProtocolPermit::confirm_all_old_writers_stopped(),
+    );
+    p74_quanta(&store, 120).await;
+    let db = store.database_connection();
+    let state=db.query_one_raw(Statement::from_string(DbBackend::Sqlite,"SELECT state FROM compaction_frozen_maintenance_progress WHERE workspace_id='ws' AND phase='cleanup_seed'".to_owned())).await.unwrap().unwrap().try_get::<String>("","state").unwrap();
+    assert_eq!(state, "complete");
+    // INSERT dirty trigger closes IDs arriving before the already complete cursor.
+    let new = p73_capture(&store, "000-seed-new", &[]).await;
+    let id = new.descriptor().manifest_id;
+    let n=db.query_one_raw(Statement::from_sql_and_values(DbBackend::Sqlite,"SELECT COUNT(*) AS n FROM compaction_frozen_cleanup WHERE manifest_id=? AND kind IN (0,1)",[id.into()])).await.unwrap().unwrap().try_get::<i64>("","n").unwrap();
+    assert_eq!(n, 2);
+    new.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn p74_all_runtime_and_cli_carriers_finish_empty_initial_inventories_without_rewriting_json()
+{
+    let base = store().await;
+    let db = base.database_connection();
+    db.execute_unprepared("INSERT INTO turn_runtime_snapshot(turn_id,thread_id,workspace_id,mode_json,model,provider_name,hook_runtime_context_json,workspace_skill_policies_json,input_json,capabilities_json,resolved_artifacts_json,runtime_environment_json,history_json) VALUES('turn','thread','ws','{}','model','provider','{}','{}','{}','{}','[]','{}','[]')").await.unwrap();
+    db.execute_unprepared("INSERT INTO thread_cli_runtime_binding(thread_id,workspace_id,runtime_id,runtime_kind,native_thread_id,status) VALUES('thread','ws','claude','claude','native','ready')").await.unwrap();
+    db.execute_unprepared("INSERT INTO turn_cli_runtime_binding(turn_id,thread_id,continuation_thread_id,workspace_id,runtime_id,runtime_kind,native_thread_id,status) VALUES('turn','thread','thread','ws','claude','claude','native','running')").await.unwrap();
+    let store = base.with_frozen_history_protocol(
+        pioneer_crud::FrozenHistoryProtocolPermit::confirm_all_old_writers_stopped(),
+    );
+    p74_quanta(&store, 144).await;
+    for (table, body, expected) in [
+        ("turn_runtime_snapshot", "history_json", "[]"),
+        ("thread_cli_runtime_binding", "resume_cursor_json", "{}"),
+        ("turn_cli_runtime_binding", "input_mapping_json", "{}"),
+    ] {
+        let row = db
+            .query_one_raw(Statement::from_string(
+                DbBackend::Sqlite,
+                format!("SELECT frozen_root_state,{body} AS body FROM {table}"),
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.try_get::<String>("", "frozen_root_state").unwrap(),
+            "none"
+        );
+        assert_eq!(row.try_get::<String>("", "body").unwrap(), expected);
+    }
+    assert!(
+        store
+            .compaction_frozen_workspace_inventory_ready("ws")
+            .await
+            .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn p75_effective_proof_matches_bound_metadata_and_promised_corruption_never_falls_back() {
+    let base = store().await;
+    let assertion = p73_source(&base, "p75-source", 1, "{}").await;
+    let guard = p73_capture(&base, "p75-origin", &[p73_reference(&assertion)]).await;
+    let cp = p73_native_candidate(&base, "p75-completed", &assertion, &guard, true).await;
+    base.compaction_apply(&cp, None, &[assertion])
+        .await
+        .unwrap();
+    let legacy = base
+        .compaction_checkpoint_edges(&cp.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let store = base.with_frozen_history_protocol(
+        pioneer_crud::FrozenHistoryProtocolPermit::confirm_all_old_writers_stopped(),
+    );
+    p74_quanta(&store, 180).await;
+    let effective = store
+        .compaction_checkpoint_edges(&cp.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(format!("{legacy:?}"), format!("{effective:?}"));
+    assert_eq!(p73_accounting(&store, "p75-completed").await.4, "complete");
+    store.database_connection().execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,"UPDATE compaction_checkpoint_proof SET evidence_sha256='corrupt' WHERE checkpoint_id=?",[cp.id.clone().into()])).await.unwrap();
+    assert!(store.compaction_checkpoint_edges(&cp.id).await.is_err());
+    // Gate closed retains the original guarded path while the body is bound.
+    assert!(base.compaction_checkpoint_edges(&cp.id).await.is_ok());
+    guard.close().await.unwrap();
+}
+
+async fn p76_reclamation_store(base: &CrudStore) -> CrudStore {
+    base.with_frozen_history_protocol(pioneer_crud::FrozenHistoryProtocolPermit::confirm_all_old_writers_stopped()).with_frozen_history_reclamation(pioneer_crud::FrozenHistoryReclamationPermit::confirm_independent_validation_and_rollout_authorized()).unwrap()
+}
+#[tokio::test]
+async fn p76_logical_release_waits_for_every_use_and_same_id_rebuild_resets_only_own_mapping() {
+    let base = store().await;
+    let guard = p73_capture(&base, "p76-zero", &[]).await;
+    let descriptor = guard.descriptor();
+    let store = p76_reclamation_store(&base).await;
+    p74_quanta(&store, 160).await;
+    let availability =
+        |row: sea_orm::QueryResult| row.try_get::<String>("", "availability").unwrap();
+    let query = Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "SELECT availability FROM compaction_frozen_history WHERE id=?",
+        [descriptor.manifest_id.clone().into()],
+    );
+    assert_eq!(
+        availability(
+            store
+                .database_connection()
+                .query_one_raw(query.clone())
+                .await
+                .unwrap()
+                .unwrap()
+        ),
+        "resident"
+    );
+    guard.close().await.unwrap();
+    p74_quanta(&store, 192).await;
+    assert_eq!(
+        availability(
+            store
+                .database_connection()
+                .query_one_raw(query)
+                .await
+                .unwrap()
+                .unwrap()
+        ),
+        "released"
+    );
+    let rebuilt = store
+        .compaction_begin_frozen_history("ws", "thread", &descriptor)
+        .await
+        .unwrap();
+    assert_eq!(rebuilt.descriptor(), descriptor);
+    store
+        .compaction_finish_frozen_history_with_use(&rebuilt)
+        .await
+        .unwrap();
+    rebuilt.close().await.unwrap();
+}
+#[tokio::test]
+async fn p76_effective_history_survives_detach_while_held_origin_remains_readable() {
+    let base = store().await;
+    let protocol = base.with_frozen_history_protocol(
+        pioneer_crud::FrozenHistoryProtocolPermit::confirm_all_old_writers_stopped(),
+    );
+    let assertion = p73_source(&protocol, "p76-source", 1, "{}").await;
+    let guard = p73_capture(&protocol, "p76-native", &[p73_reference(&assertion)]).await;
+    let snapshot = p73_snapshot("p76-operation", assertion.reference());
+    protocol
+        .compaction_admit_frozen_for_turn(
+            "ws",
+            "thread",
+            &snapshot,
+            Some("turn"),
+            &guard.descriptor(),
+            &guard,
+        )
+        .await
+        .unwrap();
+    protocol
+        .compaction_bind_source_projection(&snapshot.id, &guard.descriptor())
+        .await
+        .unwrap();
+    let commit = ready_operation(
+        &protocol,
+        &snapshot,
+        &[("thread".into(), assertion.reference())],
+    )
+    .await;
+    assert_eq!(
+        protocol
+            .compaction_apply_runner(&snapshot.id, &commit, None)
+            .await
+            .unwrap(),
+        CommitOutcome::Applied
+    );
+    let pioneer_compaction::runner::RunnerPhase::Commit { checkpoint } = commit.phase else {
+        panic!("Commit expected")
+    };
+    let before = protocol
+        .compaction_checkpoint_edges(&checkpoint)
+        .await
+        .unwrap()
+        .unwrap();
+    let store = p76_reclamation_store(&protocol).await;
+    p74_quanta(&store, 192).await;
+    let row = store
+        .database_connection()
+        .query_one_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "SELECT storage_state FROM compaction_operation_projection WHERE operation_id=?",
+            [snapshot.id.clone().into()],
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        row.try_get::<String>("", "storage_state").unwrap(),
+        "proof_only"
+    );
+    guard.validate().await.unwrap();
+    assert!(
+        store
+            .compaction_bound_source_projection(&snapshot.id)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        format!("{before:?}"),
+        format!(
+            "{:?}",
+            store
+                .compaction_checkpoint_edges(&checkpoint)
+                .await
+                .unwrap()
+                .unwrap()
+        )
+    );
+    guard.close().await.unwrap();
+    p74_quanta(&store, 192).await;
+    assert!(store.compaction_checkpoint_edges(&checkpoint).await.is_ok());
+}
+
+#[tokio::test]
+async fn p76_task_scalar_and_stale_generation_use_are_each_independent_retirement_roots() {
+    let base = store().await;
+    let guard = p73_capture(&base, "p76-root", &[]).await;
+    let descriptor = guard.descriptor();
+    p74_task_carrier(
+        &base,
+        "p76-root-task",
+        &serde_json::to_string(&descriptor).unwrap(),
+    )
+    .await;
+    guard.close().await.unwrap();
+    let store = p76_reclamation_store(&base).await;
+    p74_quanta(&store, 192).await;
+    assert_eq!(p74_root_state(&store, "p76-root-task").await.1, "manifest");
+    let query = Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "SELECT availability FROM compaction_frozen_history WHERE id=?",
+        [descriptor.manifest_id.clone().into()],
+    );
+    assert_eq!(
+        store
+            .database_connection()
+            .query_one_raw(query.clone())
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get::<String>("", "availability")
+            .unwrap(),
+        "resident"
+    );
+    // Fault fixture deliberately leaves a durable use from a different epoch.
+    store.database_connection().execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,"INSERT INTO compaction_frozen_use(use_id,manifest_id,storage_generation,purpose,workspace_id) VALUES('stale-p76',?,777,'read','ws')",[descriptor.manifest_id.into()])).await.unwrap();
+    store
+        .database_connection()
+        .execute_unprepared(
+            "DELETE FROM task_run_conversation_snapshot WHERE run_id='p76-root-task'",
+        )
+        .await
+        .unwrap();
+    p74_quanta(&store, 192).await;
+    assert_eq!(
+        store
+            .database_connection()
+            .query_one_raw(query)
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get::<String>("", "availability")
+            .unwrap(),
+        "resident"
+    );
+}
+
+async fn p77_root(store: &CrudStore, run: &str, body: &str) {
+    let task = format!("task-{run}");
+    let db = store.database_connection();
+    db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,"INSERT INTO task(id,workspace_id,owner_kind,owner_id,created_by_thread_id,created_by_turn_id,executor_kind,status,title,goal) VALUES (?,'ws','thread','thread','thread','turn','agent','running','Task','fixture')",[task.clone().into()])).await.unwrap();
+    db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,"INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES (?,?,?,1,1,'running','agent')",[run.into(),task.clone().into(),run.into()])).await.unwrap();
+    store
+        .insert_task_run_conversation_snapshot_if_absent(
+            pioneer_crud::NewTaskRunConversationSnapshot {
+                run_id: run.into(),
+                task_id: task,
+                workspace_id: "ws".into(),
+                conversation_thread_id: "thread".into(),
+                source_turn_id: None,
+                history_json: body.into(),
+                created_at: chrono::Utc::now().fixed_offset(),
+            },
+        )
+        .await
+        .unwrap();
+}
+async fn p77_physical_store(base: &CrudStore) -> CrudStore {
+    let store = p76_reclamation_store(base).await;
+    p74_quanta(&store, 160).await;
+    assert!(
+        store
+            .compaction_frozen_workspace_inventory_ready("ws")
+            .await
+            .unwrap()
+    );
+    store.with_frozen_history_physical_cleanup(pioneer_crud::FrozenHistoryPhysicalCleanupPermit::confirm_physical_validation_and_rollout_authorized()).unwrap()
+}
+async fn p77_job(
+    store: &CrudStore,
+    id: &str,
+    kind: i64,
+) -> (String, i64, Option<i64>, Option<i64>) {
+    let row=store.database_connection().query_one_raw(Statement::from_sql_and_values(DbBackend::Sqlite,"SELECT state,pass_no,after_ordinal,ceiling_ordinal FROM compaction_frozen_cleanup WHERE manifest_id=? AND kind=?",[id.into(),kind.into()])).await.unwrap().unwrap();
+    (
+        row.try_get("", "state").unwrap(),
+        row.try_get("", "pass_no").unwrap(),
+        row.try_get("", "after_ordinal").unwrap(),
+        row.try_get("", "ceiling_ordinal").unwrap(),
+    )
+}
+async fn p77_keys(store: &CrudStore, id: &str, kind: i64) -> Vec<i64> {
+    let table = if kind == 0 {
+        "compaction_frozen_message_data"
+    } else {
+        "compaction_frozen_import_data"
+    };
+    store
+        .database_connection()
+        .query_all_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            format!("SELECT ordinal FROM {table} WHERE manifest_id=? ORDER BY ordinal"),
+            [id.into()],
+        ))
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| r.try_get("", "ordinal").unwrap())
+        .collect()
+}
+#[tokio::test]
+async fn p77_both_kinds_include_zero_and_gaps_and_repeat_after_last_foreign_span_is_removed() {
+    let base = store().await;
+    let refs = shared_refs(40);
+    let b = shared_capture(&base, "p77-B10", &refs[..10], true).await;
+    let m = shared_capture(&base, "p77-M40", &refs, true).await;
+    p77_root(&base, "p77-keep-M", &serde_json::to_string(&m).unwrap()).await;
+    // The import rows/reservation are a structural storage fixture only. They
+    // mint no import grant; both actual accepted snapshots have import_count=0.
+    for ordinal in [0i64, 2, 39] {
+        base.database_connection().execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,"INSERT INTO compaction_frozen_import_data(manifest_id,ordinal,message_ordinal,source_scope,source_id,source_version,source_thread,proof_json,bytes) VALUES(?,?,0,'event:turn','fixture','opaque','thread','{}',2)",[b.manifest_id.clone().into(),ordinal.into()])).await.unwrap();
+    }
+    base.database_connection().execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,"INSERT INTO compaction_frozen_span(manifest_id,kind,start,end,source_manifest) VALUES(?,1,0,40,?)",[m.manifest_id.clone().into(),b.manifest_id.clone().into()])).await.unwrap();
+    let store = p77_physical_store(&base).await;
+    for _ in 0..96 {
+        store
+            .compaction_physical_cleanup_quantum_for_test()
+            .await
+            .unwrap();
+    }
+    assert_eq!(p77_job(&store, &b.manifest_id, 0).await.0, "idle");
+    assert_eq!(p77_job(&store, &b.manifest_id, 0).await.3, Some(39));
+    assert_eq!(
+        p77_keys(&store, &b.manifest_id, 0).await,
+        (0..40).collect::<Vec<_>>()
+    );
+    assert_eq!(p77_keys(&store, &b.manifest_id, 1).await, vec![0, 2, 39]);
+    assert_eq!(shared_read(&store, &m.manifest_id).await, refs);
+    let first = [
+        p77_job(&store, &b.manifest_id, 0).await.1,
+        p77_job(&store, &b.manifest_id, 1).await.1,
+    ];
+    store
+        .delete_task_run_conversation_snapshot("p77-keep-M")
+        .await
+        .unwrap();
+    // Run logical work without physical consumer, then recreate the store to
+    // lose process-local wake/fairness state. Durable trigger jobs are authority.
+    let logical = p76_reclamation_store(&base).await;
+    p74_quanta(&logical, 256).await;
+    for kind in [0i64, 1] {
+        assert_eq!(p77_job(&logical, &b.manifest_id, kind).await.0, "queued");
+    }
+    let restarted=CrudStore::new(store.database_connection().clone()).with_frozen_history_protocol(pioneer_crud::FrozenHistoryProtocolPermit::confirm_all_old_writers_stopped()).with_frozen_history_reclamation(pioneer_crud::FrozenHistoryReclamationPermit::confirm_independent_validation_and_rollout_authorized()).unwrap().with_frozen_history_physical_cleanup(pioneer_crud::FrozenHistoryPhysicalCleanupPermit::confirm_physical_validation_and_rollout_authorized()).unwrap();
+    for _ in 0..96 {
+        restarted
+            .compaction_physical_cleanup_quantum_for_test()
+            .await
+            .unwrap();
+    }
+    for kind in [0i64, 1] {
+        assert!(p77_keys(&restarted, &b.manifest_id, kind).await.is_empty());
+        let job = p77_job(&restarted, &b.manifest_id, kind).await;
+        assert_eq!(job.0, "idle");
+        assert!(job.1 > first[kind as usize]);
+    }
+    assert_eq!(
+        frozen_count(&restarted, "compaction_frozen_history").await,
+        2
+    );
+}
+#[tokio::test]
+async fn p77_empty_pass_has_negative_ceiling_and_poison_job_does_not_block_other_container() {
+    let base = store().await;
+    for id in ["p77-empty", "p77-poison", "p77-good"] {
+        let guard = p73_capture(&base, id, &[]).await;
+        let d = guard.descriptor();
+        guard.close().await.unwrap();
+        p77_root(
+            &base,
+            &format!("keep-{id}"),
+            &serde_json::to_string(&d).unwrap(),
+        )
+        .await;
+    }
+    base.database_connection().execute_unprepared("INSERT INTO compaction_frozen_message_data(manifest_id,ordinal,reference_json,bytes) VALUES('p73-p77-poison',0,'{}',300000),('p73-p77-good',0,'{}',2)").await.unwrap();
+    let store = p77_physical_store(&base).await;
+    for _ in 0..64 {
+        store
+            .compaction_physical_cleanup_quantum_for_test()
+            .await
+            .unwrap();
+    }
+    assert_eq!(p77_job(&store, "p73-p77-empty", 0).await.3, Some(-1));
+    assert_eq!(p77_job(&store, "p73-p77-empty", 0).await.2, None);
+    assert_eq!(p77_job(&store, "p73-p77-poison", 0).await.0, "quarantined");
+    assert_eq!(p77_keys(&store, "p73-p77-poison", 0).await, vec![0]);
+    assert!(p77_keys(&store, "p73-p77-good", 0).await.is_empty());
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn p77_dirty_before_null_batch_rolls_back_cursor_and_insert_beyond_ceiling_gets_new_pass() {
+    let base = store().await;
+    let guard = p73_capture(&base, "p77-race", &[]).await;
+    let d = guard.descriptor();
+    guard.close().await.unwrap();
+    p77_root(&base, "keep-p77-race", &serde_json::to_string(&d).unwrap()).await;
+    base.database_connection().execute_unprepared("INSERT INTO compaction_frozen_message_data(manifest_id,ordinal,reference_json,bytes) VALUES('p73-p77-race',0,'{}',2)").await.unwrap();
+    let store = p77_physical_store(&base).await;
+    store
+        .compaction_physical_cleanup_quantum_for_test()
+        .await
+        .unwrap();
+    store
+        .compaction_physical_cleanup_quantum_for_test()
+        .await
+        .unwrap();
+    let mut hook = arm_publication_test_hook(
+        &store,
+        "p73-p77-race",
+        PublicationTestPause::PhysicalBeforeWriter,
+    );
+    let participant = store.clone();
+    let task = tokio::spawn(async move {
+        participant
+            .compaction_physical_cleanup_quantum_for_test()
+            .await
+    });
+    hook.reached().await;
+    store.database_connection().execute_unprepared("INSERT INTO compaction_frozen_message_data(manifest_id,ordinal,reference_json,bytes) VALUES('p73-p77-race',100,'{}',2)").await.unwrap();
+    hook.release();
+    assert!(
+        !tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+    );
+    assert_eq!(p77_keys(&store, "p73-p77-race", 0).await, vec![0, 100]);
+    assert_eq!(p77_job(&store, "p73-p77-race", 0).await.2, None);
+    assert_eq!(p77_job(&store, "p73-p77-race", 0).await.3, Some(0));
+    for _ in 0..64 {
+        store
+            .compaction_physical_cleanup_quantum_for_test()
+            .await
+            .unwrap();
+    }
+    let job = p77_job(&store, "p73-p77-race", 0).await;
+    assert_eq!(job.0, "idle");
+    assert!(job.1 >= 2);
+    assert_eq!(job.3, Some(100));
+    assert!(p77_keys(&store, "p73-p77-race", 0).await.is_empty());
+}
+
+#[tokio::test]
+async fn p78_completed_empty_initial_inventory_is_known_only_after_matching_eof() {
+    let base = store().await;
+    let guard = p73_capture(&base, "p78-empty-boundary", &[]).await;
+    let mut snapshot = p73_snapshot(
+        "p78-empty-operation",
+        SourceRef {
+            scope: "event:turn".into(),
+            id: "unused".into(),
+            version: "opaque".into(),
+        },
+    );
+    snapshot.plan.compact.clear();
+    snapshot.plan.coverage.clear();
+    base.compaction_admit_frozen_for_turn(
+        "ws",
+        "thread",
+        &snapshot,
+        Some("turn"),
+        &guard.descriptor(),
+        &guard,
+    )
+    .await
+    .unwrap();
+    base.compaction_bind_source_projection(&snapshot.id, &guard.descriptor())
+        .await
+        .unwrap();
+    // Historical boundary fixture only: an empty completed operation has no
+    // checkpoint/grant. This deliberately tests the allowed initial EOF state,
+    // and is not a synthetic publication authority for nonempty coverage.
+    base.database_connection().execute_unprepared("UPDATE compaction_operation SET status='completed',outcome='applied' WHERE id='p78-empty-operation'").await.unwrap();
+    let store = base.with_frozen_history_protocol(
+        pioneer_crud::FrozenHistoryProtocolPermit::confirm_all_old_writers_stopped(),
+    );
+    let mut started = false;
+    for _ in 0..64 {
+        store.compact_frozen_storage_quantum().await.unwrap();
+        if p73_accounting(&store, &snapshot.id).await.1 == "completed_inventory" {
+            started = true;
+            break;
+        }
+    }
+    assert!(started);
+    assert_eq!(p73_accounting(&store, &snapshot.id).await.2, Some(0));
+    assert_eq!(p73_accounting(&store, &snapshot.id).await.4, "pending");
+    let row=store.database_connection().query_one_raw(Statement::from_sql_and_values(DbBackend::Sqlite,"SELECT frozen_inventory_state,frozen_backfill_after_checkpoint FROM compaction_operation WHERE id=?",[snapshot.id.clone().into()])).await.unwrap().unwrap();
+    assert_eq!(
+        row.try_get::<String>("", "frozen_inventory_state").unwrap(),
+        "pending"
+    );
+    assert_eq!(
+        row.try_get::<Option<String>>("", "frozen_backfill_after_checkpoint")
+            .unwrap(),
+        None
+    );
+    p74_quanta(&store, 192).await;
+    assert_eq!(p73_accounting(&store, &snapshot.id).await.4, "complete");
+    assert_eq!(p73_accounting(&store, &snapshot.id).await.3, Some(0));
+    assert!(
+        store
+            .compaction_checkpoint_edges("absent-empty-checkpoint")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    guard.close().await.unwrap();
+}
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn p78_completed_boundary_cas_failure_rolls_back_all_flags_counts_and_null_cursor() {
+    let base = store().await;
+    let assertion = p73_source(&base, "p78-cas-source", 1, "{}").await;
+    let guard = p73_capture(&base, "p78-cas-origin", &[p73_reference(&assertion)]).await;
+    let cp = p73_native_candidate(&base, "p78-cas-operation", &assertion, &guard, true).await;
+    assert_eq!(
+        base.compaction_apply(&cp, None, &[assertion])
+            .await
+            .unwrap(),
+        CommitOutcome::Applied
+    );
+    let store = base.with_frozen_history_protocol(
+        pioneer_crud::FrozenHistoryProtocolPermit::confirm_all_old_writers_stopped(),
+    );
+    let mut started = false;
+    for _ in 0..64 {
+        store.compact_frozen_storage_quantum().await.unwrap();
+        if p73_accounting(&store, &cp.operation_id).await.1 == "completed_inventory" {
+            started = true;
+            break;
+        }
+    }
+    assert!(started);
+    let mut hook = arm_publication_test_hook(
+        &store,
+        &cp.operation_id,
+        PublicationTestPause::CompletedInventoryBeforeWriter,
+    );
+    let participant = store.clone();
+    let task = tokio::spawn(async move {
+        for _ in 0..40 {
+            participant.compact_frozen_storage_quantum().await?;
+        }
+        anyhow::Result::<()>::Ok(())
+    });
+    hook.reached().await;
+    store.database_connection().execute_unprepared("UPDATE compaction_operation SET deadline_ms=deadline_ms+1 WHERE id='p78-cas-operation'").await.unwrap();
+    hook.release();
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_err()
+    );
+    assert_eq!(p73_accounting(&store, &cp.operation_id).await.2, Some(0));
+    assert_eq!(p73_accounting(&store, &cp.operation_id).await.3, Some(0));
+    let row=store.database_connection().query_one_raw(Statement::from_sql_and_values(DbBackend::Sqlite,"SELECT p.frozen_accounting_state,o.frozen_backfill_after_checkpoint FROM compaction_checkpoint p JOIN compaction_operation o ON o.id=p.operation_id WHERE p.id=?",[cp.id.clone().into()])).await.unwrap().unwrap();
+    assert_eq!(
+        row.try_get::<String>("", "frozen_accounting_state")
+            .unwrap(),
+        "uncounted"
+    );
+    assert_eq!(
+        row.try_get::<Option<String>>("", "frozen_backfill_after_checkpoint")
+            .unwrap(),
+        None
+    );
+    store.database_connection().execute_unprepared("UPDATE compaction_operation SET deadline_ms=deadline_ms-1 WHERE id='p78-cas-operation'").await.unwrap();
+    p74_quanta(&store, 192).await;
+    assert_eq!(p73_accounting(&store, &cp.operation_id).await.2, Some(1));
+    assert_eq!(p73_accounting(&store, &cp.operation_id).await.3, Some(1));
+    guard.close().await.unwrap();
+}
+#[tokio::test]
+async fn p78_same_id_no_share_rebuild_counts_own_ten_without_truncating_foreign_forty() {
+    let base = store().await;
+    let refs = shared_refs(40);
+    let b = shared_capture(&base, "p78-B10", &refs[..10], true).await;
+    let m = shared_capture(&base, "p78-M40", &refs, true).await;
+    p77_root(&base, "p78-keep-M", &serde_json::to_string(&m).unwrap()).await;
+    let store = p76_reclamation_store(&base).await;
+    p74_quanta(&store, 256).await;
+    let row = store
+        .database_connection()
+        .query_one_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "SELECT availability,storage_generation FROM compaction_frozen_history WHERE id=?",
+            [b.manifest_id.clone().into()],
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        row.try_get::<String>("", "availability").unwrap(),
+        "released"
+    );
+    let generation = row.try_get::<i64>("", "storage_generation").unwrap();
+    assert_eq!(shared_read(&store, &m.manifest_id).await, refs);
+    assert_eq!(
+        p77_keys(&store, &b.manifest_id, 0).await,
+        (0..40).collect::<Vec<_>>()
+    );
+    let mut collision = b.clone();
+    collision.identity_sha256 = "b".repeat(64);
+    assert!(
+        store
+            .compaction_begin_frozen_history("ws", "thread", &collision)
+            .await
+            .is_err()
+    );
+    let guard = store
+        .compaction_begin_frozen_history("ws", "thread", &b)
+        .await
+        .unwrap();
+    assert!(
+        store
+            .compaction_finish_frozen_history_with_use(&guard)
+            .await
+            .is_err()
+    );
+    store
+        .compaction_append_frozen_history_with_use(&guard, 0, &refs[..10])
+        .await
+        .unwrap();
+    assert!(
+        store
+            .compaction_finish_frozen_history_with_use(&guard)
+            .await
+            .unwrap()
+    );
+    assert_eq!(shared_read(&store, &b.manifest_id).await, refs[..10]);
+    assert_eq!(shared_read(&store, &m.manifest_id).await, refs);
+    let row=store.database_connection().query_one_raw(Statement::from_sql_and_values(DbBackend::Sqlite,"SELECT storage_generation,next_ordinal,message_count,identity_sha256 FROM compaction_frozen_history WHERE id=?",[b.manifest_id.clone().into()])).await.unwrap().unwrap();
+    assert_eq!(
+        row.try_get::<i64>("", "storage_generation").unwrap(),
+        generation + 1
+    );
+    assert_eq!(row.try_get::<i64>("", "next_ordinal").unwrap(), 10);
+    assert_eq!(row.try_get::<i64>("", "message_count").unwrap(), 10);
+    assert_eq!(
+        row.try_get::<String>("", "identity_sha256").unwrap(),
+        b.identity_sha256
+    );
+    guard.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn p78_parent_owned_task_basis_keeps_child_checkpoint_context_through_proof_and_detach() {
+    let base = store().await;
+    let assertion = p73_source(&base, "p78-parent-source", 1, "{}").await;
+    let mut reference = p73_reference(&assertion);
+    reference.inherited = true;
+    reference.context_thread = Some("thread".into());
+    let guard = p73_capture(&base, "p78-parent-basis", &[reference]).await;
+    let descriptor = guard.descriptor();
+    p77_root(
+        &base,
+        "p78-parent-run",
+        &serde_json::to_string(&descriptor).unwrap(),
+    )
+    .await;
+    for statement in [
+        "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES ('p78-child','ws','','agent','m','p','active','task_run','internal',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('p78-child-turn','p78-child','completed','conversation','system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        "INSERT INTO thread_lineage(child_thread_id,parent_thread_id,root_thread_id,depth,created_at) VALUES('p78-child','thread','thread',1,CURRENT_TIMESTAMP)",
+        "INSERT INTO task_run_turn(id,task_id,run_id,thread_id,turn_id,kind,round,sequence,status,created_at) VALUES('p78-rt','task-p78-parent-run','p78-parent-run','p78-child','p78-child-turn','initial',0,1,'completed',CURRENT_TIMESTAMP)",
+    ] {
+        base.database_connection()
+            .execute_unprepared(statement)
+            .await
+            .unwrap();
+    }
+    let protocol = base.with_frozen_history_protocol(
+        pioneer_crud::FrozenHistoryProtocolPermit::confirm_all_old_writers_stopped(),
+    );
+    let mut snapshot = p73_snapshot("p78-parent-operation", assertion.reference());
+    snapshot.owner = "p78-child-owner".into();
+    snapshot.plan.coverage_domain = CoverageDomain::WorkingContext;
+    snapshot.source_epochs.insert(
+        "thread".into(),
+        protocol
+            .compaction_projection_version("ws", "thread")
+            .await
+            .unwrap(),
+    );
+    protocol
+        .compaction_admit_frozen_for_turn(
+            "ws",
+            "p78-child",
+            &snapshot,
+            Some("p78-child-turn"),
+            &descriptor,
+            &guard,
+        )
+        .await
+        .unwrap();
+    // This actual binding is permitted only by the exact immutable Task basis
+    // and lineage. The proof never invents parent OWN or a synthetic basis.
+    protocol
+        .compaction_bind_source_projection(&snapshot.id, &descriptor)
+        .await
+        .unwrap();
+    let commit = ready_operation(
+        &protocol,
+        &snapshot,
+        &[("thread".into(), assertion.reference())],
+    )
+    .await;
+    assert_eq!(
+        protocol
+            .compaction_apply_runner(&snapshot.id, &commit, None)
+            .await
+            .unwrap(),
+        CommitOutcome::Applied
+    );
+    let pioneer_compaction::runner::RunnerPhase::Commit { checkpoint } = commit.phase else {
+        panic!("Commit expected")
+    };
+    let before = base
+        .compaction_checkpoint_edges(&checkpoint)
+        .await
+        .unwrap()
+        .unwrap();
+    let store = p76_reclamation_store(&protocol).await;
+    p74_quanta(&store, 192).await;
+    let after = store
+        .compaction_checkpoint_edges(&checkpoint)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(format!("{before:?}"), format!("{after:?}"));
+    assert_eq!(after.thread_id, "p78-child");
+    assert_eq!(after.coverage.len(), 1);
+    assert_eq!(after.coverage[0].source_thread, "thread");
+    assert_eq!(after.coverage[0].source, assertion.reference());
+    assert!(
+        store
+            .compaction_bound_source_projection(&snapshot.id)
+            .await
+            .is_err()
+    );
+    assert_eq!(guard.owner(), "thread");
+    guard.validate().await.unwrap();
+    guard.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn p78_detach_bad_origin_before_pin_retains_projection_and_advances_discovery() {
+    let base = store().await;
+    let protocol = base.with_frozen_history_protocol(
+        pioneer_crud::FrozenHistoryProtocolPermit::confirm_all_old_writers_stopped(),
+    );
+    let assertion = p73_source(&protocol, "p78-poison-source", 1, "{}").await;
+    let guard = p73_capture(&protocol, "p78-poison-origin", &[p73_reference(&assertion)]).await;
+    let snapshot = p73_snapshot("p78-poison-operation", assertion.reference());
+    protocol
+        .compaction_admit_frozen_for_turn(
+            "ws",
+            "thread",
+            &snapshot,
+            Some("turn"),
+            &guard.descriptor(),
+            &guard,
+        )
+        .await
+        .unwrap();
+    protocol
+        .compaction_bind_source_projection(&snapshot.id, &guard.descriptor())
+        .await
+        .unwrap();
+    let commit = ready_operation(
+        &protocol,
+        &snapshot,
+        &[("thread".into(), assertion.reference())],
+    )
+    .await;
+    assert_eq!(
+        protocol
+            .compaction_apply_runner(&snapshot.id, &commit, None)
+            .await
+            .unwrap(),
+        CommitOutcome::Applied
+    );
+    // Fault injection after a real complete publication. Pin fails before the
+    // guarded detach body, so no proof/body fallback can mask this corruption.
+    protocol
+        .database_connection()
+        .execute_unprepared(
+            "UPDATE compaction_frozen_history SET ready=0 WHERE id='p73-p78-poison-origin'",
+        )
+        .await
+        .unwrap();
+    let reclaim = protocol.with_frozen_history_reclamation(
+        pioneer_crud::FrozenHistoryReclamationPermit::confirm_independent_validation_and_rollout_authorized(),
+    ).unwrap();
+    let mut advanced = false;
+    for _ in 0..192 {
+        reclaim.compact_frozen_storage_quantum().await.unwrap();
+        let row = reclaim.database_connection().query_one_raw(Statement::from_sql_and_values(DbBackend::Sqlite, "SELECT after_key FROM compaction_frozen_maintenance_progress WHERE workspace_id='ws' AND phase='detach'", [])).await.unwrap();
+        if row.is_some_and(|r| {
+            r.try_get::<Option<String>>("", "after_key")
+                .unwrap()
+                .as_deref()
+                == Some(snapshot.id.as_str())
+        }) {
+            advanced = true;
+        }
+    }
+    assert!(advanced);
+    let row = reclaim
+        .database_connection()
+        .query_one_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "SELECT storage_state FROM compaction_operation_projection WHERE operation_id=?",
+            [snapshot.id.into()],
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.try_get::<String>("", "storage_state").unwrap(), "bound");
+    guard.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn p73_final_repeated_dirty_physical_jobs_do_not_starve_existing_prefix_conversion() {
+    let base = store().await;
+    let store = p77_physical_store(&base).await;
+    let assertion = p73_source(&store, "p73-final-fair-source", 1, "{}").await;
+    let guard = p73_capture(&store, "final-fair-origin", &[p73_reference(&assertion)]).await;
+    let descriptor = guard.descriptor();
+    p77_root(
+        &store,
+        "p73-final-fair-root",
+        &serde_json::to_string(&descriptor).unwrap(),
+    )
+    .await;
+    guard.close().await.unwrap();
+    // A new physical tail dirties the job on every worker call. Physical work
+    // remains runnable throughout, while logical row zero stays Task-rooted.
+    for n in 0..128i64 {
+        store.database_connection().execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+            "INSERT INTO compaction_frozen_message_data(manifest_id,ordinal,reference_json,bytes) VALUES(?,?, '{}',2)",
+            [descriptor.manifest_id.clone().into(),(100+n).into()])).await.unwrap();
+        store.compact_frozen_storage_quantum().await.unwrap();
+    }
+    let row = store.database_connection().query_one_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+        "SELECT storage_registered,(SELECT COUNT(*) FROM compaction_frozen_layout l WHERE l.manifest_id=h.id AND l.active=1 AND l.pending=0) AS settled FROM compaction_frozen_history h WHERE id=?",
+        [descriptor.manifest_id.clone().into()])).await.unwrap().unwrap();
+    assert_eq!(row.try_get::<i64>("", "storage_registered").unwrap(), 1);
+    assert_eq!(row.try_get::<i64>("", "settled").unwrap(), 2);
+    assert_eq!(
+        shared_read(&store, &descriptor.manifest_id).await,
+        vec![p73_reference(&assertion)]
+    );
+}
+
+async fn assert_frozen_cursors(
+    store: &CrudStore,
+    descriptor: &frozen::FrozenHistoryRef,
+    next: i64,
+    imports: i64,
+    ready: i64,
+    stored_imports: i64,
+) {
+    let row=store.database_connection().query_one_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+        "SELECT ready,next_ordinal,next_import,(SELECT COUNT(*) FROM compaction_frozen_import_data i WHERE i.manifest_id=h.id) AS stored FROM compaction_frozen_history h WHERE h.id=?",
+        [descriptor.manifest_id.clone().into()])).await.unwrap().unwrap();
+    assert_eq!(row.try_get::<i64>("", "ready").unwrap(), ready);
+    assert_eq!(row.try_get::<i64>("", "next_ordinal").unwrap(), next);
+    assert_eq!(row.try_get::<i64>("", "next_import").unwrap(), imports);
+    assert_eq!(row.try_get::<i64>("", "stored").unwrap(), stored_imports);
+}
+async fn assert_incomplete_capture(
+    store: &CrudStore,
+    workspace: &str,
+    owner: &str,
+    descriptor: &frozen::FrozenHistoryRef,
+    next: i64,
+) {
+    let error = store
+        .compaction_finish_frozen_history(workspace, owner, descriptor)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "frozen capture is incomplete",
+        "must reach full verifier, not fail setup"
+    );
+    assert_frozen_cursors(store, descriptor, next, 0, 0, 0).await;
+}
+
+#[tokio::test]
+async fn oversized_legal_prefix_pointer_keeps_valid_capture_on_direct_backing() {
+    let store = store().await;
+    let refs = shared_refs(1);
+    let base = shared_capture(&store, "oversized-pointer-base", &refs, true).await;
+    let huge = format!("legal-{}", "я".repeat(140_000));
+    let empty = shared_descriptor(&huge, &[]);
+    let source_guard = store
+        .compaction_begin_frozen_history("ws", "thread", &empty)
+        .await
+        .unwrap();
+    assert!(
+        store
+            .compaction_finish_frozen_history_with_use(&source_guard)
+            .await
+            .unwrap()
+    );
+    let db = store.database_connection();
+    // A valid foreign physical tail below a zero-count source header.
+    db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+        "INSERT INTO compaction_frozen_message_data(manifest_id,ordinal,reference_json,bytes) SELECT ?,ordinal,reference_json,bytes FROM compaction_frozen_message_data WHERE manifest_id=?",
+        [huge.clone().into(),base.manifest_id.clone().into()])).await.unwrap();
+    db.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "UPDATE compaction_frozen_span SET source_manifest=? WHERE manifest_id=? AND kind=0",
+        [huge.clone().into(), base.manifest_id.clone().into()],
+    ))
+    .await
+    .unwrap();
+    let target = shared_descriptor("oversized-pointer-target", &refs);
+    let guard = store
+        .compaction_begin_frozen_history("ws", "thread", &target)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .compaction_share_frozen_prefix_with_use(&guard, &refs, &[])
+            .await
+            .unwrap(),
+        (0, 0)
+    );
+    store
+        .compaction_append_frozen_history_with_use(&guard, 0, &refs)
+        .await
+        .unwrap();
+    assert!(
+        store
+            .compaction_finish_frozen_history_with_use(&guard)
+            .await
+            .unwrap()
+    );
+    assert_eq!(shared_read(&store, &target.manifest_id).await, refs);
+    assert_eq!(shared_read(&store, &base.manifest_id).await, refs);
+    let state=db.query_one_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+        "SELECT active,failed,copy_next,candidate FROM compaction_frozen_layout WHERE manifest_id=? AND kind=0",
+        [target.manifest_id.into()])).await.unwrap().unwrap();
+    assert_eq!(state.try_get::<i64>("", "active").unwrap(), 0);
+    assert_eq!(state.try_get::<i64>("", "failed").unwrap(), 1);
+    assert_eq!(state.try_get::<i64>("", "copy_next").unwrap(), 0);
+    assert_eq!(
+        state.try_get::<String>("", "candidate").unwrap(),
+        base.manifest_id
+    );
+    guard.close().await.unwrap();
+    source_guard.close().await.unwrap();
 }

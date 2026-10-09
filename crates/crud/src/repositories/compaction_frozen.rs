@@ -2,30 +2,13 @@
 //! incomplete manifest cannot be referenced by a started execution snapshot.
 use super::compaction::*;
 use super::compaction_frozen_views::message as compaction_frozen_message;
-use crate::CrudStore;
+use crate::{CrudStore, FrozenUseGuard};
 use anyhow::{Result, ensure};
 use pioneer_compaction::frozen::{FrozenHistoryRef, FrozenMessageRef};
 use pioneer_entity::{compaction_frozen_history, compaction_frozen_message_data, thread};
 use sea_orm::sea_query::{Expr, ExprTrait, OnConflict, Query};
-use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect};
+use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QuerySelect};
 use sea_orm::{ConnectionTrait, TransactionTrait};
-
-pub(crate) async fn compaction_begin_frozen_history(
-    store: &CrudStore,
-    workspace: &str,
-    owner_thread: &str,
-    descriptor: &FrozenHistoryRef,
-) -> Result<()> {
-    store
-        .compaction_begin_frozen_history_with_imports(
-            workspace,
-            owner_thread,
-            descriptor,
-            0,
-            EMPTY_FROZEN_IMPORT_SHA256,
-        )
-        .await
-}
 
 pub(crate) async fn compaction_begin_frozen_history_with_imports<C: ConnectionTrait>(
     db: &C,
@@ -109,7 +92,15 @@ pub(crate) async fn compaction_append_frozen_history(
     manifest: &str,
     start: u64,
     messages: &[FrozenMessageRef],
+    guard: &FrozenUseGuard,
 ) -> Result<()> {
+    ensure!(
+        guard.workspace() == workspace
+            && guard.owner() == owner_thread
+            && guard.header().id == manifest,
+        "frozen append use scope mismatch"
+    );
+    guard.validate_in(&store.connection, false).await?;
     ensure!(
         messages.len() as u64 <= SOURCE_PAGE_ROWS,
         "frozen history batch row limit"
@@ -134,6 +125,7 @@ pub(crate) async fn compaction_append_frozen_history(
         ));
     }
     let tx = store.connection.begin().await?;
+    guard.validate_in(&tx, false).await?;
     let row = compaction_frozen_history::Entity::find_by_id(manifest)
         .filter(compaction_frozen_history::Column::WorkspaceId.eq(workspace))
         .filter(compaction_frozen_history::Column::OwnerThread.eq(owner_thread))
@@ -207,54 +199,9 @@ pub(crate) async fn compaction_append_frozen_history(
             .exec(&tx)
             .await?;
     }
+    guard.validate_in(&tx, false).await?;
     tx.commit().await?;
     Ok(())
-}
-
-/// Ready is published only after the bounded writer has filled all exact
-/// ordinals. The content digest is checked by the caller before this CAS.
-pub(crate) async fn compaction_finish_frozen_history<C: ConnectionTrait>(
-    db: &C,
-    workspace: &str,
-    owner_thread: &str,
-    descriptor: &FrozenHistoryRef,
-) -> Result<bool> {
-    // Constant-size publication: next_ordinal advances atomically with each
-    // sequential batch, so finalization never scans the whole manifest.
-    Ok(compaction_frozen_history::Entity::update_many()
-        .col_expr(compaction_frozen_history::Column::Ready, Expr::val(1_i64))
-        .filter(
-            Expr::col(compaction_frozen_history::Column::Id)
-                .eq(Expr::Value(descriptor.manifest_id.clone().into()))
-                .and(
-                    Expr::col(compaction_frozen_history::Column::WorkspaceId)
-                        .eq(Expr::Value(workspace.into())),
-                )
-                .and(
-                    Expr::col(compaction_frozen_history::Column::OwnerThread)
-                        .eq(Expr::Value(owner_thread.into())),
-                )
-                .and(
-                    Expr::col(compaction_frozen_history::Column::IdentitySha256)
-                        .eq(Expr::Value(descriptor.identity_sha256.clone().into())),
-                )
-                .and(
-                    Expr::col(compaction_frozen_history::Column::MessageCount)
-                        .eq(Expr::Value(i64::try_from(descriptor.messages)?.into())),
-                )
-                .and(
-                    Expr::col(compaction_frozen_history::Column::MessageCount)
-                        .eq(Expr::col(compaction_frozen_history::Column::NextOrdinal)),
-                )
-                .and(
-                    Expr::col(compaction_frozen_history::Column::ImportCount)
-                        .eq(Expr::col(compaction_frozen_history::Column::NextImport)),
-                ),
-        )
-        .exec(db)
-        .await?
-        .rows_affected
-        == 1)
 }
 
 pub(crate) async fn compaction_frozen_history_owner<C: ConnectionTrait>(
@@ -268,67 +215,12 @@ pub(crate) async fn compaction_frozen_history_owner<C: ConnectionTrait>(
     let row = history::Entity::find_by_id(descriptor.manifest_id.clone())
         .filter(history::Column::WorkspaceId.eq(workspace))
         .filter(history::Column::Ready.eq(1_i64))
+        .filter(history::Column::Availability.eq("resident"))
         .filter(history::Column::IdentitySha256.eq(descriptor.identity_sha256.clone()))
         .filter(history::Column::MessageCount.eq(i64::try_from(descriptor.messages)?))
         .one(db)
         .await?;
     Ok(row.map(|row| row.owner_thread))
-}
-
-pub(crate) async fn compaction_frozen_history_page<C: ConnectionTrait>(
-    db: &C,
-    workspace: &str,
-    owner_thread: &str,
-    manifest: &str,
-    start: u64,
-) -> Result<Vec<FrozenMessageRef>> {
-    // Fetch bounded sizes first, release the reader, then choose a byte-bounded page.
-    let scoped = compaction_frozen_message::Entity::find()
-        .inner_join(compaction_frozen_history::Entity)
-        .filter(compaction_frozen_history::Column::Id.eq(manifest))
-        .filter(compaction_frozen_history::Column::WorkspaceId.eq(workspace))
-        .filter(compaction_frozen_history::Column::OwnerThread.eq(owner_thread))
-        .filter(compaction_frozen_history::Column::Ready.eq(1_i64))
-        .filter(compaction_frozen_message::Column::Ordinal.gte(i64::try_from(start)?));
-    let rows = scoped
-        .clone()
-        .select_only()
-        .column(compaction_frozen_message::Column::Ordinal)
-        .column(compaction_frozen_message::Column::Bytes)
-        .order_by_asc(compaction_frozen_message::Column::Ordinal)
-        .limit(SOURCE_PAGE_ROWS)
-        .into_tuple::<(i64, i64)>()
-        .all(db)
-        .await?;
-    let mut end = i64::try_from(start)?;
-    let mut bytes = 0_i64;
-    for (ordinal, size) in rows {
-        ensure!(
-            (0..=SOURCE_PAGE_BYTES as i64).contains(&size),
-            "invalid frozen reference size"
-        );
-        if bytes + size > SOURCE_PAGE_BYTES as i64 {
-            break;
-        }
-        ensure!(ordinal == end, "frozen history ordinal gap");
-        bytes += size;
-        end += 1;
-    }
-    let rows = scoped
-        .select_only()
-        .column(compaction_frozen_message::Column::ReferenceJson)
-        .filter(compaction_frozen_message::Column::Ordinal.lt(end))
-        .order_by_asc(compaction_frozen_message::Column::Ordinal)
-        .into_tuple::<String>()
-        .all(db)
-        .await?;
-    let mut result = Vec::new();
-    for json in rows {
-        let message: FrozenMessageRef = serde_json::from_str(&json)?;
-        message.validate()?;
-        result.push(message);
-    }
-    Ok(result)
 }
 
 use sea_orm::QueryTrait;

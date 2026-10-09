@@ -19,6 +19,12 @@ pub(crate) async fn compaction_bound_source_projection<C: ConnectionTrait>(
         compaction_frozen_history as history, compaction_operation_projection as projection,
     };
     use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QuerySelect};
+    if let Some(receipt) = projection::Entity::find_by_id(operation).one(db).await? {
+        ensure!(
+            receipt.storage_state == "bound",
+            "frozen origin is proof-only; body access unavailable"
+        );
+    }
     let row = projection::Entity::find_by_id(operation)
         .inner_join(history::Entity)
         .select_only()
@@ -32,6 +38,8 @@ pub(crate) async fn compaction_bound_source_projection<C: ConnectionTrait>(
             "message_count",
         )
         .filter(history::Column::Ready.eq(1_i64))
+        .filter(history::Column::Availability.eq("resident"))
+        .filter(projection::Column::StorageState.eq("bound"))
         .filter(
             Expr::col((history::Entity, history::Column::IdentitySha256)).eq(Expr::col((
                 projection::Entity,
@@ -85,9 +93,17 @@ pub(crate) async fn compaction_bind_source_projection(
         "oversized source projection"
     );
     let count = i64::try_from(descriptor.messages)?;
-    store
+    let workspace = store.connection.query_one_raw(sea_orm::Statement::from_sql_and_values(sea_orm::DbBackend::Sqlite,
+        "SELECT c.workspace_id FROM compaction_operation o JOIN compaction_context c ON c.owner=o.owner WHERE o.id=?",
+        [operation.into()])).await?.ok_or_else(|| anyhow::anyhow!("source projection operation is unavailable"))?
+        .try_get::<String>("", "workspace_id")?;
+    let guard = store
+        .compaction_acquire_frozen_use(&workspace, descriptor, None)
+        .await?;
+    let result = store
         .run_serialized_write(|| async {
             let tx = store.connection.begin().await?;
+            guard.validate_in(&tx, true).await?;
             // A parent manifest is eligible only through the exact accepted
             // TaskRun basis for this execution. Output candidate selection
             // remains a separate boundary; it excludes reviewer outputs.
@@ -339,6 +355,7 @@ pub(crate) async fn compaction_bind_source_projection(
                         identity_sha256: sea_orm::Set(identity_sha256),
                         imports_sha256: sea_orm::Set(imports_sha256),
                         import_count: sea_orm::Set(import_count),
+                        ..Default::default()
                     },
                 )
                 .on_conflict(
@@ -449,7 +466,8 @@ pub(crate) async fn compaction_bind_source_projection(
             tx.commit().await?;
             Ok(())
         })
-        .await
+        .await;
+    guard.complete(result).await
 }
 
 use sea_orm::{EntityTrait, QueryFilter, QuerySelect};

@@ -7,6 +7,11 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "thread_cli_runtime_binding")]
 pub struct Model {
+    #[sea_orm(column_type = "Text", nullable)]
+    pub frozen_manifest_id: Option<String>,
+    #[sea_orm(column_type = "Text")]
+    pub frozen_root_state: String,
+
     #[sea_orm(primary_key, auto_increment = false)]
     pub thread_id: String,
     pub workspace_id: String,

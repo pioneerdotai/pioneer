@@ -157,26 +157,34 @@ pub(crate) async fn restored_conversation_scope_projection_from_snapshot(
     AgentTurnHookRuntimeContext,
     crate::compaction::frozen::RestoredAcceptedHistory,
 )> {
-    let context: AgentTurnHookRuntimeContext =
-        from_snapshot_json(&snapshot.hook_runtime_context_json, "hook runtime context")?;
-    let allowed = crate::compaction::frozen::execution_history_scopes(
-        store,
-        &snapshot.workspace_id,
-        &snapshot.thread_id,
-        &snapshot.turn_id,
-        context.conversation_thread_id.as_deref(),
-    )
-    .await?;
-    let history = crate::compaction::frozen::restore_accepted_history_for_execution(
-        store,
-        &snapshot.workspace_id,
-        context.conversation_thread_id.as_deref(),
-        &snapshot.thread_id,
-        &allowed,
-        &snapshot.history_json,
-    )
-    .await?;
-    Ok((context, history))
+    let guard = store.compaction_pin_runtime_snapshot(snapshot).await?;
+    let result = async {
+        let context: AgentTurnHookRuntimeContext =
+            from_snapshot_json(&snapshot.hook_runtime_context_json, "hook runtime context")?;
+        let allowed = crate::compaction::frozen::execution_history_scopes(
+            store,
+            &snapshot.workspace_id,
+            &snapshot.thread_id,
+            &snapshot.turn_id,
+            context.conversation_thread_id.as_deref(),
+        )
+        .await?;
+        let history = crate::compaction::frozen::restore_accepted_history_for_execution(
+            store,
+            &snapshot.workspace_id,
+            context.conversation_thread_id.as_deref(),
+            &snapshot.thread_id,
+            &allowed,
+            &snapshot.history_json,
+        )
+        .await?;
+        Ok((context, history))
+    }
+    .await;
+    match guard {
+        Some(guard) => guard.complete(result).await,
+        None => result,
+    }
 }
 
 /// Read compatibility is explicit: already accepted array snapshots keep their

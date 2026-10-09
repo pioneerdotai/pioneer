@@ -671,6 +671,7 @@ struct PreparedCliRuntimeCombinedPreflight {
 }
 
 struct PreparedCliRuntimeDelivery {
+    frozen_use: Option<pioneer_crud::FrozenUseGuard>,
     plan: pioneer_promt::CompiledInstructionDeliveryPlan,
     sent_context_basis: Option<crate::cli_runtime::thread_binding::CliRuntimeSentContextBasis>,
 }
@@ -6024,6 +6025,7 @@ impl MessageProcessor {
                 .map(|skill| skill.install_name.clone())
                 .collect::<Vec<_>>();
             let PreparedCliRuntimeDelivery {
+                frozen_use,
                 plan: delivery_plan,
                 sent_context_basis,
             } = match self
@@ -6063,6 +6065,7 @@ impl MessageProcessor {
                     return;
                 }
             };
+            async {
             if let Some(sent) = sent_context_basis.as_ref() {
                 let revalidation = crate::cli_runtime::thread_binding::completed_context_basis_is_current(
                     self.crud_store.as_ref(),
@@ -6639,6 +6642,10 @@ impl MessageProcessor {
                 }
             } else {
                 self.spawn_prepared_cli_runtime_native_turn(native_turn_start);
+            }
+            }.await;
+            if let Some(guard) = frozen_use {
+                if guard.close().await.is_err() { tracing::warn!(phase = "cli_history", outcome = "release_deferred", "Frozen history use retained"); }
             }
             })
             .await;
@@ -8689,7 +8696,9 @@ impl MessageProcessor {
                 ).await?;
                 // Use the shared projector before sizing or sending CLI history.
                 // The frozen descriptor remains the accepted authority boundary.
-                prepared.project_accepted_checkpoints(&history_store, workspace_id, thread_id).await?;
+                if let Err(error) = prepared.project_accepted_checkpoints(&history_store, workspace_id, thread_id).await {
+                    return prepared.guard.complete(Err(error)).await;
+                }
                 Ok(prepared)
             } => prepared,
         }
@@ -8938,11 +8947,16 @@ impl MessageProcessor {
         remaining_compactions: u32,
         history_deadline_ms: u64,
     ) -> anyhow::Result<PreparedCliRuntimeDelivery> {
+        let mut frozen_use = None;
+        let mut receipt_use = None;
+        let mut accepted_projection = None;
+        let result = async {
         let original_input = input_mapping.clone();
         let persisted_binding = self
             .crud_store
             .get_cli_runtime_thread_binding(continuation_thread_id)
             .await?;
+        if let Some(binding) = &persisted_binding { receipt_use = self.crud_store.compaction_pin_cli_thread_binding(binding).await?; }
         let native_cwd = persisted_binding
             .as_ref()
             .and_then(|binding| binding.native_cwd.clone())
@@ -8955,7 +8969,7 @@ impl MessageProcessor {
             message_revision: outcome.started_notification.turn.message_revision,
             message_deleted: outcome.started_notification.turn.message_deleted,
         };
-        let (history, mut sent_context_basis, mut accepted_projection) =
+        let (history, mut sent_context_basis, _prepared_projection) =
             if bootstrap_provider_context {
                 // One authoritative preparation supplies the bytes sent to the
                 // provider, their exact direct sources, and the separately
@@ -8970,6 +8984,9 @@ impl MessageProcessor {
                         history_deadline_ms,
                     )
                     .await?;
+                frozen_use = Some(accepted.guard.clone());
+                accepted_projection = Some(accepted);
+                let accepted = accepted_projection.as_ref().unwrap();
                 let direct_sources = crate::compaction::frozen::frozen_history_projection_sources(
                     self.crud_store.as_ref(),
                     outcome.started_notification.workspace_id.as_str(),
@@ -8997,7 +9014,7 @@ impl MessageProcessor {
                             pending_turn: pending_turn.clone(),
                         },
                     ),
-                    Some(accepted),
+                    true,
                 )
             } else {
                 // A completed provider turn can outlive the separate receipt
@@ -9052,7 +9069,7 @@ impl MessageProcessor {
                         pending_turn,
                     }
                 });
-                (None, basis, None)
+                (None, basis, false)
             };
         if continuation_thread_id != outcome.started_notification.thread_id
             && let Some(sent) = sent_context_basis.as_mut()
@@ -9110,6 +9127,13 @@ impl MessageProcessor {
                         );
                     }
                 }
+            }
+        }
+        if frozen_use.is_none() {
+            if let Some(sent) = &sent_context_basis {
+                let descriptor = serde_json::from_str(&sent.completed.history_json)?;
+                frozen_use = Some(self.crud_store.compaction_acquire_frozen_use(
+                    &outcome.started_notification.workspace_id, &descriptor, Some(&sent.completed.manifest_owner_thread_id)).await?);
             }
         }
         let plan = crate::cli_runtime::context::compile_cli_runtime_delivery_plan(
@@ -9204,7 +9228,7 @@ impl MessageProcessor {
                 // Rebuild and validate the actual CLI frame; the bounded retry
                 // budget still applies if its wire format needs more compression.
                 *input_mapping = original_input;
-                return Box::pin(self.compile_cli_runtime_delivery_plan_for_turn(
+                let rebuilt = Box::pin(self.compile_cli_runtime_delivery_plan_for_turn(
                     runtime_id,
                     runtime_kind,
                     outcome,
@@ -9220,14 +9244,46 @@ impl MessageProcessor {
                     remaining_compactions - 1,
                     history_deadline_ms,
                 ))
-                .await;
+                .await?;
+                if let Some(guard) = frozen_use.take() {
+                    if let Err(error) = guard.close().await {
+                        // The rebuilt delivery already owns another share.
+                        // An ordinary failure closing the previous share must
+                        // explicitly release that new owner as well.
+                        return match rebuilt.frozen_use {
+                            Some(rebuilt_use) => rebuilt_use.complete(Err(error)).await,
+                            None => Err(error),
+                        };
+                    }
+                }
+                frozen_use = rebuilt.frozen_use;
+                return Ok((rebuilt.plan, rebuilt.sent_context_basis));
             }
             return Err(error);
         }
-        Ok(PreparedCliRuntimeDelivery {
-            plan,
-            sent_context_basis,
-        })
+        Ok((plan, sent_context_basis))
+        }.await;
+        let result = match receipt_use {
+            Some(guard) => guard.complete(result).await,
+            None => result,
+        };
+        // Compaction consumes and closes its PreparedHistory; otherwise close its share here,
+        // leaving the transfer share in the returned delivery plan.
+        let result = match accepted_projection {
+            Some(prepared) => prepared.guard.complete(result).await,
+            None => result,
+        };
+        match result {
+            Ok((plan, sent_context_basis)) => Ok(PreparedCliRuntimeDelivery {
+                plan,
+                sent_context_basis,
+                frozen_use,
+            }),
+            Err(error) => match frozen_use {
+                Some(guard) => guard.complete(Err(error)).await,
+                None => Err(error),
+            },
+        }
     }
 
     pub(crate) async fn materialize_historical_artifacts(

@@ -571,56 +571,69 @@ pub fn deserialize_cli_runtime_json<T: DeserializeOwned>(value: &str) -> Result<
     serde_json::from_str(value).context("failed to deserialize CLI runtime JSON payload")
 }
 
-pub async fn upsert_thread_binding<C: ConnectionTrait>(
+pub(crate) async fn upsert_thread_binding<C: ConnectionTrait>(
     db: &C,
     binding: NewCliRuntimeThreadBinding,
+    root: &super::compaction_frozen_root::RootPublication,
 ) -> Result<CliRuntimeThreadBindingRecord> {
+    root.validate_root_in(db, &binding.workspace_id).await?;
+    frozen_thread_domain(db, &binding.workspace_id, &binding.thread_id).await?;
     let thread_id = binding.thread_id.clone();
-    thread_cli_runtime_binding::Entity::insert(active_thread_binding_from_new(binding))
-        .on_conflict(
-            OnConflict::column(thread_cli_runtime_binding::Column::ThreadId)
-                .update_columns([
-                    thread_cli_runtime_binding::Column::WorkspaceId,
-                    thread_cli_runtime_binding::Column::RuntimeId,
-                    thread_cli_runtime_binding::Column::RuntimeKind,
-                    thread_cli_runtime_binding::Column::NativeThreadId,
-                    thread_cli_runtime_binding::Column::NativeSessionId,
-                    thread_cli_runtime_binding::Column::NativeRootThreadId,
-                    thread_cli_runtime_binding::Column::NativeCwd,
-                    thread_cli_runtime_binding::Column::NativeModel,
-                    thread_cli_runtime_binding::Column::ResumeCursorJson,
-                    thread_cli_runtime_binding::Column::Status,
-                    thread_cli_runtime_binding::Column::UpdatedAt,
-                ])
-                .to_owned(),
-        )
-        .exec(db)
-        .await
-        .context("failed to upsert CLI runtime thread binding")?;
+    thread_cli_runtime_binding::Entity::insert(active_thread_binding_from_new(
+        binding,
+        root.values(),
+    ))
+    .on_conflict(
+        OnConflict::column(thread_cli_runtime_binding::Column::ThreadId)
+            .update_columns([
+                thread_cli_runtime_binding::Column::WorkspaceId,
+                thread_cli_runtime_binding::Column::RuntimeId,
+                thread_cli_runtime_binding::Column::RuntimeKind,
+                thread_cli_runtime_binding::Column::NativeThreadId,
+                thread_cli_runtime_binding::Column::NativeSessionId,
+                thread_cli_runtime_binding::Column::NativeRootThreadId,
+                thread_cli_runtime_binding::Column::NativeCwd,
+                thread_cli_runtime_binding::Column::NativeModel,
+                thread_cli_runtime_binding::Column::ResumeCursorJson,
+                thread_cli_runtime_binding::Column::FrozenManifestId,
+                thread_cli_runtime_binding::Column::FrozenRootState,
+                thread_cli_runtime_binding::Column::Status,
+                thread_cli_runtime_binding::Column::UpdatedAt,
+            ])
+            .to_owned(),
+    )
+    .exec(db)
+    .await
+    .context("failed to upsert CLI runtime thread binding")?;
 
     find_thread_binding(db, thread_id.as_str())
         .await?
         .context("upserted CLI runtime thread binding is missing")
 }
 
-pub async fn insert_fork_intent_if_absent<C: ConnectionTrait>(
+pub(crate) async fn insert_fork_intent_if_absent<C: ConnectionTrait>(
     db: &C,
     pending: NewCliRuntimeThreadBinding,
+    root: &super::compaction_frozen_root::RootPublication,
 ) -> Result<bool> {
+    root.validate_root_in(db, &pending.workspace_id).await?;
+    frozen_thread_domain(db, &pending.workspace_id, &pending.thread_id).await?;
     anyhow::ensure!(
         pending.status == "fork_pending",
         "CLI fork intent must be pending"
     );
-    let result =
-        thread_cli_runtime_binding::Entity::insert(active_thread_binding_from_new(pending))
-            .on_conflict(
-                OnConflict::column(thread_cli_runtime_binding::Column::ThreadId)
-                    .do_nothing()
-                    .to_owned(),
-            )
-            .exec_without_returning(db)
-            .await
-            .context("failed to insert CLI fork intent")?;
+    let result = thread_cli_runtime_binding::Entity::insert(active_thread_binding_from_new(
+        pending,
+        root.values(),
+    ))
+    .on_conflict(
+        OnConflict::column(thread_cli_runtime_binding::Column::ThreadId)
+            .do_nothing()
+            .to_owned(),
+    )
+    .exec_without_returning(db)
+    .await
+    .context("failed to insert CLI fork intent")?;
     Ok(result == 1)
 }
 
@@ -665,7 +678,7 @@ pub async fn discard_rejected_fork_intent<C: ConnectionTrait>(
 
 /// Commit a provider fork only while the exact durable intent is still
 /// pending. The caller performs provider I/O before entering the writer.
-pub async fn confirm_marked_fork_intent<C: ConnectionTrait>(
+pub(crate) async fn confirm_marked_fork_intent<C: ConnectionTrait>(
     db: &C,
     pending: &CliRuntimeThreadBindingRecord,
     fork_native_thread_id: &str,
@@ -673,8 +686,19 @@ pub async fn confirm_marked_fork_intent<C: ConnectionTrait>(
     native_model: Option<String>,
     resume_cursor_json: String,
     updated_at: DateTimeWithTimeZone,
+    root: &super::compaction_frozen_root::RootPublication,
 ) -> Result<CliRuntimeThreadBindingRecord> {
+    root.validate_root_in(db, &pending.workspace_id).await?;
+    frozen_thread_domain(db, &pending.workspace_id, &pending.thread_id).await?;
     let result = thread_cli_runtime_binding::Entity::update_many()
+        .col_expr(
+            thread_cli_runtime_binding::Column::FrozenManifestId,
+            Expr::value(root.root.id()),
+        )
+        .col_expr(
+            thread_cli_runtime_binding::Column::FrozenRootState,
+            Expr::value(root.root.state()),
+        )
         .col_expr(
             thread_cli_runtime_binding::Column::NativeThreadId,
             Expr::value(fork_native_thread_id.to_owned()),
@@ -721,15 +745,30 @@ pub async fn confirm_marked_fork_intent<C: ConnectionTrait>(
         .context("confirmed CLI fork binding is missing")
 }
 
-pub async fn update_thread_resume_cursor<C: ConnectionTrait>(
+pub(crate) async fn update_thread_resume_cursor<C: ConnectionTrait>(
     db: &C,
     thread_id: &str,
     expected_native_thread_id: &str,
     expected_cursor_json: &str,
     resume_cursor_json: String,
     updated_at: DateTimeWithTimeZone,
+    root: &super::compaction_frozen_root::RootPublication,
 ) -> Result<CliRuntimeThreadBindingRecord> {
+    let actual = thread_cli_runtime_binding::Entity::find_by_id(thread_id)
+        .one(db)
+        .await?
+        .ok_or_else(|| anyhow!("CLI thread binding is unavailable"))?;
+    root.validate_root_in(db, &actual.workspace_id).await?;
+    frozen_thread_domain(db, &actual.workspace_id, thread_id).await?;
     let result = thread_cli_runtime_binding::Entity::update_many()
+        .col_expr(
+            thread_cli_runtime_binding::Column::FrozenManifestId,
+            Expr::value(root.root.id()),
+        )
+        .col_expr(
+            thread_cli_runtime_binding::Column::FrozenRootState,
+            Expr::value(root.root.state()),
+        )
         .col_expr(
             thread_cli_runtime_binding::Column::ResumeCursorJson,
             Expr::value(resume_cursor_json),
@@ -761,10 +800,19 @@ pub async fn update_thread_resume_cursor<C: ConnectionTrait>(
 /// Atomically load or create the durable Claude provider UUID before a
 /// provider process can be spawned. The caller supplies a freshly generated
 /// candidate, but an existing binding always wins.
-pub async fn prepare_claude_provider_session_binding<C: ConnectionTrait>(
+pub(crate) async fn prepare_claude_provider_session_binding<C: ConnectionTrait>(
     db: &C,
     request: PrepareClaudeProviderSessionBinding,
+    root: &super::compaction_frozen_root::RootPublication,
 ) -> Result<PreparedClaudeProviderSessionBinding> {
+    root.validate_root_in(db, &request.thread_binding.workspace_id)
+        .await?;
+    frozen_thread_domain(
+        db,
+        &request.thread_binding.workspace_id,
+        &request.thread_binding.thread_id,
+    )
+    .await?;
     validate_provider_session_id(request.proposed_provider_session_id.as_str())?;
     let thread_id = request.thread_binding.thread_id.clone();
     let workspace_id = request.thread_binding.workspace_id.clone();
@@ -797,6 +845,8 @@ pub async fn prepare_claude_provider_session_binding<C: ConnectionTrait>(
             active.native_cwd = Set(request.thread_binding.native_cwd);
             active.native_model = Set(request.thread_binding.native_model);
             active.resume_cursor_json = Set(request.thread_binding.resume_cursor_json);
+            active.frozen_manifest_id = Set(root.root.id());
+            active.frozen_root_state = Set(root.root.state().into());
             active.provider_session_id = Set(Some(proposed_provider_session_id));
             active.provider_session_lifecycle_state = Set(Some(
                 CliRuntimeProviderSessionLifecycle::Prepared
@@ -838,7 +888,7 @@ pub async fn prepare_claude_provider_session_binding<C: ConnectionTrait>(
     }
 
     let proposed_provider_session_id = request.proposed_provider_session_id;
-    let mut active = active_thread_binding_from_new(request.thread_binding);
+    let mut active = active_thread_binding_from_new(request.thread_binding, root.values());
     active.native_thread_id = Set(proposed_provider_session_id.clone());
     active.native_session_id = Set(Some(proposed_provider_session_id.clone()));
     active.provider_session_id = Set(Some(proposed_provider_session_id));
@@ -1071,12 +1121,35 @@ pub async fn list_thread_bindings_for_runtime<C: ConnectionTrait>(
         .collect()
 }
 
-pub async fn upsert_turn_binding<C: ConnectionTrait>(
+pub(crate) async fn upsert_turn_binding<C: ConnectionTrait>(
     db: &C,
     binding: NewCliRuntimeTurnBinding,
+    root: &super::compaction_frozen_root::RootPublication,
+) -> Result<CliRuntimeTurnBindingRecord> {
+    root.validate_root_in(db, &binding.workspace_id).await?;
+    frozen_thread_domain(db, &binding.workspace_id, &binding.thread_id).await?;
+    frozen_thread_domain(db, &binding.workspace_id, &binding.continuation_thread_id).await?;
+    let domain = db
+        .query_one_raw(Statement::from_sql_and_values(
+            sea_orm::DbBackend::Sqlite,
+            "SELECT id FROM turn WHERE id=? AND thread_id=?",
+            [
+                binding.turn_id.clone().into(),
+                binding.thread_id.clone().into(),
+            ],
+        ))
+        .await?;
+    anyhow::ensure!(domain.is_some(), "CLI turn domain is unavailable");
+    upsert_turn_binding_values(db, binding, root.values()).await
+}
+
+async fn upsert_turn_binding_values<C: ConnectionTrait>(
+    db: &C,
+    binding: NewCliRuntimeTurnBinding,
+    root: (Option<String>, String),
 ) -> Result<CliRuntimeTurnBindingRecord> {
     let turn_id = binding.turn_id.clone();
-    turn_cli_runtime_binding::Entity::insert(active_turn_binding_from_new(binding))
+    turn_cli_runtime_binding::Entity::insert(active_turn_binding_from_new(binding, root))
         .on_conflict(
             OnConflict::column(turn_cli_runtime_binding::Column::TurnId)
                 .update_columns([
@@ -1094,6 +1167,8 @@ pub async fn upsert_turn_binding<C: ConnectionTrait>(
                     turn_cli_runtime_binding::Column::SandboxJson,
                     turn_cli_runtime_binding::Column::ApprovalPolicy,
                     turn_cli_runtime_binding::Column::InputMappingJson,
+                    turn_cli_runtime_binding::Column::FrozenManifestId,
+                    turn_cli_runtime_binding::Column::FrozenRootState,
                     turn_cli_runtime_binding::Column::UpdatedAt,
                 ])
                 .to_owned(),
@@ -1105,6 +1180,30 @@ pub async fn upsert_turn_binding<C: ConnectionTrait>(
     find_turn_binding(db, turn_id.as_str())
         .await?
         .context("upserted CLI runtime turn binding is missing")
+}
+/// Recovery changes metadata while preserving the exact stored carrier and scalar.
+pub(crate) async fn upsert_turn_binding_retained<C: ConnectionTrait>(
+    db: &C,
+    binding: NewCliRuntimeTurnBinding,
+) -> Result<CliRuntimeTurnBindingRecord> {
+    let actual = turn_cli_runtime_binding::Entity::find_by_id(&binding.turn_id)
+        .one(db)
+        .await?
+        .ok_or_else(|| anyhow!("retained CLI turn binding is unavailable"))?;
+    anyhow::ensure!(
+        actual.thread_id == binding.thread_id
+            && actual.workspace_id == binding.workspace_id
+            && actual.input_mapping_json == binding.input_mapping_json,
+        "retained CLI history carrier changed"
+    );
+    frozen_thread_domain(db, &binding.workspace_id, &binding.thread_id).await?;
+    frozen_thread_domain(db, &binding.workspace_id, &binding.continuation_thread_id).await?;
+    upsert_turn_binding_values(
+        db,
+        binding,
+        (actual.frozen_manifest_id, actual.frozen_root_state),
+    )
+    .await
 }
 
 pub async fn find_turn_binding<C: ConnectionTrait>(
@@ -2288,6 +2387,7 @@ async fn update_pending_request_metadata<C: ConnectionTrait>(
 
 fn active_thread_binding_from_new(
     binding: NewCliRuntimeThreadBinding,
+    root: (Option<String>, String),
 ) -> thread_cli_runtime_binding::ActiveModel {
     thread_cli_runtime_binding::ActiveModel {
         thread_id: Set(binding.thread_id),
@@ -2300,6 +2400,8 @@ fn active_thread_binding_from_new(
         native_cwd: Set(binding.native_cwd),
         native_model: Set(binding.native_model),
         resume_cursor_json: Set(binding.resume_cursor_json),
+        frozen_manifest_id: Set(root.0),
+        frozen_root_state: Set(root.1),
         status: Set(binding.status),
         created_at: Set(binding.created_at),
         updated_at: Set(binding.updated_at),
@@ -2309,6 +2411,7 @@ fn active_thread_binding_from_new(
 
 fn active_turn_binding_from_new(
     binding: NewCliRuntimeTurnBinding,
+    root: (Option<String>, String),
 ) -> turn_cli_runtime_binding::ActiveModel {
     turn_cli_runtime_binding::ActiveModel {
         turn_id: Set(binding.turn_id),
@@ -2326,6 +2429,8 @@ fn active_turn_binding_from_new(
         sandbox_json: Set(binding.sandbox_json),
         approval_policy: Set(binding.approval_policy),
         input_mapping_json: Set(binding.input_mapping_json),
+        frozen_manifest_id: Set(root.0),
+        frozen_root_state: Set(root.1),
         created_at: Set(binding.created_at),
         updated_at: Set(binding.updated_at),
         ..Default::default()
@@ -3038,4 +3143,16 @@ mod tests {
             CLI_RUNTIME_PENDING_REQUEST_PAGE_MAX
         );
     }
+}
+
+async fn frozen_thread_domain<C: ConnectionTrait>(
+    db: &C,
+    workspace: &str,
+    thread: &str,
+) -> Result<()> {
+    let row = db.query_one_raw(Statement::from_sql_and_values(sea_orm::DbBackend::Sqlite,
+        "SELECT t.id FROM thread t JOIN workspace w ON w.id=t.workspace_id WHERE t.id=? AND t.workspace_id=?",
+        [thread.into(), workspace.into()])).await?;
+    anyhow::ensure!(row.is_some(), "CLI thread domain is unavailable");
+    Ok(())
 }

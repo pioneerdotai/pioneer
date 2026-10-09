@@ -7,6 +7,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "compaction_operation_projection")]
 pub struct Model {
+    #[sea_orm(column_type = "Text")]
+    pub storage_state: String,
+
     #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub operation_id: String,
     #[sea_orm(column_type = "Text")]

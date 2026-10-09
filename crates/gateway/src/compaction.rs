@@ -926,9 +926,27 @@ impl CompactionRunner {
                             &state,
                             self.snapshot.expected_checkpoint.as_deref(),
                         )
-                        .await?
+                        .await
                     {
-                        CommitOutcome::Applied | CommitOutcome::AlreadyApplied => {
+                        Err(error)
+                            if error
+                                .is::<pioneer_crud::compaction::FrozenProofReadinessInvalidated>(
+                                ) =>
+                        {
+                            // Repeat this same saved Commit. Existing cancellation and
+                            // operation deadline own the wait; no state/budget renewal.
+                            self.clock
+                                .sleep_until(
+                                    self.clock
+                                        .now_ms()
+                                        .saturating_add(25)
+                                        .min(self.snapshot.admission.deadline_ms),
+                                )
+                                .await;
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                        Ok(CommitOutcome::Applied | CommitOutcome::AlreadyApplied) => {
                             let applied = state.applied(&checkpoint)?;
                             // Observer failures cannot roll back or regenerate a committed summary.
                             if self.observer.terminal(operation, &applied).await.is_err() {
@@ -936,10 +954,10 @@ impl CompactionRunner {
                             }
                             return Ok(CompactionExit::Applied(checkpoint));
                         }
-                        CommitOutcome::Cancelled => {
+                        Ok(CommitOutcome::Cancelled) => {
                             return Ok(CompactionExit::Reconcile(FailureKind::Cancelled));
                         }
-                        CommitOutcome::Stale => {
+                        Ok(CommitOutcome::Stale) => {
                             state = self
                                 .persist(&state, Self::diagnose(state.terminate(FailureKind::Permanent)?,
                                     FailureDiagnostic::new("checkpoint_commit", "checkpoint_stale", "Checkpoint was not applied: saved candidate, coverage, runner generation or context head no longer matches")), None)

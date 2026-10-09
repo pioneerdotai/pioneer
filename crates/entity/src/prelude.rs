@@ -196,3 +196,15 @@ pub use super::turn_work_projection::Entity as TurnWorkProjection;
 pub use super::user_notification_outbox::Entity as UserNotificationOutbox;
 pub use super::workspace::Entity as Workspace;
 pub use super::workspace_membership::Entity as WorkspaceMembership;
+
+pub use super::compaction_checkpoint_proof::Entity as CompactionCheckpointProof;
+
+pub use super::compaction_checkpoint_replay_proof::Entity as CompactionCheckpointReplayProof;
+
+pub use super::compaction_checkpoint_event_input_proof::Entity as CompactionCheckpointEventInputProof;
+
+pub use super::compaction_frozen_use::Entity as CompactionFrozenUse;
+
+pub use super::compaction_frozen_maintenance_progress::Entity as CompactionFrozenMaintenanceProgress;
+
+pub use super::compaction_frozen_cleanup::Entity as CompactionFrozenCleanup;

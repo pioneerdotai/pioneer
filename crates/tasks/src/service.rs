@@ -1937,9 +1937,14 @@ impl TaskService {
 
     pub async fn create_task(
         &self,
-        context: TaskCreateContext,
+        mut context: TaskCreateContext,
         params: TaskCreateParams,
     ) -> TaskRuntimeResult<TaskCreateResponse> {
+        let frozen_use = context
+            .conversation_snapshot
+            .as_mut()
+            .and_then(|seed| seed.frozen_use.take());
+        let result = async {
         validate_create_params(&params)?;
         self.validate_review_policy_create_gate(&params)?;
         match (
@@ -2238,6 +2243,11 @@ impl TaskService {
                 .find(|spec| spec.run_id.is_none())
                 .or(agent_spec),
         })
+        }.await;
+        match frozen_use {
+            Some(guard) => guard.complete(result).await,
+            None => result,
+        }
     }
 
     pub async fn wait_tasks(

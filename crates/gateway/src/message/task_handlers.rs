@@ -614,8 +614,8 @@ impl MessageProcessor {
             .as_ref()
             .and_then(|spec| spec.context_policy.as_ref())
             .unwrap_or(&default_policy);
-        let history_json = if let Some(principal) = principal {
-            self.capture_authorized_task_basis(
+        let prepared = if let Some(principal) = principal {
+            self.capture_authorized_task_basis_prepared(
                 self.crud_store.as_ref(),
                 principal,
                 params.workspace_id.as_str(),
@@ -628,7 +628,7 @@ impl MessageProcessor {
         } else {
             // Unauthenticated fixture construction has no authority to adopt
             // foreign Task output. Product callers supply their current actor.
-            crate::compaction::frozen::capture_execution_basis_json(
+            crate::compaction::frozen::capture_execution_basis_prepared(
                 self.crud_store.as_ref(),
                 params.workspace_id.as_str(),
                 conversation_thread_id.as_str(),
@@ -640,8 +640,13 @@ impl MessageProcessor {
         }
         .context("failed to freeze Task conversation sources")?;
 
+        let history_json = match serde_json::to_string(&prepared.descriptor) {
+            Ok(json) => json,
+            Err(error) => return prepared.guard.complete(Err(error.into())).await,
+        };
         Ok(pioneer_tasks::TaskCreateContext {
             conversation_snapshot: Some(pioneer_tasks::TaskRunConversationSnapshotSeed {
+                frozen_use: Some(prepared.guard),
                 conversation_thread_id,
                 source_turn_id: source_turn_id.map(str::to_owned),
                 history_json,
@@ -1135,6 +1140,13 @@ impl MessageProcessor {
                 .await
                 .is_err()
         {
+            if context.close_frozen_use().await.is_err() {
+                tracing::warn!(
+                    phase = "task_capture",
+                    outcome = "release_deferred",
+                    "Frozen history use retained"
+                );
+            }
             self.send_error(
                 connection_id,
                 task_authorization_unavailable(

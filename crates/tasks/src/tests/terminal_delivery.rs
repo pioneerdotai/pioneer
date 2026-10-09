@@ -1058,6 +1058,7 @@ async fn delivery_output_binding_and_candidate_keep_the_original_delivery_identi
             next_import: Set(0),
             ready: Set(1),
             storage_registered: Set(0),
+            ..Default::default()
         },
     )
     .exec(&db)
@@ -1687,4 +1688,61 @@ async fn cancellation_without_reason_rejects_unconfirmed_graph_facts_atomically(
             "{invalid_fact}"
         );
     }
+}
+
+#[tokio::test]
+async fn frozen_task_seed_clones_keep_ownership_until_the_last_explicit_context_close() {
+    let (runtime, _, _, _) = fixture().await;
+    let store = runtime.service().store();
+    store.database_connection().execute_unprepared(
+        "INSERT OR IGNORE INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES ('thr_terminal_delivery','ws_tasks','','agent','m','p','active','user','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)"
+    ).await.unwrap();
+    let descriptor = serde_json::from_value(serde_json::json!({
+        "format":1,"manifest_id":"p2-task-seed","messages":0,
+        "identity_sha256":pioneer_crud::compaction::EMPTY_FROZEN_IMPORT_SHA256
+    }))
+    .unwrap();
+    let guard = store
+        .compaction_begin_frozen_history(TEST_WORKSPACE_ID, "thr_terminal_delivery", &descriptor)
+        .await
+        .unwrap();
+    store
+        .compaction_finish_frozen_history_with_use(&guard)
+        .await
+        .unwrap();
+    let mut context = TaskCreateContext {
+        conversation_snapshot: Some(TaskRunConversationSnapshotSeed {
+            frozen_use: Some(guard),
+            conversation_thread_id: "thr_terminal_delivery".into(),
+            source_turn_id: None,
+            history_json: serde_json::to_string(&descriptor).unwrap(),
+        }),
+        ..Default::default()
+    };
+    let mut clone = context.clone();
+    context.close_frozen_use().await.unwrap();
+    clone
+        .conversation_snapshot
+        .as_ref()
+        .unwrap()
+        .frozen_use
+        .as_ref()
+        .unwrap()
+        .validate()
+        .await
+        .unwrap();
+    clone.close_frozen_use().await.unwrap();
+    let n = store
+        .database_connection()
+        .query_one_raw(Statement::from_string(
+            DatabaseBackend::Sqlite,
+            "SELECT COUNT(*) AS n FROM compaction_frozen_use WHERE manifest_id='p2-task-seed'"
+                .to_owned(),
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get::<i64>("", "n")
+        .unwrap();
+    assert_eq!(n, 0);
 }

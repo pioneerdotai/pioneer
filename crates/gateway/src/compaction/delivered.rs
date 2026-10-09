@@ -233,6 +233,7 @@ impl MessageProcessor {
     /// generation that admitted all foreign originals. Runtime callers switch
     /// to this entry point together with accepted-source CAS support.
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     pub(crate) async fn capture_authorized_task_basis(
         &self,
         store: &CrudStore,
@@ -254,7 +255,8 @@ impl MessageProcessor {
                 policy,
             )
             .await?;
-        Ok(serde_json::to_string(&prepared.descriptor)?)
+        let json = serde_json::to_string(&prepared.descriptor).map_err(anyhow::Error::from);
+        prepared.guard.complete(json).await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -299,10 +301,17 @@ impl MessageProcessor {
             Some(&outputs),
         )
         .await?;
-        ensure!(
-            self.current_authorization_revision().await? == outputs.authorization_revision,
-            "authorization changed while freezing Task originals"
-        );
+        let validation = async {
+            ensure!(
+                self.current_authorization_revision().await? == outputs.authorization_revision,
+                "authorization changed while freezing Task originals"
+            );
+            Ok(())
+        }
+        .await;
+        if let Err(error) = validation {
+            return prepared.guard.complete(Err(error)).await;
+        }
         Ok(prepared)
     }
 }

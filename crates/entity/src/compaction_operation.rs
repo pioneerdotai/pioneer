@@ -7,6 +7,19 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "compaction_operation")]
 pub struct Model {
+    #[sea_orm(column_type = "Text")]
+    pub frozen_publication_contract: String,
+    #[sea_orm(column_type = "Text")]
+    pub frozen_accounting_mode: String,
+    #[sea_orm(column_type = "Text")]
+    pub frozen_inventory_state: String,
+    pub frozen_checkpoint_count: Option<i64>,
+    pub frozen_prepared_checkpoint_count: Option<i64>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub frozen_backfill_after_checkpoint: Option<String>,
+    #[sea_orm(column_type = "Text")]
+    pub frozen_proof_state: String,
+
     #[sea_orm(primary_key, auto_increment = false, column_type = "Text")]
     pub id: String,
     #[sea_orm(column_type = "Text")]

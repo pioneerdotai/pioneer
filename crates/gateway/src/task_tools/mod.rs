@@ -1919,10 +1919,18 @@ impl TaskToolHandler {
             .conversation_snapshot;
         create_context.execution_admission = execution_admission;
         if let Some(seed) = create_context.execution_admission.as_ref() {
-            self.processor
+            if self
+                .processor
                 .validate_task_execution_admission_seed(seed)
                 .await
-                .map_err(|_| task_tool_authorization_error())?;
+                .is_err()
+            {
+                create_context
+                    .close_frozen_use()
+                    .await
+                    .map_err(|error| ToolError::execution_failed(error.to_string()))?;
+                return Err(task_tool_authorization_error());
+            }
         }
         let service = self.processor.task_runtime.service();
         let response =

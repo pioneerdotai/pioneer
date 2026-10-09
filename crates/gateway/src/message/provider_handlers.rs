@@ -1325,7 +1325,7 @@ impl MessageProcessor {
                 Some(turn_id),
             )
             .await?;
-        Ok(prepared.messages)
+        prepared.guard.complete(Ok(prepared.messages)).await
     }
 
     #[cfg(test)]

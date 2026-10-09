@@ -11,7 +11,9 @@ use pioneer_entity::{
     task_delivery, task_result_candidate, task_run, task_run_turn, thread, turn,
 };
 use sea_orm::sea_query::{Expr, ExprTrait, JoinType, OnConflict, Query};
-use sea_orm::{ConnectionTrait, EntityTrait, FromQueryResult, QueryFilter, QuerySelect};
+use sea_orm::{
+    ConnectionTrait, EntityTrait, FromQueryResult, QueryFilter, QuerySelect, TransactionTrait,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TaskOutputSnapshot {
@@ -43,167 +45,178 @@ pub(crate) async fn compaction_record_task_output(
     {
         return Ok(existing);
     }
-    store
-        .connection
-        .execute(
-            &Query::insert()
-                .into_table(compaction_task_output::Entity)
-                .columns([
-                    compaction_task_output::Column::TaskRunTurnId,
-                    compaction_task_output::Column::TaskId,
-                    compaction_task_output::Column::RunId,
-                    compaction_task_output::Column::WorkspaceId,
-                    compaction_task_output::Column::SourceThread,
-                    compaction_task_output::Column::SourceTurn,
-                    compaction_task_output::Column::ManifestId,
-                ])
-                .select_from(
-                    task_run_turn::Entity::find()
-                        .select_only()
-                        .join(
-                            JoinType::InnerJoin,
-                            task_run_turn::Entity::belongs_to(task_run::Entity)
-                                .from(task_run_turn::Column::RunId)
-                                .to(task_run::Column::Id)
-                                .into(),
-                        )
-                        .join(
-                            JoinType::InnerJoin,
-                            task_run_turn::Entity::belongs_to(task::Entity)
-                                .from(task_run_turn::Column::TaskId)
-                                .to(task::Column::Id)
-                                .into(),
-                        )
-                        .join(
-                            JoinType::InnerJoin,
-                            task_run_turn::Entity::belongs_to(turn::Entity)
-                                .from(task_run_turn::Column::TurnId)
-                                .to(turn::Column::Id)
-                                .into(),
-                        )
-                        .join(
-                            JoinType::InnerJoin,
-                            turn::Entity::belongs_to(thread::Entity)
-                                .from(turn::Column::ThreadId)
-                                .to(thread::Column::Id)
-                                .into(),
-                        )
-                        .join(
-                            JoinType::InnerJoin,
-                            turn::Entity::belongs_to(compaction_frozen_history::Entity)
-                                .from(turn::Column::ThreadId)
-                                .to(compaction_frozen_history::Column::OwnerThread)
-                                .into(),
-                        )
-                        .filter(Expr::col((task_run::Entity, task_run::Column::TaskId)).eq(
-                            Expr::col((task_run_turn::Entity, task_run_turn::Column::TaskId)),
-                        ))
-                        .filter(
-                            Expr::col((turn::Entity, turn::Column::ThreadId)).eq(Expr::col((
+    let guard = store
+        .compaction_acquire_frozen_use(workspace, history, None)
+        .await?;
+    let result = store
+        .run_serialized_write(|| async {
+            let tx = store.connection.begin().await?;
+            guard.validate_in(&tx, true).await?;
+            tx.execute(
+                &Query::insert()
+                    .into_table(compaction_task_output::Entity)
+                    .columns([
+                        compaction_task_output::Column::TaskRunTurnId,
+                        compaction_task_output::Column::TaskId,
+                        compaction_task_output::Column::RunId,
+                        compaction_task_output::Column::WorkspaceId,
+                        compaction_task_output::Column::SourceThread,
+                        compaction_task_output::Column::SourceTurn,
+                        compaction_task_output::Column::ManifestId,
+                    ])
+                    .select_from(
+                        task_run_turn::Entity::find()
+                            .select_only()
+                            .join(
+                                JoinType::InnerJoin,
+                                task_run_turn::Entity::belongs_to(task_run::Entity)
+                                    .from(task_run_turn::Column::RunId)
+                                    .to(task_run::Column::Id)
+                                    .into(),
+                            )
+                            .join(
+                                JoinType::InnerJoin,
+                                task_run_turn::Entity::belongs_to(task::Entity)
+                                    .from(task_run_turn::Column::TaskId)
+                                    .to(task::Column::Id)
+                                    .into(),
+                            )
+                            .join(
+                                JoinType::InnerJoin,
+                                task_run_turn::Entity::belongs_to(turn::Entity)
+                                    .from(task_run_turn::Column::TurnId)
+                                    .to(turn::Column::Id)
+                                    .into(),
+                            )
+                            .join(
+                                JoinType::InnerJoin,
+                                turn::Entity::belongs_to(thread::Entity)
+                                    .from(turn::Column::ThreadId)
+                                    .to(thread::Column::Id)
+                                    .into(),
+                            )
+                            .join(
+                                JoinType::InnerJoin,
+                                turn::Entity::belongs_to(compaction_frozen_history::Entity)
+                                    .from(turn::Column::ThreadId)
+                                    .to(compaction_frozen_history::Column::OwnerThread)
+                                    .into(),
+                            )
+                            .filter(Expr::col((task_run::Entity, task_run::Column::TaskId)).eq(
+                                Expr::col((task_run_turn::Entity, task_run_turn::Column::TaskId)),
+                            ))
+                            .filter(Expr::col((turn::Entity, turn::Column::ThreadId)).eq(
+                                Expr::col((task_run_turn::Entity, task_run_turn::Column::ThreadId)),
+                            ))
+                            .filter(
+                                Expr::col((thread::Entity, thread::Column::WorkspaceId))
+                                    .eq(Expr::col((task::Entity, task::Column::WorkspaceId))),
+                            )
+                            .filter(
+                                Expr::col((
+                                    compaction_frozen_history::Entity,
+                                    compaction_frozen_history::Column::WorkspaceId,
+                                ))
+                                .eq(Expr::col((task::Entity, task::Column::WorkspaceId))),
+                            )
+                            .expr(Expr::col((
+                                task_run_turn::Entity,
+                                task_run_turn::Column::Id,
+                            )))
+                            .expr(Expr::col((
+                                task_run_turn::Entity,
+                                task_run_turn::Column::TaskId,
+                            )))
+                            .expr(Expr::col((
+                                task_run_turn::Entity,
+                                task_run_turn::Column::RunId,
+                            )))
+                            .expr(Expr::col((task::Entity, task::Column::WorkspaceId)))
+                            .expr(Expr::col((
                                 task_run_turn::Entity,
                                 task_run_turn::Column::ThreadId,
-                            ))),
-                        )
-                        .filter(
-                            Expr::col((thread::Entity, thread::Column::WorkspaceId))
-                                .eq(Expr::col((task::Entity, task::Column::WorkspaceId))),
-                        )
-                        .filter(
-                            Expr::col((
+                            )))
+                            .expr(Expr::col((
+                                task_run_turn::Entity,
+                                task_run_turn::Column::TurnId,
+                            )))
+                            .expr(Expr::col((
                                 compaction_frozen_history::Entity,
-                                compaction_frozen_history::Column::WorkspaceId,
-                            ))
-                            .eq(Expr::col((task::Entity, task::Column::WorkspaceId))),
-                        )
-                        .expr(Expr::col((
-                            task_run_turn::Entity,
-                            task_run_turn::Column::Id,
-                        )))
-                        .expr(Expr::col((
-                            task_run_turn::Entity,
-                            task_run_turn::Column::TaskId,
-                        )))
-                        .expr(Expr::col((
-                            task_run_turn::Entity,
-                            task_run_turn::Column::RunId,
-                        )))
-                        .expr(Expr::col((task::Entity, task::Column::WorkspaceId)))
-                        .expr(Expr::col((
-                            task_run_turn::Entity,
-                            task_run_turn::Column::ThreadId,
-                        )))
-                        .expr(Expr::col((
-                            task_run_turn::Entity,
-                            task_run_turn::Column::TurnId,
-                        )))
-                        .expr(Expr::col((
-                            compaction_frozen_history::Entity,
-                            compaction_frozen_history::Column::Id,
-                        )))
-                        .filter(
-                            Expr::col((task_run_turn::Entity, task_run_turn::Column::Id))
-                                .eq(Expr::Value(task_run_turn.into()))
-                                .and(
-                                    Expr::col((task::Entity, task::Column::WorkspaceId))
-                                        .eq(Expr::Value(workspace.into())),
-                                )
-                                .and(
-                                    Expr::col((turn::Entity, turn::Column::Status))
-                                        .eq(Expr::val("completed")),
-                                )
-                                .and(
-                                    Expr::col((task_run_turn::Entity, task_run_turn::Column::Kind))
+                                compaction_frozen_history::Column::Id,
+                            )))
+                            .filter(
+                                Expr::col((task_run_turn::Entity, task_run_turn::Column::Id))
+                                    .eq(Expr::Value(task_run_turn.into()))
+                                    .and(
+                                        Expr::col((task::Entity, task::Column::WorkspaceId))
+                                            .eq(Expr::Value(workspace.into())),
+                                    )
+                                    .and(
+                                        Expr::col((turn::Entity, turn::Column::Status))
+                                            .eq(Expr::val("completed")),
+                                    )
+                                    .and(
+                                        Expr::col((
+                                            task_run_turn::Entity,
+                                            task_run_turn::Column::Kind,
+                                        ))
                                         .is_in(["initial", "revision", "recovery"]),
-                                )
-                                .and(
-                                    Expr::col((task_run::Entity, task_run::Column::Status))
-                                        .ne(Expr::val("cancelled")),
-                                )
-                                .and(
-                                    Expr::col((
-                                        compaction_frozen_history::Entity,
-                                        compaction_frozen_history::Column::Id,
-                                    ))
-                                    .eq(Expr::Value(history.manifest_id.clone().into())),
-                                )
-                                .and(
-                                    Expr::col((
-                                        compaction_frozen_history::Entity,
-                                        compaction_frozen_history::Column::Ready,
-                                    ))
-                                    .eq(Expr::val(1_i64)),
-                                )
-                                .and(
-                                    Expr::col((
-                                        compaction_frozen_history::Entity,
-                                        compaction_frozen_history::Column::IdentitySha256,
-                                    ))
-                                    .eq(Expr::Value(history.identity_sha256.clone().into())),
-                                )
-                                .and(
-                                    Expr::col((
-                                        compaction_frozen_history::Entity,
-                                        compaction_frozen_history::Column::MessageCount,
-                                    ))
-                                    .eq(Expr::Value(i64::try_from(history.messages)?.into())),
-                                ),
-                        )
-                        .into_query(),
-                )?
-                .on_conflict(
-                    OnConflict::columns(["task_run_turn_id"])
-                        .do_nothing()
-                        .to_owned(),
-                )
-                .to_owned(),
-        )
-        .await?;
-    store
-        .compaction_task_output(workspace, task_run_turn)
-        .await?
-        .ok_or_else(|| {
-            anyhow::anyhow!("Task output snapshot has no completed canonical source binding")
+                                    )
+                                    .and(
+                                        Expr::col((task_run::Entity, task_run::Column::Status))
+                                            .ne(Expr::val("cancelled")),
+                                    )
+                                    .and(
+                                        Expr::col((
+                                            compaction_frozen_history::Entity,
+                                            compaction_frozen_history::Column::Id,
+                                        ))
+                                        .eq(Expr::Value(history.manifest_id.clone().into())),
+                                    )
+                                    .and(
+                                        Expr::col((
+                                            compaction_frozen_history::Entity,
+                                            compaction_frozen_history::Column::Ready,
+                                        ))
+                                        .eq(Expr::val(1_i64)),
+                                    )
+                                    .and(
+                                        Expr::col((
+                                            compaction_frozen_history::Entity,
+                                            compaction_frozen_history::Column::IdentitySha256,
+                                        ))
+                                        .eq(Expr::Value(history.identity_sha256.clone().into())),
+                                    )
+                                    .and(
+                                        Expr::col((
+                                            compaction_frozen_history::Entity,
+                                            compaction_frozen_history::Column::MessageCount,
+                                        ))
+                                        .eq(Expr::Value(i64::try_from(history.messages)?.into())),
+                                    ),
+                            )
+                            .into_query(),
+                    )?
+                    .on_conflict(
+                        OnConflict::columns(["task_run_turn_id"])
+                            .do_nothing()
+                            .to_owned(),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+            let record = compaction_task_output(&tx, workspace, task_run_turn)
+                .await?
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Task output snapshot has no completed canonical source binding"
+                    )
+                })?;
+            tx.commit().await?;
+            Ok(record)
         })
+        .await;
+    guard.complete(result).await
 }
 
 /// Point metadata read with the complete retained Task/turn relationship.
@@ -620,8 +633,8 @@ pub(crate) async fn bind_queued_task_output<C: ConnectionTrait>(
     Ok(())
 }
 
-pub(crate) async fn compaction_delivery_output(
-    store: &CrudStore,
+pub(crate) async fn compaction_delivery_output<C: ConnectionTrait>(
+    db: &C,
     workspace: &str,
     delivery: &str,
 ) -> Result<Option<TaskDeliveryOutputSnapshot>> {
@@ -751,15 +764,12 @@ pub(crate) async fn compaction_delivery_output(
                 ),
         )
         .into_tuple::<(String, String)>()
-        .one(&store.connection)
+        .one(db)
         .await?;
     let Some((candidate_id, task_run_turn)) = row else {
         return Ok(None);
     };
-    let Some(output) = store
-        .compaction_task_output(workspace, &task_run_turn)
-        .await?
-    else {
+    let Some(output) = compaction_task_output(db, workspace, &task_run_turn).await? else {
         return Ok(None);
     };
     Ok(Some(TaskDeliveryOutputSnapshot {

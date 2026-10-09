@@ -67,6 +67,7 @@ pub(super) async fn prepare_native_projection(
 }
 
 struct PreparedProjection {
+    guard: Option<pioneer_crud::FrozenUseGuard>,
     descriptor: pioneer_compaction::frozen::FrozenHistoryRef,
     accepted_scopes: BTreeSet<String>,
     source_epochs: std::collections::BTreeMap<String, u64>,
@@ -301,6 +302,22 @@ async fn prepare_native_projection_with_prepared(
     mut accepted_projection: Option<AcceptedProjection>,
     processor: Option<&crate::message::MessageProcessor>,
 ) -> Result<NativePreparedRequest> {
+    let guard = match &mut accepted_projection {
+        Some(AcceptedProjection::Prepared(projection)) => Some(
+            projection
+                .guard
+                .take()
+                .ok_or_else(|| anyhow::anyhow!("prepared native projection has no frozen use"))?,
+        ),
+        #[cfg(test)]
+        Some(AcceptedProjection::Descriptor(descriptor)) => Some(
+            store
+                .compaction_acquire_frozen_use(&context.workspace_id, descriptor, None)
+                .await?,
+        ),
+        None => None,
+    };
+    let result = async {
     let workspace = context.workspace_id.as_str();
     let thread = context.thread_id.as_str();
     let owner = native_owner(workspace, thread);
@@ -770,6 +787,11 @@ async fn prepare_native_projection_with_prepared(
         _ = clock.sleep_until(request_deadline) => anyhow::bail!("native context preparation deadline exceeded after checkpoint"),
         result = materialize => result,
     }
+    }.await;
+    match guard {
+        Some(guard) => guard.complete(result).await,
+        None => result,
+    }
 }
 
 #[cfg(test)]
@@ -785,6 +807,7 @@ pub(super) async fn prepare_native_projection_from_history(
     clock: Arc<dyn CompactionClock>,
 ) -> Result<NativePreparedRequest> {
     let super::frozen::PreparedHistory {
+        guard,
         descriptor,
         messages: _,
         accepted_scopes,
@@ -804,6 +827,7 @@ pub(super) async fn prepare_native_projection_from_history(
         observer,
         clock,
         Some(AcceptedProjection::Prepared(PreparedProjection {
+            guard: Some(guard),
             descriptor,
             accepted_scopes,
             source_epochs,
@@ -951,6 +975,7 @@ async fn refresh_native_history(
         )
         .await?;
     let super::frozen::PreparedHistory {
+        guard,
         descriptor,
         messages: mut history,
         accepted_scopes: allowed,
@@ -959,92 +984,101 @@ async fn refresh_native_history(
         checkpoint,
         mut checkpoint_graphs,
     } = prepared;
-    let is_current = |thread: &str, scope: &str| {
-        thread == context.thread_id
-            && scope.split_once(':').is_some_and(|(kind, turn)| {
-                turn == context.turn_id
-                    && matches!(
-                        kind,
-                        "input"
-                            | "event"
-                            | "context"
-                            | "item"
-                            | "pending-input"
-                            | "pending-assistant"
-                            | "pending-tool"
-                            | "pending-item"
-                    )
-            })
-    };
-    for message in request.messages {
-        let Some(origin) = &message.provenance else {
-            // Current runtime instructions without canonical history provenance
-            // remain protected by the request planner.
-            history.push(message);
-            continue;
+    let result = async {
+        let is_current = |thread: &str, scope: &str| {
+            thread == context.thread_id
+                && scope.split_once(':').is_some_and(|(kind, turn)| {
+                    turn == context.turn_id
+                        && matches!(
+                            kind,
+                            "input"
+                                | "event"
+                                | "context"
+                                | "item"
+                                | "pending-input"
+                                | "pending-assistant"
+                                | "pending-tool"
+                                | "pending-item"
+                        )
+                })
         };
-        let checkpoint = origin
-            .sources
-            .iter()
-            .find(|source| source.scope.starts_with("checkpoint:"));
-        if let Some(checkpoint) = checkpoint {
-            let source = SourceRef {
-                scope: checkpoint.scope.clone(),
-                id: checkpoint.id.clone(),
-                version: checkpoint.version.clone(),
+        for message in request.messages {
+            let Some(origin) = &message.provenance else {
+                // Current runtime instructions without canonical history provenance
+                // remain protected by the request planner.
+                history.push(message);
+                continue;
             };
-            let leaves = checkpoint_graphs
-                .resolve(&store, &context.workspace_id, Some(&allowed), &source)
-                .await?
-                .ok_or_else(|| anyhow::anyhow!("checkpoint root is unavailable"))?
-                .leaves
-                .clone();
-            if leaves
+            let checkpoint = origin
+                .sources
                 .iter()
-                .any(|leaf| is_current(&leaf.thread, &leaf.source.scope))
-            {
-                let already_present = history.iter().any(|existing| {
-                    existing.provenance.as_ref().is_some_and(|origin| {
-                        origin.sources.iter().any(|candidate| {
-                            candidate.scope == checkpoint.scope
-                                && candidate.id == checkpoint.id
-                                && candidate.version == checkpoint.version
-                        })
-                    })
-                });
-                if !already_present {
-                    history.push(message);
-                }
-            }
-            continue;
-        }
-        let mut message = message;
-        let origin = message
-            .provenance
-            .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("current history lost provenance"))?;
-        if origin
-            .sources
-            .iter()
-            .any(|source| is_current(&origin.thread_id, &source.scope))
-        {
-            ensure!(
-                origin
-                    .sources
+                .find(|source| source.scope.starts_with("checkpoint:"));
+            if let Some(checkpoint) = checkpoint {
+                let source = SourceRef {
+                    scope: checkpoint.scope.clone(),
+                    id: checkpoint.id.clone(),
+                    version: checkpoint.version.clone(),
+                };
+                let leaves = checkpoint_graphs
+                    .resolve(&store, &context.workspace_id, Some(&allowed), &source)
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("checkpoint root is unavailable"))?
+                    .leaves
+                    .clone();
+                if leaves
                     .iter()
-                    .all(|source| is_current(&origin.thread_id, &source.scope)),
-                "history unit crosses the current execution boundary"
-            );
-            if origin.sources.iter().any(|source| {
-                source.scope.starts_with("input:") || source.scope.starts_with("pending-input:")
-            }) {
-                origin.protected_input = true;
+                    .any(|leaf| is_current(&leaf.thread, &leaf.source.scope))
+                {
+                    let already_present = history.iter().any(|existing| {
+                        existing.provenance.as_ref().is_some_and(|origin| {
+                            origin.sources.iter().any(|candidate| {
+                                candidate.scope == checkpoint.scope
+                                    && candidate.id == checkpoint.id
+                                    && candidate.version == checkpoint.version
+                            })
+                        })
+                    });
+                    if !already_present {
+                        history.push(message);
+                    }
+                }
+                continue;
             }
-            history.push(message);
+            let mut message = message;
+            let origin = message
+                .provenance
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("current history lost provenance"))?;
+            if origin
+                .sources
+                .iter()
+                .any(|source| is_current(&origin.thread_id, &source.scope))
+            {
+                ensure!(
+                    origin
+                        .sources
+                        .iter()
+                        .all(|source| is_current(&origin.thread_id, &source.scope)),
+                    "history unit crosses the current execution boundary"
+                );
+                if origin.sources.iter().any(|source| {
+                    source.scope.starts_with("input:") || source.scope.starts_with("pending-input:")
+                }) {
+                    origin.protected_input = true;
+                }
+                history.push(message);
+            }
         }
+        request.messages = history;
+        Ok(request)
     }
-    request.messages = history;
-    let projection = PreparedProjection {
+    .await;
+    let request = match result {
+        Ok(request) => request,
+        Err(error) => return guard.complete(Err(error)).await,
+    };
+    let mut projection = PreparedProjection {
+        guard: Some(guard),
         descriptor,
         accepted_scopes: allowed,
         source_epochs,
@@ -1052,13 +1086,15 @@ async fn refresh_native_history(
         checkpoint,
         checkpoint_graphs,
     };
-    observe_refreshed_projection(
+    if let Err(error) = observe_refreshed_projection(
         store,
         &context.workspace_id,
         &context.thread_id,
         &request,
         &projection,
-    )?;
+    ) {
+        return projection.guard.take().unwrap().complete(Err(error)).await;
+    }
     Ok((request, projection))
 }
 

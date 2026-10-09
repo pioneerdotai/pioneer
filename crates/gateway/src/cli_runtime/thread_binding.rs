@@ -749,155 +749,175 @@ async fn context_basis_from_acknowledged_turn(
     source: &pioneer_crud::CliRuntimeTurnBindingRecord,
     sent: Option<CliRuntimeSentContextBasis>,
 ) -> Result<Option<CliRuntimeContextBasis>> {
-    let (mut basis, pending_turn) = if let Some(sent) = sent {
-        if sent.pending_turn.turn_id != source.turn_id {
-            bail!("CLI fork source context belongs to a different turn");
-        }
-        (sent.completed, sent.pending_turn)
-    } else {
-        // The context receipt was introduced after existing CLI sessions and
-        // Task snapshots. Recover the immutable accepted history that the old
-        // execution actually used; never substitute today's mutable thread
-        // projection for that historical boundary.
-        let frozen = if let Some(snapshot) = store
-            .get_turn_runtime_snapshot(source.turn_id.as_str())
-            .await?
-        {
-            Some((snapshot.thread_id, snapshot.history_json))
-        } else if let Some(run_turn) = store
-            .get_task_run_turn_by_turn(source.thread_id.as_str(), source.turn_id.as_str())
-            .await?
-        {
-            store
-                .get_task_run_conversation_snapshot(run_turn.run_id.as_str())
-                .await?
-                .map(|snapshot| (snapshot.conversation_thread_id, snapshot.history_json))
+    let guard = store.compaction_pin_cli_turn_binding(source).await?;
+    let mut fallback_use = None;
+    let result = async {
+        let (mut basis, pending_turn) = if let Some(sent) = sent {
+            if sent.pending_turn.turn_id != source.turn_id {
+                bail!("CLI fork source context belongs to a different turn");
+            }
+            (sent.completed, sent.pending_turn)
         } else {
-            None
-        };
-        let Some((manifest_owner, history_json)) = frozen else {
-            return Ok(None);
-        };
-        if history_json.trim_start().starts_with('[') {
-            return Ok(None);
-        }
-        let descriptor: pioneer_compaction::frozen::FrozenHistoryRef =
-            serde_json::from_str(history_json.as_str())?;
-        let direct_sources = crate::compaction::frozen::frozen_history_direct_sources(
-            store,
-            source.workspace_id.as_str(),
-            &descriptor,
-        )
-        .await?;
-        let Some((_, turn)) = store
-            .get_turn(source.thread_id.as_str(), source.turn_id.as_str())
-            .await?
-        else {
-            return Ok(None);
-        };
-        // Prior history snapshots do not contain the separately submitted
-        // current input. A legacy mapping proves that it was sent, while an
-        // unedited revision-zero Turn proves which immutable input it was.
-        // Any later edit/delete (or an earlier edit with no recorded sent
-        // revision) requires a fresh history bridge.
-        let mapping = match serde_json::from_str::<
-            pioneer_cli_agent_runtime::input::CLIRuntimeTurnInputMapping,
-        >(source.input_mapping_json.as_str())
-        {
-            Ok(mapping) => mapping,
-            Err(_) => return Ok(None),
-        };
-        if mapping.input.is_empty() || turn.message_revision != 0 || turn.message_deleted {
-            return Ok(None);
-        }
-        (
-            cli_runtime_context_basis(
-                source.thread_id.as_str(),
-                manifest_owner.as_str(),
-                history_json,
-                &direct_sources,
-            ),
-            CliRuntimeDeliveredTurn {
-                turn_id: source.turn_id.clone(),
-                thread_id: Some(source.thread_id.clone()),
-                message_revision: turn.message_revision,
-                message_deleted: turn.message_deleted,
-            },
-        )
-    };
-    if basis
-        .delivered_turns
-        .iter()
-        .all(|turn| turn.turn_id != source.turn_id)
-    {
-        basis.delivered_turns.push(pending_turn);
-    }
-    basis.delivered_sources.extend(
-        completed_turn_output_sources(
-            store,
-            source.workspace_id.as_str(),
-            source.thread_id.as_str(),
-            source.turn_id.as_str(),
-        )
-        .await?,
-    );
-    if source.continuation_thread_id != source.thread_id
-        && let Some(run_turn) = store
-            .get_task_run_turn_by_turn(source.thread_id.as_str(), source.turn_id.as_str())
-            .await?
-        && let Some(run) = store.get_task_run(run_turn.run_id.as_str()).await?
-        && let Some(task) = store.get_task_record(run.task_id.as_str()).await?
-        && let Some(work) = task
-            .metadata
-            .as_ref()
-            .and_then(|metadata| metadata.composer_work.as_ref())
-    {
-        // An older service turn sent its Composer launch separately from the
-        // frozen prior history. Recover guards for that delivered input and
-        // its occurrence too; otherwise an edit to either would be hidden by
-        // the newer completed child turn when reconstructing a legacy basis.
-        for parent_turn_id in [work.launch.turn_id.as_str(), run.id.as_str()] {
-            let (_, parent_turn) = store
-                .get_turn(source.continuation_thread_id.as_str(), parent_turn_id)
+            // The context receipt was introduced after existing CLI sessions and
+            // Task snapshots. Recover the immutable accepted history that the old
+            // execution actually used; never substitute today's mutable thread
+            // projection for that historical boundary.
+            let frozen = if let Some(snapshot) = store
+                .get_turn_runtime_snapshot(source.turn_id.as_str())
                 .await?
-                .with_context(|| format!("legacy Composer turn {parent_turn_id} is missing"))?;
-            if parent_turn.message_revision != 0 || parent_turn.message_deleted {
+            {
+                fallback_use = store.compaction_pin_runtime_snapshot(&snapshot).await?;
+                Some((snapshot.thread_id, snapshot.history_json))
+            } else if let Some(run_turn) = store
+                .get_task_run_turn_by_turn(source.thread_id.as_str(), source.turn_id.as_str())
+                .await?
+            {
+                match store
+                    .get_task_run_conversation_snapshot(run_turn.run_id.as_str())
+                    .await?
+                {
+                    Some(snapshot) => {
+                        fallback_use = store.compaction_pin_task_snapshot(&snapshot).await?;
+                        Some((snapshot.conversation_thread_id, snapshot.history_json))
+                    }
+                    None => None,
+                }
+            } else {
+                None
+            };
+            let Some((manifest_owner, history_json)) = frozen else {
+                return Ok(None);
+            };
+            if history_json.trim_start().starts_with('[') {
                 return Ok(None);
             }
-            if basis.delivered_turns.iter().all(|turn| {
-                turn.turn_id != parent_turn_id
-                    || turn.thread_id.as_deref() != Some(source.continuation_thread_id.as_str())
-            }) {
-                basis.delivered_turns.push(CliRuntimeDeliveredTurn {
-                    turn_id: parent_turn_id.to_owned(),
-                    thread_id: Some(source.continuation_thread_id.clone()),
-                    message_revision: parent_turn.message_revision,
-                    message_deleted: parent_turn.message_deleted,
-                });
+            let descriptor: pioneer_compaction::frozen::FrozenHistoryRef =
+                serde_json::from_str(history_json.as_str())?;
+            let direct_sources = crate::compaction::frozen::frozen_history_direct_sources(
+                store,
+                source.workspace_id.as_str(),
+                &descriptor,
+            )
+            .await?;
+            let Some((_, turn)) = store
+                .get_turn(source.thread_id.as_str(), source.turn_id.as_str())
+                .await?
+            else {
+                return Ok(None);
+            };
+            // Prior history snapshots do not contain the separately submitted
+            // current input. A legacy mapping proves that it was sent, while an
+            // unedited revision-zero Turn proves which immutable input it was.
+            // Any later edit/delete (or an earlier edit with no recorded sent
+            // revision) requires a fresh history bridge.
+            let mapping = match serde_json::from_str::<
+                pioneer_cli_agent_runtime::input::CLIRuntimeTurnInputMapping,
+            >(source.input_mapping_json.as_str())
+            {
+                Ok(mapping) => mapping,
+                Err(_) => return Ok(None),
+            };
+            if mapping.input.is_empty() || turn.message_revision != 0 || turn.message_deleted {
+                return Ok(None);
             }
-            if parent_turn_id == work.launch.turn_id {
-                basis.delivered_sources.extend(
-                    completed_turn_output_sources(
-                        store,
-                        source.workspace_id.as_str(),
-                        source.continuation_thread_id.as_str(),
-                        parent_turn_id,
-                    )
-                    .await?,
-                );
+            (
+                cli_runtime_context_basis(
+                    source.thread_id.as_str(),
+                    manifest_owner.as_str(),
+                    history_json,
+                    &direct_sources,
+                ),
+                CliRuntimeDeliveredTurn {
+                    turn_id: source.turn_id.clone(),
+                    thread_id: Some(source.thread_id.clone()),
+                    message_revision: turn.message_revision,
+                    message_deleted: turn.message_deleted,
+                },
+            )
+        };
+        if basis
+            .delivered_turns
+            .iter()
+            .all(|turn| turn.turn_id != source.turn_id)
+        {
+            basis.delivered_turns.push(pending_turn);
+        }
+        basis.delivered_sources.extend(
+            completed_turn_output_sources(
+                store,
+                source.workspace_id.as_str(),
+                source.thread_id.as_str(),
+                source.turn_id.as_str(),
+            )
+            .await?,
+        );
+        if source.continuation_thread_id != source.thread_id
+            && let Some(run_turn) = store
+                .get_task_run_turn_by_turn(source.thread_id.as_str(), source.turn_id.as_str())
+                .await?
+            && let Some(run) = store.get_task_run(run_turn.run_id.as_str()).await?
+            && let Some(task) = store.get_task_record(run.task_id.as_str()).await?
+            && let Some(work) = task
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.composer_work.as_ref())
+        {
+            // An older service turn sent its Composer launch separately from the
+            // frozen prior history. Recover guards for that delivered input and
+            // its occurrence too; otherwise an edit to either would be hidden by
+            // the newer completed child turn when reconstructing a legacy basis.
+            for parent_turn_id in [work.launch.turn_id.as_str(), run.id.as_str()] {
+                let (_, parent_turn) = store
+                    .get_turn(source.continuation_thread_id.as_str(), parent_turn_id)
+                    .await?
+                    .with_context(|| format!("legacy Composer turn {parent_turn_id} is missing"))?;
+                if parent_turn.message_revision != 0 || parent_turn.message_deleted {
+                    return Ok(None);
+                }
+                if basis.delivered_turns.iter().all(|turn| {
+                    turn.turn_id != parent_turn_id
+                        || turn.thread_id.as_deref() != Some(source.continuation_thread_id.as_str())
+                }) {
+                    basis.delivered_turns.push(CliRuntimeDeliveredTurn {
+                        turn_id: parent_turn_id.to_owned(),
+                        thread_id: Some(source.continuation_thread_id.clone()),
+                        message_revision: parent_turn.message_revision,
+                        message_deleted: parent_turn.message_deleted,
+                    });
+                }
+                if parent_turn_id == work.launch.turn_id {
+                    basis.delivered_sources.extend(
+                        completed_turn_output_sources(
+                            store,
+                            source.workspace_id.as_str(),
+                            source.continuation_thread_id.as_str(),
+                            parent_turn_id,
+                        )
+                        .await?,
+                    );
+                }
             }
         }
+        basis.delivered_sources.sort_by(|left, right| {
+            (&left.source_thread_id, &left.scope, &left.id, &left.version).cmp(&(
+                &right.source_thread_id,
+                &right.scope,
+                &right.id,
+                &right.version,
+            ))
+        });
+        basis.delivered_sources.dedup();
+        Ok(Some(basis))
     }
-    basis.delivered_sources.sort_by(|left, right| {
-        (&left.source_thread_id, &left.scope, &left.id, &left.version).cmp(&(
-            &right.source_thread_id,
-            &right.scope,
-            &right.id,
-            &right.version,
-        ))
-    });
-    basis.delivered_sources.dedup();
-    Ok(Some(basis))
+    .await;
+    let result = match fallback_use {
+        Some(guard) => guard.complete(result).await,
+        None => result,
+    };
+    match guard {
+        Some(guard) => guard.complete(result).await,
+        None => result,
+    }
 }
 
 pub(crate) async fn completed_context_basis_is_current(
@@ -1415,18 +1435,26 @@ async fn current_context_basis_for_receipt(
         .context_manifest_owner_thread_id
         .as_deref()
         .unwrap_or(execution_owner);
-    let basis = CliRuntimeContextBasis {
-        execution_thread_id: execution_owner.to_owned(),
-        manifest_owner_thread_id: manifest_owner.to_owned(),
-        history_json: history_json.to_owned(),
-        delivered_turns: receipt.delivered_turns.clone(),
-        delivered_sources: receipt.delivered_sources.clone(),
-    };
-    Ok(
-        completed_context_basis_is_current(store, workspace_id, &basis)
-            .await?
-            .then_some(basis),
-    )
+    let guard = store.compaction_pin_cli_thread_binding(binding).await?;
+    let result = async {
+        let basis = CliRuntimeContextBasis {
+            execution_thread_id: execution_owner.to_owned(),
+            manifest_owner_thread_id: manifest_owner.to_owned(),
+            history_json: history_json.to_owned(),
+            delivered_turns: receipt.delivered_turns.clone(),
+            delivered_sources: receipt.delivered_sources.clone(),
+        };
+        Ok(
+            completed_context_basis_is_current(store, workspace_id, &basis)
+                .await?
+                .then_some(basis),
+        )
+    }
+    .await;
+    match guard {
+        Some(guard) => guard.complete(result).await,
+        None => result,
+    }
 }
 
 fn ensure_turn_guard_size(encoded_id_bytes: usize) -> Result<()> {

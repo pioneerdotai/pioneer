@@ -49,10 +49,18 @@ pub struct NewTurnRuntimeSnapshot {
     pub updated_at: DateTimeWithTimeZone,
 }
 
-pub async fn upsert_turn_runtime_snapshot<C: ConnectionTrait>(
+pub(crate) async fn upsert_turn_runtime_snapshot<C: ConnectionTrait>(
     db: &C,
     snapshot: NewTurnRuntimeSnapshot,
+    root: &super::compaction_frozen_root::RootPublication,
 ) -> Result<TurnRuntimeSnapshotRecord> {
+    root.validate_in(db, &snapshot.workspace_id, &snapshot.thread_id)
+        .await?;
+    let domain = db.query_one_raw(sea_orm::Statement::from_sql_and_values(sea_orm::DbBackend::Sqlite,
+        "SELECT v.id FROM turn v JOIN thread t ON t.id=v.thread_id JOIN workspace w ON w.id=t.workspace_id \
+         WHERE v.id=? AND t.id=? AND t.workspace_id=?",
+        [snapshot.turn_id.clone().into(), snapshot.thread_id.clone().into(), snapshot.workspace_id.clone().into()])).await?;
+    anyhow::ensure!(domain.is_some(), "runtime snapshot domain is unavailable");
     let turn_id = snapshot.turn_id.clone();
     turn_runtime_snapshot::Entity::insert(turn_runtime_snapshot::ActiveModel {
         turn_id: Set(snapshot.turn_id),
@@ -70,8 +78,11 @@ pub async fn upsert_turn_runtime_snapshot<C: ConnectionTrait>(
         resolved_artifacts_json: Set(snapshot.resolved_artifacts_json),
         runtime_environment_json: Set(snapshot.runtime_environment_json),
         history_json: Set(snapshot.history_json),
+        frozen_manifest_id: Set(root.root.id()),
+        frozen_root_state: Set(root.root.state().to_owned()),
         created_at: Set(snapshot.created_at),
         updated_at: Set(snapshot.updated_at),
+        ..Default::default()
     })
     .on_conflict(
         OnConflict::column(turn_runtime_snapshot::Column::TurnId)
@@ -90,6 +101,8 @@ pub async fn upsert_turn_runtime_snapshot<C: ConnectionTrait>(
                 turn_runtime_snapshot::Column::ResolvedArtifactsJson,
                 turn_runtime_snapshot::Column::RuntimeEnvironmentJson,
                 turn_runtime_snapshot::Column::HistoryJson,
+                turn_runtime_snapshot::Column::FrozenManifestId,
+                turn_runtime_snapshot::Column::FrozenRootState,
                 turn_runtime_snapshot::Column::UpdatedAt,
             ])
             .to_owned(),

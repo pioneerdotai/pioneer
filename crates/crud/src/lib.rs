@@ -2812,6 +2812,38 @@ pub struct TurnMcpProjectionRecord {
     pub created_at_unix: i64,
 }
 
+/// Explicit operational attestation; never inferred from a process, schema or restart.
+/// Constructing this permit is reserved for the separately authorized rollout.
+#[derive(Clone, Copy, Debug)]
+pub struct FrozenHistoryProtocolPermit {
+    _private: (),
+}
+impl FrozenHistoryProtocolPermit {
+    pub fn confirm_all_old_writers_stopped() -> Self {
+        Self { _private: () }
+    }
+}
+
+/// Separate, externally authorized rollout attestation. No application enables it.
+#[derive(Clone, Copy, Debug)]
+pub struct FrozenHistoryReclamationPermit {
+    _private: (),
+}
+impl FrozenHistoryReclamationPermit {
+    pub fn confirm_independent_validation_and_rollout_authorized() -> Self {
+        Self { _private: () }
+    }
+}
+/// Physical cleanup additionally requires independently reviewed SQL costs.
+#[derive(Clone, Copy, Debug)]
+pub struct FrozenHistoryPhysicalCleanupPermit {
+    _private: (),
+}
+impl FrozenHistoryPhysicalCleanupPermit {
+    pub fn confirm_physical_validation_and_rollout_authorized() -> Self {
+        Self { _private: () }
+    }
+}
 #[derive(Clone)]
 pub struct CrudStore {
     #[cfg(any(test, feature = "test-support"))]
@@ -2819,6 +2851,11 @@ pub struct CrudStore {
         std::sync::Mutex<Option<task_delivery_lifecycle::TaskDeliveryCommitTestGate>>,
     >,
     connection: SqliteDatabase,
+    frozen_history_protocol: bool,
+    frozen_history_reclamation: bool,
+    frozen_history_physical_cleanup: bool,
+    frozen_maintenance_cursor:
+        std::sync::Arc<std::sync::Mutex<repositories::compaction_frozen_maintenance::Cursor>>,
     projector: TurnProjector,
     task_projector: TaskProjector,
 }
@@ -4401,11 +4438,55 @@ impl CrudStore {
     pub fn new(connection: impl Into<SqliteDatabase>) -> Self {
         Self {
             connection: connection.into(),
+            frozen_history_protocol: false,
+            frozen_history_reclamation: false,
+            frozen_history_physical_cleanup: false,
+            frozen_maintenance_cursor: Default::default(),
             #[cfg(any(test, feature = "test-support"))]
             delivery_commit_test_gate: std::sync::Arc::new(std::sync::Mutex::new(None)),
             projector: TurnProjector::new(),
             task_projector: TaskProjector::new(),
         }
+    }
+
+    /// No application or worker calls this during the implementation rollout.
+    pub fn with_frozen_history_protocol(&self, _permit: FrozenHistoryProtocolPermit) -> Self {
+        let mut scoped = self.clone();
+        scoped.frozen_history_protocol = true;
+        scoped
+    }
+    pub fn with_frozen_history_reclamation(
+        &self,
+        _permit: FrozenHistoryReclamationPermit,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            self.frozen_history_protocol,
+            "exclusive frozen protocol permit required"
+        );
+        let mut scoped = self.clone();
+        scoped.frozen_history_reclamation = true;
+        Ok(scoped)
+    }
+    pub(crate) fn frozen_history_reclamation_enabled(&self) -> bool {
+        self.frozen_history_protocol && self.frozen_history_reclamation
+    }
+    pub fn with_frozen_history_physical_cleanup(
+        &self,
+        _permit: FrozenHistoryPhysicalCleanupPermit,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            self.frozen_history_reclamation_enabled(),
+            "logical reclamation rollout required"
+        );
+        let mut scoped = self.clone();
+        scoped.frozen_history_physical_cleanup = true;
+        Ok(scoped)
+    }
+    pub(crate) fn frozen_history_physical_cleanup_enabled(&self) -> bool {
+        self.frozen_history_reclamation_enabled() && self.frozen_history_physical_cleanup
+    }
+    pub(crate) fn frozen_history_protocol_enabled(&self) -> bool {
+        self.frozen_history_protocol
     }
 
     /// Returns a store whose reads and writes are both classified as
@@ -4992,11 +5073,27 @@ impl CrudStore {
         &self,
         snapshot: NewTurnRuntimeSnapshot,
     ) -> Result<TurnRuntimeSnapshotRecord> {
-        self.run_serialized_write(|| async {
-            turn_runtime_snapshot::upsert_turn_runtime_snapshot(&self.connection, snapshot.clone())
-                .await
-        })
-        .await
+        let root = repositories::compaction_frozen_root::RootPublication::prepare(
+            self,
+            &snapshot.workspace_id,
+            &snapshot.thread_id,
+            &snapshot.history_json,
+        )
+        .await?;
+        let result = self
+            .run_serialized_write(|| async {
+                let tx = self.connection.begin().await?;
+                let record = turn_runtime_snapshot::upsert_turn_runtime_snapshot(
+                    &tx,
+                    snapshot.clone(),
+                    &root,
+                )
+                .await?;
+                tx.commit().await?;
+                Ok(record)
+            })
+            .await;
+        root.complete(result).await
     }
 
     pub async fn get_turn_runtime_snapshot(
@@ -5079,21 +5176,53 @@ impl CrudStore {
         &self,
         binding: NewCliRuntimeThreadBinding,
     ) -> Result<CliRuntimeThreadBindingRecord> {
-        self.run_serialized_write(|| async {
-            cli_runtime_binding::upsert_thread_binding(&self.connection, binding.clone()).await
-        })
-        .await
+        let root = repositories::compaction_frozen_root::RootPublication::prepare_classified(
+            self,
+            &binding.workspace_id,
+            repositories::compaction_frozen_root::FrozenRoot::cli_thread(
+                &binding.resume_cursor_json,
+            ),
+        )
+        .await?;
+        let result = self
+            .run_serialized_write(|| async {
+                let tx = self.connection.begin().await?;
+                let value = async {
+                    cli_runtime_binding::upsert_thread_binding(&tx, binding.clone(), &root).await
+                }
+                .await?;
+                tx.commit().await?;
+                Ok(value)
+            })
+            .await;
+        root.complete(result).await
     }
 
     pub async fn insert_cli_fork_intent_if_absent(
         &self,
         pending: NewCliRuntimeThreadBinding,
     ) -> Result<bool> {
-        self.run_serialized_write(|| async {
-            cli_runtime_binding::insert_fork_intent_if_absent(&self.connection, pending.clone())
-                .await
-        })
-        .await
+        let root = repositories::compaction_frozen_root::RootPublication::prepare_classified(
+            self,
+            &pending.workspace_id,
+            repositories::compaction_frozen_root::FrozenRoot::cli_thread(
+                &pending.resume_cursor_json,
+            ),
+        )
+        .await?;
+        let result = self
+            .run_serialized_write(|| async {
+                let tx = self.connection.begin().await?;
+                let value = async {
+                    cli_runtime_binding::insert_fork_intent_if_absent(&tx, pending.clone(), &root)
+                        .await
+                }
+                .await?;
+                tx.commit().await?;
+                Ok(value)
+            })
+            .await;
+        root.complete(result).await
     }
 
     pub async fn get_cli_runtime_thread_binding(
@@ -5133,19 +5262,34 @@ impl CrudStore {
         resume_cursor_json: String,
         updated_at: sea_orm::entity::prelude::DateTimeWithTimeZone,
     ) -> Result<CliRuntimeThreadBindingRecord> {
-        self.run_serialized_write(|| async {
-            cli_runtime_binding::confirm_marked_fork_intent(
-                &self.connection,
-                pending,
-                fork_native_thread_id,
-                native_cwd.clone(),
-                native_model.clone(),
-                resume_cursor_json.clone(),
-                updated_at,
-            )
-            .await
-        })
-        .await
+        let root = repositories::compaction_frozen_root::RootPublication::prepare_classified(
+            self,
+            &pending.workspace_id,
+            repositories::compaction_frozen_root::FrozenRoot::cli_thread(&resume_cursor_json),
+        )
+        .await?;
+        let result = self
+            .run_serialized_write(|| async {
+                let tx = self.connection.begin().await?;
+                let value = async {
+                    cli_runtime_binding::confirm_marked_fork_intent(
+                        &tx,
+                        pending,
+                        fork_native_thread_id,
+                        native_cwd.clone(),
+                        native_model.clone(),
+                        resume_cursor_json.clone(),
+                        updated_at,
+                        &root,
+                    )
+                    .await
+                }
+                .await?;
+                tx.commit().await?;
+                Ok(value)
+            })
+            .await;
+        root.complete(result).await
     }
 
     pub async fn update_cli_runtime_thread_resume_cursor(
@@ -5159,32 +5303,68 @@ impl CrudStore {
         let thread_id = thread_id.to_owned();
         let expected_native_thread_id = expected_native_thread_id.to_owned();
         let expected_cursor_json = expected_cursor_json.to_owned();
-        self.run_serialized_write(|| async {
-            cli_runtime_binding::update_thread_resume_cursor(
-                &self.connection,
-                thread_id.as_str(),
-                expected_native_thread_id.as_str(),
-                expected_cursor_json.as_str(),
-                resume_cursor_json.clone(),
-                updated_at,
-            )
-            .await
-        })
-        .await
+        let current = self
+            .get_cli_runtime_thread_binding(&thread_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("CLI thread binding is unavailable"))?;
+        let root = repositories::compaction_frozen_root::RootPublication::prepare_classified(
+            self,
+            &current.workspace_id,
+            repositories::compaction_frozen_root::FrozenRoot::cli_thread(&resume_cursor_json),
+        )
+        .await?;
+        let result = self
+            .run_serialized_write(|| async {
+                let tx = self.connection.begin().await?;
+                let value = async {
+                    cli_runtime_binding::update_thread_resume_cursor(
+                        &tx,
+                        thread_id.as_str(),
+                        expected_native_thread_id.as_str(),
+                        expected_cursor_json.as_str(),
+                        resume_cursor_json.clone(),
+                        updated_at,
+                        &root,
+                    )
+                    .await
+                }
+                .await?;
+                tx.commit().await?;
+                Ok(value)
+            })
+            .await;
+        root.complete(result).await
     }
 
     pub async fn prepare_claude_provider_session_binding(
         &self,
         request: PrepareClaudeProviderSessionBinding,
     ) -> Result<PreparedClaudeProviderSessionBinding> {
-        self.run_serialized_write(|| async {
-            cli_runtime_binding::prepare_claude_provider_session_binding(
-                &self.connection,
-                request.clone(),
-            )
-            .await
-        })
-        .await
+        let root = repositories::compaction_frozen_root::RootPublication::prepare_classified(
+            self,
+            &request.thread_binding.workspace_id,
+            repositories::compaction_frozen_root::FrozenRoot::cli_thread(
+                &request.thread_binding.resume_cursor_json,
+            ),
+        )
+        .await?;
+        let result = self
+            .run_serialized_write(|| async {
+                let tx = self.connection.begin().await?;
+                let value = async {
+                    cli_runtime_binding::prepare_claude_provider_session_binding(
+                        &tx,
+                        request.clone(),
+                        &root,
+                    )
+                    .await
+                }
+                .await?;
+                tx.commit().await?;
+                Ok(value)
+            })
+            .await;
+        root.complete(result).await
     }
 
     pub async fn verify_claude_provider_session_binding(
@@ -5261,12 +5441,27 @@ impl CrudStore {
         &self,
         binding: NewCliRuntimeTurnBinding,
     ) -> Result<CliRuntimeTurnBindingRecord> {
-        self.run_serialized_write(|| async {
-            let stored =
-                cli_runtime_binding::upsert_turn_binding(&self.connection, binding.clone()).await?;
-            Ok(stored)
-        })
-        .await
+        let root = repositories::compaction_frozen_root::RootPublication::prepare_classified(
+            self,
+            &binding.workspace_id,
+            repositories::compaction_frozen_root::FrozenRoot::cli_turn(&binding.input_mapping_json),
+        )
+        .await?;
+        let result = self
+            .run_serialized_write(|| async {
+                let tx = self.connection.begin().await?;
+                let value = async {
+                    let stored =
+                        cli_runtime_binding::upsert_turn_binding(&tx, binding.clone(), &root)
+                            .await?;
+                    Ok::<_, anyhow::Error>(stored)
+                }
+                .await?;
+                tx.commit().await?;
+                Ok(value)
+            })
+            .await;
+        root.complete(result).await
     }
 
     pub async fn get_cli_runtime_turn_binding(
@@ -5760,7 +5955,13 @@ impl CrudStore {
         attempt_id: String,
         execution_window_index: u32,
     ) -> Result<(CliRuntimeTurnBindingRecord, CliRuntimeTurnAttemptRecord)> {
-        self.run_serialized_write(|| async {
+        let root = repositories::compaction_frozen_root::RootPublication::prepare_classified(
+            self,
+            &binding.workspace_id,
+            repositories::compaction_frozen_root::FrozenRoot::cli_turn(&binding.input_mapping_json),
+        )
+        .await?;
+        let result = self.run_serialized_write(|| async {
             let transaction = self
                 .connection
                 .begin()
@@ -5821,7 +6022,7 @@ impl CrudStore {
                         );
                     }
                     let stored_binding =
-                        cli_runtime_binding::upsert_turn_binding(&transaction, binding.clone())
+                        cli_runtime_binding::upsert_turn_binding(&transaction, binding.clone(), &root)
                             .await?;
                     cli_runtime_binding::create_turn_attempt(
                         &transaction,
@@ -5863,7 +6064,8 @@ impl CrudStore {
                 .context("failed to commit CLI runtime initial attempt transaction")?;
             Ok((stored_binding, attempt))
         })
-        .await
+        .await;
+        root.complete(result).await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -6035,7 +6237,7 @@ impl CrudStore {
             binding.native_turn_id = None;
             binding.status = "starting".to_owned();
             binding.updated_at = prepared_at;
-            let stored_binding = cli_runtime_binding::upsert_turn_binding(
+            let stored_binding = cli_runtime_binding::upsert_turn_binding_retained(
                 &transaction,
                 NewCliRuntimeTurnBinding {
                     turn_id: binding.turn_id,
@@ -6238,7 +6440,7 @@ impl CrudStore {
                 transaction.rollback().await.ok();
                 bail!("CLI runtime turn attempt `{attempt_id}` is no longer starting");
             }
-            let stored_binding = cli_runtime_binding::upsert_turn_binding(
+            let stored_binding = cli_runtime_binding::upsert_turn_binding_retained(
                 &transaction,
                 NewCliRuntimeTurnBinding {
                     turn_id: binding.turn_id,
@@ -6807,7 +7009,7 @@ impl CrudStore {
                     attempt.id
                 );
             }
-            let stored_binding = cli_runtime_binding::upsert_turn_binding(
+            let stored_binding = cli_runtime_binding::upsert_turn_binding_retained(
                 &transaction,
                 NewCliRuntimeTurnBinding {
                     turn_id: binding.turn_id,
@@ -14322,8 +14524,25 @@ impl CrudStore {
         &self,
         input: TaskCreationCommitInput,
     ) -> Result<Vec<AppendedTaskEvent>> {
-        self.run_serialized_write(|| self.commit_task_creation_once(input.clone()))
-            .await
+        let root = match &input.conversation_snapshot {
+            Some(snapshot) => Some(
+                repositories::compaction_frozen_root::RootPublication::prepare(
+                    self,
+                    &snapshot.workspace_id,
+                    &snapshot.conversation_thread_id,
+                    &snapshot.history_json,
+                )
+                .await?,
+            ),
+            None => None,
+        };
+        let result = self
+            .run_serialized_write(|| self.commit_task_creation_once(input.clone(), root.as_ref()))
+            .await;
+        match root {
+            Some(root) => root.complete(result).await,
+            None => result,
+        }
     }
 
     /// Creates an agent-owned Thread, its execution-scoped continuation route
@@ -14677,10 +14896,24 @@ impl CrudStore {
         &self,
         snapshot: NewTaskRunConversationSnapshot,
     ) -> Result<TaskRunConversationSnapshotRecord> {
-        self.run_serialized_write(|| {
-            task_run_conversation_snapshot::insert_if_absent(&self.connection, snapshot.clone())
-        })
-        .await
+        let root = repositories::compaction_frozen_root::RootPublication::prepare(
+            self,
+            &snapshot.workspace_id,
+            &snapshot.conversation_thread_id,
+            &snapshot.history_json,
+        )
+        .await?;
+        let result = self
+            .run_serialized_write(|| async {
+                let tx = self.connection.begin().await?;
+                let record =
+                    task_run_conversation_snapshot::insert_if_absent(&tx, snapshot.clone(), &root)
+                        .await?;
+                tx.commit().await?;
+                Ok(record)
+            })
+            .await;
+        root.complete(result).await
     }
 
     pub async fn get_task_run_conversation_snapshot(
@@ -30269,6 +30502,7 @@ impl CrudStore {
     async fn commit_task_creation_once(
         &self,
         input: TaskCreationCommitInput,
+        root: Option<&repositories::compaction_frozen_root::RootPublication>,
     ) -> Result<Vec<AppendedTaskEvent>> {
         let prepared_events = self
             .prepare_task_events_for_write(input.events.clone())
@@ -30289,9 +30523,12 @@ impl CrudStore {
 
             if let Some(snapshot) = input.conversation_snapshot {
                 let expected = snapshot.clone();
-                let persisted =
-                    task_run_conversation_snapshot::insert_if_absent(&transaction, snapshot)
-                        .await?;
+                let persisted = task_run_conversation_snapshot::insert_if_absent(
+                    &transaction,
+                    snapshot,
+                    root.ok_or_else(|| anyhow::anyhow!("Task snapshot root preparation missing"))?,
+                )
+                .await?;
                 if persisted.run_id != expected.run_id
                     || persisted.task_id != expected.task_id
                     || persisted.workspace_id != expected.workspace_id
@@ -54991,3 +55228,5 @@ mod tests {
         );
     }
 }
+
+pub use repositories::compaction_frozen_use::FrozenUseGuard;

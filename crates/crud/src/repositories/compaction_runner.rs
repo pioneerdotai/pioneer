@@ -22,6 +22,9 @@ use sea_orm::{ConnectionTrait, TransactionTrait};
 pub enum PublicationTestPause {
     ReaderPreflight,
     BeforeWriter,
+    RootInventoryBeforeWriter,
+    CompletedInventoryBeforeWriter,
+    PhysicalBeforeWriter,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -1034,7 +1037,7 @@ pub(crate) async fn compaction_resume_deadline(
             purpose: pioneer_compaction::runner::AttemptPurpose::Portion,
             ..
         }
-    ) && !compaction_manifest_sources_current(&store.connection, operation).await?
+    ) && !compaction_manifest_sources_current(store, operation).await?
     {
         return Ok(false);
     }
@@ -1311,6 +1314,7 @@ pub(crate) async fn compaction_runner_transition(
             format_version: sea_orm::Set(1),
             identity_sha256: sea_orm::Set(identity.clone()),
             status: sea_orm::Set("candidate".to_owned()),
+            ..Default::default()
         });
         identity_query = Some(
             compaction_checkpoint::Entity::find()
@@ -1616,7 +1620,7 @@ pub(crate) async fn compaction_runner_transition(
                     .await?;
             }
             if let Some(model) = &candidate_model {
-                compaction_checkpoint::Entity::insert(model.clone())
+                let inserted = compaction_checkpoint::Entity::insert(model.clone())
                     .on_conflict(
                         OnConflict::columns([
                             compaction_checkpoint::Column::OperationId,
@@ -1627,6 +1631,13 @@ pub(crate) async fn compaction_runner_transition(
                     )
                     .exec_without_returning(&txn)
                     .await?;
+                super::compaction_checkpoint_proof::account_insert(
+                    &txn,
+                    operation,
+                    &candidate.expect("candidate model").id,
+                    inserted,
+                )
+                .await?;
             }
             for model in &coverage_models {
                 compaction_coverage::Entity::insert(model.clone())
@@ -1820,13 +1831,6 @@ WHERE o.id=?1
     };
 
     let coverage_exact = if identity_current {
-        #[cfg(any(test, feature = "test-support"))]
-        pause_publication_test_hook(
-            store.connection.runtime_identity(),
-            operation,
-            PublicationTestPause::ReaderPreflight,
-        )
-        .await;
         compaction_runner_coverage_exact(&snapshot, operation).await?
     } else {
         false
@@ -1834,6 +1838,15 @@ WHERE o.id=?1
     // Explicitly end the read snapshot before queuing for the writer. This
     // also releases the maintenance-read permit carried by the scoped store.
     snapshot.commit().await?;
+    if identity_current {
+        #[cfg(any(test, feature = "test-support"))]
+        pause_publication_test_hook(
+            store.connection.runtime_identity(),
+            operation,
+            PublicationTestPause::ReaderPreflight,
+        )
+        .await;
+    }
     // Stale candidates do not publish. Validate the graph only after exact
     // saved coverage validation, with the read snapshot released.
     if identity_current && coverage_exact {
@@ -1857,14 +1870,27 @@ pub(super) async fn validate_publication_checkpoint_graph(
     store: &CrudStore,
     candidate: &str,
 ) -> Result<()> {
-    let mut pending = vec![(candidate.to_owned(), false)];
+    // Legacy saved Commits retain their original graph policy. The new native
+    // certificate also verifies the role oracle used by historical consumers.
+    let check_roles = store.connection.query_one_raw(Statement::from_sql_and_values(
+        sea_orm::DbBackend::Sqlite,
+        "SELECT 1 FROM compaction_checkpoint p JOIN compaction_operation o ON o.id=p.operation_id WHERE p.id=? AND o.frozen_accounting_mode='live_known'",
+        [candidate.into()])).await?.is_some();
+    let mut pending = vec![Some((candidate.to_owned(), false))];
+    let mut queued = std::collections::BTreeMap::from([(candidate.to_owned(), 0usize)]);
+    let mut discovered = std::collections::BTreeSet::from([candidate.to_owned()]);
+    let mut event_roles = std::collections::BTreeMap::new();
     let mut visited = std::collections::BTreeSet::new();
     let mut visiting = std::collections::BTreeSet::new();
     let mut done = std::collections::BTreeSet::new();
     let mut leaves = std::collections::BTreeSet::new();
     let mut aliases = pioneer_compaction::frozen::ReplayAliasGraph::default();
     let mut root = None;
-    while let Some((id, exiting)) = pending.pop() {
+    while let Some(entry) = pending.pop() {
+        let Some((id, exiting)) = entry else { continue };
+        if !exiting {
+            queued.remove(&id);
+        }
         if exiting {
             visiting.remove(&id);
             done.insert(id);
@@ -1879,8 +1905,8 @@ pub(super) async fn validate_publication_checkpoint_graph(
             visited.len() <= 65_536,
             "checkpoint historical coverage exceeds supported quantum"
         );
-        pending.push((id.clone(), true));
-        let edges = compaction_checkpoint_edges(&store.connection, &id)
+        pending.push(Some((id.clone(), true)));
+        let edges = compaction_checkpoint_edges(store, &id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("candidate checkpoint graph is unavailable"))?;
         ensure!(
@@ -1899,6 +1925,17 @@ pub(super) async fn validate_publication_checkpoint_graph(
                 edges.thread_id.clone(),
             ));
         }
+        if check_roles {
+            for evidence in edges.event_input_evidence {
+                let key = (evidence.source.source_thread, evidence.source.source);
+                if let Some(previous) = event_roles.insert(key, evidence.role.clone()) {
+                    ensure!(
+                        previous == evidence.role,
+                        "checkpoint event-input evidence is ambiguous"
+                    );
+                }
+            }
+        }
         for alias in edges.replay_aliases {
             aliases.insert(
                 pioneer_compaction::frozen::ScopedReplaySource {
@@ -1913,7 +1950,7 @@ pub(super) async fn validate_publication_checkpoint_graph(
             )?;
         }
         if let Some(previous) = edges.previous {
-            let previous_edges = compaction_checkpoint_edges(&store.connection, &previous)
+            let previous_edges = compaction_checkpoint_edges(store, &previous)
                 .await?
                 .ok_or_else(|| anyhow::anyhow!("previous checkpoint disappeared"))?;
             ensure!(
@@ -1923,7 +1960,14 @@ pub(super) async fn validate_publication_checkpoint_graph(
                     && previous_edges.format_version == pioneer_compaction::FORMAT_VERSION,
                 "previous checkpoint changed historical ownership"
             );
-            pending.push((previous, false));
+            queue_checkpoint_node(
+                &mut pending,
+                &mut queued,
+                &mut discovered,
+                &visiting,
+                &done,
+                previous,
+            )?;
         }
         for covered in edges.coverage {
             if covered.source.scope.starts_with("checkpoint:") {
@@ -1939,7 +1983,7 @@ pub(super) async fn validate_publication_checkpoint_graph(
                         == Some(&covered.source),
                     "checkpoint coverage node is not a published exact source"
                 );
-                let child = compaction_checkpoint_edges(&store.connection, &covered.source.id)
+                let child = compaction_checkpoint_edges(store, &covered.source.id)
                     .await?
                     .ok_or_else(|| anyhow::anyhow!("checkpoint coverage node disappeared"))?;
                 ensure!(
@@ -1950,7 +1994,14 @@ pub(super) async fn validate_publication_checkpoint_graph(
                         && covered.source.version == child.identity_sha256,
                     "checkpoint coverage owner or identity changed"
                 );
-                pending.push((covered.source.id, false));
+                queue_checkpoint_node(
+                    &mut pending,
+                    &mut queued,
+                    &mut discovered,
+                    &visiting,
+                    &done,
+                    covered.source.id,
+                )?;
             } else {
                 leaves.insert((covered.source_thread, covered.source));
             }
@@ -1968,6 +2019,43 @@ pub(super) async fn validate_publication_checkpoint_graph(
             )
             .collect(),
     )?;
+    Ok(())
+}
+
+// Each queued node has one live entry. Reprioritising a sibling preserves DFS
+// cycle detection; compact tombstones before a bounded queue can accumulate.
+fn queue_checkpoint_node(
+    pending: &mut Vec<Option<(String, bool)>>,
+    queued: &mut std::collections::BTreeMap<String, usize>,
+    discovered: &mut std::collections::BTreeSet<String>,
+    visiting: &std::collections::BTreeSet<String>,
+    done: &std::collections::BTreeSet<String>,
+    id: String,
+) -> Result<()> {
+    if done.contains(&id) {
+        return Ok(());
+    }
+    ensure!(!visiting.contains(&id), "cyclic checkpoint coverage");
+    discovered.insert(id.clone());
+    ensure!(
+        discovered.len() <= 65_536,
+        "checkpoint historical coverage exceeds supported quantum"
+    );
+    if let Some(index) = queued.remove(&id) {
+        pending[index] = None;
+    }
+    if pending.len() >= 131_072 {
+        pending.retain(Option::is_some);
+        queued.clear();
+        for (index, entry) in pending.iter().enumerate() {
+            if let Some((id, false)) = entry {
+                queued.insert(id.clone(), index);
+            }
+        }
+    }
+    let index = pending.len();
+    pending.push(Some((id.clone(), false)));
+    queued.insert(id, index);
     Ok(())
 }
 
@@ -2133,310 +2221,325 @@ pub(crate) async fn compaction_apply_runner(
     let RunnerPhase::Commit { checkpoint } = &state.phase else {
         anyhow::bail!("runner has no commit candidate")
     };
-    let applied = state.applied(checkpoint)?;
-    let encoded = serde_json::to_string(&applied)?;
-    store
-        .prepare_checkpoint_ancestry(operation, checkpoint, state.generation)
-        .await?;
-    let prepared = store
-        .run_scoped_database_quantum(|| {
-            prepare_runner_publication(
-                store,
-                operation,
-                checkpoint,
-                state.generation,
-                expected_head,
-            )
-        })
-        .await?;
-    #[cfg(any(test, feature = "test-support"))]
-    pause_publication_test_hook(
-        store.connection.runtime_identity(),
-        operation,
-        PublicationTestPause::BeforeWriter,
-    )
-    .await;
-    ensure!(
-        prepared.operation.as_str() == operation
-            && prepared.checkpoint.as_str() == checkpoint.as_str()
-            && prepared.generation == state.generation
-            && prepared.expected_head.as_deref() == expected_head,
-        "runner publication preflight identity mismatch"
-    );
-    store
-        .run_serialized_write(|| async {
-            let txn = store.connection.begin().await?;
-            #[cfg(test)]
-            let _writer_test_guard = PublicationWriterTestGuard::enter(operation);
-            let row = compaction_operation::Entity::find()
-                .select_only()
-                .join(
-                    JoinType::InnerJoin,
-                    compaction_operation::Entity::belongs_to(compaction_checkpoint::Entity)
-                        .from(compaction_operation::Column::Id)
-                        .to(compaction_checkpoint::Column::OperationId)
-                        .on_condition(|_, _| {
-                            sea_orm::Condition::all().add(
-                                Expr::col((
-                                    compaction_checkpoint::Entity,
-                                    compaction_checkpoint::Column::Owner,
-                                ))
-                                .eq(Expr::col((
-                                    compaction_operation::Entity,
-                                    compaction_operation::Column::Owner,
-                                ))),
-                            )
-                        })
-                        .into(),
+    let publication =
+        super::compaction_checkpoint_proof::prepare_publication(store, operation, checkpoint)
+            .await?;
+    let result = async {
+        let applied = state.applied(checkpoint)?;
+        let encoded = serde_json::to_string(&applied)?;
+        store
+            .prepare_checkpoint_ancestry(operation, checkpoint, state.generation)
+            .await?;
+        let prepared = store
+            .run_scoped_database_quantum(|| {
+                prepare_runner_publication(
+                    store,
+                    operation,
+                    checkpoint,
+                    state.generation,
+                    expected_head,
                 )
-                .expr(Expr::col((
-                    compaction_operation::Entity,
-                    compaction_operation::Column::Status,
-                )))
-                .filter(
-                    Expr::col((
-                        compaction_operation::Entity,
-                        compaction_operation::Column::Id,
-                    ))
-                    .eq(Expr::Value(operation.into()))
-                    .and(
-                        Expr::col((
-                            compaction_checkpoint::Entity,
-                            compaction_checkpoint::Column::Id,
-                        ))
-                        .eq(Expr::Value(checkpoint.clone().into())),
+            })
+            .await?;
+        #[cfg(any(test, feature = "test-support"))]
+        pause_publication_test_hook(
+            store.connection.runtime_identity(),
+            operation,
+            PublicationTestPause::BeforeWriter,
+        )
+        .await;
+        ensure!(
+            prepared.operation.as_str() == operation
+                && prepared.checkpoint.as_str() == checkpoint.as_str()
+                && prepared.generation == state.generation
+                && prepared.expected_head.as_deref() == expected_head,
+            "runner publication preflight identity mismatch"
+        );
+        store
+            .run_serialized_write(|| async {
+                let txn = store.connection.begin().await?;
+                #[cfg(test)]
+                let _writer_test_guard = PublicationWriterTestGuard::enter(operation);
+                let row = compaction_operation::Entity::find()
+                    .select_only()
+                    .join(
+                        JoinType::InnerJoin,
+                        compaction_operation::Entity::belongs_to(compaction_checkpoint::Entity)
+                            .from(compaction_operation::Column::Id)
+                            .to(compaction_checkpoint::Column::OperationId)
+                            .on_condition(|_, _| {
+                                sea_orm::Condition::all().add(
+                                    Expr::col((
+                                        compaction_checkpoint::Entity,
+                                        compaction_checkpoint::Column::Owner,
+                                    ))
+                                    .eq(Expr::col((
+                                        compaction_operation::Entity,
+                                        compaction_operation::Column::Owner,
+                                    ))),
+                                )
+                            })
+                            .into(),
                     )
-                    .and(
+                    .expr(Expr::col((
+                        compaction_operation::Entity,
+                        compaction_operation::Column::Status,
+                    )))
+                    .filter(
                         Expr::col((
                             compaction_operation::Entity,
-                            compaction_operation::Column::ExpectedHead,
+                            compaction_operation::Column::Id,
                         ))
-                        .binary(
-                            BinOper::Is,
-                            Expr::Value(expected_head.map(str::to_owned).into()),
+                        .eq(Expr::Value(operation.into()))
+                        .and(
+                            Expr::col((
+                                compaction_checkpoint::Entity,
+                                compaction_checkpoint::Column::Id,
+                            ))
+                            .eq(Expr::Value(checkpoint.clone().into())),
+                        )
+                        .and(
+                            Expr::col((
+                                compaction_operation::Entity,
+                                compaction_operation::Column::ExpectedHead,
+                            ))
+                            .binary(
+                                BinOper::Is,
+                                Expr::Value(expected_head.map(str::to_owned).into()),
+                            ),
                         ),
-                    ),
-                )
-                .into_tuple::<String>()
-                .one(&txn)
-                .await?;
-            let Some(row) = row else {
-                txn.rollback().await?;
-                return Ok(super::compaction::CommitOutcome::Stale);
-            };
-            let status = row;
-            if status == "completed" {
-                let exact = compaction_checkpoint::Entity::find()
-                    .select_only()
-                    .expr(Expr::col(compaction_checkpoint::Column::Id))
-                    .filter(
-                        Expr::col(compaction_checkpoint::Column::Id)
-                            .eq(Expr::Value(checkpoint.clone().into()))
+                    )
+                    .into_tuple::<String>()
+                    .one(&txn)
+                    .await?;
+                let Some(row) = row else {
+                    txn.rollback().await?;
+                    return Ok(super::compaction::CommitOutcome::Stale);
+                };
+                let status = row;
+                if status == "completed" {
+                    let exact = compaction_checkpoint::Entity::find()
+                        .select_only()
+                        .expr(Expr::col(compaction_checkpoint::Column::Id))
+                        .filter(
+                            Expr::col(compaction_checkpoint::Column::Id)
+                                .eq(Expr::Value(checkpoint.clone().into()))
+                                .and(
+                                    Expr::col(compaction_checkpoint::Column::Status)
+                                        .eq(Expr::val("applied")),
+                                ),
+                        )
+                        .into_tuple::<String>()
+                        .one(&txn)
+                        .await?;
+                    txn.rollback().await?;
+                    return Ok(if exact.is_some() {
+                        super::compaction::CommitOutcome::AlreadyApplied
+                    } else {
+                        super::compaction::CommitOutcome::Stale
+                    });
+                }
+                if status != "running" {
+                    txn.rollback().await?;
+                    return Ok(super::compaction::CommitOutcome::Cancelled);
+                }
+                if !publication.validate(&txn).await? {
+                    txn.rollback().await?;
+                    return Ok(super::compaction::CommitOutcome::Stale);
+                }
+                let interrupted =
+                    compaction_operation::Entity::find()
+                        .select_only()
+                        .join(
+                            JoinType::InnerJoin,
+                            compaction_operation::Entity::belongs_to(compaction_context::Entity)
+                                .from(compaction_operation::Column::Owner)
+                                .to(compaction_context::Column::Owner)
+                                .into(),
+                        )
+                        .expr(Expr::col((
+                            compaction_operation::Entity,
+                            compaction_operation::Column::Id,
+                        )))
+                        .filter(
+                            Expr::col((
+                                compaction_operation::Entity,
+                                compaction_operation::Column::Id,
+                            ))
+                            .eq(Expr::Value(operation.into()))
                             .and(
-                                Expr::col(compaction_checkpoint::Column::Status)
-                                    .eq(Expr::val("applied")),
+                                Expr::col((
+                                    compaction_operation::Entity,
+                                    compaction_operation::Column::ExecutionTurn,
+                                ))
+                                .binary(BinOper::Is, Expr::val(Option::<String>::None))
+                                .not(),
+                            )
+                            .and(
+                                Expr::exists(
+                                    Query::select()
+                                        .expr(Expr::val(1_i64))
+                                        .from_as(compaction_execution_stop::Entity, "stop")
+                                        .and_where(
+                                            Expr::col((
+                                                "stop",
+                                                compaction_execution_stop::Column::Owner,
+                                            ))
+                                            .eq(Expr::col((
+                                                compaction_context::Entity,
+                                                compaction_context::Column::Owner,
+                                            )))
+                                            .and(
+                                                Expr::col((
+                                                    "stop",
+                                                    compaction_execution_stop::Column::TurnId,
+                                                ))
+                                                .eq(Expr::col((
+                                                    compaction_operation::Entity,
+                                                    compaction_operation::Column::ExecutionTurn,
+                                                ))),
+                                            ),
+                                        )
+                                        .to_owned(),
+                                )
+                                .or(Expr::exists(
+                                    Query::select()
+                                        .expr(Expr::val(1_i64))
+                                        .from_as(turn::Entity, "t")
+                                        .and_where(
+                                            Expr::col(("t", turn::Column::Id))
+                                                .eq(Expr::col((
+                                                    compaction_operation::Entity,
+                                                    compaction_operation::Column::ExecutionTurn,
+                                                )))
+                                                .and(
+                                                    Expr::col(("t", turn::Column::Status))
+                                                        .is_in(["interrupted", "cancelled"])
+                                                        .not(),
+                                                ),
+                                        )
+                                        .to_owned(),
+                                )
+                                .not()),
+                            ),
+                        )
+                        .into_tuple::<String>()
+                        .one(&txn)
+                        .await?;
+                if interrupted.is_some() {
+                    txn.rollback().await?;
+                    return Ok(super::compaction::CommitOutcome::Cancelled);
+                }
+
+                let generation = compaction_runner_state::Entity::find()
+                    .select_only()
+                    .expr(Expr::col(compaction_runner_state::Column::OperationId))
+                    .filter(
+                        Expr::col(compaction_runner_state::Column::OperationId)
+                            .eq(Expr::Value(operation.into()))
+                            .and(
+                                Expr::col(compaction_runner_state::Column::Generation)
+                                    .eq(Expr::Value(i64::try_from(state.generation)?.into())),
+                            )
+                            .and(
+                                Expr::expr(Func::cust(Alias::new("json_extract")).args([
+                                    Expr::col(compaction_runner_state::Column::State),
+                                    Expr::val("$.phase.Commit.checkpoint"),
+                                ]))
+                                .eq(Expr::Value(checkpoint.clone().into())),
                             ),
                     )
                     .into_tuple::<String>()
                     .one(&txn)
                     .await?;
-                txn.rollback().await?;
-                return Ok(if exact.is_some() {
-                    super::compaction::CommitOutcome::AlreadyApplied
-                } else {
-                    super::compaction::CommitOutcome::Stale
-                });
-            }
-            if status != "running" {
-                txn.rollback().await?;
-                return Ok(super::compaction::CommitOutcome::Cancelled);
-            }
-            let interrupted = compaction_operation::Entity::find()
-                .select_only()
-                .join(
-                    JoinType::InnerJoin,
-                    compaction_operation::Entity::belongs_to(compaction_context::Entity)
-                        .from(compaction_operation::Column::Owner)
-                        .to(compaction_context::Column::Owner)
-                        .into(),
-                )
-                .expr(Expr::col((
-                    compaction_operation::Entity,
-                    compaction_operation::Column::Id,
-                )))
-                .filter(
-                    Expr::col((
-                        compaction_operation::Entity,
-                        compaction_operation::Column::Id,
-                    ))
-                    .eq(Expr::Value(operation.into()))
-                    .and(
-                        Expr::col((
-                            compaction_operation::Entity,
-                            compaction_operation::Column::ExecutionTurn,
-                        ))
-                        .binary(BinOper::Is, Expr::val(Option::<String>::None))
-                        .not(),
+                if generation.is_none() {
+                    txn.rollback().await?;
+                    return Ok(super::compaction::CommitOutcome::Stale);
+                }
+                if !prepared.identity_current || !prepared.coverage_exact {
+                    txn.rollback().await?;
+                    return Ok(super::compaction::CommitOutcome::Stale);
+                }
+                let changed = compaction_context::Entity::update_many()
+                    .col_expr(
+                        compaction_context::Column::Head,
+                        Expr::Value(checkpoint.clone().into()),
                     )
-                    .and(
-                        Expr::exists(
-                            Query::select()
-                                .expr(Expr::val(1_i64))
-                                .from_as(compaction_execution_stop::Entity, "stop")
-                                .and_where(
-                                    Expr::col(("stop", compaction_execution_stop::Column::Owner))
-                                        .eq(Expr::col((
-                                            compaction_context::Entity,
-                                            compaction_context::Column::Owner,
-                                        )))
-                                        .and(
-                                            Expr::col((
-                                                "stop",
-                                                compaction_execution_stop::Column::TurnId,
-                                            ))
-                                            .eq(
-                                                Expr::col((
-                                                    compaction_operation::Entity,
-                                                    compaction_operation::Column::ExecutionTurn,
-                                                )),
-                                            ),
-                                        ),
-                                )
-                                .to_owned(),
-                        )
-                        .or(Expr::exists(
-                            Query::select()
-                                .expr(Expr::val(1_i64))
-                                .from_as(turn::Entity, "t")
-                                .and_where(
-                                    Expr::col(("t", turn::Column::Id))
-                                        .eq(Expr::col((
-                                            compaction_operation::Entity,
-                                            compaction_operation::Column::ExecutionTurn,
-                                        )))
-                                        .and(
-                                            Expr::col(("t", turn::Column::Status))
-                                                .is_in(["interrupted", "cancelled"])
-                                                .not(),
-                                        ),
-                                )
-                                .to_owned(),
-                        )
-                        .not()),
-                    ),
-                )
-                .into_tuple::<String>()
-                .one(&txn)
-                .await?;
-            if interrupted.is_some() {
-                txn.rollback().await?;
-                return Ok(super::compaction::CommitOutcome::Cancelled);
-            }
-
-            let generation = compaction_runner_state::Entity::find()
-                .select_only()
-                .expr(Expr::col(compaction_runner_state::Column::OperationId))
-                .filter(
-                    Expr::col(compaction_runner_state::Column::OperationId)
-                        .eq(Expr::Value(operation.into()))
-                        .and(
-                            Expr::col(compaction_runner_state::Column::Generation)
-                                .eq(Expr::Value(i64::try_from(state.generation)?.into())),
-                        )
-                        .and(
-                            Expr::expr(Func::cust(Alias::new("json_extract")).args([
-                                Expr::col(compaction_runner_state::Column::State),
-                                Expr::val("$.phase.Commit.checkpoint"),
-                            ]))
-                            .eq(Expr::Value(checkpoint.clone().into())),
-                        ),
-                )
-                .into_tuple::<String>()
-                .one(&txn)
-                .await?;
-            if generation.is_none() {
-                txn.rollback().await?;
-                return Ok(super::compaction::CommitOutcome::Stale);
-            }
-            if !prepared.identity_current || !prepared.coverage_exact {
-                txn.rollback().await?;
-                return Ok(super::compaction::CommitOutcome::Stale);
-            }
-            let changed = compaction_context::Entity::update_many()
-                .col_expr(
-                    compaction_context::Column::Head,
-                    Expr::Value(checkpoint.clone().into()),
-                )
-                .filter(
-                    Expr::col(compaction_context::Column::Owner)
-                        .eq(Expr::SubQuery(
-                            None,
-                            Box::new(
-                                Query::select()
-                                    .expr(Expr::col(compaction_operation::Column::Owner))
-                                    .from(compaction_operation::Entity)
-                                    .and_where(
-                                        Expr::col(compaction_operation::Column::Id)
-                                            .eq(Expr::Value(operation.into())),
-                                    )
-                                    .to_owned()
-                                    .into(),
+                    .filter(
+                        Expr::col(compaction_context::Column::Owner)
+                            .eq(Expr::SubQuery(
+                                None,
+                                Box::new(
+                                    Query::select()
+                                        .expr(Expr::col(compaction_operation::Column::Owner))
+                                        .from(compaction_operation::Entity)
+                                        .and_where(
+                                            Expr::col(compaction_operation::Column::Id)
+                                                .eq(Expr::Value(operation.into())),
+                                        )
+                                        .to_owned()
+                                        .into(),
+                                ),
+                            ))
+                            .and(Expr::col(compaction_context::Column::Head).binary(
+                                BinOper::Is,
+                                Expr::Value(expected_head.map(str::to_owned).into()),
+                            ))
+                            .and(
+                                Expr::col(compaction_context::Column::FormatVersion)
+                                    .eq(Expr::val(1_i64)),
                             ),
-                        ))
-                        .and(Expr::col(compaction_context::Column::Head).binary(
-                            BinOper::Is,
-                            Expr::Value(expected_head.map(str::to_owned).into()),
-                        ))
-                        .and(
-                            Expr::col(compaction_context::Column::FormatVersion)
-                                .eq(Expr::val(1_i64)),
-                        ),
-                )
-                .exec(&txn)
-                .await?;
-            if changed.rows_affected != 1 {
-                txn.rollback().await?;
-                return Ok(super::compaction::CommitOutcome::Stale);
-            }
-            compaction_checkpoint::Entity::update_many()
-                .col_expr(compaction_checkpoint::Column::Status, Expr::val("applied"))
-                .filter(
-                    Expr::col(compaction_checkpoint::Column::Id)
-                        .eq(Expr::Value(checkpoint.clone().into())),
-                )
-                .exec(&txn)
-                .await?;
-            compaction_operation::Entity::update_many()
-                .col_expr(compaction_operation::Column::Status, Expr::val("completed"))
-                .col_expr(compaction_operation::Column::Outcome, Expr::val("applied"))
-                .filter(
-                    Expr::col(compaction_operation::Column::Id).eq(Expr::Value(operation.into())),
-                )
-                .exec(&txn)
-                .await?;
-            compaction_runner_state::Entity::update_many()
-                .col_expr(
-                    compaction_runner_state::Column::Generation,
-                    Expr::Value(i64::try_from(applied.generation)?.into()),
-                )
-                .col_expr(
-                    compaction_runner_state::Column::State,
-                    Expr::Value(encoded.clone().into()),
-                )
-                .filter(
-                    Expr::col(compaction_runner_state::Column::OperationId)
-                        .eq(Expr::Value(operation.into()))
-                        .and(
-                            Expr::col(compaction_runner_state::Column::Generation)
-                                .eq(Expr::Value(i64::try_from(state.generation)?.into())),
-                        ),
-                )
-                .exec(&txn)
-                .await?;
-            txn.commit().await?;
-            Ok(super::compaction::CommitOutcome::Applied)
-        })
-        .await
+                    )
+                    .exec(&txn)
+                    .await?;
+                if changed.rows_affected != 1 {
+                    txn.rollback().await?;
+                    return Ok(super::compaction::CommitOutcome::Stale);
+                }
+                compaction_checkpoint::Entity::update_many()
+                    .col_expr(compaction_checkpoint::Column::Status, Expr::val("applied"))
+                    .filter(
+                        Expr::col(compaction_checkpoint::Column::Id)
+                            .eq(Expr::Value(checkpoint.clone().into())),
+                    )
+                    .exec(&txn)
+                    .await?;
+                compaction_operation::Entity::update_many()
+                    .col_expr(compaction_operation::Column::Status, Expr::val("completed"))
+                    .col_expr(compaction_operation::Column::Outcome, Expr::val("applied"))
+                    .filter(
+                        Expr::col(compaction_operation::Column::Id)
+                            .eq(Expr::Value(operation.into())),
+                    )
+                    .exec(&txn)
+                    .await?;
+                compaction_runner_state::Entity::update_many()
+                    .col_expr(
+                        compaction_runner_state::Column::Generation,
+                        Expr::Value(i64::try_from(applied.generation)?.into()),
+                    )
+                    .col_expr(
+                        compaction_runner_state::Column::State,
+                        Expr::Value(encoded.clone().into()),
+                    )
+                    .filter(
+                        Expr::col(compaction_runner_state::Column::OperationId)
+                            .eq(Expr::Value(operation.into()))
+                            .and(
+                                Expr::col(compaction_runner_state::Column::Generation)
+                                    .eq(Expr::Value(i64::try_from(state.generation)?.into())),
+                            ),
+                    )
+                    .exec(&txn)
+                    .await?;
+                publication.seal_complete(&txn).await?;
+                txn.commit().await?;
+                Ok(super::compaction::CommitOutcome::Applied)
+            })
+            .await
+    }
+    .await;
+    publication.complete(result).await
 }
 
 use sea_orm::QuerySelect;
@@ -2945,10 +3048,37 @@ fn compaction_manifest_sources_current_statement(operation: &str) -> Statement {
 
 /// Admission/read-time predicate. Validate raw inputs before consuming them;
 /// publication of a completed summary never rechecks canonical source state.
-pub(crate) async fn compaction_manifest_sources_current<C: ConnectionTrait>(
-    db: &C,
+pub(crate) async fn compaction_manifest_sources_current(
+    store: &CrudStore,
     operation: &str,
 ) -> Result<bool> {
+    use super::compaction_frozen_root::OperationProjectionPin;
+    let guard = match store
+        .compaction_pin_operation_projection_for_read(operation)
+        .await?
+    {
+        OperationProjectionPin::Absent => None,
+        OperationProjectionPin::Pinned(guard) => Some(guard),
+        OperationProjectionPin::AuthorityRejected => return Ok(false),
+    };
+    let result = async {
+        if let Some(guard) = &guard {
+            guard.validate().await?;
+        }
+        let result = manifest_sources_current_in(&store.connection, operation).await?;
+        if let Some(guard) = &guard {
+            guard.validate().await?;
+        }
+        Ok(result)
+    }
+    .await;
+    match guard {
+        Some(guard) => guard.complete(result).await,
+        None => result,
+    }
+}
+
+async fn manifest_sources_current_in<C: ConnectionTrait>(db: &C, operation: &str) -> Result<bool> {
     #[cfg(test)]
     record_publication_heavy_check(operation, true);
     // Direct raw manifest entries remain exact-current. Direct checkpoint

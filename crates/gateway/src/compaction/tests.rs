@@ -3113,7 +3113,8 @@ async fn legacy_frozen_failed_provider_observation_restores_portable_execution_a
         messages: 1,
         identity_sha256: hex::encode(identity.finalize()),
     };
-    f.store
+    let fixture_capture_1 = f
+        .store
         .compaction_begin_frozen_history("ws", "thread", &descriptor)
         .await
         .unwrap();
@@ -3170,6 +3171,7 @@ async fn legacy_frozen_failed_provider_observation_restores_portable_execution_a
             .unwrap(),
         payload
     );
+    fixture_capture_1.close().await.unwrap();
 }
 
 #[tokio::test]
@@ -3779,26 +3781,52 @@ async fn fixture(
     observer_fails: bool,
 ) -> Fixture {
     fixture_with_canonical_payload(
-        serde_json::to_string(&pioneer_crud::CanonicalTurnEventPayload::ItemCompleted(
-            pioneer_protocol::ItemCompletedNotification {
-                workspace_id: "ws".into(),
-                thread_id: "thread".into(),
-                turn_id: "turn".into(),
-                item: pioneer_protocol::TurnItem::AgentMessage {
-                    id: "fixture-agent-message".into(),
-                    text: text.into(),
-                    phase: Default::default(),
-                    markdown: None,
-                    markdown_version: None,
-                },
-            },
-        ))
-        .unwrap(),
+        fixture_agent_payload(text),
         replies,
         target_fits,
         observer_fails,
     )
     .await
+}
+
+fn fixture_agent_payload(text: &str) -> String {
+    serde_json::to_string(&pioneer_crud::CanonicalTurnEventPayload::ItemCompleted(
+        pioneer_protocol::ItemCompletedNotification {
+            workspace_id: "ws".into(),
+            thread_id: "thread".into(),
+            turn_id: "turn".into(),
+            item: pioneer_protocol::TurnItem::AgentMessage {
+                id: "fixture-agent-message".into(),
+                text: text.into(),
+                phase: Default::default(),
+                markdown: None,
+                markdown_version: None,
+            },
+        },
+    ))
+    .unwrap()
+}
+
+// Opt in only where the scenario needs an origin before runner activation.
+// Assertion-compatible fixtures keep their existing admission contract.
+async fn fixture_with_bound_origin(
+    text: &str,
+    replies: Vec<Reply>,
+    target_fits: bool,
+    observer_fails: bool,
+) -> (Fixture, pioneer_compaction::frozen::FrozenHistoryRef) {
+    let (fixture, origin) = fixture_with_canonical_payloads_setup(
+        vec![fixture_agent_payload(text)],
+        replies,
+        target_fits,
+        observer_fails,
+        true,
+    )
+    .await;
+    (
+        fixture,
+        origin.expect("bound-origin setup must return its capture"),
+    )
 }
 
 async fn fixture_with_canonical_payload(
@@ -3816,6 +3844,21 @@ async fn fixture_with_canonical_payloads(
     target_fits: bool,
     observer_fails: bool,
 ) -> Fixture {
+    fixture_with_canonical_payloads_setup(payloads, replies, target_fits, observer_fails, false)
+        .await
+        .0
+}
+
+async fn fixture_with_canonical_payloads_setup(
+    payloads: Vec<String>,
+    replies: Vec<Reply>,
+    target_fits: bool,
+    observer_fails: bool,
+    bind_origin: bool,
+) -> (
+    Fixture,
+    Option<pioneer_compaction::frozen::FrozenHistoryRef>,
+) {
     assert!(!payloads.is_empty());
     super::load_test_catalog();
     pioneer_sqlite::zstd::register_auto_extension_once().unwrap();
@@ -3883,6 +3926,29 @@ async fn fixture_with_canonical_payloads(
         .compaction_admit("ws", "thread", &snapshot)
         .await
         .unwrap();
+    let origin = if bind_origin {
+        let descriptor = super::frozen::capture(
+            &store,
+            "ws",
+            "thread",
+            &std::collections::BTreeSet::from(["thread".into()]),
+            &[],
+        )
+        .await
+        .unwrap();
+        store
+            .compaction_bind_execution_turn("operation", "turn")
+            .await
+            .unwrap();
+        // First bind is before prepare/activation. No ready plan exists yet.
+        store
+            .compaction_bind_source_projection("operation", &descriptor)
+            .await
+            .unwrap();
+        Some(descriptor)
+    } else {
+        None
+    };
     let budget = ModelBudget::new(Some(4096), None, None);
     store
         .compaction_prepare_runner(
@@ -3908,6 +3974,9 @@ async fn fixture_with_canonical_payloads(
         .compaction_append_manifest("operation", &manifest)
         .await
         .unwrap();
+    if let Some(origin) = &origin {
+        assert_fixture_origin(&store, origin, 0).await;
+    }
     store
         .compaction_activate_runner(
             "operation",
@@ -3915,6 +3984,9 @@ async fn fixture_with_canonical_payloads(
         )
         .await
         .unwrap();
+    if let Some(origin) = &origin {
+        assert_fixture_origin(&store, origin, 1).await;
+    }
     let provider = Arc::new(ProviderFixture::new(replies));
     let summarizer = Arc::new(
         pioneer_agent::compaction::NativeSummarizer::new(provider.clone(), selection, budget)
@@ -3935,15 +4007,81 @@ async fn fixture_with_canonical_payloads(
         observer.clone(),
         clock.clone(),
     ));
-    Fixture {
-        store,
-        runner,
-        provider,
-        clock,
-        observer,
-        model_text,
-        canonical_payload: payloads[0].clone(),
-    }
+    (
+        Fixture {
+            store,
+            runner,
+            provider,
+            clock,
+            observer,
+            model_text,
+            canonical_payload: payloads[0].clone(),
+        },
+        origin,
+    )
+}
+
+/// Establish the exact bound, ready origin and plan before any fault injection.
+async fn assert_fixture_origin(
+    store: &CrudStore,
+    origin: &pioneer_compaction::frozen::FrozenHistoryRef,
+    runner_ready: i64,
+) {
+    assert_eq!(
+        store
+            .compaction_bound_source_projection("operation")
+            .await
+            .unwrap(),
+        Some(origin.clone())
+    );
+    let row = store.database_connection().query_one_raw(Statement::from_string(DbBackend::Sqlite,
+        "SELECT p.storage_state,p.imports_sha256,p.import_count,h.imports_sha256 AS origin_digest,h.import_count AS origin_imports,h.ready,h.next_ordinal,h.message_count,o.status,o.execution_turn,o.frozen_publication_contract,r.ready AS runner_ready FROM compaction_operation_projection p JOIN compaction_frozen_history h ON h.id=p.manifest_id JOIN compaction_operation o ON o.id=p.operation_id JOIN compaction_runner_plan r ON r.operation_id=o.id WHERE o.id='operation'"
+    )).await.unwrap().expect("exact receipt/header/runner plan must exist");
+    assert_eq!(row.try_get::<String>("", "storage_state").unwrap(), "bound");
+    assert_eq!(
+        row.try_get::<String>("", "imports_sha256").unwrap(),
+        row.try_get::<String>("", "origin_digest").unwrap()
+    );
+    assert_eq!(
+        row.try_get::<i64>("", "import_count").unwrap(),
+        row.try_get::<i64>("", "origin_imports").unwrap()
+    );
+    assert_eq!(row.try_get::<i64>("", "ready").unwrap(), 1);
+    assert_eq!(
+        row.try_get::<i64>("", "next_ordinal").unwrap(),
+        row.try_get::<i64>("", "message_count").unwrap()
+    );
+    assert_eq!(row.try_get::<String>("", "status").unwrap(), "running");
+    assert_eq!(row.try_get::<String>("", "execution_turn").unwrap(), "turn");
+    assert_eq!(
+        row.try_get::<String>("", "frozen_publication_contract")
+            .unwrap(),
+        "assertion_compat"
+    );
+    assert_eq!(
+        row.try_get::<i64>("", "runner_ready").unwrap(),
+        runner_ready
+    );
+    assert!(
+        store
+            .compaction_manifest_sources_current("operation")
+            .await
+            .unwrap()
+    );
+    let row = store
+        .database_connection()
+        .query_one_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT COUNT(*) AS n FROM compaction_frozen_use",
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        row.try_get::<i64>("", "n").unwrap(),
+        0,
+        "capture/bind/preflight must await ordinary use closure"
+    );
 }
 
 // These runner tests synthesize a durable manifest after the common fixture
@@ -4935,7 +5073,8 @@ async fn admission_resumes_exact_plan_without_resetting_deadline() {
         manifest_id: "legacy-recaptured-projection".into(),
         ..recaptured
     };
-    f.store
+    let fixture_capture_2 = f
+        .store
         .compaction_begin_frozen_history("ws", "thread", &legacy_alias)
         .await
         .unwrap();
@@ -5021,6 +5160,7 @@ async fn admission_resumes_exact_plan_without_resetting_deadline() {
         "failed"
     );
     assert_eq!(*f.provider.count.borrow(), 0);
+    fixture_capture_2.close().await.unwrap();
 }
 
 #[tokio::test]
@@ -5415,18 +5555,34 @@ async fn interrupted_portion_resumes_from_saved_summary_with_same_retry_budget()
 
 #[tokio::test]
 async fn later_admission_resumes_deadline_progress_without_replaying_saved_portions() {
-    for case in ["saved", "legacy", "edited", "stop"] {
-        let f = fixture(
-            &"漢字🌍".repeat(4000),
-            vec![Reply::Success, Reply::Hang],
-            true,
-            false,
-        )
-        .await;
-        f.store
-            .compaction_bind_execution_turn("operation", "turn")
-            .await
-            .unwrap();
+    for case in ["saved", "legacy", "edited", "stop", "receipt"] {
+        let (f, origin) = if case == "receipt" {
+            let (fixture, origin) = fixture_with_bound_origin(
+                &"漢字🌍".repeat(4000),
+                vec![Reply::Success, Reply::Hang],
+                true,
+                false,
+            )
+            .await;
+            (fixture, Some(origin))
+        } else {
+            (
+                fixture(
+                    &"漢字🌍".repeat(4000),
+                    vec![Reply::Success, Reply::Hang],
+                    true,
+                    false,
+                )
+                .await,
+                None,
+            )
+        };
+        if origin.is_none() {
+            f.store
+                .compaction_bind_execution_turn("operation", "turn")
+                .await
+                .unwrap();
+        }
         let task = tokio::spawn({
             let runner = f.runner.clone();
             async move { runner.run(CancellationToken::new()).await }
@@ -5444,6 +5600,25 @@ async fn later_admission_resumes_deadline_progress_without_replaying_saved_porti
             .await
             .unwrap()
             .unwrap();
+        let operation_before = if origin.is_some() {
+            let operation = pioneer_entity::compaction_operation::Entity::find_by_id("operation")
+                .one(f.store.database_connection())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(operation.status, "failed");
+            assert_eq!(operation.outcome.as_deref(), Some("deadline"));
+            Some(operation)
+        } else {
+            None
+        };
+        let calls_before = f.provider.calls.lock().unwrap().len();
+        if case == "receipt" {
+            assert_eq!(
+                calls_before, 2,
+                "receipt scenario must reach the real attempts/deadline"
+            );
+        }
         let resumed_deadline = before.deadline_ms + pioneer_compaction::OPERATION_MILLIS;
         assert!(before.cursor > pioneer_compaction::runner::SourceCursor::default());
         assert_eq!(before.attempts, 2);
@@ -5467,7 +5642,59 @@ async fn later_admission_resumes_deadline_progress_without_replaying_saved_porti
                 "INSERT INTO compaction_execution_stop(owner,turn_id) SELECT owner,execution_turn FROM compaction_operation WHERE id='operation'"
             )).await.unwrap();
         }
-        if matches!(case, "edited" | "stop") {
+        if case == "receipt" {
+            let descriptor = origin
+                .as_ref()
+                .expect("receipt was bound before activation");
+            assert!(before.can_resume_deadline());
+            assert!(before.resume_phase.is_some());
+            assert!(
+                matches!(
+                    before
+                        .resume_deadline(resumed_deadline, false)
+                        .unwrap()
+                        .phase,
+                    RunnerPhase::Ready {
+                        purpose: AttemptPurpose::Portion
+                    } | RunnerPhase::Backoff {
+                        purpose: AttemptPurpose::Portion,
+                        ..
+                    }
+                ),
+                "receipt rejection must reach the resume read-time predicate"
+            );
+            assert!(
+                f.store
+                    .compaction_runner_plan("operation")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .ready
+            );
+            assert_eq!(
+                f.store
+                    .compaction_bound_source_projection("operation")
+                    .await
+                    .unwrap(),
+                Some(descriptor.clone())
+            );
+            assert!(
+                f.store
+                    .compaction_manifest_sources_current("operation")
+                    .await
+                    .unwrap()
+            );
+            f.store
+                .database_connection()
+                .execute_raw(Statement::from_sql_and_values(
+                    DbBackend::Sqlite,
+                    "UPDATE compaction_frozen_history SET imports_sha256='changed' WHERE id=?",
+                    [descriptor.manifest_id.clone().into()],
+                ))
+                .await
+                .unwrap();
+        }
+        if matches!(case, "edited" | "stop" | "receipt") {
             assert!(
                 !f.store
                     .compaction_resume_deadline("operation", "turn", resumed_deadline)
@@ -5482,6 +5709,28 @@ async fn later_admission_resumes_deadline_progress_without_replaying_saved_porti
                     .unwrap(),
                 before
             );
+            if case == "receipt" {
+                assert_eq!(
+                    pioneer_entity::compaction_operation::Entity::find_by_id("operation")
+                        .one(f.store.database_connection())
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                    operation_before.unwrap()
+                );
+                assert_eq!(f.provider.calls.lock().unwrap().len(), calls_before);
+                let row = f
+                    .store
+                    .database_connection()
+                    .query_one_raw(Statement::from_string(
+                        DbBackend::Sqlite,
+                        "SELECT COUNT(*) AS n FROM compaction_frozen_use",
+                    ))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(row.try_get::<i64>("", "n").unwrap(), 0);
+            }
             continue;
         }
         // Operation and state must roll back together if the second write fails.
@@ -6433,7 +6682,8 @@ async fn native_discovers_working_context_head_published_after_inherited_snapsho
         messages: legacy_references.len() as u64,
         identity_sha256: hex::encode(sha2::Digest::finalize(identity)),
     };
-    f.store
+    let fixture_capture_3 = f
+        .store
         .compaction_begin_frozen_history_with_imports(
             "ws",
             "context-d",
@@ -7276,22 +7526,24 @@ async fn native_discovers_working_context_head_published_after_inherited_snapsho
             source: d_retained_source.clone(),
         },
     ];
-    assert_eq!(
-        f.store
-            .compaction_prepare_delivery_checkpoint_imports(
-                "ws",
-                "thread",
-                &atomic_delivered.delivery_id,
-                &acknowledgement,
-                &atomic_grants,
-                "context-d",
-                &atomic_checkpoint_source,
-            )
-            .await
-            .unwrap()
-            .len(),
-        2
-    );
+    let grants = f
+        .store
+        .compaction_prepare_delivery_checkpoint_imports(
+            "ws",
+            "thread",
+            &atomic_delivered.delivery_id,
+            &acknowledgement,
+            &atomic_grants,
+            "context-d",
+            &atomic_checkpoint_source,
+        )
+        .await
+        .unwrap();
+    assert_eq!(grants.len(), 2);
+    for grant in grants {
+        grant.close().await.unwrap();
+    }
+
     let mut wrong_atomic_version = atomic_grants.clone();
     wrong_atomic_version[0].source.version = "wrong-exact-version".into();
     assert!(
@@ -8285,6 +8537,11 @@ async fn native_discovers_working_context_head_published_after_inherited_snapsho
     // CLI must project the accepted raw snapshot before frame sizing, while
     // retaining its immutable authority and guarding only the sent summary.
     let mut cli_history = super::frozen::PreparedHistory {
+        guard: f
+            .store
+            .compaction_acquire_frozen_use("ws", &frozen, None)
+            .await
+            .unwrap(),
         descriptor: frozen.clone(),
         messages: accepted.clone(),
         accepted_scopes: allowed.clone(),
@@ -8320,6 +8577,8 @@ async fn native_discovers_working_context_head_published_after_inherited_snapsho
         "covered raw sources must not be recorded as sent"
     );
     assert_eq!(f.provider.calls.lock().unwrap().len(), summarizer_calls);
+
+    cli_history.guard.close().await.unwrap();
 
     // Re-projecting an already captured checkpoint is idempotent.
     let mut projected = restored.clone();
@@ -8688,22 +8947,24 @@ async fn native_discovers_working_context_head_published_after_inherited_snapsho
             grant.source
         );
     }
-    assert_eq!(
-        f.store
-            .compaction_prepare_delivery_checkpoint_imports(
-                "ws",
-                "thread",
-                &bound_atomic_delivery.delivery_id,
-                &acknowledgement,
-                &atomic_grants,
-                "context-d",
-                &atomic_checkpoint_source,
-            )
-            .await
-            .unwrap()
-            .len(),
-        2
-    );
+    let grants = f
+        .store
+        .compaction_prepare_delivery_checkpoint_imports(
+            "ws",
+            "thread",
+            &bound_atomic_delivery.delivery_id,
+            &acknowledgement,
+            &atomic_grants,
+            "context-d",
+            &atomic_checkpoint_source,
+        )
+        .await
+        .unwrap();
+    assert_eq!(grants.len(), 2);
+    for grant in grants {
+        grant.close().await.unwrap();
+    }
+
     // The atomic output and its checkpoint remain usable after the raw
     // predecessor disappears. Restoring S_A and recapturing it must not need
     // the historical A/T payloads merely to validate their saved coverage.
@@ -8729,22 +8990,24 @@ async fn native_discovers_working_context_head_published_after_inherited_snapsho
             .await
             .unwrap();
     }
-    assert_eq!(
-        f.store
-            .compaction_prepare_delivery_checkpoint_imports(
-                "ws",
-                "thread",
-                &bound_atomic_delivery.delivery_id,
-                &acknowledgement,
-                &atomic_grants,
-                "context-d",
-                &atomic_checkpoint_source,
-            )
-            .await
-            .unwrap()
-            .len(),
-        2
-    );
+    let grants = f
+        .store
+        .compaction_prepare_delivery_checkpoint_imports(
+            "ws",
+            "thread",
+            &bound_atomic_delivery.delivery_id,
+            &acknowledgement,
+            &atomic_grants,
+            "context-d",
+            &atomic_checkpoint_source,
+        )
+        .await
+        .unwrap();
+    assert_eq!(grants.len(), 2);
+    for grant in grants {
+        grant.close().await.unwrap();
+    }
+
     let restored_atomic_output = super::frozen::restore(
         &f.store,
         "ws",
@@ -8774,6 +9037,7 @@ async fn native_discovers_working_context_head_published_after_inherited_snapsho
         .unwrap(),
         restored_atomic_output
     );
+    fixture_capture_3.close().await.unwrap();
 }
 
 #[tokio::test]
@@ -13242,7 +13506,8 @@ async fn frozen_failed_event_preserves_old_wire_form_and_new_terminal_status() {
         messages: 1,
         identity_sha256: hex::encode(identity.finalize()),
     };
-    f.store
+    let fixture_capture_4 = f
+        .store
         .compaction_begin_frozen_history("ws", "thread", &corrupted)
         .await
         .unwrap();
@@ -13269,6 +13534,7 @@ async fn frozen_failed_event_preserves_old_wire_form_and_new_terminal_status() {
         error.to_string(),
         "frozen source no longer renders the captured model message"
     );
+    fixture_capture_4.close().await.unwrap();
 }
 
 #[tokio::test]
@@ -13342,7 +13608,8 @@ async fn legacy_frozen_empty_agent_message_authenticates_wire_then_disappears_fr
         messages: 1,
         identity_sha256: hex::encode(identity.finalize()),
     };
-    f.store
+    let fixture_capture_5 = f
+        .store
         .compaction_begin_frozen_history("ws", "thread", &descriptor)
         .await
         .unwrap();
@@ -13379,6 +13646,7 @@ async fn legacy_frozen_empty_agent_message_authenticates_wire_then_disappears_fr
     .unwrap();
     assert!(execution.messages.is_empty());
     assert_eq!(descriptor.messages, 1, "the source ordinal remains frozen");
+    fixture_capture_5.close().await.unwrap();
 }
 
 #[tokio::test]
@@ -13452,7 +13720,8 @@ async fn frozen_commentary_authenticates_old_wire_before_execution_upgrade() {
         messages: 1,
         identity_sha256: hex::encode(digest.finalize()),
     };
-    f.store
+    let fixture_capture_6 = f
+        .store
         .compaction_begin_frozen_history("ws", "thread", &descriptor)
         .await
         .unwrap();
@@ -13488,6 +13757,7 @@ async fn frozen_commentary_authenticates_old_wire_before_execution_upgrade() {
         pioneer_crud::portable_commentary_text("checking result")
     );
     assert_eq!(execution.messages[0].reasoning_content, None);
+    fixture_capture_6.close().await.unwrap();
 }
 
 #[tokio::test]
@@ -13714,6 +13984,11 @@ async fn capture_carries_foreign_own_authority_onto_late_summary() {
     )
     .await
     .unwrap();
+    for grants in imports.into_values() {
+        for grant in grants {
+            grant.close().await.unwrap();
+        }
+    }
     let parent_json = serde_json::to_string(&parent_projection.descriptor).unwrap();
 
     async fn install_execution(db: &pioneer_sqlite::SqliteDatabase, id: &str, parent_json: &str) {
@@ -13929,6 +14204,9 @@ async fn capture_carries_foreign_own_authority_onto_late_summary() {
         .await
         .unwrap();
     assert_eq!(batch_imports.len(), 2);
+    for grant in batch_imports {
+        grant.close().await.unwrap();
+    }
     assert_eq!(
         graph_reads.reads(),
         3,
@@ -26183,7 +26461,8 @@ async fn frozen_service_event_authenticates_old_wire_before_execution_omits_it()
                 corrupt.wire_sha256 = "0".repeat(64);
                 corrupt
             });
-            f.store
+            let fixture_capture_7 = f
+                .store
                 .compaction_begin_frozen_history("ws", "thread", &descriptor)
                 .await
                 .unwrap();
@@ -26230,7 +26509,8 @@ async fn frozen_service_event_authenticates_old_wire_before_execution_omits_it()
                     messages: 1,
                     identity_sha256: hex::encode(digest.finalize()),
                 };
-                f.store
+                let fixture_capture_8 = f
+                    .store
                     .compaction_begin_frozen_history("ws", "thread", &corrupt_descriptor)
                     .await
                     .unwrap();
@@ -26267,7 +26547,9 @@ async fn frozen_service_event_authenticates_old_wire_before_execution_omits_it()
                     .await
                     .is_err()
                 );
+                fixture_capture_8.close().await.unwrap();
             }
+            fixture_capture_7.close().await.unwrap();
         }
     }
 }
@@ -26382,4 +26664,137 @@ async fn published_checkpoint_keeps_coverage_of_newly_hidden_service_event() {
         .unwrap();
     assert_eq!(after_operations, before_operations);
     assert!(f.provider.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn receipt_authority_rejection_keeps_admission_and_runner_terminal_handling() {
+    for case in [
+        "admission",
+        "runner",
+        "database",
+        "domain",
+        "proof_only",
+        "not_ready",
+        "missing_header",
+    ] {
+        let (f, descriptor) = fixture_with_bound_origin("source", vec![], true, false).await;
+        assert_fixture_origin(&f.store, &descriptor, 1).await;
+        let db = f.store.database_connection();
+        match case {
+            "database" => {
+                db.execute_unprepared(
+                    "ALTER TABLE compaction_operation_projection RENAME TO unavailable_projection",
+                )
+                .await
+                .unwrap();
+            }
+            "domain" => {
+                // Match the production FK-OFF contour: a hard domain deletion
+                // leaves an orphan receipt for actual domain guards to reject.
+                db.execute_unprepared("PRAGMA foreign_keys=OFF")
+                    .await
+                    .unwrap();
+                db.execute_unprepared("DELETE FROM workspace WHERE id='ws'")
+                    .await
+                    .unwrap();
+            }
+            "not_ready" => {
+                db.execute_raw(Statement::from_sql_and_values(
+                    DbBackend::Sqlite,
+                    "UPDATE compaction_frozen_history SET ready=0 WHERE id=?",
+                    [descriptor.manifest_id.clone().into()],
+                ))
+                .await
+                .unwrap();
+            }
+            "missing_header" => {
+                db.execute_unprepared("PRAGMA foreign_keys=OFF")
+                    .await
+                    .unwrap();
+                db.execute_raw(Statement::from_sql_and_values(
+                    DbBackend::Sqlite,
+                    "DELETE FROM compaction_frozen_history WHERE id=?",
+                    [descriptor.manifest_id.clone().into()],
+                ))
+                .await
+                .unwrap();
+            }
+            "proof_only" => {
+                db.execute_unprepared("UPDATE compaction_operation_projection SET storage_state='proof_only' WHERE operation_id='operation'").await.unwrap();
+            }
+            _ => {
+                db.execute_raw(Statement::from_sql_and_values(
+                    DbBackend::Sqlite,
+                    "UPDATE compaction_frozen_history SET imports_sha256='changed' WHERE id=?",
+                    [descriptor.manifest_id.clone().into()],
+                ))
+                .await
+                .unwrap();
+            }
+        }
+        if case == "admission" {
+            let error = super::admission::validate_manifest(&f.store, "operation")
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "compaction source revisions or accepted imports do not match the admitted manifest"
+            );
+            let operation = f
+                .store
+                .compaction_operation("operation")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(operation.status, "failed");
+            assert_eq!(
+                operation.outcome.as_deref(),
+                Some("invalid_source_manifest")
+            );
+        } else if case == "runner" {
+            assert_eq!(
+                f.runner.run(CancellationToken::new()).await.unwrap(),
+                CompactionExit::Failed(FailureKind::Permanent)
+            );
+            let state = f
+                .store
+                .compaction_runner_state("operation")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                state.diagnostic.as_ref().unwrap().code,
+                "source_revision_changed"
+            );
+            assert_eq!(f.provider.calls.lock().unwrap().len(), 0);
+        } else {
+            let error = f
+                .store
+                .compaction_manifest_sources_current("operation")
+                .await
+                .unwrap_err();
+            if case == "database" {
+                assert!(error.downcast_ref::<sea_orm::DbErr>().is_some());
+            } else {
+                assert_eq!(
+                    error.to_string(),
+                    "bound operation projection or domain is unavailable"
+                );
+            }
+        }
+        let row = db
+            .query_one_raw(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT COUNT(*) AS n FROM compaction_frozen_use",
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.try_get::<i64>("", "n").unwrap(),
+            0,
+            "ordinary preflight must close its use"
+        );
+        assert!(f.provider.calls.lock().unwrap().is_empty());
+    }
 }

@@ -187,6 +187,32 @@ pub(crate) async fn prepare_completed_history_owned(
     accepted_projection: Option<super::frozen::PreparedHistory>,
     diagnostic: &mut HistoryCheckDiagnostic,
 ) -> Result<HistoryCheckOutcome> {
+    let (accepted_use, accepted_projection) = match accepted_projection {
+        Some(super::frozen::PreparedHistory {
+            guard,
+            descriptor,
+            messages,
+            accepted_scopes,
+            source_epochs,
+            expected_checkpoint,
+            checkpoint,
+            checkpoint_graphs,
+        }) => (
+            Some(guard),
+            Some((
+                descriptor,
+                messages,
+                accepted_scopes,
+                source_epochs,
+                expected_checkpoint,
+                checkpoint,
+                checkpoint_graphs,
+            )),
+        ),
+        None => (None, None),
+    };
+    let mut captured_use = None;
+    let result = async {
     // The owner chooses the database class: foreground transfer is part of
     // turn startup; the completed-turn worker passes a maintenance handle.
     let store = scoped_store.clone();
@@ -239,23 +265,16 @@ pub(crate) async fn prepare_completed_history_owned(
         }
         diagnostic.stage = "history_capture".into();
         let owner = super::native::native_owner(workspace, thread);
-        let prepared = match accepted_projection {
-            Some(prepared) => prepared,
+        let (descriptor, mut messages, allowed, source_epochs, head, projection_checkpoint, mut checkpoint_graphs) = match accepted_projection {
+            Some(contents) => contents,
             None => {
-                processor
-                    .capture_current_context_basis_prepared(&store, workspace, thread, turn, None)
-                    .await?
+                let super::frozen::PreparedHistory { guard, descriptor, messages, accepted_scopes, source_epochs,
+                    expected_checkpoint, checkpoint, checkpoint_graphs } = processor
+                    .capture_current_context_basis_prepared(&store, workspace, thread, turn, None).await?;
+                captured_use = Some(guard);
+                (descriptor, messages, accepted_scopes, source_epochs, expected_checkpoint, checkpoint, checkpoint_graphs)
             }
         };
-        let super::frozen::PreparedHistory {
-            descriptor,
-            mut messages,
-            accepted_scopes: allowed,
-            source_epochs,
-            expected_checkpoint: head,
-            checkpoint: projection_checkpoint,
-            mut checkpoint_graphs,
-        } = prepared;
         let version = *source_epochs
             .get(thread)
             .ok_or_else(|| anyhow::anyhow!("prepared history lost its owner epoch"))?;
@@ -611,6 +630,15 @@ pub(crate) async fn prepare_completed_history_owned(
                 HistoryCheckOutcome::Failed
             })
         }
+    }
+    }.await;
+    let result = match captured_use {
+        Some(guard) => guard.complete(result).await,
+        None => result,
+    };
+    match accepted_use {
+        Some(guard) => guard.complete(result).await,
+        None => result,
     }
 }
 

@@ -12,6 +12,7 @@ use anyhow::Result;
 use pioneer_compaction::frozen::{FrozenHistoryRef, FrozenMessageRef};
 use pioneer_compaction::runner::RunnerState;
 use pioneer_compaction::{Checkpoint, ModelBudget, OperationSnapshot, SourceRef};
+use sea_orm::TransactionTrait;
 
 impl CrudStore {
     /// One restart-safe, payload-free page of legacy history preparation.
@@ -189,6 +190,52 @@ impl CrudStore {
         )
         .await
     }
+    pub async fn compaction_admit_frozen_for_turn(
+        &self,
+        workspace: &str,
+        thread: &str,
+        snapshot: &OperationSnapshot,
+        execution_turn: Option<&str>,
+        intended: &FrozenHistoryRef,
+        guard: &crate::FrozenUseGuard,
+    ) -> Result<OperationRecord> {
+        anyhow::ensure!(
+            guard.descriptor() == *intended,
+            "native admission capture tuple mismatch"
+        );
+        repositories::compaction::compaction_admit_with_intent(
+            self,
+            workspace,
+            thread,
+            snapshot,
+            execution_turn,
+            repositories::compaction::AdmissionIntent::NativeFrozen(guard),
+        )
+        .await
+    }
+    pub async fn compaction_validate_admission_intent(
+        &self,
+        operation: &str,
+        native_guard: Option<&crate::FrozenUseGuard>,
+    ) -> Result<()> {
+        let intent = match native_guard {
+            Some(guard) => {
+                guard.validate_store(self)?;
+                repositories::compaction::AdmissionIntent::NativeFrozen(guard)
+            }
+            None => repositories::compaction::AdmissionIntent::AssertionCompatible,
+        };
+        self.run_serialized_write(|| async {
+            let tx = self.connection.begin().await?;
+            repositories::compaction::validate_admission_intent_in(&tx, operation, &intent).await?;
+            tx.commit().await?;
+            Ok(())
+        })
+        .await
+    }
+    pub async fn compaction_prepare_checkpoint_proof(&self, checkpoint: &str) -> Result<()> {
+        repositories::compaction_checkpoint_proof::prepare(self, checkpoint).await
+    }
     pub async fn compaction_operation_for_plan(
         &self,
         workspace: &str,
@@ -297,7 +344,7 @@ impl CrudStore {
     }
     /// Read bounded historical coverage metadata without loading summary text.
     pub async fn compaction_checkpoint_edges(&self, id: &str) -> Result<Option<CheckpointEdges>> {
-        repositories::compaction::compaction_checkpoint_edges(&self.connection, id).await
+        repositories::compaction::compaction_checkpoint_edges(self, id).await
     }
     pub async fn compaction_checkpoint(&self, id: &str) -> Result<Option<Checkpoint>> {
         repositories::compaction::compaction_checkpoint(&self.connection, id).await
@@ -658,12 +705,13 @@ impl CrudStore {
         workspace: &str,
         owner_thread: &str,
         descriptor: &FrozenHistoryRef,
-    ) -> Result<()> {
-        repositories::compaction::frozen::compaction_begin_frozen_history(
-            self,
+    ) -> Result<crate::FrozenUseGuard> {
+        self.compaction_begin_frozen_history_with_imports(
             workspace,
             owner_thread,
             descriptor,
+            0,
+            repositories::compaction::EMPTY_FROZEN_IMPORT_SHA256,
         )
         .await
     }
@@ -674,20 +722,40 @@ impl CrudStore {
         descriptor: &FrozenHistoryRef,
         imports: u64,
         imports_sha256: &str,
-    ) -> Result<()> {
-        repositories::compaction::frozen::compaction_begin_frozen_history_with_imports(
-            &self.connection,
-            workspace,
-            owner_thread,
-            descriptor,
-            imports,
-            imports_sha256,
-        )
+    ) -> Result<crate::FrozenUseGuard> {
+        use sea_orm::TransactionTrait;
+        let use_id = uuid::Uuid::new_v4().to_string();
+        self.run_serialized_write(|| async {
+            let tx = self.connection.begin().await?;
+            repositories::compaction::frozen::compaction_begin_frozen_history_with_imports(
+                &tx,
+                workspace,
+                owner_thread,
+                descriptor,
+                imports,
+                imports_sha256,
+            )
+            .await?;
+            repositories::compaction_frozen_reclaim::rebuild(self, &tx, &descriptor.manifest_id)
+                .await?;
+            let guard = repositories::compaction_frozen_use::acquire_in(
+                self,
+                &tx,
+                workspace,
+                descriptor,
+                Some(owner_thread),
+                "capture",
+                false,
+                &use_id,
+            )
+            .await?;
+            tx.commit().await?;
+            Ok(guard)
+        })
         .await
     }
-    /// The prepared JSON contains typed references and hashes only. Before DB
-    /// admission it is validated and bounded; the transaction revalidates the
-    /// manifest owner/readiness and exact existing bytes on an idempotent retry.
+    /// Compatibility wrapper owns and explicitly closes its per-call use.
+    /// Multi-call capture retains the use returned by begin and uses the borrowed APIs.
     pub async fn compaction_append_frozen_history(
         &self,
         workspace: &str,
@@ -696,31 +764,61 @@ impl CrudStore {
         start: u64,
         messages: &[FrozenMessageRef],
     ) -> Result<()> {
-        repositories::compaction::frozen::compaction_append_frozen_history(
-            self,
-            workspace,
-            owner_thread,
-            manifest,
-            start,
-            messages,
-        )
+        let guard = self
+            .compaction_acquire_frozen_builder_use(workspace, owner_thread, manifest)
+            .await?;
+        let result = self
+            .compaction_append_frozen_history_with_use(&guard, start, messages)
+            .await;
+        guard.complete(result).await
+    }
+    pub async fn compaction_append_frozen_history_with_use(
+        &self,
+        guard: &crate::FrozenUseGuard,
+        start: u64,
+        messages: &[FrozenMessageRef],
+    ) -> Result<()> {
+        guard.validate_store(self)?;
+        self.run_serialized_write(|| {
+            repositories::compaction::frozen::compaction_append_frozen_history(
+                self,
+                guard.workspace(),
+                guard.owner(),
+                &guard.header().id,
+                start,
+                messages,
+                guard,
+            )
+        })
         .await
     }
-    /// Ready is published only after the bounded writer has filled all exact
-    /// ordinals. The content digest is checked by the caller before this CAS.
+    /// Full bounded verification issues a private capture receipt before ready CAS.
+    pub async fn compaction_finish_frozen_history_with_use(
+        &self,
+        guard: &crate::FrozenUseGuard,
+    ) -> Result<bool> {
+        guard.validate_store(self)?;
+        let receipt = repositories::compaction_frozen_verify::verify(self, guard).await?;
+        repositories::compaction_frozen_verify::finish(self, guard, &receipt).await
+    }
     pub async fn compaction_finish_frozen_history(
         &self,
         workspace: &str,
         owner_thread: &str,
         descriptor: &FrozenHistoryRef,
     ) -> Result<bool> {
-        repositories::compaction::frozen::compaction_finish_frozen_history(
-            &self.connection,
-            workspace,
-            owner_thread,
-            descriptor,
-        )
-        .await
+        let guard = self
+            .compaction_acquire_frozen_builder_use(workspace, owner_thread, &descriptor.manifest_id)
+            .await?;
+        let result = async {
+            anyhow::ensure!(
+                guard.descriptor() == *descriptor,
+                "frozen finish identity mismatch"
+            );
+            self.compaction_finish_frozen_history_with_use(&guard).await
+        }
+        .await;
+        guard.complete(result).await
     }
     pub async fn compaction_frozen_history_owner(
         &self,
@@ -741,14 +839,31 @@ impl CrudStore {
         manifest: &str,
         start: u64,
     ) -> Result<Vec<FrozenMessageRef>> {
-        repositories::compaction::frozen::compaction_frozen_history_page(
+        let guard = self
+            .compaction_acquire_frozen_builder_use(workspace, owner_thread, manifest)
+            .await?;
+        let result = self
+            .compaction_frozen_history_page_with_use(&guard, start)
+            .await;
+        guard.complete(result).await
+    }
+    pub async fn compaction_frozen_history_page_with_use(
+        &self,
+        guard: &crate::FrozenUseGuard,
+        start: u64,
+    ) -> Result<Vec<FrozenMessageRef>> {
+        guard.validate_store(self)?;
+        repositories::compaction_frozen_verify::rows(
             &self.connection,
-            workspace,
-            owner_thread,
-            manifest,
-            start,
+            guard,
+            0,
+            i64::try_from(start)?,
+            true,
         )
-        .await
+        .await?
+        .into_iter()
+        .map(|(_, json)| Ok(serde_json::from_str(&json)?))
+        .collect()
     }
     pub async fn compaction_prepare_frozen_import(
         &self,
@@ -859,9 +974,32 @@ impl CrudStore {
         start: u64,
         imports: &[(u64, PreparedFrozenImport)],
     ) -> Result<()> {
-        repositories::compaction::frozen_import::compaction_append_frozen_imports(
-            self, workspace, owner, manifest, start, imports,
-        )
+        let guard = self
+            .compaction_acquire_frozen_builder_use(workspace, owner, manifest)
+            .await?;
+        let result = self
+            .compaction_append_frozen_imports_with_use(&guard, start, imports)
+            .await;
+        guard.complete(result).await
+    }
+    pub async fn compaction_append_frozen_imports_with_use(
+        &self,
+        guard: &crate::FrozenUseGuard,
+        start: u64,
+        imports: &[(u64, PreparedFrozenImport)],
+    ) -> Result<()> {
+        guard.validate_store(self)?;
+        self.run_serialized_write(|| {
+            repositories::compaction::frozen_import::compaction_append_frozen_imports(
+                self,
+                guard.workspace(),
+                guard.owner(),
+                &guard.header().id,
+                start,
+                imports,
+                guard,
+            )
+        })
         .await
     }
     pub async fn compaction_frozen_import_state(
@@ -885,14 +1023,31 @@ impl CrudStore {
         manifest: &str,
         start: u64,
     ) -> Result<Vec<FrozenImportRecord>> {
-        repositories::compaction::frozen_import::compaction_frozen_import_page(
+        let guard = self
+            .compaction_acquire_frozen_builder_use(workspace, owner, manifest)
+            .await?;
+        let result = self
+            .compaction_frozen_import_page_with_use(&guard, start)
+            .await;
+        guard.complete(result).await
+    }
+    pub async fn compaction_frozen_import_page_with_use(
+        &self,
+        guard: &crate::FrozenUseGuard,
+        start: u64,
+    ) -> Result<Vec<FrozenImportRecord>> {
+        guard.validate_store(self)?;
+        repositories::compaction_frozen_verify::rows(
             &self.connection,
-            workspace,
-            owner,
-            manifest,
-            start,
+            guard,
+            1,
+            i64::try_from(start)?,
+            true,
         )
-        .await
+        .await?
+        .into_iter()
+        .map(|(_, json)| Ok(serde_json::from_str(&json)?))
+        .collect()
     }
     pub async fn compaction_turn_is_completed(
         &self,
@@ -1183,11 +1338,7 @@ impl CrudStore {
         repositories::compaction::runner::compaction_append_manifest(self, operation, entries).await
     }
     pub async fn compaction_manifest_sources_current(&self, operation: &str) -> Result<bool> {
-        repositories::compaction::runner::compaction_manifest_sources_current(
-            &self.connection,
-            operation,
-        )
-        .await
+        repositories::compaction::runner::compaction_manifest_sources_current(self, operation).await
     }
     pub async fn compaction_activate_runner(
         &self,
@@ -1344,8 +1495,12 @@ impl CrudStore {
         workspace: &str,
         delivery: &str,
     ) -> Result<Option<TaskDeliveryOutputSnapshot>> {
-        repositories::compaction::task_output::compaction_delivery_output(self, workspace, delivery)
-            .await
+        repositories::compaction::task_output::compaction_delivery_output(
+            &self.connection,
+            workspace,
+            delivery,
+        )
+        .await
     }
     /// Inspect at most 128 event revisions below the common capture fence.
     /// The caller retains the first acknowledgement for each delivery ID across
@@ -1377,6 +1532,27 @@ impl CrudStore {
         imports: u64,
         digest: &str,
     ) -> Result<Option<FrozenHistoryRef>> {
+        match self
+            .compaction_equivalent_frozen_history_with_use(
+                workspace, owner, descriptor, imports, digest,
+            )
+            .await?
+        {
+            Some(guard) => {
+                let descriptor = guard.descriptor();
+                guard.complete(Ok(Some(descriptor))).await
+            }
+            None => Ok(None),
+        }
+    }
+    pub async fn compaction_equivalent_frozen_history_with_use(
+        &self,
+        workspace: &str,
+        owner: &str,
+        descriptor: &FrozenHistoryRef,
+        imports: u64,
+        digest: &str,
+    ) -> Result<Option<crate::FrozenUseGuard>> {
         repositories::compaction_frozen_storage::equivalent(
             self, workspace, owner, descriptor, imports, digest,
         )
@@ -1390,6 +1566,25 @@ impl CrudStore {
         messages: &[pioneer_compaction::frozen::FrozenMessageRef],
         imports: &[(u64, PreparedFrozenImport)],
     ) -> Result<(u64, u64)> {
+        let guard = self
+            .compaction_acquire_frozen_builder_use(workspace, owner, manifest)
+            .await?;
+        let result = self
+            .compaction_share_frozen_prefix_with_use(&guard, messages, imports)
+            .await;
+        guard.complete(result).await
+    }
+    pub async fn compaction_share_frozen_prefix_with_use(
+        &self,
+        guard: &crate::FrozenUseGuard,
+        messages: &[FrozenMessageRef],
+        imports: &[(u64, PreparedFrozenImport)],
+    ) -> Result<(u64, u64)> {
+        guard.validate_store(self)?;
+        let workspace = guard.workspace();
+        let owner = guard.owner();
+        let manifest = &guard.header().id;
+        guard.validate_in(&self.connection, false).await?;
         let refs = messages
             .iter()
             .map(serde_json::to_string)
@@ -1399,11 +1594,11 @@ impl CrudStore {
             .map(|(ordinal, p)| serde_json::to_string(&p.record_at(*ordinal)))
             .collect::<std::result::Result<Vec<_>, _>>()?;
         let messages = repositories::compaction_frozen_storage::prepare(
-            self, workspace, owner, manifest, 0, &refs,
+            self, workspace, owner, manifest, 0, &refs, guard,
         )
         .await?;
         let imports = repositories::compaction_frozen_storage::prepare(
-            self, workspace, owner, manifest, 1, &proofs,
+            self, workspace, owner, manifest, 1, &proofs, guard,
         )
         .await?;
         use pioneer_entity::compaction_frozen_layout as layout;
@@ -1418,20 +1613,67 @@ impl CrudStore {
                     .into_query(),
             )
         };
-        pioneer_entity::compaction_frozen_history::Entity::update_many()
-            .col_expr(
-                pioneer_entity::compaction_frozen_history::Column::StorageRegistered,
-                sea_orm::sea_query::Expr::val(1_i64),
-            )
-            .filter(pioneer_entity::compaction_frozen_history::Column::Id.eq(manifest))
-            .filter(registered(0))
-            .filter(registered(1))
-            .exec(&self.connection)
-            .await?;
+        use sea_orm::TransactionTrait;
+        self.run_serialized_write(|| async {
+            let tx = self.connection.begin().await?;
+            guard.validate_in(&tx, false).await?;
+            pioneer_entity::compaction_frozen_history::Entity::update_many()
+                .col_expr(
+                    pioneer_entity::compaction_frozen_history::Column::StorageRegistered,
+                    sea_orm::sea_query::Expr::val(1_i64),
+                )
+                .filter(pioneer_entity::compaction_frozen_history::Column::Id.eq(manifest))
+                .filter(registered(0))
+                .filter(registered(1))
+                .exec(&tx)
+                .await?;
+            tx.commit().await?;
+            Ok(())
+        })
+        .await?;
         Ok((messages, imports))
     }
+    /// A metadata certificate only; destructive writers must repeat it in TX.
+    pub async fn compaction_frozen_workspace_inventory_ready(
+        &self,
+        workspace: &str,
+    ) -> Result<bool> {
+        if !self.frozen_history_protocol_enabled() {
+            return Ok(false);
+        }
+        repositories::compaction_frozen_maintenance::workspace_ready(&self.connection, workspace)
+            .await
+    }
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn compaction_physical_cleanup_quantum_for_test(&self) -> Result<bool> {
+        repositories::compaction_frozen_cleanup::quantum(&self.with_maintenance_access()).await
+    }
     pub async fn compact_frozen_storage_quantum(&self) -> Result<bool> {
-        repositories::compaction_frozen_storage::maintain(&self.with_maintenance_access()).await
+        let store = self.with_maintenance_access();
+        if repositories::compaction_frozen_maintenance::quantum(&store).await? {
+            return Ok(true);
+        }
+        // Protocol work already alternates with storage work. Within storage,
+        // repeated dirty physical passes must not starve prefix conversion.
+        let physical_first = {
+            let mut cursor = store
+                .frozen_maintenance_cursor
+                .lock()
+                .map_err(|_| anyhow::anyhow!("maintenance cursor poisoned"))?;
+            cursor.physical_turn = !cursor.physical_turn;
+            cursor.physical_turn
+        };
+        if physical_first {
+            if repositories::compaction_frozen_cleanup::quantum(&store).await? {
+                return Ok(true);
+            }
+            repositories::compaction_frozen_storage::maintain(&store).await
+        } else {
+            if repositories::compaction_frozen_storage::maintain(&store).await? {
+                return Ok(true);
+            }
+            repositories::compaction_frozen_cleanup::quantum(&store).await
+        }
     }
 }
 
