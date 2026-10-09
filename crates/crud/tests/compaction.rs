@@ -2894,35 +2894,1167 @@ async fn task_output_snapshot_is_bound_to_completed_turn_and_never_recaptured() 
     );
 }
 
+// Exact canonical delivery/output fixture; no mutable Task result payload is
+// needed for metadata discovery. Every output has a completed TaskRunTurn and
+// a ready frozen manifest, as in the production queue binding.
+async fn delivered_output_fixture(store: &CrudStore, delivery: &str, delivery_turn: &str) {
+    let db = store.database_connection();
+    let task = format!("task-{delivery}");
+    let run = format!("run-{delivery}");
+    let run_turn = format!("rt-{delivery}");
+    let source_turn = format!("output-turn-{delivery}");
+    for (sql, values) in [
+        (
+            "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES (?,'thread','completed','conversation','system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+            vec![source_turn.clone().into()],
+        ),
+        (
+            "INSERT INTO task(id,workspace_id,owner_kind,owner_id,created_by_thread_id,created_by_turn_id,executor_kind,status,title,goal) VALUES (?,'ws','thread','thread','thread','turn','agent','completed','Task','fixture')",
+            vec![task.clone().into()],
+        ),
+        (
+            "INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES (?,?,?,1,1,'succeeded','agent')",
+            vec![run.clone().into(), task.clone().into(), run.clone().into()],
+        ),
+        (
+            "INSERT INTO task_run_turn(id,task_id,run_id,thread_id,turn_id,kind,round,sequence,status,created_at) VALUES (?,?,?,'thread',?,'initial',0,1,'completed',CURRENT_TIMESTAMP)",
+            vec![
+                run_turn.clone().into(),
+                task.clone().into(),
+                run.clone().into(),
+                source_turn.clone().into(),
+            ],
+        ),
+        (
+            "INSERT INTO task_result_candidate(id,task_id,run_id,task_run_turn_id,thread_id,turn_id,round,status,created_at,updated_at) VALUES (?,?,?,?,'thread',?,0,'accepted',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+            vec![
+                delivery.into(),
+                task.clone().into(),
+                run.clone().into(),
+                run_turn.clone().into(),
+                source_turn.clone().into(),
+            ],
+        ),
+        (
+            "INSERT OR IGNORE INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES (?,'thread','completed','conversation','system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+            vec![delivery_turn.into()],
+        ),
+        (
+            "INSERT INTO task_delivery(id,workspace_id,task_id,run_id,delivery_key,mode,thread_target,target_thread_id,status,attempt_count,max_attempts,delivered_turn_id) VALUES (?,'ws',?,?,?,'thread','origin_thread','thread','delivered',1,1,?)",
+            vec![
+                delivery.into(),
+                task.into(),
+                run.into(),
+                delivery.into(),
+                delivery_turn.into(),
+            ],
+        ),
+    ] {
+        db.execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            sql,
+            values,
+        ))
+        .await
+        .unwrap();
+    }
+    let history = pioneer_compaction::frozen::FrozenHistoryRef {
+        format: 1,
+        manifest_id: format!("output-{delivery}"),
+        messages: 0,
+        identity_sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".into(),
+    };
+    store
+        .compaction_begin_frozen_history("ws", "thread", &history)
+        .await
+        .unwrap();
+    assert!(
+        store
+            .compaction_finish_frozen_history("ws", "thread", &history)
+            .await
+            .unwrap()
+    );
+    store
+        .compaction_record_task_output("ws", &run_turn, &history)
+        .await
+        .unwrap();
+    db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+        "INSERT INTO compaction_delivery_output(delivery_id,candidate_id,task_run_turn_id) VALUES (?,?,?)",
+        [delivery.into(),delivery.into(),run_turn.into()],
+    )).await.unwrap();
+}
+
+async fn delivered_ack(store: &CrudStore, delivery: &str, turn: &str) {
+    store
+        .materialize_item_completed(
+            pioneer_protocol::ItemCompletedNotification {
+                workspace_id: "ws".into(),
+                thread_id: "thread".into(),
+                turn_id: turn.into(),
+                item: pioneer_protocol::TurnItem::AgentMessage {
+                    id: pioneer_protocol::task_delivery_result_item_id(delivery),
+                    text: format!("result-{delivery}"),
+                    phase: Default::default(),
+                    markdown: None,
+                    markdown_version: None,
+                },
+            },
+            chrono::Utc::now().timestamp(),
+        )
+        .await
+        .unwrap();
+}
+
+async fn repeat_delivered_ack(
+    store: &CrudStore,
+    delivery: &str,
+    turn: &str,
+    id: &str,
+    sequence: i64,
+) {
+    store.database_connection().execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+        "INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at) SELECT ?,e.thread_id,e.turn_id,?,e.event_type,e.payload,CURRENT_TIMESTAMP FROM turn_event e JOIN compaction_event_revision r ON r.source_id=e.id WHERE e.turn_id=? AND r.item_id=? ORDER BY r.capture_order LIMIT 1",
+        [id.into(),sequence.into(),turn.into(),pioneer_protocol::task_delivery_result_item_id(delivery).into()],
+    )).await.unwrap();
+    let source = SourceRef {
+        scope: format!("event:{turn}"),
+        id: id.into(),
+        version: "event-revision:1".into(),
+    };
+    let payload = store
+        .compaction_reference_payload("ws", "thread", &source)
+        .await
+        .unwrap()
+        .unwrap();
+    let event = serde_json::from_str(&payload).unwrap();
+    assert!(
+        store
+            .compaction_record_event_projection("ws", "thread", &source, &event)
+            .await
+            .unwrap()
+    );
+}
+
+async fn output_metadata_padding(store: &CrudStore, turn: &str, tag: &str, start: i64, count: i64) {
+    for sequence in start..start + count {
+        store.database_connection().execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+            "INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at) VALUES (?,'thread',?,?,'fixture','{}',CURRENT_TIMESTAMP)",
+            [format!("{tag}-{sequence}").into(),turn.into(),sequence.into()],
+        )).await.unwrap();
+    }
+}
+
+async fn compress_output_events(store: &CrudStore) {
+    store.database_connection().query_one_write_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+        "SELECT zstd_enable_transparent(?)",
+        [serde_json::json!({"table":"turn_event","column":"payload","compression_level":3,"dict_chooser":"'[nodict]'"}).to_string().into()],
+    )).await.unwrap();
+}
+
+async fn refresh_output_page(store: &CrudStore, page: &DeliveredTaskOutputPage) {
+    for source in &page.unprojected_events {
+        let payload = store
+            .compaction_reference_payload("ws", "thread", source)
+            .await
+            .unwrap()
+            .unwrap();
+        let event = serde_json::from_str(&payload).unwrap();
+        assert!(
+            store
+                .compaction_record_event_projection("ws", "thread", source, &event)
+                .await
+                .unwrap()
+        );
+    }
+}
+
+async fn foreign_output_history(store: &CrudStore) {
+    let db = store.database_connection();
+    for sql in [
+        "INSERT OR IGNORE INTO workspace(id,name,is_active,is_current) VALUES ('foreign-ws','foreign',1,0)",
+        "INSERT OR IGNORE INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES ('foreign-thread','foreign-ws','','agent','m','p','active','user','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        "INSERT OR IGNORE INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('foreign-turn','foreign-thread','completed','conversation','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<4096) INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at) SELECT 'foreign-'||x,'foreign-thread','foreign-turn',x,'item/completed','{}',CURRENT_TIMESTAMP FROM n",
+    ] {
+        db.execute_unprepared(sql).await.unwrap();
+    }
+}
+
+async fn discover_output_metadata(
+    store: &CrudStore,
+    fence: &HistoryReadFence,
+) -> (Vec<DeliveredTaskOutputRef>, usize, usize) {
+    let mut cursor = DeliveredTaskOutputCursor::default();
+    let mut entries = Vec::new();
+    let mut pages = 0;
+    let mut event_rows = 0;
+    loop {
+        let page = store
+            .compaction_delivered_output_page("ws", "thread", &cursor, fence)
+            .await
+            .unwrap();
+        assert!(page.selected_turn_rows + page.selected_event_rows <= 128);
+        assert!(page.unprojected_events.is_empty());
+        pages += 1;
+        assert!(pages <= 20, "local keyset cursor must terminate");
+        event_rows += page.selected_event_rows;
+        entries.extend(page.entries);
+        if page.done {
+            break;
+        }
+        assert_ne!(page.next_cursor, cursor);
+        cursor = page.next_cursor;
+    }
+    entries.sort_by_key(|entry| entry.capture_order);
+    (entries, pages, event_rows)
+}
+
+// Inspect the actual bound repository statements. Returned row counts alone
+// cannot detect a hidden global revision/delivery scan inside a SQL plan.
+async fn assert_output_discovery_plans(store: &CrudStore, statements: &RecordedStatements) {
+    let statements = statements.lock().unwrap().clone();
+    let discovery = statements
+        .into_iter()
+        .filter(|statement| {
+            statement.sql.starts_with("SELECT d.delivered_turn_id")
+                || statement.sql.contains("WITH quantum AS MATERIALIZED")
+        })
+        .collect::<Vec<_>>();
+    assert!(!discovery.is_empty());
+    for mut statement in discovery {
+        let event_page = statement.sql.contains("WITH quantum AS MATERIALIZED");
+        let resumed_events = statement.sql.contains("AND e.sequence>?");
+        let exact_recheck = statement.sql.contains("FROM json_each(?) w");
+        assert!(!statement.sql.contains("SELECT *"));
+        assert!(!statement.sql.contains("compaction_event_revision WHERE"));
+        assert!(!statement.sql.contains("rowid"));
+        assert!(!statement.sql.contains("payload"));
+        statement.sql = format!("EXPLAIN QUERY PLAN {}", statement.sql);
+        let plan = store
+            .database_connection()
+            .query_all_raw(statement)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.try_get::<String>("", "detail").unwrap())
+            .collect::<Vec<_>>();
+        if event_page {
+            if exact_recheck {
+                assert!(
+                    plan.iter().any(|detail| detail.starts_with("SEARCH ")
+                        && (detail.starts_with("SEARCH e ") || detail.contains("turn_event"))
+                        && detail.contains("(id=?)")),
+                    "{plan:#?}"
+                );
+            } else {
+                assert!(
+                    plan.iter().any(|detail| detail.starts_with("SEARCH ")
+                        && detail.contains("idx_turn_events_turn_id_sequence")
+                        && detail.contains("(turn_id=?")
+                        && detail.contains("sequence<?")
+                        && (!resumed_events || detail.contains("sequence>?"))),
+                    "{plan:#?}"
+                );
+            }
+            assert!(
+                plan.iter()
+                    .any(|detail| detail.starts_with("SEARCH r ")
+                        && detail.contains("(source_id=?)")),
+                "{plan:#?}"
+            );
+            assert!(
+                plan.iter()
+                    .any(|detail| detail.starts_with("SEARCH d ") && detail.contains("(id=?)")),
+                "{plan:#?}"
+            );
+            assert!(
+                !plan.iter().any(|detail| detail.starts_with("SCAN ")
+                    && (detail.contains("turn_event")
+                        || detail.starts_with("SCAN e ")
+                        || detail.starts_with("SCAN r ")
+                        || detail.starts_with("SCAN d "))),
+                "{plan:#?}"
+            );
+        } else {
+            assert!(
+                plan.iter().any(|detail| detail
+                    .contains("SEARCH d USING INDEX compaction_delivery_turn")
+                    && detail
+                        .contains("workspace_id=? AND target_thread_id=? AND delivered_turn_id>?")
+                    && detail.contains("delivered_turn_id<?")),
+                "{plan:#?}"
+            );
+            assert!(
+                !plan.iter().any(|detail| detail.contains("SCAN d ")),
+                "{plan:#?}"
+            );
+            assert!(
+                plan.iter().any(
+                    |detail| detail.starts_with("SEARCH ct ") && detail.contains("(turn_id=?)")
+                ),
+                "Turn fence uses the existing unique locator: {plan:#?}"
+            );
+            assert!(
+                plan.iter().any(|detail| detail.starts_with("SEARCH ")
+                    && detail.contains("idx_turn_events_turn_id_sequence")
+                    && detail.contains("(turn_id=?)")),
+                "sequence endpoint uses the local index: {plan:#?}"
+            );
+        }
+        assert!(
+            !plan
+                .iter()
+                .any(|detail| detail.contains("compaction_event_revision_capture_order")),
+            "{plan:#?}"
+        );
+    }
+}
+
 #[tokio::test]
-async fn delivered_output_discovery_advances_empty_bounded_quanta() {
-    let store = store().await;
+async fn delivered_output_discovery_without_deliveries_ignores_foreign_history() {
+    let statements = RecordedStatements::default();
+    let store = store_recording_statements(Some(statements.clone())).await;
+    // Include same-workspace ordinary events as well: absent deliveries require
+    // no event/revision query, irrespective of any history high-water mark.
     for n in 1..=260 {
         source(&store, &format!("irrelevant-{n}"), n, "{}").await;
     }
+    foreign_output_history(&store).await;
+    let fence = store.compaction_history_read_fence().await.unwrap();
+    statements.lock().unwrap().clear();
+    let page = store
+        .compaction_delivered_output_page(
+            "ws",
+            "thread",
+            &DeliveredTaskOutputCursor::default(),
+            &fence,
+        )
+        .await
+        .unwrap();
+    assert!(page.done);
+    assert!(page.entries.is_empty() && page.unprojected_events.is_empty());
+    assert_eq!(page.selected_turn_rows, 0);
+    assert_eq!(page.selected_event_rows, 0);
+    assert_eq!(statements.lock().unwrap().len(), 1);
+    assert_output_discovery_plans(&store, &statements).await;
+    source(&store, "late", 261, "{}").await;
+    assert_eq!(
+        store
+            .compaction_delivered_output_page(
+                "ws",
+                "thread",
+                &DeliveredTaskOutputCursor::default(),
+                &fence
+            )
+            .await
+            .unwrap(),
+        page
+    );
+}
+
+#[tokio::test]
+async fn delivered_output_local_keysets_preserve_sparse_outputs_and_repeated_acks() {
+    pioneer_sqlite::zstd::register_auto_extension_once().unwrap();
+    for compressed in [false, true] {
+        let statements = RecordedStatements::default();
+        let store = store_recording_statements(Some(statements.clone())).await;
+        if compressed {
+            store.database_connection().query_one_write_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+                "SELECT zstd_enable_transparent(?)", [serde_json::json!({"table":"turn_event","column":"payload","compression_level":3,"dict_chooser":"'[nodict]'"}).to_string().into()],
+            )).await.unwrap();
+        }
+        for (delivery, turn) in [
+            ("first", "z-turn"),
+            ("second", "a-turn"),
+            ("shared", "a-turn"),
+            ("third", "m-turn"),
+        ] {
+            delivered_output_fixture(&store, delivery, turn).await;
+        }
+        let mut canonical_outputs = std::collections::BTreeSet::new();
+        for delivery in ["first", "second", "shared", "third"] {
+            let snapshot = store
+                .compaction_delivery_output("ws", delivery)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                snapshot.output.source_turn,
+                format!("output-turn-{delivery}")
+            );
+            assert_eq!(snapshot.output.task_run_turn_id, format!("rt-{delivery}"));
+            assert_eq!(snapshot.candidate_id, delivery);
+            assert_eq!(
+                snapshot.output.history.manifest_id,
+                format!("output-{delivery}")
+            );
+            assert!(canonical_outputs.insert(snapshot.output.source_turn));
+        }
+        assert_eq!(canonical_outputs.len(), 4);
+        let before = store.compaction_history_read_fence().await.unwrap();
+        delivered_ack(&store, "first", "z-turn").await;
+        foreign_output_history(&store).await;
+        delivered_ack(&store, "second", "a-turn").await;
+        delivered_ack(&store, "shared", "a-turn").await;
+        delivered_ack(&store, "third", "m-turn").await;
+        // Put a replay on a different local page; sequence order deliberately
+        // disagrees with capture order so first-encountered is invalid.
+        for n in 2..=130 {
+            store.database_connection().execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+                "INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at) VALUES (?,'thread','z-turn',?,'fixture','{}',CURRENT_TIMESTAMP)",
+                [format!("padding-{n}").into(),n.into()],
+            )).await.unwrap();
+        }
+        repeat_delivered_ack(&store, "first", "z-turn", "repeated-first", -1).await;
+        repeat_delivered_ack(&store, "first", "z-turn", "repeated-first-late", 131).await;
+        let fence = store.compaction_history_read_fence().await.unwrap();
+        statements.lock().unwrap().clear();
+        let (entries, pages, rows) = discover_output_metadata(&store, &fence).await;
+        assert_eq!(pages, 5); // a, m, two z pages, local exhaustion
+        assert_eq!(rows, 135);
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.delivery_id.as_str())
+                .collect::<Vec<_>>(),
+            ["first", "second", "shared", "third", "first", "first"]
+        );
+        assert!(
+            entries
+                .windows(2)
+                .all(|pair| pair[0].capture_order < pair[1].capture_order)
+        );
+        assert_eq!(entries[0].acknowledgement.version, "event-revision:1");
+        assert_eq!(entries[4].acknowledgement.id, "repeated-first");
+        assert_ne!(entries[0].acknowledgement.id, "repeated-first");
+        assert_output_discovery_plans(&store, &statements).await;
+        store.database_connection().execute_unprepared(
+            "WITH RECURSIVE n(x) AS (VALUES(4097) UNION ALL SELECT x+1 FROM n WHERE x<8192) INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at) SELECT 'foreign-'||x,'foreign-thread','foreign-turn',x,'item/completed','{}',CURRENT_TIMESTAMP FROM n",
+        ).await.unwrap();
+        let larger_fence = store.compaction_history_read_fence().await.unwrap();
+        statements.lock().unwrap().clear();
+        let (same, same_pages, same_rows) = discover_output_metadata(&store, &larger_fence).await;
+        assert_eq!(same, entries);
+        assert_eq!((same_pages, same_rows), (pages, rows));
+        // Three local Turn seeks plus exhaustion, and four event pages.
+        assert_eq!(statements.lock().unwrap().len(), 8);
+
+        // Append during an existing fenced request. Old discovery neither
+        // includes the new acknowledgement nor traverses foreign revisions.
+        let first_page = store
+            .compaction_delivered_output_page(
+                "ws",
+                "thread",
+                &DeliveredTaskOutputCursor::default(),
+                &fence,
+            )
+            .await
+            .unwrap();
+        assert!(!first_page.done);
+        repeat_delivered_ack(&store, "third", "m-turn", "late-third", 2).await;
+        let mut during_append = first_page.entries;
+        let mut cursor = first_page.next_cursor;
+        for n in 0..20 {
+            let page = store
+                .compaction_delivered_output_page("ws", "thread", &cursor, &fence)
+                .await
+                .unwrap();
+            assert!(page.unprojected_events.is_empty());
+            during_append.extend(page.entries);
+            if page.done {
+                break;
+            }
+            assert!(n < 19, "append must not prevent local exhaustion");
+            assert_ne!(page.next_cursor, cursor);
+            cursor = page.next_cursor;
+        }
+        during_append.sort_by_key(|entry| entry.capture_order);
+        assert_eq!(during_append, entries);
+        assert_eq!(discover_output_metadata(&store, &fence).await.0, entries);
+        assert!(discover_output_metadata(&store, &before).await.0.is_empty());
+        let after = store.compaction_history_read_fence().await.unwrap();
+        assert_eq!(discover_output_metadata(&store, &after).await.0.len(), 7);
+        for (workspace, thread) in [("foreign-ws", "thread"), ("ws", "foreign-thread")] {
+            let page = store
+                .compaction_delivered_output_page(
+                    workspace,
+                    thread,
+                    &DeliveredTaskOutputCursor::default(),
+                    &after,
+                )
+                .await
+                .unwrap();
+            assert!(page.done && page.entries.is_empty());
+            assert_eq!(page.selected_event_rows, 0);
+        }
+        assert_eq!(
+            store.database_connection().read_class(),
+            pioneer_sqlite::SqliteReadClass::Maintenance
+        );
+        assert_eq!(
+            store.database_connection().write_class(),
+            pioneer_sqlite::SqliteWriteClass::Maintenance
+        );
+    }
+}
+
+#[tokio::test]
+async fn delivered_output_exact_full_page_exhausts_without_a_revision_range_seek() {
+    let store = store().await;
+    delivered_output_fixture(&store, "delivery", "delivery-turn").await;
+    delivered_ack(&store, "delivery", "delivery-turn").await;
+    for sequence in 2..=127 {
+        store.database_connection().execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+            "INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at) VALUES (?,'thread','delivery-turn',?,'fixture','{}',CURRENT_TIMESTAMP)",
+            [format!("exact-padding-{sequence}").into(),sequence.into()],
+        )).await.unwrap();
+    }
     let fence = store.compaction_history_read_fence().await.unwrap();
     let first = store
-        .compaction_delivered_output_page("ws", "thread", 0, &fence)
+        .compaction_delivered_output_page(
+            "ws",
+            "thread",
+            &DeliveredTaskOutputCursor::default(),
+            &fence,
+        )
         .await
         .unwrap();
-    assert!(first.entries.is_empty());
-    assert_eq!(first.scanned_through, 128);
+    assert_eq!(first.selected_event_rows, 127);
+    assert_eq!(first.entries.len(), 1);
     assert!(!first.done);
-    let second = store
-        .compaction_delivered_output_page("ws", "thread", first.scanned_through, &fence)
+    assert_eq!(first.next_cursor.after_sequence, Some(127));
+    let empty_tail = store
+        .compaction_delivered_output_page("ws", "thread", &first.next_cursor, &fence)
         .await
         .unwrap();
-    assert!(second.entries.is_empty());
-    assert_eq!(second.scanned_through, 256);
-    assert!(!second.done);
-    source(&store, "late", 261, "{}").await;
+    assert_eq!(
+        empty_tail.selected_turn_rows + empty_tail.selected_event_rows,
+        0
+    );
+    assert!(!empty_tail.done);
+    assert_ne!(empty_tail.next_cursor, first.next_cursor);
+    assert_eq!(empty_tail.next_cursor.after_turn, "delivery-turn");
     let last = store
-        .compaction_delivered_output_page("ws", "thread", second.scanned_through, &fence)
+        .compaction_delivered_output_page("ws", "thread", &empty_tail.next_cursor, &fence)
         .await
         .unwrap();
-    assert!(last.entries.is_empty());
-    assert_eq!(last.scanned_through, fence.event_order);
-    assert!(last.done);
+    assert!(last.done && last.entries.is_empty());
+    assert_eq!(last.selected_turn_rows + last.selected_event_rows, 0);
+}
+
+#[tokio::test]
+async fn delivered_output_cold_metadata_uses_scoped_revision_cas_and_source_freshness() {
+    let store = store().await;
+    delivered_output_fixture(&store, "delivery", "delivery-turn").await;
+    delivered_ack(&store, "delivery", "delivery-turn").await;
+    let fence = store.compaction_history_read_fence().await.unwrap();
+    let cursor = DeliveredTaskOutputCursor::default();
+    let warm = store
+        .compaction_delivered_output_page("ws", "thread", &cursor, &fence)
+        .await
+        .unwrap();
+    assert_eq!(warm.entries.len(), 1);
+    let acknowledgement = &warm.entries[0].acknowledgement;
+    let payload = store
+        .compaction_reference_payload("ws", "thread", acknowledgement)
+        .await
+        .unwrap()
+        .unwrap();
+    let event: pioneer_crud::CanonicalTurnEventPayload = serde_json::from_str(&payload).unwrap();
+    for projection in ["NULL", "revision-1"] {
+        store.database_connection().execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+            format!("UPDATE compaction_event_revision SET projection_revision={projection},item_id=NULL,projection_kind=NULL WHERE source_id=?"),
+            [acknowledgement.id.clone().into()],
+        )).await.unwrap();
+        let cold = store
+            .compaction_delivered_output_page("ws", "thread", &cursor, &fence)
+            .await
+            .unwrap();
+        assert!(cold.entries.is_empty());
+        assert_eq!(cold.unprojected_events, vec![acknowledgement.clone()]);
+        assert!(
+            store
+                .compaction_reference_payload("foreign-ws", "thread", acknowledgement)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .compaction_record_event_projection("ws", "thread", acknowledgement, &event)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .compaction_delivered_output_page("ws", "thread", &cursor, &fence)
+                .await
+                .unwrap(),
+            warm
+        );
+    }
+    foreign_output_history(&store).await;
+    store
+        .database_connection()
+        .execute_unprepared(
+            "UPDATE task_delivery SET delivered_turn_id='foreign-turn' WHERE id='delivery'",
+        )
+        .await
+        .unwrap();
+    let foreign_locator = store
+        .compaction_delivered_output_page("ws", "thread", &cursor, &fence)
+        .await
+        .unwrap();
+    assert!(foreign_locator.done && foreign_locator.entries.is_empty());
+    assert_eq!(foreign_locator.selected_event_rows, 0);
+    store
+        .database_connection()
+        .execute_unprepared(
+            "UPDATE task_delivery SET delivered_turn_id='delivery-turn' WHERE id='delivery'",
+        )
+        .await
+        .unwrap();
+    let epoch = store
+        .compaction_projection_version("ws", "thread")
+        .await
+        .unwrap();
+    store
+        .database_connection()
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE turn_event SET payload=payload||' ' WHERE id=?",
+            [acknowledgement.id.clone().into()],
+        ))
+        .await
+        .unwrap();
+    assert_ne!(
+        store
+            .compaction_projection_version("ws", "thread")
+            .await
+            .unwrap(),
+        epoch
+    );
+    assert!(
+        !store
+            .compaction_record_event_projection("ws", "thread", acknowledgement, &event)
+            .await
+            .unwrap()
+    );
+    assert!(
+        store
+            .compaction_reference_payload("ws", "thread", acknowledgement)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let stale = store
+        .compaction_delivered_output_page("ws", "thread", &cursor, &fence)
+        .await
+        .unwrap();
+    assert!(stale.entries.is_empty());
+    assert_eq!(stale.unprojected_events.len(), 1);
+    assert_eq!(stale.unprojected_events[0].version, "event-revision:2");
+    store
+        .database_connection()
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "DELETE FROM turn_event WHERE id=?",
+            [acknowledgement.id.clone().into()],
+        ))
+        .await
+        .unwrap();
+    assert!(
+        !store
+            .compaction_record_event_projection("ws", "thread", acknowledgement, &event)
+            .await
+            .unwrap()
+    );
+    let deleted = store
+        .compaction_delivered_output_page("ws", "thread", &cursor, &fence)
+        .await
+        .unwrap();
+    assert!(deleted.entries.is_empty() && deleted.unprojected_events.is_empty());
+    assert_eq!(deleted.selected_event_rows, 0);
+}
+
+#[tokio::test]
+async fn delivered_output_fence_terminates_despite_continuous_append_and_new_turns() {
+    pioneer_sqlite::zstd::register_auto_extension_once().unwrap();
+    for compressed in [false, true] {
+        let statements = RecordedStatements::default();
+        let store = store_recording_statements(Some(statements.clone())).await;
+        if compressed {
+            compress_output_events(&store).await;
+        }
+        delivered_output_fixture(&store, "first", "a-old").await;
+        delivered_output_fixture(&store, "second", "z-old").await;
+        delivered_ack(&store, "first", "a-old").await;
+        delivered_ack(&store, "second", "z-old").await;
+        // A valid old acknowledgement can have a sequence far above the
+        // global capture order. An event_order-as-sequence cutoff would lose it.
+        let mut second_source = store
+            .compaction_source_metadata_page("ws", "thread", "z-old", PagedSource::Event, 0)
+            .await
+            .unwrap()
+            .entries[0]
+            .reference
+            .clone();
+        store
+            .database_connection()
+            .execute_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "UPDATE turn_event SET sequence=10000 WHERE id=?",
+                [second_source.id.clone().into()],
+            ))
+            .await
+            .unwrap();
+        second_source.version = "event-revision:2".into();
+        let payload = store
+            .compaction_reference_payload("ws", "thread", &second_source)
+            .await
+            .unwrap()
+            .unwrap();
+        let event = serde_json::from_str(&payload).unwrap();
+        assert!(
+            store
+                .compaction_record_event_projection("ws", "thread", &second_source, &event)
+                .await
+                .unwrap()
+        );
+        output_metadata_padding(&store, "a-old", "before", 2, 259).await;
+        let fence = store.compaction_history_read_fence().await.unwrap();
+        assert!(fence.event_order < 10000);
+        let (expected, expected_pages, expected_rows) =
+            discover_output_metadata(&store, &fence).await;
+        assert_eq!((expected_pages, expected_rows), (5, 261));
+        let mut cursor = DeliveredTaskOutputCursor::default();
+        let mut entries = Vec::new();
+        let mut sources = std::collections::BTreeSet::new();
+        let mut rows = 0;
+        let mut pages = 0_usize;
+        loop {
+            // A producer appends a full quantum before EVERY continuation,
+            // including the would-be terminating request. New Turn IDs are
+            // inside the fence's lexical range, so creation_order is essential.
+            if pages > 0 {
+                if pages == 1 {
+                    // Late rows BEFORE an unvisited old acknowledgement must
+                    // not fill its quantum or move the admitted continuation.
+                    output_metadata_padding(&store, "z-old", "late-interleaved", 1, 127).await;
+                }
+                output_metadata_padding(
+                    &store,
+                    "a-old",
+                    &format!("late-{pages}"),
+                    261 + (pages as i64 - 1) * 127,
+                    127,
+                )
+                .await;
+                repeat_delivered_ack(
+                    &store,
+                    "first",
+                    "a-old",
+                    &format!("late-low-{pages}"),
+                    -(pages as i64),
+                )
+                .await;
+                let delivery = format!("late-delivery-{pages}");
+                let turn = format!("b-new-{pages:02}");
+                delivered_output_fixture(&store, &delivery, &turn).await;
+                delivered_ack(&store, &delivery, &turn).await;
+            }
+            statements.lock().unwrap().clear();
+            let page = store
+                .compaction_delivered_output_page("ws", "thread", &cursor, &fence)
+                .await
+                .unwrap();
+            assert!(page.selected_turn_rows + page.selected_event_rows <= 128);
+            for selected in &page.selected_events {
+                assert!(selected.capture_order <= fence.event_order);
+                assert!(
+                    sources.insert(selected.source.clone()),
+                    "no source is selected twice"
+                );
+            }
+            rows += page.selected_event_rows;
+            entries.extend(page.entries);
+            pages += 1;
+            assert!(
+                pages <= expected_pages,
+                "post-fence appends must not extend discovery"
+            );
+            assert_output_discovery_plans(&store, &statements).await;
+            if page.done {
+                break;
+            }
+            if let Some(upper) = cursor.event_high_water {
+                if page.next_cursor.active_turn == cursor.active_turn {
+                    assert_eq!(page.next_cursor.event_high_water, Some(upper));
+                }
+            }
+            assert_ne!(page.next_cursor, cursor);
+            cursor = page.next_cursor;
+        }
+        entries.sort_by_key(|entry| entry.capture_order);
+        assert_eq!(entries, expected);
+        assert_eq!((pages, rows), (expected_pages, expected_rows));
+        assert_eq!(sources.len(), expected_rows);
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.delivery_id.as_str())
+                .collect::<Vec<_>>(),
+            ["first", "second"]
+        );
+    }
+}
+
+#[tokio::test]
+async fn delivered_output_cold_page_refresh_keeps_exact_sources_across_append_boundaries() {
+    pioneer_sqlite::zstd::register_auto_extension_once().unwrap();
+    for compressed in [false, true] {
+        for count in [126, 127, 128] {
+            let statements = RecordedStatements::default();
+            let store = store_recording_statements(Some(statements.clone())).await;
+            if compressed {
+                compress_output_events(&store).await;
+            }
+            delivered_output_fixture(&store, "delivery", "delivery-turn").await;
+            delivered_ack(&store, "delivery", "delivery-turn").await;
+            output_metadata_padding(&store, "delivery-turn", "before", 2, count - 1).await;
+            let fence = store.compaction_history_read_fence().await.unwrap();
+            let warm = store
+                .compaction_delivered_output_page(
+                    "ws",
+                    "thread",
+                    &DeliveredTaskOutputCursor::default(),
+                    &fence,
+                )
+                .await
+                .unwrap();
+            let ack = warm.entries[0].acknowledgement.clone();
+            store.database_connection().execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+                "UPDATE compaction_event_revision SET projection_revision=NULL,item_id=NULL,projection_kind=NULL WHERE source_id=?", [ack.id.clone().into()],
+            )).await.unwrap();
+            let cold = store
+                .compaction_delivered_output_page(
+                    "ws",
+                    "thread",
+                    &DeliveredTaskOutputCursor::default(),
+                    &fence,
+                )
+                .await
+                .unwrap();
+            assert_eq!(cold.selected_event_rows, std::cmp::min(count, 127) as usize);
+            assert_eq!(cold.selected_events, warm.selected_events);
+            assert_eq!(cold.unprojected_events, [ack.clone()]);
+            // Append between selection and CAS, then again between CAS and
+            // exact recheck. Both high and negative sequences are after fence.
+            output_metadata_padding(&store, "delivery-turn", "after-selection", count + 1, 127)
+                .await;
+            // Use the known canonical source key: its item cache is deliberately
+            // NULL until CAS, so the replay fixture cannot locate it via cache.
+            store.database_connection().execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+                "INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at) SELECT 'negative-late',thread_id,turn_id,-1,event_type,payload,CURRENT_TIMESTAMP FROM turn_event WHERE id=?",
+                [ack.id.clone().into()],
+            )).await.unwrap();
+            refresh_output_page(&store, &cold).await;
+            output_metadata_padding(&store, "delivery-turn", "after-cas", count + 128, 127).await;
+            delivered_output_fixture(&store, "late", "late-turn").await;
+            delivered_ack(&store, "late", "late-turn").await;
+            statements.lock().unwrap().clear();
+            let refreshed = store
+                .compaction_recheck_delivered_output_page("ws", "thread", &cold, &fence)
+                .await
+                .unwrap();
+            assert_eq!(refreshed, warm);
+            assert_eq!(
+                statements.lock().unwrap().len(),
+                1,
+                "refresh uses one exact-key query"
+            );
+            assert_output_discovery_plans(&store, &statements).await;
+            assert!(
+                store
+                    .compaction_recheck_delivered_output_page("foreign-ws", "thread", &cold, &fence)
+                    .await
+                    .is_err()
+            );
+            let mut selected = refreshed
+                .selected_events
+                .into_iter()
+                .map(|event| event.source)
+                .collect::<std::collections::BTreeSet<_>>();
+            let mut entries = refreshed.entries;
+            let mut cursor = refreshed.next_cursor;
+            loop {
+                let tail = store
+                    .compaction_delivered_output_page("ws", "thread", &cursor, &fence)
+                    .await
+                    .unwrap();
+                assert!(tail.selected_turn_rows + tail.selected_event_rows <= 128);
+                for event in tail.selected_events {
+                    assert!(selected.insert(event.source));
+                }
+                entries.extend(tail.entries);
+                if tail.done {
+                    break;
+                }
+                assert_ne!(tail.next_cursor, cursor);
+                cursor = tail.next_cursor;
+            }
+            assert_eq!(selected.len(), count as usize);
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].acknowledgement, ack);
+        }
+    }
+}
+
+#[tokio::test]
+async fn delivered_output_exact_refresh_rejects_source_and_known_binding_changes() {
+    pioneer_sqlite::zstd::register_auto_extension_once().unwrap();
+    for compressed in [false, true] {
+        for mutation in ["edit", "delete", "scope", "binding"] {
+            let store = store().await;
+            if compressed {
+                compress_output_events(&store).await;
+            }
+            delivered_output_fixture(&store, "first", "shared-turn").await;
+            delivered_output_fixture(&store, "second", "shared-turn").await;
+            delivered_ack(&store, "first", "shared-turn").await;
+            delivered_ack(&store, "second", "shared-turn").await;
+            let fence = store.compaction_history_read_fence().await.unwrap();
+            let warm = store
+                .compaction_delivered_output_page(
+                    "ws",
+                    "thread",
+                    &DeliveredTaskOutputCursor::default(),
+                    &fence,
+                )
+                .await
+                .unwrap();
+            let first = warm.entries[0].acknowledgement.clone();
+            store.database_connection().execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+                "UPDATE compaction_event_revision SET projection_revision=NULL,item_id=NULL,projection_kind=NULL WHERE source_id=?", [first.id.clone().into()],
+            )).await.unwrap();
+            let cold = store
+                .compaction_delivered_output_page(
+                    "ws",
+                    "thread",
+                    &DeliveredTaskOutputCursor::default(),
+                    &fence,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                cold.entries.len(),
+                1,
+                "a warm binding is retained alongside the cold source"
+            );
+            refresh_output_page(&store, &cold).await;
+            assert_eq!(
+                store
+                    .compaction_recheck_delivered_output_page("ws", "thread", &cold, &fence)
+                    .await
+                    .unwrap(),
+                warm
+            );
+            let db = store.database_connection();
+            if mutation == "binding" {
+                db.execute_unprepared("UPDATE compaction_delivery_output SET candidate_id='first' WHERE delivery_id='second'").await.unwrap();
+            } else {
+                let sql = match mutation {
+                    "edit" => "UPDATE turn_event SET payload=payload||' ' WHERE id=?",
+                    "delete" => "DELETE FROM turn_event WHERE id=?",
+                    "scope" => "UPDATE turn_event SET thread_id='other-thread' WHERE id=?",
+                    _ => unreachable!(),
+                };
+                db.execute_raw(Statement::from_sql_and_values(
+                    DbBackend::Sqlite,
+                    sql,
+                    [first.id.clone().into()],
+                ))
+                .await
+                .unwrap();
+            }
+            assert!(
+                store
+                    .compaction_recheck_delivered_output_page("ws", "thread", &cold, &fence)
+                    .await
+                    .is_err(),
+                "{mutation} must invalidate the selected page"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn delivered_output_discovery_preserves_routes_and_cancels_queued_reads() {
+    use pioneer_sqlite::{
+        SqliteReadClass, SqliteReadEvent, SqliteReadObserver, SqliteReadOutcome, SqliteWriteEvent,
+        SqliteWriteObserver,
+    };
+    use sea_orm::{ConnectOptions, StreamTrait};
+    use std::{
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
+    #[derive(Default)]
+    struct Observer {
+        reads: Mutex<Vec<SqliteReadEvent>>,
+        writes: Mutex<Vec<SqliteWriteEvent>>,
+        queued: tokio::sync::Notify,
+    }
+    impl SqliteReadObserver for Observer {
+        fn observe(&self, event: SqliteReadEvent) {
+            self.reads.lock().unwrap().push(event);
+            if matches!(
+                event,
+                SqliteReadEvent::AdmissionEnqueued {
+                    queue_depth: 1,
+                    active: 1,
+                    ..
+                }
+            ) {
+                self.queued.notify_one();
+            }
+        }
+    }
+    impl SqliteWriteObserver for Observer {
+        fn observe(&self, event: SqliteWriteEvent) {
+            self.writes.lock().unwrap().push(event);
+        }
+    }
+    let directory = std::env::current_dir()
+        .unwrap()
+        .join("target/compaction-tests");
+    std::fs::create_dir_all(&directory).unwrap();
+    let path = directory.join(format!("{}.sqlite", uuid::Uuid::new_v4()));
+    let mut options = ConnectOptions::new(format!("sqlite://{}?mode=rwc", path.display()));
+    options.max_connections(1).min_connections(1);
+    let writer = Database::connect(options).await.unwrap();
+    Migrator::up(&writer, None).await.unwrap();
+    writer
+        .execute_unprepared("PRAGMA journal_mode=WAL")
+        .await
+        .unwrap();
+    for sql in [
+        "INSERT INTO workspace(id,name,is_active,is_current) VALUES ('ws','fixture',1,1)",
+        "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES ('thread','ws','','agent','m','p','active','user','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('turn','thread','completed','conversation','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+    ] {
+        writer.execute_unprepared(sql).await.unwrap();
+    }
+    let mut options = ConnectOptions::new(format!("sqlite://{}?mode=ro", path.display()));
+    options.max_connections(2).min_connections(2);
+    let reader = Database::connect(options).await.unwrap();
+    reader
+        .execute_unprepared("PRAGMA query_only=ON")
+        .await
+        .unwrap();
+    let reader_proof = reader.clone();
+    let observer = Arc::new(Observer::default());
+    let database = pioneer_sqlite::SqliteDatabase::from_executor_with_read_observer(
+        reader,
+        pioneer_sqlite::SqliteWriteExecutor::with_observer(writer, observer.clone()),
+        observer.clone(),
+    );
+    let interactive = CrudStore::new(database.clone());
+    delivered_output_fixture(&interactive, "delivery", "delivery-turn").await;
+    delivered_ack(&interactive, "delivery", "delivery-turn").await;
+    let fence = interactive.compaction_history_read_fence().await.unwrap();
+    let maintenance = interactive.with_maintenance_access();
+    observer.reads.lock().unwrap().clear();
+    observer.writes.lock().unwrap().clear();
+    let held = maintenance
+        .database_connection()
+        .stream_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT 1".to_owned(),
+        ))
+        .await
+        .unwrap();
+    let waiting = tokio::spawn({
+        let maintenance = maintenance.clone();
+        let fence = fence.clone();
+        async move {
+            maintenance
+                .compaction_delivered_output_page(
+                    "ws",
+                    "thread",
+                    &DeliveredTaskOutputCursor::default(),
+                    &fence,
+                )
+                .await
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(2), observer.queued.notified())
+        .await
+        .unwrap();
+    // Interactive discovery remains on its reader route while maintenance is
+    // queued. Both locator and bounded event query inherit the scoped class.
+    let page = tokio::time::timeout(
+        Duration::from_secs(2),
+        interactive.compaction_delivered_output_page(
+            "ws",
+            "thread",
+            &DeliveredTaskOutputCursor::default(),
+            &fence,
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(page.entries.len(), 1);
+    waiting.abort();
+    assert!(waiting.await.unwrap_err().is_cancelled());
+    assert!(observer.reads.lock().unwrap().iter().any(|event| matches!(
+        event,
+        SqliteReadEvent::AdmissionCancelled {
+            queue_depth: 0,
+            active: 1,
+            ..
+        }
+    )));
+    drop(held);
+    let resumed = tokio::time::timeout(
+        Duration::from_secs(2),
+        maintenance.compaction_delivered_output_page(
+            "ws",
+            "thread",
+            &DeliveredTaskOutputCursor::default(),
+            &fence,
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(resumed, page);
+    let reads = observer.reads.lock().unwrap().clone();
+    for class in [SqliteReadClass::Interactive, SqliteReadClass::Maintenance] {
+        assert_eq!(reads.iter().filter(|event| matches!(event,
+            SqliteReadEvent::OperationFinished { class: actual, outcome: SqliteReadOutcome::Ok, .. } if *actual == class
+        )).count(), 2);
+    }
+    assert!(reads.iter().any(|event| matches!(
+        event,
+        SqliteReadEvent::AdmissionReleased {
+            queue_depth: 0,
+            active: 0,
+            ..
+        }
+    )));
+    assert!(
+        observer.writes.lock().unwrap().is_empty(),
+        "metadata discovery must stay on the physical reader"
+    );
+    assert!(
+        reader_proof
+            .execute_unprepared("UPDATE task_delivery SET status='queued'")
+            .await
+            .is_err(),
+        "the independently opened discovery reader must reject physical writes"
+    );
 }
 
 #[tokio::test]

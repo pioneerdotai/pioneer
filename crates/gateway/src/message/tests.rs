@@ -11411,27 +11411,31 @@ async fn assert_concurrent_collaborative_tasks_receive_independent_frozen_comman
         store: &pioneer_crud::CrudStore,
         workspace: &str,
         thread: &str,
-        mut after: i64,
+        after_capture_order: i64,
         fence: &pioneer_crud::compaction::HistoryReadFence,
     ) -> anyhow::Result<Vec<pioneer_crud::compaction::DeliveredTaskOutputRef>> {
         let mut entries = Vec::new();
-        let mut seen = std::collections::HashSet::new();
+        let mut cursor = pioneer_crud::compaction::DeliveredTaskOutputCursor::default();
         loop {
             let page = store
-                .compaction_delivered_output_page(workspace, thread, after, fence)
+                .compaction_delivered_output_page(workspace, thread, &cursor, fence)
                 .await?;
-            entries.extend(
-                page.entries
-                    .into_iter()
-                    .filter(|entry| seen.insert(entry.delivery_id.clone())),
-            );
+            assert!(page.selected_turn_rows + page.selected_event_rows <= 128);
+            entries.extend(page.entries);
             if page.done {
                 break;
             }
-            assert!(page.scanned_through > after);
-            after = page.scanned_through;
+            assert_ne!(page.next_cursor, cursor);
+            cursor = page.next_cursor;
         }
-        Ok(entries)
+        entries.sort_by_key(|entry| entry.capture_order);
+        let mut seen = std::collections::HashSet::new();
+        Ok(entries
+            .into_iter()
+            .filter(|entry| {
+                entry.capture_order > after_capture_order && seen.insert(entry.delivery_id.clone())
+            })
+            .collect())
     }
     let output_fence = crud_store.compaction_history_read_fence().await.unwrap();
     let acknowledged = collect_delivered_outputs(
@@ -11577,6 +11581,44 @@ async fn assert_concurrent_collaborative_tasks_receive_independent_frozen_comman
             .is_err(),
         "no destination Read grant means no original history is captured"
     );
+    let before_replays_json = processor
+        .capture_authorized_task_basis(
+            crud_store.as_ref(),
+            authenticated_test_superuser().as_ref(),
+            &workspace_id,
+            parent_thread_id,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let before_replays_scopes = crate::compaction::frozen::accepted_history_scopes(
+        crud_store.as_ref(),
+        &workspace_id,
+        parent_thread_id,
+        &before_replays_json,
+    )
+    .await
+    .unwrap();
+    let before_replays = crate::turn_runtime_snapshot::restore_history_json(
+        crud_store.as_ref(),
+        &workspace_id,
+        &before_replays_scopes,
+        &before_replays_json,
+    )
+    .await
+    .unwrap();
+    // Canonical transport replays span multiple local metadata pages. The
+    // newest capture is encountered first in sequence order, so selecting the
+    // first encountered row would move the logical command/outcome boundary.
+    for n in 0..130 {
+        crud_store.database_connection().execute_raw(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DbBackend::Sqlite,
+            "INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at) SELECT ?,e.thread_id,e.turn_id,CASE WHEN ?=0 THEN -1 ELSE (SELECT MAX(sequence)+1 FROM turn_event WHERE turn_id=e.turn_id) END,e.event_type,e.payload,CURRENT_TIMESTAMP FROM turn_event e WHERE e.id=?",
+            [format!("delivery-replay-{n}").into(),n.into(),acknowledged[0].acknowledgement.id.clone().into()],
+        )).await.unwrap();
+    }
     let assembled_json = processor
         .capture_authorized_task_basis(
             crud_store.as_ref(),
@@ -11605,6 +11647,10 @@ async fn assert_concurrent_collaborative_tasks_receive_independent_frozen_comman
     )
     .await
     .unwrap();
+    assert_eq!(
+        assembled, before_replays,
+        "cross-page transport copies preserve the first capture and logical context exactly"
+    );
     let mut child_history = assembled.clone();
     crate::compaction::frozen::hydrate_accepted_own(
         crud_store.as_ref(),

@@ -782,71 +782,330 @@ pub struct DeliveredTaskOutputRef {
     pub capture_order: i64,
 }
 
+/// Request-local keyset cursor. The common Turn fence bounds the set of
+/// locators; an active Turn retains its indexed sequence upper bound once.
+/// This bound limits work, while capture_order remains the admission fence.
+/// A fence-admitted event was already present when its Turn endpoint was read.
+/// Appends cannot create additional fence-admitted keys. Edits/deletions are
+/// rejected by source revision checks and the caller's retained source epoch.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DeliveredTaskOutputCursor {
+    pub after_turn: String,
+    pub active_turn: Option<String>,
+    pub after_sequence: Option<i64>,
+    pub event_high_water: Option<i64>,
+}
+
+/// Exact metadata selected by one read statement, before payload decoding.
+/// Retained only for this request's bounded refresh/revalidation operation.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct DeliveredTaskOutputEvent {
+    pub source: SourceRef,
+    pub sequence: i64,
+    pub capture_order: i64,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeliveredTaskOutputPage {
     pub entries: Vec<DeliveredTaskOutputRef>,
-    /// Destination events whose typed item metadata must be refreshed before
-    /// deciding whether this quantum contains a delivered Task output.
     pub unprojected_events: Vec<SourceRef>,
-    /// Advance even when this quantum contains no authorized-scope delivery.
-    pub scanned_through: i64,
+    /// Refresh exactly these sources, never rerun selection after a CAS.
+    pub selected_events: Vec<DeliveredTaskOutputEvent>,
+    pub next_cursor: DeliveredTaskOutputCursor,
+    /// Original selection budget: one locator and at most 127 fenced event
+    /// metadata rows. Exact refresh retains that page's selection counters.
+    pub selected_turn_rows: usize,
+    pub selected_event_rows: usize,
     pub done: bool,
 }
 
-/// Inspect at most 128 event revisions below the common capture fence.
-/// The caller retains the first acknowledgement for each delivery ID across
-/// pages; replayed notifications may occur in later quanta. No payload is read.
+const DELIVERED_OUTPUT_EVENT_ROWS: usize = 127;
+
+/// The scoped delivery index is the starting point. Both existing Turn fence
+/// components exclude newly created Turns, including IDs inserted below the
+/// lexical high water. NULL creation metadata is the existing legacy case.
+/// The scalar sequence seek reads one index endpoint, not the event history.
+const DELIVERY_TURN_SQL: &str = r#"SELECT d.delivered_turn_id AS turn_id,
+    (SELECT e.sequence FROM turn_event e WHERE e.turn_id=t.id
+     ORDER BY e.sequence DESC LIMIT 1) AS event_high_water
+FROM task_delivery d INDEXED BY compaction_delivery_turn
+CROSS JOIN turn t ON t.id=d.delivered_turn_id AND t.thread_id=d.target_thread_id
+CROSS JOIN thread h ON h.id=t.thread_id AND h.workspace_id=d.workspace_id
+LEFT JOIN compaction_turn_creation ct ON ct.turn_id=t.id
+WHERE d.workspace_id=? AND d.target_thread_id=? AND d.delivered_turn_id>?
+  AND d.delivered_turn_id<=? AND (ct.sequence IS NULL OR ct.sequence<=?)
+  AND d.status='delivered'
+ORDER BY d.delivered_turn_id LIMIT 1"#;
+
+/// Capture eligibility is checked BEFORE LIMIT: late events cannot fill a
+/// page or alter its continuation. The fixed per-Turn upper seek bound also
+/// prevents a continuing append from extending the SQL's inspected tail.
+/// CROSS JOIN keeps revisions as point lookups from scoped canonical events.
+const DELIVERY_EVENT_QUANTUM_SQL: &str = r#"
+WITH quantum AS MATERIALIZED (
+    SELECT e.id,e.turn_id,e.thread_id,e.sequence,e.event_type,
+           r.revision AS selected_revision,r.capture_order AS selected_order
+    FROM turn t CROSS JOIN thread h ON h.id=t.thread_id
+    CROSS JOIN turn_event e ON e.turn_id=t.id AND e.thread_id=t.thread_id
+    CROSS JOIN compaction_event_revision r ON r.source_id=e.id
+    WHERE t.id=? AND t.thread_id=? AND h.workspace_id=? AND e.sequence>?
+      AND e.sequence<=? AND r.turn_id=e.turn_id AND r.present=1
+      AND r.capture_order<=?
+    ORDER BY e.sequence LIMIT 127
+)
+"#;
+
+/// A refreshed page is resolved by exact source keys and expected revisions.
+/// No Turn/event pagination predicate is reused here. Any edit, deletion,
+/// sequence/scope change, or replacement removes a row and fails validation.
+const DELIVERY_RECHECK_QUANTUM_SQL: &str = r#"
+WITH quantum AS MATERIALIZED (
+    SELECT e.id,e.turn_id,e.thread_id,e.sequence,e.event_type,
+           r.revision AS selected_revision,r.capture_order AS selected_order
+    FROM json_each(?) w
+    CROSS JOIN turn_event e ON e.id=json_extract(w.value,'$.source.id')
+    CROSS JOIN turn t ON t.id=e.turn_id AND t.thread_id=e.thread_id
+    CROSS JOIN thread h ON h.id=t.thread_id
+    CROSS JOIN compaction_event_revision r ON r.source_id=e.id
+    WHERE h.workspace_id=? AND t.thread_id=? AND r.turn_id=e.turn_id
+      AND 'event:'||e.turn_id=json_extract(w.value,'$.source.scope')
+      AND 'event-revision:'||r.revision=json_extract(w.value,'$.source.version')
+      AND e.sequence=json_extract(w.value,'$.sequence')
+      AND r.capture_order=json_extract(w.value,'$.capture_order')
+      AND r.present=1 AND r.capture_order<=?
+)
+"#;
+
+const DELIVERY_BINDINGS_SQL: &str = r#"
+SELECT q.id AS event_id,q.turn_id AS event_turn,q.sequence,q.event_type,
+       r.revision,r.capture_order,r.projection_revision,
+       d.id AS delivery_id,b.candidate_id,b.task_run_turn_id,
+       s.source_thread,s.source_turn,c.id AS bound_candidate
+FROM quantum q
+CROSS JOIN compaction_event_revision r ON r.source_id=q.id
+    AND r.turn_id=q.turn_id AND r.revision=q.selected_revision
+    AND r.capture_order=q.selected_order AND r.present=1
+LEFT JOIN task_delivery d
+    ON d.id=substr(r.item_id,length(?)+1) AND r.item_id=(? || d.id)
+   AND q.event_type=? AND r.projection_revision=r.revision
+   AND d.workspace_id=? AND d.target_thread_id=q.thread_id
+   AND d.delivered_turn_id=q.turn_id AND d.status='delivered'
+LEFT JOIN compaction_delivery_output b ON b.delivery_id=d.id
+LEFT JOIN compaction_task_output s
+    ON s.task_run_turn_id=b.task_run_turn_id AND s.task_id=d.task_id
+   AND s.run_id=d.run_id AND s.workspace_id=d.workspace_id
+LEFT JOIN task_result_candidate c
+    ON c.id=b.candidate_id AND c.task_run_turn_id=s.task_run_turn_id
+   AND c.task_id=s.task_id AND c.run_id=s.run_id
+   AND c.thread_id=s.source_thread AND c.turn_id=s.source_turn
+ORDER BY q.sequence
+"#;
+
+fn delivery_binding_values(workspace: &str) -> [sea_orm::Value; 4] {
+    [
+        pioneer_protocol::task_delivery_result_item_id("").into(),
+        pioneer_protocol::task_delivery_result_item_id("").into(),
+        pioneer_protocol::constants::events::ITEM_COMPLETED.into(),
+        workspace.into(),
+    ]
+}
+
 pub(crate) async fn compaction_delivered_output_page<C: ConnectionTrait>(
     db: &C,
     workspace: &str,
     thread: &str,
-    after: i64,
+    cursor: &DeliveredTaskOutputCursor,
     fence: &HistoryReadFence,
 ) -> Result<DeliveredTaskOutputPage> {
-    ensure!(after >= 0, "invalid delivery capture cursor");
-    let scanned_through = std::cmp::min(after.saturating_add(128), fence.event_order);
-    let rows = DeliveredOutputRow::find_by_statement(sqlite_specific_sql(
-            "WITH quantum AS MATERIALIZED (SELECT * FROM compaction_event_revision WHERE capture_order>? AND capture_order<=? ORDER BY capture_order LIMIT 128) SELECT d.id AS delivery_id,b.candidate_id,b.task_run_turn_id,s.source_thread,s.source_turn,e.id AS event_id,e.turn_id AS event_turn,r.revision,r.capture_order FROM quantum r JOIN task_delivery d ON d.id=substr(r.item_id,length(?)+1) JOIN thread th ON th.id=d.target_thread_id AND th.workspace_id=d.workspace_id JOIN compaction_delivery_output b ON b.delivery_id=d.id JOIN compaction_task_output s ON s.task_run_turn_id=b.task_run_turn_id AND s.task_id=d.task_id AND s.run_id=d.run_id AND s.workspace_id=d.workspace_id JOIN task_result_candidate c ON c.id=b.candidate_id AND c.task_run_turn_id=s.task_run_turn_id AND c.task_id=s.task_id AND c.run_id=s.run_id AND c.thread_id=s.source_thread AND c.turn_id=s.source_turn JOIN turn_event e ON e.turn_id=d.delivered_turn_id AND e.thread_id=d.target_thread_id WHERE r.source_id=e.id AND r.turn_id=e.turn_id AND r.present=1 AND r.projection_revision=r.revision AND r.item_id=(? || d.id) AND d.workspace_id=? AND d.target_thread_id=? AND d.status='delivered' AND e.event_type=? ORDER BY r.capture_order LIMIT 128",
-            [after.into(),scanned_through.into(),pioneer_protocol::task_delivery_result_item_id("").into(),pioneer_protocol::task_delivery_result_item_id("").into(),workspace.into(),thread.into(),pioneer_protocol::constants::events::ITEM_COMPLETED.into()],
-        )).all(db).await?;
-    let unprojected = UnprojectedEventRow::find_by_statement(sqlite_specific_sql(
-            "WITH quantum AS MATERIALIZED (SELECT * FROM compaction_event_revision WHERE capture_order>? AND capture_order<=? ORDER BY capture_order LIMIT 128) SELECT e.id,e.turn_id,r.revision FROM quantum r JOIN turn_event e ON e.id=r.source_id AND e.turn_id=r.turn_id JOIN thread th ON th.id=e.thread_id WHERE r.present=1 AND (r.projection_revision IS NULL OR r.projection_revision<>r.revision) AND e.thread_id=? AND th.workspace_id=? AND e.event_type=? ORDER BY r.capture_order LIMIT 128",
-            [after.into(),scanned_through.into(),thread.into(),workspace.into(),pioneer_protocol::constants::events::ITEM_COMPLETED.into()],
-        )).all(db).await?;
-    let unprojected_events = unprojected
-        .into_iter()
-        .map(|row| {
-            Ok(SourceRef {
-                scope: format!("event:{}", row.turn_id),
-                id: row.id,
-                version: format!("event-revision:{}", row.revision),
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let entries = rows
-        .into_iter()
-        .map(|row| {
-            Ok(DeliveredTaskOutputRef {
-                delivery_id: row.delivery_id,
-                candidate_id: row.candidate_id,
-                task_run_turn_id: row.task_run_turn_id,
-                source_thread: row.source_thread,
-                source_turn: row.source_turn,
-                acknowledgement: SourceRef {
-                    scope: format!("event:{}", row.event_turn),
-                    id: row.event_id,
-                    version: format!("event-revision:{}", row.revision),
-                },
+    ensure!(
+        cursor
+            .active_turn
+            .as_ref()
+            .is_none_or(|turn| turn > &cursor.after_turn)
+            && (cursor.active_turn.is_some() == cursor.event_high_water.is_some())
+            && (cursor.active_turn.is_some() || cursor.after_sequence.is_none()),
+        "invalid delivery metadata cursor"
+    );
+    let mut page = DeliveredTaskOutputPage {
+        entries: Vec::new(),
+        unprojected_events: Vec::new(),
+        selected_events: Vec::new(),
+        next_cursor: cursor.clone(),
+        selected_turn_rows: 0,
+        selected_event_rows: 0,
+        done: false,
+    };
+    let (selected_turn, high_water) = if let Some(turn) = &cursor.active_turn {
+        (turn.clone(), cursor.event_high_water)
+    } else {
+        let row = DeliveryTurnRow::find_by_statement(sqlite_specific_sql(
+            DELIVERY_TURN_SQL,
+            [
+                workspace.into(),
+                thread.into(),
+                cursor.after_turn.clone().into(),
+                fence.turn_id.clone().into(),
+                fence.turn_order.into(),
+            ],
+        ))
+        .one(db)
+        .await?;
+        let Some(row) = row else {
+            page.done = true;
+            return Ok(page);
+        };
+        page.selected_turn_rows = 1;
+        (row.turn_id, row.event_high_water)
+    };
+    let Some(high_water) = high_water else {
+        page.next_cursor = DeliveredTaskOutputCursor {
+            after_turn: selected_turn,
+            ..Default::default()
+        };
+        return Ok(page);
+    };
+    let quantum = if cursor.after_sequence.is_some() {
+        DELIVERY_EVENT_QUANTUM_SQL.to_owned()
+    } else {
+        DELIVERY_EVENT_QUANTUM_SQL.replace(" AND e.sequence>?", "")
+    };
+    let sql = quantum + DELIVERY_BINDINGS_SQL;
+    let mut values = vec![
+        selected_turn.clone().into(),
+        thread.into(),
+        workspace.into(),
+    ];
+    if let Some(sequence) = cursor.after_sequence {
+        values.push(sequence.into());
+    }
+    values.extend([high_water.into(), fence.event_order.into()]);
+    values.extend(delivery_binding_values(workspace));
+    let rows = DeliveredOutputRow::find_by_statement(sqlite_specific_sql(&sql, values))
+        .all(db)
+        .await?;
+    // all() releases DB capacity before transforming or retaining metadata.
+    page.next_cursor = if rows.len() == DELIVERED_OUTPUT_EVENT_ROWS {
+        DeliveredTaskOutputCursor {
+            after_turn: cursor.after_turn.clone(),
+            active_turn: Some(selected_turn),
+            after_sequence: rows.last().map(|row| row.sequence),
+            event_high_water: Some(high_water),
+        }
+    } else {
+        DeliveredTaskOutputCursor {
+            after_turn: selected_turn,
+            ..Default::default()
+        }
+    };
+    populate_delivery_page(&mut page, rows);
+    Ok(page)
+}
+
+pub(crate) async fn compaction_recheck_delivered_output_page<C: ConnectionTrait>(
+    db: &C,
+    workspace: &str,
+    thread: &str,
+    page: &DeliveredTaskOutputPage,
+    fence: &HistoryReadFence,
+) -> Result<DeliveredTaskOutputPage> {
+    ensure!(
+        page.selected_events.len() <= DELIVERED_OUTPUT_EVENT_ROWS,
+        "delivery refresh exceeds metadata row budget"
+    );
+    // Serialization occurs before acquiring reader admission.
+    let selected = serde_json::to_string(&page.selected_events)?;
+    ensure!(
+        selected.len() <= SOURCE_PAGE_BYTES,
+        "delivery refresh exceeds metadata byte budget"
+    );
+    let sql = DELIVERY_RECHECK_QUANTUM_SQL.to_owned() + DELIVERY_BINDINGS_SQL;
+    let mut values = vec![
+        selected.into(),
+        workspace.into(),
+        thread.into(),
+        fence.event_order.into(),
+    ];
+    values.extend(delivery_binding_values(workspace));
+    let rows = DeliveredOutputRow::find_by_statement(sqlite_specific_sql(&sql, values))
+        .all(db)
+        .await?;
+    let mut refreshed = DeliveredTaskOutputPage {
+        entries: Vec::new(),
+        unprojected_events: Vec::new(),
+        selected_events: Vec::new(),
+        next_cursor: page.next_cursor.clone(),
+        selected_turn_rows: page.selected_turn_rows,
+        selected_event_rows: 0,
+        done: page.done,
+    };
+    populate_delivery_page(&mut refreshed, rows);
+    // The unique (turn_id, sequence) keys preserve the original order. Full
+    // equality validates every selected source, not just acknowledged rows;
+    // append cannot add or remove a token in this exact-key query. Keep the
+    // original continuation so refresh neither repeats nor skips a page.
+    ensure!(
+        refreshed.selected_events == page.selected_events,
+        "selected delivery sources changed while refreshing metadata"
+    );
+    ensure!(
+        refreshed.unprojected_events.is_empty(),
+        "delivery metadata changed during refresh"
+    );
+    ensure!(
+        page.entries
+            .iter()
+            .all(|entry| refreshed.entries.contains(entry)),
+        "selected delivery binding changed while refreshing metadata"
+    );
+    Ok(refreshed)
+}
+
+fn populate_delivery_page(page: &mut DeliveredTaskOutputPage, rows: Vec<DeliveredOutputRow>) {
+    page.selected_event_rows = rows.len();
+    for row in rows {
+        let acknowledgement = SourceRef {
+            scope: format!("event:{}", row.event_turn),
+            id: row.event_id,
+            version: format!("event-revision:{}", row.revision),
+        };
+        page.selected_events.push(DeliveredTaskOutputEvent {
+            source: acknowledgement.clone(),
+            sequence: row.sequence,
+            capture_order: row.capture_order,
+        });
+        if row.event_type != pioneer_protocol::constants::events::ITEM_COMPLETED {
+            continue;
+        }
+        if row.projection_revision != Some(row.revision) {
+            page.unprojected_events.push(acknowledgement);
+            continue;
+        }
+        if let (
+            Some(delivery_id),
+            Some(candidate_id),
+            Some(task_run_turn_id),
+            Some(source_thread),
+            Some(source_turn),
+            Some(_),
+        ) = (
+            row.delivery_id,
+            row.candidate_id,
+            row.task_run_turn_id,
+            row.source_thread,
+            row.source_turn,
+            row.bound_candidate,
+        ) {
+            page.entries.push(DeliveredTaskOutputRef {
+                delivery_id,
+                candidate_id,
+                task_run_turn_id,
+                source_thread,
+                source_turn,
+                acknowledgement,
                 capture_order: row.capture_order,
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
-    Ok(DeliveredTaskOutputPage {
-        entries,
-        unprojected_events,
-        scanned_through,
-        done: scanned_through >= fence.event_order,
-    })
+            });
+        }
+    }
 }
 
 #[derive(sea_orm::FromQueryResult)]
@@ -862,23 +1121,25 @@ struct TaskOutputRow {
 
 use sea_orm::QueryTrait;
 
-// SQLite MATERIALIZED CTE projections are typed even though their physical
-// scan boundary requires SQL rather than a SeaORM entity select.
+#[derive(sea_orm::FromQueryResult)]
+struct DeliveryTurnRow {
+    turn_id: String,
+    event_high_water: Option<i64>,
+}
+
 #[derive(sea_orm::FromQueryResult)]
 struct DeliveredOutputRow {
-    delivery_id: String,
-    candidate_id: String,
-    task_run_turn_id: String,
-    source_thread: String,
-    source_turn: String,
     event_id: String,
     event_turn: String,
+    sequence: i64,
+    event_type: String,
     revision: i64,
     capture_order: i64,
-}
-#[derive(sea_orm::FromQueryResult)]
-struct UnprojectedEventRow {
-    id: String,
-    turn_id: String,
-    revision: i64,
+    projection_revision: Option<i64>,
+    delivery_id: Option<String>,
+    candidate_id: Option<String>,
+    task_run_turn_id: Option<String>,
+    source_thread: Option<String>,
+    source_turn: Option<String>,
+    bound_candidate: Option<String>,
 }
