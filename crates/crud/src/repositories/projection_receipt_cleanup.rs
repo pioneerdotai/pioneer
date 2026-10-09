@@ -66,23 +66,31 @@ pub(crate) async fn backfill_ready<C: ConnectionTrait>(db: &C) -> Result<bool> {
     }))
 }
 
-// Do not filter by eligibility before LIMIT: even a database full of protected
-// streams must be scanned in bounded keyset quanta, without reserving a writer.
+// The partial index contains only streams with potential cleanup work. Fully
+// compacted and quarantined history is excluded before the bounded keyset page;
+// prepare still validates the receipt prefix of each discovered candidate.
 pub(crate) async fn next_stream<C: ConnectionTrait>(
     db: &C,
     after_turn_id: Option<&str>,
 ) -> Result<Option<CleanupStream>> {
-    let mut query = stream_query();
-    if let Some(after) = after_turn_id {
-        query = query.filter(stream::Column::TurnId.gt(after.to_owned()));
-    }
-    query
-        .order_by_asc(stream::Column::TurnId)
-        .limit(1)
+    discovery_query(after_turn_id)
         .into_model::<CleanupStream>()
         .one(db)
         .await
         .context("failed to discover receipt cleanup stream")
+}
+
+fn discovery_query(after_turn_id: Option<&str>) -> sea_orm::Select<stream::Entity> {
+    // Keep identical to idx_turn_event_projection_stream_cleanup_work. Literal
+    // comparisons let SQLite prove partial-index eligibility for either page.
+    let mut query = stream_query().filter(Expr::cust(
+        "status = 'healthy' AND receipts_compacted_through_sequence >= 0 \
+         AND projected_through_sequence > receipts_compacted_through_sequence",
+    ));
+    if let Some(after) = after_turn_id {
+        query = query.filter(stream::Column::TurnId.gt(after.to_owned()));
+    }
+    query.order_by_asc(stream::Column::TurnId).limit(1)
 }
 
 fn stream_query() -> sea_orm::Select<stream::Entity> {
