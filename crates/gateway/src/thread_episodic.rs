@@ -14999,12 +14999,11 @@ mod tests {
         }
     }
 
-    async fn materialize_thread_with_item(
+    async fn materialize_thread_turn(
         crud_store: &CrudStore,
         workspace_id: &str,
         thread_id: &str,
         turn_id: &str,
-        item: TurnItem,
         timestamp: i64,
     ) {
         let thread = Thread {
@@ -15059,6 +15058,17 @@ mod tests {
             .expect("thread-episodic turn should exist");
         assert_eq!(persisted.initiated_by_actor_kind.as_deref(), Some("system"));
         assert_eq!(persisted.initiated_by_actor_id, None);
+    }
+
+    async fn materialize_thread_with_item(
+        crud_store: &CrudStore,
+        workspace_id: &str,
+        thread_id: &str,
+        turn_id: &str,
+        item: TurnItem,
+        timestamp: i64,
+    ) {
+        materialize_thread_turn(crud_store, workspace_id, thread_id, turn_id, timestamp).await;
         crud_store
             .materialize_item_completed(
                 ItemCompletedNotification {
@@ -15624,6 +15634,46 @@ mod tests {
         let child_item_id = format!("user_{child_turn_id}");
         let run_id = "run_projection_child";
         let source_text = "shared async task input";
+        // Establish conversation domains before publishing the snapshot. Keep
+        // item materialization after the basis and initial-turn link are present.
+        for (thread_id, turn_id) in [
+            (parent_thread_id, parent_turn_id),
+            (child_thread_id, child_turn_id),
+        ] {
+            materialize_thread_turn(
+                crud_store.as_ref(),
+                workspace_id.as_str(),
+                thread_id,
+                turn_id,
+                1_700_000_000,
+            )
+            .await;
+        }
+        let database = crud_store.database_connection();
+        database
+            .execute_raw(Statement::from_sql_and_values(
+                DatabaseBackend::Sqlite,
+                "INSERT INTO task(id,workspace_id,owner_kind,owner_id,created_by_thread_id,created_by_turn_id,executor_kind,status,title,goal) \
+                 VALUES (?,?,'thread',?,?,?,'agent','running','Projection child','fixture')",
+                [
+                    "task_projection_child".into(),
+                    workspace_id.clone().into(),
+                    parent_thread_id.into(),
+                    parent_thread_id.into(),
+                    parent_turn_id.into(),
+                ],
+            ))
+            .await
+            .expect("snapshot Task domain should insert");
+        database
+            .execute_raw(Statement::from_sql_and_values(
+                DatabaseBackend::Sqlite,
+                "INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) \
+                 VALUES (?,?,?,1,1,'running','agent')",
+                [run_id.into(), "task_projection_child".into(), run_id.into()],
+            ))
+            .await
+            .expect("snapshot TaskRun domain should insert");
         crud_store
             .upsert_task_run_turn(pioneer_protocol::TaskRunTurn {
                 id: "task_run_turn_projection_child".to_owned(),
