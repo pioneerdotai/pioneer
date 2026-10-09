@@ -8,6 +8,7 @@ use pioneer_memory::hooks::{
     active_recall_preflight_provider_fallback, active_recall_preflight_provider_success,
     normalize_active_recall_plan, parse_active_memory_decision_json,
 };
+use pioneer_observability::turn_startup::{Stage, scope_current_stage};
 use pioneer_promt::{
     MemoryActiveRecallProviderOutputSections, TurnPreflightMemoryActiveRecallPromptInput,
     TurnPreflightPromptInput, render_turn_preflight_prompt,
@@ -651,55 +652,60 @@ fn turn_preflight_request_attempt_failure(
 pub(crate) async fn call_turn_preflight_provider(
     input: TurnPreflightProviderCallInput,
 ) -> TurnPreflightProviderCallResult {
-    let prompt = match render_turn_preflight_prompt_from_local_modules(
-        &input.local_modules,
-        input.turn.clone(),
-        input.max_output_chars,
-    ) {
-        Ok(prompt) => prompt,
-        Err(_error) => {
-            let description =
-                TurnPreflightSafeFailure::local("prompt_render", "prompt_render_failed");
-            tracing::error!(
-                target: "pioneer::turn_preflight",
-                stage = description.stage,
-                cause_code = description.cause_code,
-                provider = input.endpoint.provider_name,
-                model = input.endpoint.model,
-                message = %description,
-            );
-            return TurnPreflightProviderCallResult::Failure(local_preflight_provider_failure(
-                TurnPreflightFallbackReason::ValidationError,
-                "preflight.prompt.render_failed",
-                description.to_string(),
-            ));
-        }
-    };
-    let input_chars = prompt.chars().count();
-    let timeout_ms = input
-        .timeout_ms
-        .max(1)
-        .min(TURN_PREFLIGHT_PROVIDER_MAX_TIMEOUT_MS);
-    let max_output_chars = input.max_output_chars.max(1);
+    scope_current_stage(Stage::PreflightProvider, async {
+        let prompt = match render_turn_preflight_prompt_from_local_modules(
+            &input.local_modules,
+            input.turn.clone(),
+            input.max_output_chars,
+        ) {
+            Ok(prompt) => prompt,
+            Err(_error) => {
+                let description =
+                    TurnPreflightSafeFailure::local("prompt_render", "prompt_render_failed");
+                tracing::error!(
+                    target: "pioneer::turn_preflight",
+                    stage = description.stage,
+                    cause_code = description.cause_code,
+                    provider = input.endpoint.provider_name,
+                    model = input.endpoint.model,
+                    message = %description,
+                );
+                return TurnPreflightProviderCallResult::Failure(local_preflight_provider_failure(
+                    TurnPreflightFallbackReason::ValidationError,
+                    "preflight.prompt.render_failed",
+                    description.to_string(),
+                ));
+            }
+        };
+        let input_chars = prompt.chars().count();
+        let timeout_ms = input
+            .timeout_ms
+            .max(1)
+            .min(TURN_PREFLIGHT_PROVIDER_MAX_TIMEOUT_MS);
+        let max_output_chars = input.max_output_chars.max(1);
 
-    let result = call_turn_preflight_provider_once(
-        &input.endpoint,
-        input.usage_context.as_ref(),
-        prompt.as_str(),
-        1,
-        timeout_ms,
-        max_output_chars,
-        input_chars,
-    )
-    .await;
-    match result {
-        Ok(success) => TurnPreflightProviderCallResult::Success(success),
-        Err(failure) => TurnPreflightProviderCallResult::Failure(TurnPreflightProviderFailure {
-            fallback_reason: failure.fallback_reason,
-            diagnostics: vec![failure.diagnostic.clone()],
-            attempts: vec![failure],
-        }),
-    }
+        let result = call_turn_preflight_provider_once(
+            &input.endpoint,
+            input.usage_context.as_ref(),
+            prompt.as_str(),
+            1,
+            timeout_ms,
+            max_output_chars,
+            input_chars,
+        )
+        .await;
+        match result {
+            Ok(success) => TurnPreflightProviderCallResult::Success(success),
+            Err(failure) => {
+                TurnPreflightProviderCallResult::Failure(TurnPreflightProviderFailure {
+                    fallback_reason: failure.fallback_reason,
+                    diagnostics: vec![failure.diagnostic.clone()],
+                    attempts: vec![failure],
+                })
+            }
+        }
+    })
+    .await
 }
 
 pub(crate) fn render_turn_preflight_prompt_from_local_modules(

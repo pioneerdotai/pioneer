@@ -397,9 +397,16 @@ where
     F: Future<Output = T> + Send + 'static,
     T: Send + 'static,
 {
+    let startup_queued_at = std::time::Instant::now();
     let future = pioneer_observability::turn_startup::scope(
         pioneer_observability::turn_startup::current_key(),
-        future,
+        async move {
+            pioneer_observability::turn_startup::record_current_duration(
+                pioneer_observability::turn_startup::Stage::GatewayWorkerWait,
+                startup_queued_at.elapsed(),
+            );
+            future.await
+        },
     );
     // Test-local reporting scopes must follow the same owned request tasks as
     // the admission path. This does not install a global subscriber or change

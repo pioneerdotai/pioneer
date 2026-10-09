@@ -12,6 +12,7 @@ use crate::{
 use pioneer_crud::compaction::{
     DeliveredTaskOutputCursor, HistoryReadFence, TaskDeliveryOutputSnapshot,
 };
+use pioneer_observability::turn_startup::{Stage, Work, record_work, scope_current_stage};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub(crate) struct AuthorizedOutputBranch {
@@ -84,152 +85,169 @@ impl MessageProcessor {
         workspace: &str,
         destination: &str,
     ) -> Result<AuthorizedOutputSet> {
-        let authorization_revision = self.current_authorization_revision().await?;
-        let resolver = AuthorizationResolver::new(store.clone());
-        let mut access = BTreeMap::new();
-        let mut branches: Vec<AuthorizedOutputBranch> = Vec::new();
-        let mut seen = BTreeMap::<String, Option<usize>>::new();
-        let mut cursor = DeliveredTaskOutputCursor::default();
-        let mut references = Vec::new();
-        let destination_read =
-            can_read_originals(&resolver, principal, workspace, destination).await?;
-        ensure!(
-            destination_read,
-            "destination history is unavailable or access is denied"
-        );
-        super::history::prepare_history(&store, workspace, destination).await?;
-        let epoch = store
-            .compaction_projection_version(workspace, destination)
-            .await?;
-        let checkpoint = store
-            .compaction_head(&super::native::native_owner(workspace, destination))
-            .await?;
-        let fence = store.compaction_history_read_fence().await?;
-        let mut source_epochs = BTreeMap::from([(destination.to_owned(), epoch)]);
-        access.insert(destination.to_owned(), true);
-        loop {
-            let mut page = store
-                .compaction_delivered_output_page(workspace, destination, &cursor, &fence)
+        scope_current_stage(Stage::HistoryOutputs, async {
+            let authorization_revision = self.current_authorization_revision().await?;
+            let resolver = AuthorizationResolver::new(store.clone());
+            let mut access = BTreeMap::new();
+            let mut branches: Vec<AuthorizedOutputBranch> = Vec::new();
+            let mut seen = BTreeMap::<String, Option<usize>>::new();
+            let mut cursor = DeliveredTaskOutputCursor::default();
+            let mut references = Vec::new();
+            let destination_read =
+                can_read_originals(&resolver, principal, workspace, destination).await?;
+            ensure!(
+                destination_read,
+                "destination history is unavailable or access is denied"
+            );
+            super::history::prepare_history(&store, workspace, destination).await?;
+            let epoch = store
+                .compaction_projection_version(workspace, destination)
                 .await?;
-            if !page.unprojected_events.is_empty() {
-                for source in &page.unprojected_events {
-                    let payload =
-                        super::history::reference_payload(&store, workspace, destination, source)
-                            .await?;
-                    let event: pioneer_crud::CanonicalTurnEventPayload =
-                        serde_json::from_str(&payload)?;
-                    ensure!(
-                        store
-                            .compaction_record_event_projection(
-                                workspace,
-                                destination,
-                                source,
-                                &event
-                            )
-                            .await?,
-                        "delivery event changed while refreshing its metadata"
-                    );
-                }
-                page = store
-                    .compaction_recheck_delivered_output_page(workspace, destination, &page, &fence)
+            let checkpoint = store
+                .compaction_head(&super::native::native_owner(workspace, destination))
+                .await?;
+            let fence = store.compaction_history_read_fence().await?;
+            let mut source_epochs = BTreeMap::from([(destination.to_owned(), epoch)]);
+            access.insert(destination.to_owned(), true);
+            loop {
+                let mut page = store
+                    .compaction_delivered_output_page(workspace, destination, &cursor, &fence)
                     .await?;
-            }
-            references.extend(page.entries);
-            if page.done {
-                break;
-            }
-            ensure!(
-                page.next_cursor != cursor,
-                "Task output discovery made no progress"
-            );
-            cursor = page.next_cursor;
-        }
-        // Delivery Turn/sequence order is unrelated to capture order. Retain
-        // only necessary output references, then recover the original global
-        // acknowledgement ordering without loading or sorting event history.
-        references.sort_by_key(|reference| reference.capture_order);
-        for reference in references {
-            if let Some(accepted) = seen.get(&reference.delivery_id) {
-                if let Some(index) = accepted {
-                    branches[*index]
-                        .acknowledgements
-                        .push(reference.acknowledgement);
+                record_work(Work::Pages, 1);
+                if !page.unprojected_events.is_empty() {
+                    for source in &page.unprojected_events {
+                        let payload = super::history::reference_payload(
+                            &store,
+                            workspace,
+                            destination,
+                            source,
+                        )
+                        .await?;
+                        let event: pioneer_crud::CanonicalTurnEventPayload =
+                            serde_json::from_str(&payload)?;
+                        ensure!(
+                            store
+                                .compaction_record_event_projection(
+                                    workspace,
+                                    destination,
+                                    source,
+                                    &event
+                                )
+                                .await?,
+                            "delivery event changed while refreshing its metadata"
+                        );
+                    }
+                    page = store
+                        .compaction_recheck_delivered_output_page(
+                            workspace,
+                            destination,
+                            &page,
+                            &fence,
+                        )
+                        .await?;
+                    record_work(Work::Pages, 1);
                 }
-                continue;
-            }
-            seen.insert(reference.delivery_id.clone(), None);
-            let snapshot = store
-                .compaction_delivery_output(workspace, &reference.delivery_id)
-                .await?
-                .ok_or_else(|| anyhow::anyhow!("acknowledged Task source binding disappeared"))?;
-            ensure!(
-                snapshot.candidate_id == reference.candidate_id
-                    && snapshot.output.task_run_turn_id == reference.task_run_turn_id
-                    && snapshot.output.source_thread == reference.source_thread
-                    && snapshot.output.source_turn == reference.source_turn,
-                "acknowledged Task source binding changed"
-            );
-            let source_threads = super::frozen::accepted_history_scopes(
-                &store,
-                workspace,
-                &snapshot.output.source_thread,
-                &serde_json::to_string(&snapshot.output.history)?,
-            )
-            .await?;
-            let mut permitted = true;
-            for thread in &source_threads {
-                if !access.contains_key(thread) {
-                    access.insert(
-                        thread.clone(),
-                        can_read_originals(&resolver, principal, workspace, thread).await?,
-                    );
-                }
-                if !access[thread] {
-                    permitted = false;
+                references.extend(page.entries);
+                if page.done {
                     break;
                 }
+                ensure!(
+                    page.next_cursor != cursor,
+                    "Task output discovery made no progress"
+                );
+                cursor = page.next_cursor;
             }
-            if !permitted {
-                continue;
-            }
-            for thread in &source_threads {
-                if !source_epochs.contains_key(thread) {
-                    source_epochs.insert(
-                        thread.clone(),
-                        store
-                            .compaction_projection_version(workspace, thread)
-                            .await?,
-                    );
+            // Delivery Turn/sequence order is unrelated to capture order. Retain
+            // only necessary output references, then recover the original global
+            // acknowledgement ordering without loading or sorting event history.
+            references.sort_by_key(|reference| reference.capture_order);
+            for reference in references {
+                if let Some(accepted) = seen.get(&reference.delivery_id) {
+                    if let Some(index) = accepted {
+                        branches[*index]
+                            .acknowledgements
+                            .push(reference.acknowledgement);
+                    }
+                    continue;
                 }
+                seen.insert(reference.delivery_id.clone(), None);
+                let snapshot = store
+                    .compaction_delivery_output(workspace, &reference.delivery_id)
+                    .await?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("acknowledged Task source binding disappeared")
+                    })?;
+                ensure!(
+                    snapshot.candidate_id == reference.candidate_id
+                        && snapshot.output.task_run_turn_id == reference.task_run_turn_id
+                        && snapshot.output.source_thread == reference.source_thread
+                        && snapshot.output.source_turn == reference.source_turn,
+                    "acknowledged Task source binding changed"
+                );
+                let source_threads = super::frozen::accepted_history_scopes(
+                    &store,
+                    workspace,
+                    &snapshot.output.source_thread,
+                    &serde_json::to_string(&snapshot.output.history)?,
+                )
+                .await?;
+                let mut permitted = true;
+                for thread in &source_threads {
+                    if !access.contains_key(thread) {
+                        access.insert(
+                            thread.clone(),
+                            can_read_originals(&resolver, principal, workspace, thread).await?,
+                        );
+                    }
+                    if !access[thread] {
+                        permitted = false;
+                        break;
+                    }
+                }
+                if !permitted {
+                    continue;
+                }
+                for thread in &source_threads {
+                    if !source_epochs.contains_key(thread) {
+                        source_epochs.insert(
+                            thread.clone(),
+                            store
+                                .compaction_projection_version(workspace, thread)
+                                .await?,
+                        );
+                    }
+                }
+                seen.insert(reference.delivery_id, Some(branches.len()));
+                branches.push(AuthorizedOutputBranch {
+                    snapshot,
+                    acknowledgements: vec![reference.acknowledgement.clone()],
+                    acknowledgement: reference.acknowledgement,
+                    source_threads,
+                });
             }
-            seen.insert(reference.delivery_id, Some(branches.len()));
-            branches.push(AuthorizedOutputBranch {
-                snapshot,
-                acknowledgements: vec![reference.acknowledgement.clone()],
-                acknowledgement: reference.acknowledgement,
-                source_threads,
-            });
-        }
-        ensure!(
-            self.current_authorization_revision().await? == authorization_revision,
-            "authorization changed while selecting Task originals"
-        );
-        ensure!(
-            store
-                .compaction_projection_version(workspace, destination)
-                .await?
-                == epoch,
-            "delivery history changed while selecting Task originals"
-        );
-        Ok(AuthorizedOutputSet {
-            workspace: workspace.into(),
-            destination: destination.into(),
-            checkpoint,
-            fence,
-            authorization_revision,
-            source_epochs,
-            branches,
+            ensure!(
+                self.current_authorization_revision().await? == authorization_revision,
+                "authorization changed while selecting Task originals"
+            );
+            ensure!(
+                store
+                    .compaction_projection_version(workspace, destination)
+                    .await?
+                    == epoch,
+                "delivery history changed while selecting Task originals"
+            );
+            record_work(Work::Branches, branches.len() as u64);
+            Ok(AuthorizedOutputSet {
+                workspace: workspace.into(),
+                destination: destination.into(),
+                checkpoint,
+                fence,
+                authorization_revision,
+                source_epochs,
+                branches,
+            })
         })
+        .await
     }
     /// Return the descriptor only after rechecking the same authorization
     /// generation that admitted all foreign originals. Runtime callers switch
@@ -270,41 +288,44 @@ impl MessageProcessor {
         excluded_turn: Option<&str>,
         policy: Option<&pioneer_protocol::TaskAgentContextPolicy>,
     ) -> Result<super::frozen::PreparedHistory> {
-        if policy.is_some_and(|policy| {
-            matches!(
-                policy.mode,
-                pioneer_protocol::TaskAgentContextMode::Empty
-                    | pioneer_protocol::TaskAgentContextMode::Custom
-            ) || (policy.mode == pioneer_protocol::TaskAgentContextMode::SummaryOnly
-                && !policy.include_parent_summary)
-        }) {
-            return super::frozen::capture_execution_basis_prepared(
+        scope_current_stage(Stage::HistoryAuthority, async {
+            if policy.is_some_and(|policy| {
+                matches!(
+                    policy.mode,
+                    pioneer_protocol::TaskAgentContextMode::Empty
+                        | pioneer_protocol::TaskAgentContextMode::Custom
+                ) || (policy.mode == pioneer_protocol::TaskAgentContextMode::SummaryOnly
+                    && !policy.include_parent_summary)
+            }) {
+                return super::frozen::capture_execution_basis_prepared(
+                    store,
+                    workspace,
+                    destination,
+                    basis_turn,
+                    excluded_turn,
+                    policy,
+                )
+                .await;
+            }
+            let outputs = self
+                .authorize_delivered_output_branches(store, principal, workspace, destination)
+                .await?;
+            let prepared = super::frozen::capture_execution_basis_prepared_with_outputs(
                 store,
                 workspace,
                 destination,
                 basis_turn,
                 excluded_turn,
                 policy,
+                Some(&outputs),
             )
-            .await;
-        }
-        let outputs = self
-            .authorize_delivered_output_branches(store, principal, workspace, destination)
             .await?;
-        let prepared = super::frozen::capture_execution_basis_prepared_with_outputs(
-            store,
-            workspace,
-            destination,
-            basis_turn,
-            excluded_turn,
-            policy,
-            Some(&outputs),
-        )
-        .await?;
-        ensure!(
-            self.current_authorization_revision().await? == outputs.authorization_revision,
-            "authorization changed while freezing Task originals"
-        );
-        Ok(prepared)
+            ensure!(
+                self.current_authorization_revision().await? == outputs.authorization_revision,
+                "authorization changed while freezing Task originals"
+            );
+            Ok(prepared)
+        })
+        .await
     }
 }
