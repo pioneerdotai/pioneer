@@ -488,6 +488,15 @@ struct PendingProvider;
 
 #[async_trait::async_trait]
 impl Provider for PendingProvider {
+    fn model_tool_support(&self, _model: &str) -> pioneer_provider::ModelToolSupport {
+        // The fixture implements this simulated protocol for its model labels.
+        if self.capabilities().tool_calling {
+            pioneer_provider::ModelToolSupport::Supported
+        } else {
+            pioneer_provider::ModelToolSupport::Unsupported
+        }
+    }
+
     fn name(&self) -> &str {
         "pending"
     }
@@ -3037,6 +3046,15 @@ impl ToolHandler for StatefulMemoryToolHandler {
 
 #[async_trait::async_trait]
 impl Provider for CaptureStandardProvider {
+    fn model_tool_support(&self, _model: &str) -> pioneer_provider::ModelToolSupport {
+        // The fixture implements this simulated protocol for its model labels.
+        if self.capabilities().tool_calling {
+            pioneer_provider::ModelToolSupport::Supported
+        } else {
+            pioneer_provider::ModelToolSupport::Unsupported
+        }
+    }
+
     fn name(&self) -> &str {
         "capture-standard"
     }
@@ -3086,6 +3104,15 @@ impl Provider for CaptureStandardProvider {
 
 #[async_trait::async_trait]
 impl Provider for SequencedToolProvider {
+    fn model_tool_support(&self, _model: &str) -> pioneer_provider::ModelToolSupport {
+        // The fixture implements this simulated protocol for its model labels.
+        if self.capabilities().tool_calling {
+            pioneer_provider::ModelToolSupport::Supported
+        } else {
+            pioneer_provider::ModelToolSupport::Unsupported
+        }
+    }
+
     fn name(&self) -> &str {
         "sequenced-tools"
     }
@@ -3162,6 +3189,15 @@ impl Provider for SequencedToolProvider {
 
 #[async_trait::async_trait]
 impl Provider for LoopBudgetProvider {
+    fn model_tool_support(&self, _model: &str) -> pioneer_provider::ModelToolSupport {
+        // The fixture implements this simulated protocol for its model labels.
+        if self.capabilities().tool_calling {
+            pioneer_provider::ModelToolSupport::Supported
+        } else {
+            pioneer_provider::ModelToolSupport::Unsupported
+        }
+    }
+
     fn name(&self) -> &str {
         "loop-budget"
     }
@@ -3271,6 +3307,15 @@ impl Provider for LoopBudgetProvider {
 
 #[async_trait::async_trait]
 impl Provider for AlwaysTaskCreateProvider {
+    fn model_tool_support(&self, _model: &str) -> pioneer_provider::ModelToolSupport {
+        // The fixture implements this simulated protocol for its model labels.
+        if self.capabilities().tool_calling {
+            pioneer_provider::ModelToolSupport::Supported
+        } else {
+            pioneer_provider::ModelToolSupport::Unsupported
+        }
+    }
+
     fn name(&self) -> &str {
         "always-task-create"
     }
@@ -3331,6 +3376,15 @@ impl Provider for AlwaysTaskCreateProvider {
 
 #[async_trait::async_trait]
 impl Provider for ProviderRecoveryBoundaryProvider {
+    fn model_tool_support(&self, _model: &str) -> pioneer_provider::ModelToolSupport {
+        // The fixture implements this simulated protocol for its model labels.
+        if self.capabilities().tool_calling {
+            pioneer_provider::ModelToolSupport::Supported
+        } else {
+            pioneer_provider::ModelToolSupport::Unsupported
+        }
+    }
+
     fn name(&self) -> &str {
         "provider-recovery-boundary"
     }
@@ -3391,6 +3445,15 @@ impl Provider for ProviderRecoveryBoundaryProvider {
 
 #[async_trait::async_trait]
 impl Provider for CaptureAgentProvider {
+    fn model_tool_support(&self, _model: &str) -> pioneer_provider::ModelToolSupport {
+        // The fixture implements this simulated protocol for its model labels.
+        if self.capabilities().tool_calling {
+            pioneer_provider::ModelToolSupport::Supported
+        } else {
+            pioneer_provider::ModelToolSupport::Unsupported
+        }
+    }
+
     fn name(&self) -> &str {
         "capture"
     }
@@ -3457,6 +3520,15 @@ impl Provider for CaptureAgentProvider {
 
 #[async_trait::async_trait]
 impl Provider for FirstCallBlockingProvider {
+    fn model_tool_support(&self, _model: &str) -> pioneer_provider::ModelToolSupport {
+        // The fixture implements this simulated protocol for its model labels.
+        if self.capabilities().tool_calling {
+            pioneer_provider::ModelToolSupport::Supported
+        } else {
+            pioneer_provider::ModelToolSupport::Unsupported
+        }
+    }
+
     fn name(&self) -> &str {
         "generation-blocking"
     }
@@ -3492,6 +3564,15 @@ impl Provider for FirstCallBlockingProvider {
 
 #[async_trait::async_trait]
 impl Provider for ReviewGuardProvider {
+    fn model_tool_support(&self, _model: &str) -> pioneer_provider::ModelToolSupport {
+        // The fixture implements this simulated protocol for its model labels.
+        if self.capabilities().tool_calling {
+            pioneer_provider::ModelToolSupport::Supported
+        } else {
+            pioneer_provider::ModelToolSupport::Unsupported
+        }
+    }
+
     fn name(&self) -> &str {
         "review-guard"
     }
@@ -3567,6 +3648,15 @@ impl Provider for ReviewGuardProvider {
 
 #[async_trait::async_trait]
 impl Provider for EmptyNoToolRoundProvider {
+    fn model_tool_support(&self, _model: &str) -> pioneer_provider::ModelToolSupport {
+        // The fixture implements this simulated protocol for its model labels.
+        if self.capabilities().tool_calling {
+            pioneer_provider::ModelToolSupport::Supported
+        } else {
+            pioneer_provider::ModelToolSupport::Unsupported
+        }
+    }
+
     fn name(&self) -> &str {
         "empty-no-tool-round"
     }
@@ -3643,6 +3733,15 @@ impl Provider for EmptyNoToolRoundProvider {
 
 #[async_trait::async_trait]
 impl Provider for SequencedTextProvider {
+    fn model_tool_support(&self, _model: &str) -> pioneer_provider::ModelToolSupport {
+        // The fixture implements this simulated protocol for its model labels.
+        if self.capabilities().tool_calling {
+            pioneer_provider::ModelToolSupport::Supported
+        } else {
+            pioneer_provider::ModelToolSupport::Unsupported
+        }
+    }
+
     fn name(&self) -> &str {
         "sequenced-text"
     }
@@ -3733,6 +3832,15 @@ impl TurnFinalizationProvider for FailFinalizationProvider {
 
 #[async_trait::async_trait]
 impl Provider for TextOnlyAgentProvider {
+    fn model_tool_support(&self, _model: &str) -> pioneer_provider::ModelToolSupport {
+        // The fixture implements this simulated protocol for its model labels.
+        if self.capabilities().tool_calling {
+            pioneer_provider::ModelToolSupport::Supported
+        } else {
+            pioneer_provider::ModelToolSupport::Unsupported
+        }
+    }
+
     fn name(&self) -> &str {
         "text-only"
     }
@@ -3762,6 +3870,15 @@ impl Provider for TextOnlyAgentProvider {
 
 #[async_trait::async_trait]
 impl Provider for NoToolCaptureProvider {
+    fn model_tool_support(&self, _model: &str) -> pioneer_provider::ModelToolSupport {
+        // The fixture implements this simulated protocol for its model labels.
+        if self.capabilities().tool_calling {
+            pioneer_provider::ModelToolSupport::Supported
+        } else {
+            pioneer_provider::ModelToolSupport::Unsupported
+        }
+    }
+
     fn name(&self) -> &str {
         "no-tool-capture"
     }
@@ -15969,6 +16086,15 @@ impl crate::compaction::controller::NativeContextController for RecordingContext
 struct UsageToolProvider(SequencedToolProvider);
 #[async_trait::async_trait]
 impl Provider for UsageToolProvider {
+    fn model_tool_support(&self, _model: &str) -> pioneer_provider::ModelToolSupport {
+        // The fixture implements this simulated protocol for its model labels.
+        if self.capabilities().tool_calling {
+            pioneer_provider::ModelToolSupport::Supported
+        } else {
+            pioneer_provider::ModelToolSupport::Unsupported
+        }
+    }
+
     fn name(&self) -> &str {
         self.0.name()
     }
@@ -16782,4 +16908,103 @@ async fn invalid_required_context_request_never_reaches_hook_runtime() {
         .is_err()
     );
     assert!(snapshot_hook_calls(&calls).is_empty());
+}
+
+// Intentionally supplies only a transport ceiling, with no model evidence.
+struct UnknownModelEvidenceProvider(Arc<CaptureAgentProvider>);
+#[async_trait::async_trait]
+impl Provider for UnknownModelEvidenceProvider {
+    fn name(&self) -> &str {
+        "unknown-model-evidence"
+    }
+    fn capabilities(&self) -> ProviderCapabilities {
+        self.0.capabilities()
+    }
+    async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
+        self.0.chat(request).await
+    }
+    async fn stream_chat(
+        &self,
+        request: ChatRequest,
+    ) -> anyhow::Result<futures_util::stream::BoxStream<'static, anyhow::Result<StreamChunk>>> {
+        self.0.stream_chat(request).await
+    }
+}
+
+#[tokio::test]
+async fn native_required_tools_unknown_stops_before_initial_hooks_or_dispatch() {
+    let capture = Arc::new(CaptureAgentProvider::default());
+    let provider = Arc::new(UnknownModelEvidenceProvider(capture.clone()));
+    assert_eq!(
+        provider.model_tool_support("test-model"),
+        pioneer_provider::ModelToolSupport::Unknown
+    );
+    let manager = AgentManager::new(
+        Arc::new(ProviderRegistry::with_provider(
+            "unknown-model-evidence",
+            provider,
+        )),
+        test_tool_loop_config(),
+    );
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    manager
+        .set_hook_runtime(Some(recording_hook_runtime(
+            calls.clone(),
+            Vec::new(),
+            HookFailurePolicy::BestEffort,
+            false,
+        )))
+        .await;
+    let events = start_simple_turn(
+        &manager,
+        "r05-unknown-thread",
+        "r05-workspace",
+        "r05-unknown-turn",
+        ThreadMode::Agent,
+        "unknown-model-evidence",
+        "requires native tools",
+    )
+    .await;
+    assert_turn_blocked(&events, "native Agent requires verified model tool support");
+    assert!(capture.snapshot_requests().is_empty());
+    assert!(snapshot_hook_calls(&calls).is_empty());
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::TurnCapabilitiesResolved { .. }))
+    );
+}
+
+#[tokio::test]
+async fn ordinary_chat_does_not_require_native_tool_model_evidence() {
+    let capture = Arc::new(CaptureAgentProvider::default());
+    let manager = AgentManager::new(
+        Arc::new(ProviderRegistry::with_provider(
+            "unknown-model-evidence",
+            Arc::new(UnknownModelEvidenceProvider(capture.clone())),
+        )),
+        test_tool_loop_config(),
+    );
+    let events = start_simple_turn(
+        &manager,
+        "r05-chat-unknown-thread",
+        "r05-workspace",
+        "r05-chat-unknown-turn",
+        ThreadMode::Chat,
+        "unknown-model-evidence",
+        "plain chat",
+    )
+    .await;
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::TurnCompleted { .. }))
+    );
+    let requests = capture.snapshot_requests();
+    assert!(!requests.is_empty());
+    assert!(
+        requests
+            .iter()
+            .all(|r| r.tools.as_deref().unwrap_or_default().is_empty())
+    );
 }

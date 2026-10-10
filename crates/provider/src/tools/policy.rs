@@ -70,11 +70,6 @@ pub(crate) fn tool_support_with_catalog(
     )
 }
 
-pub(crate) fn model_tool_support(provider: &str, model: &str) -> Option<bool> {
-    let catalog = crate::catalog::model_catalog().ok();
-    tool_support_with_catalog(provider, model, catalog.as_deref())
-}
-
 fn validate_tool_name(provider: &str, name: &str) -> Result<()> {
     let provider = policy_id(provider);
     let max_name = if matches!(provider, "anthropic" | "gemini") {

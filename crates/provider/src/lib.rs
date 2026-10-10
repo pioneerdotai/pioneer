@@ -52,7 +52,7 @@ pub use registry::{
     ProviderRegistryCapacityExceeded, ProviderRegistryDefinitionCapacityExceeded,
     ProviderRegistryLimits, ProviderRegistryStats,
 };
-pub use traits::{Provider, ProviderWarmupOutcome};
+pub use traits::{ModelToolSupport, Provider, ProviderWarmupOutcome};
 pub use types::{
     AttachmentArtifactContext, AttachmentDataSource, CanonicalProviderRoundEnvelope, ChatMessage,
     ChatRequest, ChatResponse, CompiledPromptPayload, EmbeddingRequest, EmbeddingResponse,

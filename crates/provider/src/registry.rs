@@ -262,11 +262,11 @@ fn redacted_endpoint_error(
 }
 
 impl AuthorityBoundProvider {
-    fn model_tool_calling_with_catalog(
+    fn model_tool_support_with_catalog(
         &self,
         model: &str,
         catalog: Option<&crate::catalog::ModelCatalog>,
-    ) -> bool {
+    ) -> crate::ModelToolSupport {
         let discovery = self
             .discovery_tools
             .read()
@@ -277,8 +277,22 @@ impl AuthorityBoundProvider {
             .use_public_catalog
             .then(|| catalog.and_then(|c| c.tool_support(self.name(), model)))
             .flatten();
-        self.capabilities().tool_calling
-            && crate::catalog::merge_tool_support(discovery, source) != Some(false)
+        if !self.capabilities().tool_calling {
+            return crate::ModelToolSupport::Unsupported;
+        }
+        crate::ModelToolSupport::from_optional(crate::catalog::merge_tool_support(
+            self.inner.model_tool_support(model).as_optional(),
+            crate::catalog::merge_tool_support(discovery, source),
+        ))
+    }
+
+    #[cfg(test)]
+    fn model_tool_calling_with_catalog(
+        &self,
+        model: &str,
+        catalog: Option<&crate::catalog::ModelCatalog>,
+    ) -> bool {
+        self.model_tool_support_with_catalog(model, catalog) == crate::ModelToolSupport::Supported
     }
 
     fn enrich_discovery(
@@ -413,9 +427,9 @@ impl Provider for AuthorityBoundProvider {
         self.inner.capabilities()
     }
 
-    fn model_tool_calling(&self, model: &str) -> bool {
+    fn model_tool_support(&self, model: &str) -> crate::ModelToolSupport {
         let catalog = crate::catalog::model_catalog().ok();
-        self.model_tool_calling_with_catalog(model, catalog.as_deref())
+        self.model_tool_support_with_catalog(model, catalog.as_deref())
     }
 
     fn native_file_tool_capability(
@@ -1846,14 +1860,22 @@ mod tests {
         // with an isolated source-generated snapshot rather than global state.
         assert!(!public.model_tool_calling_with_catalog("g03-negative", Some(&catalog)));
         assert!(public.model_tool_calling_with_catalog("g03-positive", Some(&catalog)));
-        assert!(public.model_tool_calling_with_catalog("unknown", Some(&catalog)));
+        assert_eq!(
+            public.model_tool_support_with_catalog("unknown", Some(&catalog)),
+            crate::ModelToolSupport::Unknown
+        );
+        assert!(!public.model_tool_calling_with_catalog("unknown", Some(&catalog)));
         let a = wrapper("authority-a");
         let b = wrapper("authority-b");
         let mut models = a.inner.list_models().await.unwrap();
         a.enrich_discovery(&catalog, &mut models);
         assert_eq!(models[0].capabilities.tool_calling, Some(false));
         assert!(!a.model_tool_calling("g03-positive"));
-        assert!(b.model_tool_calling("g03-positive"));
+        assert_eq!(
+            b.model_tool_support("g03-positive"),
+            crate::ModelToolSupport::Unknown
+        );
+        assert!(!b.model_tool_calling("g03-positive"));
         let mut request = crate::tools::policy::test_request();
         request.model = "g03-positive".into();
         assert!(
@@ -2049,7 +2071,19 @@ mod tests {
                 "malformed",
                 "custom-unknown",
             ] {
-                assert!(wrapper.model_tool_calling_with_catalog(id, Some(&catalog)));
+                let expected = if id == "native-positive" {
+                    crate::ModelToolSupport::Supported
+                } else {
+                    crate::ModelToolSupport::Unknown
+                };
+                assert_eq!(
+                    wrapper.model_tool_support_with_catalog(id, Some(&catalog)),
+                    expected
+                );
+                assert_eq!(
+                    wrapper.model_tool_calling_with_catalog(id, Some(&catalog)),
+                    id == "native-positive"
+                );
             }
             // A public source negative is still a veto against discovery true;
             // a foreign endpoint never inherits that same source restriction.
@@ -2060,7 +2094,11 @@ mod tests {
             let other = registry
                 .get_or_create_for_workspace("other", "openrouter")
                 .unwrap();
-            assert!(other.model_tool_calling("negative-no-source"));
+            assert_eq!(
+                other.model_tool_support("negative-no-source"),
+                crate::ModelToolSupport::Unknown
+            );
+            assert!(!other.model_tool_calling("negative-no-source"));
 
             // Native-normalized fixture adapter permits the allowed-path cases
             // without HTTP/preparation/runtime; registry constructors stay real.
@@ -2171,7 +2209,11 @@ mod tests {
                 // Public negative, positive and compat controls all stay out.
                 for id in ["g03-positive", "g03-negative"] {
                     assert_eq!(wrapper_support(&wrapper, id, &catalog).await, None);
-                    assert!(wrapper.model_tool_calling_with_catalog(id, Some(&catalog)));
+                    assert_eq!(
+                        wrapper.model_tool_support_with_catalog(id, Some(&catalog)),
+                        crate::ModelToolSupport::Unknown
+                    );
+                    assert!(!wrapper.model_tool_calling_with_catalog(id, Some(&catalog)));
                     let mut request = crate::tools::policy::test_request();
                     request.model = id.into();
                     request.parallel_tool_calls = Some(false);
@@ -2209,7 +2251,11 @@ mod tests {
                     wrapper_support(&other_wrapper, "g03-positive", &catalog).await,
                     None
                 );
-                assert!(other.model_tool_calling("g03-positive"));
+                assert_eq!(
+                    other.model_tool_support("g03-positive"),
+                    crate::ModelToolSupport::Unknown
+                );
+                assert!(!other.model_tool_calling("g03-positive"));
             }
         }
     }
@@ -2245,7 +2291,15 @@ mod tests {
                 );
                 assert_eq!(
                     wrapper.model_tool_calling_with_catalog("g03-negative", Some(&catalog)),
-                    !public
+                    false
+                );
+                assert_eq!(
+                    wrapper.model_tool_support_with_catalog("g03-negative", Some(&catalog)),
+                    if public {
+                        crate::ModelToolSupport::Unsupported
+                    } else {
+                        crate::ModelToolSupport::Unknown
+                    }
                 );
                 let mut request = crate::tools::policy::test_request();
                 request.model = "g03-positive".into();

@@ -3419,6 +3419,15 @@ struct CancellationBarrierProvider {
 
 #[async_trait::async_trait]
 impl Provider for CancellationBarrierProvider {
+    fn model_tool_support(&self, _model: &str) -> pioneer_provider::ModelToolSupport {
+        // The fixture implements this simulated protocol for its model labels.
+        if self.capabilities().tool_calling {
+            pioneer_provider::ModelToolSupport::Supported
+        } else {
+            pioneer_provider::ModelToolSupport::Unsupported
+        }
+    }
+
     fn name(&self) -> &str {
         "delayed"
     }
@@ -3554,6 +3563,15 @@ struct CreateThenHangProvider {
 
 #[async_trait::async_trait]
 impl Provider for DelayedProvider {
+    fn model_tool_support(&self, _model: &str) -> pioneer_provider::ModelToolSupport {
+        // The fixture implements this simulated protocol for its model labels.
+        if self.capabilities().tool_calling {
+            pioneer_provider::ModelToolSupport::Supported
+        } else {
+            pioneer_provider::ModelToolSupport::Unsupported
+        }
+    }
+
     fn name(&self) -> &str {
         "delayed"
     }
@@ -3598,6 +3616,15 @@ impl Provider for DelayedProvider {
 
 #[async_trait::async_trait]
 impl Provider for RevisionProvider {
+    fn model_tool_support(&self, _model: &str) -> pioneer_provider::ModelToolSupport {
+        // The fixture implements this simulated protocol for its model labels.
+        if self.capabilities().tool_calling {
+            pioneer_provider::ModelToolSupport::Supported
+        } else {
+            pioneer_provider::ModelToolSupport::Unsupported
+        }
+    }
+
     fn name(&self) -> &str {
         "revision"
     }
@@ -3673,6 +3700,15 @@ impl RevisionProvider {
 
 #[async_trait::async_trait]
 impl Provider for RevisionHangingProvider {
+    fn model_tool_support(&self, _model: &str) -> pioneer_provider::ModelToolSupport {
+        // The fixture implements this simulated protocol for its model labels.
+        if self.capabilities().tool_calling {
+            pioneer_provider::ModelToolSupport::Supported
+        } else {
+            pioneer_provider::ModelToolSupport::Unsupported
+        }
+    }
+
     fn name(&self) -> &str {
         "revision-hanging"
     }
@@ -3765,6 +3801,15 @@ impl RevisionHangingProvider {
 
 #[async_trait::async_trait]
 impl Provider for CountingDelayedProvider {
+    fn model_tool_support(&self, _model: &str) -> pioneer_provider::ModelToolSupport {
+        // The fixture implements this simulated protocol for its model labels.
+        if self.capabilities().tool_calling {
+            pioneer_provider::ModelToolSupport::Supported
+        } else {
+            pioneer_provider::ModelToolSupport::Unsupported
+        }
+    }
+
     fn name(&self) -> &str {
         "counting-delayed"
     }
@@ -3953,6 +3998,15 @@ impl ConcurrentComposerHistoryProvider {
 
 #[async_trait::async_trait]
 impl Provider for CaptureSummaryProvider {
+    fn model_tool_support(&self, _model: &str) -> pioneer_provider::ModelToolSupport {
+        // The fixture implements this simulated protocol for its model labels.
+        if self.capabilities().tool_calling {
+            pioneer_provider::ModelToolSupport::Supported
+        } else {
+            pioneer_provider::ModelToolSupport::Unsupported
+        }
+    }
+
     fn name(&self) -> &str {
         &self.name
     }
@@ -4098,6 +4152,15 @@ impl Provider for CaptureSummaryProvider {
 
 #[async_trait::async_trait]
 impl Provider for PreflightCaptureProvider {
+    fn model_tool_support(&self, _model: &str) -> pioneer_provider::ModelToolSupport {
+        // The fixture implements this simulated protocol for its model labels.
+        if self.capabilities().tool_calling {
+            pioneer_provider::ModelToolSupport::Supported
+        } else {
+            pioneer_provider::ModelToolSupport::Unsupported
+        }
+    }
+
     fn name(&self) -> &str {
         "preflight-capture"
     }
@@ -4142,6 +4205,15 @@ impl Provider for PreflightCaptureProvider {
 
 #[async_trait::async_trait]
 impl Provider for PromptParityCaptureProvider {
+    fn model_tool_support(&self, _model: &str) -> pioneer_provider::ModelToolSupport {
+        // The fixture implements this simulated protocol for its model labels.
+        if self.capabilities().tool_calling {
+            pioneer_provider::ModelToolSupport::Supported
+        } else {
+            pioneer_provider::ModelToolSupport::Unsupported
+        }
+    }
+
     fn name(&self) -> &str {
         "openai"
     }
@@ -4232,6 +4304,15 @@ impl Provider for PromptParityCaptureProvider {
 
 #[async_trait::async_trait]
 impl Provider for HangingChildProvider {
+    fn model_tool_support(&self, _model: &str) -> pioneer_provider::ModelToolSupport {
+        // The fixture implements this simulated protocol for its model labels.
+        if self.capabilities().tool_calling {
+            pioneer_provider::ModelToolSupport::Supported
+        } else {
+            pioneer_provider::ModelToolSupport::Unsupported
+        }
+    }
+
     fn name(&self) -> &str {
         "hanging-child"
     }
@@ -4277,6 +4358,15 @@ impl Provider for HangingChildProvider {
 
 #[async_trait::async_trait]
 impl Provider for ConcurrentComposerHistoryProvider {
+    fn model_tool_support(&self, _model: &str) -> pioneer_provider::ModelToolSupport {
+        // The fixture implements this simulated protocol for its model labels.
+        if self.capabilities().tool_calling {
+            pioneer_provider::ModelToolSupport::Supported
+        } else {
+            pioneer_provider::ModelToolSupport::Unsupported
+        }
+    }
+
     fn name(&self) -> &str {
         "concurrent-composer-history"
     }
@@ -4344,6 +4434,15 @@ impl Provider for ConcurrentComposerHistoryProvider {
 
 #[async_trait::async_trait]
 impl Provider for FlakyTitleProvider {
+    fn model_tool_support(&self, _model: &str) -> pioneer_provider::ModelToolSupport {
+        // The fixture implements this simulated protocol for its model labels.
+        if self.capabilities().tool_calling {
+            pioneer_provider::ModelToolSupport::Supported
+        } else {
+            pioneer_provider::ModelToolSupport::Unsupported
+        }
+    }
+
     fn name(&self) -> &str {
         "flaky-title"
     }
@@ -4406,6 +4505,15 @@ impl FlakyTitleProvider {
 
 #[async_trait::async_trait]
 impl Provider for GuardAwareProvider {
+    fn model_tool_support(&self, _model: &str) -> pioneer_provider::ModelToolSupport {
+        // The fixture implements this simulated protocol for its model labels.
+        if self.capabilities().tool_calling {
+            pioneer_provider::ModelToolSupport::Supported
+        } else {
+            pioneer_provider::ModelToolSupport::Unsupported
+        }
+    }
+
     fn name(&self) -> &str {
         "guard-aware"
     }
@@ -4544,6 +4652,15 @@ impl GuardAwareProvider {
 
 #[async_trait::async_trait]
 impl Provider for CreateThenHangProvider {
+    fn model_tool_support(&self, _model: &str) -> pioneer_provider::ModelToolSupport {
+        // The fixture implements this simulated protocol for its model labels.
+        if self.capabilities().tool_calling {
+            pioneer_provider::ModelToolSupport::Supported
+        } else {
+            pioneer_provider::ModelToolSupport::Unsupported
+        }
+    }
+
     fn name(&self) -> &str {
         "create-then-hang"
     }
@@ -5478,6 +5595,15 @@ impl VerticalSelfImprovementProvider {
 
 #[async_trait::async_trait]
 impl Provider for VerticalSelfImprovementProvider {
+    fn model_tool_support(&self, _model: &str) -> pioneer_provider::ModelToolSupport {
+        // The fixture implements this simulated protocol for its model labels.
+        if self.capabilities().tool_calling {
+            pioneer_provider::ModelToolSupport::Supported
+        } else {
+            pioneer_provider::ModelToolSupport::Unsupported
+        }
+    }
+
     fn name(&self) -> &str {
         "learning"
     }
@@ -5569,6 +5695,15 @@ impl VerticalUnfinishedSiblingProvider {
 
 #[async_trait::async_trait]
 impl Provider for VerticalUnfinishedSiblingProvider {
+    fn model_tool_support(&self, _model: &str) -> pioneer_provider::ModelToolSupport {
+        // The fixture implements this simulated protocol for its model labels.
+        if self.capabilities().tool_calling {
+            pioneer_provider::ModelToolSupport::Supported
+        } else {
+            pioneer_provider::ModelToolSupport::Unsupported
+        }
+    }
+
     fn name(&self) -> &str {
         "vertical-unfinished-sibling"
     }
@@ -5623,6 +5758,15 @@ impl Provider for VerticalUnfinishedSiblingProvider {
 
 #[async_trait::async_trait]
 impl Provider for VerticalCollaborativeSourceProvider {
+    fn model_tool_support(&self, _model: &str) -> pioneer_provider::ModelToolSupport {
+        // The fixture implements this simulated protocol for its model labels.
+        if self.capabilities().tool_calling {
+            pioneer_provider::ModelToolSupport::Supported
+        } else {
+            pioneer_provider::ModelToolSupport::Unsupported
+        }
+    }
+
     fn name(&self) -> &str {
         "source"
     }
@@ -5729,6 +5873,15 @@ impl VerticalReadSkillProvider {
 
 #[async_trait::async_trait]
 impl Provider for VerticalReadSkillProvider {
+    fn model_tool_support(&self, _model: &str) -> pioneer_provider::ModelToolSupport {
+        // The fixture implements this simulated protocol for its model labels.
+        if self.capabilities().tool_calling {
+            pioneer_provider::ModelToolSupport::Supported
+        } else {
+            pioneer_provider::ModelToolSupport::Unsupported
+        }
+    }
+
     fn name(&self) -> &str {
         "native"
     }
@@ -5827,6 +5980,15 @@ impl MemoryAgentE2eProvider {
 
 #[async_trait::async_trait]
 impl Provider for MemoryAgentE2eProvider {
+    fn model_tool_support(&self, _model: &str) -> pioneer_provider::ModelToolSupport {
+        // The fixture implements this simulated protocol for its model labels.
+        if self.capabilities().tool_calling {
+            pioneer_provider::ModelToolSupport::Supported
+        } else {
+            pioneer_provider::ModelToolSupport::Unsupported
+        }
+    }
+
     fn name(&self) -> &str {
         self.name
     }
@@ -6384,6 +6546,15 @@ fn is_child_task_main_request(request: &ChatRequest) -> bool {
 
 #[async_trait::async_trait]
 impl Provider for SequencedToolProvider {
+    fn model_tool_support(&self, _model: &str) -> pioneer_provider::ModelToolSupport {
+        // The fixture implements this simulated protocol for its model labels.
+        if self.capabilities().tool_calling {
+            pioneer_provider::ModelToolSupport::Supported
+        } else {
+            pioneer_provider::ModelToolSupport::Unsupported
+        }
+    }
+
     fn name(&self) -> &str {
         "sequenced-tools"
     }
@@ -6482,6 +6653,15 @@ impl Provider for SequencedToolProvider {
 
 #[async_trait::async_trait]
 impl Provider for DirectAgentSandboxProvider {
+    fn model_tool_support(&self, _model: &str) -> pioneer_provider::ModelToolSupport {
+        // The fixture implements this simulated protocol for its model labels.
+        if self.capabilities().tool_calling {
+            pioneer_provider::ModelToolSupport::Supported
+        } else {
+            pioneer_provider::ModelToolSupport::Unsupported
+        }
+    }
+
     fn name(&self) -> &str {
         "direct-agent-sandbox"
     }
@@ -75100,6 +75280,15 @@ async fn check_native_overflow_twice(with_tool: bool, cli_summary: bool) {
     struct OverflowProvider(std::sync::Mutex<Vec<ChatRequest>>, Vec<ProviderToolCall>);
     #[async_trait::async_trait]
     impl Provider for OverflowProvider {
+        fn model_tool_support(&self, _model: &str) -> pioneer_provider::ModelToolSupport {
+            // The fixture implements this simulated protocol for its model labels.
+            if self.capabilities().tool_calling {
+                pioneer_provider::ModelToolSupport::Supported
+            } else {
+                pioneer_provider::ModelToolSupport::Unsupported
+            }
+        }
+
         fn name(&self) -> &str {
             "overflow-fixture"
         }

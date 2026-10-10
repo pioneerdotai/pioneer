@@ -9,6 +9,31 @@ use futures_util::stream::BoxStream;
 
 use pioneer_protocol::ProviderModelInfo;
 
+/// Model evidence, distinct from the adapter's protocol ceiling.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelToolSupport {
+    Supported,
+    Unsupported,
+    Unknown,
+}
+impl ModelToolSupport {
+    pub fn from_optional(supported: Option<bool>) -> Self {
+        match supported {
+            Some(true) => Self::Supported,
+            Some(false) => Self::Unsupported,
+            None => Self::Unknown,
+        }
+    }
+    pub fn as_optional(self) -> Option<bool> {
+        match self {
+            Self::Supported => Some(true),
+            Self::Unsupported => Some(false),
+            Self::Unknown => None,
+        }
+    }
+}
+
 /// Result of a safe, non-inference provider warm-up.
 ///
 /// `NotSupported` is intentionally distinct from success: adapters that do
@@ -52,11 +77,18 @@ pub trait Provider: Send + Sync {
         ProviderCapabilities::default()
     }
 
-    /// Adapter capability is a protocol ceiling; known catalog model support
-    /// can narrow it. Absence remains unknown, not evidence for every model.
+    /// Explicit adapter-owned model evidence. A brand-wide transport feature
+    /// does not establish support for an unknown model or deployment.
+    fn model_tool_support(&self, _model: &str) -> ModelToolSupport {
+        if self.capabilities().tool_calling {
+            ModelToolSupport::Unknown
+        } else {
+            ModelToolSupport::Unsupported
+        }
+    }
+
     fn model_tool_calling(&self, model: &str) -> bool {
-        self.capabilities().tool_calling
-            && crate::tools::policy::model_tool_support(self.name(), model) != Some(false)
+        self.model_tool_support(model) == ModelToolSupport::Supported
     }
 
     /// Selects the native file-tool wire contract for this provider/model.
@@ -210,6 +242,44 @@ mod tests {
             ];
             Ok(stream::iter(chunks).boxed())
         }
+    }
+
+    #[test]
+    fn transport_ceiling_alone_does_not_prove_model_tool_support() {
+        struct CeilingOnly;
+        #[async_trait]
+        impl Provider for CeilingOnly {
+            fn name(&self) -> &str {
+                "ceiling-only"
+            }
+            fn capabilities(&self) -> ProviderCapabilities {
+                ProviderCapabilities {
+                    tool_calling: true,
+                    ..Default::default()
+                }
+            }
+            async fn chat(&self, _: ChatRequest) -> Result<ChatResponse> {
+                unreachable!()
+            }
+            async fn stream_chat(
+                &self,
+                _: ChatRequest,
+            ) -> Result<BoxStream<'static, Result<StreamChunk>>> {
+                unreachable!()
+            }
+        }
+        // An enabled transport protocol alone establishes no model evidence.
+        assert!(CeilingOnly.capabilities().tool_calling);
+        assert_eq!(
+            CeilingOnly.model_tool_support("unlisted"),
+            ModelToolSupport::Unknown
+        );
+        assert!(!CeilingOnly.model_tool_calling("unlisted"));
+        assert_eq!(
+            MockProvider.model_tool_support("any"),
+            ModelToolSupport::Unsupported
+        );
+        assert!(!MockProvider.model_tool_calling("any"));
     }
 
     #[test]

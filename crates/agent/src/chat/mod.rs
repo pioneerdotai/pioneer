@@ -3565,8 +3565,15 @@ async fn execute_agent_provider_response(
     let filesystem_prompt_snapshot = execution_security_snapshot.clone();
 
     let tool_loop_config = tool_loop_config.normalized();
-    let provider_tool_calling =
-        provider.model_tool_calling(model.as_str()) && !disable_tool_calling;
+    let model_tool_support = provider.model_tool_support(model.as_str());
+    if !disable_tool_calling && model_tool_support == pioneer_provider::ModelToolSupport::Unknown {
+        return Err(ChatTurnError::Blocked(
+            "native Agent requires verified model tool support; capability evidence is unknown"
+                .to_owned(),
+        ));
+    }
+    let provider_tool_calling = model_tool_support == pioneer_provider::ModelToolSupport::Supported
+        && !disable_tool_calling;
     let native_file_tool_capability = if provider_tool_calling {
         provider.native_file_tool_capability(model.as_str())
     } else {
