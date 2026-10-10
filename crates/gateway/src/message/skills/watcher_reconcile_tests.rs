@@ -2198,6 +2198,7 @@ async fn real_worker_retains_failed_root_generation_while_a_neighbor_is_publishe
     let source = harness.directory.path().join("source");
     package(&source.join("healthy"), "neighbor progresses");
     let source = fs::canonicalize(source).unwrap();
+    let healthy_source_ref = storage::import_source_ref(&source.join("healthy")).unwrap();
     let bad = new_attempt(&source, source.clone()).unwrap();
     package(&bad.join("backup"), "protected");
     set_attempt_publishing(&bad, true).unwrap();
@@ -2209,35 +2210,51 @@ async fn real_worker_retains_failed_root_generation_while_a_neighbor_is_publishe
         stop.clone(),
         signals.clone(),
     ));
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    // Native re-registration can cancel a round and increment attempts before
+    // the healthy neighbor is published. Wait for publication and an active
+    // failure backoff, allowing normal retries after subscription changes.
+    let rows = tokio::time::timeout(std::time::Duration::from_secs(30), async {
         loop {
+            let rows = harness
+                .processor
+                .crud_store
+                .list_skill_installations_scope_page("user", "ws", None, 64)
+                .await
+                .unwrap();
+            let published = rows
+                .iter()
+                .any(|row| row.source_ref == healthy_source_ref && !row.fingerprint.is_empty());
             let failed = signals
                 .roots
                 .lock()
                 .unwrap()
                 .get(&source)
-                .is_some_and(|dirty| dirty.attempts > 0);
-            if failed {
-                break;
+                .is_some_and(|dirty| {
+                    dirty.attempts > 0 && dirty.retry_at > std::time::Instant::now()
+                });
+            if failed && published {
+                break rows;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
     })
     .await
-    .unwrap();
+    .expect("healthy neighbor must be published while the source retains failed work");
     {
         let roots = signals.roots.lock().unwrap();
         let dirty = &roots[&source];
         assert_ne!(dirty.generation, dirty.acknowledged);
         assert!(dirty.retry_at > std::time::Instant::now());
     }
-    let rows = harness
-        .processor
-        .crud_store
-        .list_skill_installations_scope_page("user", "ws", None, 64)
-        .await
-        .unwrap();
-    assert!(rows.iter().any(|row| !row.fingerprint.is_empty()));
+    let healthy = rows
+        .iter()
+        .find(|row| row.source_ref == healthy_source_ref)
+        .expect("published healthy neighbor must retain its import provenance");
+    assert!(!healthy.fingerprint.is_empty());
+    assert_eq!(
+        fs::read_to_string(Path::new(&healthy.install_path).join("assets/value.txt")).unwrap(),
+        "neighbor progresses"
+    );
     assert!(bad.join("backup/SKILL.md").exists());
     stop.cancel();
     worker.await.unwrap();
