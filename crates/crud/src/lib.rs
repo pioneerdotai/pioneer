@@ -57265,7 +57265,18 @@ mod tests {
                  serde_json::to_string(&permission_profile).unwrap().into(), rich_turn_id.clone().into()],
         )).await.unwrap();
 
-        for (limit, expected_turn_queries) in [(0, 0), (1, 2), (128, 2), (129, 4), (231, 4)] {
+        // At 129, the second batch contains only thread 102, which has no Turns.
+        // At 130, it also contains thread 101, whose latest Turn is Conversation.
+        // Neither needs a fallback query; at 132, TaskRun thread 99 does.
+        for (limit, expected_turn_queries) in [
+            (0, 0),
+            (1, 2),
+            (128, 2),
+            (129, 3),
+            (130, 3),
+            (132, 4),
+            (231, 4),
+        ] {
             statements.lock().unwrap().clear();
             let threads = store
                 .list_threads_for_workspace("ws_batch", limit)
@@ -57273,7 +57284,11 @@ mod tests {
                 .unwrap();
             assert_eq!(threads.len(), limit as usize);
             let recorded = statements.lock().unwrap().clone();
-            assert_eq!(recorded.len(), 1 + expected_turn_queries);
+            assert_eq!(
+                recorded.len(),
+                1 + expected_turn_queries,
+                "unexpected query count for limit {limit}"
+            );
             assert_thread_turn_snapshot_statements(&recorded, &threads);
             for (position, thread) in threads.iter().enumerate() {
                 let index = 230 - position;
