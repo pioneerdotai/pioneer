@@ -41186,7 +41186,7 @@ mod tests {
             capabilities_json: "[]".to_owned(),
             resolved_artifacts_json: "[]".to_owned(),
             runtime_environment_json: r#"{"PIONEER_ARTIFACT_OUTPUT_DIR":"/tmp/a"}"#.to_owned(),
-            history_json: r#"[{"role":"User","content":"hello"}]"#.to_owned(),
+            history_json: r#"[{"role":"user","content":"hello"}]"#.to_owned(),
             created_at,
             updated_at: created_at,
         };

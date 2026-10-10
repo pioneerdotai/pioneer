@@ -14,10 +14,12 @@ async fn fixture(
     Turn,
     pioneer_protocol::NativeTerminalEffectPreparation,
 ) {
-    fixture_with_migrator::<Migrator>(suffix).await
+    let store = test_store_with_workspace(&format!("ws_cancel_{suffix}")).await;
+    fixture_with_store(store, suffix).await
 }
 
-async fn fixture_with_migrator<M: MigratorTrait>(
+async fn fixture_with_store(
+    store: CrudStore,
     suffix: &str,
 ) -> (
     CrudStore,
@@ -27,7 +29,6 @@ async fn fixture_with_migrator<M: MigratorTrait>(
     let ws = format!("ws_cancel_{suffix}");
     let thread = format!("thread_cancel_{suffix}");
     let id = format!("turn_cancel_{suffix}");
-    let store = test_store_with_workspace_migrator::<M>(&ws).await;
     let (store, _, turn) = start_test_turn(store, &ws, &thread, &id).await;
     let mut plan = cleanup_effect_preparation(&ws, &thread, &id, "original");
     plan.effects[0].effect_id = format!("{id}:cancellation-effect:attached-task-cleanup");
@@ -1211,13 +1212,55 @@ impl MigratorTrait for CancellationSchemaFixtureMigrator {
     }
 }
 
+async fn cancellation_schema_store(workspace_id: &str) -> CrudStore {
+    use migration::{ColumnDef, SchemaManager, Table};
+    use sea_orm::sea_query::Alias;
+
+    let store =
+        test_store_with_workspace_migrator::<CancellationSchemaFixtureMigrator>(workspace_id).await;
+    // Keep down(1) aimed at cancellation, without applying later migrations.
+    // These tests still use today's terminal projector: its CLI binding Entity
+    // selects the locator even though these fixtures have no CLI/frozen roots.
+    let transaction = store.connection.begin().await.unwrap();
+    let schema = SchemaManager::new(&*transaction);
+    assert!(
+        !schema
+            .has_column("turn_cli_runtime_binding", "frozen_manifest_id")
+            .await
+            .unwrap(),
+        "the fixture must stop before frozen lifetime migration"
+    );
+    schema
+        .alter_table(
+            Table::alter()
+                .table(Alias::new("turn_cli_runtime_binding"))
+                .add_column(
+                    ColumnDef::new(Alias::new("frozen_manifest_id"))
+                        .text()
+                        .null(),
+                )
+                .to_owned(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        pioneer_entity::turn_cli_runtime_binding::Entity::find()
+            .one(&transaction)
+            .await
+            .unwrap()
+            .is_none(),
+        "the compatibility column must not reclassify existing CLI roots"
+    );
+    transaction.commit().await.unwrap();
+    store
+}
+
 async fn cancellation_schema_started_turn(
     workspace_id: &str,
     thread_id: &str,
     turn_id: &str,
 ) -> (CrudStore, Thread, Turn) {
-    let store =
-        test_store_with_workspace_migrator::<CancellationSchemaFixtureMigrator>(workspace_id).await;
+    let store = cancellation_schema_store(workspace_id).await;
     start_test_turn(store, workspace_id, thread_id, turn_id).await
 }
 
@@ -2178,8 +2221,8 @@ async fn native_cancellation_migration_plain_and_zstd_use_entity_schema_without_
 
 #[tokio::test]
 async fn native_cancellation_migration_down_preserves_context_and_terminal_markers() {
-    let (store, turn, plan) =
-        fixture_with_migrator::<CancellationSchemaFixtureMigrator>("down_guard").await;
+    let store = cancellation_schema_store("ws_cancel_down_guard").await;
+    let (store, turn, plan) = fixture_with_store(store, "down_guard").await;
     let original = pioneer_entity::native_cancellation_context::Entity::find_by_id(turn.id.clone())
         .one(&store.connection)
         .await
