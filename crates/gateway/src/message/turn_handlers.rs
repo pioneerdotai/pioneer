@@ -8737,6 +8737,7 @@ impl MessageProcessor {
         max_input_tokens: Option<u64>,
         attempt: u32,
         deadline_ms: u64,
+        codex_history_budget: Option<crate::cli_runtime::context::CodexTransferHistoryBudget>,
         accepted: crate::compaction::frozen::PreparedHistory,
     ) -> anyhow::Result<()> {
         scope_current_stage(Stage::CliCompaction, async {
@@ -8810,6 +8811,8 @@ impl MessageProcessor {
                 .min((crate::cli_runtime::context::MAX_CLI_TURN_INPUT_FRAME_BYTES / 8) as u64)
                 .max(1);
             let fixed_input_tokens = limits.context_window.saturating_sub(desired);
+            let codex_history_budget = codex_history_budget
+                .map(|budget| budget.with_token_target(desired, fraction));
             let transfer_store = ordinary_history_store(self.crud_store.as_ref());
             let owner = std::sync::Arc::new(self.clone());
             let hub = std::sync::Arc::new(pioneer_runtime_events::ExecutionEventHub::new());
@@ -8842,6 +8845,7 @@ impl MessageProcessor {
                     Some(deadline_ms),
                     None,
                     fixed_input_tokens,
+                    codex_history_budget,
                     std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                     Some(accepted),
                     &mut diagnostic,
@@ -9219,6 +9223,14 @@ impl MessageProcessor {
                         runtime_kind,
                     ))
                     .context("current CLI input, attachment, or launch instructions cannot fit in one request")?;
+                    let codex_history_budget = if runtime_kind == CLIAgentRuntimeKind::Codex {
+                        crate::cli_runtime::context::CodexTransferHistoryBudget::from_prepared_input(
+                            input_mapping,
+                            &current_only,
+                        )
+                    } else {
+                        None
+                    };
                     let compaction_thread_id = outcome.started_notification.thread_id.as_str();
                     self.compact_cli_transfer_history(
                         outcome.started_notification.workspace_id.as_str(),
@@ -9230,6 +9242,7 @@ impl MessageProcessor {
                         max_input_tokens,
                         3 - remaining_compactions,
                         history_deadline_ms,
+                        codex_history_budget,
                         accepted_projection
                             .take()
                             .context("CLI transfer projection was lost")?,
