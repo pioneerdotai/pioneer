@@ -8670,12 +8670,14 @@ impl MessageProcessor {
                 );
             }
         }
-        resume_requirements
-            .push("Resume the same turn after the requirement is satisfied.".to_owned());
-        if !can_resume_same_turn {
-            if recovery_job
-                .as_ref()
-                .is_some_and(|job| job.item_type.is_tool_item())
+        if can_resume_same_turn {
+            resume_requirements
+                .push("Resume the same turn after the requirement is satisfied.".to_owned());
+        } else {
+            if snapshot.is_none()
+                && recovery_job
+                    .as_ref()
+                    .is_some_and(|job| job.item_type.is_tool_item())
             {
                 resume_requirements.push(
                     "This blocked tool recovery has no durable turn runtime snapshot; operator recovery is required."
