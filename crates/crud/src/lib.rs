@@ -5126,6 +5126,8 @@ impl CrudStore {
         &self,
         snapshot: NewTurnRuntimeSnapshot,
     ) -> Result<TurnRuntimeSnapshotRecord> {
+        // The payload is already encoded; validate before entering SQL/retry work.
+        snapshot.validate_storage_size()?;
         self.run_serialized_write(|| async {
             turn_runtime_snapshot::upsert_turn_runtime_snapshot(&self.connection, snapshot.clone())
                 .await
@@ -55617,6 +55619,8 @@ mod tests {
 
     #[path = "native_media_admission_tests.rs"]
     mod native_media_admission_tests;
+    #[path = "runtime_snapshot_bounds_tests.rs"]
+    mod runtime_snapshot_bounds_tests;
 
     #[tokio::test]
     async fn authorized_admission_rolls_back_on_owner_failure_and_replay_preserves_receipt() {

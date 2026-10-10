@@ -20,11 +20,54 @@ use std::collections::{HashMap, HashSet};
 const MAX_AGENT_SKILL_PINS_JSON_BYTES: usize = 16 * 1024;
 const MAX_AGENT_SKILL_FINGERPRINT_CHARS: usize = 128;
 
+#[derive(Serialize)]
+struct CanonicalArtifactSnapshot<'a> {
+    artifact_id: &'a str,
+    version_id: Option<&'a str>,
+    content_type: pioneer_provider::InputContentType,
+    attachment: CanonicalAttachmentSnapshot<'a>,
+}
+
+#[derive(Serialize)]
+struct CanonicalAttachmentSnapshot<'a> {
+    mime_type: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    size_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sha256: Option<&'a str>,
+    source: CanonicalArtifactSource<'a>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    artifact: Option<&'a pioneer_provider::AttachmentArtifactContext>,
+}
+
+#[derive(Serialize)]
+struct CanonicalArtifactSource<'a> {
+    source: &'static str,
+    #[serde(serialize_with = "serialize_canonical_artifact_locator")]
+    reference: &'a str,
+}
+
+fn serialize_canonical_artifact_locator<S: serde::Serializer>(
+    id: &str,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    struct Locator<'a>(&'a str);
+    impl std::fmt::Display for Locator<'_> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "pioneer-artifact:{}", self.0)
+        }
+    }
+    serializer.collect_str(&Locator(id))
+}
+
 /// Structural compatibility is separate from existence and fresh authorization.
 /// No DB access occurs here, so a decode rejection cannot hide a failed read.
 pub(crate) fn validate_runtime_snapshot_for_resume(
     snapshot: &TurnRuntimeSnapshotRecord,
 ) -> Result<()> {
+    snapshot.validate_storage_size()?;
     let _: ThreadMode = from_snapshot_json(&snapshot.mode_json, "thread mode")?;
     let _: AgentTurnHookRuntimeContext =
         from_snapshot_json(&snapshot.hook_runtime_context_json, "hook runtime context")?;
@@ -110,8 +153,30 @@ pub(crate) fn new_turn_runtime_snapshot(
     history: &[ChatMessage],
     agent_skill_overlay: &[AgentSkillRuntimeEntry],
 ) -> Result<NewTurnRuntimeSnapshot> {
-    let mut canonical_artifacts = resolved_artifacts.to_vec();
-    for resolved in &mut canonical_artifacts {
+    let limit = pioneer_protocol::TURN_EXECUTION_REQUEST_MAX_BYTES;
+    let mut remaining = limit;
+    for scalar in [
+        thread_id,
+        workspace_id,
+        turn_id,
+        model,
+        provider_name,
+        reasoning_effort.unwrap_or(""),
+    ] {
+        remaining = remaining
+            .checked_sub(scalar.len())
+            .context("runtime snapshot scalar byte limit exceeded")?;
+    }
+    anyhow::ensure!(
+        resolved_artifacts.len() <= pioneer_protocol::TURN_EXECUTION_ATTACHMENT_REFERENCE_MAX_COUNT,
+        "runtime snapshot artifact cardinality limit exceeded"
+    );
+    anyhow::ensure!(
+        workspace_skill_policies.len() <= limit / (pioneer_protocol::SKILL_ID_LEN + 2),
+        "runtime snapshot policy cardinality exceeds encoded byte limit"
+    );
+    let mut canonical_artifacts = Vec::with_capacity(resolved_artifacts.len());
+    for resolved in resolved_artifacts {
         anyhow::ensure!(
             resolved
                 .version_id
@@ -119,30 +184,69 @@ pub(crate) fn new_turn_runtime_snapshot(
                 .is_some_and(|v| !v.is_empty()),
             "artifact snapshot requires exact version"
         );
-        resolved.attachment.source = pioneer_provider::AttachmentDataSource::Reference {
-            reference: format!("pioneer-artifact:{}", resolved.artifact_id),
-        };
+        anyhow::ensure!(
+            resolved.artifact_id.len() <= remaining,
+            "runtime snapshot artifact identity byte limit exceeded"
+        );
+        let attachment = &resolved.attachment;
+        canonical_artifacts.push(CanonicalArtifactSnapshot {
+            artifact_id: &resolved.artifact_id,
+            version_id: resolved.version_id.as_deref(),
+            content_type: resolved.content_type,
+            attachment: CanonicalAttachmentSnapshot {
+                mime_type: &attachment.mime_type,
+                name: attachment.name.as_deref(),
+                size_bytes: attachment.size_bytes,
+                sha256: attachment.sha256.as_deref(),
+                source: CanonicalArtifactSource {
+                    source: "reference",
+                    reference: &resolved.artifact_id,
+                },
+                artifact: attachment.artifact.as_ref(),
+            },
+        });
     }
+    let agent_skill_versions_json = agent_skill_versions_json(agent_skill_overlay)?;
+    remaining = remaining
+        .checked_sub(agent_skill_versions_json.as_deref().unwrap_or("").len())
+        .context("runtime snapshot aggregate byte limit exceeded")?;
+    // Validate capability shape with the existing owner before bounded encoding.
+    validate_execution_capabilities(capabilities)?;
+    let capabilities_json =
+        to_snapshot_json_bounded(capabilities, "turn capabilities", &mut remaining)?;
     let now = chrono::Utc::now().fixed_offset();
     Ok(NewTurnRuntimeSnapshot {
         turn_id: turn_id.to_owned(),
         thread_id: thread_id.to_owned(),
         workspace_id: workspace_id.to_owned(),
-        mode_json: to_snapshot_json(&mode, "thread mode")?,
+        mode_json: to_snapshot_json_bounded(&mode, "thread mode", &mut remaining)?,
         model: model.to_owned(),
         provider_name: provider_name.to_owned(),
         reasoning_effort: reasoning_effort.map(str::to_owned),
-        agent_skill_versions_json: agent_skill_versions_json(agent_skill_overlay)?,
-        hook_runtime_context_json: to_snapshot_json(hook_runtime_context, "hook runtime context")?,
-        workspace_skill_policies_json: to_snapshot_json(
+        agent_skill_versions_json,
+        hook_runtime_context_json: to_snapshot_json_bounded(
+            hook_runtime_context,
+            "hook runtime context",
+            &mut remaining,
+        )?,
+        workspace_skill_policies_json: to_snapshot_json_bounded(
             &stored_workspace_skill_policies(workspace_skill_policies),
             "workspace skill policies",
+            &mut remaining,
         )?,
-        input_json: to_snapshot_json(input, "turn input")?,
-        capabilities_json: execution_capabilities_json(capabilities)?,
-        resolved_artifacts_json: to_snapshot_json(&canonical_artifacts, "resolved artifacts")?,
-        runtime_environment_json: to_snapshot_json(runtime_environment, "runtime environment")?,
-        history_json: to_snapshot_json(history, "conversation history")?,
+        input_json: to_snapshot_json_bounded(input, "turn input", &mut remaining)?,
+        capabilities_json,
+        resolved_artifacts_json: to_snapshot_json_bounded(
+            &canonical_artifacts,
+            "resolved artifacts",
+            &mut remaining,
+        )?,
+        runtime_environment_json: to_snapshot_json_bounded(
+            runtime_environment,
+            "runtime environment",
+            &mut remaining,
+        )?,
+        history_json: to_snapshot_json_bounded(history, "conversation history", &mut remaining)?,
         created_at: now,
         updated_at: now,
     })
@@ -479,6 +583,7 @@ pub(crate) async fn restored_recovery_turn_request_from_snapshot(
     execution_security_snapshot: TurnExecutionSecuritySnapshot,
     agent_skill_overlay: Vec<AgentSkillRuntimeEntry>,
 ) -> Result<RestoredRecoveryTurnRequest> {
+    snapshot.validate_storage_size()?;
     let (hook_runtime_context, history) =
         restored_conversation_scope_from_snapshot(store, snapshot).await?;
     let input: Vec<UserInput> = from_snapshot_json(&snapshot.input_json, "turn input")?;
@@ -582,6 +687,7 @@ pub(crate) async fn restored_conversation_scope_projection_from_snapshot(
     AgentTurnHookRuntimeContext,
     crate::compaction::frozen::RestoredAcceptedHistory,
 )> {
+    snapshot.validate_storage_size()?;
     let context: AgentTurnHookRuntimeContext =
         from_snapshot_json(&snapshot.hook_runtime_context_json, "hook runtime context")?;
     let allowed = crate::compaction::frozen::execution_history_scopes(
@@ -727,6 +833,7 @@ fn validate_agent_skill_version_pins(pins: &[AgentSkillVersionPin]) -> Result<()
     Ok(())
 }
 
+#[cfg(test)]
 fn execution_capabilities_json(capabilities: &[TurnCapability]) -> Result<String> {
     validate_execution_capabilities(capabilities)?;
     to_snapshot_json(capabilities, "turn capabilities")
@@ -739,6 +846,10 @@ pub(crate) fn restored_execution_capabilities(value: &str) -> Result<Vec<TurnCap
 }
 
 fn validate_execution_capabilities(capabilities: &[TurnCapability]) -> Result<()> {
+    anyhow::ensure!(
+        capabilities.len() <= pioneer_protocol::TURN_EXECUTION_CAPABILITY_MAX_COUNT,
+        "runtime snapshot capability cardinality limit exceeded"
+    );
     let mut seen_skill_ids = HashSet::new();
     for capability in capabilities {
         match &capability.kind {
@@ -810,11 +921,50 @@ fn restore_workspace_skill_policies(
 }
 
 fn to_snapshot_json<T: Serialize + ?Sized>(value: &T, label: &str) -> Result<String> {
-    serde_json::to_string(value).with_context(|| format!("failed to serialize {label} snapshot"))
+    let mut remaining = pioneer_protocol::TURN_EXECUTION_REQUEST_MAX_BYTES;
+    to_snapshot_json_bounded(value, label, &mut remaining)
+}
+
+fn to_snapshot_json_bounded<T: Serialize + ?Sized>(
+    value: &T,
+    label: &str,
+    remaining: &mut usize,
+) -> Result<String> {
+    struct Writer {
+        bytes: Vec<u8>,
+        limit: usize,
+    }
+    impl std::io::Write for Writer {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if bytes.len() > self.limit.saturating_sub(self.bytes.len()) {
+                return Err(std::io::Error::other(
+                    "runtime snapshot encoded byte limit exceeded",
+                ));
+            }
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut writer = Writer {
+        bytes: Vec::new(),
+        limit: *remaining,
+    };
+    serde_json::to_writer(&mut writer, value)
+        .map_err(|_| anyhow::anyhow!("failed to encode bounded {label} snapshot"))?;
+    *remaining -= writer.bytes.len();
+    String::from_utf8(writer.bytes).map_err(|_| anyhow::anyhow!("invalid encoded {label} snapshot"))
 }
 
 fn from_snapshot_json<T: DeserializeOwned>(value: &str, label: &str) -> Result<T> {
-    serde_json::from_str(value).with_context(|| format!("failed to deserialize {label} snapshot"))
+    anyhow::ensure!(
+        value.len() <= pioneer_protocol::TURN_EXECUTION_REQUEST_MAX_BYTES,
+        "{label} snapshot encoded byte limit exceeded"
+    );
+    serde_json::from_str(value)
+        .map_err(|_| anyhow::anyhow!("failed to decode required {label} snapshot"))
 }
 
 #[cfg(test)]
@@ -1065,3 +1215,92 @@ mod tests {
 #[cfg(test)]
 #[path = "turn_runtime_snapshot_r04_tests.rs"]
 mod r04_media_tests;
+
+#[cfg(test)]
+mod r05_snapshot_bounds_tests {
+    use super::*;
+    #[test]
+    fn snapshot_writer_counts_actual_unicode_escaping_and_shared_remaining_bytes() {
+        let mut remaining = 4;
+        assert_eq!(
+            to_snapshot_json_bounded("é", "fixture", &mut remaining).unwrap(),
+            "\"é\""
+        );
+        assert_eq!(remaining, 0);
+        let mut remaining = 7;
+        assert!(to_snapshot_json_bounded("\0", "fixture", &mut remaining).is_err());
+        assert_eq!(remaining, 7);
+        assert!(to_snapshot_json_bounded(&"x".repeat(100_000), "fixture", &mut remaining).is_err());
+        let mut remaining = 7;
+        to_snapshot_json_bounded("é", "first", &mut remaining).unwrap();
+        assert!(to_snapshot_json_bounded("é", "second", &mut remaining).is_err());
+        assert_eq!(remaining, 3);
+    }
+    #[test]
+    fn snapshot_projection_never_copies_or_encodes_large_owned_media_body() {
+        let limit = pioneer_protocol::TURN_EXECUTION_REQUEST_MAX_BYTES;
+        let resolved = ResolvedArtifactInput {
+            artifact_id: "artifact".into(),
+            version_id: Some("version".into()),
+            content_type: pioneer_provider::InputContentType::Image,
+            attachment: pioneer_provider::MessageAttachment {
+                mime_type: "image/png".into(),
+                name: Some("image.png".into()),
+                size_bytes: Some((limit * 4) as u64),
+                sha256: Some("a".repeat(64)),
+                source: pioneer_provider::AttachmentDataSource::Bytes {
+                    base64_data: "A".repeat(limit * 4),
+                },
+                artifact: Some(pioneer_provider::AttachmentArtifactContext {
+                    workspace_id: "ws".into(),
+                    artifact_id: "artifact".into(),
+                    artifact_version_id: Some("version".into()),
+                }),
+            },
+        };
+        let make = |environment: &HashMap<String, String>| {
+            new_turn_runtime_snapshot(
+                "thread",
+                "ws",
+                "turn",
+                ThreadMode::Agent,
+                &AgentTurnHookRuntimeContext::default(),
+                "model",
+                "fixture",
+                None,
+                &HashMap::new(),
+                &[],
+                &[],
+                std::slice::from_ref(&resolved),
+                environment,
+                &[],
+                &[],
+            )
+        };
+        let snapshot = make(&HashMap::new()).unwrap();
+        assert!(snapshot.resolved_artifacts_json.len() < 1024);
+        assert!(!snapshot.resolved_artifacts_json.contains("base64_data"));
+        let restored: Vec<ResolvedArtifactInput> =
+            serde_json::from_str(&snapshot.resolved_artifacts_json).unwrap();
+        assert_eq!(
+            restored[0].attachment.source,
+            pioneer_provider::AttachmentDataSource::Reference {
+                reference: "pioneer-artifact:artifact".into()
+            }
+        );
+        assert_eq!(restored[0].attachment.sha256, resolved.attachment.sha256);
+        let environment = HashMap::from([("key".into(), "x".repeat(limit))]);
+        assert!(make(&environment).is_err());
+    }
+    #[test]
+    fn oversized_legacy_section_fails_without_echoing_stored_content() {
+        let json = format!(
+            "\"SECRET{}\"",
+            "x".repeat(pioneer_protocol::TURN_EXECUTION_REQUEST_MAX_BYTES)
+        );
+        let error = from_snapshot_json::<String>(&json, "legacy fixture").unwrap_err();
+        assert!(!format!("{error:#?}").contains("SECRET"));
+        let error = from_snapshot_json::<Vec<String>>("\"SECRET\"", "legacy fixture").unwrap_err();
+        assert!(!format!("{error:#?}").contains("SECRET"));
+    }
+}

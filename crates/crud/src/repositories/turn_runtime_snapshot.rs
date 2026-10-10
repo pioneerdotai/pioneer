@@ -3,7 +3,7 @@ use pioneer_entity::{turn, turn_runtime_snapshot};
 use pioneer_protocol::TurnStatus;
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::sea_query::{Expr, OnConflict, Query};
-use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, Set};
+use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, PaginatorTrait, QueryFilter, Set};
 
 use crate::convention::turn_status_to_db;
 
@@ -48,6 +48,64 @@ pub struct NewTurnRuntimeSnapshot {
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
 }
+
+fn validate_snapshot_storage_size(fields: &[&str]) -> Result<()> {
+    let mut remaining = pioneer_protocol::TURN_EXECUTION_REQUEST_MAX_BYTES;
+    for field in fields {
+        remaining = remaining
+            .checked_sub(field.len())
+            .context("runtime snapshot exceeds accepted execution byte limit")?;
+    }
+    Ok(())
+}
+
+impl NewTurnRuntimeSnapshot {
+    pub fn validate_storage_size(&self) -> Result<()> {
+        validate_snapshot_storage_size(&[
+            &self.turn_id,
+            &self.thread_id,
+            &self.workspace_id,
+            &self.mode_json,
+            &self.model,
+            &self.provider_name,
+            self.reasoning_effort.as_deref().unwrap_or(""),
+            self.agent_skill_versions_json.as_deref().unwrap_or(""),
+            &self.hook_runtime_context_json,
+            &self.workspace_skill_policies_json,
+            &self.input_json,
+            &self.capabilities_json,
+            &self.resolved_artifacts_json,
+            &self.runtime_environment_json,
+            &self.history_json,
+        ])
+    }
+}
+
+impl TurnRuntimeSnapshotRecord {
+    pub fn validate_storage_size(&self) -> Result<()> {
+        validate_snapshot_storage_size(&[
+            &self.turn_id,
+            &self.thread_id,
+            &self.workspace_id,
+            &self.mode_json,
+            &self.model,
+            &self.provider_name,
+            self.reasoning_effort.as_deref().unwrap_or(""),
+            self.agent_skill_versions_json.as_deref().unwrap_or(""),
+            &self.hook_runtime_context_json,
+            &self.workspace_skill_policies_json,
+            &self.input_json,
+            &self.capabilities_json,
+            &self.resolved_artifacts_json,
+            &self.runtime_environment_json,
+            &self.history_json,
+        ])
+    }
+}
+
+// SQLite byte lengths are checked before a driver materializes TEXT columns.
+// Keep this exact stored-column set aligned with validate_storage_size above.
+const SNAPSHOT_STORAGE_BYTES_SQL: &str = "coalesce(length(cast(turn_id as blob)),0) + coalesce(length(cast(thread_id as blob)),0) + coalesce(length(cast(workspace_id as blob)),0) + coalesce(length(cast(mode_json as blob)),0) + coalesce(length(cast(model as blob)),0) + coalesce(length(cast(provider_name as blob)),0) + coalesce(length(cast(reasoning_effort as blob)),0) + coalesce(length(cast(agent_skill_versions_json as blob)),0) + coalesce(length(cast(hook_runtime_context_json as blob)),0) + coalesce(length(cast(workspace_skill_policies_json as blob)),0) + coalesce(length(cast(input_json as blob)),0) + coalesce(length(cast(capabilities_json as blob)),0) + coalesce(length(cast(resolved_artifacts_json as blob)),0) + coalesce(length(cast(runtime_environment_json as blob)),0) + coalesce(length(cast(history_json as blob)),0)";
 
 pub async fn upsert_turn_runtime_snapshot<C: ConnectionTrait>(
     db: &C,
@@ -108,9 +166,23 @@ pub async fn find_turn_runtime_snapshot<C: ConnectionTrait>(
     turn_id: &str,
 ) -> Result<Option<TurnRuntimeSnapshotRecord>> {
     let row = turn_runtime_snapshot::Entity::find_by_id(turn_id.to_owned())
+        .filter(Expr::cust_with_values(
+            format!("({SNAPSHOT_STORAGE_BYTES_SQL}) <= ?"),
+            [pioneer_protocol::TURN_EXECUTION_REQUEST_MAX_BYTES as i64],
+        ))
         .one(db)
         .await
         .context("failed to query turn_runtime_snapshot row")?;
+    if row.is_none()
+        && turn_runtime_snapshot::Entity::find_by_id(turn_id.to_owned())
+            .count(db)
+            .await?
+            > 0
+    {
+        anyhow::bail!(
+            "runtime snapshot exceeds accepted execution byte limit or changed during bounded read"
+        );
+    }
     Ok(row.map(record_from_model))
 }
 

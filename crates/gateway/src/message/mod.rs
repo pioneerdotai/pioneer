@@ -4201,6 +4201,7 @@ impl MessageProcessor {
             .context("failed to freeze canonical runtime history")?;
             snapshot.history_json = serde_json::to_string(&descriptor)?;
         }
+        snapshot.validate_storage_size()?;
         // Temporary compatibility for the ordinary legacy loader is removed
         // when that loader is replaced. Canonical Task histories never enter it.
         self.crud_store
