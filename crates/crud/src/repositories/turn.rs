@@ -950,6 +950,10 @@ pub async fn set_turn_execution_envelope<C: ConnectionTrait>(
     snapshot: &TurnExecutionSecuritySnapshot,
     authorization_context_json: &str,
 ) -> Result<bool> {
+    anyhow::ensure!(
+        authorization_context_json.len() <= pioneer_protocol::TURN_EXECUTION_REQUEST_MAX_BYTES,
+        "execution authorization context exceeds byte limit",
+    );
     let version = i32::try_from(snapshot.version)
         .context("turn execution security snapshot version exceeds database integer range")?;
     let snapshot_json = serde_json::to_string(snapshot)
@@ -1014,6 +1018,10 @@ pub async fn set_turn_execution_authorization_context<C: ConnectionTrait>(
     turn_id: &str,
     context_json: &str,
 ) -> Result<bool> {
+    anyhow::ensure!(
+        context_json.len() <= pioneer_protocol::TURN_EXECUTION_REQUEST_MAX_BYTES,
+        "execution authorization context exceeds byte limit",
+    );
     let context_json = context_json.trim();
     if context_json.is_empty() {
         anyhow::bail!("execution authorization context must not be empty");
@@ -1034,9 +1042,22 @@ pub async fn find_turn_execution_authorization_context<C: ConnectionTrait>(
     db: &C,
     turn_id: &str,
 ) -> Result<Option<String>> {
-    Ok(find_turn_by_id(db, turn_id)
-        .await?
-        .and_then(|model| model.execution_authorization_context_json)
+    let limit = pioneer_protocol::TURN_EXECUTION_REQUEST_MAX_BYTES as i64;
+    let row = db.query_one_raw(Statement::from_sql_and_values(
+        db.get_database_backend(),
+        "SELECT CASE WHEN coalesce(length(cast(execution_authorization_context_json as blob)),0) <= ? \
+         THEN execution_authorization_context_json ELSE NULL END AS context_json, \
+         coalesce(length(cast(execution_authorization_context_json as blob)),0) AS context_bytes \
+         FROM \"turn\" WHERE id=?",
+        [limit.into(), turn_id.into()],
+    )).await.context("failed to read bounded execution authority")?;
+    let Some(row) = row else { return Ok(None) };
+    anyhow::ensure!(
+        row.try_get::<i64>("", "context_bytes")? <= limit,
+        "execution authorization context exceeds byte limit"
+    );
+    Ok(row
+        .try_get::<Option<String>>("", "context_json")?
         .filter(|json| !json.trim().is_empty()))
 }
 

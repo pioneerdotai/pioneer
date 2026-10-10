@@ -1534,6 +1534,10 @@ pub struct UnreconciledTerminalTaskChildTurnRecord {
     pub error: Option<String>,
 }
 
+/// Eight authority envelopes of at most 2 MiB bound each reader page to 16 MiB
+/// of encoded context. Startup consumes every page using the same quantum.
+pub const MAX_EXECUTION_AUTHORITY_PAGE_ROWS: u64 = 8;
+
 /// Active execution row inspected by the startup authority-integrity worker.
 /// The envelope remains opaque to CRUD and is validated by Gateway policy
 /// code; CRUD never fabricates or repairs it.
@@ -4934,15 +4938,19 @@ impl CrudStore {
         if limit == 0 {
             return Ok(Vec::new());
         }
+        let limit = limit.min(MAX_EXECUTION_AUTHORITY_PAGE_ROWS);
         let rows = self
             .connection
             .query_all_raw(Statement::from_sql_and_values(
                 self.connection.get_database_backend(),
-                "SELECT thread_id, id AS turn_id, execution_authorization_context_json \
+                "SELECT thread_id, id AS turn_id, \
+                        CASE WHEN coalesce(length(cast(execution_authorization_context_json as blob)),0) <= ? \
+                        THEN execution_authorization_context_json ELSE NULL END AS execution_authorization_context_json \
                  FROM \"turn\" WHERE status = 'in_progress' AND id > ? \
                  ORDER BY id ASC LIMIT ?"
                     .to_owned(),
                 [
+                    (pioneer_protocol::TURN_EXECUTION_REQUEST_MAX_BYTES as i64).into(),
                     after_turn_id.unwrap_or_default().into(),
                     i64::try_from(limit).unwrap_or(i64::MAX).into(),
                 ],
@@ -4970,6 +4978,7 @@ impl CrudStore {
         if limit == 0 {
             return Ok(Vec::new());
         }
+        let limit = limit.min(MAX_EXECUTION_AUTHORITY_PAGE_ROWS);
         let rows = self
             .connection
             .query_all_raw(Statement::from_sql_and_values(
@@ -4977,7 +4986,8 @@ impl CrudStore {
                 "SELECT t.id AS task_id, t.workspace_id AS task_workspace_id, \
                         a.workspace_id AS admission_workspace_id, \
                         a.root_thread_id, a.initiating_principal_id, \
-                        a.authorization_context_json, \
+                        CASE WHEN length(cast(a.authorization_context_json as blob)) <= ? \
+                        THEN a.authorization_context_json ELSE NULL END AS authorization_context_json, \
                         root.workspace_id AS root_thread_workspace_id, \
                         root.access_class AS root_thread_access_class, \
                         gp.id AS principal_id, gp.kind AS principal_kind \
@@ -4991,6 +5001,7 @@ impl CrudStore {
                  ORDER BY t.id ASC LIMIT ?"
                     .to_owned(),
                 [
+                    (pioneer_protocol::TURN_EXECUTION_REQUEST_MAX_BYTES as i64).into(),
                     after_task_id.unwrap_or_default().into(),
                     i64::try_from(limit).unwrap_or(i64::MAX).into(),
                 ],
@@ -15122,6 +15133,7 @@ impl CrudStore {
         event_timestamp_secs: i64,
         admission: NewTaskExecutionAdmission,
     ) -> Result<Vec<AppendedTaskEvent>> {
+        admission.validate_context_size()?;
         self.run_serialized_write(|| {
             self.append_task_events_with_execution_admission_once(
                 events.clone(),
@@ -15138,6 +15150,7 @@ impl CrudStore {
         event_timestamp_secs: i64,
         admission: NewTaskExecutionAdmission,
     ) -> Result<Vec<AppendedTaskEvent>> {
+        admission.validate_context_size()?;
         self.run_serialized_write(|| {
             self.append_task_events_with_execution_readmission_once(
                 events.clone(),
@@ -15155,6 +15168,7 @@ impl CrudStore {
         admission: NewTaskExecutionAdmission,
         agent_action: AgentCommitInput,
     ) -> Result<Vec<AppendedTaskEvent>> {
+        admission.validate_context_size()?;
         self.run_serialized_write(|| {
             self.append_task_events_with_execution_readmission_and_agent_action_once(
                 events.clone(),
@@ -15175,6 +15189,9 @@ impl CrudStore {
         &self,
         input: TaskCreationCommitInput,
     ) -> Result<Vec<AppendedTaskEvent>> {
+        if let Some(admission) = &input.execution_admission {
+            admission.validate_context_size()?;
+        }
         self.run_serialized_write(|| self.commit_task_creation_once(input.clone()))
             .await
     }
@@ -18745,6 +18762,10 @@ impl CrudStore {
     ) -> Result<bool> {
         let turn_id = turn_id.to_owned();
         let snapshot = snapshot.clone();
+        anyhow::ensure!(
+            authorization_context_json.len() <= pioneer_protocol::TURN_EXECUTION_REQUEST_MAX_BYTES,
+            "execution authorization context exceeds byte limit",
+        );
         let authorization_context_json = authorization_context_json.to_owned();
         self.run_serialized_write(|| async {
             turn::set_turn_execution_envelope(
@@ -18764,6 +18785,10 @@ impl CrudStore {
         context_json: &str,
     ) -> Result<bool> {
         let turn_id = turn_id.to_owned();
+        anyhow::ensure!(
+            context_json.len() <= pioneer_protocol::TURN_EXECUTION_REQUEST_MAX_BYTES,
+            "execution authorization context exceeds byte limit",
+        );
         let context_json = context_json.to_owned();
         self.run_serialized_write(|| async {
             turn::set_turn_execution_authorization_context(
@@ -19776,6 +19801,10 @@ impl CrudStore {
             turn_id.as_str(),
             bindings,
             unix_to_datetime(event_timestamp_secs),
+        );
+        anyhow::ensure!(
+            authorization_context_json.len() <= pioneer_protocol::TURN_EXECUTION_REQUEST_MAX_BYTES,
+            "execution authorization context exceeds byte limit",
         );
         let authorization_context_json = authorization_context_json.to_owned();
         self.run_serialized_write(|| async {
@@ -22157,6 +22186,12 @@ impl CrudStore {
     ) -> std::result::Result<TurnMcpProjectionReplaceOutcome, TurnMcpProjectionPersistenceError>
     {
         let replacement = replacement.clone();
+        if authorization_context_json.len() > pioneer_protocol::TURN_EXECUTION_REQUEST_MAX_BYTES {
+            return Err(TurnMcpProjectionPersistenceError::Storage {
+                stage: "authorization_context_bounds",
+                source: anyhow::anyhow!("execution authorization context exceeds byte limit"),
+            });
+        }
         let authorization_context_json = authorization_context_json.to_owned();
         retry_with_backoff(
             || {
@@ -55701,6 +55736,8 @@ mod tests {
         )));
     }
 
+    #[path = "execution_authority_bounds_tests.rs"]
+    mod execution_authority_bounds_tests;
     #[path = "native_media_admission_tests.rs"]
     mod native_media_admission_tests;
     #[path = "runtime_snapshot_bounds_tests.rs"]
