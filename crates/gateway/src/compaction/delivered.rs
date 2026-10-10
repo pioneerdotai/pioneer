@@ -9,7 +9,9 @@ use crate::{
     },
     message::MessageProcessor,
 };
-use pioneer_crud::compaction::{HistoryReadFence, TaskDeliveryOutputSnapshot};
+use pioneer_crud::compaction::{
+    DeliveredTaskOutputCursor, HistoryReadFence, TaskDeliveryOutputSnapshot,
+};
 use pioneer_observability::turn_startup::{Stage, Work, record_work, scope_current_stage};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -89,7 +91,8 @@ impl MessageProcessor {
             let mut access = BTreeMap::new();
             let mut branches: Vec<AuthorizedOutputBranch> = Vec::new();
             let mut seen = BTreeMap::<String, Option<usize>>::new();
-            let mut after = 0;
+            let mut cursor = DeliveredTaskOutputCursor::default();
+            let mut references = Vec::new();
             let destination_read =
                 can_read_originals(&resolver, principal, workspace, destination).await?;
             ensure!(
@@ -108,7 +111,7 @@ impl MessageProcessor {
             access.insert(destination.to_owned(), true);
             loop {
                 let mut page = store
-                    .compaction_delivered_output_page(workspace, destination, after, &fence)
+                    .compaction_delivered_output_page(workspace, destination, &cursor, &fence)
                     .await?;
                 record_work(Work::Pages, 1);
                 if !page.unprojected_events.is_empty() {
@@ -135,86 +138,92 @@ impl MessageProcessor {
                         );
                     }
                     page = store
-                        .compaction_delivered_output_page(workspace, destination, after, &fence)
+                        .compaction_recheck_delivered_output_page(
+                            workspace,
+                            destination,
+                            &page,
+                            &fence,
+                        )
                         .await?;
                     record_work(Work::Pages, 1);
-                    ensure!(
-                        page.unprojected_events.is_empty(),
-                        "delivery metadata changed during discovery"
-                    );
                 }
-                for reference in page.entries {
-                    if let Some(accepted) = seen.get(&reference.delivery_id) {
-                        if let Some(index) = accepted {
-                            branches[*index]
-                                .acknowledgements
-                                .push(reference.acknowledgement);
-                        }
-                        continue;
-                    }
-                    seen.insert(reference.delivery_id.clone(), None);
-                    let snapshot = store
-                        .compaction_delivery_output(workspace, &reference.delivery_id)
-                        .await?
-                        .ok_or_else(|| {
-                            anyhow::anyhow!("acknowledged Task source binding disappeared")
-                        })?;
-                    ensure!(
-                        snapshot.candidate_id == reference.candidate_id
-                            && snapshot.output.task_run_turn_id == reference.task_run_turn_id
-                            && snapshot.output.source_thread == reference.source_thread
-                            && snapshot.output.source_turn == reference.source_turn,
-                        "acknowledged Task source binding changed"
-                    );
-                    let source_threads = super::frozen::accepted_history_scopes(
-                        &store,
-                        workspace,
-                        &snapshot.output.source_thread,
-                        &serde_json::to_string(&snapshot.output.history)?,
-                    )
-                    .await?;
-                    let mut permitted = true;
-                    for thread in &source_threads {
-                        if !access.contains_key(thread) {
-                            access.insert(
-                                thread.clone(),
-                                can_read_originals(&resolver, principal, workspace, thread).await?,
-                            );
-                        }
-                        if !access[thread] {
-                            permitted = false;
-                            break;
-                        }
-                    }
-                    if !permitted {
-                        continue;
-                    }
-                    for thread in &source_threads {
-                        if !source_epochs.contains_key(thread) {
-                            source_epochs.insert(
-                                thread.clone(),
-                                store
-                                    .compaction_projection_version(workspace, thread)
-                                    .await?,
-                            );
-                        }
-                    }
-                    seen.insert(reference.delivery_id, Some(branches.len()));
-                    branches.push(AuthorizedOutputBranch {
-                        snapshot,
-                        acknowledgements: vec![reference.acknowledgement.clone()],
-                        acknowledgement: reference.acknowledgement,
-                        source_threads,
-                    });
-                }
+                references.extend(page.entries);
                 if page.done {
                     break;
                 }
                 ensure!(
-                    page.scanned_through > after,
+                    page.next_cursor != cursor,
                     "Task output discovery made no progress"
                 );
-                after = page.scanned_through;
+                cursor = page.next_cursor;
+            }
+            // Delivery Turn/sequence order is unrelated to capture order. Retain
+            // only necessary output references, then recover the original global
+            // acknowledgement ordering without loading or sorting event history.
+            references.sort_by_key(|reference| reference.capture_order);
+            for reference in references {
+                if let Some(accepted) = seen.get(&reference.delivery_id) {
+                    if let Some(index) = accepted {
+                        branches[*index]
+                            .acknowledgements
+                            .push(reference.acknowledgement);
+                    }
+                    continue;
+                }
+                seen.insert(reference.delivery_id.clone(), None);
+                let snapshot = store
+                    .compaction_delivery_output(workspace, &reference.delivery_id)
+                    .await?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("acknowledged Task source binding disappeared")
+                    })?;
+                ensure!(
+                    snapshot.candidate_id == reference.candidate_id
+                        && snapshot.output.task_run_turn_id == reference.task_run_turn_id
+                        && snapshot.output.source_thread == reference.source_thread
+                        && snapshot.output.source_turn == reference.source_turn,
+                    "acknowledged Task source binding changed"
+                );
+                let source_threads = super::frozen::accepted_history_scopes(
+                    &store,
+                    workspace,
+                    &snapshot.output.source_thread,
+                    &serde_json::to_string(&snapshot.output.history)?,
+                )
+                .await?;
+                let mut permitted = true;
+                for thread in &source_threads {
+                    if !access.contains_key(thread) {
+                        access.insert(
+                            thread.clone(),
+                            can_read_originals(&resolver, principal, workspace, thread).await?,
+                        );
+                    }
+                    if !access[thread] {
+                        permitted = false;
+                        break;
+                    }
+                }
+                if !permitted {
+                    continue;
+                }
+                for thread in &source_threads {
+                    if !source_epochs.contains_key(thread) {
+                        source_epochs.insert(
+                            thread.clone(),
+                            store
+                                .compaction_projection_version(workspace, thread)
+                                .await?,
+                        );
+                    }
+                }
+                seen.insert(reference.delivery_id, Some(branches.len()));
+                branches.push(AuthorizedOutputBranch {
+                    snapshot,
+                    acknowledgements: vec![reference.acknowledgement.clone()],
+                    acknowledgement: reference.acknowledgement,
+                    source_threads,
+                });
             }
             ensure!(
                 self.current_authorization_revision().await? == authorization_revision,
