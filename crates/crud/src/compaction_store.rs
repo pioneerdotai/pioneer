@@ -1,11 +1,11 @@
 //! CrudStore facade; persistence operations live in repositories.
 use crate::compaction::{
     AcceptedTaskBasis, CanonicalFragment, CanonicalSource, CheckpointEdges, CheckpointMetadata,
-    CommitOutcome, CompletedHistoryCheck, DeliveredTaskOutputPage, DeliveryCheckpointImportSource,
-    FrozenImportRecord, HistoricalEventProjection, HistoryCausalBoundary, HistoryReadFence,
-    HistoryTurnBoundary, ManifestEntry, OperationRecord, PagedSource, PreparedFrozenImport,
-    RunnerPlanRecord, SourceAssertion, SourcePage, TaskDeliveryOutputSnapshot, TaskInputCopyAlias,
-    TaskOutputSnapshot,
+    CommitOutcome, CompletedHistoryCheck, DeliveredTaskOutputCursor, DeliveredTaskOutputPage,
+    DeliveryCheckpointImportSource, FrozenImportRecord, HistoricalEventProjection,
+    HistoryCausalBoundary, HistoryReadFence, HistoryTurnBoundary, ManifestEntry, OperationRecord,
+    PagedSource, PreparedFrozenImport, RunnerPlanRecord, SourceAssertion, SourcePage,
+    TaskDeliveryOutputSnapshot, TaskInputCopyAlias, TaskOutputSnapshot,
 };
 use crate::{CanonicalTurnEventPayload, CrudStore, repositories};
 use anyhow::Result;
@@ -1373,21 +1373,39 @@ impl CrudStore {
         repositories::compaction::task_output::compaction_delivery_output(self, workspace, delivery)
             .await
     }
-    /// Inspect at most 128 event revisions below the common capture fence.
-    /// The caller retains the first acknowledgement for each delivery ID across
-    /// pages; replayed notifications may occur in later quanta. No payload is read.
+    /// Select at most one local delivery Turn and 127 event metadata rows.
+    /// Callers order acknowledgements by capture_order across all local pages
+    /// before selecting the first per delivery. No payload is read.
     pub async fn compaction_delivered_output_page(
         &self,
         workspace: &str,
         thread: &str,
-        after: i64,
+        cursor: &DeliveredTaskOutputCursor,
         fence: &HistoryReadFence,
     ) -> Result<DeliveredTaskOutputPage> {
         repositories::compaction::task_output::compaction_delivered_output_page(
             &self.connection,
             workspace,
             thread,
-            after,
+            cursor,
+            fence,
+        )
+        .await
+    }
+    /// Revalidate only the metadata sources selected by the original page.
+    /// Append never changes the selected set or its saved continuation.
+    pub async fn compaction_recheck_delivered_output_page(
+        &self,
+        workspace: &str,
+        thread: &str,
+        page: &DeliveredTaskOutputPage,
+        fence: &HistoryReadFence,
+    ) -> Result<DeliveredTaskOutputPage> {
+        repositories::compaction::task_output::compaction_recheck_delivered_output_page(
+            &self.connection,
+            workspace,
+            thread,
+            page,
             fence,
         )
         .await

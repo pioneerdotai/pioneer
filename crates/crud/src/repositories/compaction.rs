@@ -54,7 +54,8 @@ use sea_orm::{ConnectionTrait, DbBackend, FromQueryResult, Statement, Transactio
 use sha2::{Digest, Sha256};
 pub(crate) use task_output::bind_queued_task_output;
 pub use task_output::{
-    DeliveredTaskOutputPage, DeliveredTaskOutputRef, TaskDeliveryOutputSnapshot, TaskOutputSnapshot,
+    DeliveredTaskOutputCursor, DeliveredTaskOutputEvent, DeliveredTaskOutputPage,
+    DeliveredTaskOutputRef, TaskDeliveryOutputSnapshot, TaskOutputSnapshot,
 };
 
 #[derive(Clone, Debug)]
@@ -126,9 +127,8 @@ pub const SOURCE_PAGE_ROWS: u64 = 128;
 pub const SOURCE_PAGE_BYTES: usize = 256 * 1024;
 pub const CHECKPOINT_SOURCE_LIMIT: usize = pioneer_compaction::REPLAY_ALIAS_LIMIT;
 
-// Kept only for correlated SQLite json_each snapshot validation and the two
-// MATERIALIZED event quanta. These queries preserve one atomic validation or a
-// physical scan boundary; ordinary reads/writes use Entity/ActiveModel.
+// Correlated SQLite json_each validation and bounded MATERIALIZED metadata
+// quanta require SQLite-specific SQL. Ordinary reads/writes use entities.
 pub(super) fn sqlite_specific_sql(
     statement: &str,
     values: impl IntoIterator<Item = Value>,
