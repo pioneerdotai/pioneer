@@ -3560,6 +3560,20 @@ pub(super) async fn request_agent_round(
     .await
 }
 
+fn retry_invalidated_reference<T>(
+    result: &Result<T, ChatTurnError>,
+    attempt: usize,
+    known_tokens: u64,
+) -> bool {
+    attempt == 0
+        && known_tokens == 0
+        && matches!(result,
+        Err(ChatTurnError::ProviderFailure { failure, .. })
+            if failure.class == ProviderFailureClass::ProviderRejected
+            && failure.stage == ProviderFailureStage::Connect
+            && failure.provider_code.as_deref() == Some(pioneer_provider::failure::REJECTED_CACHED_FILE_REFERENCE_CODE))
+}
+
 pub(super) async fn request_agent_round_accounted(
     provider: &Arc<dyn Provider>,
     request: ChatRequest,
@@ -3570,59 +3584,69 @@ pub(super) async fn request_agent_round_accounted(
     force_non_stream: bool,
     provider_timeout_policy: ProviderTimeoutPolicy,
     event_tx: &AgentEventHub,
-    accounting: Option<&mut super::ChatExecutionWindowStats>,
+    mut accounting: Option<&mut super::ChatExecutionWindowStats>,
 ) -> Result<AgentRoundResponse, ChatTurnError> {
-    let observation = ProviderAttemptObservation::new(provider.as_ref(), &request.model)
-        .with_window_index(accounting.as_ref().map(|stats| stats.window_index))
-        .with_publication(event_tx, workspace_id, thread_id, turn_id);
     let context = pioneer_provider::ProviderAttemptContext::from_started(
         provider_timeout_policy,
         provider.capabilities().streaming && !force_non_stream,
-        observation.started,
+        tokio::time::Instant::now(),
     )
     .map_err(|_| {
         ChatTurnError::Terminal("provider attempt timeout policy is out of range".into())
     })?;
-    let mut observation_started = false;
-    let result = pioneer_provider::with_provider_attempt_context(context, async {
-        observation
-            .publish(event_tx, workspace_id, thread_id, turn_id, None)
-            .await?;
-        observation_started = true;
-        request_agent_round_observed(
-            provider,
-            request,
-            workspace_id,
-            thread_id,
-            turn_id,
-            thinking_item_id,
-            force_non_stream,
-            provider_timeout_policy,
-            event_tx,
-            &observation,
-        )
-        .await
-    })
-    .await;
-    if let Some(stats) = accounting {
-        stats.record_provider_round(
-            result.as_ref().map_or(0, |round| round.tool_calls.len()),
-            Some(observation.known_token_count()),
-        );
-        stats.provider_token_usage_unknown |= observation.token_count().is_none();
-    }
-    if observation_started {
-        observation
-            .publish(
-                event_tx,
+    for attempt in 0..2 {
+        let observation = ProviderAttemptObservation::new(provider.as_ref(), &request.model)
+            .with_window_index(accounting.as_ref().map(|stats| stats.window_index))
+            .with_publication(event_tx, workspace_id, thread_id, turn_id);
+        let attempt_context = pioneer_provider::ProviderAttemptContext {
+            cancellation: context.cancellation.child_token(),
+            ..context.clone()
+        };
+        let mut observation_started = false;
+        let result = pioneer_provider::with_provider_attempt_context(attempt_context, async {
+            observation
+                .publish(event_tx, workspace_id, thread_id, turn_id, None)
+                .await?;
+            observation_started = true;
+            request_agent_round_observed(
+                provider,
+                request.clone(),
                 workspace_id,
                 thread_id,
                 turn_id,
-                Some(result.is_ok()),
+                thinking_item_id,
+                force_non_stream,
+                provider_timeout_policy,
+                event_tx,
+                &observation,
             )
-            .await?;
+            .await
+        })
+        .await;
+        if let Some(stats) = accounting.as_deref_mut() {
+            stats.record_provider_round(
+                result.as_ref().map_or(0, |round| round.tool_calls.len()),
+                Some(observation.known_token_count()),
+            );
+            stats.provider_token_usage_unknown |= observation.token_count().is_none();
+        }
+        if observation_started {
+            observation
+                .publish(
+                    event_tx,
+                    workspace_id,
+                    thread_id,
+                    turn_id,
+                    Some(result.is_ok()),
+                )
+                .await?;
+        }
+        if retry_invalidated_reference(&result, attempt, observation.known_token_count()) {
+            continue;
+        }
+        return result;
     }
-    result
+    unreachable!("bounded provider reference retry always returns")
 }
 
 #[cfg(test)]
@@ -3662,56 +3686,66 @@ pub(super) async fn stream_provider_response_accounted(
     message_item_id: &str,
     provider_timeout_policy: ProviderTimeoutPolicy,
     event_tx: &AgentEventHub,
-    accounting: Option<&mut super::ChatExecutionWindowStats>,
+    mut accounting: Option<&mut super::ChatExecutionWindowStats>,
 ) -> Result<(String, Option<pioneer_provider::TokenUsage>), ChatTurnError> {
-    let observation = ProviderAttemptObservation::new(provider.as_ref(), &request.model)
-        .with_window_index(accounting.as_ref().map(|stats| stats.window_index))
-        .with_publication(event_tx, workspace_id, thread_id, turn_id);
     let context = pioneer_provider::ProviderAttemptContext::from_started(
         provider_timeout_policy,
         true,
-        observation.started,
+        tokio::time::Instant::now(),
     )
     .map_err(|_| {
         ChatTurnError::Terminal("provider attempt timeout policy is out of range".into())
     })?;
-    let mut observation_started = false;
-    let result = pioneer_provider::with_provider_attempt_context(context, async {
-        observation
-            .publish(event_tx, workspace_id, thread_id, turn_id, None)
-            .await?;
-        observation_started = true;
-        stream_provider_response_observed(
-            provider,
-            request,
-            workspace_id,
-            thread_id,
-            turn_id,
-            thinking_item_id,
-            message_item_id,
-            provider_timeout_policy,
-            event_tx,
-            &observation,
-        )
-        .await
-    })
-    .await;
-    if let Some(stats) = accounting {
-        stats.record_provider_round(0, Some(observation.known_token_count()));
-        stats.provider_token_usage_unknown |= observation.token_count().is_none();
-    }
-    if observation_started {
-        observation
-            .publish(
-                event_tx,
+    for attempt in 0..2 {
+        let observation = ProviderAttemptObservation::new(provider.as_ref(), &request.model)
+            .with_window_index(accounting.as_ref().map(|stats| stats.window_index))
+            .with_publication(event_tx, workspace_id, thread_id, turn_id);
+        let attempt_context = pioneer_provider::ProviderAttemptContext {
+            cancellation: context.cancellation.child_token(),
+            ..context.clone()
+        };
+        let mut observation_started = false;
+        let result = pioneer_provider::with_provider_attempt_context(attempt_context, async {
+            observation
+                .publish(event_tx, workspace_id, thread_id, turn_id, None)
+                .await?;
+            observation_started = true;
+            stream_provider_response_observed(
+                provider,
+                request.clone(),
                 workspace_id,
                 thread_id,
                 turn_id,
-                Some(result.is_ok()),
+                thinking_item_id,
+                message_item_id,
+                provider_timeout_policy,
+                event_tx,
+                &observation,
             )
-            .await?;
+            .await
+        })
+        .await;
+        if let Some(stats) = accounting.as_deref_mut() {
+            stats.record_provider_round(0, Some(observation.known_token_count()));
+            stats.provider_token_usage_unknown |= observation.token_count().is_none();
+        }
+        if observation_started {
+            observation
+                .publish(
+                    event_tx,
+                    workspace_id,
+                    thread_id,
+                    turn_id,
+                    Some(result.is_ok()),
+                )
+                .await?;
+        }
+        if retry_invalidated_reference(&result, attempt, observation.known_token_count()) {
+            continue;
+        }
+        return result;
     }
-    result
+    unreachable!("bounded provider reference retry always returns")
 }
 
 pub(super) async fn non_stream_provider_response_with_policy(
@@ -3724,55 +3758,65 @@ pub(super) async fn non_stream_provider_response_with_policy(
     message_item_id: &str,
     provider_timeout_policy: ProviderTimeoutPolicy,
     event_tx: &AgentEventHub,
-    accounting: Option<&mut super::ChatExecutionWindowStats>,
+    mut accounting: Option<&mut super::ChatExecutionWindowStats>,
 ) -> Result<(String, Option<TokenUsage>), ChatTurnError> {
-    let observation = ProviderAttemptObservation::new(provider.as_ref(), &request.model)
-        .with_window_index(accounting.as_ref().map(|stats| stats.window_index))
-        .with_publication(event_tx, workspace_id, thread_id, turn_id);
     let context = pioneer_provider::ProviderAttemptContext::from_started(
         provider_timeout_policy,
         false,
-        observation.started,
+        tokio::time::Instant::now(),
     )
     .map_err(|_| {
         ChatTurnError::Terminal("provider attempt timeout policy is out of range".into())
     })?;
-    let mut observation_started = false;
-    let result = pioneer_provider::with_provider_attempt_context(context, async {
-        observation
-            .publish(event_tx, workspace_id, thread_id, turn_id, None)
-            .await?;
-        observation_started = true;
-        non_stream_provider_response_observed(
-            provider,
-            request,
-            workspace_id,
-            thread_id,
-            turn_id,
-            thinking_item_id,
-            message_item_id,
-            event_tx,
-            &observation,
-        )
-        .await
-    })
-    .await;
-    if let Some(stats) = accounting {
-        stats.record_provider_round(0, Some(observation.known_token_count()));
-        stats.provider_token_usage_unknown |= observation.token_count().is_none();
-    }
-    if observation_started {
-        observation
-            .publish(
-                event_tx,
+    for attempt in 0..2 {
+        let observation = ProviderAttemptObservation::new(provider.as_ref(), &request.model)
+            .with_window_index(accounting.as_ref().map(|stats| stats.window_index))
+            .with_publication(event_tx, workspace_id, thread_id, turn_id);
+        let attempt_context = pioneer_provider::ProviderAttemptContext {
+            cancellation: context.cancellation.child_token(),
+            ..context.clone()
+        };
+        let mut observation_started = false;
+        let result = pioneer_provider::with_provider_attempt_context(attempt_context, async {
+            observation
+                .publish(event_tx, workspace_id, thread_id, turn_id, None)
+                .await?;
+            observation_started = true;
+            non_stream_provider_response_observed(
+                provider,
+                request.clone(),
                 workspace_id,
                 thread_id,
                 turn_id,
-                Some(result.is_ok()),
+                thinking_item_id,
+                message_item_id,
+                event_tx,
+                &observation,
             )
-            .await?;
+            .await
+        })
+        .await;
+        if let Some(stats) = accounting.as_deref_mut() {
+            stats.record_provider_round(0, Some(observation.known_token_count()));
+            stats.provider_token_usage_unknown |= observation.token_count().is_none();
+        }
+        if observation_started {
+            observation
+                .publish(
+                    event_tx,
+                    workspace_id,
+                    thread_id,
+                    turn_id,
+                    Some(result.is_ok()),
+                )
+                .await?;
+        }
+        if retry_invalidated_reference(&result, attempt, observation.known_token_count()) {
+            continue;
+        }
+        return result;
     }
-    result
+    unreachable!("bounded provider reference retry always returns")
 }
 
 #[cfg(test)]
@@ -3814,6 +3858,124 @@ mod terminal_boundary_tests {
                 ));
             }
             Ok(Box::pin(futures_util::stream::iter(chunks)))
+        }
+    }
+
+    struct ExpiredReferenceProvider {
+        code: &'static str,
+        deadlines: Arc<std::sync::Mutex<Vec<(tokio::time::Instant, tokio::time::Instant)>>>,
+    }
+    #[test]
+    fn cached_reference_retry_rejects_known_cost_partial_stream_and_second_rejection() {
+        let mut classification =
+            ProviderFailureClassification::new(ProviderFailureClass::ProviderRejected);
+        classification.provider_code =
+            Some(pioneer_provider::failure::REJECTED_CACHED_FILE_REFERENCE_CODE.into());
+        for (attempt, tokens, stage) in [
+            (0, 1, ProviderFailureStage::Connect),
+            (0, 0, ProviderFailureStage::MidStream),
+            (1, 0, ProviderFailureStage::Connect),
+        ] {
+            let error: Result<(), ChatTurnError> = Err(provider_failure_error_with_classification(
+                "reasoning",
+                TurnItemType::Reasoning,
+                "fixture",
+                "model",
+                ProviderTransportKind::Stream,
+                stage,
+                "fixed failure".into(),
+                Some(classification.clone()),
+            ));
+            assert!(!retry_invalidated_reference(&error, attempt, tokens));
+        }
+    }
+    #[async_trait]
+    impl Provider for ExpiredReferenceProvider {
+        fn name(&self) -> &str {
+            "fixture"
+        }
+        async fn chat(&self, _: ChatRequest) -> anyhow::Result<pioneer_provider::ChatResponse> {
+            let context = pioneer_provider::current_provider_attempt_context().unwrap();
+            self.deadlines
+                .lock()
+                .unwrap()
+                .push((context.first_output_deadline, context.deadline));
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            let mut classification =
+                ProviderFailureClassification::new(ProviderFailureClass::ProviderRejected);
+            classification.provider_code = Some(self.code.into());
+            classification.http_status = Some(404);
+            Err(pioneer_provider::failure::ProviderTransportFailure { classification }.into())
+        }
+        async fn stream_chat(
+            &self,
+            _: ChatRequest,
+        ) -> anyhow::Result<futures_util::stream::BoxStream<'static, anyhow::Result<StreamChunk>>>
+        {
+            anyhow::bail!("unexpected stream")
+        }
+    }
+    #[tokio::test(start_paused = true)]
+    async fn generated_expiry_receipt_retries_once_with_original_deadlines_and_distinct_usage() {
+        for (code, expected_attempts) in [
+            (
+                pioneer_provider::failure::REJECTED_CACHED_FILE_REFERENCE_CODE,
+                2usize,
+            ),
+            ("file_not_found", 1usize),
+            ("not_found", 1usize),
+        ] {
+            let deadlines = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let provider: Arc<dyn Provider> = Arc::new(ExpiredReferenceProvider {
+                code,
+                deadlines: deadlines.clone(),
+            });
+            let hub = AgentEventHub::new();
+            let mut receiver = hub.take_durable_receiver().await.unwrap();
+            let mut stats = super::super::ChatExecutionWindowStats::new(1);
+            let (result, completed_ids) = tokio::join!(
+                request_agent_round_accounted(
+                    &provider,
+                    request(),
+                    "ws",
+                    "thread",
+                    "turn",
+                    "reasoning",
+                    true,
+                    ProviderTimeoutPolicy::default(),
+                    &hub,
+                    Some(&mut stats)
+                ),
+                async {
+                    let mut completed_ids = Vec::new();
+                    while completed_ids.len() < expected_attempts {
+                        let event = receiver.recv().await.unwrap();
+                        if let AgentDurableEvent::ItemCompleted { notification } = &event {
+                            if let TurnItem::SystemEvent { code, id, .. } = &notification.item {
+                                if code.as_deref() == Some("provider_usage") {
+                                    completed_ids.push(id.clone());
+                                }
+                            }
+                        }
+                        receiver.acknowledge_last(Ok(()));
+                    }
+                    completed_ids
+                }
+            );
+            assert!(result.is_err());
+            assert_eq!(stats.agent_round_count as usize, expected_attempts);
+            assert_eq!(stats.provider_token_count, Some(0));
+            assert!(stats.provider_token_usage_unknown);
+            let recorded = deadlines.lock().unwrap();
+            assert_eq!(recorded.len(), expected_attempts);
+            assert!(recorded.iter().all(|deadline| deadline == &recorded[0]));
+            assert_eq!(
+                completed_ids
+                    .iter()
+                    .collect::<std::collections::HashSet<_>>()
+                    .len(),
+                expected_attempts
+            );
         }
     }
 

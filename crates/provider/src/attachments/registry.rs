@@ -44,6 +44,18 @@ pub trait ArtifactExternalRefCacheBackend: Send + Sync {
         request: ArtifactExternalRefLookupRequest,
     ) -> Result<Option<String>>;
 
+    /// Must compare the full authority/version key and the rejected external ID.
+    /// Unsupported custom backends fail explicitly rather than claiming recovery.
+    async fn compare_delete_uploaded_reference(
+        &self,
+        _request: ArtifactExternalRefLookupRequest,
+        _rejected_id: &str,
+    ) -> Result<bool> {
+        Err(anyhow!(
+            "external reference cache does not support exact invalidation"
+        ))
+    }
+
     async fn store_uploaded_reference(
         &self,
         request: ArtifactExternalRefStoreRequest,
@@ -168,6 +180,42 @@ pub async fn lookup_uploaded_reference_with_artifact_for_authority(
     Ok(result)
 }
 
+pub async fn invalidate_uploaded_reference_for_authority(
+    config: &AttachmentPipelineConfig,
+    provider: &str,
+    model_family: &str,
+    attachment: &PreparedAttachment,
+    rejected_id: &str,
+    authority: &str,
+) -> Result<bool> {
+    if !config.upload_registry.enabled || attachment.artifact.is_none() {
+        return Ok(false);
+    }
+    let transport_kind = AttachmentTransportKind::Upload;
+    let registry_key = upload_registry_key_for_authority(
+        provider,
+        model_family,
+        transport_kind,
+        &attachment.sha256,
+        authority,
+    );
+    artifact_external_ref_cache_backend()?
+        .compare_delete_uploaded_reference(
+            ArtifactExternalRefLookupRequest {
+                provider: provider.trim().to_ascii_lowercase(),
+                authority_fingerprint: authority.trim().to_ascii_lowercase(),
+                model_family: model_family.trim().to_ascii_lowercase(),
+                transport_kind,
+                sha256: attachment.sha256.to_ascii_lowercase(),
+                registry_key,
+                now_unix_ms: now_unix_ms(),
+                artifact: attachment.artifact.clone(),
+            },
+            rejected_id,
+        )
+        .await
+}
+
 pub async fn store_uploaded_reference_for_authority(
     config: &AttachmentPipelineConfig,
     provider: &str,
@@ -278,6 +326,26 @@ mod tests {
             },
             artifact: None,
         }
+    }
+
+    #[tokio::test]
+    async fn legacy_cache_backend_cannot_claim_successful_reference_invalidation() {
+        let request = ArtifactExternalRefLookupRequest {
+            provider: "openai".into(),
+            authority_fingerprint: "authority".into(),
+            model_family: "model".into(),
+            transport_kind: AttachmentTransportKind::Upload,
+            sha256: "hash".into(),
+            registry_key: "key".into(),
+            now_unix_ms: 0,
+            artifact: None,
+        };
+        assert!(
+            InMemoryRegistryBackend::default()
+                .compare_delete_uploaded_reference(request, "expired-id")
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

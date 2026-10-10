@@ -556,6 +556,8 @@ impl OpenAiProvider {
             "upload_file",
             format!("{}#{}", endpoint, attachment.sha256),
         );
+        // Retries within this upload share one key. A fresh upload after a
+        // proven expired reference must not replay the old upload response.
         let idempotency_key = Self::upload_idempotency_key(attachment);
         let file_name = attachment.name.clone();
         let mime_type = attachment.mime_type.clone();
@@ -716,10 +718,77 @@ impl OpenAiProvider {
         Ok(prepared)
     }
 
+    async fn rejected_file_reference_error(
+        &self,
+        model: &str,
+        prepared: &PreparedProviderMessages,
+        error: anyhow::Error,
+    ) -> anyhow::Error {
+        let Some(mut classification) = crate::Provider::classify_failure(self, &error) else {
+            return error;
+        };
+        if !matches!(
+            classification.provider_code.as_deref(),
+            Some("file_expired" | "file_not_found")
+        ) || !classification
+            .http_status
+            .is_some_and(|status| (400..500).contains(&status))
+        {
+            return error;
+        }
+        let refs = prepared
+            .attachments
+            .iter()
+            .filter_map(|attachment| {
+                if attachment.transport_plan.kind != AttachmentTransportKind::Upload
+                    || attachment.artifact.is_none()
+                {
+                    return None;
+                }
+                match &attachment.source {
+                    PreparedAttachmentSource::Reference { reference } => {
+                        Some((attachment, reference))
+                    }
+                    _ => None,
+                }
+            })
+            .take(65)
+            .collect::<Vec<_>>();
+        let Some((_, rejected_id)) = refs.first() else {
+            return error;
+        };
+        if refs.len() > 64 || refs.iter().any(|(_, id)| id != rejected_id) {
+            return error;
+        }
+        let config = default_attachment_pipeline_config();
+        let family = model_family_for_model(model);
+        for (attachment, id) in refs {
+            if crate::attachments::invalidate_uploaded_reference_for_authority(
+                &config,
+                "openai",
+                &family,
+                attachment,
+                id,
+                self.authority_fingerprint.as_str(),
+            )
+            .await
+            .is_err()
+            {
+                return error;
+            }
+        }
+        classification.provider_code =
+            Some(crate::failure::REJECTED_CACHED_FILE_REFERENCE_CODE.to_owned());
+        anyhow::Error::new(crate::failure::ProviderTransportFailure { classification })
+    }
+
     fn upload_idempotency_key(attachment: &crate::attachments::PreparedAttachment) -> String {
         format!(
-            "openai-upload:{}:{}:{}",
-            attachment.sha256, attachment.mime_type, attachment.size_bytes
+            "openai-upload:{}:{}:{}:{}",
+            attachment.sha256,
+            attachment.mime_type,
+            attachment.size_bytes,
+            pioneer_protocol::generate_id(21)
         )
     }
 
@@ -1255,7 +1324,10 @@ impl crate::traits::Provider for OpenAiProvider {
             .map_err(crate::failure::safe_transport_error)?;
 
         if !response.status().is_success() {
-            return Err(Self::api_error(response).await);
+            let error = Self::api_error(response).await;
+            return Err(self
+                .rejected_file_reference_error(&request.model, &prepared, error)
+                .await);
         }
 
         let native_request_id = crate::usage::native_id(
@@ -1344,7 +1416,10 @@ impl crate::traits::Provider for OpenAiProvider {
             crate::http::send_stream_request(request_builder, self.timeout_policy).await?;
 
         if !response.status().is_success() {
-            return Err(Self::api_error(response).await);
+            let error = Self::api_error(response).await;
+            return Err(self
+                .rejected_file_reference_error(&request.model, &prepared, error)
+                .await);
         }
 
         let native_request_id = crate::usage::native_id(
@@ -1490,6 +1565,82 @@ fn openai_embedding_model_info(model: &OpenAiEmbeddingModelDefinition) -> Provid
 
 #[cfg(test)]
 mod tests {
+    fn cached_media(reference: &str) -> crate::attachments::PreparedAttachment {
+        crate::attachments::PreparedAttachment {
+            message_index: 0,
+            part_index: 0,
+            kind: InputContentType::File,
+            mime_type: "application/pdf".into(),
+            name: "input.pdf".into(),
+            size_bytes: 8,
+            sha256: "a".repeat(64),
+            source: PreparedAttachmentSource::Reference {
+                reference: reference.into(),
+            },
+            bytes: None,
+            transport_plan: crate::attachments::AttachmentTransportPlan {
+                kind: AttachmentTransportKind::Upload,
+                reason: "fixture".into(),
+            },
+            artifact: Some(crate::AttachmentArtifactContext {
+                workspace_id: "ws".into(),
+                artifact_id: "artifact".into(),
+                artifact_version_id: Some("version".into()),
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn reference_recovery_requires_machine_expiry_and_one_identifiable_uploaded_id() {
+        let provider = OpenAiProvider::new("fixture-unused");
+        for (code, attachments) in [
+            ("not_found", vec![cached_media("file-a")]),
+            (
+                "file_not_found",
+                vec![cached_media("file-a"), cached_media("file-b")],
+            ),
+            ("file_expired", vec![]),
+            (
+                "file_not_found",
+                vec![crate::attachments::PreparedAttachment {
+                    artifact: None,
+                    ..cached_media("file-a")
+                }],
+            ),
+        ] {
+            let mut classification =
+                ProviderFailureClassification::new(ProviderFailureClass::ProviderRejected);
+            classification.http_status = Some(404);
+            classification.provider_code = Some(code.into());
+            let error =
+                anyhow::Error::new(crate::failure::ProviderTransportFailure { classification });
+            let prepared = PreparedProviderMessages {
+                messages: vec![],
+                attachments,
+                budget_report: Default::default(),
+            };
+            let error = provider
+                .rejected_file_reference_error("gpt-4.1", &prepared, error)
+                .await;
+            assert_eq!(
+                crate::failure::classify_transport_error(&error)
+                    .unwrap()
+                    .provider_code
+                    .as_deref(),
+                Some(code)
+            );
+        }
+    }
+
+    #[test]
+    fn fresh_upload_does_not_reuse_the_expired_upload_idempotency_key() {
+        let attachment = cached_media("file-expired");
+        let first = OpenAiProvider::upload_idempotency_key(&attachment);
+        let fresh = OpenAiProvider::upload_idempotency_key(&attachment);
+        assert_ne!(first, fresh);
+        assert!(first.starts_with("openai-upload:"));
+    }
+
     #[test]
     fn discovered_51_and_52_fallback_vocabulary_agrees_with_direct_chat_bodies() {
         for (id, xhigh) in [("gpt-5.1", false), ("gpt-5.2", true)] {

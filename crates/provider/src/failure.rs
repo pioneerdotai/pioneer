@@ -1,6 +1,9 @@
 //! Provider-neutral failure classification shared by transport redaction and agent fallback.
 //! Only transport facts and controlled machine codes select recovery policy.
 
+/// Safe adapter-owned invalidation receipt; never accepted from upstream JSON.
+pub const REJECTED_CACHED_FILE_REFERENCE_CODE: &str = "pioneer_cached_file_reference_rejected";
+
 use crate::types::ProviderFailureClassification;
 use pioneer_protocol::{ProviderFailureClass, ProviderFailureStage};
 

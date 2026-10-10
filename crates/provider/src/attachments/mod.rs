@@ -23,8 +23,8 @@ use crate::attachments::errors::AttachmentPipelineError;
 use crate::attachments::normalize::{normalize_attachment_name, reconcile_mime};
 use crate::attachments::resolve::{resolve_attachment_source, resolve_sha256};
 use crate::types::{
-    ChatMessage, ChatRequest, InputContentType, MessageAttachment, MessageContentPart,
-    ProviderCapabilities,
+    AttachmentDataSource, ChatMessage, ChatRequest, InputContentType, MessageAttachment,
+    MessageContentPart, ProviderCapabilities,
 };
 use anyhow::{Context, Result};
 use base64::Engine;
@@ -34,10 +34,8 @@ pub(crate) use normalize::canonical_mime as canonical_media_mime;
 pub(crate) use normalize::normalize_mime as normalized_media_mime;
 use std::sync::Arc;
 use std::sync::{OnceLock, RwLock};
-use std::time::Duration;
 
 const ATTACHMENT_BLOCKING_MAX_CONCURRENCY: usize = 16;
-const ATTACHMENT_BLOCKING_QUEUE_TIMEOUT: Duration = Duration::from_secs(30);
 
 static ATTACHMENT_BLOCKING_GOVERNOR: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
 
@@ -55,9 +53,10 @@ pub use input_estimate::{MediaInputEstimate, PreparedInputBudget, image_tokens};
 pub use normalize::infer_mime_from_reference;
 pub use registry::{
     ArtifactExternalRefCacheBackend, ArtifactExternalRefLookupRequest,
-    ArtifactExternalRefStoreRequest, lookup_uploaded_reference_with_artifact_for_authority,
-    model_family_for_model, set_artifact_external_ref_cache_backend,
-    store_uploaded_reference_for_authority, upload_registry_key_for_authority,
+    ArtifactExternalRefStoreRequest, invalidate_uploaded_reference_for_authority,
+    lookup_uploaded_reference_with_artifact_for_authority, model_family_for_model,
+    set_artifact_external_ref_cache_backend, store_uploaded_reference_for_authority,
+    upload_registry_key_for_authority,
 };
 pub use runtime::AttachmentOperationAuthority;
 pub use runtime::AttachmentOperationError;
@@ -194,6 +193,35 @@ async fn prepare_messages_async(
     capabilities: &ProviderCapabilities,
     messages: &[ChatMessage],
 ) -> Result<PreparedProviderMessages> {
+    let parent = crate::http::current_provider_attempt_context()
+        .map(Ok)
+        .unwrap_or_else(|| {
+            crate::ProviderAttemptContext::new(crate::ProviderTimeoutPolicy::default(), false)
+        })?;
+    let context = crate::ProviderAttemptContext {
+        cancellation: parent.cancellation.child_token(),
+        ..parent
+    };
+    crate::http::with_provider_attempt_context(
+        context,
+        runtime::bounded_work(prepare_messages_async_owned(
+            provider_name,
+            model,
+            thinking_override,
+            capabilities,
+            messages,
+        )),
+    )
+    .await
+}
+
+async fn prepare_messages_async_owned(
+    provider_name: &str,
+    model: &str,
+    thinking_override: Option<bool>,
+    capabilities: &ProviderCapabilities,
+    messages: &[ChatMessage],
+) -> Result<PreparedProviderMessages> {
     // Reject mismatches before I/O and retain this snapshot through materialization.
     let state = admission::current();
     let entry = if messages.iter().any(ChatMessage::has_attachments)
@@ -221,28 +249,98 @@ async fn prepare_messages_async(
         None
     };
     let authority_fingerprint = runtime::current_authority_fingerprint()?;
-    let permit = tokio::time::timeout(
-        ATTACHMENT_BLOCKING_QUEUE_TIMEOUT,
-        attachment_blocking_governor().acquire_owned(),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("attachment materialization capacity wait timed out"))?
-    .map_err(|_| anyhow::anyhow!("attachment materialization governor is closed"))?;
+    #[cfg(test)]
+    let config = admission::current()
+        .and_then(|s| s.pipeline_config.clone())
+        .unwrap_or_else(default_attachment_pipeline_config);
+    #[cfg(not(test))]
+    let config = default_attachment_pipeline_config();
+    let mut owned_messages = messages.to_vec();
+    let mut remaining = config.max_total_bytes_per_request;
+    let mut count = 0;
+    let mut prefetched = Vec::new();
+    for (message_index, message) in owned_messages.iter_mut().enumerate() {
+        for (part_index, part) in message.content_parts.iter_mut().enumerate() {
+            let kind = part.kind();
+            let attachment = match part {
+                MessageContentPart::Image { image } => image,
+                MessageContentPart::File { file } => file,
+                MessageContentPart::Audio { audio } => audio,
+                MessageContentPart::Video { video } => video,
+                MessageContentPart::Text { .. } => continue,
+            };
+            count += 1;
+            if count > config.max_attachments_per_request {
+                return Err(AttachmentPipelineError::attachment_count_exceeded(
+                    count,
+                    config.max_attachments_per_request,
+                )
+                .into());
+            }
+            if matches!(
+                attachment.source,
+                AttachmentDataSource::Path { .. } | AttachmentDataSource::Url { .. }
+            ) {
+                let resolved = resolve::resolve_attachment_source_async(
+                    provider_name,
+                    attachment,
+                    kind,
+                    &config,
+                    remaining.min(config.max_bytes_per_attachment),
+                )
+                .await?;
+                let bytes = resolved
+                    .bytes
+                    .context("owned attachment source has no bytes")?;
+                remaining = remaining
+                    .checked_sub(bytes.len())
+                    .context("attachment aggregate budget exceeded")?;
+                if attachment.name.is_none() {
+                    attachment.name = resolved.source_name;
+                }
+                prefetched.push((message_index, part_index, bytes, attachment.source.clone()));
+            } else if let AttachmentDataSource::Bytes { base64_data } = &attachment.source {
+                // Reserve an upper bound before fetching any later mutable source.
+                let size = normalize::estimate_decoded_base64_size(base64_data);
+                remaining = remaining.checked_sub(size).ok_or_else(|| {
+                    AttachmentPipelineError::attachment_total_budget_exceeded(size, remaining)
+                })?;
+            }
+        }
+    }
+    // Capacity waits spend the same end-to-end deadline, never a nested 30s cap.
+    let permit = attachment_blocking_governor()
+        .acquire_owned()
+        .await
+        .map_err(|_| anyhow::anyhow!("attachment materialization governor is closed"))?;
+    let work_context = runtime::work_context().context("attachment work context missing")?;
     let provider_name = provider_name.to_owned();
     let model = model.to_owned();
     let capabilities = capabilities.clone();
-    let messages = messages.to_vec();
+    let mut messages = owned_messages;
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        runtime::with_blocking_authority_scope(authority_fingerprint, || {
-            admission::blocking_scope(state, || {
-                #[cfg(test)]
-                let config = admission::current()
-                    .and_then(|s| s.pipeline_config.clone())
-                    .unwrap_or_else(default_attachment_pipeline_config);
-                #[cfg(not(test))]
-                let config = default_attachment_pipeline_config();
-                let prepared = prepare_messages_for_provider_target(
+        runtime::with_blocking_work_context(work_context, || {
+            runtime::with_blocking_authority_scope(authority_fingerprint, || {
+                admission::blocking_scope(state.clone(), || {
+                    runtime::check_work()?;
+                    let mut ingress = Vec::with_capacity(prefetched.len());
+                    for (message, part, bytes, original_source) in prefetched {
+                        runtime::check_work()?;
+                        let target = match &mut messages[message].content_parts[part] {
+                            MessageContentPart::Image { image } => image,
+                            MessageContentPart::File { file } => file,
+                            MessageContentPart::Audio { audio } => audio,
+                            MessageContentPart::Video { video } => video,
+                            MessageContentPart::Text { .. } => {
+                                unreachable!("prefetched media position")
+                            }
+                        };
+                        target.source = owned_bytes_source(&bytes);
+                        ingress.push((message, part, original_source));
+                    }
+                    runtime::check_work()?;
+                    let prepared = prepare_messages_for_provider_target(
                     provider_name.as_str(),
                     Some(model.as_str()),
                     thinking_override,
@@ -253,29 +351,113 @@ async fn prepare_messages_async(
                 .context(MediaInputRejection(
                     "media input could not be materialized under the selected attachment policy",
                 ))?;
-                if let Some(entry) = entry.as_ref() {
-                    for attachment in &prepared.attachments {
-                        contracts::validate_materialized_constraints(entry, attachment).context(
-                            MediaInputRejection(
-                                "materialized media violates catalog size/duration/MIME limits",
-                            ),
-                        )?;
+                    // Preserve the existing authority-owned ingress receipt after
+                    // source I/O moves before CPU normalization. The witness uses
+                    // the actual normalized digest, never a caller-supplied hash.
+                    if let Some(state) = &state {
+                        for (message, part, original_source) in ingress {
+                            let mut witness = prepared
+                                .attachments
+                                .iter()
+                                .find(|attachment| {
+                                    attachment.message_index == message
+                                        && attachment.part_index == part
+                                })
+                                .context("prefetched media lost its request position")?
+                                .clone();
+                            witness.source = match original_source {
+                                AttachmentDataSource::Path { path } => {
+                                    PreparedAttachmentSource::Path { path }
+                                }
+                                AttachmentDataSource::Url { url } => {
+                                    PreparedAttachmentSource::Url { url }
+                                }
+                                _ => unreachable!("mutable ingress source"),
+                            };
+                            state.pin(&witness)?;
+                        }
                     }
-                    contracts::validate_model_media_limits(
-                        &provider_name,
-                        entry,
-                        &prepared.attachments,
-                    )
-                    .context(MediaInputRejection(
-                        "media input exceeds the native model PDF/media limit",
-                    ))?;
-                }
-                Ok(prepared)
+                    if let Some(entry) = entry.as_ref() {
+                        for attachment in &prepared.attachments {
+                            contracts::validate_materialized_constraints(entry, attachment)
+                                .context(MediaInputRejection(
+                                    "materialized media violates catalog size/duration/MIME limits",
+                                ))?;
+                        }
+                        contracts::validate_model_media_limits(
+                            &provider_name,
+                            entry,
+                            &prepared.attachments,
+                        )
+                        .context(MediaInputRejection(
+                            "media input exceeds the native model PDF/media limit",
+                        ))?;
+                    }
+                    Ok(prepared)
+                })
             })
         })
     })
     .await
-    .map_err(|error| anyhow::anyhow!("attachment materialization worker failed: {error}"))?
+    .map_err(|_| anyhow::anyhow!("attachment materialization worker failed"))?
+}
+
+/// Bounded ingress read of original bytes. The authority and policy are supplied
+/// by the already-authorized native admission owner, never by the model.
+pub async fn read_accepted_source_bytes(
+    provider: &str,
+    authority_fingerprint: String,
+    attachment: &MessageAttachment,
+    kind: InputContentType,
+    config: &AttachmentPipelineConfig,
+    max_bytes: usize,
+) -> Result<Vec<u8>> {
+    let context = crate::http::current_provider_attempt_context()
+        .map(Ok)
+        .unwrap_or_else(|| {
+            crate::ProviderAttemptContext::new(crate::ProviderTimeoutPolicy::default(), false)
+        })?;
+    let context = crate::ProviderAttemptContext {
+        cancellation: context.cancellation.child_token(),
+        ..context
+    };
+    crate::http::with_provider_attempt_context(
+        context,
+        runtime::with_async_authority_scope(
+            authority_fingerprint,
+            runtime::bounded_work(async {
+                let resolved = resolve::resolve_attachment_source_async(
+                    provider, attachment, kind, config, max_bytes,
+                )
+                .await?;
+                let bytes = resolved
+                    .bytes
+                    .context("accepted source requires owned bytes")?;
+                resolve::resolve_sha256(attachment.sha256.as_deref(), Some(&bytes), "source")?;
+                if attachment
+                    .size_bytes
+                    .is_some_and(|size| size != bytes.len() as u64)
+                {
+                    return Err(AttachmentPipelineError::declared_size_mismatch(
+                        attachment.size_bytes.unwrap(),
+                        bytes.len(),
+                        "source",
+                    )
+                    .into());
+                }
+                Ok(bytes)
+            }),
+        ),
+    )
+    .await
+}
+
+/// Canonical owned source; callers keep durable artifact refs separately.
+pub fn owned_bytes_source(bytes: &[u8]) -> AttachmentDataSource {
+    use base64::Engine;
+    AttachmentDataSource::Bytes {
+        base64_data: base64::engine::general_purpose::STANDARD.encode(bytes),
+    }
 }
 
 pub fn prepare_messages_for_provider_with_config(
@@ -309,6 +491,24 @@ fn prepare_messages_for_provider_target(
         messages,
         config,
     );
+    // Public diagnostics own only typed, fixed safe facts. Parser/I/O chains
+    // may contain input bytes or locators and never escape this boundary.
+    let result = result.map_err(|error| {
+        if let Some(classification) = crate::failure::classify_transport_error(&error) {
+            return anyhow::Error::new(crate::failure::ProviderTransportFailure { classification });
+        }
+        if let Some(safe) = error.downcast_ref::<AttachmentPipelineError>() {
+            anyhow::Error::new(safe.clone())
+        } else if error.downcast_ref::<MediaInputRejection>().is_some() {
+            anyhow::Error::new(MediaInputRejection(
+                "media input violates the selected attachment contract",
+            ))
+        } else {
+            anyhow::Error::new(AttachmentPipelineError::contract_violation(
+                "materialization",
+            ))
+        }
+    });
     match &result {
         Ok(prepared) => {
             observability::emit_preflight_ok(provider_name, prepared.budget_report);
@@ -341,6 +541,7 @@ fn prepare_messages_impl(
         })
         .transpose()?;
     let messages = projected_messages.as_deref().unwrap_or(messages);
+    runtime::check_work()?;
     let attachment_count = messages
         .iter()
         .flat_map(|message| message.content_parts.iter())
@@ -624,7 +825,10 @@ fn error_code_and_message(error: &anyhow::Error) -> (&'static str, String) {
     if let Some(pipeline) = error.downcast_ref::<AttachmentPipelineError>() {
         return (pipeline.code(), pipeline.to_string());
     }
-    ("ATTACHMENT_PIPELINE_UNKNOWN_ERROR", error.to_string())
+    (
+        "ATTACHMENT_PIPELINE_UNKNOWN_ERROR",
+        "attachment preparation failed".to_owned(),
+    )
 }
 
 #[cfg(test)]

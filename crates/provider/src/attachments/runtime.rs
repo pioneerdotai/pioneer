@@ -21,6 +21,66 @@ thread_local! {
     };
 }
 
+thread_local! {
+    static BLOCKING_WORK_CONTEXT: std::cell::RefCell<Option<crate::ProviderAttemptContext>> = const { std::cell::RefCell::new(None) };
+}
+
+pub(crate) fn work_context() -> Option<crate::ProviderAttemptContext> {
+    crate::http::current_provider_attempt_context()
+        .or_else(|| BLOCKING_WORK_CONTEXT.with(|slot| slot.borrow().clone()))
+}
+
+pub(crate) fn check_work() -> Result<()> {
+    if work_context().is_some_and(|context| {
+        context.cancellation.is_cancelled() || tokio::time::Instant::now() >= context.deadline
+    }) {
+        return Err(crate::failure::transport_timeout_error());
+    }
+    Ok(())
+}
+
+pub(crate) fn with_blocking_work_context<T>(
+    context: crate::ProviderAttemptContext,
+    operation: impl FnOnce() -> T,
+) -> T {
+    struct Restore(Option<crate::ProviderAttemptContext>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            BLOCKING_WORK_CONTEXT.with(|slot| slot.replace(self.0.take()));
+        }
+    }
+    let previous = BLOCKING_WORK_CONTEXT.with(|slot| slot.replace(Some(context)));
+    let _restore = Restore(previous);
+    operation()
+}
+
+pub(crate) async fn bounded_work<T>(future: impl Future<Output = Result<T>>) -> Result<T> {
+    if let Some(context) = work_context() {
+        check_work()?;
+        let result = tokio::select! { biased;
+            _ = context.cancellation.cancelled() => Err(crate::failure::transport_timeout_error()),
+            result = tokio::time::timeout_at(context.deadline, future) => result.map_err(|_| crate::failure::transport_timeout_error())?,
+        };
+        // A ready synchronous leaf can finish after the timeout was first polled.
+        check_work()?;
+        result
+    } else {
+        future.await
+    }
+}
+
+fn blocking_backoff(delay: Duration) -> Result<()> {
+    let end = Instant::now() + delay;
+    loop {
+        check_work()?;
+        let remaining = end.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(());
+        }
+        std::thread::sleep(remaining.min(Duration::from_millis(10)));
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct AttachmentOperationAuthority {
     authority_fingerprint: String,
@@ -275,6 +335,7 @@ where
     let mut last_error: Option<anyhow::Error> = None;
 
     for attempt in 1..=max_attempts {
+        check_work()?;
         match attempt_fn(attempt) {
             Ok(result) => {
                 record_success(operation_key);
@@ -283,7 +344,7 @@ where
             Err(error) if error.is_retryable() && attempt < max_attempts => {
                 let delay = next_delay(policy, jitter_identity.as_str(), attempt);
                 observability::emit_upload_retry(provider, operation, attempt, delay);
-                std::thread::sleep(delay);
+                blocking_backoff(delay)?;
                 last_error = Some(error.into_error());
             }
             Err(error) => {
@@ -337,7 +398,8 @@ where
     let mut last_error: Option<anyhow::Error> = None;
 
     for attempt in 1..=max_attempts {
-        match attempt_fn(attempt).await {
+        check_work()?;
+        match bounded_work(async { Ok(attempt_fn(attempt).await) }).await? {
             Ok(result) => {
                 record_success(operation_key);
                 return Ok(result);
@@ -345,7 +407,11 @@ where
             Err(error) if error.is_retryable() && attempt < max_attempts => {
                 let delay = next_delay(policy, jitter_identity.as_str(), attempt);
                 observability::emit_upload_retry(provider, operation, attempt, delay);
-                tokio::time::sleep(delay).await;
+                bounded_work(async {
+                    tokio::time::sleep(delay).await;
+                    Ok(())
+                })
+                .await?;
                 last_error = Some(error.into_error());
             }
             Err(error) => {
@@ -496,5 +562,67 @@ mod tests {
         assert!(lock_breaker_map(&map).is_empty());
         assert!(lock_breaker_map(&map).is_empty());
         assert!(!map.is_poisoned());
+    }
+}
+
+#[cfg(test)]
+mod r04_owned_work_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test(start_paused = true)]
+    async fn cancellation_during_retry_backoff_never_starts_another_attempt() {
+        let context =
+            crate::ProviderAttemptContext::new(crate::ProviderTimeoutPolicy::default(), false)
+                .unwrap();
+        let cancellation = context.cancellation.clone();
+        let attempts = AtomicUsize::new(0);
+        let mut policy = AttachmentRuntimePolicy::default();
+        policy.retry.initial_backoff_ms = 10_000;
+        policy.retry.max_backoff_ms = 10_000;
+        policy.retry.jitter_ms = 0;
+        let authority = AttachmentOperationAuthority::new("r04-stop", "url_fetch", "safe-endpoint");
+        let (result, _) = tokio::join!(
+            crate::with_provider_attempt_context(
+                context,
+                execute_with_retry_async("fixture", "url_fetch", &authority, &policy, |_| async {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    Err::<(), _>(AttachmentOperationError::retryable(anyhow!(
+                        "fixed retryable failure"
+                    )))
+                })
+            ),
+            async {
+                tokio::task::yield_now().await;
+                cancellation.cancel();
+            }
+        );
+        assert!(result.is_err());
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn blocking_retry_cancellation_is_observed_before_dispatch() {
+        let context =
+            crate::ProviderAttemptContext::new(crate::ProviderTimeoutPolicy::default(), false)
+                .unwrap();
+        context.cancellation.cancel();
+        let mut attempted = false;
+        let authority =
+            AttachmentOperationAuthority::new("r04-prestop", "url_fetch", "safe-endpoint");
+        let result = with_blocking_work_context(context, || {
+            execute_with_retry_blocking(
+                "fixture",
+                "url_fetch",
+                &authority,
+                &AttachmentRuntimePolicy::default(),
+                |_| {
+                    attempted = true;
+                    Ok(())
+                },
+            )
+        });
+        assert!(result.is_err());
+        assert!(!attempted);
     }
 }

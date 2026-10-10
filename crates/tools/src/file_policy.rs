@@ -268,6 +268,80 @@ pub enum FilePolicyDenyReason {
 pub struct FilePolicyChecker;
 
 impl FilePolicyChecker {
+    /// Read the already policy-bound file object, not a reopened pathname.
+    /// OS reads are finite chunks; cancellation prevents further reads/retries.
+    pub async fn read_accepted_bytes(
+        snapshot: TurnExecutionSecuritySnapshot,
+        requested_path: PathBuf,
+        max_bytes: usize,
+        context: pioneer_provider::ProviderAttemptContext,
+    ) -> Result<Vec<u8>, crate::ToolError> {
+        let cancellation = context.cancellation.child_token();
+        struct CancelOnDrop(tokio_util::sync::CancellationToken);
+        impl Drop for CancelOnDrop {
+            fn drop(&mut self) {
+                self.0.cancel();
+            }
+        }
+        let _owner = CancelOnDrop(cancellation.clone());
+        let deadline = context.deadline;
+        let worker = tokio::task::spawn_blocking(move || {
+            use std::io::Read;
+            let check = || {
+                if cancellation.is_cancelled() || std::time::Instant::now() >= deadline.into_std() {
+                    Err(crate::ToolError::TimedOut)
+                } else {
+                    Ok(())
+                }
+            };
+            check()?;
+            let grant = match Self::check_read(&snapshot, &requested_path) {
+                FilePolicyDecision::Allowed(grant) => grant,
+                FilePolicyDecision::Denied(_) => {
+                    return Err(crate::ToolError::Rejected(
+                        "accepted media path is denied by the Turn filesystem policy".to_owned(),
+                    ));
+                }
+            };
+            let mut file = grant.capability.open_regular_file().map_err(|_| {
+                crate::ToolError::execution_failed("accepted media file is unavailable")
+            })?;
+            let metadata = file.metadata().map_err(|_| {
+                crate::ToolError::execution_failed("accepted media file metadata is unavailable")
+            })?;
+            if !metadata.is_file() {
+                return Err(crate::ToolError::Rejected(
+                    "accepted media must be a regular file".to_owned(),
+                ));
+            }
+            if metadata.len() > max_bytes as u64 {
+                return Err(crate::ToolError::ResponseLimitExceeded);
+            }
+            let mut bytes = Vec::new();
+            let mut chunk = [0; 64 * 1024];
+            loop {
+                check()?;
+                let count = file.read(&mut chunk).map_err(|_| {
+                    crate::ToolError::execution_failed("accepted media file read failed")
+                })?;
+                if count == 0 {
+                    break;
+                }
+                if count > max_bytes.saturating_sub(bytes.len()) {
+                    return Err(crate::ToolError::ResponseLimitExceeded);
+                }
+                bytes.extend_from_slice(&chunk[..count]);
+            }
+            check()?;
+            Ok(bytes)
+        });
+        tokio::select! { biased;
+            _ = context.cancellation.cancelled() => Err(crate::ToolError::TimedOut),
+            result = tokio::time::timeout_at(deadline, worker) => result.map_err(|_| crate::ToolError::TimedOut)?
+                .map_err(|_| crate::ToolError::internal("accepted media file worker failed"))?,
+        }
+    }
+
     /// Returns the concrete roots authorized for the requested operation in
     /// this turn. Relative model paths always resolve from `sandbox.cwd`; the
     /// roots are the additional boundaries selected by Composer/security.
@@ -703,6 +777,54 @@ mod tests {
             )],
             1,
         )
+    }
+
+    #[tokio::test]
+    async fn accepted_read_is_bounded_policy_checked_and_stopped_before_open() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("SECRET-input.bin");
+        std::fs::write(&file, b"original accepted bytes").unwrap();
+        let snapshot = workspace_write_snapshot(root.path());
+        let context = || {
+            pioneer_provider::ProviderAttemptContext::new(
+                pioneer_provider::ProviderTimeoutPolicy::default(),
+                false,
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            FilePolicyChecker::read_accepted_bytes(snapshot.clone(), file.clone(), 1024, context())
+                .await
+                .unwrap(),
+            b"original accepted bytes"
+        );
+        assert!(matches!(
+            FilePolicyChecker::read_accepted_bytes(snapshot.clone(), file.clone(), 3, context())
+                .await,
+            Err(crate::ToolError::ResponseLimitExceeded)
+        ));
+        let stopped = context();
+        stopped.cancellation.cancel();
+        assert!(matches!(
+            FilePolicyChecker::read_accepted_bytes(
+                snapshot.clone(),
+                root.path().join("missing-SECRET"),
+                1024,
+                stopped
+            )
+            .await,
+            Err(crate::ToolError::TimedOut)
+        ));
+        let outside = tempfile::tempdir().unwrap();
+        let denied = FilePolicyChecker::read_accepted_bytes(
+            snapshot,
+            outside.path().join("SECRET"),
+            1024,
+            context(),
+        )
+        .await
+        .unwrap_err();
+        assert!(!format!("{denied:?} {denied}").contains("SECRET"));
     }
 
     #[test]

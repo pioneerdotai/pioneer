@@ -23,6 +23,212 @@ pub struct ResolvedAttachmentSource {
     pub source_name: Option<String>,
 }
 
+/// Async source I/O runs before bounded CPU normalization; redirects/retries
+/// spend the owning attempt allowance and retain production pinned-peer guards.
+pub(crate) async fn resolve_attachment_source_async(
+    provider: &str,
+    attachment: &MessageAttachment,
+    kind: InputContentType,
+    config: &AttachmentPipelineConfig,
+    limit: usize,
+) -> Result<ResolvedAttachmentSource> {
+    runtime::bounded_work(async {
+        runtime::check_work()?;
+        match &attachment.source {
+            AttachmentDataSource::Path { path } => {
+                use tokio::io::AsyncReadExt;
+                let canonical = tokio::fs::canonicalize(path).await.map_err(|_| AttachmentPipelineError::unsupported_attachment_source("file_open"))?;
+                if config.security.enforce_path_allowlist {
+                    let mut allowed = false;
+                    for root in &config.security.allowed_path_roots {
+                        runtime::check_work()?;
+                        if let Ok(root) = tokio::fs::canonicalize(root).await {
+                            allowed |= canonical.starts_with(root);
+                        }
+                    }
+                    if !allowed { return Err(AttachmentPipelineError::unsupported_attachment_source("path_outside_allowed_roots").into()); }
+                }
+                let mut file = tokio::fs::File::open(&canonical).await.map_err(|_| AttachmentPipelineError::unsupported_attachment_source("file_open"))?;
+                let metadata = file.metadata().await.map_err(|_| AttachmentPipelineError::unsupported_attachment_source("file_metadata"))?;
+                if !metadata.is_file() { return Err(AttachmentPipelineError::unsupported_attachment_source("regular_file_required").into()); }
+                if metadata.len() > limit as u64 { return Err(AttachmentPipelineError::attachment_too_large(metadata.len() as usize, limit, "path").into()); }
+                let mut bytes = Vec::new();
+                let mut chunk = [0; 64 * 1024];
+                loop {
+                    runtime::check_work()?;
+                    let count = file.read(&mut chunk).await.map_err(|_| AttachmentPipelineError::unsupported_attachment_source("file_read"))?;
+                    if count == 0 { break; }
+                    if count > limit.saturating_sub(bytes.len()) { return Err(AttachmentPipelineError::attachment_too_large(bytes.len().saturating_add(count), limit, "path").into()); }
+                    bytes.extend_from_slice(&chunk[..count]);
+                }
+                Ok(ResolvedAttachmentSource { bytes: Some(bytes), source: PreparedAttachmentSource::Bytes,
+                    source_label: "path:[redacted]".to_owned(), source_name: canonical.file_name().and_then(|s| s.to_str()).map(str::to_owned) })
+            }
+            AttachmentDataSource::Url { url } => {
+                let parsed = security::parse_url_without_dns(provider, url, &config.security)?;
+                #[cfg(test)]
+                let fixture = super::admission::current().and_then(|state| state.fixture_url(parsed.as_str()));
+                #[cfg(not(test))]
+                let fixture: Option<Vec<u8>> = None;
+                let bytes = match fixture {
+                    Some(bytes) if bytes.len() <= limit => bytes,
+                    Some(_) => return Err(AttachmentPipelineError::url_fetch_budget_exceeded(limit).into()),
+                    None => fetch_url_attachment_async(provider, parsed.clone(), &attachment.mime_type, config, limit).await?,
+                };
+                Ok(ResolvedAttachmentSource { bytes: Some(bytes), source: PreparedAttachmentSource::Bytes,
+                    source_label: "url:[redacted]".to_owned(), source_name: parsed.path_segments().and_then(|s| s.last()).filter(|s| !s.is_empty()).map(str::to_owned) })
+            }
+            _ => resolve_attachment_source(provider, attachment, kind, config, limit),
+        }
+    }).await
+}
+
+async fn fetch_url_attachment_async(
+    provider: &str,
+    mut url: Url,
+    expected_mime: &str,
+    config: &AttachmentPipelineConfig,
+    limit: usize,
+) -> Result<Vec<u8>> {
+    use futures_util::StreamExt;
+    let deadline = tokio::time::Instant::now()
+        + Duration::from_millis(config.security.url_fetch_timeout_ms.max(1));
+    tokio::time::timeout_at(deadline, async {
+        for redirect in 0..=config.security.max_url_redirects {
+            runtime::check_work()?;
+            security::validate_url_without_dns(provider, &url, &config.security)?;
+            let host = url
+                .host_str()
+                .ok_or_else(|| AttachmentPipelineError::url_source_blocked("missing host"))?;
+            let addresses =
+                tokio::net::lookup_host((host, url.port_or_known_default().unwrap_or(443)))
+                    .await
+                    .map_err(|_| AttachmentPipelineError::url_source_blocked("dns failure"))?;
+            let mut pinned = Vec::new();
+            for address in addresses {
+                if pinned.len() >= 64 {
+                    return Err(AttachmentPipelineError::url_source_blocked(
+                        "DNS cardinality limit",
+                    )
+                    .into());
+                }
+                security::validate_connected_peer(provider, address, &[address], &config.security)?;
+                if !pinned.contains(&address) {
+                    pinned.push(address);
+                }
+            }
+            if pinned.is_empty() {
+                return Err(AttachmentPipelineError::url_source_blocked("DNS empty").into());
+            }
+            let client = reqwest::Client::builder()
+                .redirect(RedirectPolicy::none())
+                .no_proxy()
+                .resolve_to_addrs(host, &pinned)
+                .build()
+                .map_err(|_| AttachmentPipelineError::url_source_blocked("client build"))?;
+            let authority = runtime::AttachmentOperationAuthority::new(
+                runtime::current_authority_fingerprint()?,
+                "url_fetch",
+                format!(
+                    "{}://{}:{}",
+                    url.scheme(),
+                    host,
+                    url.port_or_known_default().unwrap_or(443)
+                ),
+            );
+            let response = runtime::execute_with_retry_async(
+                provider,
+                "url_fetch",
+                &authority,
+                &config.runtime,
+                |_| async {
+                    let response = client
+                        .get(url.clone())
+                        .send()
+                        .await
+                        .map_err(classify_reqwest_error)?;
+                    let status = response.status();
+                    if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
+                    {
+                        return Err(AttachmentOperationError::retryable(
+                            crate::failure::ProviderTransportFailure {
+                                classification: crate::failure::classify_transport_status(
+                                    Some(status.as_u16()),
+                                    None,
+                                ),
+                            },
+                        ));
+                    }
+                    Ok(response)
+                },
+            )
+            .await?;
+            let peer = response
+                .remote_addr()
+                .ok_or_else(|| AttachmentPipelineError::url_source_blocked("missing peer"))?;
+            security::validate_connected_peer(provider, peer, &pinned, &config.security)?;
+            if response.status().is_redirection() {
+                if redirect == config.security.max_url_redirects {
+                    return Err(
+                        AttachmentPipelineError::url_redirect_blocked("redirect limit").into(),
+                    );
+                }
+                let next = response
+                    .headers()
+                    .get(reqwest::header::LOCATION)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| url.join(v).ok())
+                    .ok_or_else(|| {
+                        AttachmentPipelineError::url_redirect_blocked("invalid location")
+                    })?;
+                if url.scheme() == "https" && next.scheme() == "http" {
+                    return Err(AttachmentPipelineError::url_redirect_blocked("downgrade").into());
+                }
+                url = next;
+                continue;
+            }
+            if !response.status().is_success() {
+                return Err(crate::failure::ProviderTransportFailure {
+                    classification: crate::failure::classify_transport_status(
+                        Some(response.status().as_u16()),
+                        None,
+                    ),
+                }
+                .into());
+            }
+            validate_observed_content_type(
+                expected_mime,
+                response
+                    .headers()
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok()),
+                config,
+            )?;
+            let limit = limit.min(config.security.url_fetch_max_bytes);
+            if response
+                .content_length()
+                .is_some_and(|length| length > limit as u64)
+            {
+                return Err(AttachmentPipelineError::url_fetch_budget_exceeded(limit).into());
+            }
+            let mut bytes = Vec::new();
+            let mut stream = response.bytes_stream();
+            while let Some(chunk) = stream.next().await {
+                runtime::check_work()?;
+                let chunk = chunk.map_err(crate::failure::safe_transport_error)?;
+                if chunk.len() > limit.saturating_sub(bytes.len()) {
+                    return Err(AttachmentPipelineError::url_fetch_budget_exceeded(limit).into());
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            return Ok(bytes);
+        }
+        Err(AttachmentPipelineError::url_redirect_blocked("redirect failure").into())
+    })
+    .await
+    .map_err(|_| crate::failure::transport_timeout_error())?
+}
+
 pub fn resolve_attachment_source(
     provider_name: &str,
     attachment: &MessageAttachment,
@@ -90,7 +296,7 @@ pub fn resolve_attachment_source(
                 source: PreparedAttachmentSource::Path {
                     path: canonical.display().to_string(),
                 },
-                source_label: format!("path:{}", canonical.display()),
+                source_label: "path:[redacted]".to_owned(),
                 source_name,
             }
         }
@@ -145,7 +351,7 @@ pub fn resolve_attachment_source(
                 source: PreparedAttachmentSource::Reference {
                     reference: reference.clone(),
                 },
-                source_label: format!("ref:{reference}"),
+                source_label: "reference:[redacted]".to_owned(),
                 source_name: None,
             }
         }
@@ -155,8 +361,9 @@ pub fn resolve_attachment_source(
 }
 
 fn read_file_limited(path: &std::path::Path, max_bytes: usize) -> Result<Vec<u8>> {
-    let file = File::open(path)
-        .with_context(|| format!("failed to open attachment path `{}`", path.display()))?;
+    runtime::check_work()?;
+    let mut file = File::open(path)
+        .map_err(|_| AttachmentPipelineError::unsupported_attachment_source("file_open"))?;
     if let Ok(metadata) = file.metadata()
         && metadata.is_file()
         && metadata.len() > max_bytes as u64
@@ -164,21 +371,44 @@ fn read_file_limited(path: &std::path::Path, max_bytes: usize) -> Result<Vec<u8>
         return Err(AttachmentPipelineError::attachment_too_large(
             usize::try_from(metadata.len()).unwrap_or(usize::MAX),
             max_bytes,
-            path.display().to_string().as_str(),
+            "path",
+        )
+        .into());
+    }
+    if !file
+        .metadata()
+        .map_err(|_| AttachmentPipelineError::unsupported_attachment_source("file_metadata"))?
+        .is_file()
+    {
+        return Err(AttachmentPipelineError::unsupported_attachment_source(
+            "regular_file_required",
         )
         .into());
     }
     let mut bytes = Vec::new();
-    file.take(max_bytes.saturating_add(1) as u64)
-        .read_to_end(&mut bytes)
-        .with_context(|| format!("failed to read attachment path `{}`", path.display()))?;
+    let mut chunk = [0; 64 * 1024];
+    loop {
+        runtime::check_work()?;
+        let count = file
+            .read(&mut chunk)
+            .map_err(|_| AttachmentPipelineError::unsupported_attachment_source("file_read"))?;
+        if count == 0 {
+            break;
+        }
+        if count > max_bytes.saturating_sub(bytes.len()) {
+            return Err(AttachmentPipelineError::attachment_too_large(
+                bytes.len().saturating_add(count),
+                max_bytes,
+                "path",
+            )
+            .into());
+        }
+        bytes.extend_from_slice(&chunk[..count]);
+    }
     if bytes.len() > max_bytes {
-        return Err(AttachmentPipelineError::attachment_too_large(
-            bytes.len(),
-            max_bytes,
-            path.display().to_string().as_str(),
-        )
-        .into());
+        return Err(
+            AttachmentPipelineError::attachment_too_large(bytes.len(), max_bytes, "path").into(),
+        );
     }
     Ok(bytes)
 }
@@ -199,7 +429,10 @@ fn compact_base64(value: &str, max_chars: usize) -> Result<String> {
     }
 
     let mut normalized = String::with_capacity(value.len().min(max_chars));
-    for character in value.chars() {
+    for (index, character) in value.chars().enumerate() {
+        if index % 65_536 == 0 {
+            runtime::check_work()?;
+        }
         if character.is_ascii_whitespace() {
             continue;
         }
@@ -228,6 +461,7 @@ fn fetch_url_attachment(
     let expected_mime = normalize_mime(expected_mime)?;
 
     for redirect_index in 0..=config.security.max_url_redirects {
+        runtime::check_work()?;
         security::validate_url(provider_name, &current_url, &config.security)?;
         let host = current_url
             .host_str()
@@ -321,17 +555,7 @@ fn fetch_url_attachment(
         }
 
         if !response.status().is_success() {
-            let status = response.status();
-            let diagnostic_limit = response_limit.min(16 * 1024);
-            let body = read_response_limited(response, diagnostic_limit)?;
-            let body = String::from_utf8_lossy(&body);
-            let body_preview = body.chars().take(4_096).collect::<String>();
-            return Err(anyhow!(
-                "URL fetch failed for `{}` with status {}: {}",
-                security::safe_url_label(&current_url),
-                status,
-                body_preview
-            ));
+            return Err(AttachmentPipelineError::http_status(response.status().as_u16()).into());
         }
 
         validate_observed_content_type(
@@ -413,15 +637,16 @@ fn send_url_request(
 }
 
 fn classify_reqwest_error(error: reqwest::Error) -> AttachmentOperationError {
-    if error.is_timeout() {
-        return AttachmentOperationError::retryable(anyhow!("attachment URL request timed out"));
+    let retryable = error.is_timeout()
+        || error.is_connect()
+        || error.is_request()
+        || error.is_body()
+        || error.is_decode();
+    let safe = crate::failure::safe_transport_error(error);
+    if retryable {
+        return AttachmentOperationError::retryable(safe);
     }
-    if error.is_connect() || error.is_request() || error.is_body() || error.is_decode() {
-        return AttachmentOperationError::retryable(anyhow!(
-            "attachment URL request failed during transport"
-        ));
-    }
-    AttachmentOperationError::non_retryable(anyhow!("attachment URL request failed"))
+    AttachmentOperationError::non_retryable(safe)
 }
 
 fn build_blocking_client(
@@ -441,7 +666,9 @@ fn build_blocking_client(
 fn read_response_limited(response: BlockingResponse, max_bytes: usize) -> Result<Vec<u8>> {
     let mut buffer = Vec::new();
     let mut limited = response.take((max_bytes.saturating_add(1)) as u64);
-    limited.read_to_end(&mut buffer)?;
+    limited
+        .read_to_end(&mut buffer)
+        .map_err(|_| AttachmentPipelineError::unsupported_attachment_source("response_read"))?;
     if buffer.len() > max_bytes {
         return Err(AttachmentPipelineError::url_fetch_budget_exceeded(max_bytes).into());
     }
@@ -572,7 +799,7 @@ mod tests {
     }
 
     #[test]
-    fn chunked_http_error_body_is_bounded_before_diagnostic_materialization() {
+    fn chunked_http_error_body_is_never_materialized_for_diagnostics() {
         let (url, server) = chunked_response_server(
             "this diagnostic body is deliberately larger than the attachment budget",
         );
@@ -598,8 +825,238 @@ mod tests {
             })
             .expect_err("oversized chunked error diagnostics must be rejected");
 
-        assert!(error.to_string().contains("URL_FETCH_BUDGET_EXCEEDED"));
+        assert!(error.to_string().contains("URL_FETCH_HTTP_ERROR"));
         assert!(!error.to_string().contains("deliberately larger"));
         server.join().expect("attachment test server");
+    }
+}
+
+#[cfg(test)]
+mod r04_source_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn original_url_ingress_is_read_once_and_owned_bytes_ignore_changed_response() {
+        let state = std::sync::Arc::new(super::super::admission::AdmissionState::default());
+        let url = "https://example.com/original?token=SECRET";
+        let original = b"original immutable bytes";
+        let mut config = AttachmentPipelineConfig::default();
+        config.security.allow_url_sources = true;
+        config.security.url_allowed_domains = vec!["example.com".into()];
+        for kind in [
+            InputContentType::Image,
+            InputContentType::File,
+            InputContentType::Audio,
+            InputContentType::Video,
+        ] {
+            state
+                .url_fixtures
+                .write()
+                .unwrap()
+                .insert(url.into(), original.to_vec());
+            let source = MessageAttachment::from_url(url, "application/octet-stream");
+            let bytes = super::super::admission::scope(
+                state.clone(),
+                super::super::read_accepted_source_bytes(
+                    "fixture",
+                    "r04-url-ingress".into(),
+                    &source,
+                    kind,
+                    &config,
+                    1024,
+                ),
+            )
+            .await
+            .unwrap();
+            assert_eq!(bytes, original);
+            state
+                .url_fixtures
+                .write()
+                .unwrap()
+                .insert(url.into(), b"replacement".to_vec());
+            let owned = MessageAttachment {
+                source: super::super::owned_bytes_source(&bytes),
+                sha256: Some(resolve_sha256(None, Some(&bytes), "source").unwrap()),
+                ..source
+            };
+            let replay = super::super::admission::scope(
+                state.clone(),
+                super::super::read_accepted_source_bytes(
+                    "fixture",
+                    "r04-url-ingress".into(),
+                    &owned,
+                    kind,
+                    &config,
+                    1024,
+                ),
+            )
+            .await
+            .unwrap();
+            assert_eq!(replay, original);
+        }
+        assert_eq!(
+            state.url_reads.load(std::sync::atomic::Ordering::Relaxed),
+            4
+        );
+        let mut mismatched = MessageAttachment::from_url(url, "application/octet-stream");
+        mismatched.sha256 = Some("wrong-SECRET-hash".into());
+        let error = super::super::admission::scope(
+            state,
+            super::super::read_accepted_source_bytes(
+                "fixture",
+                "r04-url-ingress".into(),
+                &mismatched,
+                InputContentType::File,
+                &config,
+                1024,
+            ),
+        )
+        .await
+        .unwrap_err();
+        assert!(!format!("{error:#?}").contains("SECRET"));
+    }
+
+    #[tokio::test]
+    async fn stopped_source_does_not_open_path_or_resolve_url_and_diagnostics_are_safe() {
+        let context =
+            crate::ProviderAttemptContext::new(crate::ProviderTimeoutPolicy::default(), false)
+                .unwrap();
+        context.cancellation.cancel();
+        let config = AttachmentPipelineConfig::default();
+        for attachment in [
+            MessageAttachment::from_path("/private/SECRET/missing.png", "image/png"),
+            MessageAttachment::from_url(
+                "https://user:SECRET@example.invalid/object?token=SECRET",
+                "image/png",
+            ),
+        ] {
+            let child = crate::ProviderAttemptContext {
+                cancellation: context.cancellation.child_token(),
+                ..context.clone()
+            };
+            let error = crate::with_provider_attempt_context(
+                child,
+                resolve_attachment_source_async(
+                    "fixture",
+                    &attachment,
+                    InputContentType::Image,
+                    &config,
+                    1024,
+                ),
+            )
+            .await
+            .unwrap_err();
+            assert!(crate::failure::classify_transport_error(&error).is_some());
+            assert!(!format!("{error:#?}").contains("SECRET"));
+        }
+    }
+
+    #[tokio::test]
+    async fn async_file_read_is_bounded_and_rejects_declared_hash_mismatch() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("SECRET-file.bin");
+        tokio::fs::write(&path, b"original bytes").await.unwrap();
+        let attachment =
+            MessageAttachment::from_path(path.to_string_lossy(), "application/octet-stream");
+        let config = AttachmentPipelineConfig::default();
+        let error = resolve_attachment_source_async(
+            "fixture",
+            &attachment,
+            InputContentType::File,
+            &config,
+            3,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("ATTACHMENT_TOO_LARGE"));
+        assert!(!format!("{error:#?}").contains("SECRET"));
+        let source = resolve_attachment_source_async(
+            "fixture",
+            &attachment,
+            InputContentType::File,
+            &config,
+            1024,
+        )
+        .await
+        .unwrap();
+        assert_eq!(source.bytes.as_deref(), Some(b"original bytes".as_slice()));
+        assert!(
+            resolve_sha256(Some("wrong-SECRET-hash"), source.bytes.as_deref(), "source").is_err()
+        );
+        let hash_error =
+            resolve_sha256(Some("wrong-SECRET-hash"), source.bytes.as_deref(), "source")
+                .unwrap_err();
+        assert!(!format!("{hash_error:#?}").contains("SECRET"));
+    }
+
+    #[tokio::test]
+    async fn stop_cancels_a_stalled_body_without_another_fetch() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let headers_written = std::sync::Arc::new(tokio::sync::Notify::new());
+        let notify = headers_written.clone();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buffer = [0; 4096];
+            socket.read(&mut buffer).await.unwrap();
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nTransfer-Encoding: chunked\r\n\r\n").await.unwrap();
+            notify.notify_one();
+            std::future::pending::<()>().await;
+        });
+        let context =
+            crate::ProviderAttemptContext::new(crate::ProviderTimeoutPolicy::default(), false)
+                .unwrap();
+        let mut config = AttachmentPipelineConfig::default();
+        config.security.allow_url_sources = true;
+        config.security.allow_http = true;
+        config.security.allow_private_network = true; // fixture-only explicit authority
+        config.security.url_allowed_domains = vec!["127.0.0.1".into()];
+        let attachment = MessageAttachment::from_url(
+            format!("http://{address}/source?token=SECRET"),
+            "application/octet-stream",
+        );
+        let cancel = context.cancellation.clone();
+        let (result, ()) = tokio::join!(
+            crate::with_provider_attempt_context(
+                context,
+                runtime::with_async_authority_scope(
+                    "r04-stalled-test".into(),
+                    resolve_attachment_source_async(
+                        "fixture",
+                        &attachment,
+                        InputContentType::File,
+                        &config,
+                        1024
+                    )
+                )
+            ),
+            async {
+                headers_written.notified().await;
+                cancel.cancel();
+            }
+        );
+        let error = result.unwrap_err();
+        assert!(crate::failure::classify_transport_error(&error).is_some());
+        assert!(!format!("{error:#?}").contains("SECRET"));
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+    }
+
+    #[test]
+    fn locator_and_body_fields_never_enter_typed_attachment_diagnostics() {
+        for error in [
+            AttachmentPipelineError::unsupported_attachment_source("/private/SECRET"),
+            AttachmentPipelineError::url_fetch_timeout(
+                "https://user:SECRET@host/path?token=SECRET",
+                5,
+            ),
+            AttachmentPipelineError::retry_exhausted("upload", 3, "upstream SECRET body"),
+            AttachmentPipelineError::invalid_file_name("/private/SECRET"),
+            AttachmentPipelineError::invalid_mime("application/SECRET"),
+            AttachmentPipelineError::contract_violation("nested SECRET chain"),
+        ] {
+            assert!(!format!("{error:?} {error}").contains("SECRET"));
+        }
     }
 }

@@ -8,17 +8,17 @@ pub struct AttachmentPipelineError {
 }
 
 impl AttachmentPipelineError {
-    pub fn new(code: &'static str, message: impl Into<String>) -> Self {
+    fn new(code: &'static str, message: impl Into<String>) -> Self {
         Self {
             code,
             message: message.into(),
         }
     }
 
-    pub fn attachment_too_large(size: usize, max_size: usize, label: &str) -> Self {
+    pub fn attachment_too_large(size: usize, max_size: usize, _label: &str) -> Self {
         Self::new(
             "ATTACHMENT_TOO_LARGE",
-            format!("attachment `{label}` is too large: {size} bytes exceeds max {max_size} bytes"),
+            format!("attachment is too large: {size} bytes exceeds max {max_size} bytes"),
         )
     }
 
@@ -31,12 +31,10 @@ impl AttachmentPipelineError {
         )
     }
 
-    pub fn declared_size_mismatch(declared: u64, actual: usize, label: &str) -> Self {
+    pub fn declared_size_mismatch(declared: u64, actual: usize, _label: &str) -> Self {
         Self::new(
             "ATTACHMENT_SIZE_MISMATCH",
-            format!(
-                "attachment `{label}` declared {declared} bytes but materialized {actual} bytes"
-            ),
+            format!("attachment declared {declared} bytes but materialized {actual} bytes"),
         )
     }
 
@@ -47,48 +45,52 @@ impl AttachmentPipelineError {
         )
     }
 
-    pub fn unsupported_attachment_source(source: &str) -> Self {
+    pub fn unsupported_attachment_source(_source: &str) -> Self {
         Self::new(
             "UNSUPPORTED_ATTACHMENT_SOURCE",
-            format!("attachment source `{source}` is not supported"),
+            "attachment source is not supported",
         )
     }
 
-    pub fn invalid_mime(mime: &str) -> Self {
-        Self::new(
-            "INVALID_MIME",
-            format!("attachment mime_type must be a valid MIME value: `{mime}`"),
-        )
+    pub fn invalid_mime(_mime: &str) -> Self {
+        Self::new("INVALID_MIME", "attachment mime_type is invalid")
     }
 
-    pub fn mime_mismatch(declared: &str, sniffed: &str) -> Self {
+    pub fn mime_mismatch(_declared: &str, _sniffed: &str) -> Self {
         Self::new(
             "MIME_MISMATCH",
-            format!(
-                "attachment mime mismatch: declared `{declared}` but content looks like `{sniffed}`"
-            ),
+            "attachment content does not match declared MIME",
         )
     }
 
-    pub fn invalid_file_name(name: &str) -> Self {
-        Self::new(
-            "INVALID_FILENAME",
-            format!("attachment filename `{name}` is invalid after normalization"),
-        )
+    pub fn invalid_file_name(_name: &str) -> Self {
+        Self::new("INVALID_FILENAME", "attachment filename is invalid")
     }
 
     pub fn url_source_blocked(reason: impl Into<String>) -> Self {
-        Self::new("URL_SOURCE_BLOCKED", reason)
+        let reason = reason.into();
+        let safe = match reason.as_str() {
+            "private IP blocked" => "private IP blocked",
+            "connected peer does not match the pinned DNS decision" => {
+                "connected peer does not match the pinned DNS decision"
+            }
+            "URL userinfo is forbidden" => "URL userinfo is forbidden",
+            _ => "attachment URL source blocked by policy",
+        };
+        Self::new("URL_SOURCE_BLOCKED", safe)
     }
 
-    pub fn url_redirect_blocked(reason: impl Into<String>) -> Self {
-        Self::new("URL_REDIRECT_BLOCKED", reason)
+    pub fn url_redirect_blocked(_reason: impl Into<String>) -> Self {
+        Self::new(
+            "URL_REDIRECT_BLOCKED",
+            "attachment URL redirect blocked by policy",
+        )
     }
 
-    pub fn url_fetch_timeout(url: &str, timeout_ms: u64) -> Self {
+    pub fn url_fetch_timeout(_url: &str, timeout_ms: u64) -> Self {
         Self::new(
             "URL_FETCH_TIMEOUT",
-            format!("attachment URL fetch timed out for `{url}` after {timeout_ms}ms"),
+            format!("attachment URL fetch timed out after {timeout_ms}ms"),
         )
     }
 
@@ -99,26 +101,32 @@ impl AttachmentPipelineError {
         )
     }
 
-    pub fn retry_exhausted(operation: &str, attempts: usize, reason: &str) -> Self {
+    pub fn retry_exhausted(_operation: &str, attempts: usize, _reason: &str) -> Self {
         Self::new(
             "ATTACHMENT_RETRY_EXHAUSTED",
-            format!(
-                "attachment operation `{operation}` exhausted after {attempts} attempt(s): {reason}"
-            ),
+            format!("attachment operation exhausted after {attempts} attempt(s)"),
         )
     }
 
-    pub fn circuit_breaker_open(operation: &str, retry_after_ms: u64) -> Self {
+    pub fn circuit_breaker_open(_operation: &str, retry_after_ms: u64) -> Self {
         Self::new(
             "ATTACHMENT_CIRCUIT_BREAKER_OPEN",
-            format!(
-                "attachment operation `{operation}` is blocked by circuit breaker for {retry_after_ms}ms"
-            ),
+            format!("attachment operation is blocked by circuit breaker for {retry_after_ms}ms"),
         )
     }
 
-    pub fn contract_violation(message: impl Into<String>) -> Self {
-        Self::new("ATTACHMENT_PIPELINE_CONTRACT_VIOLATION", message)
+    pub fn contract_violation(_message: impl Into<String>) -> Self {
+        Self::new(
+            "ATTACHMENT_PIPELINE_CONTRACT_VIOLATION",
+            "attachment contract rejected",
+        )
+    }
+
+    pub fn http_status(status: u16) -> Self {
+        Self::new(
+            "URL_FETCH_HTTP_ERROR",
+            format!("attachment URL returned HTTP {status}"),
+        )
     }
 
     pub fn code(&self) -> &'static str {

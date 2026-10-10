@@ -217,6 +217,16 @@ fn redacted_endpoint_error(
     if error.is::<RedactedEndpointError>() {
         return error;
     }
+    if let Some(classification) = crate::failure::classify_transport_error(&error) {
+        // Owned attachment cancellation is a transport fact even when the
+        // preparation stage added a static media-policy context.
+        let observed = crate::usage::error_usage(&error).cloned();
+        let safe = crate::failure::ProviderTransportFailure { classification }.into();
+        return match observed {
+            Some(usage) => crate::usage::with_error_usage(safe, &usage),
+            None => safe,
+        };
+    }
     if let Some(rejection) = error.downcast_ref::<crate::attachments::MediaInputRejection>() {
         // Keep only the controlled diagnostic, dropping any raw context chain.
         return rejection.clone().into();
@@ -3807,3 +3817,63 @@ mod stream_error_redaction_tests {
 #[cfg(test)]
 #[path = "registry_wire_tests.rs"]
 mod wire_contract_tests;
+
+#[cfg(test)]
+mod r04_failure_receipt_tests {
+    use super::*;
+    struct Fixture;
+    #[async_trait::async_trait]
+    impl crate::Provider for Fixture {
+        fn name(&self) -> &str {
+            "fixture"
+        }
+        async fn chat(&self, _: crate::ChatRequest) -> anyhow::Result<crate::ChatResponse> {
+            anyhow::bail!("unused fixture")
+        }
+        async fn stream_chat(
+            &self,
+            _: crate::ChatRequest,
+        ) -> anyhow::Result<
+            futures_util::stream::BoxStream<'static, anyhow::Result<crate::StreamChunk>>,
+        > {
+            anyhow::bail!("unused fixture")
+        }
+    }
+    #[test]
+    fn typed_media_transport_redaction_preserves_confirmed_error_usage() {
+        let mut classification = crate::ProviderFailureClassification::new(
+            pioneer_protocol::ProviderFailureClass::ProviderRejected,
+        );
+        classification.provider_code =
+            Some(crate::failure::REJECTED_CACHED_FILE_REFERENCE_CODE.into());
+        let usage = crate::TokenUsage {
+            input_tokens: Some(7),
+            output_tokens: Some(3),
+            ..Default::default()
+        };
+        let raw = anyhow::Error::new(crate::failure::ProviderTransportFailure { classification })
+            .context("SECRET source chain");
+        let wrapped = crate::usage::with_error_usage(raw, &usage);
+        let safe = redacted_endpoint_error(
+            &Fixture,
+            wrapped,
+            pioneer_protocol::ProviderFailureStage::Connect,
+        );
+        assert_eq!(
+            crate::usage::error_usage(&safe).unwrap().input_tokens,
+            Some(7)
+        );
+        assert_eq!(
+            crate::usage::error_usage(&safe).unwrap().output_tokens,
+            Some(3)
+        );
+        assert_eq!(
+            crate::failure::classify_transport_error(&safe)
+                .unwrap()
+                .provider_code
+                .as_deref(),
+            Some(crate::failure::REJECTED_CACHED_FILE_REFERENCE_CODE)
+        );
+        assert!(!format!("{safe:#?}").contains("SECRET"));
+    }
+}
