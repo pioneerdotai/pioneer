@@ -1,6 +1,6 @@
 //! Schema only: no legacy scan, backfill, expiry or physical cleanup.
 use sea_orm_migration::prelude::*;
-use sea_orm_migration::sea_query::{Expr, ExprTrait, Func};
+use sea_orm_migration::sea_query::{Expr, ExprTrait};
 #[derive(DeriveMigrationName)]
 pub struct Migration;
 #[async_trait::async_trait]
@@ -172,28 +172,10 @@ impl MigrationTrait for Migration {
                 .to_owned(),
         )
         .await?;
-        m.create_index(
-            Index::create()
-                .name("checkpoint_replay_alias_identity")
-                .table(Alias::new("compaction_checkpoint_replay_alias"))
-                .unique()
-                .col("checkpoint_id")
-                .col("covered_thread")
-                .col("covered_scope")
-                .col("covered_id")
-                .col("covered_version")
-                .col("replay_thread")
-                .col("replay_scope")
-                .col("replay_id")
-                .col("replay_version")
-                .col(Expr::col(Alias::new("tool_item_id")).is_null())
-                .col(Func::coalesce([
-                    Expr::col(Alias::new("tool_item_id")),
-                    Expr::val(""),
-                ]))
-                .to_owned(),
-        )
-        .await?;
+        // SeaQuery 1.0's SQLite index builder panics on expression columns.
+        // Both expressions are needed to distinguish NULL from an empty ID
+        // while rejecting duplicate aliases with either nullable identity.
+        m.get_connection().execute_unprepared(r#"CREATE UNIQUE INDEX checkpoint_replay_alias_identity ON compaction_checkpoint_replay_alias(checkpoint_id,covered_thread,covered_scope,covered_id,covered_version,replay_thread,replay_scope,replay_id,replay_version, (tool_item_id IS NULL), COALESCE(tool_item_id,''))"#).await?;
         m.create_table(
             Table::create()
                 .table(Alias::new("compaction_checkpoint_event_input"))
