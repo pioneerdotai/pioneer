@@ -67,6 +67,9 @@ pub fn create_provider_with_timeout_policy_and_proxy(
     timeout_policy: ProviderTimeoutPolicy,
     proxy_url: Option<&str>,
 ) -> Result<Box<dyn Provider>> {
+    let azure = (provider_definition(provider_name).is_some_and(|d| d.name == "azure-openai"))
+        .then(|| crate::AzureResolvedConnection::from_environment(None))
+        .transpose()?;
     let mut digest = Sha256::new();
     digest.update(b"pioneer-provider-authority-v1");
     digest.update([0]);
@@ -77,18 +80,25 @@ pub fn create_provider_with_timeout_policy_and_proxy(
     digest.update(api_key.as_bytes());
     digest.update([0]);
     digest.update(proxy_url.unwrap_or("<direct>").as_bytes());
-    hash_connection_environment(&mut digest, provider_name);
+    if let Some(connection) = &azure {
+        connection.hash_into(&mut digest);
+    } else {
+        hash_connection_environment(&mut digest, provider_name);
+    }
     let authority_fingerprint = hex::encode(digest.finalize());
-    create_provider_with_timeout_policy_and_proxy_and_authority(
+    create_provider_with_timeout_policy_and_proxy_and_base_url_and_resolved_azure(
         provider_name,
         api_key,
         timeout_policy,
         proxy_url,
+        None,
         authority_fingerprint.as_str(),
+        azure.as_ref(),
     )
     .map(|inner| crate::registry::bind_direct_provider(inner, &authority_fingerprint))
 }
 
+#[cfg(test)]
 pub(crate) fn create_provider_with_timeout_policy_and_proxy_and_base_url_and_authority(
     provider_name: &str,
     api_key: &str,
@@ -97,6 +107,50 @@ pub(crate) fn create_provider_with_timeout_policy_and_proxy_and_base_url_and_aut
     base_url: Option<&str>,
     authority_fingerprint: &str,
 ) -> Result<Box<dyn Provider>> {
+    create_provider_with_timeout_policy_and_proxy_and_base_url_and_resolved_azure(
+        provider_name,
+        api_key,
+        timeout_policy,
+        proxy_url,
+        base_url,
+        authority_fingerprint,
+        None,
+    )
+}
+
+pub(crate) fn create_provider_with_timeout_policy_and_proxy_and_base_url_and_resolved_azure(
+    provider_name: &str,
+    api_key: &str,
+    timeout_policy: ProviderTimeoutPolicy,
+    proxy_url: Option<&str>,
+    base_url: Option<&str>,
+    authority_fingerprint: &str,
+    azure: Option<&crate::AzureResolvedConnection>,
+) -> Result<Box<dyn Provider>> {
+    let resolved;
+    let azure = if provider_definition(provider_name).is_some_and(|d| d.name == "azure-openai") {
+        match azure {
+            Some(connection) => {
+                connection.validate(true)?;
+                anyhow::ensure!(
+                    connection.configured_base_url.as_deref()
+                        == base_url.map(|value| value.trim_end_matches('/')),
+                    "accepted Azure gateway route changed"
+                );
+                Some(connection)
+            }
+            None => {
+                resolved = crate::AzureResolvedConnection::from_environment(base_url)?;
+                Some(&resolved)
+            }
+        }
+    } else {
+        anyhow::ensure!(
+            azure.is_none(),
+            "accepted Azure configuration belongs to another provider"
+        );
+        None
+    };
     let proxy_url = proxy_url.map(crate::http::validate_proxy_url).transpose()?;
     let base_url = base_url
         .map(|url| validate_provider_base_url(provider_name, url))
@@ -108,25 +162,9 @@ pub(crate) fn create_provider_with_timeout_policy_and_proxy_and_base_url_and_aut
             timeout_policy,
             base_url.as_deref(),
             authority_fingerprint,
+            azure,
         )
     })
-}
-
-pub(crate) fn create_provider_with_timeout_policy_and_proxy_and_authority(
-    provider_name: &str,
-    api_key: &str,
-    timeout_policy: ProviderTimeoutPolicy,
-    proxy_url: Option<&str>,
-    authority_fingerprint: &str,
-) -> Result<Box<dyn Provider>> {
-    create_provider_with_timeout_policy_and_proxy_and_base_url_and_authority(
-        provider_name,
-        api_key,
-        timeout_policy,
-        proxy_url,
-        None,
-        authority_fingerprint,
-    )
 }
 
 fn create_provider_with_timeout_policy_inner(
@@ -135,6 +173,7 @@ fn create_provider_with_timeout_policy_inner(
     timeout_policy: ProviderTimeoutPolicy,
     base_url: Option<&str>,
     authority_fingerprint: &str,
+    azure: Option<&crate::AzureResolvedConnection>,
 ) -> Result<Box<dyn Provider>> {
     let definition =
         provider_definition(provider_name).ok_or_else(|| anyhow::anyhow!("unknown provider"))?;
@@ -240,31 +279,13 @@ fn create_provider_with_timeout_policy_inner(
 
         // ── Azure OpenAI ────────────────────────────────────────────────
         "azure-openai" => {
-            // Azure requires resource_name and deployment_name; for the
-            // simple factory we pass api_key as the key and expect env
-            // configuration for the rest.
-            let resource = std::env::var("AZURE_OPENAI_RESOURCE").unwrap_or_default();
-            let deployment = std::env::var("AZURE_OPENAI_DEPLOYMENT").unwrap_or_default();
-            let version = std::env::var("AZURE_OPENAI_API_VERSION").ok();
-            let provider = if let Some(base_url) = base_url {
-                AzureOpenAiProvider::with_base_url_and_timeout_policy(
-                    api_key,
-                    resource,
-                    deployment,
-                    base_url,
-                    timeout_policy,
-                )
-            } else {
-                AzureOpenAiProvider::with_timeout_policy(
-                    api_key,
-                    resource,
-                    deployment,
-                    timeout_policy,
-                )
-            }
-            .with_version_override(version.as_deref());
-            provider.validate_connection(true)?;
-            Ok(Box::new(provider))
+            let connection =
+                azure.ok_or_else(|| anyhow::anyhow!("Azure connection is unresolved"))?;
+            Ok(Box::new(AzureOpenAiProvider::from_resolved_connection(
+                api_key,
+                connection,
+                timeout_policy,
+            )?))
         }
 
         "deepseek" => Ok(Box::new(

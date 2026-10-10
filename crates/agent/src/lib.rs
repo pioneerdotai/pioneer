@@ -1312,6 +1312,7 @@ pub struct RestoredRecoveryTurnRequest {
     pub hook_runtime_context: AgentTurnHookRuntimeContext,
     pub model: String,
     pub provider_name: String,
+    pub azure_connection: Option<pioneer_provider::AzureResolvedConnection>,
     pub reasoning: Option<ReasoningConfig>,
     pub workspace_skill_policies: HashMap<SkillPolicyKey, WorkspaceSkillPolicy>,
     pub skill_catalog: SkillCatalogSnapshot,
@@ -1356,6 +1357,7 @@ struct ActiveTurnRequest {
     hook_runtime_context: AgentTurnHookRuntimeContext,
     model: String,
     provider_name: String,
+    azure_connection: Option<pioneer_provider::AzureResolvedConnection>,
     reasoning: Option<ReasoningConfig>,
     workspace_skill_policies: HashMap<SkillPolicyKey, WorkspaceSkillPolicy>,
     skill_catalog: SkillCatalogSnapshot,
@@ -1888,6 +1890,7 @@ enum AgentCommand {
         hook_runtime_context: AgentTurnHookRuntimeContext,
         model: String,
         provider_name: String,
+        azure_connection: Option<pioneer_provider::AzureResolvedConnection>,
         reasoning: Option<ReasoningConfig>,
         workspace_skill_policies: HashMap<SkillPolicyKey, WorkspaceSkillPolicy>,
         skill_catalog: SkillCatalogSnapshot,
@@ -3285,6 +3288,7 @@ impl AgentManager {
             AgentTurnHookRuntimeContext::default(),
             model,
             provider_name,
+            None,
             workspace_skill_policies,
             skill_catalog,
             agent_skill_overlay,
@@ -3454,6 +3458,7 @@ impl AgentManager {
             hook_runtime_context,
             model,
             provider_name,
+            None,
             workspace_skill_policies,
             skill_catalog,
             agent_skill_overlay,
@@ -3540,6 +3545,7 @@ impl AgentManager {
             hook_runtime_context,
             model,
             provider_name,
+            None,
             workspace_skill_policies,
             skill_catalog,
             agent_skill_overlay,
@@ -3556,6 +3562,45 @@ impl AgentManager {
         .await
     }
 
+    /// Dispatch the exact owned native admission inputs restored by the Gateway.
+    pub async fn start_admitted_native_turn(
+        &self,
+        thread_id: &str,
+        request: RestoredRecoveryTurnRequest,
+        execution_checkpoint_context: Option<ExecutionCheckpointContext>,
+    ) -> Result<(), AgentStartError> {
+        if pioneer_provider::provider_definition(&request.provider_name)
+            .is_some_and(|definition| definition.name == "azure-openai")
+            && request.azure_connection.is_none()
+        {
+            return Err(AgentStartError::Internal(
+                "native Azure admission is missing its accepted connection".to_owned(),
+            ));
+        }
+        self.start_turn_with_hook_context_and_execution_checkpoint_and_reasoning(
+            thread_id,
+            &request.turn_id,
+            request.mode,
+            request.hook_runtime_context,
+            &request.model,
+            &request.provider_name,
+            request.azure_connection,
+            request.workspace_skill_policies,
+            request.skill_catalog,
+            request.agent_skill_overlay,
+            request.input,
+            request.capabilities,
+            request.resolved_artifacts,
+            request.runtime_environment,
+            request.history,
+            execution_checkpoint_context,
+            request.reasoning,
+            request.permission_profile,
+            request.execution_security_snapshot,
+        )
+        .await
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn start_turn_with_hook_context_and_execution_checkpoint_and_reasoning(
         &self,
@@ -3565,6 +3610,7 @@ impl AgentManager {
         hook_runtime_context: AgentTurnHookRuntimeContext,
         model: &str,
         provider_name: &str,
+        azure_connection: Option<pioneer_provider::AzureResolvedConnection>,
         workspace_skill_policies: HashMap<SkillPolicyKey, WorkspaceSkillPolicy>,
         skill_catalog: SkillCatalogSnapshot,
         agent_skill_overlay: Vec<AgentSkillRuntimeEntry>,
@@ -3609,6 +3655,7 @@ impl AgentManager {
             hook_runtime_context,
             model: model.to_owned(),
             provider_name: provider_name.to_owned(),
+            azure_connection,
             reasoning,
             workspace_skill_policies,
             skill_catalog,

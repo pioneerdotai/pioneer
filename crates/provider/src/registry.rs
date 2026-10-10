@@ -12,8 +12,6 @@ use async_trait::async_trait;
 use futures_util::{StreamExt, stream::BoxStream};
 use sha2::{Digest, Sha256};
 
-use crate::factory::create_provider_with_timeout_policy_and_proxy_and_base_url_and_authority;
-
 use crate::traits::{Provider, ProviderWarmupOutcome};
 use crate::types::{
     ChatRequest, ChatResponse, EmbeddingRequest, EmbeddingResponse, ProviderCapabilities,
@@ -117,11 +115,24 @@ impl Display for ProviderRegistryDefinitionCapacityExceeded {
 impl Error for ProviderRegistryDefinitionCapacityExceeded {}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct ProviderAuthorityFingerprint(String);
-
+pub struct ProviderAuthorityFingerprint {
+    value: String,
+    revocation_identity: String,
+    azure_connection: Option<crate::AzureResolvedConnection>,
+}
 impl ProviderAuthorityFingerprint {
+    fn opaque(value: String) -> Self {
+        Self {
+            revocation_identity: value.clone(),
+            value,
+            azure_connection: None,
+        }
+    }
     pub fn as_str(&self) -> &str {
-        self.0.as_str()
+        &self.value
+    }
+    pub fn azure_connection(&self) -> Option<&crate::AzureResolvedConnection> {
+        self.azure_connection.as_ref()
     }
 }
 
@@ -393,7 +404,9 @@ pub(crate) fn bind_direct_provider(
 ) -> Box<dyn Provider> {
     Box::new(AuthorityBoundProvider {
         inner: Arc::from(inner),
-        authority_fingerprint: ProviderAuthorityFingerprint(authority_fingerprint.to_owned()),
+        authority_fingerprint: ProviderAuthorityFingerprint::opaque(
+            authority_fingerprint.to_owned(),
+        ),
         revoked: Arc::new(AtomicBool::new(false)),
         redact_endpoint_errors: false,
         input_admission: Arc::new(Default::default()),
@@ -421,6 +434,10 @@ impl Provider for AuthorityBoundProvider {
 
     fn authority_fingerprint(&self) -> Option<&str> {
         Some(self.authority_fingerprint.as_str())
+    }
+
+    fn resolved_azure_connection(&self) -> Option<crate::AzureResolvedConnection> {
+        self.inner.resolved_azure_connection()
     }
 
     fn capabilities(&self) -> ProviderCapabilities {
@@ -851,9 +868,50 @@ impl ProviderRegistry {
         Self::revoke_matching(&mut cache, |existing| {
             existing.workspace_id.as_deref() == Some(workspace_id)
                 && existing.provider_name == provider_name
-                && existing.authority_fingerprint != fingerprint
+                && existing.authority_fingerprint.revocation_identity
+                    != fingerprint.revocation_identity
         });
         Ok(fingerprint)
+    }
+
+    pub fn authority_fingerprint_for_workspace_with_frozen_azure(
+        &self,
+        workspace_id: &str,
+        provider_name: &str,
+        accepted: &crate::AzureResolvedConnection,
+    ) -> Result<ProviderAuthorityFingerprint> {
+        let provider_name = normalize_provider_name(provider_name);
+        let _scope = self.lock_authority_scope(Some(workspace_id), &provider_name);
+        let fingerprint = self
+            .resolve_authority_with_frozen_azure(
+                Some(workspace_id),
+                &provider_name,
+                Some(accepted),
+            )?
+            .3;
+        let mut cache = self
+            .cache
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Self::revoke_matching(&mut cache, |existing| {
+            existing.workspace_id.as_deref() == Some(workspace_id)
+                && existing.provider_name == provider_name
+                && existing.authority_fingerprint.revocation_identity
+                    != fingerprint.revocation_identity
+        });
+        Ok(fingerprint)
+    }
+    pub fn get_or_create_for_workspace_with_frozen_azure(
+        &self,
+        workspace_id: &str,
+        provider_name: &str,
+        accepted: &crate::AzureResolvedConnection,
+    ) -> Result<Arc<dyn Provider>> {
+        self.get_or_create_for_scope_with_frozen_azure(
+            Some(workspace_id),
+            provider_name,
+            Some(accepted),
+        )
     }
 
     /// Build and immediately discard a candidate adapter before its
@@ -893,20 +951,25 @@ impl ProviderRegistry {
         {
             return Ok(());
         }
+        let azure = (provider_name == "azure-openai")
+            .then(|| crate::AzureResolvedConnection::from_environment(base_url))
+            .transpose()?;
         let authority_fingerprint = Self::authority_fingerprint(
             Some(workspace_id),
             provider_name.as_str(),
             api_key.unwrap_or_default(),
             proxy_url,
             base_url,
+            azure.as_ref(),
         );
-        create_provider_with_timeout_policy_and_proxy_and_base_url_and_authority(
+        crate::factory::create_provider_with_timeout_policy_and_proxy_and_base_url_and_resolved_azure(
             provider_name.as_str(),
             api_key.unwrap_or_default(),
             self.timeout_policy,
             proxy_url,
             base_url,
             authority_fingerprint.as_str(),
+            authority_fingerprint.azure_connection(),
         )?;
         Ok(())
     }
@@ -915,6 +978,15 @@ impl ProviderRegistry {
         &self,
         workspace_id: Option<&str>,
         provider_name: &str,
+    ) -> Result<Arc<dyn Provider>> {
+        self.get_or_create_for_scope_with_frozen_azure(workspace_id, provider_name, None)
+    }
+
+    fn get_or_create_for_scope_with_frozen_azure(
+        &self,
+        workspace_id: Option<&str>,
+        provider_name: &str,
+        accepted: Option<&crate::AzureResolvedConnection>,
     ) -> Result<Arc<dyn Provider>> {
         let provider_name = normalize_provider_name(provider_name);
         // The same bounded stripe is also a per-scope singleflight gate. It
@@ -925,8 +997,8 @@ impl ProviderRegistry {
         // injected-provider locks. The scope gate is deliberately retained so
         // the matching invalidation cannot return before this authority is
         // either published or discarded.
-        let (api_key, proxy_url, base_url, authority_fingerprint) =
-            self.resolve_authority(workspace_id, provider_name.as_str())?;
+        let (api_key, proxy_url, base_url, authority_fingerprint) = self
+            .resolve_authority_with_frozen_azure(workspace_id, provider_name.as_str(), accepted)?;
         let key = ProviderCacheKey::new(
             workspace_id,
             provider_name.as_str(),
@@ -956,7 +1028,8 @@ impl ProviderRegistry {
             Self::revoke_matching(&mut cache, |existing| {
                 existing.workspace_id == key.workspace_id
                     && existing.provider_name == key.provider_name
-                    && existing.authority_fingerprint != key.authority_fingerprint
+                    && existing.authority_fingerprint.revocation_identity
+                        != key.authority_fingerprint.revocation_identity
             });
         }
 
@@ -970,13 +1043,14 @@ impl ProviderRegistry {
             Some(provider) => (provider, ProviderOrigin::Injected),
             None => (
                 Arc::from(
-                    create_provider_with_timeout_policy_and_proxy_and_base_url_and_authority(
+                    crate::factory::create_provider_with_timeout_policy_and_proxy_and_base_url_and_resolved_azure(
                         provider_name.as_str(),
                         &api_key,
                         self.timeout_policy,
                         proxy_url.as_deref(),
                         base_url.as_deref(),
                         authority_fingerprint.as_str(),
+                        authority_fingerprint.azure_connection(),
                     )?,
                 ),
                 ProviderOrigin::Factory,
@@ -1058,15 +1132,68 @@ impl ProviderRegistry {
         Option<String>,
         ProviderAuthorityFingerprint,
     )> {
+        self.resolve_authority_with_frozen_azure(workspace_id, provider_name, None)
+    }
+
+    fn resolve_authority_with_frozen_azure(
+        &self,
+        workspace_id: Option<&str>,
+        provider_name: &str,
+        accepted: Option<&crate::AzureResolvedConnection>,
+    ) -> Result<(
+        String,
+        Option<String>,
+        Option<String>,
+        ProviderAuthorityFingerprint,
+    )> {
         let api_key = (self.key_resolver)(workspace_id, provider_name)?;
         let proxy_url = (self.proxy_resolver)(workspace_id, provider_name)?;
         let base_url = (self.base_url_resolver)(workspace_id, provider_name)?;
+        let injected = self
+            .injected
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(provider_name)
+            .cloned();
+        let azure = if provider_name == "azure-openai" {
+            match accepted {
+                Some(connection) => {
+                    connection.validate(true)?;
+                    if let Some(inner) = &injected {
+                        anyhow::ensure!(
+                            inner.resolved_azure_connection().as_ref() == Some(connection),
+                            "accepted Azure adapter configuration changed"
+                        );
+                    } else {
+                        anyhow::ensure!(
+                            connection.configured_base_url.as_deref()
+                                == base_url.as_deref().map(|value| value.trim_end_matches('/')),
+                            "accepted Azure gateway route changed"
+                        );
+                    }
+                    Some(connection.clone())
+                }
+                None => match injected {
+                    Some(inner) => inner.resolved_azure_connection(),
+                    None => Some(crate::AzureResolvedConnection::from_environment(
+                        base_url.as_deref(),
+                    )?),
+                },
+            }
+        } else {
+            anyhow::ensure!(
+                accepted.is_none(),
+                "accepted Azure connection belongs to another provider"
+            );
+            None
+        };
         let authority_fingerprint = Self::authority_fingerprint(
             workspace_id,
             provider_name,
-            api_key.as_str(),
+            &api_key,
             proxy_url.as_deref(),
             base_url.as_deref(),
+            azure.as_ref(),
         );
         Ok((api_key, proxy_url, base_url, authority_fingerprint))
     }
@@ -1077,6 +1204,7 @@ impl ProviderRegistry {
         api_key: &str,
         proxy_url: Option<&str>,
         base_url: Option<&str>,
+        azure: Option<&crate::AzureResolvedConnection>,
     ) -> ProviderAuthorityFingerprint {
         let mut digest = Sha256::new();
         digest.update(PROVIDER_AUTHORITY_FINGERPRINT_VERSION.as_bytes());
@@ -1090,14 +1218,42 @@ impl ProviderRegistry {
         digest.update(proxy_url.unwrap_or("<direct>").as_bytes());
         digest.update([0]);
         digest.update(base_url.unwrap_or("<default>").as_bytes());
-        crate::factory::hash_connection_environment(&mut digest, provider_name);
-        ProviderAuthorityFingerprint(hex::encode(digest.finalize()))
+        if let Some(azure) = azure {
+            let revocation_identity = hex::encode(digest.clone().finalize());
+            azure.hash_into(&mut digest);
+            ProviderAuthorityFingerprint {
+                value: hex::encode(digest.finalize()),
+                revocation_identity,
+                azure_connection: Some(azure.clone()),
+            }
+        } else {
+            crate::factory::hash_connection_environment(&mut digest, provider_name);
+            ProviderAuthorityFingerprint::opaque(hex::encode(digest.finalize()))
+        }
     }
 
     pub fn insert(&self, name: impl Into<String>, provider: Arc<dyn Provider>) -> Result<()> {
         let name = normalize_provider_name(name.into().as_str());
         let _scopes = self.lock_all_authority_scopes();
-        let (_, _, _, authority_fingerprint) = self.resolve_authority(None, name.as_str())?;
+        let api_key = (self.key_resolver)(None, name.as_str())?;
+        let proxy_url = (self.proxy_resolver)(None, name.as_str())?;
+        let base_url = (self.base_url_resolver)(None, name.as_str())?;
+        let azure = provider.resolved_azure_connection();
+        if let Some(connection) = &azure {
+            anyhow::ensure!(
+                name == "azure-openai",
+                "injected Azure connection belongs to another provider"
+            );
+            connection.validate(true)?;
+        }
+        let authority_fingerprint = Self::authority_fingerprint(
+            None,
+            &name,
+            &api_key,
+            proxy_url.as_deref(),
+            base_url.as_deref(),
+            azure.as_ref(),
+        );
         let mut injected = self
             .injected
             .write()
@@ -1318,6 +1474,140 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn frozen_azure_configs_coexist_but_fresh_credential_rotation_revokes_old_authority() {
+        let keys = Arc::new(std::sync::Mutex::new("key-a".to_owned()));
+        let resolver_keys = keys.clone();
+        let registry = ProviderRegistry::new_scoped(move |workspace, _| {
+            format!(
+                "{}:{}",
+                workspace.unwrap_or("public"),
+                resolver_keys.lock().unwrap()
+            )
+        });
+        let accepted = crate::AzureResolvedConnection::from_values(
+            "resource-before".into(),
+            "deployment-before".into(),
+            "v1".into(),
+            None,
+        )
+        .unwrap();
+        let changed = crate::AzureResolvedConnection::from_values(
+            "resource-after".into(),
+            "deployment-after".into(),
+            "2025-04-01-preview".into(),
+            None,
+        )
+        .unwrap();
+        // These actual factory/cache paths receive owned values; no process
+        // environment mutation, discovery request, or provider dispatch.
+        let first = registry
+            .get_or_create_for_workspace_with_frozen_azure("a", "azure-openai", &accepted)
+            .unwrap();
+        let second = registry
+            .get_or_create_for_workspace_with_frozen_azure("a", "azure-openai", &changed)
+            .unwrap();
+        assert_eq!(first.resolved_azure_connection(), Some(accepted.clone()));
+        assert_eq!(second.resolved_azure_connection(), Some(changed.clone()));
+        assert_ne!(
+            first.authority_fingerprint(),
+            second.authority_fingerprint()
+        );
+        let repeated = registry
+            .get_or_create_for_workspace_with_frozen_azure("a", "azure-openai", &accepted)
+            .unwrap();
+        assert!(Arc::ptr_eq(&first, &repeated));
+        let other_tenant = registry
+            .get_or_create_for_workspace_with_frozen_azure("b", "azure-openai", &accepted)
+            .unwrap();
+        *keys.lock().unwrap() = "key-b".into();
+        let refreshed = registry
+            .get_or_create_for_workspace_with_frozen_azure("a", "azure-openai", &accepted)
+            .unwrap();
+        assert_ne!(
+            first.authority_fingerprint(),
+            refreshed.authority_fingerprint()
+        );
+        assert_eq!(refreshed.resolved_azure_connection(), Some(accepted));
+        assert!(
+            registry
+                .cache
+                .read()
+                .unwrap()
+                .entries
+                .iter()
+                .filter(|(key, _)| key.workspace_id.as_deref() == Some("b"))
+                .all(|(_, entry)| !entry.revoked.load(Ordering::Acquire))
+        );
+        // Revocation is checked before request preparation could use network.
+        for old in [first, second] {
+            let error = old
+                .prepare_input_budget(chat_request())
+                .await
+                .err()
+                .expect("revoked authority");
+            assert!(error.is::<ProviderAuthorityRevoked>());
+        }
+        assert!(!Arc::ptr_eq(&other_tenant, &refreshed));
+        let current_b = registry
+            .get_or_create_for_workspace_with_frozen_azure("b", "azure-openai", &changed)
+            .unwrap();
+        assert_ne!(
+            other_tenant.authority_fingerprint(),
+            current_b.authority_fingerprint()
+        );
+        assert!(
+            other_tenant
+                .prepare_input_budget(chat_request())
+                .await
+                .err()
+                .expect("revoked authority")
+                .is::<ProviderAuthorityRevoked>()
+        );
+    }
+
+    #[test]
+    fn accepted_azure_revalidates_route_and_schema_without_disclosing_configuration() {
+        let route = Arc::new(std::sync::Mutex::new(Some(
+            "https://before.invalid".to_owned(),
+        )));
+        let resolver_route = route.clone();
+        let registry = ProviderRegistry::new_scoped_fallible_with_timeout_policy_proxy_and_base_url(
+            |_, _| Ok("key".into()),
+            |_, _| Ok(None),
+            move |_, _| Ok(resolver_route.lock().unwrap().clone()),
+            ProviderTimeoutPolicy::default(),
+        );
+        let accepted = crate::AzureResolvedConnection::from_values(
+            String::new(),
+            "deployment".into(),
+            "v1".into(),
+            route.lock().unwrap().clone(),
+        )
+        .unwrap();
+        let first = registry
+            .authority_fingerprint_for_workspace_with_frozen_azure("a", "azure-openai", &accepted)
+            .unwrap();
+        assert_eq!(first.azure_connection(), Some(&accepted));
+        *route.lock().unwrap() = Some("https://after.invalid/SECRET".into());
+        let error = registry
+            .authority_fingerprint_for_workspace_with_frozen_azure("a", "azure-openai", &accepted)
+            .unwrap_err();
+        assert!(!format!("{error:#}").contains("SECRET"));
+        let mut future = accepted.clone();
+        future.schema_version = 2;
+        assert!(
+            registry
+                .authority_fingerprint_for_workspace_with_frozen_azure("a", "azure-openai", &future)
+                .is_err()
+        );
+        assert!(
+            registry
+                .authority_fingerprint_for_workspace_with_frozen_azure("a", "openai", &accepted)
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
     async fn native_discovery_and_direct_chat_do_not_require_a_loaded_catalog() {
         let registry = ProviderRegistry::with_provider("openai", Arc::new(ToolDiscoveryProvider));
         let provider = registry.get_or_create("openai").unwrap();
@@ -1392,7 +1682,7 @@ mod tests {
             }
             let wrapper = AuthorityBoundProvider {
                 inner: Arc::new(NativeListFixture(definition.name)),
-                authority_fingerprint: ProviderAuthorityFingerprint(definition.name.into()),
+                authority_fingerprint: ProviderAuthorityFingerprint::opaque(definition.name.into()),
                 revoked: Arc::new(AtomicBool::new(false)),
                 redact_endpoint_errors: false,
                 input_admission: Arc::new(Default::default()),
@@ -1572,7 +1862,7 @@ mod tests {
                     catalog: catalog.clone(),
                     bodies: bodies.clone(),
                 }),
-                authority_fingerprint: ProviderAuthorityFingerprint(
+                authority_fingerprint: ProviderAuthorityFingerprint::opaque(
                     "router-reasoning-fixture".into(),
                 ),
                 revoked: Arc::new(AtomicBool::new(false)),
@@ -1706,7 +1996,7 @@ mod tests {
                                 catalog: catalog.clone(),
                                 bodies: bodies.clone(),
                             }),
-                            authority_fingerprint: ProviderAuthorityFingerprint(
+                            authority_fingerprint: ProviderAuthorityFingerprint::opaque(
                                 "router-budget-fixture".into(),
                             ),
                             revoked: Arc::new(AtomicBool::new(false)),
@@ -1846,7 +2136,7 @@ mod tests {
         let catalog = crate::catalog::tool_tests::generated_catalog();
         let wrapper = |authority: &str| AuthorityBoundProvider {
             inner: Arc::new(ToolDiscoveryProvider),
-            authority_fingerprint: ProviderAuthorityFingerprint(authority.into()),
+            authority_fingerprint: ProviderAuthorityFingerprint::opaque(authority.into()),
             revoked: Arc::new(AtomicBool::new(false)),
             redact_endpoint_errors: false,
             input_admission: Arc::new(Default::default()),

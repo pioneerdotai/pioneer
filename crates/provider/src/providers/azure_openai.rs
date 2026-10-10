@@ -382,6 +382,7 @@ impl AzureOpenAiProvider {
         Ok(body)
     }
 
+    #[cfg(test)]
     pub(crate) fn with_version_override(mut self, version: Option<&str>) -> Self {
         if let Some(version) = version {
             self.api_version = version.to_owned();
@@ -390,53 +391,41 @@ impl AzureOpenAiProvider {
     }
 
     pub(crate) fn validate_connection(&self, requires_deployment: bool) -> Result<()> {
-        if self.base_url.is_none()
-            && (self.resource_name.is_empty()
-                || !self
-                    .resource_name
-                    .bytes()
-                    .all(|c| c.is_ascii_alphanumeric() || c == b'-'))
-        {
-            anyhow::bail!(
-                "Azure OpenAI requires AZURE_OPENAI_RESOURCE or an explicit resource/gateway root base URL"
-            );
+        crate::AzureResolvedConnection::validate_parts(
+            1,
+            &self.resource_name,
+            self.base_url.as_deref(),
+            &self.deployment_name,
+            &self.api_version,
+            requires_deployment,
+        )
+    }
+
+    fn connection_snapshot(&self) -> crate::AzureResolvedConnection {
+        crate::AzureResolvedConnection {
+            schema_version: 1,
+            resource_name: self.resource_name.clone(),
+            configured_base_url: self.base_url.clone(),
+            deployment_name: self.deployment_name.clone(),
+            api_version: self.api_version.clone(),
         }
-        if requires_deployment && self.deployment_name.trim().is_empty() {
-            anyhow::bail!(
-                "Azure OpenAI requires AZURE_OPENAI_DEPLOYMENT (deployment name, not base model ID)"
-            );
-        }
-        if self.api_version == "v1" {
-            return Ok(());
-        }
-        if self
-            .base_url
-            .as_ref()
-            .is_some_and(|base| base.ends_with("/openai/v1"))
-        {
-            anyhow::bail!(
-                "Azure date-version Chat requires a resource/gateway root, not an openai/v1 prefix"
-            );
-        }
-        let version = self
-            .api_version
-            .strip_suffix("-preview")
-            .unwrap_or(&self.api_version);
-        let bytes = version.as_bytes();
-        if bytes.len() != 10
-            || !bytes.iter().enumerate().all(|(i, c)| {
-                if i == 4 || i == 7 {
-                    *c == b'-'
-                } else {
-                    c.is_ascii_digit()
-                }
-            })
-        {
-            anyhow::bail!(
-                "Azure Chat requires v1 or a date API version (YYYY-MM-DD or YYYY-MM-DD-preview); Responses needs a separate transport"
-            );
-        }
-        Ok(())
+    }
+
+    pub(crate) fn from_resolved_connection(
+        api_key: &str,
+        connection: &crate::AzureResolvedConnection,
+        timeout_policy: ProviderTimeoutPolicy,
+    ) -> Result<Self> {
+        connection.validate(true)?;
+        let mut provider = Self::with_api_version_and_timeout_policy(
+            api_key,
+            &connection.resource_name,
+            &connection.deployment_name,
+            &connection.api_version,
+            timeout_policy,
+        );
+        provider.base_url = connection.configured_base_url.clone();
+        Ok(provider)
     }
 
     pub fn new(
@@ -1031,6 +1020,10 @@ impl AzureOpenAiProvider {
 
 #[async_trait]
 impl crate::traits::Provider for AzureOpenAiProvider {
+    fn resolved_azure_connection(&self) -> Option<crate::AzureResolvedConnection> {
+        Some(self.connection_snapshot())
+    }
+
     fn usage_api(&self) -> &'static str {
         "azure_deployment_chat_completions"
     }

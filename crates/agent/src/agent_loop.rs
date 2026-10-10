@@ -369,6 +369,7 @@ pub(super) async fn run_agent_loop(
                 hook_runtime_context,
                 model,
                 provider_name,
+                azure_connection,
                 reasoning,
                 workspace_skill_policies,
                 skill_catalog,
@@ -403,13 +404,14 @@ pub(super) async fn run_agent_loop(
                     .map(|context| super::TurnExecutionUsageCounters::from_snapshot(context.usage))
                     .unwrap_or_default();
 
-                let turn_request = ActiveTurnRequest {
+                let mut turn_request = ActiveTurnRequest {
                     turn_id: turn_id.clone(),
                     execution_window_index,
                     mode,
                     hook_runtime_context,
                     model,
                     provider_name: provider_name.clone(),
+                    azure_connection,
                     reasoning,
                     workspace_skill_policies,
                     skill_catalog,
@@ -427,9 +429,13 @@ pub(super) async fn run_agent_loop(
                     execution_security_snapshot,
                 };
 
-                let provider = match provider_registry
-                    .get_or_create_for_workspace(workspace_id.as_str(), &provider_name)
-                {
+                let provider = match resolve_accepted_provider(
+                    &provider_registry,
+                    &workspace_id,
+                    &provider_name,
+                    turn_request.azure_connection.as_ref(),
+                    turn_request.execution_checkpoint_context.is_none(),
+                ) {
                     Ok(p) => p,
                     Err(e) => {
                         let _ = ack.send(Err(AgentStartError::Internal(format!(
@@ -439,6 +445,18 @@ pub(super) async fn run_agent_loop(
                     }
                 };
 
+                if turn_request.azure_connection.is_none() {
+                    turn_request.azure_connection = provider.resolved_azure_connection();
+                }
+                if pioneer_provider::provider_definition(&provider_name)
+                    .is_some_and(|definition| definition.name == "azure-openai")
+                    && turn_request.azure_connection.is_none()
+                {
+                    let _ = ack.send(Err(AgentStartError::Internal(
+                        "native Azure start is missing its accepted connection".to_owned(),
+                    )));
+                    continue;
+                }
                 // A direct start carrying an execution checkpoint is a native
                 // recovery start (task recovery uses this path instead of the
                 // explicit recovery command).  The durable state machine must
@@ -717,9 +735,12 @@ pub(super) async fn run_agent_loop(
                                 usage: next_turn_request.execution_usage.snapshot(),
                             });
 
-                        let provider = match provider_registry.get_or_create_for_workspace(
-                            workspace_id.as_str(),
-                            next_turn_request.provider_name.as_str(),
+                        let provider = match resolve_accepted_provider(
+                            &provider_registry,
+                            &workspace_id,
+                            &next_turn_request.provider_name,
+                            next_turn_request.azure_connection.as_ref(),
+                            false,
                         ) {
                             Ok(provider) => provider,
                             Err(error) => {
@@ -1178,9 +1199,12 @@ pub(super) async fn run_agent_loop(
                         );
                     }
 
-                    let provider = match provider_registry.get_or_create_for_workspace(
-                        workspace_id.as_str(),
-                        turn_request.provider_name.as_str(),
+                    let provider = match resolve_accepted_provider(
+                        &provider_registry,
+                        &workspace_id,
+                        &turn_request.provider_name,
+                        turn_request.azure_connection.as_ref(),
+                        false,
                     ) {
                         Ok(provider) => provider,
                         Err(error) => {
@@ -1298,9 +1322,12 @@ pub(super) async fn run_agent_loop(
                     );
                 }
 
-                let provider = match provider_registry.get_or_create_for_workspace(
-                    workspace_id.as_str(),
-                    turn_request.provider_name.as_str(),
+                let provider = match resolve_accepted_provider(
+                    &provider_registry,
+                    &workspace_id,
+                    &turn_request.provider_name,
+                    turn_request.azure_connection.as_ref(),
+                    false,
                 ) {
                     Ok(provider) => provider,
                     Err(error) => {
@@ -1440,6 +1467,7 @@ pub(super) async fn run_agent_loop(
                     hook_runtime_context: turn_request.hook_runtime_context,
                     model: turn_request.model,
                     provider_name: turn_request.provider_name,
+                    azure_connection: turn_request.azure_connection,
                     reasoning: turn_request.reasoning,
                     workspace_skill_policies: turn_request.workspace_skill_policies,
                     skill_catalog: turn_request.skill_catalog,
@@ -1473,9 +1501,12 @@ pub(super) async fn run_agent_loop(
                     );
                 }
 
-                let provider = match provider_registry.get_or_create_for_workspace(
-                    workspace_id.as_str(),
-                    active_request.provider_name.as_str(),
+                let provider = match resolve_accepted_provider(
+                    &provider_registry,
+                    &workspace_id,
+                    &active_request.provider_name,
+                    active_request.azure_connection.as_ref(),
+                    false,
                 ) {
                     Ok(provider) => provider,
                     Err(error) => {
@@ -1552,6 +1583,27 @@ pub(super) async fn run_agent_loop(
                 break;
             }
         }
+    }
+}
+
+fn resolve_accepted_provider(
+    registry: &ProviderRegistry,
+    workspace: &str,
+    provider: &str,
+    connection: Option<&pioneer_provider::AzureResolvedConnection>,
+    initial_direct_start: bool,
+) -> anyhow::Result<Arc<dyn Provider>> {
+    let azure = pioneer_provider::provider_definition(provider)
+        .is_some_and(|definition| definition.name == "azure-openai");
+    match (azure, connection) {
+        (true, Some(connection)) => {
+            registry.get_or_create_for_workspace_with_frozen_azure(workspace, provider, connection)
+        }
+        (true, None) if !initial_direct_start => {
+            anyhow::bail!("native Azure continuation is missing its accepted connection")
+        }
+        (false, Some(_)) => anyhow::bail!("accepted Azure connection belongs to another provider"),
+        _ => registry.get_or_create_for_workspace(workspace, provider),
     }
 }
 
@@ -2255,6 +2307,55 @@ mod tests {
     use pioneer_runtime_events::{DurableCommitRejection, ExecutionEventHub};
     use std::sync::Arc;
     use tokio::time::{Duration, timeout};
+
+    #[test]
+    fn native_recovery_provider_requires_and_retains_the_accepted_azure_connection() {
+        let registry = pioneer_provider::ProviderRegistry::new(|_| "key".into());
+        let accepted = pioneer_provider::AzureResolvedConnection::from_values(
+            "resource-before".into(),
+            "deployment-before".into(),
+            "v1".into(),
+            None,
+        )
+        .unwrap();
+        for initial_direct_start in [false, true] {
+            let provider = super::resolve_accepted_provider(
+                &registry,
+                "workspace",
+                "azure-openai",
+                Some(&accepted),
+                initial_direct_start,
+            )
+            .unwrap();
+            assert_eq!(provider.resolved_azure_connection(), Some(accepted.clone()));
+        }
+        assert!(
+            super::resolve_accepted_provider(&registry, "workspace", "azure-openai", None, false)
+                .is_err()
+        );
+        assert!(
+            super::resolve_accepted_provider(
+                &registry,
+                "workspace",
+                "openai",
+                Some(&accepted),
+                false
+            )
+            .is_err()
+        );
+        let mut future = accepted;
+        future.schema_version = 2;
+        assert!(
+            super::resolve_accepted_provider(
+                &registry,
+                "workspace",
+                "azure-openai",
+                Some(&future),
+                false
+            )
+            .is_err()
+        );
+    }
 
     fn completed_event(turn_id: &str) -> AgentDurableEvent {
         AgentDurableEvent::TurnCompleted {

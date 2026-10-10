@@ -799,17 +799,14 @@ impl TaskToolAuthorizationScope {
             Some(pioneer_protocol::AgentExecutionBackend::CLIAgentRuntime { .. })
                 | Some(pioneer_protocol::AgentExecutionBackend::ACPAgentRuntime { .. })
         ) {
-            request.provider_authority_fingerprint = Some(
-                processor
-                    .provider_registry()
-                    .authority_fingerprint_for_workspace(
-                        workspace_id.as_str(),
-                        request.provider.as_str(),
-                    )
-                    .map_err(|_| task_tool_authorization_error())?
-                    .as_str()
-                    .to_owned(),
-            );
+            let authority = processor
+                .provider_registry()
+                .authority_fingerprint_for_workspace(
+                    workspace_id.as_str(),
+                    request.provider.as_str(),
+                )
+                .map_err(|_| task_tool_authorization_error())?;
+            request.bind_resolved_provider_authority(&authority);
         }
         let revision = processor
             .current_authorization_revision()

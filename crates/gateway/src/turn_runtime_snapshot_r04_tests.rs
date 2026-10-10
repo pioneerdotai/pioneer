@@ -69,6 +69,7 @@ async fn accepted_local_media_uses_exact_bytes_after_mutation_deletion_and_snaps
         "ws",
         "thread",
         "fixture",
+        None,
         &input,
         &security,
         &PersistedActorRef::System,

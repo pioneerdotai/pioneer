@@ -6,6 +6,8 @@
 //! adapters.
 
 pub mod attachments;
+mod azure_connection;
+pub use azure_connection::AzureResolvedConnection;
 pub mod catalog;
 pub mod continuation;
 pub mod definition;

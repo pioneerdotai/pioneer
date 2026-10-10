@@ -61,7 +61,16 @@ mod tests {
             mode: ThreadMode::Agent,
             hook_runtime_context: crate::AgentTurnHookRuntimeContext::default(),
             model: "test-model".to_owned(),
-            provider_name: "test-provider".to_owned(),
+            provider_name: "azure-openai".to_owned(),
+            azure_connection: Some(
+                pioneer_provider::AzureResolvedConnection::from_values(
+                    "resource-before".into(),
+                    "deployment-before".into(),
+                    "v1".into(),
+                    None,
+                )
+                .unwrap(),
+            ),
             reasoning: None,
             workspace_skill_policies:
                 HashMap::<pioneer_skills::SkillPolicyKey, WorkspaceSkillPolicy>::new(),
@@ -105,7 +114,9 @@ mod tests {
             execution_checkpoint_context: None,
         };
 
+        let accepted_connection = turn_request.azure_connection.clone();
         apply_recovery_adjustments(&mut turn_request, &request);
+        assert_eq!(turn_request.azure_connection, accepted_connection);
 
         assert_eq!(
             turn_request.input,
@@ -137,6 +148,7 @@ mod tests {
             hook_runtime_context: crate::AgentTurnHookRuntimeContext::default(),
             model: "test-model".to_owned(),
             provider_name: "test-provider".to_owned(),
+            azure_connection: None,
             reasoning: None,
             workspace_skill_policies:
                 HashMap::<pioneer_skills::SkillPolicyKey, WorkspaceSkillPolicy>::new(),
@@ -266,6 +278,7 @@ mod tests {
             hook_runtime_context: crate::AgentTurnHookRuntimeContext::default(),
             model: "test-model".to_owned(),
             provider_name: "test-provider".to_owned(),
+            azure_connection: None,
             reasoning: None,
             workspace_skill_policies:
                 HashMap::<pioneer_skills::SkillPolicyKey, WorkspaceSkillPolicy>::new(),

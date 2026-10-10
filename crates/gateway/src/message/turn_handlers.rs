@@ -24,14 +24,6 @@ impl Drop for CliHistoryMonitorDrop {
 pub(super) struct PreparedApiProviderTurnStart {
     outcome: crate::thread::TurnStartOutcome,
     user_message_capability_attachments: Vec<pioneer_protocol::UserMessageAttachment>,
-    workspace_skill_policies:
-        HashMap<pioneer_skills::SkillPolicyKey, pioneer_agent::WorkspaceSkillPolicy>,
-    skill_catalog: pioneer_skills::SkillCatalogSnapshot,
-    agent_skill_overlay: Vec<pioneer_skills::AgentSkillRuntimeEntry>,
-    resolved_artifacts: Vec<ResolvedArtifactInput>,
-    runtime_environment: HashMap<String, String>,
-    history: Vec<ChatMessage>,
-    effective_reasoning_effort: Option<String>,
     permission_profile: pioneer_protocol::TurnPermissionProfileSnapshot,
     execution_security_snapshot: pioneer_protocol::TurnExecutionSecuritySnapshot,
 }
@@ -984,7 +976,7 @@ impl MessageProcessor {
             )
             .with_task_cause(pioneer_tasks::TaskStartCause::Policy));
         }
-        let provider_authority_fingerprint = match params.execution_backend.as_ref() {
+        let provider_authority = match params.execution_backend.as_ref() {
             Some(AgentExecutionBackend::CLIAgentRuntime { .. })
             | Some(AgentExecutionBackend::ACPAgentRuntime { .. }) => None,
             _ => Some(
@@ -994,12 +986,10 @@ impl MessageProcessor {
                         TurnStartFailure::unavailable(format!(
                             "provider authority could not be resolved: {error:#}"
                         ))
-                    })?
-                    .as_str()
-                    .to_owned(),
+                    })?,
             ),
         };
-        let request = crate::authorization::ExecutionAdmissionRequest::for_turn(
+        let mut request = crate::authorization::ExecutionAdmissionRequest::for_turn(
             entry_point,
             crate::authorization::ResourceAction::AgentTurnStart,
             additional_required_actions,
@@ -1009,11 +999,16 @@ impl MessageProcessor {
             model,
             params,
             capabilities,
-            provider_authority_fingerprint,
+            provider_authority
+                .as_ref()
+                .map(|authority| authority.as_str().to_owned()),
         )
         .map_err(|error| {
             TurnStartFailure::invalid_input(format!("invalid composite execution intent: {error}"))
         })?;
+        if let Some(authority) = provider_authority.as_ref() {
+            request.bind_resolved_provider_authority(authority);
+        }
         admission
             .authorize_composite(self.crud_store.as_ref(), &request)
             .await
@@ -2673,6 +2668,7 @@ impl MessageProcessor {
             && self.native_api_provider_supports_agent_skill_overlay(
                 outcome.started_notification.workspace_id.as_str(),
                 outcome.materialization.thread.model_provider.as_str(),
+                execution_admission.provider_azure_connection(),
             ) {
             if let Some(scoped_principal_id) = scoped_principal_id.as_ref() {
                 match self
@@ -2845,6 +2841,7 @@ impl MessageProcessor {
             &outcome.materialization.thread.workspace_id,
             &outcome.materialization.thread.id,
             &outcome.materialization.thread.model_provider,
+            execution_admission.provider_azure_connection(),
             &outcome.materialization.input,
             &execution_security_snapshot,
             &request_actor,
@@ -3165,13 +3162,6 @@ impl MessageProcessor {
             PreparedApiProviderTurnStart {
                 outcome,
                 user_message_capability_attachments,
-                workspace_skill_policies,
-                skill_catalog,
-                agent_skill_overlay,
-                resolved_artifacts,
-                runtime_environment,
-                history,
-                effective_reasoning_effort,
                 permission_profile,
                 execution_security_snapshot,
             },
@@ -3215,24 +3205,12 @@ impl MessageProcessor {
     ) {
         let outcome = prepared.outcome;
         let start_result = self
-            .agent_manager
-            .start_turn_with_resolved_artifacts_environment_reasoning_permission_profile_security_snapshot_and_agent_skill_overlay(
+            .start_admitted_native_snapshot_turn(
                 outcome.started_notification.thread_id.as_str(),
                 outcome.started_notification.turn.id.as_str(),
-                outcome.materialization.turn.mode,
-                &outcome.materialization.thread.model,
-                &outcome.materialization.thread.model_provider,
-                prepared.workspace_skill_policies,
-                prepared.skill_catalog,
-                prepared.agent_skill_overlay,
-                outcome.materialization.input.clone(),
-                outcome.materialization.capabilities.clone(),
-                prepared.resolved_artifacts,
-                prepared.runtime_environment,
-                prepared.history,
-                prepared.effective_reasoning_effort.as_deref(),
                 prepared.permission_profile,
                 prepared.execution_security_snapshot,
+                None,
             )
             .await;
         if let Err(error) = start_result {
@@ -3440,13 +3418,6 @@ impl MessageProcessor {
         Ok(PreparedApiProviderTurnStart {
             outcome,
             user_message_capability_attachments: Vec::new(),
-            workspace_skill_policies,
-            skill_catalog,
-            agent_skill_overlay,
-            resolved_artifacts,
-            runtime_environment,
-            history,
-            effective_reasoning_effort,
             permission_profile,
             execution_security_snapshot,
         })

@@ -2863,12 +2863,10 @@ impl AgentActionToolHandler {
             pioneer_protocol::AgentExecutionProfileBackend::ApiProvider
         )
         .then(|| {
-            processor
-                .provider_registry
-                .authority_fingerprint_for_workspace(
-                    self.context.workspace_id.as_str(),
-                    child.grant.profile.provider_id.as_str(),
-                )
+            parent_authority.resolve_continuation_provider_authority(
+                processor.provider_registry.as_ref(),
+                child.grant.profile.provider_id.as_str(),
+            )
         })
         .transpose()
         .map_err(|error| {
@@ -2885,6 +2883,9 @@ impl AgentActionToolHandler {
                 normalized_capabilities.execution.as_slice(),
                 &permission_profile,
                 provider_authority.as_ref().map(|value| value.as_str()),
+                provider_authority
+                    .as_ref()
+                    .and_then(|value| value.azure_connection()),
             )
             .map_err(|error| {
                 ToolError::execution_failed(format!(

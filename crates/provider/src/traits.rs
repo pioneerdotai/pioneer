@@ -72,6 +72,11 @@ pub trait Provider: Send + Sync {
         None
     }
 
+    /// The exact non-secret Azure connection owned by this adapter instance.
+    fn resolved_azure_connection(&self) -> Option<crate::AzureResolvedConnection> {
+        None
+    }
+
     /// Declares what features this provider supports.
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities::default()

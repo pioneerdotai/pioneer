@@ -112,6 +112,9 @@ impl Provider for JournalProvider {
     fn authority_fingerprint(&self) -> Option<&str> {
         self.inner.authority_fingerprint()
     }
+    fn resolved_azure_connection(&self) -> Option<pioneer_provider::AzureResolvedConnection> {
+        self.inner.resolved_azure_connection()
+    }
     fn capabilities(&self) -> ProviderCapabilities {
         self.inner.capabilities()
     }

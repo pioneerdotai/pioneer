@@ -348,6 +348,7 @@ pub(crate) async fn capture_native_media_inputs(
     workspace: &str,
     thread: &str,
     provider: &str,
+    azure_connection: Option<&pioneer_provider::AzureResolvedConnection>,
     input: &[UserInput],
     security: &TurnExecutionSecuritySnapshot,
     actor: &pioneer_protocol::PersistedActorRef,
@@ -428,10 +429,15 @@ pub(crate) async fn capture_native_media_inputs(
         } else {
             pioneer_tools::enforce_network_url(Some(security), locator, "native media ingress")
                 .map_err(|_| anyhow::anyhow!("authorized media URL capture denied"))?;
-            let authority = providers
-                .authority_fingerprint_for_workspace(workspace, provider)?
-                .as_str()
-                .to_owned();
+            let authority = match azure_connection {
+                Some(connection) => providers
+                    .authority_fingerprint_for_workspace_with_frozen_azure(
+                        workspace, provider, connection,
+                    )?,
+                None => providers.authority_fingerprint_for_workspace(workspace, provider)?,
+            }
+            .as_str()
+            .to_owned();
             let attachment = MessageAttachment::from_url(locator, &mime);
             pioneer_provider::with_provider_attempt_context(
                 pioneer_provider::ProviderAttemptContext {
@@ -643,6 +649,28 @@ pub(crate) async fn restored_recovery_turn_request_from_snapshot(
     agent_skill_overlay: Vec<AgentSkillRuntimeEntry>,
 ) -> Result<RestoredRecoveryTurnRequest> {
     snapshot.validate_storage_size()?;
+    let azure_connection = if pioneer_provider::provider_definition(&snapshot.provider_name)
+        .is_some_and(|definition| definition.name == "azure-openai")
+    {
+        let context = crate::authorization::ExecutionAuthorizationContext::load_for_turn(
+            store,
+            &snapshot.turn_id,
+        )
+        .await?;
+        anyhow::ensure!(
+            context.workspace_id() == snapshot.workspace_id,
+            "accepted Azure authority workspace differs from native snapshot"
+        );
+        context.require_provider_binding(&snapshot.provider_name, &snapshot.model)?;
+        Some(
+            context
+                .provider_azure_connection()
+                .context("native Azure restore is missing its accepted connection")?
+                .clone(),
+        )
+    } else {
+        None
+    };
     let (hook_runtime_context, history) =
         restored_conversation_scope_from_snapshot(store, snapshot).await?;
     let skill_catalog = restored_ordinary_skill_catalog(snapshot)?;
@@ -747,6 +775,7 @@ pub(crate) async fn restored_recovery_turn_request_from_snapshot(
         hook_runtime_context,
         model: snapshot.model.clone(),
         provider_name: snapshot.provider_name.clone(),
+        azure_connection,
         reasoning: snapshot
             .reasoning_effort
             .as_deref()
@@ -1019,7 +1048,7 @@ fn restore_workspace_skill_policies(
         .collect())
 }
 
-fn to_snapshot_json<T: Serialize + ?Sized>(value: &T, label: &str) -> Result<String> {
+pub(crate) fn to_snapshot_json<T: Serialize + ?Sized>(value: &T, label: &str) -> Result<String> {
     let mut remaining = pioneer_protocol::TURN_EXECUTION_REQUEST_MAX_BYTES;
     to_snapshot_json_bounded(value, label, &mut remaining)
 }

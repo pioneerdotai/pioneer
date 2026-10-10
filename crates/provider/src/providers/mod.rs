@@ -17,6 +17,7 @@ pub(crate) mod telnyx;
 
 pub use anthropic::AnthropicProvider;
 pub use azure_openai::AzureOpenAiProvider;
+pub(crate) use azure_openai::DEFAULT_API_VERSION as AZURE_DEFAULT_API_VERSION;
 pub use bedrock::BedrockProvider;
 pub use compatible::{AuthStyle, OpenAiCompatibleProvider};
 pub use copilot::CopilotProvider;

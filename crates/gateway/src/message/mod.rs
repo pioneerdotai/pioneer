@@ -4211,6 +4211,51 @@ impl MessageProcessor {
         Ok(())
     }
 
+    /// Dispatch from the same immutable owner used by cold recovery. This keeps
+    /// provider configuration and the rest of admission inputs on one path.
+    pub(crate) async fn start_admitted_native_snapshot_turn(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        permission_profile: pioneer_protocol::TurnPermissionProfileSnapshot,
+        security_snapshot: pioneer_protocol::TurnExecutionSecuritySnapshot,
+        checkpoint: Option<pioneer_agent::ExecutionCheckpointContext>,
+    ) -> anyhow::Result<()> {
+        let context = self
+            .load_turn_execution_authorization_context(turn_id)
+            .await?;
+        context.verify_current_provider_authority(self.provider_registry.as_ref())?;
+        let snapshot = self
+            .crud_store
+            .get_turn_runtime_snapshot(turn_id)
+            .await?
+            .context("native admission is missing its runtime snapshot")?;
+        anyhow::ensure!(
+            snapshot.thread_id == thread_id && snapshot.workspace_id == context.workspace_id(),
+            "native snapshot differs from execution authority scope"
+        );
+        context.require_provider_binding(&snapshot.provider_name, &snapshot.model)?;
+        let overlay = crate::turn_runtime_snapshot::restore_agent_skill_overlay_from_snapshot(
+            self.crud_store.as_ref(),
+            &snapshot.workspace_id,
+            &snapshot,
+        )
+        .await?;
+        let request = crate::turn_runtime_snapshot::restored_recovery_turn_request_from_snapshot(
+            self.crud_store.as_ref(),
+            Some(self.artifact_service.as_ref()),
+            &snapshot,
+            permission_profile,
+            security_snapshot,
+            overlay,
+        )
+        .await?;
+        self.agent_manager
+            .start_admitted_native_turn(thread_id, request, checkpoint)
+            .await
+            .map_err(|_| anyhow::anyhow!("failed to dispatch exact native admission inputs"))
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn persist_turn_runtime_snapshot_with_optional_agent_overlay(
         &self,
@@ -4259,11 +4304,21 @@ impl MessageProcessor {
         &self,
         workspace_id: &str,
         provider_name: &str,
+        azure_connection: Option<&pioneer_provider::AzureResolvedConnection>,
     ) -> bool {
-        match self
-            .provider_registry
-            .get_or_create_for_workspace(workspace_id, provider_name)
-        {
+        let provider = match azure_connection {
+            Some(connection) => self
+                .provider_registry
+                .get_or_create_for_workspace_with_frozen_azure(
+                    workspace_id,
+                    provider_name,
+                    connection,
+                ),
+            None => self
+                .provider_registry
+                .get_or_create_for_workspace(workspace_id, provider_name),
+        };
+        match provider {
             Ok(provider) => provider.capabilities().tool_calling,
             Err(error) => {
                 warn!(
