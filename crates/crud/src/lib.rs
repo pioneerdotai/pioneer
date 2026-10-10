@@ -22612,12 +22612,13 @@ impl CrudStore {
         .await?;
         let mut threads = Vec::with_capacity(models.len());
         for model in models {
-            let Some(mut thread) = thread_from_db_model(model)? else {
+            let Some(thread) = thread_from_db_model(model)? else {
                 continue;
             };
-            self.attach_latest_thread_turn_snapshot(&mut thread).await?;
             threads.push(thread);
         }
+        self.attach_latest_thread_turn_snapshots(&mut threads)
+            .await?;
         Ok(threads)
     }
 
@@ -22631,16 +22632,62 @@ impl CrudStore {
         let mut threads = Vec::with_capacity(models.len());
 
         for model in models {
-            let Some(mut thread) = thread_from_db_model(model)? else {
+            let Some(thread) = thread_from_db_model(model)? else {
                 continue;
             };
-
-            self.attach_latest_thread_turn_snapshot(&mut thread).await?;
-
             threads.push(thread);
         }
 
+        self.attach_latest_thread_turn_snapshots(&mut threads)
+            .await?;
         Ok(threads)
+    }
+
+    async fn attach_latest_thread_turn_snapshots(&self, threads: &mut [Thread]) -> Result<()> {
+        for batch in threads.chunks_mut(turn::THREAD_TURN_SNAPSHOT_BATCH_SIZE) {
+            let thread_ids = batch
+                .iter()
+                .map(|thread| thread.id.as_str())
+                .collect::<Vec<_>>();
+            let latest =
+                turn::find_latest_turns_for_threads(&self.connection, &thread_ids, false).await?;
+            // Only non-Conversation history markers need a Composer fallback.
+            // Keep NULL from the newest Conversation; never seek a non-NULL value.
+            let conversation_ids = latest
+                .iter()
+                .filter(|model| model.turn_kind != turn_kind_to_db(TurnKind::Conversation))
+                .map(|model| model.thread_id.as_str())
+                .collect::<Vec<_>>();
+            let mut conversations =
+                turn::find_latest_turns_for_threads(&self.connection, &conversation_ids, true)
+                    .await?
+                    .into_iter()
+                    .map(|model| (model.thread_id, model.reasoning_effort))
+                    .collect::<HashMap<_, _>>();
+            let mut latest = latest
+                .into_iter()
+                .map(|model| (model.thread_id.clone(), model))
+                .collect::<HashMap<_, _>>();
+
+            // All DB capacity has been released. Attach in original list order
+            // using the same snapshot conversion as the single-thread caller.
+            for thread in batch {
+                let Some(model) = latest.remove(thread.id.as_str()) else {
+                    continue;
+                };
+                let reasoning_effort = if model.turn_kind == turn_kind_to_db(TurnKind::Conversation)
+                {
+                    model.reasoning_effort.clone()
+                } else {
+                    conversations.remove(thread.id.as_str()).flatten()
+                };
+                if let Some(turn) = thread_snapshot_turn_from_db_model(model)? {
+                    thread.reasoning_effort = reasoning_effort;
+                    thread.turns.push(turn);
+                }
+            }
+        }
+        Ok(())
     }
 
     async fn attach_latest_thread_turn_snapshot(&self, thread: &mut Thread) -> Result<()> {
@@ -57020,6 +57067,13 @@ mod tests {
             .await
             .expect("default-effort conversation turn should persist");
 
+        let listed = store
+            .list_threads_for_workspace(workspace_id, 10)
+            .await
+            .unwrap();
+        assert!(listed[0].reasoning_effort.is_none());
+        assert_eq!(listed[0].turns[0].id, default_effort_turn.id);
+
         let latest_task_run_thread = Thread {
             updated_at: second_timestamp + 3,
             ..default_effort_thread
@@ -57063,6 +57117,517 @@ mod tests {
         assert_eq!(fetched.turns.len(), 1);
         assert_eq!(fetched.turns[0].id, latest_task_run_turn.id);
         assert_eq!(fetched.turns[0].turn_kind, TurnKind::TaskRun);
+        let listed = store
+            .list_threads_for_workspace(workspace_id, 10)
+            .await
+            .unwrap();
+        assert!(listed[0].reasoning_effort.is_none());
+        assert_eq!(listed[0].turns[0].id, latest_task_run_turn.id);
+        assert_eq!(listed[0].turns[0].turn_kind, TurnKind::TaskRun);
+    }
+
+    pub(crate) fn assert_thread_turn_snapshot_statements(
+        statements: &[Statement],
+        threads: &[Thread],
+    ) {
+        // The only other statement is the original thread-list selector. Any
+        // per-thread selector, history/event load or transaction is a failure.
+        let mut statements = statements.iter();
+        assert!(statements.next().unwrap().sql.contains("thread"));
+        for batch in threads.chunks(turn::THREAD_TURN_SNAPSHOT_BATCH_SIZE) {
+            let latest = statements.next().expect("one latest-Turn batch query");
+            assert_thread_turn_snapshot_statement(latest, false);
+            assert_eq!(
+                latest.values.as_ref().unwrap().0,
+                batch
+                    .iter()
+                    .map(|thread| thread.id.clone().into())
+                    .collect::<Vec<sea_orm::Value>>()
+            );
+            let fallback_ids = batch
+                .iter()
+                .filter(|thread| {
+                    thread
+                        .turns
+                        .first()
+                        .is_some_and(|turn| turn.turn_kind != TurnKind::Conversation)
+                })
+                .map(|thread| thread.id.clone())
+                .collect::<std::collections::BTreeSet<_>>();
+            if !fallback_ids.is_empty() {
+                let fallback = statements
+                    .next()
+                    .expect("one Conversation fallback batch query");
+                assert_thread_turn_snapshot_statement(fallback, true);
+                let values = &fallback.values.as_ref().unwrap().0;
+                assert_eq!(values.last(), Some(&sea_orm::Value::from("conversation")));
+                assert_eq!(values.len(), fallback_ids.len() + 1);
+                // SQL result order is deliberately irrelevant to list order.
+                for id in fallback_ids {
+                    assert!(values[..values.len() - 1].contains(&id.into()));
+                }
+            }
+        }
+        assert!(
+            statements.next().is_none(),
+            "no individual Turn or extra history queries"
+        );
+    }
+
+    fn assert_thread_turn_snapshot_statement(statement: &Statement, conversation_only: bool) {
+        let sql = &statement.sql;
+        assert!(sql.starts_with("WITH selected(thread_id) AS (VALUES "));
+        assert!(sql.contains("SELECT latest.* FROM selected CROSS JOIN turn AS latest"));
+        assert!(sql.contains("INDEXED BY idx_turn_thread_created_id"));
+        assert!(sql.contains("candidate.thread_id = selected.thread_id"));
+        assert!(sql.contains("ORDER BY candidate.created_at DESC, candidate.id DESC LIMIT 1"));
+        assert_eq!(
+            sql.contains("AND candidate.turn_kind = ?"),
+            conversation_only
+        );
+        assert!(!sql.contains("reasoning_effort IS NOT NULL"));
+        let id_count = statement.values.as_ref().unwrap().0.len() - usize::from(conversation_only);
+        assert!((1..=128).contains(&id_count));
+        assert_eq!(sql.matches("(?)").count(), id_count);
+    }
+
+    #[tokio::test]
+    async fn thread_list_batches_preserve_order_limit_effort_and_snapshot_metadata() {
+        let mut connection = Database::connect("sqlite::memory:").await.unwrap();
+        Migrator::up(&connection, None).await.unwrap();
+        let statements = Arc::new(std::sync::Mutex::new(Vec::<Statement>::new()));
+        connection.set_metric_callback({
+            let statements = statements.clone();
+            move |info| statements.lock().unwrap().push(info.statement.clone())
+        });
+        let store = CrudStore::new(connection);
+        store.connection.execute_unprepared(
+            "INSERT INTO workspace(id,name,is_active,is_current) VALUES ('ws_batch','Batch',1,1)"
+        ).await.unwrap();
+        for index in 0..231 {
+            let thread_id = format!("H{index:020}");
+            store.connection.execute_raw(Statement::from_sql_and_values(
+                DatabaseBackend::Sqlite,
+                "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,created_at,updated_at) \
+                 VALUES (?,'ws_batch','preview','agent','model','provider','idle',?,?)",
+                vec![thread_id.clone().into(), unix_to_datetime(1_700_000_000 + index).into(),
+                     unix_to_datetime(1_700_000_000 + index).into()],
+            )).await.unwrap();
+            let turns: Vec<(&str, &str, Option<&str>, i64)> = match index % 6 {
+                0 => vec![],
+                1 => vec![
+                    ("z", "conversation", Some("low"), 0),
+                    ("a", "conversation", Some("high"), 0),
+                    ("t", "task_run", Some("high"), 2),
+                ],
+                2 => vec![
+                    ("a", "conversation", Some("high"), 0),
+                    ("b", "conversation", None, 1),
+                    ("t", "task_run", Some("high"), 2),
+                ],
+                3 => vec![("t", "task_run", Some("high"), 2)],
+                // Insert z before a: equal timestamps must use ID DESC, not insertion order.
+                4 => vec![
+                    ("z", "conversation", Some("low"), 1),
+                    ("a", "conversation", Some("high"), 1),
+                ],
+                _ => vec![("a", "conversation", Some("high"), 0)],
+            };
+            for (suffix, kind, effort, offset) in turns {
+                store.connection.execute_raw(Statement::from_sql_and_values(
+                    DatabaseBackend::Sqlite,
+                    "INSERT INTO turn(id,thread_id,status,turn_kind,origin,reasoning_effort,created_at,updated_at) \
+                     VALUES (?,?,'in_progress',?,'user',?,?,?)",
+                    vec![format!("T{index:019}{suffix}").into(), thread_id.clone().into(), kind.into(), effort.into(),
+                         unix_to_datetime(1_700_000_000 + offset).into(), unix_to_datetime(1_700_000_000 + offset).into()],
+                )).await.unwrap();
+            }
+        }
+        let permission_profile = TurnPermissionProfileSnapshot::from_mode(
+            TurnPermissionMode::Supervised,
+            TurnPermissionProfileSource::Composer,
+        );
+        let rich_turn_id = format!("T{:019}t", 229);
+        let reply_id = format!("T{:019}a", 229);
+        let mention = TurnMention {
+            principal_id: PrincipalId::new("P00000000000000000001").unwrap(),
+            nickname: "member".to_owned(),
+        };
+        store.connection.execute_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "UPDATE turn SET origin='detached_task', send_mode='message', \
+             initiated_by_actor_kind='system', author_display_name_snapshot='Batch Author', \
+             author_nickname_snapshot='batch_author', author_avatar_revision_snapshot='avatar-7', \
+             reply_to_turn_id=?, mentions_json=?, message_revision=3, message_deleted_at=created_at, \
+             error='snapshot error', prompt_manifest_json='broken ignored manifest', \
+             permission_profile_snapshot_json=? WHERE id=?",
+            vec![reply_id.clone().into(), serde_json::to_string(&vec![mention.clone()]).unwrap().into(),
+                 serde_json::to_string(&permission_profile).unwrap().into(), rich_turn_id.clone().into()],
+        )).await.unwrap();
+
+        for (limit, expected_turn_queries) in [(0, 0), (1, 2), (128, 2), (129, 4), (231, 4)] {
+            statements.lock().unwrap().clear();
+            let threads = store
+                .list_threads_for_workspace("ws_batch", limit)
+                .await
+                .unwrap();
+            assert_eq!(threads.len(), limit as usize);
+            let recorded = statements.lock().unwrap().clone();
+            assert_eq!(recorded.len(), 1 + expected_turn_queries);
+            assert_thread_turn_snapshot_statements(&recorded, &threads);
+            for (position, thread) in threads.iter().enumerate() {
+                let index = 230 - position;
+                assert_eq!(thread.id, format!("H{index:020}"));
+                assert_eq!(thread.model, "model");
+                assert_eq!(thread.model_provider, "provider");
+                assert_eq!(
+                    thread.status,
+                    ThreadStatus::Idle,
+                    "TaskRun must not activate foreground"
+                );
+                let (suffix, effort, kind) = match index % 6 {
+                    0 => {
+                        assert!(thread.turns.is_empty());
+                        assert!(thread.reasoning_effort.is_none());
+                        continue;
+                    }
+                    1 => ("t", Some("low"), TurnKind::TaskRun),
+                    2 | 3 => ("t", None, TurnKind::TaskRun),
+                    4 => ("z", Some("low"), TurnKind::Conversation),
+                    _ => ("a", Some("high"), TurnKind::Conversation),
+                };
+                assert_eq!(thread.reasoning_effort.as_deref(), effort);
+                assert_eq!(thread.turns.len(), 1);
+                assert_eq!(thread.turns[0].id, format!("T{index:019}{suffix}"));
+                assert_eq!(thread.turns[0].turn_kind, kind);
+                assert!(thread.turns[0].prompt_manifest.is_none());
+                if index == 229 {
+                    let snapshot = &thread.turns[0];
+                    assert_eq!(snapshot.permission_profile, permission_profile);
+                    assert_eq!(snapshot.origin, TurnOrigin::DetachedTask);
+                    assert_eq!(snapshot.mode, ThreadMode::Message);
+                    let author = snapshot.author.as_ref().unwrap();
+                    assert_eq!(author.actor, PersistedActorRef::System);
+                    assert_eq!(author.display_name, "Batch Author");
+                    assert_eq!(author.nickname, "batch_author");
+                    assert_eq!(author.avatar_revision.as_deref(), Some("avatar-7"));
+                    assert_eq!(
+                        snapshot.reply_to_turn_id.as_deref(),
+                        Some(reply_id.as_str())
+                    );
+                    assert_eq!(snapshot.mentions, vec![mention.clone()]);
+                    assert_eq!(snapshot.message_revision, 3);
+                    assert!(snapshot.message_deleted);
+                    assert_eq!(snapshot.error.as_deref(), Some("snapshot error"));
+                }
+            }
+        }
+        statements.lock().unwrap().clear();
+        assert!(
+            store
+                .list_threads_for_workspace("missing", 231)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(statements.lock().unwrap().len(), 1);
+
+        // A skipped thread model must never be included in the selected-ID batch.
+        store
+            .connection
+            .execute_unprepared("UPDATE thread SET mode='unknown' WHERE id='H00000000000000000230'")
+            .await
+            .unwrap();
+        statements.lock().unwrap().clear();
+        let threads = store
+            .list_threads_for_workspace("ws_batch", 1)
+            .await
+            .unwrap();
+        assert!(threads.is_empty());
+        assert_eq!(statements.lock().unwrap().len(), 1);
+
+        // Unknown Turn status still suppresses its snapshot, including effort;
+        // malformed selected snapshot metadata still fails through the old decoder.
+        store
+            .connection
+            .execute_raw(Statement::from_sql_and_values(
+                DatabaseBackend::Sqlite,
+                "UPDATE turn SET status='unknown' WHERE id=?",
+                [rich_turn_id.clone().into()],
+            ))
+            .await
+            .unwrap();
+        let threads = store
+            .list_threads_for_workspace("ws_batch", 2)
+            .await
+            .unwrap();
+        assert_eq!(threads.len(), 1);
+        assert!(threads[0].turns.is_empty());
+        assert!(threads[0].reasoning_effort.is_none());
+        for corrupt_column in ["permission_profile_snapshot_json", "mentions_json"] {
+            store
+                .connection
+                .execute_raw(Statement::from_sql_and_values(
+                    DatabaseBackend::Sqlite,
+                    format!(
+                        "UPDATE turn SET status='in_progress', {corrupt_column}='broken' WHERE id=?"
+                    ),
+                    [rich_turn_id.clone().into()],
+                ))
+                .await
+                .unwrap();
+            assert!(
+                store
+                    .list_threads_for_workspace("ws_batch", 2)
+                    .await
+                    .is_err()
+            );
+            store.connection.execute_raw(Statement::from_sql_and_values(
+                DatabaseBackend::Sqlite,
+                "UPDATE turn SET permission_profile_snapshot_json=?, mentions_json='[]' WHERE id=?",
+                [serde_json::to_string(&permission_profile).unwrap().into(), rich_turn_id.clone().into()],
+            )).await.unwrap();
+        }
+    }
+
+    #[derive(Default)]
+    struct ThreadSnapshotReadObserver {
+        events: std::sync::Mutex<Vec<pioneer_sqlite::SqliteReadEvent>>,
+        enqueued: tokio::sync::Notify,
+    }
+
+    impl pioneer_sqlite::SqliteReadObserver for ThreadSnapshotReadObserver {
+        fn observe(&self, event: pioneer_sqlite::SqliteReadEvent) {
+            self.events.lock().unwrap().push(event);
+            if matches!(
+                event,
+                pioneer_sqlite::SqliteReadEvent::AdmissionEnqueued { .. }
+            ) {
+                self.enqueued.notify_one();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn thread_turn_snapshot_batches_use_scoped_readers_and_release_cancelled_capacity() {
+        use pioneer_sqlite::{
+            SqliteDatabase, SqliteReadClass, SqliteReadEvent, SqliteReadOutcome,
+            SqliteWriteExecutor, sqlite_connection_url, sqlite_read_only_connection_url,
+        };
+        use sea_orm::{ConnectOptions, StreamTrait};
+        use std::time::Duration;
+        let path = OptionalDeliveryDatabasePath(std::env::temp_dir().join(format!(
+            "pioneer-thread-snapshot-{}.sqlite",
+            generate_id(12),
+        )));
+        let mut options = ConnectOptions::new(sqlite_connection_url(&path.0));
+        options.max_connections(1);
+        let mut writer = Database::connect(options).await.unwrap();
+        Migrator::up(&writer, None).await.unwrap();
+        writer
+            .execute_unprepared("PRAGMA journal_mode=WAL")
+            .await
+            .unwrap();
+        writer.execute_unprepared(
+            "INSERT INTO workspace(id,name,is_active,is_current) VALUES ('ws','Snapshot',1,1); \
+             INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status) \
+             VALUES ('thread','ws','','agent','model','provider','idle'); \
+             INSERT INTO turn(id,thread_id,status,turn_kind,origin,reasoning_effort,created_at,updated_at) \
+             VALUES ('conversation','thread','completed','conversation','user','low','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z'), \
+                    ('task','thread','in_progress','task_run','scheduled_task','high','2026-01-01T00:00:01Z','2026-01-01T00:00:01Z')"
+        ).await.unwrap();
+        let reader_statements = Arc::new(std::sync::Mutex::new(Vec::<Statement>::new()));
+        let writer_statements = Arc::new(std::sync::Mutex::new(Vec::<Statement>::new()));
+        writer.set_metric_callback({
+            let statements = writer_statements.clone();
+            move |info| statements.lock().unwrap().push(info.statement.clone())
+        });
+        let mut options = ConnectOptions::new(sqlite_read_only_connection_url(&path.0));
+        options.max_connections(2);
+        options.map_sqlx_sqlite_opts(|options| {
+            options
+                .read_only(true)
+                .create_if_missing(false)
+                .pragma("query_only", "ON")
+        });
+        let mut reader = Database::connect(options).await.unwrap();
+        reader.set_metric_callback({
+            let statements = reader_statements.clone();
+            move |info| statements.lock().unwrap().push(info.statement.clone())
+        });
+        let reads = Arc::new(ThreadSnapshotReadObserver::default());
+        let writes = Arc::new(OptionalDeliveryDatabaseObserver::default());
+        let database = SqliteDatabase::from_executor_with_read_observer(
+            reader,
+            SqliteWriteExecutor::with_observer(writer, writes.clone()),
+            reads.clone(),
+        );
+        database.validate_reader().await.unwrap();
+        let interactive = CrudStore::new(database.clone());
+        let maintenance = interactive.with_maintenance_access();
+        let critical = interactive.with_maintenance_reads_and_critical_writes();
+        let held_writer = database.begin().await.unwrap();
+        let mut selected = Vec::new();
+        for (store, class) in [
+            (&interactive, SqliteReadClass::Interactive),
+            (&maintenance, SqliteReadClass::Maintenance),
+            (&critical, SqliteReadClass::Maintenance),
+        ] {
+            reader_statements.lock().unwrap().clear();
+            writer_statements.lock().unwrap().clear();
+            writes.events.lock().unwrap().clear();
+            reads.events.lock().unwrap().clear();
+            selected = tokio::time::timeout(
+                Duration::from_secs(5),
+                store.list_threads_for_workspace("ws", 1),
+            )
+            .await
+            .expect("list must finish while the writer is occupied")
+            .unwrap();
+            assert_eq!(selected[0].turns[0].id, "task");
+            assert_eq!(selected[0].reasoning_effort.as_deref(), Some("low"));
+            assert_eq!(selected[0].status, ThreadStatus::Idle);
+            assert_thread_turn_snapshot_statements(&reader_statements.lock().unwrap(), &selected);
+            assert!(writer_statements.lock().unwrap().is_empty());
+            assert!(
+                writes.events.lock().unwrap().is_empty(),
+                "no writer reservation"
+            );
+            let events = reads.events.lock().unwrap();
+            let finished = events
+                .iter()
+                .filter_map(|event| match event {
+                    SqliteReadEvent::OperationFinished { class, outcome, .. } => {
+                        Some((*class, *outcome))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(finished, vec![(class, SqliteReadOutcome::Ok); 3]);
+            if class == SqliteReadClass::Maintenance {
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|event| matches!(
+                            event,
+                            SqliteReadEvent::AdmissionReleased {
+                                active: 0,
+                                queue_depth: 0,
+                                ..
+                            }
+                        ))
+                        .count(),
+                    3,
+                    "each bounded read must release capacity"
+                );
+            }
+        }
+        held_writer.rollback().await.unwrap();
+
+        for thread in &mut selected {
+            thread.turns.clear();
+            thread.reasoning_effort = None;
+        }
+        let scoped = database.maintenance();
+        let held_reader = scoped
+            .stream_raw(Statement::from_string(
+                DatabaseBackend::Sqlite,
+                "SELECT 1 AS value".to_owned(),
+            ))
+            .await
+            .unwrap();
+        reads.events.lock().unwrap().clear();
+        reader_statements.lock().unwrap().clear();
+        let cancelled = tokio::spawn({
+            let store = critical.clone();
+            let mut selected = selected.clone();
+            async move {
+                store
+                    .attach_latest_thread_turn_snapshots(&mut selected)
+                    .await
+            }
+        });
+        // Wait for actual admission state, not a sleep or performance threshold.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if reads.events.lock().unwrap().iter().any(|event| {
+                    matches!(
+                        event,
+                        SqliteReadEvent::AdmissionEnqueued {
+                            active: 1,
+                            queue_depth: 1,
+                            ..
+                        }
+                    )
+                }) {
+                    break;
+                }
+                reads.enqueued.notified().await;
+            }
+        })
+        .await
+        .expect("batch selector should queue behind the held reader");
+        cancelled.abort();
+        assert!(cancelled.await.unwrap_err().is_cancelled());
+        assert!(
+            reader_statements.lock().unwrap().is_empty(),
+            "queued batch must not execute SQL"
+        );
+        {
+            let events = reads.events.lock().unwrap();
+            assert!(events.iter().any(|event| matches!(
+                event,
+                SqliteReadEvent::AdmissionCancelled {
+                    class: SqliteReadClass::Maintenance,
+                    active: 1,
+                    queue_depth: 0,
+                    ..
+                }
+            )));
+            assert!(events.iter().any(|event| matches!(
+                event,
+                SqliteReadEvent::OperationFinished {
+                    class: SqliteReadClass::Maintenance,
+                    outcome: SqliteReadOutcome::Cancelled,
+                    ..
+                }
+            )));
+        }
+        drop(held_reader);
+        // SeaORM emits the held stream's metric on drop; isolate the resumed
+        // batch statements from that deliberately occupied test reader.
+        reader_statements.lock().unwrap().clear();
+        reads.events.lock().unwrap().clear();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            critical.attach_latest_thread_turn_snapshots(&mut selected),
+        )
+        .await
+        .expect("cancelled batch must not leak reader capacity")
+        .unwrap();
+        assert_eq!(selected[0].turns[0].id, "task");
+        assert_eq!(selected[0].reasoning_effort.as_deref(), Some("low"));
+        let recorded = reader_statements.lock().unwrap();
+        assert_eq!(recorded.len(), 2);
+        assert_thread_turn_snapshot_statement(&recorded[0], false);
+        assert_thread_turn_snapshot_statement(&recorded[1], true);
+        assert_eq!(
+            reads
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    SqliteReadEvent::AdmissionReleased {
+                        active: 0,
+                        queue_depth: 0,
+                        ..
+                    }
+                ))
+                .count(),
+            2
+        );
     }
 
     #[tokio::test]

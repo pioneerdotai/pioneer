@@ -1618,6 +1618,65 @@ pub async fn find_latest_turn_for_thread<C: ConnectionTrait>(
         .context("failed to query latest turn for thread")
 }
 
+pub(crate) const THREAD_TURN_SNAPSHOT_BATCH_SIZE: usize = 128;
+
+/// Only the already selected thread IDs are visited. Each correlated seek
+/// walks the existing history index backwards and stops at its first match;
+/// the outer primary-key lookup fetches at most one model per selected ID.
+/// CROSS JOIN keeps selected IDs as the outer loop in SQLite.
+/// This is deliberately not a ranking/aggregation over the turn catalogue.
+pub(crate) async fn find_latest_turns_for_threads<C: ConnectionTrait>(
+    db: &C,
+    thread_ids: &[&str],
+    conversation_only: bool,
+) -> Result<Vec<turn::Model>> {
+    anyhow::ensure!(
+        thread_ids.len() <= THREAD_TURN_SNAPSHOT_BATCH_SIZE,
+        "thread turn snapshot batch exceeds its limit"
+    );
+    if thread_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let placeholders = vec!["(?)"; thread_ids.len()].join(", ");
+    let kind_filter = if conversation_only {
+        "AND candidate.turn_kind = ?"
+    } else {
+        ""
+    };
+    let mut values = thread_ids
+        .iter()
+        .map(|id| (*id).into())
+        .collect::<Vec<sea_orm::Value>>();
+    if conversation_only {
+        values.push(turn_kind_to_db(TurnKind::Conversation).into());
+    }
+    let statement = Statement::from_sql_and_values(
+        DatabaseBackend::Sqlite,
+        format!(
+            "WITH selected(thread_id) AS (VALUES {placeholders}) \
+             SELECT latest.* FROM selected CROSS JOIN turn AS latest \
+             WHERE latest.id = (\
+                 SELECT candidate.id FROM turn AS candidate \
+                 INDEXED BY idx_turn_thread_created_id \
+                 WHERE candidate.thread_id = selected.thread_id {kind_filter} \
+                 ORDER BY candidate.created_at DESC, candidate.id DESC LIMIT 1\
+             )"
+        ),
+        values,
+    );
+    let rows = db
+        .query_all_raw(statement)
+        .await
+        .context("failed to query latest thread turn snapshot batch")?;
+    // query_all_raw returns the bounded rows and releases reader capacity
+    // before model decoding or any snapshot/JSON transformation.
+    rows.iter()
+        .map(|row| turn::Model::from_query_result(row, ""))
+        .collect::<Result<Vec<_>, _>>()
+        .context("failed to decode latest thread turn snapshot batch")
+}
+
 /// The shared history order is timestamp, durable creation sequence, legacy
 /// rowid, then ID. The existing (thread_id, created_at, id) index finds a
 /// timestamp bucket; only that bucket needs the sequence/rowid tie-breaker.
