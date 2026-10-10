@@ -518,22 +518,19 @@ impl TurnPreflightProviderRequestFailure {
     fn provider_error(
         provider: &dyn Provider,
         stage: &'static str,
-        failure_stage: ProviderFailureStage,
+        _failure_stage: ProviderFailureStage,
         source: impl Into<anyhow::Error>,
     ) -> Self {
         let source = source.into();
         let mut description = TurnPreflightSafeFailure::local(stage, "provider_request_failed");
-        if let Some(classification) = provider.classify_failure(&source) {
+        if let Some(classification) = pioneer_provider::failure::classify_transport_error(&source)
+            .or_else(|| provider.classify_failure(&source))
+        {
             description.failure_class = Some(classification.class);
             description.http_status = classification.http_status;
             description.reason = classification.error_reason;
         } else {
-            // Preserve the legacy classifier, but never export its input or
-            // infer an HTTP status/reason from it. Drop the raw source here.
-            description.failure_class = Some(super::provider::classify_provider_failure_message(
-                format!("{source:#}").as_str(),
-                failure_stage,
-            ));
+            description.failure_class = Some(pioneer_protocol::ProviderFailureClass::Unknown);
         }
         Self {
             description,

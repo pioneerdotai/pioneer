@@ -3969,6 +3969,7 @@ fn test_agent_event_from_durable(event: AgentDurableEvent) -> Option<AgentEvent>
             turn_id,
             error,
             recovery,
+            ..
         } => Some(AgentEvent::TurnFailed {
             thread_id,
             turn_id,

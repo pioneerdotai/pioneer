@@ -746,6 +746,11 @@ pub(super) async fn run_agent_loop(
                                     thread_id: thread_id.clone(),
                                     turn_id: turn_id.clone(),
                                     error: failure_message.clone(),
+                                    failure: Some(
+                                        pioneer_protocol::NativeFailureMetadata::execution(
+                                            pioneer_protocol::TurnFailureDisposition::Permanent
+                                        )
+                                    ),
                                     recovery,
                                 },);
                                 record_turn_observation!(
@@ -831,7 +836,18 @@ pub(super) async fn run_agent_loop(
                             run_id,
                         )));
                     }
-                    Err(TurnTaskFailure::Terminal(error)) => {
+                    Err(
+                        failure @ (TurnTaskFailure::Terminal(_) | TurnTaskFailure::Transient(_)),
+                    ) => {
+                        let (error, disposition) = match failure {
+                            TurnTaskFailure::Terminal(error) => {
+                                (error, pioneer_protocol::TurnFailureDisposition::Permanent)
+                            }
+                            TurnTaskFailure::Transient(error) => {
+                                (error, pioneer_protocol::TurnFailureDisposition::Transient)
+                            }
+                            _ => unreachable!(),
+                        };
                         let error_for_dispatch = error.clone();
                         let failure_dispatch = post_turn_dispatch.or_else(|| {
                             synthesize_post_turn_failure_dispatch(
@@ -843,17 +859,28 @@ pub(super) async fn run_agent_loop(
                                 error_for_dispatch.clone(),
                             )
                         });
-                        prepare_terminal_effects_or_stop!(
-                            turn_id,
-                            run_id,
-                            runtime_snapshot.as_ref(),
-                            failure_dispatch,
-                            Some(format!("parent turn failed: {error_for_dispatch}")),
-                        );
+                        if disposition == pioneer_protocol::TurnFailureDisposition::Permanent {
+                            prepare_terminal_effects_or_stop!(
+                                turn_id,
+                                run_id,
+                                runtime_snapshot.as_ref(),
+                                failure_dispatch,
+                                Some(format!("parent turn failed: {error_for_dispatch}")),
+                            );
+                        }
                         commit_terminal_or_stop!(AgentDurableEvent::TurnFailed {
                             thread_id: thread_id.clone(),
                             turn_id: turn_id.clone(),
                             error,
+                            failure: Some(
+                                if disposition
+                                    == pioneer_protocol::TurnFailureDisposition::Transient
+                                {
+                                    pioneer_protocol::NativeFailureMetadata::runtime()
+                                } else {
+                                    pioneer_protocol::NativeFailureMetadata::execution(disposition)
+                                }
+                            ),
                             recovery,
                         },);
                         record_turn_observation!(
@@ -1172,7 +1199,9 @@ pub(super) async fn run_agent_loop(
                     )
                     .await
                     {
-                        let _ = ack.send(Err(error));
+                        let _ = ack.send(Err(super::AgentControlError::Internal(format!(
+                            "failed to publish recovery continuation: {error}"
+                        ))));
                         continue;
                     }
 
@@ -1319,17 +1348,27 @@ pub(super) async fn run_agent_loop(
                         TurnPostTurnStatus::Failed,
                         failure_message.clone(),
                     );
-                    prepare_terminal_effects_or_stop!(
-                        request.turn_id,
-                        active_turn_run_id.unwrap_or(0),
-                        Some(&runtime_snapshot),
-                        failure_dispatch,
-                        Some(format!("parent turn failed: {failure_message}")),
-                    );
+                    let permanent = matches!(&error, super::AgentEventHubError::CommitRejected(rejection) if !rejection.is_retryable());
+                    if permanent {
+                        prepare_terminal_effects_or_stop!(
+                            request.turn_id,
+                            active_turn_run_id.unwrap_or(0),
+                            Some(&runtime_snapshot),
+                            failure_dispatch,
+                            Some(format!("parent turn failed: {failure_message}")),
+                        );
+                    }
                     commit_terminal_or_stop!(AgentDurableEvent::TurnFailed {
                         thread_id: thread_id.clone(),
                         turn_id: request.turn_id.clone(),
                         error: failure_message.clone(),
+                        failure: Some(if permanent {
+                            pioneer_protocol::NativeFailureMetadata::execution(
+                                pioneer_protocol::TurnFailureDisposition::Permanent,
+                            )
+                        } else {
+                            pioneer_protocol::NativeFailureMetadata::runtime()
+                        }),
                         recovery,
                     },);
                     record_turn_observation!(
@@ -1455,7 +1494,9 @@ pub(super) async fn run_agent_loop(
                 )
                 .await
                 {
-                    let _ = ack.send(Err(error));
+                    let _ = ack.send(Err(super::AgentControlError::Internal(format!(
+                        "failed to publish recovery continuation: {error}"
+                    ))));
                     continue;
                 }
 
@@ -1661,17 +1702,16 @@ fn spawn_turn_task(
         .catch_unwind()
         .await
         .unwrap_or_else(|panic| {
-            let message = panic_payload_message(panic.as_ref());
+            let _ = panic;
             error!(
                 thread_id = %thread_id,
                 turn_id = %turn_request.turn_id,
-                message,
                 "agent turn task panicked"
             );
             TurnTaskCompletion {
-                result: Err(TurnTaskFailure::Terminal(format!(
-                    "agent turn task panicked: {message}"
-                ))),
+                result: Err(TurnTaskFailure::Transient(
+                    "agent turn task panicked".to_owned(),
+                )),
                 post_turn_dispatch: None,
             }
         });
@@ -1762,16 +1802,6 @@ async fn wait_for_turn_task_shutdown(mut task: JoinHandle<()>) {
         task.abort();
         let _ = task.await;
     }
-}
-
-fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
-    if let Some(message) = payload.downcast_ref::<&str>() {
-        return (*message).to_owned();
-    }
-    if let Some(message) = payload.downcast_ref::<String>() {
-        return message.clone();
-    }
-    "non-string panic payload".to_owned()
 }
 
 fn recovery_context(request: &super::RecoveryAttemptRequest) -> RecoveryAttemptContext {
@@ -1900,6 +1930,7 @@ async fn execute_turn_flow(
             TurnTaskCompletion {
                 result: Err(match error {
                     chat::ChatTurnError::Terminal(message) => TurnTaskFailure::Terminal(message),
+                    chat::ChatTurnError::Transient(message) => TurnTaskFailure::Transient(message),
                     chat::ChatTurnError::Blocked(message) => TurnTaskFailure::Blocked(message),
                     chat::ChatTurnError::ProviderFailure {
                         item_id,
@@ -2070,7 +2101,7 @@ async fn publish_recovery_execution_window_continued(
     workspace_id: &str,
     thread_id: &str,
     turn_request: &ActiveTurnRequest,
-) -> Result<(), super::AgentControlError> {
+) -> Result<(), super::AgentEventHubError> {
     let Some(context) = turn_request.execution_checkpoint_context.as_ref() else {
         return Ok(());
     };
@@ -2094,11 +2125,6 @@ async fn publish_recovery_execution_window_continued(
             },
         })
         .await
-        .map_err(|error| {
-            super::AgentControlError::Internal(format!(
-                "failed to publish execution window continuation for recovery: {error}"
-            ))
-        })
 }
 
 fn terminal_effect_preparation(

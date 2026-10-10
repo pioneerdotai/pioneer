@@ -805,10 +805,11 @@ impl AgentMemoryPostTurnExtractorProvider for GatewayMemoryProvider {
             .provider_registry()
             .get_or_create_for_workspace(context.workspace_id.as_str(), provider_name)
             .map_err(|error| {
-                let class = pioneer_agent::classify_provider_failure_message(
-                    error.to_string().as_str(),
-                    ProviderFailureStage::Connect,
-                );
+                let classification = pioneer_provider::failure::classify_transport_error(&error)
+                    .unwrap_or_else(|| {
+                        ProviderFailureClassification::new(ProviderFailureClass::Unknown)
+                    });
+                let class = classification.class;
                 tracing::warn!(
                     target: "pioneer::memory_post_turn_extractor",
                     stage = "provider_resolution",
@@ -823,7 +824,7 @@ impl AgentMemoryPostTurnExtractorProvider for GatewayMemoryProvider {
                     model,
                     "provider_resolution",
                     ProviderFailureStage::Connect,
-                    ProviderFailureClassification::new(class),
+                    classification,
                 )
             })?;
         // Extraction is post-turn work: never inherit an interactive handle.
@@ -1333,14 +1334,9 @@ fn memory_provider_request_error(
     stage: ProviderFailureStage,
     error: &anyhow::Error,
 ) -> HookError {
-    let classification = provider.classify_failure(error).unwrap_or_else(|| {
-        ProviderFailureClassification::new(pioneer_agent::classify_provider_failure_message(
-            pioneer_provider::usage::classification_source(error)
-                .to_string()
-                .as_str(),
-            stage,
-        ))
-    });
+    let classification = provider
+        .classify_failure(error)
+        .unwrap_or_else(|| ProviderFailureClassification::new(ProviderFailureClass::Unknown));
     classified_memory_provider_error(provider.name(), model, stage_name, stage, classification)
 }
 

@@ -1375,6 +1375,7 @@ struct ActiveTurnRequest {
 #[derive(Debug, Clone)]
 enum TurnTaskFailure {
     Terminal(String),
+    Transient(String),
     Blocked(String),
     ProviderFailure {
         item_id: String,

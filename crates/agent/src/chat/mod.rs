@@ -568,6 +568,7 @@ use crate::post_turn::{post_turn_tool_error_class, post_turn_tool_outcome_status
 #[derive(Debug, Clone)]
 pub(super) enum ChatTurnError {
     Terminal(String),
+    Transient(String),
     Blocked(String),
     ProviderFailure {
         item_id: String,
@@ -834,7 +835,8 @@ fn build_failure_execution_window_continuation(
             ExecutionWindowExhaustionReason::ProviderFailureContinuation,
             "provider_failure_continuation",
         ),
-        ChatTurnError::Terminal(_) => (
+        ChatTurnError::Terminal(_) => return None,
+        ChatTurnError::Transient(_) => (
             ExecutionWindowExhaustionReason::RuntimeShutdownContinuation,
             "runtime_shutdown_continuation",
         ),
@@ -978,22 +980,28 @@ impl ChatTurnError {
 }
 
 fn agent_event_error(error: AgentEventHubError) -> ChatTurnError {
-    ChatTurnError::Terminal(format!("failed to publish agent event: {error}"))
+    let message = format!("failed to publish agent event: {error}");
+    match error {
+        AgentEventHubError::CommitRejected(rejection) if !rejection.is_retryable() => {
+            ChatTurnError::Terminal(message)
+        }
+        _ => ChatTurnError::Transient(message),
+    }
 }
 
 fn chat_error_post_turn_status(error: &ChatTurnError) -> pioneer_hooks::TurnPostTurnStatus {
     match error {
         ChatTurnError::ProviderFailure { .. } => pioneer_hooks::TurnPostTurnStatus::ProviderFailure,
         ChatTurnError::Blocked(_) => pioneer_hooks::TurnPostTurnStatus::Blocked,
-        ChatTurnError::Terminal(_) | ChatTurnError::WithPostTurnDispatch { .. } => {
-            pioneer_hooks::TurnPostTurnStatus::Failed
-        }
+        ChatTurnError::Terminal(_)
+        | ChatTurnError::Transient(_)
+        | ChatTurnError::WithPostTurnDispatch { .. } => pioneer_hooks::TurnPostTurnStatus::Failed,
     }
 }
 
 fn chat_error_preview(error: &ChatTurnError) -> String {
     match error {
-        ChatTurnError::Terminal(message) => message.clone(),
+        ChatTurnError::Terminal(message) | ChatTurnError::Transient(message) => message.clone(),
         ChatTurnError::Blocked(message) => message.clone(),
         ChatTurnError::ProviderFailure { failure, .. } => {
             failure.message.clone().unwrap_or_else(|| {
@@ -5593,8 +5601,8 @@ async fn execute_agent_provider_response(
                             post_turn_assistant_text
                                 .truncate(post_turn_assistant_text_len_before_round);
                             return Err((
-                                ChatTurnError::Terminal(format!(
-                                    "turn finalization check failed: {error}"
+                                ChatTurnError::Blocked(format!(
+                                    "turn finalization outcome is unavailable: {error}"
                                 )),
                                 current_thinking_id.clone(),
                             ));

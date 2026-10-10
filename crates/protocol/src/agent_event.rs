@@ -26,6 +26,68 @@ pub enum ProtocolEventClass {
     InternalTelemetry,
 }
 
+/// Native failure policy captured by its owner, before display projection.
+/// Legacy events without this metadata remain Unknown, never inferred from text.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnFailureDisposition {
+    Permanent,
+    Transient,
+    #[default]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeFailureStage {
+    Execution,
+    Runtime,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeFailureReason {
+    ContractRejected,
+    RuntimeUnavailable,
+}
+
+/// Version 1 is enum-only and has a fixed byte/cardinality bound. Legacy
+/// absence and unknown versions must not authorize an automatic native retry.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct NativeFailureMetadata {
+    pub schema_version: u32,
+    pub disposition: TurnFailureDisposition,
+    pub stage: NativeFailureStage,
+    pub reason: NativeFailureReason,
+}
+
+impl NativeFailureMetadata {
+    pub const fn execution(disposition: TurnFailureDisposition) -> Self {
+        Self {
+            schema_version: 1,
+            disposition,
+            stage: NativeFailureStage::Execution,
+            reason: NativeFailureReason::ContractRejected,
+        }
+    }
+    pub const fn runtime() -> Self {
+        Self {
+            schema_version: 1,
+            disposition: TurnFailureDisposition::Transient,
+            stage: NativeFailureStage::Runtime,
+            reason: NativeFailureReason::RuntimeUnavailable,
+        }
+    }
+    pub const fn effective_disposition(self) -> TurnFailureDisposition {
+        if self.schema_version == 1 {
+            self.disposition
+        } else {
+            TurnFailureDisposition::Unknown
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AgentDurableEvent {
@@ -164,6 +226,8 @@ pub enum AgentDurableEvent {
         thread_id: String,
         turn_id: String,
         error: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        failure: Option<NativeFailureMetadata>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         recovery: Option<RecoveryAttemptContext>,
     },
@@ -752,6 +816,41 @@ impl TaskEventPayload {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn native_failure_disposition_survives_durable_roundtrip_and_legacy_is_unknown() {
+        for disposition in [
+            super::TurnFailureDisposition::Permanent,
+            super::TurnFailureDisposition::Transient,
+            super::TurnFailureDisposition::Unknown,
+        ] {
+            let event = super::AgentDurableEvent::TurnFailed {
+                thread_id: "thread".into(),
+                turn_id: "turn".into(),
+                error: "controlled failure".into(),
+                failure: Some(super::NativeFailureMetadata::execution(disposition)),
+                recovery: None,
+            };
+            let value = serde_json::to_value(&event).unwrap();
+            assert_eq!(
+                serde_json::from_value::<super::AgentDurableEvent>(value).unwrap(),
+                event
+            );
+        }
+        let mut future = super::NativeFailureMetadata::runtime();
+        future.schema_version = 2;
+        assert_eq!(
+            future.effective_disposition(),
+            super::TurnFailureDisposition::Unknown
+        );
+        let event: super::AgentDurableEvent = serde_json::from_value(serde_json::json!({
+            "kind": "turn_failed", "thread_id": "thread", "turn_id": "turn", "error": "rate limit unsupported auth arbitrary legacy text"
+        })).unwrap();
+        assert!(matches!(
+            event,
+            super::AgentDurableEvent::TurnFailed { failure: None, .. }
+        ));
+    }
+
     use super::*;
     use crate::{TaskErrorClass, TurnItem};
 

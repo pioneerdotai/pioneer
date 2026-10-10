@@ -20,6 +20,35 @@ use std::collections::{HashMap, HashSet};
 const MAX_AGENT_SKILL_PINS_JSON_BYTES: usize = 16 * 1024;
 const MAX_AGENT_SKILL_FINGERPRINT_CHARS: usize = 128;
 
+/// Structural compatibility is separate from existence and fresh authorization.
+/// No DB access occurs here, so a decode rejection cannot hide a failed read.
+pub(crate) fn validate_runtime_snapshot_for_resume(
+    snapshot: &TurnRuntimeSnapshotRecord,
+) -> Result<()> {
+    let _: ThreadMode = from_snapshot_json(&snapshot.mode_json, "thread mode")?;
+    let _: AgentTurnHookRuntimeContext =
+        from_snapshot_json(&snapshot.hook_runtime_context_json, "hook runtime context")?;
+    restore_workspace_skill_policies(&snapshot.workspace_skill_policies_json)?;
+    let _: Vec<UserInput> = from_snapshot_json(&snapshot.input_json, "turn input")?;
+    restored_execution_capabilities(&snapshot.capabilities_json)?;
+    let _: Vec<ResolvedArtifactInput> =
+        from_snapshot_json(&snapshot.resolved_artifacts_json, "resolved artifacts")?;
+    let _: HashMap<String, String> =
+        from_snapshot_json(&snapshot.runtime_environment_json, "runtime environment")?;
+    agent_skill_version_pins_from_snapshot(snapshot)?;
+    if let Some(effort) = snapshot.reasoning_effort.as_deref() {
+        reasoning_config_from_snapshot_effort(effort)?;
+    }
+    if snapshot.history_json.trim_start().starts_with('[') {
+        let _: Vec<ChatMessage> =
+            from_snapshot_json(&snapshot.history_json, "conversation history")?;
+    } else {
+        let _: pioneer_compaction::frozen::FrozenHistoryRef =
+            from_snapshot_json(&snapshot.history_json, "history reference")?;
+    }
+    Ok(())
+}
+
 pub(crate) async fn execution_window_usage_snapshot(
     store: &CrudStore,
     turn_id: &str,
@@ -435,6 +464,22 @@ mod tests {
             created_at: now,
             updated_at: now,
         }
+    }
+
+    #[test]
+    fn resume_compatibility_rejects_malformed_and_unknown_required_state() {
+        let mut snapshot = runtime_snapshot(None);
+        snapshot.mode_json = serde_json::to_string(&pioneer_protocol::ThreadMode::Agent).unwrap();
+        assert!(super::validate_runtime_snapshot_for_resume(&snapshot).is_ok());
+        let original = snapshot.clone();
+        snapshot.input_json = "{\"incomplete\":true}".into();
+        assert!(super::validate_runtime_snapshot_for_resume(&snapshot).is_err());
+        snapshot = original.clone();
+        snapshot.history_json = "{\"schema_version\":999}".into();
+        assert!(super::validate_runtime_snapshot_for_resume(&snapshot).is_err());
+        snapshot = original;
+        snapshot.agent_skill_versions_json = Some("[{\"version_id\":\"missing\"}]".into());
+        assert!(super::validate_runtime_snapshot_for_resume(&snapshot).is_err());
     }
 
     fn pin_json(version_id: &str, fingerprint: &str) -> String {

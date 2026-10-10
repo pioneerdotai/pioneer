@@ -39984,6 +39984,7 @@ async fn terminal_turn_completion_closes_running_execution_window() {
             thread_id: thread_id.to_owned(),
             turn_id: turn_id.to_owned(),
             error: "stale failure".to_owned(),
+            failure: None,
             recovery: None,
         })
         .await
@@ -40081,6 +40082,7 @@ async fn agent_turn_failed_without_recovery_opens_runtime_recovery() {
             thread_id: thread_id.to_owned(),
             turn_id: turn_id.to_owned(),
             error: "provider failed".to_owned(),
+            failure: Some(pioneer_protocol::NativeFailureMetadata::runtime()),
             recovery: None,
         })
         .await;
@@ -40112,6 +40114,67 @@ async fn agent_turn_failed_without_recovery_opens_runtime_recovery() {
             .as_deref()
             .unwrap_or("")
             .contains("provider failed")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn permanent_native_failure_commits_terminal_without_runtime_recovery() {
+    let thread_id = "thr_native_permanent";
+    let turn_id = "turn_native_permanent";
+    let (processor, crud_store, _) = setup_execution_window_terminal_turn(thread_id, turn_id).await;
+    let event = AgentDurableEvent::TurnFailed {
+        thread_id: thread_id.into(),
+        turn_id: turn_id.into(),
+        error: "execution contract rejected".into(),
+        failure: Some(pioneer_protocol::NativeFailureMetadata::execution(
+            pioneer_protocol::TurnFailureDisposition::Permanent,
+        )),
+        recovery: None,
+    };
+    let restored: AgentDurableEvent =
+        serde_json::from_value(serde_json::to_value(event).unwrap()).unwrap();
+    processor.handle_durable_agent_event(restored).await;
+    let (_, turn) = crud_store
+        .get_turn(thread_id, turn_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(turn.status, TurnStatus::Failed);
+    assert!(
+        crud_store
+            .find_recovery_jobs_by_turn_and_status(turn_id, RecoveryJobStatus::Pending)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_failure_without_disposition_blocks_without_inferred_retry() {
+    let thread_id = "thr_native_unknown";
+    let turn_id = "turn_native_unknown";
+    let (processor, crud_store, _) = setup_execution_window_terminal_turn(thread_id, turn_id).await;
+    processor
+        .handle_durable_agent_event(AgentDurableEvent::TurnFailed {
+            thread_id: thread_id.into(),
+            turn_id: turn_id.into(),
+            error: "503 connection reset retry-after: 2".into(),
+            failure: None,
+            recovery: None,
+        })
+        .await;
+    let (_, turn) = crud_store
+        .get_turn(thread_id, turn_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(turn.status, TurnStatus::Blocked);
+    assert!(
+        crud_store
+            .find_recovery_jobs_by_turn_and_status(turn_id, RecoveryJobStatus::Pending)
+            .await
+            .unwrap()
+            .is_empty()
     );
 }
 

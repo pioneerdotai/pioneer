@@ -653,6 +653,20 @@ impl TurnFailureRecoveryKind {
     }
 }
 
+fn recovery_resume_reason_class(class: pioneer_protocol::ProviderFailureClass) -> &'static str {
+    use pioneer_protocol::ProviderFailureClass::*;
+    match class {
+        AuthExpired | AuthOrPermission | PermissionDenied => "auth_or_config",
+        ModelNotFound => "model_unavailable",
+        UnsupportedImageInput
+        | UnsupportedToolCalling
+        | UnsupportedStreaming
+        | UnsupportedCapability
+        | UnsupportedParameter => "unsupported_capability",
+        _ => "recovery_blocked",
+    }
+}
+
 fn classify_legacy_turn_failure(_error_message: &str) -> TurnFailureRecoveryKind {
     TurnFailureRecoveryKind::RuntimeFailure
 }
@@ -4493,6 +4507,7 @@ impl MessageProcessor {
                 thread_id,
                 turn_id,
                 error,
+                failure,
                 recovery,
             } => message_future(async move {
                 if let Err(finalize_error) = self
@@ -4511,23 +4526,60 @@ impl MessageProcessor {
                     thread_id.as_str(),
                     turn_id.as_str(),
                 );
-                if recovery.is_some() {
-                    if !message_future(
-                        self.mark_turn_failed_with_recovery(thread_id, turn_id, error, recovery),
-                    )
-                    .await
+                let disposition =
+                    failure.map(pioneer_protocol::NativeFailureMetadata::effective_disposition);
+                if disposition == Some(pioneer_protocol::TurnFailureDisposition::Permanent) {
+                    if !self
+                        .mark_turn_failed_with_recovery(thread_id, turn_id, error, recovery)
+                        .await
                     {
                         return false;
                     }
-                } else if !message_future(self.report_turn_failure(
-                    thread_id,
-                    turn_id,
-                    TurnFailureRecoveryKind::RuntimeFailure,
-                    error,
-                ))
-                .await
-                {
-                    return false;
+                } else if disposition == Some(pioneer_protocol::TurnFailureDisposition::Transient) {
+                    let committed = if let Some(recovery) = recovery {
+                        self.handle_runtime_recovery_attempt_failure(
+                            turn_id, recovery, error, None, None,
+                        )
+                        .await
+                    } else {
+                        self.report_turn_failure(
+                            thread_id,
+                            turn_id,
+                            TurnFailureRecoveryKind::RuntimeFailure,
+                            error,
+                        )
+                        .await
+                    };
+                    if !committed {
+                        return false;
+                    }
+                } else {
+                    // Legacy CLI outcomes retain their existing projection. A
+                    // native event missing policy facts cannot authorize restart.
+                    let cli_binding =
+                        match self.crud_store.get_cli_runtime_turn_binding(&turn_id).await {
+                            Ok(binding) => binding,
+                            Err(_) => return false,
+                        };
+                    let committed = if cli_binding.is_some() {
+                        if recovery.is_some() {
+                            self.mark_turn_failed_with_recovery(thread_id, turn_id, error, recovery)
+                                .await
+                        } else {
+                            self.report_turn_failure(
+                                thread_id,
+                                turn_id,
+                                TurnFailureRecoveryKind::RuntimeFailure,
+                                error,
+                            )
+                            .await
+                        }
+                    } else {
+                        self.mark_turn_blocked_with_recovery(thread_id, turn_id, "native failure disposition is unknown; restoration requires explicit review".to_owned(), recovery, None, None).await
+                    };
+                    if !committed {
+                        return false;
+                    }
                 }
                 pioneer_tools::apply_patch::patch_telemetry().record_task_result(false);
                 true
@@ -4940,7 +4992,7 @@ impl MessageProcessor {
         }
     }
 
-    pub(super) async fn handle_cli_runtime_recovery_native_failure(
+    pub(super) async fn handle_runtime_recovery_attempt_failure(
         &self,
         turn_id: String,
         recovery: pioneer_protocol::RecoveryAttemptContext,
@@ -4951,7 +5003,7 @@ impl MessageProcessor {
         let now_unix = now_timestamp_secs();
         match self
             .recovery_coordinator
-            .record_cli_runtime_attempt_failure(
+            .record_runtime_attempt_failure(
                 recovery.job_id.as_str(),
                 recovery.attempt_id.as_str(),
                 failure_message,
@@ -8541,35 +8593,57 @@ impl MessageProcessor {
         recovery_job_id: &str,
         reason: &str,
     ) -> Result<pioneer_protocol::TurnBlockedResumeMetadata> {
-        let latest_checkpoint_id = self
+        let checkpoint = self
             .crud_store
             .latest_turn_execution_checkpoint_for_turn(turn_id)
-            .await?
-            .map(|checkpoint| checkpoint.id);
+            .await?;
+        let latest_checkpoint_id = checkpoint.as_ref().map(|checkpoint| checkpoint.id.clone());
         let recovery_job = self.crud_store.get_recovery_job(recovery_job_id).await?;
-        let has_runtime_snapshot = self
-            .crud_store
-            .get_turn_runtime_snapshot(turn_id)
-            .await?
-            .is_some();
-        let can_resume_same_turn = recovery_job
+        let snapshot = self.crud_store.get_turn_runtime_snapshot(turn_id).await?;
+        let snapshot_compatible = snapshot.as_ref().is_some_and(|snapshot| {
+            snapshot.turn_id == turn_id
+                && crate::turn_runtime_snapshot::validate_runtime_snapshot_for_resume(snapshot)
+                    .is_ok()
+        });
+        let checkpoint_compatible = checkpoint.as_ref().is_some_and(|checkpoint| {
+            serde_json::from_value::<pioneer_protocol::ExecutionCheckpointPayload>(
+                checkpoint.payload_json.clone(),
+            )
+            .is_ok_and(|payload| {
+                payload.turn_id == turn_id
+                    && payload.schema_version
+                        == pioneer_protocol::EXECUTION_CHECKPOINT_PAYLOAD_SCHEMA_VERSION
+            })
+        });
+        if snapshot_compatible {
+            // Resolve canonical history, propagating repository/read failures.
+            // A row's mere existence is not proof its referenced state exists.
+            crate::turn_runtime_snapshot::restored_conversation_scope_from_snapshot(
+                &self.crud_store,
+                snapshot.as_ref().expect("validated snapshot"),
+            )
+            .await?;
+            crate::turn_runtime_snapshot::restore_agent_skill_overlay_from_snapshot(
+                &self.crud_store,
+                &snapshot.as_ref().expect("validated snapshot").workspace_id,
+                snapshot.as_ref().expect("validated snapshot"),
+            )
+            .await?;
+        }
+        let can_resume_same_turn = recovery_job.as_ref().is_some_and(|job| {
+            job.turn_id == turn_id
+                && !matches!(
+                    job.action,
+                    pioneer_protocol::RecoveryAction::MarkFailed
+                        | pioneer_protocol::RecoveryAction::Fallback
+                )
+        }) && snapshot_compatible
+            && checkpoint_compatible;
+        let reason_class = recovery_job
             .as_ref()
-            .is_some_and(|job| !job.item_type.is_tool_item() || has_runtime_snapshot);
-
-        let normalized = reason.to_ascii_lowercase();
-        let reason_class = if normalized.contains("auth")
-            || normalized.contains("permission")
-            || normalized.contains("credential")
-            || normalized.contains("api key")
-        {
-            "auth_or_config"
-        } else if normalized.contains("model") {
-            "model_unavailable"
-        } else if normalized.contains("capability") || normalized.contains("unsupported") {
-            "unsupported_capability"
-        } else {
-            "recovery_blocked"
-        };
+            .and_then(|job| job.error_class)
+            .map(recovery_resume_reason_class)
+            .unwrap_or("recovery_blocked");
 
         let mut resume_requirements = Vec::new();
         match reason_class {
@@ -8586,7 +8660,7 @@ impl MessageProcessor {
             }
             "unsupported_capability" => {
                 resume_requirements.push(
-                    "Disable the unsupported capability or configure a provider/model that supports it."
+                    "Configure support for the accepted capability; resume must preserve the original input and tools."
                         .to_owned(),
                 );
             }
@@ -10667,4 +10741,25 @@ mod user_message_attachment_tests {
 #[cfg(test)]
 pub(super) mod native_preparation_failure_tests {
     include!("native_preparation_failure_tests.rs");
+}
+
+#[cfg(test)]
+mod recovery_resume_reason_contract_tests {
+    use super::recovery_resume_reason_class;
+    use pioneer_protocol::ProviderFailureClass;
+
+    #[test]
+    fn resume_reason_uses_only_persisted_typed_class() {
+        for (class, expected) in [
+            (ProviderFailureClass::AuthOrPermission, "auth_or_config"),
+            (ProviderFailureClass::ModelNotFound, "model_unavailable"),
+            (
+                ProviderFailureClass::UnsupportedImageInput,
+                "unsupported_capability",
+            ),
+            (ProviderFailureClass::Unknown, "recovery_blocked"),
+        ] {
+            assert_eq!(recovery_resume_reason_class(class), expected);
+        }
+    }
 }

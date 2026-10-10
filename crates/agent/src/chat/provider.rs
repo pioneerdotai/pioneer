@@ -6,10 +6,9 @@ use pioneer_protocol::{
     ItemStartedNotification, ProviderFailureClass, ProviderFailureDetails, ProviderFailureStage,
     ProviderTransportKind, TurnItem, TurnItemType,
 };
-use pioneer_provider::failure::{
-    classify_http_error_body_too_large, classify_provider_failure_class, extract_provider_code,
-    extract_retry_after_ms,
-};
+use pioneer_provider::failure::classify_http_error_body_too_large;
+#[cfg(test)]
+use pioneer_provider::failure::classify_provider_failure_class;
 use pioneer_provider::{
     ChatRequest, Provider, ProviderFailureClassification, ProviderResponseLimits,
     ProviderResponseTooLarge, ProviderTermination, ProviderTimeoutPolicy, ProviderToolCall,
@@ -1041,15 +1040,6 @@ fn adapter_error_for_target(
     } else {
         provider.classify_failure(error)
     };
-    // Usage context has a safe fixed Display. Classify the original cause
-    // privately, then persist only the safe outer diagnostic and typed hints.
-    let inferred = infer_failure_classification(
-        &format!(
-            "{prefix}: {}",
-            pioneer_provider::usage::classification_source(error)
-        ),
-        stage,
-    );
     provider_failure_error_with_classification(
         target.item_id,
         target.item_type,
@@ -1057,8 +1047,8 @@ fn adapter_error_for_target(
         model,
         transport,
         stage,
-        format!("{prefix}: {error}"),
-        Some(merge_failure_classification(classification, inferred)),
+        format!("{prefix}: provider request failed"),
+        pioneer_provider::failure::classify_transport_error(error).or(classification),
     )
 }
 
@@ -1394,13 +1384,11 @@ fn provider_failure_error_with_classification(
     model: &str,
     transport: ProviderTransportKind,
     stage: ProviderFailureStage,
-    error_message: String,
+    _error_message: String,
     classification: Option<ProviderFailureClassification>,
 ) -> ChatTurnError {
-    let classification = merge_failure_classification(
-        classification,
-        infer_failure_classification(&error_message, stage),
-    );
+    let classification = classification
+        .unwrap_or_else(|| ProviderFailureClassification::new(ProviderFailureClass::Unknown));
     let ProviderFailureClassification {
         is_network_error: _,
         error_reason,
@@ -1427,41 +1415,10 @@ fn provider_failure_error_with_classification(
             provider_code,
             retry_after_ms,
             is_recoverable_hint,
-            message: Some(error_message),
+            message: Some(format!(
+                "provider request failed: {class:?} during {stage:?}"
+            )),
         },
-    }
-}
-
-fn infer_failure_classification(
-    message: &str,
-    stage: ProviderFailureStage,
-) -> ProviderFailureClassification {
-    ProviderFailureClassification {
-        is_network_error: false,
-        error_reason: None,
-        request_id: None,
-        class: classify_provider_failure_message(message, stage),
-        http_status: extract_http_status(message),
-        provider_code: extract_provider_code(message),
-        retry_after_ms: extract_retry_after_ms(&message.to_ascii_lowercase()),
-    }
-}
-
-fn merge_failure_classification(
-    classification: Option<ProviderFailureClassification>,
-    inferred: ProviderFailureClassification,
-) -> ProviderFailureClassification {
-    match classification {
-        Some(classification) => ProviderFailureClassification {
-            is_network_error: classification.is_network_error,
-            error_reason: classification.error_reason,
-            request_id: classification.request_id,
-            class: classification.class,
-            http_status: classification.http_status.or(inferred.http_status),
-            provider_code: classification.provider_code.or(inferred.provider_code),
-            retry_after_ms: classification.retry_after_ms.or(inferred.retry_after_ms),
-        },
-        None => inferred,
     }
 }
 
@@ -1488,26 +1445,12 @@ fn provider_failure_class_is_recoverable(class: ProviderFailureClass) -> bool {
 }
 
 pub(crate) fn classify_provider_failure_message(
-    error_message: &str,
-    stage: ProviderFailureStage,
+    _error_message: &str,
+    _stage: ProviderFailureStage,
 ) -> ProviderFailureClass {
-    let lower = error_message.to_ascii_lowercase();
-    let http_status = extract_http_status(error_message);
-    let provider_code = extract_provider_code(error_message);
-    classify_provider_failure_class(lower.as_str(), stage, http_status, provider_code.as_deref())
-}
-
-fn extract_http_status(message: &str) -> Option<u16> {
-    let bytes = message.as_bytes();
-    for window in bytes.windows(3) {
-        if window.iter().all(|b| b.is_ascii_digit()) {
-            let value = std::str::from_utf8(window).ok()?.parse::<u16>().ok()?;
-            if (100..600).contains(&value) {
-                return Some(value);
-            }
-        }
-    }
-    None
+    // Kept for source compatibility with old diagnostic callers. Text is not
+    // authoritative failure evidence and cannot choose any recovery action.
+    ProviderFailureClass::Unknown
 }
 
 #[cfg(test)]
@@ -1565,25 +1508,25 @@ mod tests {
             (
                 "OpenRouter API error 429: {\"code\":\"rate_limit_exceeded\"} retry-after: 2",
                 ProviderFailureStage::Connect,
-                ProviderFailureClass::RateLimit,
+                ProviderFailureClass::Unknown,
                 false,
             ),
             (
                 "OpenRouter API error 503: unavailable",
                 ProviderFailureStage::Connect,
-                ProviderFailureClass::Provider5xx,
+                ProviderFailureClass::Unknown,
                 false,
             ),
             (
                 "connection reset by peer",
                 ProviderFailureStage::MidStream,
-                ProviderFailureClass::NetworkTransient,
+                ProviderFailureClass::Unknown,
                 false,
             ),
             (
                 "provider API error 400: invalid request",
                 ProviderFailureStage::MidStream,
-                ProviderFailureClass::ProviderRejected,
+                ProviderFailureClass::Unknown,
                 false,
             ),
             (
@@ -1645,13 +1588,10 @@ mod tests {
             assert_eq!(after.http_status, before.http_status);
             assert_eq!(after.provider_code, before.provider_code);
             assert_eq!(after.retry_after_ms, before.retry_after_ms);
-            if message.starts_with("OpenRouter API error 429") {
-                assert_eq!(after.http_status, Some(429));
-                assert_eq!(after.provider_code.as_deref(), Some("rate_limit_exceeded"));
-                assert_eq!(after.retry_after_ms, Some(2000));
-            }
-            if message.starts_with("OpenRouter API error 503") {
-                assert_eq!(after.http_status, Some(503));
+            if !typed {
+                assert!(after.http_status.is_none());
+                assert!(after.provider_code.is_none());
+                assert!(after.retry_after_ms.is_none());
             }
             assert_eq!(after.is_recoverable_hint, before.is_recoverable_hint);
             assert_eq!(after.stage, before.stage);
@@ -1802,8 +1742,17 @@ mod tests {
         message: &'static str,
         stream_request: bool,
     ) -> ProviderFailureDetails {
-        failure_from_overridden_endpoint_body(provider_name, status, message, stream_request, None)
-            .await
+        failure_from_local_endpoint(
+            provider_name,
+            status,
+            message,
+            stream_request,
+            None,
+            true,
+            "X-Generation-Id: gen-private-header\r\nRetry-After: 3\r\n",
+            false,
+        )
+        .await
     }
 
     async fn failure_from_overridden_endpoint_body(
@@ -1814,9 +1763,9 @@ mod tests {
         response_body: Option<String>,
     ) -> ProviderFailureDetails {
         let headers = if provider_name == "openrouter" && response_body.is_none() {
-            "X-Generation-Id: gen-private-header\r\n"
+            "X-Generation-Id: gen-private-header\r\nRetry-After: 2\r\n"
         } else {
-            ""
+            "Retry-After: 2\r\n"
         };
         failure_from_local_endpoint(
             provider_name,
@@ -2263,16 +2212,12 @@ mod tests {
                 (
                     b"private_fixture incomplete response".to_vec(),
                     true,
-                    if redacted {
-                        ProviderFailureClass::NetworkTransient
-                    } else {
-                        ProviderFailureClass::Unknown
-                    },
+                    ProviderFailureClass::Provider5xx,
                 ),
                 (
                     [b"private_fixture ".as_slice(), &[0xff]].concat(),
                     false,
-                    ProviderFailureClass::Unknown,
+                    ProviderFailureClass::Provider5xx,
                 ),
             ] {
                 let failure = failure_from_local_response(
@@ -2624,24 +2569,24 @@ mod tests {
                 400,
                 "maximum context length exceeded",
                 false,
-                ProviderFailureClass::ContextTooLarge,
-                true,
+                ProviderFailureClass::ProviderRejected,
+                false,
             ),
             (
                 "openrouter",
                 404,
                 "No endpoints found that support image input",
                 true,
-                ProviderFailureClass::UnsupportedImageInput,
-                true,
+                ProviderFailureClass::ProviderRejected,
+                false,
             ),
             (
                 "openai",
                 400,
                 "this model does not support streaming",
                 true,
-                ProviderFailureClass::UnsupportedStreaming,
-                true,
+                ProviderFailureClass::ProviderRejected,
+                false,
             ),
             (
                 "openai",
@@ -2702,8 +2647,8 @@ mod tests {
             socket.read(&mut request).await.unwrap();
             let event = format!(
                 "data: {}\n\n",
-                serde_json::json!({"error": {"message": format!(
-                    "this model does not support streaming at {echoed_url}"
+                serde_json::json!({"error": {"code":"unsupported_streaming", "message": format!(
+                    "arbitrary secret detail at {echoed_url}"
                 )}})
             );
             socket.write_all(format!(
@@ -2834,9 +2779,9 @@ mod tests {
             panic!("expected provider failure");
         };
 
-        assert_eq!(failure.class, ProviderFailureClass::UnsupportedImageInput);
-        assert_eq!(failure.http_status, Some(404));
-        assert!(failure.is_recoverable_hint);
+        assert_eq!(failure.class, ProviderFailureClass::Unknown);
+        assert!(failure.http_status.is_none());
+        assert!(!failure.is_recoverable_hint);
     }
 
     #[test]
@@ -2846,7 +2791,7 @@ mod tests {
                 "provider stream error: api error (404 not found): model not found",
                 ProviderFailureStage::Connect,
                 Some(404),
-                None,
+                Some("model_not_found"),
             ),
             ProviderFailureClass::ModelNotFound
         );
@@ -2868,8 +2813,8 @@ mod tests {
             panic!("expected provider failure");
         };
 
-        assert_eq!(failure.class, ProviderFailureClass::ProviderRejected);
-        assert_eq!(failure.http_status, Some(400));
+        assert_eq!(failure.class, ProviderFailureClass::Unknown);
+        assert!(failure.http_status.is_none());
         assert!(!failure.is_recoverable_hint);
     }
 
@@ -2880,7 +2825,7 @@ mod tests {
                 "provider error: this model does not support streaming",
                 ProviderFailureStage::Connect,
                 Some(400),
-                None,
+                Some("unsupported_streaming"),
             ),
             ProviderFailureClass::UnsupportedStreaming
         );
@@ -2915,8 +2860,14 @@ mod tests {
             panic!("expected provider failure");
         };
 
-        assert_eq!(failure.class, ProviderFailureClass::UnsupportedParameter);
-        assert_eq!(failure.message.as_deref(), Some(message.as_str()));
+        assert_eq!(failure.class, ProviderFailureClass::Unknown);
+        assert!(
+            !failure
+                .message
+                .as_deref()
+                .unwrap()
+                .contains(message.as_str())
+        );
         assert!(!failure.is_recoverable_hint);
     }
 
@@ -2957,10 +2908,10 @@ mod tests {
     fn context_length_maps_to_context_too_large() {
         assert_eq!(
             classify_provider_failure_class(
-                "provider error: maximum context length exceeded",
+                "arbitrary body must not affect typed classification",
                 ProviderFailureStage::Connect,
                 Some(400),
-                None,
+                Some("context_length_exceeded"),
             ),
             ProviderFailureClass::ContextTooLarge
         );
