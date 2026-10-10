@@ -63,4 +63,5 @@ pub use types::{
     ProviderReplayState, ProviderResponseLimits, ProviderResponseTooLarge, ProviderStream,
     ProviderStreamDiagnostics, ProviderTermination, ProviderTimeoutPolicy, ProviderToolCall,
     ReasoningConfig, ReasoningEffort, Role, StreamChunk, TokenUsage, ToolChoice, ToolDefinition,
+    ToolResultOutcome, ToolResultStatus,
 };

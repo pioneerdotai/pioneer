@@ -121,6 +121,7 @@ impl ToolResultEnvelope {
                 name: Some(tool_name.to_owned()),
                 tool_calls: None,
                 provider_replay_state: None,
+                tool_outcome: Some(self.outcome.provider_outcome()),
             });
         }
 
@@ -130,6 +131,7 @@ impl ToolResultEnvelope {
             self.llm_text(),
             Some(payload),
         )
+        .with_tool_outcome(self.outcome.provider_outcome())
     }
 }
 

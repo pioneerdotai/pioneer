@@ -86,6 +86,7 @@ pub fn create_provider_with_timeout_policy_and_proxy(
         proxy_url,
         authority_fingerprint.as_str(),
     )
+    .map(|inner| crate::registry::bind_direct_provider(inner, &authority_fingerprint))
 }
 
 pub(crate) fn create_provider_with_timeout_policy_and_proxy_and_base_url_and_authority(

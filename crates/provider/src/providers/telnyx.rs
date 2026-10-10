@@ -435,16 +435,16 @@ impl TelnyxProvider {
                     .attachments_for_message(message_index)
                     .collect::<Vec<_>>();
                 let content = if attachments.is_empty() {
-                    if m.content.is_empty() && m.tool_calls.is_some() {
+                    if m.wire_content_is_empty() && m.tool_calls.is_some() {
                         None
                     } else {
-                        Some(ApiMessageContent::Text(m.content.clone()))
+                        Some(ApiMessageContent::Text(m.wire_content()))
                     }
                 } else {
                     let mut parts = Vec::new();
-                    if !m.content.is_empty() {
+                    if !m.wire_content_is_empty() {
                         parts.push(ApiContentPart::Text {
-                            text: m.content.clone(),
+                            text: m.wire_content(),
                         });
                     }
                     for attachment in attachments {

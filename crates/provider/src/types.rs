@@ -589,6 +589,46 @@ pub struct MessageProvenance {
     pub inherited: bool,
 }
 
+/// Fixed-size canonical result fact. Missing/unknown version or status is Unknown,
+/// never inferred from model-visible content. Owned by the tool execution boundary.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolResultStatus {
+    Ok,
+    RecoverableError,
+    FatalError,
+    PartialSuccess,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolResultOutcome {
+    pub schema_version: u8,
+    pub status: ToolResultStatus,
+}
+
+impl ToolResultOutcome {
+    pub fn new(status: ToolResultStatus) -> Self {
+        Self {
+            schema_version: 1,
+            status,
+        }
+    }
+    pub fn is_error(self) -> Option<bool> {
+        if self.schema_version != 1 {
+            return None;
+        }
+        match self.status {
+            ToolResultStatus::Ok => Some(false),
+            ToolResultStatus::RecoverableError
+            | ToolResultStatus::FatalError
+            | ToolResultStatus::PartialSuccess => Some(true),
+            ToolResultStatus::Unknown => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ChatMessage {
     #[serde(skip)]
@@ -607,9 +647,36 @@ pub struct ChatMessage {
     pub tool_calls: Option<Vec<ProviderToolCall>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_replay_state: Option<ProviderReplayState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_outcome: Option<ToolResultOutcome>,
 }
 
 impl ChatMessage {
+    /// Safe content for APIs without an outcome flag. The typed envelope remains
+    /// authoritative; preserve stored full content and never parse it for status.
+    pub(crate) fn wire_content_is_empty(&self) -> bool {
+        self.content.is_empty()
+            && !(self.role == Role::Tool
+                && self
+                    .tool_outcome
+                    .is_some_and(|outcome| outcome.is_error() == Some(true)))
+    }
+
+    pub(crate) fn wire_content(&self) -> String {
+        if self.role == Role::Tool
+            && let Some(outcome) = self.tool_outcome
+            && outcome.is_error() == Some(true)
+        {
+            let label = match outcome.status {
+                ToolResultStatus::RecoverableError => "recoverable_error",
+                ToolResultStatus::FatalError => "fatal_error",
+                ToolResultStatus::PartialSuccess => "partial_success",
+                _ => return self.content.clone(),
+            };
+            return format!("Tool outcome: {label}.\n{}", self.content);
+        }
+        self.content.clone()
+    }
     pub fn system(content: impl Into<String>) -> Self {
         Self {
             provenance: None,
@@ -621,6 +688,7 @@ impl ChatMessage {
             name: None,
             tool_calls: None,
             provider_replay_state: None,
+            tool_outcome: None,
         }
     }
 
@@ -635,6 +703,7 @@ impl ChatMessage {
             name: None,
             tool_calls: None,
             provider_replay_state: None,
+            tool_outcome: None,
         }
     }
 
@@ -649,6 +718,7 @@ impl ChatMessage {
             name: None,
             tool_calls: None,
             provider_replay_state: None,
+            tool_outcome: None,
         }
     }
 
@@ -663,6 +733,7 @@ impl ChatMessage {
             name: None,
             tool_calls: None,
             provider_replay_state: None,
+            tool_outcome: None,
         }
     }
 
@@ -697,6 +768,7 @@ impl ChatMessage {
             name: None,
             tool_calls: Some(tool_calls),
             provider_replay_state,
+            tool_outcome: None,
         }
     }
 
@@ -715,6 +787,7 @@ impl ChatMessage {
             name: Some(name.into()),
             tool_calls: None,
             provider_replay_state: None,
+            tool_outcome: None,
         }
     }
 
@@ -729,6 +802,7 @@ impl ChatMessage {
             name: None,
             tool_calls: None,
             provider_replay_state: None,
+            tool_outcome: None,
         }
     }
 
@@ -767,6 +841,8 @@ pub enum ModelInputItem {
         content: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         payload: Option<JsonValue>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool_outcome: Option<ToolResultOutcome>,
     },
 }
 
@@ -786,7 +862,16 @@ impl ModelInputItem {
             name: name.into(),
             content: content.into(),
             payload,
+            tool_outcome: None,
         }
+    }
+
+    pub fn with_tool_outcome(mut self, outcome: ToolResultOutcome) -> Self {
+        match &mut self {
+            Self::Message { message } => message.tool_outcome = Some(outcome),
+            Self::ToolResult { tool_outcome, .. } => *tool_outcome = Some(outcome),
+        }
+        self
     }
 
     pub fn into_chat_message(self) -> ChatMessage {
@@ -797,11 +882,14 @@ impl ModelInputItem {
                 name,
                 content,
                 payload,
+                tool_outcome,
             } => {
                 let content = payload
                     .map(|payload| canonical_json_string(&payload))
                     .unwrap_or(content);
-                ChatMessage::tool_result(tool_call_id, name, content)
+                let mut message = ChatMessage::tool_result(tool_call_id, name, content);
+                message.tool_outcome = tool_outcome;
+                message
             }
         }
     }
@@ -948,6 +1036,19 @@ impl ReasoningConfig {
 }
 
 impl ChatRequest {
+    /// Deterministic names and typed failure text for context admission. This
+    /// view must not be persisted or used as the tool router's canonical input.
+    pub fn tool_wire_budget_view(&self) -> anyhow::Result<Self> {
+        let manifest = crate::tools::wire::ToolWireManifest::new("_budget", self)?;
+        let mut view = self.clone();
+        manifest.project(&mut view)?;
+        for message in &mut view.messages {
+            if message.role == Role::Tool {
+                message.content = message.wire_content();
+            }
+        }
+        Ok(view)
+    }
     pub fn non_system_messages(&self) -> Vec<ChatMessage> {
         self.messages
             .iter()
@@ -1861,5 +1962,38 @@ mod provenance_tests {
         wire["provenance"] = serde_json::to_value(provenance).unwrap();
         let received: ChatMessage = serde_json::from_value(wire).unwrap();
         assert_eq!(received.provenance, None);
+    }
+}
+
+#[cfg(test)]
+mod tool_outcome_contract_tests {
+    use super::*;
+    #[test]
+    fn outcome_is_additive_fixed_size_and_never_inferred_from_content() {
+        let legacy: ChatMessage = serde_json::from_value(serde_json::json!({"role":"tool","content":"{\"success\":false}","tool_call_id":"call","name":"read"})).unwrap();
+        assert!(legacy.tool_outcome.is_none());
+        assert_eq!(legacy.wire_content(), legacy.content);
+        let future: ToolResultOutcome = serde_json::from_value(
+            serde_json::json!({"schema_version":1,"status":"future_status"}),
+        )
+        .unwrap();
+        assert_eq!(future.is_error(), None);
+        let outcome = ToolResultOutcome::new(ToolResultStatus::RecoverableError);
+        let message = ModelInputItem::tool_result("call", "read", "false", None)
+            .with_tool_outcome(outcome)
+            .into_chat_message();
+        let cold: ChatMessage =
+            serde_json::from_value(serde_json::to_value(&message).unwrap()).unwrap();
+        assert_eq!(cold.tool_outcome, Some(outcome));
+        assert_eq!(cold.content, "false");
+        assert_eq!(
+            cold.wire_content(),
+            "Tool outcome: recoverable_error.\nfalse"
+        );
+        let mut empty = ChatMessage::tool_result("call", "read", "");
+        empty.tool_outcome = Some(outcome);
+        assert!(!empty.wire_content_is_empty());
+        assert!(empty.wire_content().contains("recoverable_error"));
+        assert!(serde_json::to_vec(&outcome).unwrap().len() < 80);
     }
 }

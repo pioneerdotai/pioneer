@@ -862,10 +862,10 @@ impl OpenRouterProvider {
             });
 
             if attachments.is_empty() {
-                let content = if message.content.is_empty() && tool_calls.is_some() {
+                let content = if message.wire_content_is_empty() && tool_calls.is_some() {
                     None
                 } else {
-                    Some(ApiMessageContent::Text(message.content.clone()))
+                    Some(ApiMessageContent::Text(message.wire_content()))
                 };
                 rendered.push(ApiMessage {
                     role: match message.role {
@@ -887,10 +887,10 @@ impl OpenRouterProvider {
             }
 
             if message.role == Role::Tool {
-                let tool_content = if message.content.is_empty() {
+                let tool_content = if message.wire_content_is_empty() {
                     "{}".to_owned()
                 } else {
-                    message.content.clone()
+                    message.wire_content()
                 };
                 rendered.push(ApiMessage {
                     role: "tool".to_owned(),

@@ -156,7 +156,7 @@ struct ApiTool {
 struct ApiFunctionDeclaration {
     name: String,
     description: String,
-    parameters: serde_json::Value,
+    parameters_json_schema: serde_json::Value,
 }
 
 #[derive(Debug, Serialize)]
@@ -442,7 +442,7 @@ impl GeminiProvider {
                     previous_was_tool = false;
                     system_parts.push(ApiPart {
                         extra: Default::default(),
-                        text: Some(msg.content.clone()),
+                        text: Some(msg.wire_content()),
                         inline_data: None,
                         file_data: None,
                         thought: None,
@@ -503,12 +503,13 @@ impl GeminiProvider {
                         let name = msg.name.clone().unwrap_or_else(|| "tool".to_owned());
                         // FunctionResponse.response is a protobuf Struct, not an
                         // arbitrary JSON value. Preserve scalar/array results inside it.
-                        let response_payload =
-                            match serde_json::from_str::<serde_json::Value>(msg.content.as_str()) {
-                                Ok(value) if value.is_object() => value,
-                                Ok(value) => serde_json::json!({ "content": value }),
-                                Err(_) => serde_json::json!({ "content": msg.content }),
-                            };
+                        let response_payload = match serde_json::from_str::<serde_json::Value>(
+                            msg.wire_content().as_str(),
+                        ) {
+                            Ok(value) if value.is_object() => value,
+                            Ok(value) => serde_json::json!({ "content": value }),
+                            Err(_) => serde_json::json!({ "content": msg.wire_content() }),
+                        };
                         parts.push(ApiPart {
                             extra: Default::default(),
                             text: None,
@@ -524,10 +525,10 @@ impl GeminiProvider {
                             }),
                             thought_signature: None,
                         });
-                    } else if !msg.content.is_empty() {
+                    } else if !msg.wire_content_is_empty() {
                         parts.push(ApiPart {
                             extra: Default::default(),
-                            text: Some(msg.content.clone()),
+                            text: Some(msg.wire_content()),
                             inline_data: None,
                             file_data: None,
                             thought: None,
@@ -657,7 +658,7 @@ impl GeminiProvider {
                     .map(|tool| ApiFunctionDeclaration {
                         name: tool.name.clone(),
                         description: tool.description.clone(),
-                        parameters: tool.parameters.clone(),
+                        parameters_json_schema: tool.parameters.clone(),
                     })
                     .collect(),
             }]
@@ -2770,3 +2771,7 @@ mod stream_call_identity_tests {
 #[cfg(test)]
 #[path = "wire_tests/gemini.rs"]
 mod wire_contract_tests;
+
+#[cfg(test)]
+#[path = "wire_tests/r03_gemini.rs"]
+mod r03_wire_contract_tests;

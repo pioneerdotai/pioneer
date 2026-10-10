@@ -629,10 +629,10 @@ impl OpenAiCompatibleProvider {
                 .attachments_for_message(message_index)
                 .collect::<Vec<_>>();
             if message.role == Role::Tool && !attachments.is_empty() {
-                let tool_text = if message.content.is_empty() {
+                let tool_text = if message.wire_content_is_empty() {
                     "{}".to_owned()
                 } else {
-                    message.content.clone()
+                    message.wire_content()
                 };
                 rendered.push(Self::build_api_message(
                     "tool",
@@ -744,14 +744,14 @@ impl OpenAiCompatibleProvider {
         provider_name: &str,
     ) -> Result<Option<ApiMessageContent>> {
         if attachments.is_empty() {
-            let text = override_text.unwrap_or_else(|| message.content.clone());
+            let text = override_text.unwrap_or_else(|| message.wire_content());
             if text.is_empty() && message.tool_calls.is_some() {
                 return Ok(None);
             }
             return Ok(Some(ApiMessageContent::Text(text)));
         }
 
-        let text = override_text.unwrap_or_else(|| message.content.clone());
+        let text = override_text.unwrap_or_else(|| message.wire_content());
         let parts = Self::build_parts(text.as_str(), attachments, true, provider_name)?;
         Ok(Some(ApiMessageContent::Parts(parts)))
     }
@@ -820,10 +820,10 @@ impl OpenAiCompatibleProvider {
                 .attachments_for_message(message_index)
                 .collect::<Vec<_>>();
             if msg.role == Role::Tool && !attachments.is_empty() {
-                let tool_text = if msg.content.is_empty() {
+                let tool_text = if msg.wire_content_is_empty() {
                     "{}".to_owned()
                 } else {
-                    msg.content.clone()
+                    msg.wire_content()
                 };
                 result.push(Self::build_api_message(
                     "tool",
@@ -841,7 +841,7 @@ impl OpenAiCompatibleProvider {
             }
 
             if !system_prepended && msg.role == Role::User && !system_prefix.is_empty() {
-                let merged_text = if msg.content.is_empty() {
+                let merged_text = if msg.wire_content_is_empty() {
                     system_prefix.clone()
                 } else {
                     format!("{system_prefix}\n\n{}", msg.content)

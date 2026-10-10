@@ -6491,6 +6491,11 @@ async fn execute_agent_provider_response(
                         }
                     };
                     let mut result = result;
+                    let typed_outcome = result.outcome.provider_outcome();
+                    result.message.tool_outcome = Some(typed_outcome);
+                    if let Some(full_message) = &mut result.full_message {
+                        full_message.tool_outcome = Some(typed_outcome);
+                    }
                     let reference = serde_json::json!({"workspace_id": workspace_id, "thread_id": thread_id,
                         "turn_id": turn_id, "item_id": result.item_id}).to_string();
                     if !result.full_source_in_item {
@@ -9507,6 +9512,7 @@ mod tests {
             name: Some("computer_use".to_owned()),
             tool_calls: None,
             provider_replay_state: None,
+            tool_outcome: None,
         }
     }
 
@@ -9800,6 +9806,7 @@ mod tests {
                 name: None,
                 tool_calls: None,
                 provider_replay_state: None,
+                tool_outcome: None,
             },
             computer_use_snapshot_message("call_1", 1, "/tmp/s1-1.png"),
             computer_use_snapshot_message("call_2", 2, "/tmp/s2-1.png"),
@@ -9827,6 +9834,7 @@ mod tests {
                 name: None,
                 tool_calls: None,
                 provider_replay_state: None,
+                tool_outcome: None,
             },
             computer_use_snapshot_message("call_1", 1, "/tmp/s1-1.png"),
             computer_use_snapshot_message("call_2", 2, "/tmp/s2-1.png"),
@@ -9854,6 +9862,7 @@ mod tests {
                 name: None,
                 tool_calls: None,
                 provider_replay_state: None,
+                tool_outcome: None,
             },
             ChatMessage {
                 provenance: None,
@@ -9865,6 +9874,7 @@ mod tests {
                 name: Some("computer_use".to_owned()),
                 tool_calls: None,
                 provider_replay_state: None,
+                tool_outcome: None,
             },
             ChatMessage {
                 provenance: None,
@@ -9876,6 +9886,7 @@ mod tests {
                 name: None,
                 tool_calls: None,
                 provider_replay_state: None,
+                tool_outcome: None,
             },
         ];
 

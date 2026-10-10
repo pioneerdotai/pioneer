@@ -564,8 +564,8 @@ impl AnthropicProvider {
                         .unwrap_or_else(|| "tool".to_owned());
                     content.push(ApiMessageContentBlock::ToolResult {
                         tool_use_id,
-                        content: ToolResultContent::Text(m.content.clone()),
-                        is_error: None,
+                        content: ToolResultContent::Text(m.wire_content()),
+                        is_error: m.tool_outcome.and_then(|outcome| outcome.is_error()),
                     });
                 }
                 _ => {
@@ -627,9 +627,9 @@ impl AnthropicProvider {
                         );
                     }
 
-                    if !m.content.is_empty() {
+                    if !m.wire_content_is_empty() {
                         content.push(ApiMessageContentBlock::Text {
-                            text: m.content.clone(),
+                            text: m.wire_content(),
                         });
                     }
 
@@ -673,9 +673,9 @@ impl AnthropicProvider {
             if m.role == Role::Tool {
                 if !media.is_empty() {
                     let mut blocks = Vec::new();
-                    if !m.content.is_empty() {
+                    if !m.wire_content_is_empty() {
                         blocks.push(ApiMessageContentBlock::Text {
-                            text: m.content.clone(),
+                            text: m.wire_content(),
                         });
                     }
                     blocks.extend(media);
@@ -3339,3 +3339,7 @@ mod media_contract_tests {
 #[cfg(test)]
 #[path = "wire_tests/anthropic.rs"]
 mod wire_contract_tests;
+
+#[cfg(test)]
+#[path = "wire_tests/r03_anthropic.rs"]
+mod r03_wire_contract_tests;

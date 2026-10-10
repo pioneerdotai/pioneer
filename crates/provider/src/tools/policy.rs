@@ -111,7 +111,15 @@ pub(crate) fn prepare_request_with_catalog(
     let catalog = catalog.filter(|_| use_public_catalog);
     let tools = request.tools.as_deref().unwrap_or_default();
     let mut names = BTreeSet::new();
+    let mut schema_bytes = 0usize;
+    if tools.len() > 256 {
+        return Err(super::schema::rejected());
+    }
     for tool in tools {
+        schema_bytes += super::schema::validate(provider, &tool.parameters)?;
+        if schema_bytes > super::schema::MAX_MANIFEST_BYTES {
+            return Err(super::schema::rejected());
+        }
         validate_tool_name(provider, &tool.name)?;
         ensure!(
             names.insert(tool.name.as_str()),

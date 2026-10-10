@@ -684,9 +684,34 @@ impl BedrockProvider {
     }
 
     /// Convert messages into Bedrock format, extracting system messages.
+    #[cfg(test)]
     fn convert_messages(
         prepared: &PreparedProviderMessages,
     ) -> Result<(Vec<BedrockMessage>, Vec<BedrockSystemBlock>)> {
+        Self::convert_messages_for_model(prepared, "")
+    }
+
+    fn convert_messages_for_model(
+        prepared: &PreparedProviderMessages,
+        model: &str,
+    ) -> Result<(Vec<BedrockMessage>, Vec<BedrockSystemBlock>)> {
+        let model = ["us.", "eu.", "apac.", "global."]
+            .iter()
+            .find_map(|prefix| model.strip_prefix(prefix))
+            .unwrap_or(model);
+        let supports_status = model.starts_with("amazon.nova")
+            || [
+                "anthropic.claude-3",
+                "anthropic.claude-sonnet-4",
+                "anthropic.claude-opus-4",
+                "anthropic.claude-haiku-4",
+            ]
+            .iter()
+            .any(|family| {
+                model.strip_prefix(family).is_some_and(|tail| {
+                    tail.is_empty() || tail.starts_with('-') || tail.starts_with(':')
+                })
+            });
         let mut bedrock_messages = Vec::new();
         let mut system_blocks = Vec::new();
 
@@ -694,7 +719,7 @@ impl BedrockProvider {
             match msg.role {
                 Role::System => {
                     system_blocks.push(BedrockSystemBlock {
-                        text: msg.content.clone(),
+                        text: msg.wire_content(),
                     });
                 }
                 _ => {
@@ -723,9 +748,16 @@ impl BedrockProvider {
                                 tool_result: Some(BedrockToolResult {
                                     tool_use_id,
                                     content: vec![BedrockToolResultContent {
-                                        text: msg.content.clone(),
+                                        text: msg.wire_content(),
                                     }],
-                                    status: None,
+                                    status: supports_status
+                                        .then(|| {
+                                            msg.tool_outcome.and_then(|outcome| outcome.is_error())
+                                        })
+                                        .flatten()
+                                        .map(|error| {
+                                            if error { "error" } else { "success" }.to_owned()
+                                        }),
                                 }),
                                 reasoning_content: None,
                             });
@@ -784,9 +816,9 @@ impl BedrockProvider {
                                 }
                             }
 
-                            if !msg.content.is_empty() {
+                            if !msg.wire_content_is_empty() {
                                 content.push(BedrockContentBlock {
-                                    text: Some(msg.content.clone()),
+                                    text: Some(msg.wire_content()),
                                     image: None,
                                     document: None,
                                     audio: None,
@@ -908,7 +940,7 @@ impl BedrockProvider {
         let request = crate::tools::policy::prepare_request("bedrock", request.clone())?;
         let mut prepared = prepared.clone();
         crate::tools::policy::prepare_history("bedrock", &mut prepared.messages)?;
-        let (messages, system) = Self::convert_messages(&prepared)?;
+        let (messages, system) = Self::convert_messages_for_model(&prepared, &request.model)?;
         let generation =
             crate::generation::anthropic_fields_with_catalog(catalog, "bedrock", &request)?;
 
@@ -3496,3 +3528,7 @@ mod confirmed_duration_wire_regressions {
 #[cfg(test)]
 #[path = "wire_tests/bedrock.rs"]
 mod wire_contract_tests;
+
+#[cfg(test)]
+#[path = "wire_tests/r03_bedrock.rs"]
+mod r03_wire_contract_tests;

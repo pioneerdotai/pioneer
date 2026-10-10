@@ -179,6 +179,16 @@ pub struct ToolOutcome {
 }
 
 impl ToolOutcome {
+    pub fn provider_outcome(&self) -> pioneer_provider::ToolResultOutcome {
+        use pioneer_provider::ToolResultStatus;
+        pioneer_provider::ToolResultOutcome::new(match self.status {
+            ToolOutcomeStatus::Ok => ToolResultStatus::Ok,
+            ToolOutcomeStatus::RecoverableError => ToolResultStatus::RecoverableError,
+            ToolOutcomeStatus::FatalError => ToolResultStatus::FatalError,
+            ToolOutcomeStatus::PartialSuccess => ToolResultStatus::PartialSuccess,
+        })
+    }
+
     pub fn ok() -> Self {
         Self {
             status: ToolOutcomeStatus::Ok,
@@ -446,7 +456,9 @@ impl AnyToolResult {
 
     pub fn to_model_input_item(&self) -> ModelInputItem {
         if let Some(projection) = self.projection.as_ref() {
-            return projection.to_model_input_item(self.call_id.as_str(), self.tool_name.as_str());
+            return projection
+                .to_model_input_item(self.call_id.as_str(), self.tool_name.as_str())
+                .with_tool_outcome(self.outcome.provider_outcome());
         }
 
         let payload = serde_json::json!({
@@ -465,6 +477,7 @@ impl AnyToolResult {
             "tool result projection missing".to_owned(),
             Some(payload),
         )
+        .with_tool_outcome(self.outcome.provider_outcome())
     }
 }
 
@@ -608,6 +621,10 @@ mod tests {
 
         let history = result.to_history_message();
         let item = result.to_model_input_item();
+        assert_eq!(
+            history.tool_outcome,
+            Some(result.outcome.provider_outcome())
+        );
         let message = match item {
             ModelInputItem::Message { message } => message,
             ModelInputItem::ToolResult { .. } => {

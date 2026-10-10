@@ -333,6 +333,25 @@ impl AuthorityBoundProvider {
         Ok(())
     }
 
+    async fn prepare_tool_wire_request(
+        &self,
+        request: ChatRequest,
+    ) -> Result<(ChatRequest, crate::tools::wire::ToolWireManifest)> {
+        // The existing completed-history projection owns portability. Apply it
+        // before checking native name bindings, under the same reasoning policy
+        // as the transport, so a completed foreign round remains portable.
+        let mut request = crate::generation::with_native_reasoning(
+            self.name(),
+            self.use_public_catalog,
+            self.discovery_reasoning_snapshot(),
+            async { crate::history::project_request_for_provider(self.name(), request) },
+        )
+        .await?;
+        let manifest = crate::tools::wire::ToolWireManifest::new(self.name(), &request)?;
+        manifest.project(&mut request)?;
+        Ok((request, manifest))
+    }
+
     fn public_result<T>(&self, result: Result<T>) -> Result<T> {
         if self.redact_endpoint_errors {
             result.map_err(|error| {
@@ -342,6 +361,22 @@ impl AuthorityBoundProvider {
             result
         }
     }
+}
+
+pub(crate) fn bind_direct_provider(
+    inner: Box<dyn Provider>,
+    authority_fingerprint: &str,
+) -> Box<dyn Provider> {
+    Box::new(AuthorityBoundProvider {
+        inner: Arc::from(inner),
+        authority_fingerprint: ProviderAuthorityFingerprint(authority_fingerprint.to_owned()),
+        revoked: Arc::new(AtomicBool::new(false)),
+        redact_endpoint_errors: false,
+        input_admission: Arc::new(Default::default()),
+        use_public_catalog: true,
+        discovery_tools: RwLock::new(BTreeMap::new()),
+        discovery_reasoning: RwLock::new(BTreeMap::new()),
+    })
 }
 
 #[async_trait]
@@ -392,7 +427,8 @@ impl Provider for AuthorityBoundProvider {
         request: ChatRequest,
     ) -> Result<crate::attachments::PreparedInputBudget> {
         self.ensure_not_revoked()?;
-        self.public_result(
+        let (request, manifest) = self.prepare_tool_wire_request(request).await?;
+        let mut prepared = self.public_result(
             crate::attachments::admission::scope(
                 self.input_admission.clone(),
                 crate::attachments::runtime::with_async_authority_scope(
@@ -406,12 +442,15 @@ impl Provider for AuthorityBoundProvider {
                 ),
             )
             .await,
-        )
+        )?;
+        manifest.restore_request(&mut prepared.request)?;
+        Ok(prepared)
     }
 
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
         self.ensure_not_revoked()?;
         let context = crate::usage::UsageContext::capture(self.inner.as_ref(), &request.model);
+        let (request, manifest) = self.prepare_tool_wire_request(request).await?;
         let mut response = self
             .public_result(
                 crate::attachments::admission::scope(
@@ -436,6 +475,9 @@ impl Provider for AuthorityBoundProvider {
             .map_err(|error| context.enrich_error(error))?;
         let usage = response.usage.get_or_insert_with(Default::default);
         context.enrich(usage);
+        manifest
+            .restore_calls(&mut response.tool_calls)
+            .map_err(|error| crate::usage::with_error_usage(error, usage))?;
         Ok(response)
     }
 
@@ -452,6 +494,7 @@ impl Provider for AuthorityBoundProvider {
     ) -> Result<crate::ProviderStream> {
         self.ensure_not_revoked()?;
         let context = crate::usage::UsageContext::capture(self.inner.as_ref(), &request.model);
+        let (request, manifest) = self.prepare_tool_wire_request(request).await?;
         let mut response = self
             .public_result(
                 crate::attachments::admission::scope(
@@ -496,7 +539,7 @@ impl Provider for AuthorityBoundProvider {
                     error
                 }
             });
-            result.map(|mut chunk| {
+            result.and_then(|mut chunk| {
                 if let Some(snapshot) = &chunk.usage {
                     accumulated.update(snapshot);
                 }
@@ -504,7 +547,13 @@ impl Provider for AuthorityBoundProvider {
                     context.enrich(&mut accumulated);
                     chunk.usage = Some(accumulated.clone());
                 }
-                chunk
+                manifest
+                    .restore_calls(&mut chunk.tool_calls)
+                    .map_err(|error| {
+                        context.enrich(&mut accumulated);
+                        crate::usage::with_error_usage(error, &accumulated)
+                    })?;
+                Ok(chunk)
             })
         }));
         Ok(response)
@@ -3754,3 +3803,7 @@ mod stream_error_redaction_tests {
         assert!(!format!("{redacted:#?} {redacted:#}").contains("secret"));
     }
 }
+
+#[cfg(test)]
+#[path = "registry_wire_tests.rs"]
+mod wire_contract_tests;

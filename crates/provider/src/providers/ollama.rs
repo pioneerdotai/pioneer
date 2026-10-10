@@ -250,10 +250,10 @@ impl OllamaProvider {
                         Role::Assistant => "assistant".into(),
                         Role::Tool => "tool".into(),
                     },
-                    content: if m.content.is_empty() && m.tool_calls.is_some() {
+                    content: if m.wire_content_is_empty() && m.tool_calls.is_some() {
                         None
                     } else {
-                        Some(m.content.clone())
+                        Some(m.wire_content())
                     },
                     thinking: (m.role == Role::Assistant)
                         .then(|| m.reasoning_content.clone())

@@ -1390,6 +1390,7 @@ pub(super) fn build_tool_error_message(
         error_message,
         Some(payload),
     )
+    .with_tool_outcome(outcome.provider_outcome())
     .into_chat_message()
 }
 
