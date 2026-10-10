@@ -90,6 +90,8 @@ mod m20261008_000007_task_event_fanout_pending;
 mod m20261008_000008_native_cancellation_context;
 mod m20261008_000009_retire_compaction_publication_fences;
 
+mod m20261009_000001_projection_receipt_cleanup_discovery;
+
 #[async_trait::async_trait]
 impl MigratorTrait for Migrator {
     fn migrations() -> Vec<Box<dyn MigrationTrait>> {
@@ -178,6 +180,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261008_000007_task_event_fanout_pending::Migration),
             Box::new(m20261008_000008_native_cancellation_context::Migration),
             Box::new(m20261008_000009_retire_compaction_publication_fences::Migration),
+            Box::new(m20261009_000001_projection_receipt_cleanup_discovery::Migration),
         ]
     }
 }
