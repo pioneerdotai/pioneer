@@ -230,8 +230,21 @@ async fn install_checkpoint_and_task_basis(db: &SqliteDatabase) {
         .unwrap();
 }
 
-fn prepared(manifest: &str, source: SourceRef) -> PreparedFrozenImport {
+async fn prepared(store: &CrudStore, manifest: &str, source: SourceRef) -> PreparedFrozenImport {
+    let hold = store
+        .compaction_acquire_frozen_history(
+            "ws",
+            &pioneer_compaction::frozen::FrozenHistoryRef {
+                format: 1,
+                manifest_id: manifest.into(),
+                identity_sha256: format!("digest-{manifest}"),
+                messages: 1,
+            },
+        )
+        .await
+        .unwrap();
     PreparedFrozenImport {
+        _frozen_hold: std::sync::Arc::new(hold),
         workspace: "ws".into(),
         destination: "child".into(),
         output_digest: String::new(),
@@ -265,21 +278,20 @@ fn prepared(manifest: &str, source: SourceRef) -> PreparedFrozenImport {
 }
 
 async fn install_manifest(
-    db: &SqliteDatabase,
+    store: &CrudStore,
     manifest: &str,
     source: &SourceRef,
 ) -> PreparedFrozenImport {
-    let prepared = prepared(manifest, source.clone());
-    let basis = prepared.accepted_basis.as_ref().unwrap();
+    let db = store.database_connection();
     db.execute_raw(Statement::from_sql_and_values(
         DbBackend::Sqlite,
-        "INSERT INTO compaction_frozen_history(id,workspace_id,owner_thread,identity_sha256,message_count,next_ordinal,import_count,imports_sha256,next_import,ready) VALUES (?,?,?,?,0,0,1,?,1,1)",
+        "INSERT INTO compaction_frozen_history(id,workspace_id,owner_thread,identity_sha256,message_count,next_ordinal,import_count,imports_sha256,next_import,ready) VALUES (?,?,?,?,1,1,1,?,1,1)",
         [
             manifest.into(),
             "ws".into(),
             "parent".into(),
-            basis.digest.clone().into(),
-            basis.imports_digest.clone().into(),
+            format!("digest-{manifest}").into(),
+            format!("imports-{manifest}").into(),
         ],
     ))
     .await
@@ -297,7 +309,7 @@ async fn install_manifest(
     ))
     .await
     .unwrap();
-    prepared
+    prepared(store, manifest, source.clone()).await
 }
 
 async fn update_import_field(db: &SqliteDatabase, manifest: &str, column: &str, value: &str) {
@@ -387,7 +399,7 @@ async fn accepted_import_current_checks_every_identity_predicate_for_all_six_bra
     install_checkpoint_and_task_basis(&db).await;
     for branch in branches() {
         let manifest = format!("identity-{}", branch.name);
-        let import = install_manifest(&db, &manifest, &branch.source).await;
+        let import = install_manifest(&fixture.store, &manifest, &branch.source).await;
         assert_matches_oracle(&db, &import, true, &format!("{} positive", branch.name)).await;
 
         for (column, wrong, original) in [
@@ -431,7 +443,7 @@ async fn accepted_import_current_checks_each_canonical_liveness_predicate_indepe
     install_canonical_sources(&db).await;
     for canonical in canonical_branches() {
         let manifest = format!("canonical-{}", canonical.branch.name);
-        let import = install_manifest(&db, &manifest, &canonical.branch.source).await;
+        let import = install_manifest(&fixture.store, &manifest, &canonical.branch.source).await;
         assert_matches_oracle(
             &db,
             &import,
@@ -558,7 +570,7 @@ async fn accepted_import_current_checks_task_basis_revision_and_legacy_json_inde
     let db = fixture.db();
     install_checkpoint_and_task_basis(&db).await;
     let branch = branches().remove(5);
-    let import = install_manifest(&db, "task-basis", &branch.source).await;
+    let import = install_manifest(&fixture.store, "task-basis", &branch.source).await;
     assert_matches_oracle(&db, &import, true, "missing revision falls back to one").await;
 
     db.execute_unprepared(
@@ -629,7 +641,7 @@ async fn accepted_import_current_checks_checkpoint_status_format_and_epoch_indep
     let db = fixture.db();
     install_checkpoint_and_task_basis(&db).await;
     let branch = branches().remove(4);
-    let import = install_manifest(&db, "checkpoint", &branch.source).await;
+    let import = install_manifest(&fixture.store, "checkpoint", &branch.source).await;
     db.execute_unprepared(
         "DELETE FROM compaction_projection_epoch WHERE thread_id='source-thread'",
     )
@@ -715,7 +727,7 @@ async fn accepted_import_current_preserves_every_outer_binding() {
     let db = fixture.db();
     install_canonical_sources(&db).await;
     let source = branches().remove(2).source;
-    let import = install_manifest(&db, "outer-bindings", &source).await;
+    let import = install_manifest(&fixture.store, "outer-bindings", &source).await;
     assert_matches_oracle(&db, &import, true, "outer baseline").await;
 
     let mut cases = Vec::new();
@@ -778,19 +790,18 @@ async fn accepted_import_current_preserves_every_outer_binding() {
     assert_matches_oracle(&db, &import, false, "incomplete import cursor").await;
 }
 
-async fn install_shared_manifest(db: &SqliteDatabase, source: &SourceRef) -> PreparedFrozenImport {
-    let _physical = install_manifest(db, "shared-physical", source).await;
-    let logical = prepared("shared-logical", source.clone());
-    let basis = logical.accepted_basis.as_ref().unwrap();
+async fn install_shared_manifest(store: &CrudStore, source: &SourceRef) -> PreparedFrozenImport {
+    let db = store.database_connection();
+    let _physical = install_manifest(store, "shared-physical", source).await;
     db.execute_raw(Statement::from_sql_and_values(
         DbBackend::Sqlite,
-        "INSERT INTO compaction_frozen_history(id,workspace_id,owner_thread,identity_sha256,message_count,next_ordinal,import_count,imports_sha256,next_import,ready) VALUES (?,?,?,?,0,0,1,?,1,1)",
+        "INSERT INTO compaction_frozen_history(id,workspace_id,owner_thread,identity_sha256,message_count,next_ordinal,import_count,imports_sha256,next_import,ready) VALUES (?,?,?,?,1,1,1,?,1,1)",
         [
             "shared-logical".into(),
             "ws".into(),
             "parent".into(),
-            basis.digest.clone().into(),
-            basis.imports_digest.clone().into(),
+            "digest-shared-logical".into(),
+            "imports-shared-logical".into(),
         ],
     ))
     .await
@@ -802,7 +813,7 @@ async fn install_shared_manifest(db: &SqliteDatabase, source: &SourceRef) -> Pre
     ] {
         db.execute_unprepared(sql).await.unwrap();
     }
-    logical
+    prepared(store, "shared-logical", source.clone()).await
 }
 
 #[tokio::test]
@@ -811,7 +822,7 @@ async fn accepted_import_current_reads_shared_range_imports_through_the_logical_
     let db = fixture.db();
     install_canonical_sources(&db).await;
     let source = branches().remove(2).source;
-    let import = install_shared_manifest(&db, &source).await;
+    let import = install_shared_manifest(&fixture.store, &source).await;
     assert_matches_oracle(&db, &import, true, "shared import range").await;
     let physical_rows = db
         .query_one_raw(Statement::from_string(
@@ -883,7 +894,12 @@ async fn accepted_import_current_uses_canonical_sources_with_zstd_storage() {
     enable_zstd(&db).await;
     compress_canonical_payloads(&db).await;
     for branch in branches().into_iter().take(4) {
-        let import = install_manifest(&db, &format!("zstd-{}", branch.name), &branch.source).await;
+        let import = install_manifest(
+            &fixture.store,
+            &format!("zstd-{}", branch.name),
+            &branch.source,
+        )
+        .await;
         assert_matches_oracle(&db, &import, true, &format!("zstd {}", branch.name)).await;
     }
 }
@@ -994,7 +1010,7 @@ async fn assert_production_plan(compressed: bool) {
     }
     install_checkpoint_and_task_basis(&db).await;
     let source = branches().remove(2).source;
-    let import = install_manifest(&db, "plan", &source).await;
+    let import = install_manifest(&fixture.store, "plan", &source).await;
     let mut statement =
         accepted_import_current_statement(ACCEPTED_IMPORT_CURRENT_SQL, &import).unwrap();
     assert!(!statement.sql.contains("compaction_live_sources"));

@@ -20,7 +20,7 @@ use pioneer_entity::{
     compaction_operation as operation, compaction_operation_projection as projection,
     compaction_runner_plan as plan, compaction_runner_state as runner,
     compaction_task_output as task_output, task_delivery as delivery,
-    task_result_candidate as candidate,
+    task_result_candidate as candidate, thread, turn,
 };
 use sea_orm::sea_query::{Alias as SqlAlias, Expr, ExprTrait, JoinType, OnConflict, Order, Query};
 use sea_orm::{
@@ -259,14 +259,7 @@ impl OriginScan {
                 }
                 ensure!(member.found, "selected checkpoint exceeds original grant");
             }
-            original_binding(
-                store,
-                &self.row.workspace_id,
-                &pending.context,
-                &pending.record,
-                true,
-            )
-            .await?;
+            original_binding(store, &self.row.workspace_id, &pending.record, true).await?;
             let pending = self.pending_import.take().expect("selected import");
             digest(
                 &mut self.selected_import_digest,
@@ -503,7 +496,6 @@ impl OriginScan {
         self.pending_import = Some(PendingImport {
             proof,
             record,
-            context,
             member,
         });
         Ok(None)
@@ -570,7 +562,6 @@ async fn target_reference(
 struct PendingImport {
     proof: import::Model,
     record: FrozenImportRecord,
-    context: String,
     member: Option<HistoricalMember>,
 }
 struct HistoricalMember {
@@ -702,7 +693,6 @@ impl HistoricalMember {
 async fn original_binding(
     store: &CrudStore,
     workspace: &str,
-    context: &str,
     proof: &FrozenImportRecord,
     read_output: bool,
 ) -> Result<()> {
@@ -728,6 +718,11 @@ async fn original_binding(
         .ok_or_else(|| {
             anyhow::anyhow!("original accepted import acknowledgement scope mismatch")
         })?;
+    // This is the original delivery's acceptance, not a new grant to the
+    // current checkpoint context. Accepted Task bases can carry this exact
+    // record through multiple children; append revalidates each forwarding
+    // binding. The acknowledgement turn must still belong to the original
+    // delivery target in the same workspace.
     let query = Query::select()
         .from(delivery::Entity)
         .columns(
@@ -802,6 +797,18 @@ async fn original_binding(
                 delivery::Column::DeliveredTurnId,
             ))),
         )
+        .join(
+            JoinType::InnerJoin,
+            turn::Entity,
+            Expr::col((turn::Entity, turn::Column::Id))
+                .eq(Expr::col((ack::Entity, ack::Column::TurnId))),
+        )
+        .join(
+            JoinType::InnerJoin,
+            thread::Entity,
+            Expr::col((thread::Entity, thread::Column::Id))
+                .eq(Expr::col((turn::Entity, turn::Column::ThreadId))),
+        )
         .and_where(Expr::col((delivery::Entity, delivery::Column::Id)).eq(&proof.delivery_id))
         .and_where(
             Expr::col((
@@ -815,8 +822,14 @@ async fn original_binding(
                 .eq(&proof.output_manifest),
         )
         .and_where(Expr::col((delivery::Entity, delivery::Column::WorkspaceId)).eq(workspace))
-        .and_where(Expr::col((delivery::Entity, delivery::Column::TargetThreadId)).eq(context))
+        .and_where(
+            Expr::col((turn::Entity, turn::Column::ThreadId)).eq(Expr::col((
+                delivery::Entity,
+                delivery::Column::TargetThreadId,
+            ))),
+        )
         .and_where(Expr::col((delivery::Entity, delivery::Column::Status)).eq("delivered"))
+        .and_where(Expr::col((thread::Entity, thread::Column::WorkspaceId)).eq(workspace))
         .and_where(Expr::col((ack::Entity, ack::Column::SourceId)).eq(&proof.acknowledgement.id))
         .and_where(Expr::col((ack::Entity, ack::Column::TurnId)).eq(acknowledgement_turn))
         .and_where(Expr::col((ack::Entity, ack::Column::ItemId)).eq(
@@ -2673,7 +2686,7 @@ mod tests {
             10,
             "relations are not persisted proof identity"
         );
-        assert!(json["tool_item_id"].is_null());
+        assert!(serde_json::Value::is_null(&json["tool_item_id"]));
         // Evidence updates are forbidden even in staging. Replacement must use
         // exact unsealed deletion; the NULL key must never touch the empty key.
         assert!(
@@ -2767,7 +2780,7 @@ mod tests {
                 version: "event-revision:1".into(),
             },
         };
-        let error = original_binding(&store, "ws", "thread", &proof, true)
+        let error = original_binding(&store, "ws", &proof, true)
             .await
             .unwrap_err();
         assert!(error.to_string().contains("acknowledgement scope mismatch"));
@@ -2890,10 +2903,20 @@ mod tests {
         let store = correction_fixture().await;
         store.connection.execute_unprepared("INSERT INTO compaction_frozen_history(id,workspace_id,owner_thread,identity_sha256,message_count,next_ordinal,ready) VALUES('output','ws','thread','output',1,1,1),('backing','ws','thread','backing',1,1,1)").await.unwrap();
         let oversized = "x".repeat(SOURCE_PAGE_BYTES + 1);
+        // Model legacy corruption, then restore production CHECK enforcement
+        // before either direct or shared payload SELECT is exercised.
+        let tx = store.connection.begin().await.unwrap();
+        tx.execute_unprepared("PRAGMA ignore_check_constraints=ON")
+            .await
+            .unwrap();
         for id in ["output", "backing"] {
-            store.connection.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+            tx.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
             "INSERT INTO compaction_frozen_message_data(manifest_id,ordinal,reference_json,bytes) VALUES(?1,0,?2,1)", [id.into(), oversized.clone().into()])).await.unwrap();
         }
+        tx.execute_unprepared("PRAGMA ignore_check_constraints=OFF")
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
         for shared in [false, true] {
             if shared {
                 for sql in [

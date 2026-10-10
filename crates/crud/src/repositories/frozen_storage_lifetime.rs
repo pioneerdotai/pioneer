@@ -32,6 +32,8 @@ const LEGACY_LOCATOR_BYTES: i64 = FRAGMENT_BYTES * 128;
 pub struct FrozenStorageLifetimeProgress {
     phase: usize,
     pass_done: [bool; 6],
+    // Reconciliation/sealing can release holds discovered earlier this pass.
+    pass_changed: bool,
     locator_done: [bool; 4],
     physical_done: [bool; 2],
     scope: ScopeDiscovery,
@@ -550,10 +552,12 @@ impl ExpiryPreparation {
         if let Some(reverse) = self.reverse.as_mut() {
             reverse.step(store).await?;
             if reverse.done() {
-                ensure!(
-                    !reverse.reachable,
-                    "unsealed published ancestry retains origin"
-                );
+                if reverse.reachable {
+                    // A published legacy dependency is a hold, not poison.
+                    // End this expiry attempt; the cyclic pass revisits it
+                    // after the independent bounded proof preparation seals it.
+                    return Ok(true);
+                }
                 self.reverse = None;
             }
             return Ok(false);
@@ -1058,7 +1062,9 @@ impl FrozenStorageLifetimeProgress {
             self.pass_done = [false; 6];
             self.locator_done = [false; 4];
             self.physical_done = [false; 2];
-            return Ok(false);
+            // Confirm EOF again after newly verified roots/proofs, rather than
+            // sleeping over expiry work that became eligible late in the pass.
+            return Ok(std::mem::take(&mut self.pass_changed));
         }
         Ok(true)
     }
@@ -1073,6 +1079,7 @@ impl FrozenStorageLifetimeProgress {
         if let Some(read) = self.locator.as_mut() {
             if read.step(store).await? {
                 self.locator = None;
+                self.pass_changed = true;
             }
             return Ok(true);
         }
@@ -1136,6 +1143,7 @@ impl FrozenStorageLifetimeProgress {
             proof.step(store).await?;
             if proof.finished() {
                 self.proof = None;
+                self.pass_changed = true;
             }
             return Ok(true);
         }
@@ -1953,7 +1961,9 @@ mod tests {
     async fn empty_phase_and_completed_scope_are_not_idle_while_lifetime_work_is_pending() {
         let (store, _) = fixture(true).await;
         let mut progress = FrozenStorageLifetimeProgress::default();
-        progress.scope.done = true;
+        while !progress.scope.done {
+            progress.scope.step(&store).await.unwrap();
+        }
         progress.phase = 5;
         assert!(
             progress.quantum(&store).await.unwrap(),

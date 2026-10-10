@@ -907,11 +907,9 @@ async fn accepted_imports_require_the_bound_ready_manifest_and_exact_metadata() 
         ("import_count", "2", "1"),
         ("next_import", "0", "1"),
     ] {
-        db.execute_unprepared(&format!(
+        crate::repositories::compaction::seed_legacy_frozen_header(&db, &format!(
             "UPDATE compaction_frozen_history SET {column}={invalid} WHERE id='accepted-manifest'"
-        ))
-        .await
-        .unwrap();
+        )).await;
         assert_manifest_current(
             &db,
             "manifest-operation",
@@ -919,11 +917,13 @@ async fn accepted_imports_require_the_bound_ready_manifest_and_exact_metadata() 
             &format!("invalid frozen {column}"),
         )
         .await;
-        db.execute_unprepared(&format!(
-            "UPDATE compaction_frozen_history SET {column}={valid} WHERE id='accepted-manifest'"
-        ))
-        .await
-        .unwrap();
+        crate::repositories::compaction::seed_legacy_frozen_header(
+            &db,
+            &format!(
+                "UPDATE compaction_frozen_history SET {column}={valid} WHERE id='accepted-manifest'"
+            ),
+        )
+        .await;
     }
     db.execute_unprepared("UPDATE compaction_operation_projection SET manifest_id='empty-import-manifest' WHERE operation_id='manifest-operation'")
         .await
@@ -1868,15 +1868,14 @@ SELECT 'accepted-basis-boundary',value,?1,length(CAST(?1 AS BLOB)) FROM n"#,
     )
     .await;
 
-    db.execute_unprepared(
+    crate::repositories::compaction::seed_legacy_frozen_header(&db,
         "DELETE FROM compaction_frozen_message_data WHERE manifest_id='accepted-basis-boundary' AND ordinal=65536; \
          UPDATE compaction_frozen_history SET message_count=65536,next_ordinal=65536 WHERE id='accepted-basis-boundary'; \
          UPDATE compaction_operation SET snapshot='{\"plan\":{\"coverage_domain\":\"working_context\"},\"source_epochs\":{\"root-thread\":0,\"source-thread\":0}}' WHERE id='manifest-operation'; \
          DELETE FROM compaction_manifest WHERE operation_id='manifest-operation'; \
          INSERT INTO compaction_manifest(operation_id,ordinal,unit_ordinal,reference_only,source_thread,source_scope,source_id,source_version) VALUES ('manifest-operation',0,0,0,'source-thread','checkpoint:source-owner','source-checkpoint','source-version')",
     )
-    .await
-    .unwrap();
+    .await;
     let checkpoint_reference = serde_json::json!({
         "inherited": true,
         "source_thread": "source-thread",
@@ -2102,7 +2101,8 @@ fn assert_projection_page_statement(
     let (sql, expected_values) = match bounds {
         ProjectionPageBounds::Sizes { start } => (
             "SELECT d.ordinal,d.bytes FROM compaction_frozen_message_data d \
-             WHERE d.manifest_id=? AND d.ordinal>=? \
+             JOIN compaction_frozen_history h ON h.id=d.manifest_id \
+             WHERE h.expired=0 AND h.ready=1 AND h.message_count>=0 AND h.import_count>=0 AND h.next_ordinal=h.message_count AND h.next_import=h.import_count AND d.ordinal>=0 AND d.ordinal<h.message_count AND d.manifest_id=? AND d.ordinal>=? \
                AND NOT EXISTS (SELECT 1 FROM compaction_frozen_layout l \
                                WHERE l.manifest_id=d.manifest_id AND l.kind=0 AND l.active=1) \
              UNION ALL \
@@ -2111,7 +2111,8 @@ fn assert_projection_page_statement(
                ON d.manifest_id=s.source_manifest AND d.ordinal>=s.start AND d.ordinal<s.end \
              JOIN compaction_frozen_layout l \
                ON l.manifest_id=s.manifest_id AND l.kind=s.kind AND l.active=1 \
-             WHERE s.manifest_id=? AND s.kind=0 AND d.ordinal>=? \
+             JOIN compaction_frozen_history h ON h.id=s.manifest_id \
+             WHERE h.expired=0 AND h.ready=1 AND h.message_count>=0 AND h.import_count>=0 AND h.next_ordinal=h.message_count AND h.next_import=h.import_count AND d.ordinal>=0 AND d.ordinal<h.message_count AND s.manifest_id=? AND s.kind=0 AND d.ordinal>=? \
              ORDER BY ordinal LIMIT ?",
             vec![
                 Value::from(manifest),
@@ -2123,7 +2124,8 @@ fn assert_projection_page_statement(
         ),
         ProjectionPageBounds::Data { start, end } => (
             "SELECT d.ordinal,d.reference_json,d.bytes FROM compaction_frozen_message_data d \
-             WHERE d.manifest_id=? AND d.ordinal>=? AND d.ordinal<? \
+             JOIN compaction_frozen_history h ON h.id=d.manifest_id \
+             WHERE h.expired=0 AND h.ready=1 AND h.message_count>=0 AND h.import_count>=0 AND h.next_ordinal=h.message_count AND h.next_import=h.import_count AND d.ordinal>=0 AND d.ordinal<h.message_count AND d.manifest_id=? AND d.ordinal>=? AND d.ordinal<? AND d.bytes BETWEEN 0 AND 262144 AND length(CAST(d.reference_json AS BLOB))=d.bytes \
                AND NOT EXISTS (SELECT 1 FROM compaction_frozen_layout l \
                                WHERE l.manifest_id=d.manifest_id AND l.kind=0 AND l.active=1) \
              UNION ALL \
@@ -2132,7 +2134,8 @@ fn assert_projection_page_statement(
                ON d.manifest_id=s.source_manifest AND d.ordinal>=s.start AND d.ordinal<s.end \
              JOIN compaction_frozen_layout l \
                ON l.manifest_id=s.manifest_id AND l.kind=s.kind AND l.active=1 \
-             WHERE s.manifest_id=? AND s.kind=0 AND d.ordinal>=? AND d.ordinal<? \
+             JOIN compaction_frozen_history h ON h.id=s.manifest_id \
+             WHERE h.expired=0 AND h.ready=1 AND h.message_count>=0 AND h.import_count>=0 AND h.next_ordinal=h.message_count AND h.next_import=h.import_count AND d.ordinal>=0 AND d.ordinal<h.message_count AND s.manifest_id=? AND s.kind=0 AND d.ordinal>=? AND d.ordinal<? AND d.bytes BETWEEN 0 AND 262144 AND length(CAST(d.reference_json AS BLOB))=d.bytes \
              ORDER BY ordinal",
             vec![
                 Value::from(manifest),
@@ -2318,10 +2321,9 @@ fn assert_frozen_view_plan(plan: &[PlanNode], view: &str) {
         ordinary.iter().any(|node| {
             plan_subject(&node.detail, "SEARCH", "d")
                 && has_constraint(&node.detail, "manifest_id", "=")
-                && !has_constraint(&node.detail, "ordinal", ">")
-                && !has_constraint(&node.detail, "ordinal", "<")
+                && has_constraint(&node.detail, "ordinal", ">")
         }),
-        "ordinary {view} data lookup must not require an ordinal range: {ordinary:#?}"
+        "ordinary {view} data lookup must seek the logical ordinal prefix: {ordinary:#?}"
     );
     assert!(
         ordinary.iter().any(|node| {
@@ -2463,7 +2465,7 @@ fn synthetic_frozen_view_plan(
         PlanNode {
             id: root + 3,
             parent: root + 2,
-            detail: "SEARCH d USING INDEX frozen_data (manifest_id=?)".into(),
+            detail: "SEARCH d USING INDEX frozen_data (manifest_id=? AND ordinal>?)".into(),
         },
         PlanNode {
             id: root + 4,
@@ -4073,6 +4075,16 @@ async fn publication_foreign_fanout(f: &Fixture, operation: &str, n: usize) -> R
             "INSERT INTO compaction_coverage(checkpoint_id,source_scope,source_id,source_version) VALUES(?1,?2,?3,?4)",
             [root.clone().into(),r.scope.clone().into(),r.id.clone().into(),r.version.clone().into()])).await.unwrap();
     }
+    if n == CHECKPOINT_SOURCE_LIMIT {
+        assert!(
+            sources
+                .iter()
+                .map(|source| source.scope.len() + source.id.len() + source.version.len())
+                .sum::<usize>()
+                > SOURCE_PAGE_BYTES,
+            "supported fan-out must still exceed one byte quantum"
+        );
+    }
     checkpoint.coverage = sources;
     db.execute_raw(Statement::from_sql_and_values(
         DbBackend::Sqlite,
@@ -4100,7 +4112,7 @@ async fn publication_foreign_fanout(f: &Fixture, operation: &str, n: usize) -> R
 #[tokio::test]
 async fn large_selected_foreign_fanout_pages_every_set_and_observes_constant_actual_seal_writer() {
     use crate::repositories::compaction::CommitOutcome;
-    for n in [2, 260] {
+    for n in [2, CHECKPOINT_SOURCE_LIMIT] {
         let f = fixture().await;
         let operation = format!("seal-fanout-{n}");
         let state = publication_foreign_fanout(&f, &operation, n).await;

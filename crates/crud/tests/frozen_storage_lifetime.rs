@@ -71,7 +71,7 @@ async fn header(
         sql(store,"INSERT INTO compaction_frozen_message_data(manifest_id,ordinal,reference_json,bytes) VALUES(?1,?2,'{}',2)",vec![id.into(),ordinal.into()]).await;
     }
     for ordinal in 0..imports {
-        sql(store,"INSERT INTO compaction_frozen_import_data(manifest_id,ordinal,message_ordinal,source_scope,source_id,source_version,source_thread,proof_json,bytes) VALUES(?1,?2,0,'event:turn','e','event-revision:1',?3,'{}',2)",vec![id.into(),ordinal.into(),owner.into()]).await;
+        sql(store,"INSERT INTO compaction_frozen_import_data(manifest_id,ordinal,message_ordinal,source_scope,source_id,source_version,source_thread,proof_json,bytes) VALUES(?1,?2,0,'event:turn','e-'||?2,'event-revision:1',?3,'{}',2)",vec![id.into(),ordinal.into(),owner.into()]).await;
     }
     FrozenHistoryRef {
         format: 1,
@@ -108,7 +108,7 @@ async fn task(store: &CrudStore, id: &str, status: &str) {
     sql(store,"INSERT INTO task(id,workspace_id,owner_kind,owner_id,created_by_thread_id,created_by_turn_id,executor_kind,status,title,goal) VALUES(?1,'ws','thread','thread','thread','turn','agent',?2,'fixture','fixture')",vec![id.into(),status.into()]).await;
 }
 async fn task_input(store: &CrudStore, task: &str, run: &str, history: &FrozenHistoryRef) {
-    sql(store,"INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES(?1,?2,?1,1,1,'succeeded','agent')",vec![run.into(),task.into()]).await;
+    sql(store,"INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES(?1,?2,?1,1,(SELECT COALESCE(MAX(run_number),0)+1 FROM task_run WHERE task_id=?2),'succeeded','agent')",vec![run.into(),task.into()]).await;
     store
         .insert_task_run_conversation_snapshot_if_absent(
             pioneer_crud::NewTaskRunConversationSnapshot {
@@ -502,7 +502,7 @@ async fn expired_backing_preserves_foreign_messages_and_distinct_import_interval
         sql(&store,"INSERT INTO compaction_frozen_message_data(manifest_id,ordinal,reference_json,bytes) VALUES('p',?1,'{}',2)",vec![ordinal.into()]).await;
     }
     for ordinal in 1..5 {
-        sql(&store,"INSERT INTO compaction_frozen_import_data(manifest_id,ordinal,message_ordinal,source_scope,source_id,source_version,source_thread,proof_json,bytes) VALUES('p',?1,0,'event:turn','e','event-revision:1','thread','{}',2)",vec![ordinal.into()]).await;
+        sql(&store,"INSERT INTO compaction_frozen_import_data(manifest_id,ordinal,message_ordinal,source_scope,source_id,source_version,source_thread,proof_json,bytes) VALUES('p',?1,0,'event:turn','e-'||?1,'event-revision:1','thread','{}',2)",vec![ordinal.into()]).await;
     }
     sql(&store,"INSERT INTO compaction_frozen_layout(manifest_id,kind,active,pending) VALUES('h',0,0,1),('h',1,0,1)",vec![]).await;
     sql(&store,"INSERT INTO compaction_frozen_span(manifest_id,kind,start,end,source_manifest) VALUES('h',0,0,5,'p'),('h',1,0,3,'p')",vec![]).await;
@@ -595,7 +595,7 @@ async fn available_container_keeps_own_prefix_but_not_unreferenced_physical_tail
     let store = fixture().await;
     let h = header(&store, "p", "ws", "thread", 2, 1).await;
     sql(&store,"INSERT INTO compaction_frozen_message_data(manifest_id,ordinal,reference_json,bytes) VALUES('p',2,'{}',2)",vec![]).await;
-    sql(&store,"INSERT INTO compaction_frozen_import_data(manifest_id,ordinal,message_ordinal,source_scope,source_id,source_version,source_thread,proof_json,bytes) VALUES('p',1,0,'event:turn','e','event-revision:1','thread','{}',2)",vec![]).await;
+    sql(&store,"INSERT INTO compaction_frozen_import_data(manifest_id,ordinal,message_ordinal,source_scope,source_id,source_version,source_thread,proof_json,bytes) VALUES('p',1,0,'event:turn','e-1','event-revision:1','thread','{}',2)",vec![]).await;
     store
         .upsert_cli_runtime_thread_binding(binding(cursor(&h)))
         .await
@@ -628,7 +628,7 @@ async fn healthy_incomplete_capture_holds_only_committed_kind_prefix_and_finish_
         sql(&store,"INSERT INTO compaction_frozen_message_data(manifest_id,ordinal,reference_json,bytes) VALUES('capture',?1,'{}',2)",vec![ordinal.into()]).await;
     }
     for ordinal in 0..2 {
-        sql(&store,"INSERT INTO compaction_frozen_import_data(manifest_id,ordinal,message_ordinal,source_scope,source_id,source_version,source_thread,proof_json,bytes) VALUES('capture',?1,0,'event:turn','e','event-revision:1','thread','{}',2)",vec![ordinal.into()]).await;
+        sql(&store,"INSERT INTO compaction_frozen_import_data(manifest_id,ordinal,message_ordinal,source_scope,source_id,source_version,source_thread,proof_json,bytes) VALUES('capture',?1,0,'event:turn','e-'||?1,'event-revision:1','thread','{}',2)",vec![ordinal.into()]).await;
     }
     let h = FrozenHistoryRef {
         format: 1,
@@ -665,12 +665,23 @@ async fn understated_payload_bytes_and_early_empty_pages_fail_before_decode() {
         ("compaction_frozen_message_data", "reference_json", false),
         ("compaction_frozen_import_data", "proof_json", true),
     ] {
-        sql(
-            &store,
-            &format!("UPDATE {table} SET {field}=?1 WHERE manifest_id='corrupt'"),
-            vec![oversized.clone().into()],
-        )
-        .await;
+        // Inject pre-existing corruption only while seeding this isolated DB.
+        // Restore CHECK enforcement before exercising the bounded reader.
+        let tx = store.database_connection().begin().await.unwrap();
+        tx.execute_unprepared("PRAGMA ignore_check_constraints=ON")
+            .await
+            .unwrap();
+        tx.execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            format!("UPDATE {table} SET {field}=?1 WHERE manifest_id='corrupt'"),
+            [oversized.clone().into()],
+        ))
+        .await
+        .unwrap();
+        tx.execute_unprepared("PRAGMA ignore_check_constraints=OFF")
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
         let error = if imports {
             store
                 .compaction_frozen_import_page("ws", "thread", "corrupt", 0)

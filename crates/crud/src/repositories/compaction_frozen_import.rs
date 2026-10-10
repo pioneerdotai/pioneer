@@ -1515,6 +1515,15 @@ pub(crate) async fn compaction_frozen_import_page<C: ConnectionTrait>(
         .await?
     {
         crate::frozen_lifetime::logical_bounds(&h)?;
+        if let Some(layout) = pioneer_entity::compaction_frozen_layout::Entity::find_by_id((
+            manifest.to_owned(),
+            1_i64,
+        ))
+        .one(db)
+        .await?
+        {
+            ensure!(layout.failed == 0, "invalid frozen layout state");
+        }
         if h.ready == 1 {
             complete_count = Some(u64::try_from(h.import_count)?);
         }

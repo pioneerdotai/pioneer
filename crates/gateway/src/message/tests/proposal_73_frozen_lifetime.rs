@@ -153,6 +153,13 @@ async fn fixture_with_correction(mode: CorrectionFixture) -> FrozenFixture {
     );
     let (directory, workspace_manager, crud_store, workspace_id) =
         setup_pooled_file_workspace_manager().await;
+    // The shared harness keeps older cascade fixtures on FK ON. Only this
+    // lifetime family uses the production single-writer FK OFF policy.
+    crud_store
+        .database_connection()
+        .execute_unprepared("PRAGMA foreign_keys=OFF")
+        .await
+        .unwrap();
     let processor = Arc::new(MessageProcessor::new(
         Arc::new(ThreadManager::new("test-model", "openai")),
         phase_13_provider_registry(provider.clone()),
@@ -203,7 +210,7 @@ async fn fixture_with_correction(mode: CorrectionFixture) -> FrozenFixture {
             vec![],
         ),
         (
-            "INSERT INTO task_run_turn(id,task_id,run_id,thread_id,turn_id,kind,round,sequence,status,created_at) VALUES('p73-rt','p73-task','p73-run','p73-source','p73-source-turn','initial',0,1,'completed',CURRENT_TIMESTAMP)",
+            "INSERT INTO task_run_turn(id,task_id,run_id,thread_id,turn_id,kind,round,sequence,status,created_at) VALUES('p73-rt','p73-task','p73-run','p73-source','p73-source-turn','initial',0,1,'review_recorded',CURRENT_TIMESTAMP)",
             vec![],
         ),
     ] {
@@ -261,20 +268,29 @@ async fn fixture_with_correction(mode: CorrectionFixture) -> FrozenFixture {
     if matches!(mode, CorrectionFixture::Aggregate { .. }) {
         // A persisted legacy selected set may be larger than one metadata page.
         // Keep each source/reference small and the original accepted imports
-        // nonempty. Identical canonical event wire is owned by distinct IDs.
+        // nonempty. Completed assistant output is normally item-backed; use
+        // its real completed event wire for distinct owned event identities.
         let exemplar = refs
             .iter()
-            .find(|r| {
-                r.event_input_role
-                    == Some(pioneer_compaction::frozen::FrozenEventInputRole::Authoritative)
-            })
+            .find(|r| r.complete && !r.protected_input && !r.inherited)
             .unwrap()
             .clone();
-        let event = exemplar
-            .sources
-            .iter()
-            .find(|s| s.scope.starts_with("event:"))
-            .unwrap();
+        let event = h
+            .crud_store
+            .compaction_source_page(
+                &h.workspace_id,
+                "p73-source",
+                "p73-source-turn",
+                PagedSource::Event,
+                0,
+            )
+            .await
+            .unwrap()
+            .entries
+            .into_iter()
+            .find(|row| row.item_id.as_deref() == Some("p73-source-turn-answer"))
+            .unwrap()
+            .reference;
         let canonical = db
             .query_one_raw(Statement::from_sql_and_values(
                 DbBackend::Sqlite,
@@ -286,15 +302,26 @@ async fn fixture_with_correction(mode: CorrectionFixture) -> FrozenFixture {
             .unwrap();
         let event_type: String = canonical.try_get("", "event_type").unwrap();
         let payload: String = canonical.try_get("", "payload").unwrap();
+        db.execute_unprepared("INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES('p73-aggregate-turn','p73-source','completed','conversation','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)").await.unwrap();
+        let pioneer_crud::CanonicalTurnEventPayload::ItemCompleted(mut event_payload) =
+            serde_json::from_str(&payload).unwrap()
+        else {
+            panic!("aggregate exemplar must be a completed assistant event");
+        };
+        event_payload.turn_id = "p73-aggregate-turn".into();
+        let payload = serde_json::to_string(
+            &pioneer_crud::CanonicalTurnEventPayload::ItemCompleted(event_payload),
+        )
+        .unwrap();
         for i in 0..128 {
             let id = format!("p73-page-{i:04}-{}", "x".repeat(3072));
             db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-                "INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at) VALUES(?1,'p73-source','p73-source-turn',?2,?3,?4,CURRENT_TIMESTAMP)",
+                "INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at) VALUES(?1,'p73-source','p73-aggregate-turn',?2,?3,?4,CURRENT_TIMESTAMP)",
                 [id.clone().into(),(10_000_i64+i).into(),event_type.clone().into(),payload.clone().into()])).await.unwrap();
             let mut reference = exemplar.clone();
             reference.unit_id = format!("page-unit-{i}");
             reference.sources = vec![SourceRef {
-                scope: event.scope.clone(),
+                scope: "event:p73-aggregate-turn".into(),
                 id,
                 version: "event-revision:1".into(),
             }];
@@ -390,7 +417,7 @@ async fn fixture_with_correction(mode: CorrectionFixture) -> FrozenFixture {
             .unwrap(),
         plan: CompactionPlan {
             mode: CompactionMode::Normal,
-            coverage_domain: CoverageDomain::WorkingContext,
+            coverage_domain: CoverageDomain::OwnContribution,
             compact: vec![],
             retain: vec![],
             coverage: vec![],
@@ -528,6 +555,12 @@ async fn fixture_with_correction(mode: CorrectionFixture) -> FrozenFixture {
             .unwrap();
         assert_eq!(legacy.coverage.len(), cp.coverage.len());
         if let CorrectionFixture::UnderstatedOutput { shared } = mode {
+            // Capture creates an active self-span layout. Prepare the equivalent
+            // direct layout while physical bytes are still intact; all guards
+            // remain enabled during this fixture-only layout handoff.
+            db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+                "UPDATE compaction_frozen_layout SET active=0,pending=1 WHERE manifest_id=?1 AND kind=0",
+                [output.history.manifest_id.clone().into()])).await.unwrap();
             let backing = if shared {
                 db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
                     "INSERT INTO compaction_frozen_history(id,workspace_id,owner_thread,identity_sha256,message_count,import_count,imports_sha256,ready,next_ordinal,next_import) SELECT 'p73-output-backing',workspace_id,owner_thread,identity_sha256,message_count,0,?2,ready,next_ordinal,0 FROM compaction_frozen_history WHERE id=?1",
@@ -536,22 +569,50 @@ async fn fixture_with_correction(mode: CorrectionFixture) -> FrozenFixture {
                     "INSERT INTO compaction_frozen_message_data(manifest_id,ordinal,reference_json,bytes) SELECT 'p73-output-backing',ordinal,reference_json,bytes FROM compaction_frozen_message_data WHERE manifest_id=?1",
                     [output.history.manifest_id.clone().into()])).await.unwrap();
                 db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-                    "INSERT INTO compaction_frozen_layout(manifest_id,kind,active,pending) VALUES(?1,0,0,1)",[output.history.manifest_id.clone().into()])).await.unwrap();
-                db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-                    "INSERT INTO compaction_frozen_span(manifest_id,kind,start,end,source_manifest) VALUES(?1,0,0,?2,'p73-output-backing')",
-                    [output.history.manifest_id.clone().into(),(output.history.messages as i64).into()])).await.unwrap();
+                    "UPDATE compaction_frozen_span SET source_manifest='p73-output-backing' WHERE manifest_id=?1 AND kind=0",
+                    [output.history.manifest_id.clone().into()])).await.unwrap();
                 db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
                     "UPDATE compaction_frozen_layout SET active=1,pending=0 WHERE manifest_id=?1 AND kind=0",[output.history.manifest_id.clone().into()])).await.unwrap();
                 "p73-output-backing".to_owned()
             } else {
+                db.execute_raw(Statement::from_sql_and_values(
+                    DbBackend::Sqlite,
+                    "UPDATE compaction_frozen_layout SET pending=0 WHERE manifest_id=?1 AND kind=0",
+                    [output.history.manifest_id.clone().into()],
+                ))
+                .await
+                .unwrap();
                 output.history.manifest_id.clone()
             };
+            assert_eq!(
+                h.crud_store
+                    .compaction_frozen_history_page(
+                        &h.workspace_id,
+                        "p73-source",
+                        &output.history.manifest_id,
+                        0,
+                    )
+                    .await
+                    .unwrap(),
+                refs,
+                "layout handoff preserves the valid retained output before corruption"
+            );
             let mut bad = refs[0].clone();
             bad.unit_id = "x".repeat(pioneer_crud::compaction::SOURCE_PAGE_BYTES + 1);
             let oversized = serde_json::to_string(&bad).unwrap();
-            db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+            // Seed corrupt legacy OUTPUT bytes without changing the valid
+            // origin. Re-enable CHECKs before preparation/seal/publication.
+            let tx = db.begin().await.unwrap();
+            tx.execute_unprepared("PRAGMA ignore_check_constraints=ON")
+                .await
+                .unwrap();
+            tx.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
                 "UPDATE compaction_frozen_message_data SET reference_json=?2,bytes=1 WHERE manifest_id=?1 AND ordinal=0",
                 [backing.clone().into(),oversized.into()])).await.unwrap();
+            tx.execute_unprepared("PRAGMA ignore_check_constraints=OFF")
+                .await
+                .unwrap();
+            tx.commit().await.unwrap();
             let error = h
                 .crud_store
                 .compaction_apply_runner(&snapshot.id, &commit, None)
@@ -886,7 +947,7 @@ async fn required_expired_task_parent_basis_is_rejected_before_summary_fallback(
             vec![],
         ),
         (
-            "INSERT INTO task_run_turn(id,task_id,run_id,thread_id,turn_id,kind,round,sequence,status,created_at) VALUES('p73-child-rt','p73-child-task','p73-child-run','p73-child','p73-child-turn','initial',0,1,'completed',CURRENT_TIMESTAMP)",
+            "INSERT INTO task_run_turn(id,task_id,run_id,thread_id,turn_id,kind,round,sequence,status,created_at) VALUES('p73-child-rt','p73-child-task','p73-child-run','p73-child','p73-child-turn','initial',0,1,'review_recorded',CURRENT_TIMESTAMP)",
             vec![],
         ),
         (
@@ -906,6 +967,11 @@ async fn required_expired_task_parent_basis_is_rejected_before_summary_fallback(
         .await
         .unwrap();
     }
+    db.execute_unprepared(
+        "UPDATE thread SET origin_kind='task_run',access_class='internal' WHERE id='p73-child'",
+    )
+    .await
+    .unwrap();
     expire_and_sweep(&f).await;
     let error = capture_current(
         &f,
@@ -1004,24 +1070,65 @@ async fn obsolete_retained_raw_source_blocks_fresh_delivery_checkpoint_import() 
     .await;
     delivery(&f.h, "p73-fresh", "p73-recipient", "p73-recipient-turn").await;
     expire_and_sweep(&f).await;
-    f.h.crud_store
-        .materialize_item_completed(
-            ItemCompletedNotification {
-                workspace_id: f.h.workspace_id.clone(),
-                thread_id: "p73-source".into(),
-                turn_id: "p73-source-turn".into(),
-                item: TurnItem::AgentMessage {
-                    id: "p73-source-turn-answer".into(),
-                    text: "changed after retained output".into(),
-                    phase: Default::default(),
-                    markdown: None,
-                    markdown_version: None,
-                },
-            },
-            phase_13_now_secs() + 5,
-        )
+    // Terminal materialization is idempotent. Edit the actual retained event,
+    // then prove that its old reference became obsolete before capture.
+    let output_refs =
+        f.h.crud_store
+            .compaction_frozen_history_page(
+                &f.h.workspace_id,
+                "p73-source",
+                &f.output.history.manifest_id,
+                0,
+            )
+            .await
+            .unwrap();
+    let source = output_refs
+        .iter()
+        .flat_map(|r| &r.sources)
+        .find(|source| source.scope.starts_with("event:"))
+        .unwrap();
+    let db = f.h.crud_store.database_connection();
+    let row = db
+        .query_one_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "SELECT payload FROM turn_event WHERE id=?1",
+            [source.id.clone().into()],
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    let pioneer_crud::CanonicalTurnEventPayload::ItemCompleted(mut event) =
+        serde_json::from_str(&row.try_get::<String>("", "payload").unwrap()).unwrap()
+    else {
+        panic!("retained output must reference a completed item event");
+    };
+    let TurnItem::AgentMessage { text, .. } = &mut event.item else {
+        panic!("retained output must reference an assistant message");
+    };
+    *text = "changed after retained output".into();
+    let payload = serde_json::to_string(&pioneer_crud::CanonicalTurnEventPayload::ItemCompleted(
+        event,
+    ))
+    .unwrap();
+    let changed = db
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE turn_event SET payload=?2 WHERE id=?1",
+            [source.id.clone().into(), payload.into()],
+        ))
         .await
         .unwrap();
+    assert_eq!(changed.rows_affected(), 1);
+    assert!(
+        !f.h.crud_store
+            .compaction_sources_current(
+                &f.h.workspace_id,
+                "p73-source",
+                std::slice::from_ref(source)
+            )
+            .await
+            .unwrap()
+    );
     assert!(
         capture_current(
             &f,
@@ -1200,11 +1307,17 @@ async fn capture_current(
     turn: &str,
     principal: &crate::auth::AuthenticatedSessionPrincipal,
 ) -> anyhow::Result<crate::compaction::frozen::PreparedHistory> {
+    let root =
+        f.h.crud_store
+            .get_task_thread_lineage(thread)
+            .await?
+            .map(|lineage| lineage.root_thread_id)
+            .unwrap_or_else(|| thread.to_owned());
     persist_test_execution_authorization_context_for_principal(
         &f.h.processor,
         principal,
         &f.h.workspace_id,
-        thread,
+        &root,
         turn,
     )
     .await;
@@ -1324,9 +1437,11 @@ async fn selected_import_understated_retained_output_direct_and_shared_fails_bef
     }
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn automatic_frozen_worker_restart_prepares_legacy_proofs_expires_and_sweeps_with_fk_off() {
     let f = fixture_with_correction(CorrectionFixture::WorkerLegacy).await;
+    // Real timers let SQLite's external worker finish: a paused runtime can
+    // auto-advance to pool timeouts while a database request is in flight.
     let db = f.h.crud_store.database_connection();
     // Run the actual production loop, cancel it, and restart with fresh private
     // progress. No fixture calls quantum: durable markers must survive restart.
@@ -1338,8 +1453,8 @@ async fn automatic_frozen_worker_restart_prepares_legacy_proofs_expires_and_swee
         ));
         let mut swept = false;
         let mut interrupted_staging = false;
-        for _ in 0..20_000 {
-            tokio::time::advance(Duration::from_millis(100)).await;
+        for iteration in 0..20_000 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
             tokio::task::yield_now().await;
             let row = db.query_one_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
                 "SELECT h.expired,c.proof_version,(SELECT count(*) FROM compaction_frozen_message_data WHERE manifest_id=h.id)+(SELECT count(*) FROM compaction_frozen_import_data WHERE manifest_id=h.id) AS n FROM compaction_frozen_history h JOIN compaction_checkpoint c ON c.id=?2 WHERE h.id=?1",
@@ -1358,9 +1473,25 @@ async fn automatic_frozen_worker_restart_prepares_legacy_proofs_expires_and_swee
                 .unwrap()
                 .try_get("", "n")
                 .unwrap();
+            if iteration % 500 == 0 {
+                eprintln!(
+                    "worker restart={restart} poll={iteration} expired={} proof={} physical={} selected={selected}",
+                    row.try_get::<i64>("", "expired").unwrap(),
+                    row.try_get::<i64>("", "proof_version").unwrap(),
+                    row.try_get::<i64>("", "n").unwrap()
+                );
+            }
             interrupted_staging =
                 selected > 0 && row.try_get::<i64>("", "proof_version").unwrap() == 0;
-            if (restart == 0 && interrupted_staging) || (restart == 1 && swept) {
+            if restart == 0 && interrupted_staging {
+                assert_eq!(
+                    row.try_get::<i64>("", "expired").unwrap(),
+                    0,
+                    "unsealed published ancestry must hold the origin during worker preparation"
+                );
+                break;
+            }
+            if restart == 1 && swept {
                 break;
             }
         }
@@ -1406,9 +1537,15 @@ async fn automatic_frozen_worker_restart_prepares_legacy_proofs_expires_and_swee
     );
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn idle_frozen_worker_cancellation_interrupts_backoff_without_detached_work() {
     let (_directory, _, store, _) = setup_pooled_file_workspace_manager().await;
+    store
+        .database_connection()
+        .execute_unprepared("PRAGMA foreign_keys=OFF")
+        .await
+        .unwrap();
+    tokio::time::pause();
     let cancellation = tokio_util::sync::CancellationToken::new();
     let worker = tokio::spawn(crate::database::maintenance::run_frozen_worker_for_test(
         store,

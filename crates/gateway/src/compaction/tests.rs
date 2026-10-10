@@ -8575,11 +8575,25 @@ async fn native_discovers_working_context_head_published_after_inherited_snapsho
         assert_eq!(origin.sources[0].id, checkpoint.id);
         assert!(origin.inherited);
     }
+    assert!(
+        f.store
+            .database_connection()
+            .execute_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "DELETE FROM compaction_checkpoint WHERE id=?",
+                [checkpoint.id.clone().into()],
+            ))
+            .await
+            .is_err(),
+        "sealed historical identity must remain retained"
+    );
+    // Model an unavailable legacy summary without deleting its historical
+    // evidence. The actual sent reference must still invalidate continuity.
     f.store
         .database_connection()
         .execute_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
-            "DELETE FROM compaction_checkpoint WHERE id=?",
+            "UPDATE compaction_checkpoint SET status='failed' WHERE id=?",
             [checkpoint.id.clone().into()],
         ))
         .await
@@ -8592,7 +8606,7 @@ async fn native_discovers_working_context_head_published_after_inherited_snapsho
             &parent_projection_json,
         )
         .await
-        .expect("deleting the later summary must not rewrite the accepted Task boundary")
+        .expect("an unavailable later summary must not rewrite the accepted Task boundary")
     );
     assert!(
         !super::frozen::validate_direct_history_sources_current(
@@ -14191,6 +14205,73 @@ async fn capture_carries_foreign_own_authority_onto_late_summary() {
                 .await
                 .unwrap()
         );
+        if execution == "consumer-one" {
+            // Forwarding keeps the original delivery acceptance, even when
+            // the current capture belongs to a child. A changed delivery
+            // target that disagrees with its acknowledgement remains invalid.
+            let record = fixture
+                .store
+                .compaction_frozen_import_page("ws", execution, &capture.descriptor.manifest_id, 0)
+                .await
+                .unwrap()
+                .into_iter()
+                .next()
+                .unwrap();
+            let db = fixture.store.database_connection();
+            let row = db
+                .query_one_raw(Statement::from_sql_and_values(
+                    DbBackend::Sqlite,
+                    "SELECT target_thread_id FROM task_delivery WHERE id=?",
+                    [record.delivery_id.clone().into()],
+                ))
+                .await
+                .unwrap()
+                .unwrap();
+            let target: String = row.try_get("", "target_thread_id").unwrap();
+            db.execute_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "UPDATE task_delivery SET target_thread_id=? WHERE id=?",
+                [execution.into(), record.delivery_id.clone().into()],
+            ))
+            .await
+            .unwrap();
+            let error = fixture
+                .store
+                .compaction_apply_runner(&snapshot.id, &ready, None)
+                .await
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("original accepted import binding mismatch"),
+                "{error:#}"
+            );
+            let row = db
+                .query_one_raw(Statement::from_sql_and_values(
+                    DbBackend::Sqlite,
+                    "SELECT proof_version FROM compaction_checkpoint WHERE id=?",
+                    [checkpoint.id.clone().into()],
+                ))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.try_get::<i64>("", "proof_version").unwrap(), 0);
+            assert_eq!(
+                fixture
+                    .store
+                    .compaction_head(&snapshot.owner)
+                    .await
+                    .unwrap(),
+                snapshot.expected_checkpoint
+            );
+            db.execute_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "UPDATE task_delivery SET target_thread_id=? WHERE id=?",
+                [target.into(), record.delivery_id.into()],
+            ))
+            .await
+            .unwrap();
+        }
         fixture
             .store
             .compaction_apply_runner(&snapshot.id, &ready, None)

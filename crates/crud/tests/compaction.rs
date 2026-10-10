@@ -1,7 +1,7 @@
 use migration::{Migrator, MigratorTrait};
 use pioneer_compaction::*;
 use pioneer_crud::{CrudStore, compaction::*};
-use sea_orm::{ConnectionTrait, Database, DbBackend, Statement};
+use sea_orm::{ConnectionTrait, Database, DbBackend, Statement, TransactionTrait};
 
 async fn store() -> CrudStore {
     store_recording_statements(None).await
@@ -543,8 +543,20 @@ async fn source(store: &CrudStore, id: &str, sequence: i64, payload: &str) -> So
     store.database_connection().execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
         "INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at) VALUES (?,'thread','turn',?,'fixture',?,CURRENT_TIMESTAMP)",
         [id.into(), sequence.into(), payload.into()])).await.unwrap();
+    let revision = store
+        .database_connection()
+        .query_one_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "SELECT revision FROM compaction_event_revision WHERE source_id=?1",
+            [id.into()],
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "revision")
+        .unwrap();
     SourceAssertion {
-        revision: None,
+        revision: Some(revision),
         kind: CanonicalSource::Event,
         turn_id: "turn".into(),
         id: id.into(),
@@ -1204,9 +1216,9 @@ async fn verify_runner_commit_dependency(edit_parent: bool) {
         plan: CompactionPlan {
             mode: CompactionMode::Normal,
             coverage_domain: pioneer_compaction::CoverageDomain::OwnContribution,
-            compact: vec![],
+            compact: vec![0],
             retain: vec![],
-            coverage: vec![],
+            coverage: vec![reference.clone()],
             fingerprint: "runner-plan".into(),
         },
     };
@@ -1494,12 +1506,20 @@ async fn verify_runner_commit_dependency(edit_parent: bool) {
             .is_some(),
         "published checkpoint must survive an edit to its historical leaf"
     );
-    // Normal thread deletion must keep its existing cascade contract.
-    store
-        .database_connection()
-        .execute_unprepared("DELETE FROM thread WHERE id='thread'")
-        .await
-        .unwrap();
+    // FK-on cascade must not bypass permanent checkpoint identity/ownership
+    // guards. The rejected delete rolls back the entire thread cascade.
+    assert!(
+        store
+            .database_connection()
+            .execute_unprepared("DELETE FROM thread WHERE id='thread'")
+            .await
+            .is_err()
+    );
+    assert!(store.get_thread_model("thread").await.unwrap().is_some());
+    assert_eq!(
+        store.compaction_head(&checkpoint.owner).await.unwrap(),
+        Some(checkpoint.id.clone())
+    );
 }
 
 #[tokio::test]
@@ -4102,7 +4122,7 @@ async fn frozen_own_imports_require_exact_output_membership_and_atomic_publicati
         let mut digest = Sha256::new();
         for message in messages {
             let bytes = serde_json::to_vec(message).unwrap();
-            digest.update((bytes.len() as u64).to_le_bytes());
+            digest.update((bytes.len() as u64).to_be_bytes());
             digest.update(bytes);
         }
         FrozenHistoryRef {
@@ -4616,7 +4636,21 @@ async fn frozen_own_imports_require_exact_output_membership_and_atomic_publicati
     );
     // An accessible checkpoint must not launder H into accepted OWN work.
     // Model an older mixed checkpoint: only one of its two leaves was delivered.
-    let mixed_op = admit_import_operation(&store, "mixed-summary", "child", "child-turn").await;
+    let mut mixed_op = admit_import_operation(&store, "mixed-summary", "child", "child-turn").await;
+    // This legacy raw checkpoint originally admitted both leaves. It still
+    // must not grant a leaf that was never accepted in the delivered output.
+    mixed_op.plan.compact = vec![0, 1];
+    mixed_op.plan.coverage = vec![own_source.clone(), inherited.clone()];
+    db.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "UPDATE compaction_operation SET snapshot=? WHERE id=?",
+        [
+            serde_json::to_string(&mixed_op).unwrap().into(),
+            mixed_op.id.clone().into(),
+        ],
+    ))
+    .await
+    .unwrap();
     let mixed = Checkpoint {
         id: "mixed-checkpoint".into(),
         operation_id: mixed_op.id.clone(),
@@ -5404,7 +5438,7 @@ async fn frozen_own_import_treats_published_summary_as_atomic_output() {
         let mut digest = Sha256::new();
         for message in messages {
             let bytes = serde_json::to_vec(message).unwrap();
-            digest.update((bytes.len() as u64).to_le_bytes());
+            digest.update((bytes.len() as u64).to_be_bytes());
             digest.update(bytes);
         }
         FrozenHistoryRef {
@@ -5441,6 +5475,19 @@ async fn frozen_own_import_treats_published_summary_as_atomic_output() {
         let h = h_assertion.reference();
         let operation =
             admit_import_operation(&store, "portion-output", "portion-child", "portion-turn").await;
+        let mut raw = operation.clone();
+        raw.plan.compact = vec![0];
+        raw.plan.coverage = vec![h.clone()];
+        db.execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE compaction_operation SET snapshot=?2 WHERE id=?1",
+            [
+                operation.id.clone().into(),
+                serde_json::to_string(&raw).unwrap().into(),
+            ],
+        ))
+        .await
+        .unwrap();
         let budget = ModelBudget::new(None, None, None);
         store
             .compaction_prepare_runner(&operation.id, &budget, 1, 0)
@@ -5807,11 +5854,6 @@ async fn frozen_own_import_treats_published_summary_as_atomic_output() {
         // that atomic grant onto a distinct T whose historical input is K.
         for statement in [
             "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES ('portion-target-thread','ws','','agent','m','p','active','user','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
-            "INSERT INTO compaction_context(workspace_id,thread_id,owner,format_version) VALUES ('ws','portion-target-thread','portion-target-owner',1)",
-            "INSERT INTO compaction_operation(id,owner,fingerprint,status,snapshot,deadline_ms) VALUES ('portion-target-operation','portion-target-owner','portion-target','completed','{}',1)",
-            "INSERT INTO compaction_checkpoint(id,operation_id,owner,portion,summary,identity_sha256,selection,projection_version,format_version,status) VALUES ('portion-t','portion-target-operation','portion-target-owner',0,'target T','portion-t-version','{}',0,1,'applied')",
-            "INSERT INTO compaction_coverage(checkpoint_id,source_scope,source_id,source_version) SELECT 'portion-t',source_scope,source_id,source_version FROM compaction_live_sources WHERE source_id='portion-k'",
-            "INSERT INTO compaction_manifest(operation_id,ordinal,unit_ordinal,reference_only,source_thread,source_scope,source_id,source_version) SELECT 'portion-target-operation',0,0,0,'portion-child',source_scope,source_id,source_version FROM compaction_live_sources WHERE source_id='portion-k'",
             "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES ('portion-consumer','ws','','agent','m','p','active','task_run','internal',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
             "INSERT INTO thread_lineage(child_thread_id,parent_thread_id,root_thread_id,depth,created_at) VALUES ('portion-consumer','thread','thread',1,CURRENT_TIMESTAMP)",
             "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('portion-consumer-turn','portion-consumer','in_progress','conversation','system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
@@ -5821,6 +5863,49 @@ async fn frozen_own_import_treats_published_summary_as_atomic_output() {
         ] {
             db.execute_unprepared(statement).await.unwrap();
         }
+        db.execute_unprepared("INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('portion-target-turn','portion-target-thread','completed','conversation','system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)").await.unwrap();
+        let mut target_op = admit_import_operation(
+            &store,
+            "portion-target-operation",
+            "portion-target-thread",
+            "portion-target-turn",
+        )
+        .await;
+        target_op.plan.compact = vec![0];
+        target_op.plan.coverage = vec![k_source.clone()];
+        db.execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE compaction_operation SET snapshot=? WHERE id=?",
+            [
+                serde_json::to_string(&target_op).unwrap().into(),
+                target_op.id.clone().into(),
+            ],
+        ))
+        .await
+        .unwrap();
+        let target_checkpoint = Checkpoint {
+            id: "portion-t".into(),
+            operation_id: target_op.id.clone(),
+            owner: target_op.owner.clone(),
+            previous: None,
+            coverage: vec![k_source.clone()],
+            summary: "target T".into(),
+            selection: target_op.admission.selection.clone(),
+            projection_version: target_op.projection_version,
+            format_version: 1,
+        };
+        store
+            .compaction_save_candidate(&target_checkpoint, 0)
+            .await
+            .unwrap();
+        // Model a pre-proof published legacy node with a real original raw
+        // contract, exact identity and ownership, rather than malformed '{}'.
+        db.execute_unprepared(
+            "UPDATE compaction_checkpoint SET status='applied' WHERE id='portion-t'",
+        )
+        .await
+        .unwrap();
+        db.execute_unprepared("UPDATE compaction_operation SET status='completed' WHERE id='portion-target-operation'").await.unwrap();
         db.execute_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
             "WITH frozen_root_fixture(run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at) AS (VALUES ('portion-consumer-run','portion-consumer-task','ws','thread',?,CURRENT_TIMESTAMP)) INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at,frozen_manifest_id) SELECT run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at,CASE WHEN json_valid(history_json) THEN CASE WHEN json_type(history_json)='object' THEN json_extract(history_json,'$.manifest_id') ELSE NULL END ELSE NULL END FROM frozen_root_fixture",
@@ -5922,13 +6007,27 @@ async fn frozen_own_import_treats_published_summary_as_atomic_output() {
             .unwrap();
         let (raced_target, raced_imports) =
             begin_target(&store, "portion-target-raced", &target_message, raced).await;
-        db.execute_unprepared(if delete_leaf {
-            "DELETE FROM compaction_checkpoint WHERE id='portion-k'"
+        if delete_leaf {
+            assert!(
+                db.execute_unprepared("DELETE FROM compaction_checkpoint WHERE id='portion-k'")
+                    .await
+                    .is_err(),
+                "sealed original grant evidence cannot be deleted"
+            );
+            // The accepted binding itself can disappear after preparation;
+            // retain the immutable checkpoint and test that real writer race.
+            db.execute_unprepared(
+                "DELETE FROM task_run_conversation_snapshot WHERE run_id='portion-consumer-run'",
+            )
+            .await
+            .unwrap();
         } else {
-            "UPDATE compaction_checkpoint SET status='candidate' WHERE id='portion-k'"
-        })
-        .await
-        .unwrap();
+            db.execute_unprepared(
+                "UPDATE compaction_checkpoint SET status='candidate' WHERE id='portion-k'",
+            )
+            .await
+            .unwrap();
+        }
         assert!(
             store
                 .compaction_append_frozen_imports(
@@ -6033,6 +6132,32 @@ async fn ready_operation_with_references(
 ) -> pioneer_compaction::runner::RunnerState {
     use pioneer_compaction::runner::{RunnerState, SourceCursor};
     let op = &snapshot.id;
+    // Seed the exact original legacy raw plan before runner execution. An
+    // empty frozen-style plan is not a valid missing-binding contract.
+    if !sources.is_empty()
+        && snapshot.plan.compact.is_empty()
+        && store
+            .compaction_bound_source_projection(op)
+            .await
+            .unwrap()
+            .is_none()
+    {
+        let mut raw = snapshot.clone();
+        raw.plan.compact = (0..sources.len()).collect();
+        raw.plan.coverage = sources.iter().map(|(_, source)| source.clone()).collect();
+        store
+            .database_connection()
+            .execute_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "UPDATE compaction_operation SET snapshot=?2 WHERE id=?1",
+                [
+                    op.clone().into(),
+                    serde_json::to_string(&raw).unwrap().into(),
+                ],
+            ))
+            .await
+            .unwrap();
+    }
     let budget = ModelBudget::new(None, None, None);
     store
         .compaction_prepare_runner(op, &budget, sources.len() as u64, references.len() as u64)
@@ -7153,6 +7278,44 @@ async fn independent_summary_migration_reuses_existing_checkpoint_without_rewrit
         db.execute_unprepared("INSERT INTO compaction_coverage(checkpoint_id,source_scope,source_id,source_version) VALUES ('upgrade-summary','event:upgrade-turn','upgrade-leaf','event-revision:1')")
             .await
             .unwrap();
+        let raw = OperationSnapshot {
+            id: "upgrade-operation".into(),
+            owner: "upgrade-owner".into(),
+            expected_checkpoint: None,
+            projection_version: 0,
+            source_epochs: Default::default(),
+            admission: CompactionSettings::default()
+                .admit(
+                    &ModelSelection {
+                        transport: Transport::Api,
+                        instance: "upgrade-instance".into(),
+                        model: "upgrade-model".into(),
+                        effort: None,
+                    },
+                    None,
+                    0,
+                )
+                .unwrap(),
+            plan: CompactionPlan {
+                mode: CompactionMode::Normal,
+                coverage_domain: CoverageDomain::OwnContribution,
+                compact: vec![0],
+                retain: vec![],
+                coverage: vec![SourceRef {
+                    scope: "event:upgrade-turn".into(),
+                    id: "upgrade-leaf".into(),
+                    version: "event-revision:1".into(),
+                }],
+                fingerprint: "upgrade".into(),
+            },
+        };
+        db.execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE compaction_operation SET snapshot=?1 WHERE id='upgrade-operation'",
+            [serde_json::to_string(&raw).unwrap().into()],
+        ))
+        .await
+        .unwrap();
         if compressed {
             let config = serde_json::json!({
                 "table":"turn_event",
@@ -7436,7 +7599,7 @@ fn shared_descriptor(
     let mut digest = Sha256::new();
     for r in refs {
         let b = serde_json::to_vec(r).unwrap();
-        digest.update((b.len() as u64).to_le_bytes());
+        digest.update((b.len() as u64).to_be_bytes());
         digest.update(b);
     }
     pioneer_compaction::frozen::FrozenHistoryRef {
@@ -7708,7 +7871,17 @@ async fn duplicate_cleanup_rejects_understated_physical_bytes_after_layout_switc
         activated,
         "fixture must pause after real activation and before cleanup"
     );
-    store.database_connection().execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,"UPDATE compaction_frozen_message_data SET reference_json=?1,bytes=2 WHERE manifest_id='legacy' AND ordinal=0",[serde_json::json!({"padding":"x".repeat(300_000)}).to_string().into()])).await.unwrap();
+    // Seed legacy corruption only; tested cleanup runs with CHECKs restored.
+    let oversized = serde_json::json!({"padding":"x".repeat(300_000)}).to_string();
+    let tx = store.database_connection().begin().await.unwrap();
+    tx.execute_unprepared("PRAGMA ignore_check_constraints=ON")
+        .await
+        .unwrap();
+    tx.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,"UPDATE compaction_frozen_message_data SET reference_json=?1,bytes=2 WHERE manifest_id='legacy' AND ordinal=0",[oversized.into()])).await.unwrap();
+    tx.execute_unprepared("PRAGMA ignore_check_constraints=OFF")
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
     assert!(
         store
             .compact_frozen_storage_quantum(&mut progress)
@@ -7754,6 +7927,16 @@ async fn restart_staged_copy_next_does_not_publish_wrong_backing() {
             .await
             .is_err(),
         "corrupt layout is explicit, not empty history"
+    );
+    store.database_connection().execute_unprepared(
+        "INSERT INTO compaction_frozen_layout(manifest_id,kind,active,pending,failed) VALUES('staged',1,0,1,1)"
+    ).await.unwrap();
+    assert!(
+        store
+            .compaction_frozen_import_page("ws", "thread", "staged", 0)
+            .await
+            .is_err(),
+        "a failed import layout is explicit even when its stream is empty"
     );
     assert_eq!(
         frozen_count(&store, "compaction_frozen_message_data").await,
@@ -8472,7 +8655,10 @@ async fn deadline_saved_ready_candidate_commit_expiry_refuses_resume_without_cha
             corrections: 0,
             target_tokens: 10,
             source_text_projection_version: 0,
-            cursor: Default::default(),
+            cursor: pioneer_compaction::runner::SourceCursor {
+                unit: 1,
+                ..Default::default()
+            },
             previous_checkpoint: Some(cp.id.clone()),
             phase: RunnerPhase::Failed {
                 kind: FailureKind::Deadline,
@@ -8482,7 +8668,7 @@ async fn deadline_saved_ready_candidate_commit_expiry_refuses_resume_without_cha
             diagnostic: None,
         };
         db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,"INSERT INTO compaction_runner_state(operation_id,generation,state) VALUES('resume-op',0,?1)",[serde_json::to_string(&state).unwrap().into()])).await.unwrap();
-        db.execute_unprepared("UPDATE compaction_operation SET status='failed',outcome='deadline' WHERE id='resume-op'").await.unwrap();
+        db.execute_unprepared("UPDATE compaction_operation SET status='failed',outcome='deadline',deadline_ms=1000 WHERE id='resume-op'").await.unwrap();
         drop(hold);
         if phase_name == "Commit" {
             assert!(
