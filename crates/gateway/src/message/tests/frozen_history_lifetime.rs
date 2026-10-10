@@ -131,25 +131,25 @@ async fn ack(h: &Phase13CompactionHarness, delivery: &str, thread: &str, turn: &
 }
 async fn delivery(h: &Phase13CompactionHarness, id: &str, thread: &str, turn: &str) -> SourceRef {
     let db = h.crud_store.database_connection();
-    db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,"INSERT INTO task_delivery(id,workspace_id,task_id,run_id,delivery_key,mode,thread_target,target_thread_id,status,attempt_count,max_attempts,delivered_turn_id) VALUES(?1,?2,'p73-task','p73-run',?1,'thread','origin_thread',?3,'delivered',1,1,?4)",[id.into(),h.workspace_id.clone().into(),thread.into(),turn.into()])).await.unwrap();
-    db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,"INSERT INTO compaction_delivery_output(delivery_id,candidate_id,task_run_turn_id) VALUES(?1,'p73-candidate','p73-rt')",[id.into()])).await.unwrap();
+    db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,"INSERT INTO task_delivery(id,workspace_id,task_id,run_id,delivery_key,mode,thread_target,target_thread_id,status,attempt_count,max_attempts,delivered_turn_id) VALUES(?1,?2,'frozen-task','frozen-run',?1,'thread','origin_thread',?3,'delivered',1,1,?4)",[id.into(),h.workspace_id.clone().into(),thread.into(),turn.into()])).await.unwrap();
+    db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,"INSERT INTO compaction_delivery_output(delivery_id,candidate_id,task_run_turn_id) VALUES(?1,'frozen-candidate','frozen-rt')",[id.into()])).await.unwrap();
     ack(h, id, thread, turn).await
 }
 #[derive(Clone, Copy)]
-enum CorrectionFixture {
+enum FixtureMode {
     Normal,
     WorkerLegacy,
     Aggregate { legacy: bool },
     UnderstatedOutput { shared: bool },
 }
 async fn fixture() -> FrozenFixture {
-    fixture_with_correction(CorrectionFixture::Normal).await
+    fixture_with_mode(FixtureMode::Normal).await
 }
-async fn fixture_with_correction(mode: CorrectionFixture) -> FrozenFixture {
+async fn fixture_with_mode(mode: FixtureMode) -> FrozenFixture {
     let provider = Arc::new(
         CaptureSummaryProvider::new("unused")
             .with_valid_summary_completion()
-            .with_summary_marker("P73 PERMANENT SUMMARY"),
+            .with_summary_marker("FROZEN PERMANENT SUMMARY"),
     );
     let (directory, workspace_manager, crud_store, workspace_id) =
         setup_pooled_file_workspace_manager().await;
@@ -193,8 +193,8 @@ async fn fixture_with_correction(mode: CorrectionFixture) -> FrozenFixture {
     tx.commit().await.unwrap();
     materialize(
         &h,
-        "p73-source",
-        "p73-source-turn",
+        "frozen-source",
+        "frozen-source-turn",
         "retained delivered work",
         true,
     )
@@ -202,15 +202,15 @@ async fn fixture_with_correction(mode: CorrectionFixture) -> FrozenFixture {
     let db = h.crud_store.database_connection();
     for (sql, values) in [
         (
-            "INSERT INTO task(id,workspace_id,owner_kind,owner_id,created_by_thread_id,created_by_turn_id,executor_kind,status,title,goal) VALUES('p73-task',?1,'thread','p73-source','p73-source','p73-source-turn','agent','completed','fixture','fixture')",
+            "INSERT INTO task(id,workspace_id,owner_kind,owner_id,created_by_thread_id,created_by_turn_id,executor_kind,status,title,goal) VALUES('frozen-task',?1,'thread','frozen-source','frozen-source','frozen-source-turn','agent','completed','fixture','fixture')",
             vec![h.workspace_id.clone().into()],
         ),
         (
-            "INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES('p73-run','p73-task','p73-run',1,1,'succeeded','agent')",
+            "INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES('frozen-run','frozen-task','frozen-run',1,1,'succeeded','agent')",
             vec![],
         ),
         (
-            "INSERT INTO task_run_turn(id,task_id,run_id,thread_id,turn_id,kind,round,sequence,status,created_at) VALUES('p73-rt','p73-task','p73-run','p73-source','p73-source-turn','initial',0,1,'review_recorded',CURRENT_TIMESTAMP)",
+            "INSERT INTO task_run_turn(id,task_id,run_id,thread_id,turn_id,kind,round,sequence,status,created_at) VALUES('frozen-rt','frozen-task','frozen-run','frozen-source','frozen-source-turn','initial',0,1,'review_recorded',CURRENT_TIMESTAMP)",
             vec![],
         ),
     ] {
@@ -224,7 +224,7 @@ async fn fixture_with_correction(mode: CorrectionFixture) -> FrozenFixture {
     }
     let rt = h
         .crud_store
-        .get_task_run_turn("p73-rt")
+        .get_task_run_turn("frozen-rt")
         .await
         .unwrap()
         .unwrap();
@@ -232,13 +232,13 @@ async fn fixture_with_correction(mode: CorrectionFixture) -> FrozenFixture {
         crate::compaction::frozen::capture_task_output(&h.crud_store, &h.workspace_id, &rt)
             .await
             .unwrap();
-    db.execute_unprepared("INSERT INTO task_result_candidate(id,task_id,run_id,task_run_turn_id,thread_id,turn_id,round,status,created_at,updated_at) VALUES('p73-candidate','p73-task','p73-run','p73-rt','p73-source','p73-source-turn',0,'accepted',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)").await.unwrap();
-    let original_ack = delivery(&h, "p73-original", "p73-source", "p73-source-turn").await;
+    db.execute_unprepared("INSERT INTO task_result_candidate(id,task_id,run_id,task_run_turn_id,thread_id,turn_id,round,status,created_at,updated_at) VALUES('frozen-candidate','frozen-task','frozen-run','frozen-rt','frozen-source','frozen-source-turn',0,'accepted',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)").await.unwrap();
+    let original_ack = delivery(&h, "frozen-original", "frozen-source", "frozen-source-turn").await;
     let mut refs = h
         .crud_store
         .compaction_frozen_history_page(
             &h.workspace_id,
-            "p73-source",
+            "frozen-source",
             &output.history.manifest_id,
             0,
         )
@@ -252,11 +252,11 @@ async fn fixture_with_correction(mode: CorrectionFixture) -> FrozenFixture {
                 .crud_store
                 .compaction_prepare_frozen_import(
                     &h.workspace_id,
-                    "p73-source",
-                    "p73-original",
+                    "frozen-source",
+                    "frozen-original",
                     &original_ack,
                     ordinal as u64,
-                    "p73-source",
+                    "frozen-source",
                     source,
                 )
                 .await
@@ -265,7 +265,7 @@ async fn fixture_with_correction(mode: CorrectionFixture) -> FrozenFixture {
         }
     }
     assert!(!imports.is_empty());
-    if matches!(mode, CorrectionFixture::Aggregate { .. }) {
+    if matches!(mode, FixtureMode::Aggregate { .. }) {
         // A persisted legacy selected set may be larger than one metadata page.
         // Keep each source/reference small and the original accepted imports
         // nonempty. Completed assistant output is normally item-backed; use
@@ -279,8 +279,8 @@ async fn fixture_with_correction(mode: CorrectionFixture) -> FrozenFixture {
             .crud_store
             .compaction_source_page(
                 &h.workspace_id,
-                "p73-source",
-                "p73-source-turn",
+                "frozen-source",
+                "frozen-source-turn",
                 PagedSource::Event,
                 0,
             )
@@ -288,7 +288,7 @@ async fn fixture_with_correction(mode: CorrectionFixture) -> FrozenFixture {
             .unwrap()
             .entries
             .into_iter()
-            .find(|row| row.item_id.as_deref() == Some("p73-source-turn-answer"))
+            .find(|row| row.item_id.as_deref() == Some("frozen-source-turn-answer"))
             .unwrap()
             .reference;
         let canonical = db
@@ -302,26 +302,26 @@ async fn fixture_with_correction(mode: CorrectionFixture) -> FrozenFixture {
             .unwrap();
         let event_type: String = canonical.try_get("", "event_type").unwrap();
         let payload: String = canonical.try_get("", "payload").unwrap();
-        db.execute_unprepared("INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES('p73-aggregate-turn','p73-source','completed','conversation','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)").await.unwrap();
+        db.execute_unprepared("INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES('frozen-aggregate-turn','frozen-source','completed','conversation','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)").await.unwrap();
         let pioneer_crud::CanonicalTurnEventPayload::ItemCompleted(mut event_payload) =
             serde_json::from_str(&payload).unwrap()
         else {
             panic!("aggregate exemplar must be a completed assistant event");
         };
-        event_payload.turn_id = "p73-aggregate-turn".into();
+        event_payload.turn_id = "frozen-aggregate-turn".into();
         let payload = serde_json::to_string(
             &pioneer_crud::CanonicalTurnEventPayload::ItemCompleted(event_payload),
         )
         .unwrap();
         for i in 0..128 {
-            let id = format!("p73-page-{i:04}-{}", "x".repeat(3072));
+            let id = format!("frozen-page-{i:04}-{}", "x".repeat(3072));
             db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-                "INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at) VALUES(?1,'p73-source','p73-aggregate-turn',?2,?3,?4,CURRENT_TIMESTAMP)",
+                "INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at) VALUES(?1,'frozen-source','frozen-aggregate-turn',?2,?3,?4,CURRENT_TIMESTAMP)",
                 [id.clone().into(),(10_000_i64+i).into(),event_type.clone().into(),payload.clone().into()])).await.unwrap();
             let mut reference = exemplar.clone();
             reference.unit_id = format!("page-unit-{i}");
             reference.sources = vec![SourceRef {
-                scope: "event:p73-aggregate-turn".into(),
+                scope: "event:frozen-aggregate-turn".into(),
                 id,
                 version: "event-revision:1".into(),
             }];
@@ -340,7 +340,7 @@ async fn fixture_with_correction(mode: CorrectionFixture) -> FrozenFixture {
                 > pioneer_crud::compaction::SOURCE_PAGE_BYTES
         );
     }
-    if matches!(mode, CorrectionFixture::WorkerLegacy) {
+    if matches!(mode, FixtureMode::WorkerLegacy) {
         // Automatic conversion is active too. Give the origin a distinct first
         // unit (before computing its identity) so the retained output cannot
         // legitimately borrow this origin's physical prefix during the test.
@@ -354,14 +354,14 @@ async fn fixture_with_correction(mode: CorrectionFixture) -> FrozenFixture {
     }
     let origin = pioneer_compaction::frozen::FrozenHistoryRef {
         format: 1,
-        manifest_id: "p73-origin".into(),
+        manifest_id: "frozen-origin".into(),
         identity_sha256: hex::encode(digest.finalize()),
         messages: refs.len() as u64,
     };
     h.crud_store
         .compaction_begin_frozen_history_with_imports(
             &h.workspace_id,
-            "p73-source",
+            "frozen-source",
             &origin,
             imports.len() as u64,
             &frozen_import_identity(&imports).unwrap(),
@@ -372,7 +372,7 @@ async fn fixture_with_correction(mode: CorrectionFixture) -> FrozenFixture {
         h.crud_store
             .compaction_append_frozen_history(
                 &h.workspace_id,
-                "p73-source",
+                "frozen-source",
                 &origin.manifest_id,
                 (page * 16) as u64,
                 records,
@@ -383,7 +383,7 @@ async fn fixture_with_correction(mode: CorrectionFixture) -> FrozenFixture {
     h.crud_store
         .compaction_append_frozen_imports(
             &h.workspace_id,
-            "p73-source",
+            "frozen-source",
             &origin.manifest_id,
             0,
             &imports,
@@ -392,7 +392,7 @@ async fn fixture_with_correction(mode: CorrectionFixture) -> FrozenFixture {
         .unwrap();
     let hold = h
         .crud_store
-        .compaction_finish_frozen_history_held(&h.workspace_id, "p73-source", &origin)
+        .compaction_finish_frozen_history_held(&h.workspace_id, "frozen-source", &origin)
         .await
         .unwrap();
     let selection = ModelSelection {
@@ -403,12 +403,12 @@ async fn fixture_with_correction(mode: CorrectionFixture) -> FrozenFixture {
     };
     let now = chrono::Utc::now().timestamp_millis() as u64;
     let snapshot = OperationSnapshot {
-        id: "p73-operation".into(),
-        owner: crate::compaction::native_owner(&h.workspace_id, "p73-source"),
+        id: "frozen-operation".into(),
+        owner: crate::compaction::native_owner(&h.workspace_id, "frozen-source"),
         expected_checkpoint: None,
         projection_version: h
             .crud_store
-            .compaction_projection_version(&h.workspace_id, "p73-source")
+            .compaction_projection_version(&h.workspace_id, "frozen-source")
             .await
             .unwrap(),
         source_epochs: std::collections::BTreeMap::new(),
@@ -421,16 +421,16 @@ async fn fixture_with_correction(mode: CorrectionFixture) -> FrozenFixture {
             compact: vec![],
             retain: vec![],
             coverage: vec![],
-            fingerprint: "p73-origin".into(),
+            fingerprint: "frozen-origin".into(),
         },
     };
     let budget = ModelBudget::new(Some(65_536), None, None);
     h.crud_store
         .compaction_admit_for_turn(
             &h.workspace_id,
-            "p73-source",
+            "frozen-source",
             &snapshot,
-            Some("p73-source-turn"),
+            Some("frozen-source-turn"),
         )
         .await
         .unwrap();
@@ -447,7 +447,7 @@ async fn fixture_with_correction(mode: CorrectionFixture) -> FrozenFixture {
             ordinal: ordinal as u64,
             unit: unit as u64,
             reference_only: false,
-            thread_id: "p73-source".into(),
+            thread_id: "frozen-source".into(),
             source,
         })
         .collect();
@@ -474,14 +474,14 @@ async fn fixture_with_correction(mode: CorrectionFixture) -> FrozenFixture {
         )
         .await
         .unwrap();
-    let checkpoint = if matches!(mode, CorrectionFixture::Normal) {
+    let checkpoint = if matches!(mode, FixtureMode::Normal) {
         let summarizer = Arc::new(
             pioneer_agent::compaction::NativeSummarizer::new(provider, selection, budget).unwrap(),
         );
         let runner = crate::compaction::CompactionRunner::new(
             h.crud_store.as_ref().clone(),
             h.workspace_id.clone(),
-            "p73-source".into(),
+            "frozen-source".into(),
             snapshot,
             summarizer,
             Arc::new(Fits),
@@ -506,11 +506,11 @@ async fn fixture_with_correction(mode: CorrectionFixture) -> FrozenFixture {
             .unwrap()
             .unwrap();
         let cp = pioneer_compaction::Checkpoint {
-            id: "p73-correction-checkpoint".into(),
+            id: "frozen-checkpoint".into(),
             operation_id: snapshot.id.clone(),
             owner: snapshot.owner.clone(),
             previous: None,
-            summary: "P73 PERMANENT SUMMARY".into(),
+            summary: "FROZEN PERMANENT SUMMARY".into(),
             selection: snapshot.admission.selection.clone(),
             coverage: manifest
                 .iter()
@@ -554,7 +554,7 @@ async fn fixture_with_correction(mode: CorrectionFixture) -> FrozenFixture {
             .unwrap()
             .unwrap();
         assert_eq!(legacy.coverage.len(), cp.coverage.len());
-        if let CorrectionFixture::UnderstatedOutput { shared } = mode {
+        if let FixtureMode::UnderstatedOutput { shared } = mode {
             // Capture creates an active self-span layout. Prepare the equivalent
             // direct layout while physical bytes are still intact; all guards
             // remain enabled during this fixture-only layout handoff.
@@ -563,17 +563,17 @@ async fn fixture_with_correction(mode: CorrectionFixture) -> FrozenFixture {
                 [output.history.manifest_id.clone().into()])).await.unwrap();
             let backing = if shared {
                 db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-                    "INSERT INTO compaction_frozen_history(id,workspace_id,owner_thread,identity_sha256,message_count,import_count,imports_sha256,ready,next_ordinal,next_import) SELECT 'p73-output-backing',workspace_id,owner_thread,identity_sha256,message_count,0,?2,ready,next_ordinal,0 FROM compaction_frozen_history WHERE id=?1",
+                    "INSERT INTO compaction_frozen_history(id,workspace_id,owner_thread,identity_sha256,message_count,import_count,imports_sha256,ready,next_ordinal,next_import) SELECT 'frozen-output-backing',workspace_id,owner_thread,identity_sha256,message_count,0,?2,ready,next_ordinal,0 FROM compaction_frozen_history WHERE id=?1",
                     [output.history.manifest_id.clone().into(),hex::encode(Sha256::digest([])).into()])).await.unwrap();
                 db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-                    "INSERT INTO compaction_frozen_message_data(manifest_id,ordinal,reference_json,bytes) SELECT 'p73-output-backing',ordinal,reference_json,bytes FROM compaction_frozen_message_data WHERE manifest_id=?1",
+                    "INSERT INTO compaction_frozen_message_data(manifest_id,ordinal,reference_json,bytes) SELECT 'frozen-output-backing',ordinal,reference_json,bytes FROM compaction_frozen_message_data WHERE manifest_id=?1",
                     [output.history.manifest_id.clone().into()])).await.unwrap();
                 db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-                    "UPDATE compaction_frozen_span SET source_manifest='p73-output-backing' WHERE manifest_id=?1 AND kind=0",
+                    "UPDATE compaction_frozen_span SET source_manifest='frozen-output-backing' WHERE manifest_id=?1 AND kind=0",
                     [output.history.manifest_id.clone().into()])).await.unwrap();
                 db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
                     "UPDATE compaction_frozen_layout SET active=1,pending=0 WHERE manifest_id=?1 AND kind=0",[output.history.manifest_id.clone().into()])).await.unwrap();
-                "p73-output-backing".to_owned()
+                "frozen-output-backing".to_owned()
             } else {
                 db.execute_raw(Statement::from_sql_and_values(
                     DbBackend::Sqlite,
@@ -588,7 +588,7 @@ async fn fixture_with_correction(mode: CorrectionFixture) -> FrozenFixture {
                 h.crud_store
                     .compaction_frozen_history_page(
                         &h.workspace_id,
-                        "p73-source",
+                        "frozen-source",
                         &output.history.manifest_id,
                         0,
                     )
@@ -653,7 +653,7 @@ async fn fixture_with_correction(mode: CorrectionFixture) -> FrozenFixture {
                 h.crud_store
                     .compaction_frozen_history_page(
                         &h.workspace_id,
-                        "p73-source",
+                        "frozen-source",
                         &origin.manifest_id,
                         0
                     )
@@ -674,7 +674,7 @@ async fn fixture_with_correction(mode: CorrectionFixture) -> FrozenFixture {
         }
         if matches!(
             mode,
-            CorrectionFixture::Aggregate { legacy: true } | CorrectionFixture::WorkerLegacy
+            FixtureMode::Aggregate { legacy: true } | FixtureMode::WorkerLegacy
         ) {
             // Persisted pre-upgrade publication, before proof_version existed.
             let applied = commit.applied(&cp.id).unwrap();
@@ -710,7 +710,7 @@ async fn fixture_with_correction(mode: CorrectionFixture) -> FrozenFixture {
             ))
             .await
             .unwrap();
-            if !matches!(mode, CorrectionFixture::WorkerLegacy) {
+            if !matches!(mode, FixtureMode::WorkerLegacy) {
                 let mut progress = pioneer_crud::FrozenStorageLifetimeProgress::default();
                 let mut sealed = false;
                 for _ in 0..40_000 {
@@ -759,7 +759,7 @@ async fn fixture_with_correction(mode: CorrectionFixture) -> FrozenFixture {
         .unwrap()
         .try_get("", "n")
         .unwrap();
-    if matches!(mode, CorrectionFixture::WorkerLegacy) {
+    if matches!(mode, FixtureMode::WorkerLegacy) {
         assert_eq!(n, 0, "restart fixture starts before legacy proof backfill");
     } else {
         assert!(n > 0, "A/B must exercise nonempty permanent imports");
@@ -820,34 +820,41 @@ async fn published_local_checkpoint_with_nonempty_proofs_survives_expired_origin
 {
     let f = fixture().await;
     expire_and_sweep(&f).await;
-    materialize(&f.h, "p73-source", "p73-tail", "P73 NEW TAIL", true).await;
+    materialize(
+        &f.h,
+        "frozen-source",
+        "frozen-tail",
+        "FROZEN NEW TAIL",
+        true,
+    )
+    .await;
     let prepared = capture_current(
         &f,
-        "p73-source",
-        "p73-tail",
+        "frozen-source",
+        "frozen-tail",
         &authenticated_test_superuser(),
     )
     .await
     .unwrap();
-    commit_current(&f, "p73-source", "p73-tail", &prepared).await;
+    commit_current(&f, "frozen-source", "frozen-tail", &prepared).await;
     assert_ne!(prepared.descriptor.manifest_id, f.origin.manifest_id);
     assert!(
         prepared
             .messages
             .iter()
-            .any(|m| m.content.contains("P73 PERMANENT SUMMARY"))
+            .any(|m| m.content.contains("FROZEN PERMANENT SUMMARY"))
     );
     assert!(
         prepared
             .messages
             .iter()
-            .any(|m| m.content.contains("P73 NEW TAIL"))
+            .any(|m| m.content.contains("FROZEN NEW TAIL"))
     );
     let refs =
         f.h.crud_store
             .compaction_frozen_history_page(
                 &f.h.workspace_id,
-                "p73-source",
+                "frozen-source",
                 &prepared.descriptor.manifest_id,
                 0,
             )
@@ -872,42 +879,48 @@ async fn retained_output_checkpoint_replacement_uses_fresh_ordinals_through_proc
     let f = fixture().await;
     materialize(
         &f.h,
-        "p73-recipient",
-        "p73-recipient-turn",
+        "frozen-recipient",
+        "frozen-recipient-turn",
         "recipient own tail",
         true,
     )
     .await;
-    let fresh_ack = delivery(&f.h, "p73-fresh", "p73-recipient", "p73-recipient-turn").await;
+    let fresh_ack = delivery(
+        &f.h,
+        "frozen-fresh",
+        "frozen-recipient",
+        "frozen-recipient-turn",
+    )
+    .await;
     expire_and_sweep(&f).await;
     let prepared = capture_current(
         &f,
-        "p73-recipient",
-        "p73-recipient-turn",
+        "frozen-recipient",
+        "frozen-recipient-turn",
         &authenticated_test_superuser(),
     )
     .await
     .unwrap();
-    commit_current(&f, "p73-recipient", "p73-recipient-turn", &prepared).await;
+    commit_current(&f, "frozen-recipient", "frozen-recipient-turn", &prepared).await;
     let imports =
         f.h.crud_store
             .compaction_frozen_import_page(
                 &f.h.workspace_id,
-                "p73-recipient",
+                "frozen-recipient",
                 &prepared.descriptor.manifest_id,
                 0,
             )
             .await
             .unwrap();
     assert!(!imports.is_empty());
-    assert!(imports.iter().all(|r| r.delivery_id == "p73-fresh"
+    assert!(imports.iter().all(|r| r.delivery_id == "frozen-fresh"
         && r.acknowledgement == fresh_ack
         && r.output_manifest == f.output.history.manifest_id));
     let refs =
         f.h.crud_store
             .compaction_frozen_history_page(
                 &f.h.workspace_id,
-                "p73-recipient",
+                "frozen-recipient",
                 &prepared.descriptor.manifest_id,
                 0,
             )
@@ -918,40 +931,40 @@ async fn retained_output_checkpoint_replacement_uses_fresh_ordinals_through_proc
         assert_eq!(target.sources.len(), 1);
         assert_eq!(target.sources[0].id, f.checkpoint);
         assert!(target.sources[0].scope.starts_with("checkpoint:"));
-        assert_eq!(target.context_thread.as_deref(), Some("p73-recipient"));
+        assert_eq!(target.context_thread.as_deref(), Some("frozen-recipient"));
     }
     assert!(
         prepared
             .messages
             .iter()
-            .any(|m| m.content.contains("P73 PERMANENT SUMMARY"))
+            .any(|m| m.content.contains("FROZEN PERMANENT SUMMARY"))
     );
 }
 
 #[tokio::test]
 async fn required_expired_task_parent_basis_is_rejected_before_summary_fallback() {
     let f = fixture().await;
-    materialize(&f.h, "p73-child", "p73-child-turn", "child", true).await;
+    materialize(&f.h, "frozen-child", "frozen-child-turn", "child", true).await;
     let db = f.h.crud_store.database_connection();
     for (sql, values) in [
         (
-            "INSERT INTO thread_lineage(child_thread_id,parent_thread_id,root_thread_id,depth,created_at,origin_kind) VALUES('p73-child','p73-source','p73-source',1,CURRENT_TIMESTAMP,'task_run')",
+            "INSERT INTO thread_lineage(child_thread_id,parent_thread_id,root_thread_id,depth,created_at,origin_kind) VALUES('frozen-child','frozen-source','frozen-source',1,CURRENT_TIMESTAMP,'task_run')",
             vec![],
         ),
         (
-            "INSERT INTO task(id,workspace_id,owner_kind,owner_id,created_by_thread_id,created_by_turn_id,executor_kind,status,title,goal) VALUES('p73-child-task',?1,'thread','p73-source','p73-source','p73-source-turn','agent','completed','child','child')",
+            "INSERT INTO task(id,workspace_id,owner_kind,owner_id,created_by_thread_id,created_by_turn_id,executor_kind,status,title,goal) VALUES('frozen-child-task',?1,'thread','frozen-source','frozen-source','frozen-source-turn','agent','completed','child','child')",
             vec![f.h.workspace_id.clone().into()],
         ),
         (
-            "INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES('p73-child-run','p73-child-task','p73-child-run',1,1,'succeeded','agent')",
+            "INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES('frozen-child-run','frozen-child-task','frozen-child-run',1,1,'succeeded','agent')",
             vec![],
         ),
         (
-            "INSERT INTO task_run_turn(id,task_id,run_id,thread_id,turn_id,kind,round,sequence,status,created_at) VALUES('p73-child-rt','p73-child-task','p73-child-run','p73-child','p73-child-turn','initial',0,1,'review_recorded',CURRENT_TIMESTAMP)",
+            "INSERT INTO task_run_turn(id,task_id,run_id,thread_id,turn_id,kind,round,sequence,status,created_at) VALUES('frozen-child-rt','frozen-child-task','frozen-child-run','frozen-child','frozen-child-turn','initial',0,1,'review_recorded',CURRENT_TIMESTAMP)",
             vec![],
         ),
         (
-            "INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at,frozen_manifest_id) VALUES('p73-child-run','p73-child-task',?1,'p73-source',?2,CURRENT_TIMESTAMP,?3)",
+            "INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at,frozen_manifest_id) VALUES('frozen-child-run','frozen-child-task',?1,'frozen-source',?2,CURRENT_TIMESTAMP,?3)",
             vec![
                 f.h.workspace_id.clone().into(),
                 serde_json::to_string(&f.origin).unwrap().into(),
@@ -968,15 +981,15 @@ async fn required_expired_task_parent_basis_is_rejected_before_summary_fallback(
         .unwrap();
     }
     db.execute_unprepared(
-        "UPDATE thread SET origin_kind='task_run',access_class='internal' WHERE id='p73-child'",
+        "UPDATE thread SET origin_kind='task_run',access_class='internal' WHERE id='frozen-child'",
     )
     .await
     .unwrap();
     expire_and_sweep(&f).await;
     let error = capture_current(
         &f,
-        "p73-child",
-        "p73-child-turn",
+        "frozen-child",
+        "frozen-child-turn",
         &authenticated_test_superuser(),
     )
     .await
@@ -992,17 +1005,23 @@ async fn checkpoint_proofs_do_not_restore_revoked_consumer_read_authority() {
     let f = fixture().await;
     materialize(
         &f.h,
-        "p73-recipient",
-        "p73-recipient-turn",
+        "frozen-recipient",
+        "frozen-recipient-turn",
         "recipient",
         true,
     )
     .await;
-    delivery(&f.h, "p73-fresh", "p73-recipient", "p73-recipient-turn").await;
+    delivery(
+        &f.h,
+        "frozen-fresh",
+        "frozen-recipient",
+        "frozen-recipient-turn",
+    )
+    .await;
     expire_and_sweep(&f).await;
     let denied = authenticated_test_member_collaborator();
     assert!(
-        capture_current(&f, "p73-recipient", "p73-recipient-turn", &denied)
+        capture_current(&f, "frozen-recipient", "frozen-recipient-turn", &denied)
             .await
             .is_err(),
         "permanent historical evidence cannot grant current thread read"
@@ -1013,13 +1032,19 @@ async fn missing_fresh_ack_does_not_forward_permanent_historical_import() {
     let f = fixture().await;
     materialize(
         &f.h,
-        "p73-recipient",
-        "p73-recipient-turn",
+        "frozen-recipient",
+        "frozen-recipient-turn",
         "recipient",
         true,
     )
     .await;
-    let ack = delivery(&f.h, "p73-fresh", "p73-recipient", "p73-recipient-turn").await;
+    let ack = delivery(
+        &f.h,
+        "frozen-fresh",
+        "frozen-recipient",
+        "frozen-recipient-turn",
+    )
+    .await;
     expire_and_sweep(&f).await;
     f.h.crud_store
         .database_connection()
@@ -1032,8 +1057,8 @@ async fn missing_fresh_ack_does_not_forward_permanent_historical_import() {
         .unwrap();
     let prepared = capture_current(
         &f,
-        "p73-recipient",
-        "p73-recipient-turn",
+        "frozen-recipient",
+        "frozen-recipient-turn",
         &authenticated_test_superuser(),
     )
     .await
@@ -1042,13 +1067,17 @@ async fn missing_fresh_ack_does_not_forward_permanent_historical_import() {
         f.h.crud_store
             .compaction_frozen_import_page(
                 &f.h.workspace_id,
-                "p73-recipient",
+                "frozen-recipient",
                 &prepared.descriptor.manifest_id,
                 0,
             )
             .await
             .unwrap();
-    assert!(imports.iter().all(|proof| proof.delivery_id != "p73-fresh"));
+    assert!(
+        imports
+            .iter()
+            .all(|proof| proof.delivery_id != "frozen-fresh")
+    );
     assert!(
         !prepared.messages.iter().any(|message| message
             .provenance
@@ -1062,13 +1091,19 @@ async fn obsolete_retained_raw_source_blocks_fresh_delivery_checkpoint_import() 
     let f = fixture().await;
     materialize(
         &f.h,
-        "p73-recipient",
-        "p73-recipient-turn",
+        "frozen-recipient",
+        "frozen-recipient-turn",
         "recipient",
         true,
     )
     .await;
-    delivery(&f.h, "p73-fresh", "p73-recipient", "p73-recipient-turn").await;
+    delivery(
+        &f.h,
+        "frozen-fresh",
+        "frozen-recipient",
+        "frozen-recipient-turn",
+    )
+    .await;
     expire_and_sweep(&f).await;
     // Terminal materialization is idempotent. Edit the actual retained event,
     // then prove that its old reference became obsolete before capture.
@@ -1076,7 +1111,7 @@ async fn obsolete_retained_raw_source_blocks_fresh_delivery_checkpoint_import() 
         f.h.crud_store
             .compaction_frozen_history_page(
                 &f.h.workspace_id,
-                "p73-source",
+                "frozen-source",
                 &f.output.history.manifest_id,
                 0,
             )
@@ -1123,7 +1158,7 @@ async fn obsolete_retained_raw_source_blocks_fresh_delivery_checkpoint_import() 
         !f.h.crud_store
             .compaction_sources_current(
                 &f.h.workspace_id,
-                "p73-source",
+                "frozen-source",
                 std::slice::from_ref(source)
             )
             .await
@@ -1132,8 +1167,8 @@ async fn obsolete_retained_raw_source_blocks_fresh_delivery_checkpoint_import() 
     assert!(
         capture_current(
             &f,
-            "p73-recipient",
-            "p73-recipient-turn",
+            "frozen-recipient",
+            "frozen-recipient-turn",
             &authenticated_test_superuser()
         )
         .await
@@ -1144,8 +1179,8 @@ async fn obsolete_retained_raw_source_blocks_fresh_delivery_checkpoint_import() 
     // to remain current; this is a separate production-entry contract.
     let own = capture_current(
         &f,
-        "p73-source",
-        "p73-source-turn",
+        "frozen-source",
+        "frozen-source-turn",
         &authenticated_test_superuser(),
     )
     .await
@@ -1153,7 +1188,7 @@ async fn obsolete_retained_raw_source_blocks_fresh_delivery_checkpoint_import() 
     assert!(
         own.messages
             .iter()
-            .any(|message| message.content.contains("P73 PERMANENT SUMMARY"))
+            .any(|message| message.content.contains("FROZEN PERMANENT SUMMARY"))
     );
 }
 
@@ -1163,8 +1198,8 @@ async fn larger_checkpoint_closure_does_not_expand_one_retained_output_grant() {
     let f = fixture().await;
     materialize(
         &f.h,
-        "p73-source",
-        "p73-extra",
+        "frozen-source",
+        "frozen-extra",
         "outside retained grant",
         true,
     )
@@ -1173,8 +1208,8 @@ async fn larger_checkpoint_closure_does_not_expand_one_retained_output_grant() {
         f.h.crud_store
             .compaction_source_page(
                 &f.h.workspace_id,
-                "p73-source",
-                "p73-extra",
+                "frozen-source",
+                "frozen-extra",
                 PagedSource::Event,
                 0,
             )
@@ -1182,7 +1217,7 @@ async fn larger_checkpoint_closure_does_not_expand_one_retained_output_grant() {
             .unwrap()
             .entries
             .into_iter()
-            .find(|row| row.item_id.as_deref() == Some("p73-extra-answer"))
+            .find(|row| row.item_id.as_deref() == Some("frozen-extra-answer"))
             .unwrap();
     let assertion = SourceAssertion {
         revision: Some(
@@ -1195,7 +1230,7 @@ async fn larger_checkpoint_closure_does_not_expand_one_retained_output_grant() {
                 .unwrap(),
         ),
         kind: CanonicalSource::Event,
-        turn_id: "p73-extra".into(),
+        turn_id: "frozen-extra".into(),
         id: event.reference.id.clone(),
         payload: event.payload.unwrap(),
     };
@@ -1206,13 +1241,13 @@ async fn larger_checkpoint_closure_does_not_expand_one_retained_output_grant() {
         effort: None,
     };
     let operation = OperationSnapshot {
-        id: "p73-larger-op".into(),
-        owner: crate::compaction::native_owner(&f.h.workspace_id, "p73-source"),
+        id: "frozen-larger-op".into(),
+        owner: crate::compaction::native_owner(&f.h.workspace_id, "frozen-source"),
         expected_checkpoint: Some(f.checkpoint.clone()),
         projection_version: f
             .h
             .crud_store
-            .compaction_projection_version(&f.h.workspace_id, "p73-source")
+            .compaction_projection_version(&f.h.workspace_id, "frozen-source")
             .await
             .unwrap(),
         source_epochs: std::collections::BTreeMap::new(),
@@ -1233,11 +1268,11 @@ async fn larger_checkpoint_closure_does_not_expand_one_retained_output_grant() {
         },
     };
     f.h.crud_store
-        .compaction_admit(&f.h.workspace_id, "p73-source", &operation)
+        .compaction_admit(&f.h.workspace_id, "frozen-source", &operation)
         .await
         .unwrap();
     let larger = pioneer_compaction::Checkpoint {
-        id: "p73-larger".into(),
+        id: "frozen-larger".into(),
         operation_id: operation.id.clone(),
         owner: operation.owner.clone(),
         previous: Some(f.checkpoint.clone()),
@@ -1260,18 +1295,24 @@ async fn larger_checkpoint_closure_does_not_expand_one_retained_output_grant() {
     );
     materialize(
         &f.h,
-        "p73-recipient",
-        "p73-recipient-turn",
+        "frozen-recipient",
+        "frozen-recipient-turn",
         "recipient",
         true,
     )
     .await;
-    delivery(&f.h, "p73-fresh", "p73-recipient", "p73-recipient-turn").await;
+    delivery(
+        &f.h,
+        "frozen-fresh",
+        "frozen-recipient",
+        "frozen-recipient-turn",
+    )
+    .await;
     expire_and_sweep(&f).await;
     let prepared = capture_current(
         &f,
-        "p73-recipient",
-        "p73-recipient-turn",
+        "frozen-recipient",
+        "frozen-recipient-turn",
         &authenticated_test_superuser(),
     )
     .await
@@ -1280,7 +1321,7 @@ async fn larger_checkpoint_closure_does_not_expand_one_retained_output_grant() {
         f.h.crud_store
             .compaction_frozen_history_page(
                 &f.h.workspace_id,
-                "p73-recipient",
+                "frozen-recipient",
                 &prepared.descriptor.manifest_id,
                 0,
             )
@@ -1376,7 +1417,7 @@ async fn commit_current(
 async fn aggregate_large_checkpoint_keeps_nonempty_imports_through_legacy_backfill_publication_and_expired_reader()
  {
     for legacy in [false, true] {
-        let f = fixture_with_correction(CorrectionFixture::Aggregate { legacy }).await;
+        let f = fixture_with_mode(FixtureMode::Aggregate { legacy }).await;
         let db = f.h.crud_store.database_connection();
         for sql in [
             "SELECT sum(length(CAST(source_scope AS BLOB))+length(CAST(source_id AS BLOB))+length(CAST(source_version AS BLOB))) AS bytes FROM compaction_coverage WHERE checkpoint_id=?1",
@@ -1410,21 +1451,28 @@ async fn aggregate_large_checkpoint_keeps_nonempty_imports_through_legacy_backfi
                 .unwrap();
         assert_eq!(before.coverage, after.coverage);
         assert_eq!(before.event_input_evidence, after.event_input_evidence);
-        materialize(&f.h, "p73-source", "p73-large-tail", "P73 LARGE TAIL", true).await;
+        materialize(
+            &f.h,
+            "frozen-source",
+            "frozen-large-tail",
+            "FROZEN LARGE TAIL",
+            true,
+        )
+        .await;
         let prepared = capture_current(
             &f,
-            "p73-source",
-            "p73-large-tail",
+            "frozen-source",
+            "frozen-large-tail",
             &authenticated_test_superuser(),
         )
         .await
         .unwrap();
-        commit_current(&f, "p73-source", "p73-large-tail", &prepared).await;
+        commit_current(&f, "frozen-source", "frozen-large-tail", &prepared).await;
         assert!(
             prepared
                 .messages
                 .iter()
-                .any(|m| m.content.contains("P73 PERMANENT SUMMARY"))
+                .any(|m| m.content.contains("FROZEN PERMANENT SUMMARY"))
         );
         assert_ne!(prepared.descriptor.manifest_id, f.origin.manifest_id);
     }
@@ -1433,13 +1481,13 @@ async fn aggregate_large_checkpoint_keeps_nonempty_imports_through_legacy_backfi
 async fn selected_import_understated_retained_output_direct_and_shared_fails_before_payload_seal_and_publication()
  {
     for shared in [false, true] {
-        let _ = fixture_with_correction(CorrectionFixture::UnderstatedOutput { shared }).await;
+        let _ = fixture_with_mode(FixtureMode::UnderstatedOutput { shared }).await;
     }
 }
 
 #[tokio::test]
 async fn automatic_frozen_worker_restart_prepares_legacy_proofs_expires_and_sweeps_with_fk_off() {
-    let f = fixture_with_correction(CorrectionFixture::WorkerLegacy).await;
+    let f = fixture_with_mode(FixtureMode::WorkerLegacy).await;
     // Real timers let SQLite's external worker finish: a paused runtime can
     // auto-advance to pool timeouts while a database request is in flight.
     let db = f.h.crud_store.database_connection();
@@ -1526,7 +1574,7 @@ async fn automatic_frozen_worker_restart_prepares_legacy_proofs_expires_and_swee
         !f.h.crud_store
             .compaction_frozen_history_page(
                 &f.h.workspace_id,
-                "p73-source",
+                "frozen-source",
                 &f.output.history.manifest_id,
                 0
             )

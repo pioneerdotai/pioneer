@@ -81752,5 +81752,5 @@ fn native_cancellation_race_fallback_preserves_materialization_error_and_require
 #[path = "tests/task_start_failure.rs"]
 mod task_start_failure;
 
-#[path = "tests/proposal_73_frozen_lifetime.rs"]
-mod proposal_73_frozen_lifetime;
+#[path = "tests/frozen_history_lifetime.rs"]
+mod frozen_history_lifetime;

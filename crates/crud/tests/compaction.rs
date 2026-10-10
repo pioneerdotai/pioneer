@@ -8412,7 +8412,7 @@ async fn history_check_legacy_pages_discard_superseded_turns_and_make_progress()
     );
 }
 
-// proposal-73: written regressions, intentionally not executed before review.
+// Frozen history lifetime regressions.
 async fn checkpoint_proof_version(store: &CrudStore, id: &str) -> i64 {
     store
         .database_connection()
