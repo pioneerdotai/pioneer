@@ -2919,7 +2919,7 @@ mod tests {
             .connection
             .query_one_raw(Statement::from_string(
                 DbBackend::Sqlite,
-                "SELECT count(*) AS n FROM compaction_frozen_message_data".into(),
+                "SELECT count(*) AS n FROM compaction_frozen_message_data",
             ))
             .await
             .unwrap()

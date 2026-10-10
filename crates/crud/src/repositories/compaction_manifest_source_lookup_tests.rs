@@ -4217,8 +4217,7 @@ async fn actual_proof_seal_boundary_rejects_mutation_and_stop_but_allows_histori
             .db()
             .query_one_raw(Statement::from_string(
                 DbBackend::Sqlite,
-                "SELECT proof_version FROM compaction_checkpoint WHERE id='seal-stop-checkpoint'"
-                    .into(),
+                "SELECT proof_version FROM compaction_checkpoint WHERE id='seal-stop-checkpoint'",
             ))
             .await
             .unwrap()
@@ -4260,7 +4259,7 @@ async fn proof_seal_cancelled_preparation_and_marker_rollback_restart_exactly() 
             assert!(task.await.unwrap_err().is_cancelled());
             drop(hook);
         }
-        let marker:i64=f.db().query_one_raw(Statement::from_string(DbBackend::Sqlite,"SELECT proof_version FROM compaction_checkpoint WHERE id='seal-restart-checkpoint'".into())).await.unwrap().unwrap().try_get("","proof_version").unwrap();
+        let marker:i64=f.db().query_one_raw(Statement::from_string(DbBackend::Sqlite,"SELECT proof_version FROM compaction_checkpoint WHERE id='seal-restart-checkpoint'")).await.unwrap().unwrap().try_get("","proof_version").unwrap();
         assert_eq!(marker, 0);
         assert_eq!(f.store.compaction_head("root-owner").await.unwrap(), None);
         assert_eq!(
@@ -4509,8 +4508,7 @@ async fn prepared_unsealed_parent_edges_prevent_dependency_demotion_before_actua
         .db()
         .query_one_raw(Statement::from_string(
             DbBackend::Sqlite,
-            "SELECT proof_version FROM compaction_checkpoint WHERE id='seal-incoming-checkpoint'"
-                .into(),
+            "SELECT proof_version FROM compaction_checkpoint WHERE id='seal-incoming-checkpoint'",
         ))
         .await
         .unwrap()

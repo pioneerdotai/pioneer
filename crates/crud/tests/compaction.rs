@@ -5062,7 +5062,7 @@ async fn frozen_own_imports_require_exact_output_membership_and_atomic_publicati
     let pinned: String = db
         .query_one_raw(Statement::from_string(
             DbBackend::Sqlite,
-            "SELECT imports_sha256 FROM compaction_frozen_history WHERE id='assembled'".into(),
+            "SELECT imports_sha256 FROM compaction_frozen_history WHERE id='assembled'",
         ))
         .await
         .unwrap()
@@ -8585,7 +8585,7 @@ async fn legacy_large_raw_admission_and_coverage_are_paged_not_poisoned_by_aggre
     let row = db
         .query_one_raw(Statement::from_string(
             DbBackend::Sqlite,
-            "SELECT snapshot FROM compaction_operation WHERE id='raw-large-op'".into(),
+            "SELECT snapshot FROM compaction_operation WHERE id='raw-large-op'",
         ))
         .await
         .unwrap()
