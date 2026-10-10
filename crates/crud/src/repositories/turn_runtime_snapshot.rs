@@ -17,6 +17,7 @@ pub struct TurnRuntimeSnapshotRecord {
     pub provider_name: String,
     pub reasoning_effort: Option<String>,
     pub agent_skill_versions_json: Option<String>,
+    pub ordinary_skill_catalog_json: Option<String>,
     pub hook_runtime_context_json: String,
     pub workspace_skill_policies_json: String,
     pub input_json: String,
@@ -38,6 +39,7 @@ pub struct NewTurnRuntimeSnapshot {
     pub provider_name: String,
     pub reasoning_effort: Option<String>,
     pub agent_skill_versions_json: Option<String>,
+    pub ordinary_skill_catalog_json: Option<String>,
     pub hook_runtime_context_json: String,
     pub workspace_skill_policies_json: String,
     pub input_json: String,
@@ -70,6 +72,7 @@ impl NewTurnRuntimeSnapshot {
             &self.provider_name,
             self.reasoning_effort.as_deref().unwrap_or(""),
             self.agent_skill_versions_json.as_deref().unwrap_or(""),
+            self.ordinary_skill_catalog_json.as_deref().unwrap_or(""),
             &self.hook_runtime_context_json,
             &self.workspace_skill_policies_json,
             &self.input_json,
@@ -92,6 +95,7 @@ impl TurnRuntimeSnapshotRecord {
             &self.provider_name,
             self.reasoning_effort.as_deref().unwrap_or(""),
             self.agent_skill_versions_json.as_deref().unwrap_or(""),
+            self.ordinary_skill_catalog_json.as_deref().unwrap_or(""),
             &self.hook_runtime_context_json,
             &self.workspace_skill_policies_json,
             &self.input_json,
@@ -105,7 +109,7 @@ impl TurnRuntimeSnapshotRecord {
 
 // SQLite byte lengths are checked before a driver materializes TEXT columns.
 // Keep this exact stored-column set aligned with validate_storage_size above.
-const SNAPSHOT_STORAGE_BYTES_SQL: &str = "coalesce(length(cast(turn_id as blob)),0) + coalesce(length(cast(thread_id as blob)),0) + coalesce(length(cast(workspace_id as blob)),0) + coalesce(length(cast(mode_json as blob)),0) + coalesce(length(cast(model as blob)),0) + coalesce(length(cast(provider_name as blob)),0) + coalesce(length(cast(reasoning_effort as blob)),0) + coalesce(length(cast(agent_skill_versions_json as blob)),0) + coalesce(length(cast(hook_runtime_context_json as blob)),0) + coalesce(length(cast(workspace_skill_policies_json as blob)),0) + coalesce(length(cast(input_json as blob)),0) + coalesce(length(cast(capabilities_json as blob)),0) + coalesce(length(cast(resolved_artifacts_json as blob)),0) + coalesce(length(cast(runtime_environment_json as blob)),0) + coalesce(length(cast(history_json as blob)),0)";
+const SNAPSHOT_STORAGE_BYTES_SQL: &str = "coalesce(length(cast(turn_id as blob)),0) + coalesce(length(cast(thread_id as blob)),0) + coalesce(length(cast(workspace_id as blob)),0) + coalesce(length(cast(mode_json as blob)),0) + coalesce(length(cast(model as blob)),0) + coalesce(length(cast(provider_name as blob)),0) + coalesce(length(cast(reasoning_effort as blob)),0) + coalesce(length(cast(agent_skill_versions_json as blob)),0) + coalesce(length(cast(hook_runtime_context_json as blob)),0) + coalesce(length(cast(workspace_skill_policies_json as blob)),0) + coalesce(length(cast(input_json as blob)),0) + coalesce(length(cast(capabilities_json as blob)),0) + coalesce(length(cast(resolved_artifacts_json as blob)),0) + coalesce(length(cast(runtime_environment_json as blob)),0) + coalesce(length(cast(history_json as blob)),0) + coalesce(length(cast(ordinary_skill_catalog_json as blob)),0)";
 
 pub async fn upsert_turn_runtime_snapshot<C: ConnectionTrait>(
     db: &C,
@@ -121,6 +125,7 @@ pub async fn upsert_turn_runtime_snapshot<C: ConnectionTrait>(
         provider_name: Set(snapshot.provider_name),
         reasoning_effort: Set(snapshot.reasoning_effort),
         agent_skill_versions_json: Set(snapshot.agent_skill_versions_json),
+        ordinary_skill_catalog_json: Set(snapshot.ordinary_skill_catalog_json),
         hook_runtime_context_json: Set(snapshot.hook_runtime_context_json),
         workspace_skill_policies_json: Set(snapshot.workspace_skill_policies_json),
         input_json: Set(snapshot.input_json),
@@ -141,6 +146,7 @@ pub async fn upsert_turn_runtime_snapshot<C: ConnectionTrait>(
                 turn_runtime_snapshot::Column::ProviderName,
                 turn_runtime_snapshot::Column::ReasoningEffort,
                 turn_runtime_snapshot::Column::AgentSkillVersionsJson,
+                turn_runtime_snapshot::Column::OrdinarySkillCatalogJson,
                 turn_runtime_snapshot::Column::HookRuntimeContextJson,
                 turn_runtime_snapshot::Column::WorkspaceSkillPoliciesJson,
                 turn_runtime_snapshot::Column::InputJson,
@@ -259,6 +265,7 @@ fn record_from_model(model: turn_runtime_snapshot::Model) -> TurnRuntimeSnapshot
         provider_name: model.provider_name,
         reasoning_effort: model.reasoning_effort,
         agent_skill_versions_json: model.agent_skill_versions_json,
+        ordinary_skill_catalog_json: model.ordinary_skill_catalog_json,
         hook_runtime_context_json: model.hook_runtime_context_json,
         workspace_skill_policies_json: model.workspace_skill_policies_json,
         input_json: model.input_json,

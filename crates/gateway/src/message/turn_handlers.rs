@@ -3131,6 +3131,7 @@ impl MessageProcessor {
                 &runtime_environment,
                 history.as_slice(),
                 &mut agent_skill_overlay,
+                &skill_catalog,
             )
             .await;
         if let Err(error) = snapshot_result {
@@ -3428,6 +3429,7 @@ impl MessageProcessor {
             &runtime_environment,
             history.as_slice(),
             &mut agent_skill_overlay,
+            &skill_catalog,
         )
         .await
         .map_err(|error| format!("failed to persist child runtime snapshot: {error:#}"))?;

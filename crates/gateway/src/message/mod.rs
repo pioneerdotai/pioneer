@@ -4162,6 +4162,7 @@ impl MessageProcessor {
         runtime_environment: &HashMap<String, String>,
         history: &[ChatMessage],
         agent_skill_overlay: &[pioneer_skills::AgentSkillRuntimeEntry],
+        skill_catalog: &pioneer_skills::SkillCatalogSnapshot,
     ) -> anyhow::Result<()> {
         let canonical = history.iter().all(|message| message.provenance.is_some());
         let mut snapshot = crate::turn_runtime_snapshot::new_turn_runtime_snapshot(
@@ -4180,6 +4181,7 @@ impl MessageProcessor {
             runtime_environment,
             if canonical { &[] } else { history },
             agent_skill_overlay,
+            skill_catalog,
         )?;
         if canonical {
             let allowed = crate::compaction::frozen::execution_history_scopes(
@@ -4232,6 +4234,7 @@ impl MessageProcessor {
         runtime_environment: &HashMap<String, String>,
         history: &[ChatMessage],
         agent_skill_overlay: &[pioneer_skills::AgentSkillRuntimeEntry],
+        skill_catalog: &pioneer_skills::SkillCatalogSnapshot,
     ) -> anyhow::Result<()> {
         self.persist_turn_runtime_snapshot(
             thread_id,
@@ -4249,6 +4252,7 @@ impl MessageProcessor {
             runtime_environment,
             history,
             agent_skill_overlay,
+            skill_catalog,
         )
         .await
     }

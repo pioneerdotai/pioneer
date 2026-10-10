@@ -157,6 +157,11 @@ async fn accepted_local_media_uses_exact_bytes_after_mutation_deletion_and_snaps
         &HashMap::new(),
         &restored_history,
         &[],
+        &pioneer_skills::SkillCatalogSnapshot {
+            version: 0,
+            generated_at_unix: 0,
+            skills: Vec::new(),
+        },
     )
     .unwrap();
     let durable: Vec<ResolvedArtifactInput> =

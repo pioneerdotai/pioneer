@@ -2693,6 +2693,7 @@ impl TaskAgentExecutor {
                 &runtime_environment,
                 history.as_slice(),
                 &mut agent_skill_overlay,
+                &skill_catalog,
             )
             .await
         {
@@ -3708,6 +3709,7 @@ impl TaskAgentExecutor {
                 &runtime_environment,
                 history.as_slice(),
                 &mut agent_skill_overlay,
+                &skill_catalog,
             )
             .await
         {
@@ -4276,35 +4278,6 @@ impl TaskAgentExecutor {
                 .await
                 .context("failed to mark restored task run execution running")?;
         }
-        let workspace_skill_policies =
-            load_workspace_skill_policies(processor, task.workspace_id.as_str())
-                .await
-                .context("failed to load restored task workspace skill policies")?;
-        let skill_catalog = processor
-            .validate_turn_skill_capabilities(
-                task.workspace_id.as_str(),
-                turn_outcome.materialization.capabilities.as_slice(),
-            )
-            .await
-            .map_err(|message| anyhow!(message))
-            .context("failed to validate restored task skill capabilities")?;
-        let resolved_artifacts = processor
-            .resolve_provider_artifact_inputs(
-                task.workspace_id.as_str(),
-                turn_outcome.materialization.input.as_slice(),
-            )
-            .await
-            .context("failed to resolve restored task artifact input for provider")?;
-        let runtime_environment = processor
-            .create_artifact_output_environment(
-                task.workspace_id.as_str(),
-                child_thread_id,
-                child_turn_id,
-            )
-            .await
-            .context("failed to prepare restored task artifact output directory")?
-            .into_iter()
-            .collect();
         let execution_checkpoint_context =
             load_execution_checkpoint_context_for_turn(processor, child_turn_id).await?;
         let runtime_snapshot = processor
@@ -4320,13 +4293,6 @@ impl TaskAgentExecutor {
         {
             bail!("restored task turn runtime identity does not match its authoritative snapshot");
         }
-        let (hook_runtime_context, history) =
-            crate::turn_runtime_snapshot::restored_conversation_scope_from_snapshot(
-                processor.crud_store.as_ref(),
-                &runtime_snapshot,
-            )
-            .await
-            .context("failed to restore frozen Task conversation scope")?;
         let agent_skill_overlay =
             crate::turn_runtime_snapshot::restore_agent_skill_overlay_from_snapshot(
                 processor.crud_store.as_ref(),
@@ -4340,23 +4306,33 @@ impl TaskAgentExecutor {
             .context("failed to resolve restored task permission profile")?;
         let runtime_security_snapshot =
             load_required_task_child_execution_security_snapshot(processor, child_turn_id).await?;
+        let restored = crate::turn_runtime_snapshot::restored_recovery_turn_request_from_snapshot(
+            processor.crud_store.as_ref(),
+            Some(processor.artifact_service.as_ref()),
+            &runtime_snapshot,
+            runtime_permission_profile.clone(),
+            runtime_security_snapshot.clone(),
+            agent_skill_overlay,
+        )
+        .await
+        .context("failed to restore exact accepted native Task inputs")?;
         processor
             .agent_manager
             .start_turn_with_hook_context_and_execution_checkpoint_permission_profile_security_snapshot_and_agent_skill_overlay(
                 child_thread_id,
                 child_turn_id,
                 ThreadMode::Agent,
-                hook_runtime_context,
+                restored.hook_runtime_context,
                 &restored_thread.model,
                 &restored_thread.model_provider,
-                workspace_skill_policies,
-                skill_catalog,
-                agent_skill_overlay,
-                turn_outcome.materialization.input,
-                turn_outcome.materialization.capabilities,
-                resolved_artifacts,
-                runtime_environment,
-                history,
+                restored.workspace_skill_policies,
+                restored.skill_catalog,
+                restored.agent_skill_overlay,
+                restored.input,
+                restored.capabilities,
+                restored.resolved_artifacts,
+                restored.runtime_environment,
+                restored.history,
                 execution_checkpoint_context,
                 runtime_permission_profile,
                 runtime_security_snapshot,
@@ -5906,6 +5882,7 @@ impl TaskAgentExecutor {
                 &runtime_environment,
                 history.as_slice(),
                 &mut agent_skill_overlay,
+                &skill_catalog,
             )
             .await
         {
@@ -7871,6 +7848,11 @@ mod prepared_snapshot_tests {
                 &std::collections::HashMap::new(),
                 &history,
                 &[],
+                &pioneer_skills::SkillCatalogSnapshot {
+                    version: 0,
+                    generated_at_unix: 0,
+                    skills: Vec::new(),
+                },
             )
             .await
             .unwrap();

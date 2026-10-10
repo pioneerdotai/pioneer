@@ -3215,37 +3215,9 @@ impl RecoveryCoordinator {
                     ));
                 }
             };
-        let skills_context =
-            match crate::message::skills::workspace::skills_runtime_context_from_config(
-                &self.tool_loop_config,
-                workspace_id.as_str(),
-            ) {
-                Ok(context) => context,
-                Err(error) => {
-                    return Ok(RestoredRecoveryTurnRequestLookup::Unavailable(
-                        RestoredRecoveryTurnUnavailable::SnapshotInvalid {
-                            error: format!("failed to resolve recovery skills context: {error:#}"),
-                        },
-                    ));
-                }
-            };
-        request.skill_catalog =
-            match crate::message::skills::workspace::load_skills_catalog_from_store(
-                self.crud_store.as_ref(),
-                workspace_id.as_str(),
-                &skills_context,
-            )
-            .await
-            {
-                Ok(catalog) => catalog,
-                Err(error) => {
-                    return Ok(RestoredRecoveryTurnRequestLookup::Unavailable(
-                        RestoredRecoveryTurnUnavailable::SnapshotInvalid {
-                            error: format!("failed to load recovery skill catalog: {error:#}"),
-                        },
-                    ));
-                }
-            };
+        // Ordinary skills are the exact catalog accepted in the runtime snapshot.
+        // Current authorization is revalidated by the existing continuation/tool
+        // owners; it cannot replace accepted content with the latest catalog.
         self.checkpoint_running_execution_window(
             workspace_id.as_str(),
             thread_id,
@@ -5116,9 +5088,10 @@ fn deterministic_jitter_secs(seed: &str, base_delay_secs: u64) -> u64 {
 mod tests {
     use super::{
         ProviderFailureCandidate, RecoveryCoordinator, RecoveryCoordinatorEvent,
-        RecoveryJobEnqueueOutcome, RecoveryPolicyRegistry, RetainedProviderHistoryRow,
-        RuntimeFailureCandidate, TURN_RECOVERY_MAX_WALL_CLOCK_SECS,
-        assemble_retained_provider_history, is_causal_recovery_progress, terminal_diagnostic,
+        RecoveryJobEnqueueOutcome, RecoveryPolicyRegistry, RestoredRecoveryTurnRequestLookup,
+        RestoredRecoveryTurnUnavailable, RetainedProviderHistoryRow, RuntimeFailureCandidate,
+        TURN_RECOVERY_MAX_WALL_CLOCK_SECS, assemble_retained_provider_history,
+        is_causal_recovery_progress, terminal_diagnostic,
     };
     use migration::{Migrator, MigratorTrait};
     use pioneer_agent::{
@@ -5149,9 +5122,8 @@ mod tests {
         build_execution_checkpoint_payload,
     };
     use pioneer_provider::{
-        CanonicalProviderRoundEnvelope, ChatMessage, InputContentType, MessageAttachment,
-        ProviderCallIdentity, ProviderRegistry, ProviderReplayState, ProviderTermination,
-        ProviderToolCall, providers::EchoProvider,
+        CanonicalProviderRoundEnvelope, ChatMessage, ProviderCallIdentity, ProviderRegistry,
+        ProviderReplayState, ProviderTermination, ProviderToolCall, providers::EchoProvider,
     };
     use pioneer_skills::{SkillPolicyKey, SkillTrustLevel};
     use pioneer_tools::{
@@ -6844,20 +6816,36 @@ mod tests {
                 allow_implicit_invocation: Some(false),
             },
         );
-        let capabilities = vec![TurnCapability {
-            id: format!("skill:{writer_skill_id}"),
-            kind: TurnCapabilityKind::Skill {
-                skill_id: writer_skill_id,
-                pack_id: None,
-            },
-            label: Some("Writer".to_owned()),
-        }];
-        let resolved_artifacts = vec![ResolvedArtifactInput {
-            artifact_id: "artifact_snapshot".to_owned(),
-            version_id: Some("version_snapshot".to_owned()),
-            content_type: InputContentType::File,
-            attachment: MessageAttachment::from_path("/tmp/snapshot.txt", "text/plain"),
-        }];
+        let capabilities = if crud_store
+            .find_skill_installation(&writer_skill_id)
+            .await
+            .unwrap()
+            .is_some()
+        {
+            vec![TurnCapability {
+                id: format!("skill:{writer_skill_id}"),
+                kind: TurnCapabilityKind::Skill {
+                    skill_id: writer_skill_id,
+                    pack_id: None,
+                },
+                label: Some("Writer".to_owned()),
+            }]
+        } else {
+            Vec::new()
+        };
+        let resolved_artifacts: Vec<ResolvedArtifactInput> = Vec::new();
+        let skills_context = crate::message::skills::workspace::skills_runtime_context_from_config(
+            &test_tool_loop_config(),
+            workspace_id,
+        )
+        .unwrap();
+        let accepted_catalog = crate::message::skills::workspace::load_skills_catalog_from_store(
+            crud_store,
+            workspace_id,
+            &skills_context,
+        )
+        .await
+        .unwrap();
         let runtime_environment = HashMap::from([(
             "PIONEER_ARTIFACT_OUTPUT_DIR".to_owned(),
             "/tmp/pioneer-snapshot-output".to_owned(),
@@ -6888,6 +6876,7 @@ mod tests {
             &runtime_environment,
             history.as_slice(),
             &[],
+            &accepted_catalog,
         )
         .expect("runtime snapshot should serialize");
         crud_store
@@ -7085,11 +7074,8 @@ mod tests {
             .expect("frozen SkillId should resolve without its former parent");
         assert_eq!(restored_skill.identity.owner.as_deref(), Some("tests"));
         assert_eq!(restored_skill.identity.slug, "writer");
-        assert_eq!(
-            restored_skill.instructions.body.trim(),
-            "Write with current content."
-        );
-        assert_eq!(restored.resolved_artifacts.len(), 1);
+        assert_eq!(restored_skill.instructions.body.trim(), "Write carefully.");
+        assert!(restored.resolved_artifacts.is_empty());
         assert_eq!(
             restored
                 .runtime_environment
@@ -7107,6 +7093,36 @@ mod tests {
             security_snapshot.sandbox.mode,
             TurnSandboxMode::WorkspaceWrite
         );
+        crud_store
+            .upsert_workspace_skill_policy(
+                &pioneer_crud::WorkspaceSkillPolicyRecord {
+                    id: "snapshot-skill-disabled".into(),
+                    workspace_id: workspace_id.into(),
+                    skill_id: restored_skill_id.clone(),
+                    enabled: Some(false),
+                    allow_implicit_invocation: None,
+                },
+                4,
+            )
+            .await
+            .unwrap();
+        let disabled = coordinator
+            .restored_recovery_turn_request(thread_id, turn_id, 1_700_000_001)
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                disabled,
+                RestoredRecoveryTurnRequestLookup::Unavailable(
+                    RestoredRecoveryTurnUnavailable::SnapshotInvalid { .. }
+                )
+            ),
+            "frozen content cannot override fresh disabling"
+        );
+        crud_store
+            .delete_workspace_skill_policy(workspace_id, &restored_skill_id)
+            .await
+            .unwrap();
         assert!(
             crud_store
                 .delete_skill_installation(&restored_skill_id)
@@ -7116,20 +7132,15 @@ mod tests {
         let restored_missing = coordinator
             .restored_recovery_turn_request(thread_id, turn_id, 1_700_000_001)
             .await
-            .expect("missing-skill recovery request should load")
-            .into_available()
-            .expect("runtime snapshot remains the authoritative identity set");
-        assert!(matches!(
-            &restored_missing.capabilities[0].kind,
-            TurnCapabilityKind::Skill { skill_id, .. } if skill_id == &restored_skill_id
-        ));
+            .expect("missing-skill lookup is explicit");
         assert!(
-            restored_missing
-                .skill_catalog
-                .skills
-                .iter()
-                .all(|skill| skill.identity.skill_id != restored_skill_id),
-            "removed frozen child must remain missing instead of being replaced"
+            matches!(
+                restored_missing,
+                RestoredRecoveryTurnRequestLookup::Unavailable(
+                    RestoredRecoveryTurnUnavailable::SnapshotInvalid { .. }
+                )
+            ),
+            "removed selected skill must stop recovery, never become an empty/latest catalog"
         );
         let _ = std::fs::remove_dir_all(skill_dir);
     }
@@ -8213,6 +8224,7 @@ mod tests {
                 provider_name: "echo".to_owned(),
                 reasoning_effort: None,
                 agent_skill_versions_json: None,
+                ordinary_skill_catalog_json: Some(r#"{"schema_version":1,"catalog":{"version":0,"generated_at_unix":0,"skills":[]}}"#.into()),
                 hook_runtime_context_json: "{}".to_owned(),
                 workspace_skill_policies_json: "[]".to_owned(),
                 input_json: "[]".to_owned(),

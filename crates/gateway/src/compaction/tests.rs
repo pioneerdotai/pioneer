@@ -10441,6 +10441,11 @@ async fn canonical_line_snapshot_keeps_completed_rounds_and_exact_ui_aliases() {
         &std::collections::HashMap::new(),
         &[],
         &[],
+        &pioneer_skills::SkillCatalogSnapshot {
+            version: 0,
+            generated_at_unix: 0,
+            skills: Vec::new(),
+        },
     )
     .unwrap();
     runtime.history_json = descriptor_json;
@@ -18621,6 +18626,11 @@ async fn history_capture_inherits_read_class_and_cancellation_releases_admission
         &std::collections::HashMap::new(),
         &[],
         &[],
+        &pioneer_skills::SkillCatalogSnapshot {
+            version: 0,
+            generated_at_unix: 0,
+            skills: Vec::new(),
+        },
     )
     .unwrap();
     runtime.history_json = history_json;

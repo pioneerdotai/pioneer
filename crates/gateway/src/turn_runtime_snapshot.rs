@@ -6,7 +6,7 @@ use pioneer_agent::{
 use pioneer_crud::{CrudStore, NewTurnRuntimeSnapshot, TurnRuntimeSnapshotRecord};
 use pioneer_protocol::ReasoningEffort;
 use pioneer_protocol::{
-    SkillId, ThreadMode, TurnCapability, TurnExecutionSecuritySnapshot,
+    SkillId, ThreadMode, TurnCapability, TurnCapabilityKind, TurnExecutionSecuritySnapshot,
     TurnPermissionProfileSnapshot, UserInput,
 };
 use pioneer_provider::{ChatMessage, ReasoningConfig};
@@ -62,12 +62,60 @@ fn serialize_canonical_artifact_locator<S: serde::Serializer>(
     serializer.collect_str(&Locator(id))
 }
 
+#[derive(Serialize)]
+struct StoredOrdinarySkillCatalog<'a> {
+    schema_version: u32,
+    catalog: &'a pioneer_skills::SkillCatalogSnapshot,
+}
+#[derive(Deserialize)]
+struct RestoredOrdinarySkillCatalog {
+    schema_version: u32,
+    catalog: pioneer_skills::SkillCatalogSnapshot,
+}
+fn validate_ordinary_skill_catalog(catalog: &pioneer_skills::SkillCatalogSnapshot) -> Result<()> {
+    anyhow::ensure!(
+        catalog.skills.len()
+            <= pioneer_protocol::TURN_EXECUTION_REQUEST_MAX_BYTES
+                / (pioneer_protocol::SKILL_ID_LEN + 2),
+        "ordinary skill catalog cardinality exceeds snapshot byte policy"
+    );
+    let mut ids = HashSet::new();
+    for skill in &catalog.skills {
+        anyhow::ensure!(
+            ids.insert(skill.identity.skill_id.as_str()),
+            "duplicate accepted ordinary skill identity"
+        );
+        anyhow::ensure!(
+            !skill.identity.fingerprint.is_empty()
+                && skill.identity.fingerprint.len() <= MAX_AGENT_SKILL_FINGERPRINT_CHARS,
+            "invalid accepted ordinary skill fingerprint"
+        );
+    }
+    Ok(())
+}
+fn restored_ordinary_skill_catalog(
+    snapshot: &TurnRuntimeSnapshotRecord,
+) -> Result<pioneer_skills::SkillCatalogSnapshot> {
+    let value = snapshot
+        .ordinary_skill_catalog_json
+        .as_deref()
+        .context("accepted ordinary skill catalog is unavailable in legacy snapshot")?;
+    let stored: RestoredOrdinarySkillCatalog = from_snapshot_json(value, "ordinary skill catalog")?;
+    anyhow::ensure!(
+        stored.schema_version == 1,
+        "unsupported ordinary skill catalog snapshot version"
+    );
+    validate_ordinary_skill_catalog(&stored.catalog)?;
+    Ok(stored.catalog)
+}
+
 /// Structural compatibility is separate from existence and fresh authorization.
 /// No DB access occurs here, so a decode rejection cannot hide a failed read.
 pub(crate) fn validate_runtime_snapshot_for_resume(
     snapshot: &TurnRuntimeSnapshotRecord,
 ) -> Result<()> {
     snapshot.validate_storage_size()?;
+    restored_ordinary_skill_catalog(snapshot)?;
     let _: ThreadMode = from_snapshot_json(&snapshot.mode_json, "thread mode")?;
     let _: AgentTurnHookRuntimeContext =
         from_snapshot_json(&snapshot.hook_runtime_context_json, "hook runtime context")?;
@@ -152,6 +200,7 @@ pub(crate) fn new_turn_runtime_snapshot(
     runtime_environment: &HashMap<String, String>,
     history: &[ChatMessage],
     agent_skill_overlay: &[AgentSkillRuntimeEntry],
+    skill_catalog: &pioneer_skills::SkillCatalogSnapshot,
 ) -> Result<NewTurnRuntimeSnapshot> {
     let limit = pioneer_protocol::TURN_EXECUTION_REQUEST_MAX_BYTES;
     let mut remaining = limit;
@@ -214,6 +263,15 @@ pub(crate) fn new_turn_runtime_snapshot(
     validate_execution_capabilities(capabilities)?;
     let capabilities_json =
         to_snapshot_json_bounded(capabilities, "turn capabilities", &mut remaining)?;
+    validate_ordinary_skill_catalog(skill_catalog)?;
+    let ordinary_skill_catalog_json = Some(to_snapshot_json_bounded(
+        &StoredOrdinarySkillCatalog {
+            schema_version: 1,
+            catalog: skill_catalog,
+        },
+        "ordinary skill catalog",
+        &mut remaining,
+    )?);
     let now = chrono::Utc::now().fixed_offset();
     Ok(NewTurnRuntimeSnapshot {
         turn_id: turn_id.to_owned(),
@@ -224,6 +282,7 @@ pub(crate) fn new_turn_runtime_snapshot(
         provider_name: provider_name.to_owned(),
         reasoning_effort: reasoning_effort.map(str::to_owned),
         agent_skill_versions_json,
+        ordinary_skill_catalog_json,
         hook_runtime_context_json: to_snapshot_json_bounded(
             hook_runtime_context,
             "hook runtime context",
@@ -586,6 +645,50 @@ pub(crate) async fn restored_recovery_turn_request_from_snapshot(
     snapshot.validate_storage_size()?;
     let (hook_runtime_context, history) =
         restored_conversation_scope_from_snapshot(store, snapshot).await?;
+    let skill_catalog = restored_ordinary_skill_catalog(snapshot)?;
+    let capabilities = restored_execution_capabilities(&snapshot.capabilities_json)?;
+    for capability in &capabilities {
+        let TurnCapabilityKind::Skill { skill_id, .. } = &capability.kind else {
+            continue;
+        };
+        if agent_skill_overlay
+            .iter()
+            .any(|skill| &skill.skill_id == skill_id)
+        {
+            continue;
+        }
+        let skill = skill_catalog
+            .skills
+            .iter()
+            .find(|skill| &skill.identity.skill_id == skill_id)
+            .context("selected ordinary skill is absent from accepted snapshot")?;
+        anyhow::ensure!(
+            skill.is_available(),
+            "accepted selected ordinary skill is unavailable"
+        );
+        if !matches!(
+            skill.identity.source_kind,
+            pioneer_skills::SkillSourceKind::System
+        ) {
+            let current = store
+                .find_skill_installation(skill_id)
+                .await?
+                .context("selected ordinary skill was removed since admission")?;
+            anyhow::ensure!(
+                current.scope_key == snapshot.workspace_id,
+                "selected ordinary skill scope was revoked"
+            );
+        }
+        if let Some(policy) = store
+            .find_workspace_skill_policy(&snapshot.workspace_id, skill_id)
+            .await?
+        {
+            anyhow::ensure!(
+                policy.enabled != Some(false),
+                "selected ordinary skill use was disabled since admission"
+            );
+        }
+    }
     let input: Vec<UserInput> = from_snapshot_json(&snapshot.input_json, "turn input")?;
     let (resolved_artifacts, history) = if let Some(artifacts) = artifacts {
         let fresh =
@@ -652,14 +755,10 @@ pub(crate) async fn restored_recovery_turn_request_from_snapshot(
         workspace_skill_policies: restore_workspace_skill_policies(
             &snapshot.workspace_skill_policies_json,
         )?,
-        skill_catalog: pioneer_skills::SkillCatalogSnapshot {
-            version: 0,
-            generated_at_unix: 0,
-            skills: Vec::new(),
-        },
+        skill_catalog,
         agent_skill_overlay,
         input,
-        capabilities: restored_execution_capabilities(&snapshot.capabilities_json)?,
+        capabilities,
         resolved_artifacts,
         runtime_environment: from_snapshot_json(
             &snapshot.runtime_environment_json,
@@ -989,7 +1088,9 @@ mod tests {
     const VERSION_ONE: &str = "111111111111111111111";
     const VERSION_TWO: &str = "222222222222222222222";
 
-    fn runtime_snapshot(agent_skill_versions_json: Option<String>) -> TurnRuntimeSnapshotRecord {
+    pub(super) fn runtime_snapshot(
+        agent_skill_versions_json: Option<String>,
+    ) -> TurnRuntimeSnapshotRecord {
         let now = chrono::Utc::now().fixed_offset();
         TurnRuntimeSnapshotRecord {
             turn_id: "turn_pinned_snapshot".to_owned(),
@@ -1000,6 +1101,10 @@ mod tests {
             provider_name: "provider".to_owned(),
             reasoning_effort: None,
             agent_skill_versions_json,
+            ordinary_skill_catalog_json: Some(
+                r#"{"schema_version":1,"catalog":{"version":0,"generated_at_unix":0,"skills":[]}}"#
+                    .into(),
+            ),
             hook_runtime_context_json: "{}".to_owned(),
             workspace_skill_policies_json: "[]".to_owned(),
             input_json: "[]".to_owned(),
@@ -1275,6 +1380,11 @@ mod r05_snapshot_bounds_tests {
                 environment,
                 &[],
                 &[],
+                &pioneer_skills::SkillCatalogSnapshot {
+                    version: 0,
+                    generated_at_unix: 0,
+                    skills: Vec::new(),
+                },
             )
         };
         let snapshot = make(&HashMap::new()).unwrap();
@@ -1302,5 +1412,108 @@ mod r05_snapshot_bounds_tests {
         assert!(!format!("{error:#?}").contains("SECRET"));
         let error = from_snapshot_json::<Vec<String>>("\"SECRET\"", "legacy fixture").unwrap_err();
         assert!(!format!("{error:#?}").contains("SECRET"));
+    }
+}
+
+#[cfg(test)]
+mod r05_ordinary_catalog_tests {
+    use super::*;
+    fn catalog() -> pioneer_skills::SkillCatalogSnapshot {
+        use pioneer_skills::*;
+        let skill = compile_skill_definition(compile::CompileSkillInput {
+            skill_id: pioneer_protocol::SkillId::new("SSSSSSSSSSSSSSSSSSSSS").unwrap(),
+            owner: Some("fixture".into()),
+            slug: "writer".into(),
+            name: "Writer".into(),
+            display_name: "Writer".into(),
+            description: "accepted description".into(),
+            body: "accepted body".into(),
+            source_kind: SkillSourceKind::User,
+            source_root: "/old/root".into(),
+            skill_dir: "/old/root/writer".into(),
+            skill_file: "/old/root/writer/SKILL.md".into(),
+            version_hint: Some("1".into()),
+            fingerprint: "accepted-fingerprint".into(),
+            user_invocable: true,
+            disable_model_invocation: false,
+            paths: Vec::new(),
+            allowed_tools: Vec::new(),
+            runtime_tools: Vec::new(),
+            trust_level: SkillTrustLevel::Verified,
+            dependencies: SkillDependencies::default(),
+            license: None,
+            compatibility: None,
+            metadata_raw: serde_json::json!({}),
+            conformance: validation::SkillConformanceReport::default(),
+        });
+        SkillCatalogSnapshot {
+            version: 41,
+            generated_at_unix: 1700000000,
+            skills: vec![skill],
+        }
+    }
+    #[test]
+    fn ordinary_catalog_restores_exact_accepted_body_identity_and_revision() {
+        let mut admitted = catalog();
+        let mut snapshot = tests::runtime_snapshot(None);
+        snapshot.ordinary_skill_catalog_json = Some(
+            to_snapshot_json(
+                &StoredOrdinarySkillCatalog {
+                    schema_version: 1,
+                    catalog: &admitted,
+                },
+                "ordinary skill catalog",
+            )
+            .unwrap(),
+        );
+        let expected = serde_json::to_value(&admitted).unwrap();
+        admitted.version = 42;
+        admitted.skills[0].instructions.body = "changed body".into();
+        admitted.skills[0].identity.fingerprint = "changed-fingerprint".into();
+        admitted.skills[0].identity.skill_dir = "/changed/root/writer".into();
+        let restored = restored_ordinary_skill_catalog(&snapshot).unwrap();
+        assert_eq!(serde_json::to_value(restored).unwrap(), expected);
+        admitted.skills.clear();
+        assert_eq!(
+            restored_ordinary_skill_catalog(&snapshot).unwrap().skills[0]
+                .instructions
+                .body,
+            "accepted body"
+        );
+    }
+    #[test]
+    fn ordinary_catalog_missing_unknown_duplicate_and_oversized_are_explicit_errors() {
+        let mut snapshot = tests::runtime_snapshot(None);
+        snapshot.ordinary_skill_catalog_json = None;
+        assert!(restored_ordinary_skill_catalog(&snapshot).is_err());
+        let mut admitted = catalog();
+        snapshot.ordinary_skill_catalog_json = Some(
+            to_snapshot_json(
+                &StoredOrdinarySkillCatalog {
+                    schema_version: 99,
+                    catalog: &admitted,
+                },
+                "ordinary skill catalog",
+            )
+            .unwrap(),
+        );
+        assert!(restored_ordinary_skill_catalog(&snapshot).is_err());
+        admitted.skills.push(admitted.skills[0].clone());
+        assert!(validate_ordinary_skill_catalog(&admitted).is_err());
+        admitted.skills.pop();
+        admitted.skills[0].instructions.body =
+            "x".repeat(pioneer_protocol::TURN_EXECUTION_REQUEST_MAX_BYTES);
+        let mut remaining = pioneer_protocol::TURN_EXECUTION_REQUEST_MAX_BYTES;
+        assert!(
+            to_snapshot_json_bounded(
+                &StoredOrdinarySkillCatalog {
+                    schema_version: 1,
+                    catalog: &admitted
+                },
+                "ordinary skill catalog",
+                &mut remaining
+            )
+            .is_err()
+        );
     }
 }

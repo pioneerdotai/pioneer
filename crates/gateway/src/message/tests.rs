@@ -30660,6 +30660,10 @@ async fn legacy_cli_input_mapping_cannot_prove_a_later_message_edit_impl() {
             provider_name: "cli_runtime:codex".to_owned(),
             reasoning_effort: None,
             agent_skill_versions_json: None,
+            ordinary_skill_catalog_json: Some(
+                r#"{"schema_version":1,"catalog":{"version":0,"generated_at_unix":0,"skills":[]}}"#
+                    .into(),
+            ),
             hook_runtime_context_json: "{}".to_owned(),
             workspace_skill_policies_json: "[]".to_owned(),
             input_json: r#"[{"type":"text","text":"ORIGINAL LEGACY INPUT","textElements":[]}]"#
@@ -55024,6 +55028,11 @@ async fn agent_skill_snapshot_failure_preserves_overlay_and_retries_identical_pa
             &runtime_environment,
             &[],
             &mut overlay,
+            &pioneer_skills::SkillCatalogSnapshot {
+                version: 0,
+                generated_at_unix: 0,
+                skills: Vec::new(),
+            },
         )
         .await
         .expect_err("required Agent pin persistence failure must abort preparation");
@@ -55061,6 +55070,11 @@ async fn agent_skill_snapshot_failure_preserves_overlay_and_retries_identical_pa
             &runtime_environment,
             &[],
             &mut overlay,
+            &pioneer_skills::SkillCatalogSnapshot {
+                version: 0,
+                generated_at_unix: 0,
+                skills: Vec::new(),
+            },
         )
         .await
         .expect("same payload may be retried after the transient storage fault clears");
@@ -55134,6 +55148,11 @@ async fn persist_agent_skill_snapshot_for_resolution_tests(
             &runtime_environment,
             &[],
             &mut overlay,
+            &pioneer_skills::SkillCatalogSnapshot {
+                version: 0,
+                generated_at_unix: 0,
+                skills: Vec::new(),
+            },
         )
         .await
         .expect("Agent skill snapshot fixture must persist");
@@ -74902,6 +74921,11 @@ async fn compaction_failed_partial_writer_preserves_event_but_excludes_observati
             &std::collections::HashMap::new(),
             &history,
             &[],
+            &pioneer_skills::SkillCatalogSnapshot {
+                version: 0,
+                generated_at_unix: 0,
+                skills: Vec::new(),
+            },
         )
         .await
         .unwrap();

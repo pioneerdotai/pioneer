@@ -41716,6 +41716,7 @@ mod tests {
                 r#"[{"skill_id":"AAAAAAAAAAAAAAAAAAAAA","version_id":"111111111111111111111","fingerprint":"fingerprint-a"}]"#
                     .to_owned(),
             ),
+            ordinary_skill_catalog_json: Some(r#"{"schema_version":1,"catalog":{"version":0,"generated_at_unix":0,"skills":[]}}"#.into()),
             hook_runtime_context_json: r#"{"mode":"agent","actor_kind":"agent"}"#.to_owned(),
             workspace_skill_policies_json: "[]".to_owned(),
             input_json: r#"[{"type":"text","text":"hello","textElements":[]}]"#.to_owned(),
@@ -41910,6 +41911,7 @@ mod tests {
                     provider_name: "provider-a".to_owned(),
                     reasoning_effort: None,
                     agent_skill_versions_json: None,
+                    ordinary_skill_catalog_json: Some(r#"{"schema_version":1,"catalog":{"version":0,"generated_at_unix":0,"skills":[]}}"#.into()),
                     hook_runtime_context_json: r#"{"mode":"agent","actor_kind":"agent"}"#
                         .to_owned(),
                     workspace_skill_policies_json: "[]".to_owned(),

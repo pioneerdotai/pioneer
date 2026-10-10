@@ -14,6 +14,7 @@ async fn snapshot_write_and_physical_read_reject_aggregate_oversize_instead_of_m
         provider_name: "fixture".into(),
         reasoning_effort: None,
         agent_skill_versions_json: None,
+        ordinary_skill_catalog_json: None,
         hook_runtime_context_json: "{}".into(),
         workspace_skill_policies_json: "[]".into(),
         input_json: "[]".into(),
