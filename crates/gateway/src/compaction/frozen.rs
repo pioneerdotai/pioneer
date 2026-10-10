@@ -3119,6 +3119,46 @@ pub(crate) async fn validate_direct_history_sources_current(
     validate_direct_source_groups_current(store, workspace, direct_sources).await
 }
 
+/// Conservative turn identities represented by an already sent projection.
+/// A checkpoint is atomic for current-source validation, but its historical
+/// coverage still prevents claiming that a covered Message was never sent.
+/// Read metadata for these exact roots only, without restoring any payload.
+pub(crate) async fn provider_history_source_turns(
+    store: &CrudStore,
+    workspace: &str,
+    sources: &[(String, pioneer_compaction::SourceRef)],
+) -> Result<Option<BTreeSet<(String, String)>>> {
+    let mut turns = BTreeSet::new();
+    let mut checkpoints = super::coverage::CheckpointGraphResolver::default();
+    for (thread, source) in sources {
+        if source.scope.starts_with("checkpoint:") {
+            let Some(graph) = checkpoints.resolve(store, workspace, None, source).await? else {
+                return Ok(None);
+            };
+            for covered in graph
+                .leaves
+                .iter()
+                .chain(graph.replay_aliases.keys())
+                .chain(graph.replay_aliases.values())
+                .chain(graph.ambiguous_input_aliases.iter())
+            {
+                let Some(turn) =
+                    accepted_source_turn(std::iter::once(covered.source.scope.as_str()))
+                else {
+                    return Ok(None);
+                };
+                turns.insert((covered.thread.clone(), turn));
+            }
+        } else {
+            let Some(turn) = accepted_source_turn(std::iter::once(source.scope.as_str())) else {
+                return Ok(None);
+            };
+            turns.insert((thread.clone(), turn));
+        }
+    }
+    Ok(Some(turns))
+}
+
 async fn validate_direct_source_groups_current(
     store: &CrudStore,
     workspace: &str,

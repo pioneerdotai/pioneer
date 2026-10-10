@@ -28679,6 +28679,13 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_i
                     .contains(history_marker.as_str()),
                 "a provider-owned parent conversation must not receive its old history again"
             );
+            assert!(
+                !next_start
+                    .input
+                    .to_string()
+                    .contains("UNSENT DELETED MESSAGE MUST NOT REACH PROVIDER"),
+                "the deleted Message must not alter the provider context"
+            );
             complete_recorded_cli_task_turn(
                 &processor,
                 cli_session.as_ref(),
@@ -28706,6 +28713,44 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_i
                 .unwrap()
                 .unwrap();
             assert_eq!(binding.continuation_thread_id, parent_thread_id);
+            if composer_index == 2 {
+                // A deleted, never-dispatched parent Message must reveal this
+                // completed Composer occurrence and its child CLI source.
+                // The next iteration checks the same provider session and
+                // both existing admission/pre-dispatch basis validations.
+                let deleted_message = format!("unsent_{runtime_id}_message");
+                seed_completed_task_parent_with_history(
+                    &processor,
+                    &workspace_id,
+                    &parent_thread_id,
+                    &deleted_message,
+                    "UNSENT DELETED MESSAGE MUST NOT REACH PROVIDER",
+                )
+                .await;
+                crud_store
+                    .delete_turn_message(pioneer_crud::DeleteTurnMessageRequest {
+                        workspace_id: workspace_id.clone(),
+                        thread_id: parent_thread_id.clone(),
+                        turn_id: deleted_message.clone(),
+                        expected_revision: 0,
+                        changed_by: pioneer_protocol::PersistedActorRef::Principal(
+                            authenticated_test_superuser().principal_id.clone(),
+                        ),
+                        changed_at_unix: super::now_timestamp_secs(),
+                    })
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    crate::cli_runtime::thread_binding::previous_delivered_parent_turn(
+                        crud_store.as_ref(),
+                        &parent_thread_id,
+                        Some(deleted_message),
+                    )
+                    .await
+                    .unwrap(),
+                    Some(run.id.clone()),
+                );
+            }
         }
         open_persisted_child_for_test(
             &processor,

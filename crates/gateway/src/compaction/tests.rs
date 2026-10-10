@@ -5887,6 +5887,39 @@ async fn interrupted_execution_turn_fences_summary_commit_before_service_cancell
 }
 
 #[tokio::test]
+async fn cli_message_delivery_evidence_includes_historical_checkpoint_coverage() {
+    let f = fixture("covered Message history", vec![], true, false).await;
+    let CompactionExit::Applied(head) = f.runner.run(CancellationToken::new()).await.unwrap()
+    else {
+        panic!("checkpoint missing");
+    };
+    // The saved checkpoint remains valid after deletion of its covered turn.
+    // Its direct SourceRef does not name that turn; historical coverage does.
+    f.store.database_connection().execute_unprepared(
+        "UPDATE turn SET status='completed',send_mode='message',message_revision=1,message_deleted_at=CURRENT_TIMESTAMP WHERE id='turn'",
+    ).await.unwrap();
+    f.store
+        .database_connection()
+        .execute_unprepared("DELETE FROM turn_event WHERE id='source'")
+        .await
+        .unwrap();
+    let root = f
+        .store
+        .compaction_checkpoint_source("ws", "thread", &head)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!root.scope.ends_with(":turn"));
+    let turns =
+        super::frozen::provider_history_source_turns(&f.store, "ws", &[("thread".into(), root)])
+            .await
+            .unwrap()
+            .unwrap();
+    assert!(turns.contains(&("thread".into(), "turn".into())));
+    assert!(!turns.contains(&("thread".into(), "later-unsent-message".into())));
+}
+
+#[tokio::test]
 async fn expected_head_does_not_force_a_projection_basis_after_historical_edit() {
     let f = fixture("old source", vec![], true, false).await;
     let CompactionExit::Applied(head) = f.runner.run(CancellationToken::new()).await.unwrap()

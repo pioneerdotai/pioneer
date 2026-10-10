@@ -5411,6 +5411,13 @@ impl CrudStore {
         cli_runtime_binding::find_turn_binding(&self.connection, turn_id.as_str()).await
     }
 
+    pub async fn has_cli_runtime_dispatch_at_or_after(
+        &self,
+        source: &CliRuntimeTurnBindingRecord,
+    ) -> Result<bool> {
+        cli_runtime_binding::has_dispatch_at_or_after(&self.connection, source).await
+    }
+
     pub async fn set_cli_runtime_turn_mcp_metadata(
         &self,
         turn_id: &str,
