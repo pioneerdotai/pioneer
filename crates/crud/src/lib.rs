@@ -5135,6 +5135,86 @@ impl CrudStore {
         .await
     }
 
+    /// Native startup is immutable. The existing legacy upsert is retained for
+    /// legacy projections; all native admission producers use this boundary.
+    pub async fn insert_native_turn_runtime_snapshot(
+        &self,
+        snapshot: NewTurnRuntimeSnapshot,
+    ) -> Result<TurnRuntimeSnapshotRecord> {
+        snapshot.validate_admission_json()?;
+        let owner = self
+            .get_turn_execution(&snapshot.turn_id)
+            .await?
+            .context("native snapshot has no execution owner")?;
+        anyhow::ensure!(
+            matches!(
+                owner.executor_kind,
+                TurnExecutorKind::NativeAgent | TurnExecutorKind::ApiProvider
+            ) && owner.status.is_active(),
+            "native snapshot execution owner is unavailable"
+        );
+        let guard = Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "SELECT 1 FROM \"turn\" t JOIN thread th ON th.id=t.thread_id \
+             JOIN turn_execution e ON e.turn_id=t.id \
+             WHERE t.id=? AND t.thread_id=? AND th.workspace_id=? \
+               AND t.status='in_progress' AND t.message_deleted_at IS NULL \
+               AND e.thread_id=t.thread_id AND e.workspace_id=th.workspace_id \
+               AND e.executor_kind IN ('native_agent','api_provider') \
+               AND e.status IN ('queued','starting','running','recovering') \
+               AND e.owner_id=? AND e.owner_generation=?",
+            [
+                snapshot.turn_id.clone().into(),
+                snapshot.thread_id.clone().into(),
+                snapshot.workspace_id.clone().into(),
+                owner.owner_id.into(),
+                i64::try_from(owner.owner_generation)
+                    .context("native snapshot generation is invalid")?
+                    .into(),
+            ],
+        );
+        let prepared = turn_runtime_snapshot::prepare_snapshot_row(snapshot.clone());
+        let accepted = self
+            .run_serialized_write(|| {
+                let guard = guard.clone();
+                let final_guard = guard.clone();
+                let prepared = prepared.clone();
+                let turn_id = snapshot.turn_id.clone();
+                async move {
+                    let transaction = self
+                        .connection
+                        .begin()
+                        .await
+                        .context("failed to begin immutable native snapshot admission")?;
+                    anyhow::ensure!(
+                        transaction.query_one_raw(guard).await?.is_some(),
+                        "native snapshot admission owner or Turn is unavailable"
+                    );
+                    let accepted = turn_runtime_snapshot::insert_snapshot_if_absent(
+                        &transaction,
+                        prepared,
+                        &turn_id,
+                    )
+                    .await?;
+                    anyhow::ensure!(
+                        transaction.query_one_raw(final_guard).await?.is_some(),
+                        "native snapshot admission owner changed before commit"
+                    );
+                    transaction
+                        .commit()
+                        .await
+                        .context("failed to commit immutable native snapshot admission")?;
+                    Ok(accepted)
+                }
+            })
+            .await?;
+        anyhow::ensure!(
+            snapshot.same_admission_payload(&accepted)?,
+            "native runtime snapshot conflicts with accepted startup"
+        );
+        Ok(accepted)
+    }
+
     pub async fn get_turn_runtime_snapshot(
         &self,
         turn_id: &str,
@@ -29826,15 +29906,6 @@ impl CrudStore {
             }
         }
 
-        for binding in input_bindings {
-            if let Err(error) =
-                artifact_repository::apply_native_input_binding(&transaction, binding).await
-            {
-                let _ = transaction.rollback().await;
-                return Err(error);
-            }
-        }
-
         if let Some(admission) = admission
             && let Err(error) = turn_admission::insert(&transaction, admission, created_at).await
         {
@@ -29911,6 +29982,17 @@ impl CrudStore {
         {
             let _ = transaction.rollback().await;
             return Err(error);
+        }
+
+        // A Task child may not have linked its Thread lineage yet. Its exact
+        // responding execution must exist atomically before input scope checks.
+        for binding in input_bindings {
+            if let Err(error) =
+                artifact_repository::apply_native_input_binding(&transaction, binding).await
+            {
+                let _ = transaction.rollback().await;
+                return Err(error);
+            }
         }
 
         if let Some(agent_action) = agent_action.as_ref() {

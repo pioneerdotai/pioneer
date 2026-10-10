@@ -24762,6 +24762,29 @@ async fn assert_composer_work_replays_exact_launch_payload_for_permission(
         [pioneer_provider::MessageContentPart::File { file }]
             if file.name.as_deref() == Some("launch-context.txt")
     ));
+    let [pioneer_provider::MessageContentPart::File { file }] =
+        user_message.content_parts.as_slice()
+    else {
+        panic!("exact composer File required");
+    };
+    let pioneer_provider::AttachmentDataSource::Bytes { base64_data } = &file.source else {
+        panic!("Task provider input must own accepted bytes, never a mutable Path");
+    };
+    use base64::Engine as _;
+    assert_eq!(
+        base64::engine::general_purpose::STANDARD
+            .decode(base64_data)
+            .unwrap(),
+        b"hello artifact"
+    );
+    assert_eq!(
+        file.artifact.as_ref().unwrap().artifact_id,
+        artifact.artifact_id
+    );
+    assert_eq!(
+        file.artifact.as_ref().unwrap().artifact_version_id,
+        artifact.version_id
+    );
     let compiled_prompt = main_request
         .compiled_prompt
         .as_ref()
@@ -55137,6 +55160,44 @@ fn agents_doc_turn_prompt_uses_root_inheritance_and_folder_override() {
     });
 }
 
+async fn ensure_test_native_snapshot_owner(
+    processor: &MessageProcessor,
+    workspace: &str,
+    thread: &str,
+    turn: &str,
+) {
+    use sea_orm::{ActiveModelTrait, Set};
+    if processor
+        .crud_store
+        .get_turn_execution(turn)
+        .await
+        .unwrap()
+        .is_some()
+    {
+        return;
+    }
+    let now = chrono::Utc::now().fixed_offset();
+    pioneer_entity::turn_execution::ActiveModel {
+        turn_id: Set(turn.into()),
+        thread_id: Set(thread.into()),
+        workspace_id: Set(workspace.into()),
+        executor_kind: Set("native_agent".into()),
+        executor_key: Set(None),
+        status: Set("starting".into()),
+        owner_id: Set(processor.turn_execution_owner_id.to_string()),
+        owner_generation: Set(1),
+        lease_until: Set(now + chrono::Duration::minutes(1)),
+        heartbeat_at: Set(now),
+        started_at: Set(None),
+        completed_at: Set(None),
+        created_at: Set(now),
+        updated_at: Set(now),
+    }
+    .insert(&processor.crud_store.database_connection())
+    .await
+    .unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn agent_skill_snapshot_failure_preserves_overlay_and_retries_identical_payload() {
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -55168,6 +55229,13 @@ async fn agent_skill_snapshot_failure_preserves_overlay_and_retries_identical_pa
     ensure_test_superuser_execution_turn(
         &processor,
         workspace_id.as_str(),
+        "thread_agent_pin_fail_closed",
+        turn_id,
+    )
+    .await;
+    ensure_test_native_snapshot_owner(
+        &processor,
+        &workspace_id,
         "thread_agent_pin_fail_closed",
         turn_id,
     )
@@ -55297,6 +55365,7 @@ async fn persist_agent_skill_snapshot_for_resolution_tests(
     entries: &[AgentSkillRuntimeEntry],
 ) {
     ensure_test_superuser_execution_turn(processor, workspace_id, thread_id, turn_id).await;
+    ensure_test_native_snapshot_owner(processor, workspace_id, thread_id, turn_id).await;
     bind_test_execution_skill_grants(
         processor,
         turn_id,

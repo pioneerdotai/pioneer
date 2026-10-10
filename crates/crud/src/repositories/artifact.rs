@@ -1511,7 +1511,7 @@ pub(crate) async fn apply_native_input_binding<C: ConnectionTrait>(
         .await?
         .is_some();
     anyhow::ensure!(exists, "accepted media exact version is unavailable");
-    let target_root = crate::resolve_artifact_binding_authorization_root(
+    let mut target_root = crate::resolve_artifact_binding_authorization_root(
         db,
         &prepared.workspace,
         Some(&prepared.thread),
@@ -1520,6 +1520,51 @@ pub(crate) async fn apply_native_input_binding<C: ConnectionTrait>(
         None,
     )
     .await?;
+    if target_root.as_deref() == Some(prepared.thread.as_str()) {
+        let thread_scope = crate::resolve_thread_authorization_scope(
+            db,
+            &prepared.thread,
+            Some(&prepared.workspace),
+        )
+        .await?;
+        if thread_scope
+            .is_some_and(|scope| scope.access_class == crate::PersistedThreadAccessClass::Internal)
+            && let Some(response) =
+                super::agent_domain::load_agent_turn_response(db, &prepared.turn).await?
+        {
+            use pioneer_entity::agent_execution;
+            let facts = agent_execution::Entity::find_by_id(response.execution_id)
+                .select_only()
+                .columns([
+                    agent_execution::Column::WorkspaceId,
+                    agent_execution::Column::HomeRootThreadId,
+                    agent_execution::Column::ParentTaskId,
+                ])
+                .into_tuple::<(String, String, Option<String>)>()
+                .one(db)
+                .await?;
+            if let Some((workspace, home_root, Some(task_id))) = facts {
+                anyhow::ensure!(
+                    workspace == prepared.workspace,
+                    "accepted media Task execution workspace changed"
+                );
+                let task_scope = crate::resolve_task_authorization_scope(
+                    db,
+                    &task_id,
+                    Some(&prepared.workspace),
+                    Some(&home_root),
+                )
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("accepted media Task root is unavailable"))?;
+                anyhow::ensure!(
+                    task_scope.root_thread_id.as_deref() == Some(home_root.as_str())
+                        && home_root != prepared.thread,
+                    "accepted media Task root is inconsistent"
+                );
+                target_root = Some(home_root);
+            }
+        }
+    }
     let scope = crate::resolve_native_artifact_authorization_scope(
         db,
         &prepared.artifact,

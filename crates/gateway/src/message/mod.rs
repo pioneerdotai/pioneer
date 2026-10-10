@@ -4204,10 +4204,8 @@ impl MessageProcessor {
             snapshot.history_json = serde_json::to_string(&descriptor)?;
         }
         snapshot.validate_storage_size()?;
-        // Temporary compatibility for the ordinary legacy loader is removed
-        // when that loader is replaced. Canonical Task histories never enter it.
         self.crud_store
-            .upsert_turn_runtime_snapshot(snapshot)
+            .insert_native_turn_runtime_snapshot(snapshot)
             .await
             .with_context(|| format!("failed to persist runtime snapshot for turn `{turn_id}`"))?;
         Ok(())

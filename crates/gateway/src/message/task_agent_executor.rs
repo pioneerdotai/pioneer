@@ -2091,7 +2091,7 @@ impl TaskAgentExecutor {
             let agent_spec = &workflow_agent_spec;
             let run = &workflow_run;
             let parent = &workflow_parent;
-            let turn_outcome = processor
+            let mut turn_outcome = processor
                 .thread_manager
                 .agent_turn_start_with_permission_profile(
                     TurnStartParams {
@@ -2165,6 +2165,20 @@ impl TaskAgentExecutor {
         // scheduler -> TaskExecutor -> child-admission frames are not stacked
         // underneath the projector. Abort-on-drop preserves cancellation and
         // lets the transaction roll back if its caller disappears.
+        if cli_runtime_backend.is_none() {
+            match crate::turn_runtime_snapshot::capture_native_media_inputs(
+                processor.artifact_service.as_ref(), processor.provider_registry.as_ref(),
+                &turn_outcome.materialization.thread.workspace_id, &turn_outcome.materialization.thread.id,
+                &turn_outcome.materialization.thread.model_provider, &turn_outcome.materialization.input,
+                &child_security_snapshot, &materialize_actor,
+            ).await {
+                Ok(input) => turn_outcome.materialization.input = input,
+                Err(_) => {
+                    processor.thread_manager.rollback_turn_start(turn_outcome.rollback_context).await;
+                    return Err(anyhow!("authorized Task media input could not be captured"));
+                }
+            }
+        }
         let materialize_store = processor.crud_store.clone();
         let materialize_thread = turn_outcome.materialization.thread.clone();
         let materialize_sandbox_mode = turn_outcome.materialization.sandbox_mode;
@@ -2629,7 +2643,7 @@ impl TaskAgentExecutor {
             child_thread_id.as_str(),
             child_turn_id.as_str(),
             processor
-                .resolve_provider_artifact_inputs(
+                .resolve_owned_provider_artifact_inputs(
                     task.workspace_id.as_str(),
                     turn_outcome.materialization.input.as_slice(),
                 )
@@ -3204,7 +3218,7 @@ impl TaskAgentExecutor {
         ) {
             bail!("revision Task backend has no installed runtime adapter");
         }
-        let turn_outcome = match processor
+        let mut turn_outcome = match processor
             .thread_manager
             .agent_turn_start_with_permission_profile(
                 TurnStartParams {
@@ -3395,6 +3409,39 @@ impl TaskAgentExecutor {
                     return Ok(());
                 }
             };
+        match crate::turn_runtime_snapshot::capture_native_media_inputs(
+            processor.artifact_service.as_ref(),
+            processor.provider_registry.as_ref(),
+            &turn_outcome.materialization.thread.workspace_id,
+            &turn_outcome.materialization.thread.id,
+            &turn_outcome.materialization.thread.model_provider,
+            &turn_outcome.materialization.input,
+            &child_security_snapshot,
+            &action_actor,
+        )
+        .await
+        {
+            Ok(input) => turn_outcome.materialization.input = input,
+            Err(_) => {
+                processor
+                    .thread_manager
+                    .rollback_turn_start(turn_outcome.rollback_context)
+                    .await;
+                self.block_revision_dispatch_turn(
+                    processor,
+                    child_runtime,
+                    handle,
+                    task_error(
+                        "revision_media_capture_unavailable",
+                        "authorized Task media input could not be captured",
+                        TaskErrorClass::Validation,
+                        Some(run.id.clone()),
+                    ),
+                )
+                .await?;
+                return Ok(());
+            }
+        }
         let child_authorization_context = child_authorization.context;
         let child_authorization_revalidation = child_authorization.revalidation;
         let profile_selected_audit = processor.turn_profile_selected_audit_event_for_turn(
@@ -3638,7 +3685,7 @@ impl TaskAgentExecutor {
             child_thread_id.as_str(),
             child_turn_id.as_str(),
             processor
-                .resolve_provider_artifact_inputs(
+                .resolve_owned_provider_artifact_inputs(
                     task.workspace_id.as_str(),
                     turn_outcome.materialization.input.as_slice(),
                 )
@@ -5605,7 +5652,7 @@ impl TaskAgentExecutor {
         ) {
             bail!("reviewer Task backend has no installed runtime adapter");
         }
-        let turn_outcome = processor
+        let mut turn_outcome = processor
             .thread_manager
             .agent_turn_start_with_permission_profile(
                 TurnStartParams {
@@ -5666,6 +5713,30 @@ impl TaskAgentExecutor {
             bail!("materialized reviewer permission profile differs from its execution admission");
         }
         let child_security_snapshot = reviewer_security_snapshot;
+        match crate::turn_runtime_snapshot::capture_native_media_inputs(
+            processor.artifact_service.as_ref(),
+            processor.provider_registry.as_ref(),
+            &turn_outcome.materialization.thread.workspace_id,
+            &turn_outcome.materialization.thread.id,
+            &turn_outcome.materialization.thread.model_provider,
+            &turn_outcome.materialization.input,
+            &child_security_snapshot,
+            &action_actor,
+        )
+        .await
+        {
+            Ok(input) => turn_outcome.materialization.input = input,
+            Err(_) => {
+                processor
+                    .thread_manager
+                    .rollback_turn_start(turn_outcome.rollback_context)
+                    .await;
+                return Err(anyhow!(
+                    "authorized reviewer Task media input could not be captured"
+                ));
+            }
+        }
+
         let child_authorization_context = reviewer_authorization_context;
         let child_authorization_revalidation = reviewer_authorization_revalidation;
         let profile_selected_audit = processor.turn_profile_selected_audit_event_for_turn(
@@ -5818,7 +5889,7 @@ impl TaskAgentExecutor {
             task_run_turn.thread_id.as_str(),
             task_run_turn.turn_id.as_str(),
             processor
-                .resolve_provider_artifact_inputs(
+                .resolve_owned_provider_artifact_inputs(
                     task.workspace_id.as_str(),
                     turn_outcome.materialization.input.as_slice(),
                 )

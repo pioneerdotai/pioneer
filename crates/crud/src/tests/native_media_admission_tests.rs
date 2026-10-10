@@ -239,3 +239,220 @@ async fn exact_native_input_binding_is_atomic_idempotent_and_revalidates_scope()
             .unwrap()
     );
 }
+
+#[tokio::test]
+async fn task_child_media_admission_uses_exact_atomic_response_root_before_lineage_link() {
+    use crate::{
+        AgentTurnResponseInput, NewTurnAdmission, NewTurnExecution, TurnExecutionStatus,
+        TurnExecutorKind,
+    };
+    let workspace = "ws_task_native_media";
+    let store = test_store_with_workspace(workspace).await;
+    let timestamp = 1_700_000_000;
+    let parent = sample_thread(workspace, "task_media_parent", timestamp);
+    let seed = sample_turn("task_media_seed");
+    store
+        .materialize_turn_start(
+            &parent,
+            SandboxMode::FullAccess,
+            &seed,
+            &[],
+            PersistedActorRef::System,
+        )
+        .await
+        .unwrap();
+    let other_root = sample_thread(workspace, "foreign-root", timestamp);
+    store
+        .materialize_turn_start(
+            &other_root,
+            SandboxMode::FullAccess,
+            &sample_turn("other_task_media_seed"),
+            &[],
+            PersistedActorRef::System,
+        )
+        .await
+        .unwrap();
+    ensure_test_agent_identity(&store, workspace, timestamp).await;
+    let mut task = sample_task(timestamp);
+    task.id = "task_native_media".into();
+    task.workspace_id = workspace.into();
+    task.owner_id = Some(parent.id.clone());
+    task.created_by_thread_id = Some(parent.id.clone());
+    task.created_by_turn_id = Some(seed.id.clone());
+    let mut run = sample_task_run(timestamp);
+    run.id = "run_native_media".into();
+    run.task_id = task.id.clone();
+    run.trigger_id = None;
+    run.run_group_id = run.id.clone();
+    store
+        .append_task_events(
+            vec![
+                TaskEventPayload::TaskCreated { task: task.clone() },
+                TaskEventPayload::RunCreated {
+                    run: run.clone(),
+                    agent_spec: None,
+                },
+            ],
+            timestamp,
+        )
+        .await
+        .unwrap();
+    let execution = store
+        .reserve_execution_for_run(&run.id, TaskExecutorKind::Agent, timestamp)
+        .await
+        .unwrap();
+    attach_test_agent_execution_contract(
+        &store,
+        workspace,
+        &task.id,
+        &run.id,
+        &execution.id,
+        &parent.id,
+        timestamp,
+    )
+    .await;
+    let actor = crate::load_agent_execution(&store.connection, &execution.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let ingested = store
+        .ingest_artifact_metadata(
+            NewArtifactBlobRecord {
+                workspace_id: workspace.into(),
+                sha256: "c".repeat(64),
+                size_bytes: 5,
+                mime_type: Some("text/plain".into()),
+                storage_backend: "fixture".into(),
+                storage_key: "task-media-original".into(),
+                metadata: BTreeMap::new(),
+            },
+            IngestArtifactMetadataRecord {
+                workspace_id: workspace.into(),
+                primary_thread_id: Some(parent.id.clone()),
+                display_name: "original.txt".into(),
+                kind: ArtifactKind::File,
+                mime_type: Some("text/plain".into()),
+                created_by_kind: ArtifactCreatedByKind::User,
+                created_by_actor_id: None,
+                metadata: BTreeMap::new(),
+            },
+            None,
+            BTreeMap::new(),
+        )
+        .await
+        .unwrap();
+    for (index, expected_ok) in [(0, true), (1, false)] {
+        if !expected_ok {
+            store
+                .connection
+                .execute_raw(Statement::from_sql_and_values(
+                    DatabaseBackend::Sqlite,
+                    "UPDATE agent_execution SET home_root_thread_id='foreign-root' WHERE id=?",
+                    [execution.id.clone().into()],
+                ))
+                .await
+                .unwrap();
+        }
+        let mut child = sample_thread(workspace, &format!("task_media_child_{index}"), timestamp);
+        child.origin_kind = ThreadOriginKind::TaskRun;
+        let mut turn = sample_turn(&format!("task_media_turn_{index}"));
+        turn.mode = ThreadMode::Agent;
+        let audit = pioneer_protocol::TurnPermissionAuditEvent {
+            workspace_id: workspace.into(),
+            thread_id: child.id.clone(),
+            turn_id: turn.id.clone(),
+            event_kind: TurnPermissionAuditEventKind::ProfileSelected,
+            profile_mode: turn.permission_profile.mode,
+            profile_source: turn.permission_profile.source,
+            security_snapshot_id: None,
+            security_snapshot_version: None,
+            security_reason_code: None,
+            security_capability: None,
+            item_id: None,
+            tool_call_id: None,
+            tool_name: None,
+            action_kind: None,
+            request_key: None,
+            decision: None,
+            reason: None,
+            cached: false,
+        };
+        let result = store
+            .materialize_authorized_turn_start_with_reasoning_effort_and_permission_audit(
+                &child,
+                SandboxMode::FullAccess,
+                &turn,
+                &[UserInput::Artifact {
+                    artifact_id: ingested.artifact.id.clone(),
+                    version_id: Some(ingested.version.id.clone()),
+                }],
+                None,
+                TurnWorkOwner::Turn,
+                PersistedActorRef::System,
+                audit,
+                r#"{"kind":"fixture_exact_task_authority"}"#,
+                None,
+                Some(NewTurnAdmission {
+                    turn_id: turn.id.clone(),
+                    thread_id: child.id.clone(),
+                    workspace_id: workspace.into(),
+                    request_digest: "d".repeat(64),
+                    policy_generation: None,
+                    role_key: None,
+                    policy_fingerprint: None,
+                    execution_lease: None,
+                }),
+                Some(NewTurnExecution {
+                    turn_id: turn.id.clone(),
+                    thread_id: child.id.clone(),
+                    workspace_id: workspace.into(),
+                    executor_kind: TurnExecutorKind::NativeAgent,
+                    executor_key: None,
+                    status: TurnExecutionStatus::Starting,
+                    owner_id: "task-media-owner".into(),
+                    lease_until: unix_to_datetime(timestamp + 45),
+                    created_at: unix_to_datetime(timestamp),
+                }),
+                &TurnExecutionSecuritySnapshot::unrestricted_full_access(
+                    "/fixture",
+                    timestamp * 1000,
+                ),
+                Vec::new(),
+                None,
+                Some(AgentTurnResponseInput {
+                    turn_id: turn.id.clone(),
+                    execution_id: execution.id.clone(),
+                    presentation_snapshot_id: actor.presentation_snapshot_id.clone().unwrap(),
+                    now: unix_to_datetime(timestamp),
+                }),
+            )
+            .await;
+        assert_eq!(result.is_ok(), expected_ok, "scenario {index}: {result:?}");
+        assert!(
+            store
+                .get_task_thread_lineage(&child.id)
+                .await
+                .unwrap()
+                .is_none(),
+            "the native atomic admission precedes the existing Task lineage link"
+        );
+        assert_eq!(
+            pioneer_entity::artifact_binding::Entity::find()
+                .filter(pioneer_entity::artifact_binding::Column::TurnId.eq(&turn.id))
+                .count(&store.connection)
+                .await
+                .unwrap(),
+            u64::from(expected_ok)
+        );
+        if !expected_ok {
+            assert!(store.get_turn(&child.id, &turn.id).await.unwrap().is_none());
+            assert!(
+                crate::load_agent_turn_response(&store.connection, &turn.id)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "response/root proof also rolls back with the failed binding"
+            );
+        }
+    }
+}

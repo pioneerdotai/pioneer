@@ -111,12 +111,11 @@ impl TurnRuntimeSnapshotRecord {
 // Keep this exact stored-column set aligned with validate_storage_size above.
 const SNAPSHOT_STORAGE_BYTES_SQL: &str = "coalesce(length(cast(turn_id as blob)),0) + coalesce(length(cast(thread_id as blob)),0) + coalesce(length(cast(workspace_id as blob)),0) + coalesce(length(cast(mode_json as blob)),0) + coalesce(length(cast(model as blob)),0) + coalesce(length(cast(provider_name as blob)),0) + coalesce(length(cast(reasoning_effort as blob)),0) + coalesce(length(cast(agent_skill_versions_json as blob)),0) + coalesce(length(cast(hook_runtime_context_json as blob)),0) + coalesce(length(cast(workspace_skill_policies_json as blob)),0) + coalesce(length(cast(input_json as blob)),0) + coalesce(length(cast(capabilities_json as blob)),0) + coalesce(length(cast(resolved_artifacts_json as blob)),0) + coalesce(length(cast(runtime_environment_json as blob)),0) + coalesce(length(cast(history_json as blob)),0) + coalesce(length(cast(ordinary_skill_catalog_json as blob)),0)";
 
-pub async fn upsert_turn_runtime_snapshot<C: ConnectionTrait>(
-    db: &C,
+// Encoded values are prepared before opening the admission transaction.
+pub(crate) fn prepare_snapshot_row(
     snapshot: NewTurnRuntimeSnapshot,
-) -> Result<TurnRuntimeSnapshotRecord> {
-    let turn_id = snapshot.turn_id.clone();
-    turn_runtime_snapshot::Entity::insert(turn_runtime_snapshot::ActiveModel {
+) -> turn_runtime_snapshot::ActiveModel {
+    turn_runtime_snapshot::ActiveModel {
         turn_id: Set(snapshot.turn_id),
         thread_id: Set(snapshot.thread_id),
         workspace_id: Set(snapshot.workspace_id),
@@ -135,32 +134,163 @@ pub async fn upsert_turn_runtime_snapshot<C: ConnectionTrait>(
         history_json: Set(snapshot.history_json),
         created_at: Set(snapshot.created_at),
         updated_at: Set(snapshot.updated_at),
-    })
-    .on_conflict(
-        OnConflict::column(turn_runtime_snapshot::Column::TurnId)
-            .update_columns([
-                turn_runtime_snapshot::Column::ThreadId,
-                turn_runtime_snapshot::Column::WorkspaceId,
-                turn_runtime_snapshot::Column::ModeJson,
-                turn_runtime_snapshot::Column::Model,
-                turn_runtime_snapshot::Column::ProviderName,
-                turn_runtime_snapshot::Column::ReasoningEffort,
-                turn_runtime_snapshot::Column::AgentSkillVersionsJson,
-                turn_runtime_snapshot::Column::OrdinarySkillCatalogJson,
-                turn_runtime_snapshot::Column::HookRuntimeContextJson,
-                turn_runtime_snapshot::Column::WorkspaceSkillPoliciesJson,
-                turn_runtime_snapshot::Column::InputJson,
-                turn_runtime_snapshot::Column::CapabilitiesJson,
-                turn_runtime_snapshot::Column::ResolvedArtifactsJson,
-                turn_runtime_snapshot::Column::RuntimeEnvironmentJson,
-                turn_runtime_snapshot::Column::HistoryJson,
-                turn_runtime_snapshot::Column::UpdatedAt,
-            ])
-            .to_owned(),
-    )
-    .exec(db)
-    .await
-    .context("failed to upsert turn_runtime_snapshot row")?;
+    }
+}
+
+pub(crate) async fn insert_snapshot_if_absent<C: ConnectionTrait>(
+    db: &C,
+    snapshot: turn_runtime_snapshot::ActiveModel,
+    turn_id: &str,
+) -> Result<TurnRuntimeSnapshotRecord> {
+    turn_runtime_snapshot::Entity::insert(snapshot)
+        .on_conflict(
+            OnConflict::column(turn_runtime_snapshot::Column::TurnId)
+                .do_nothing()
+                .to_owned(),
+        )
+        .try_insert()
+        .exec(db)
+        .await
+        .context("failed to insert immutable native runtime snapshot")?;
+    find_turn_runtime_snapshot(db, turn_id)
+        .await?
+        .context("immutable native runtime snapshot is missing")
+}
+
+impl NewTurnRuntimeSnapshot {
+    pub(crate) fn validate_admission_json(&self) -> Result<()> {
+        self.validate_storage_size()?;
+        for encoded in [
+            Some(self.mode_json.as_str()),
+            self.agent_skill_versions_json.as_deref(),
+            self.ordinary_skill_catalog_json.as_deref(),
+            Some(self.hook_runtime_context_json.as_str()),
+            Some(self.workspace_skill_policies_json.as_str()),
+            Some(self.input_json.as_str()),
+            Some(self.capabilities_json.as_str()),
+            Some(self.resolved_artifacts_json.as_str()),
+            Some(self.runtime_environment_json.as_str()),
+            Some(self.history_json.as_str()),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let _: serde_json::Value = serde_json::from_str(encoded)
+                .map_err(|_| anyhow::anyhow!("native snapshot candidate JSON is invalid"))?;
+        }
+        Ok(())
+    }
+
+    /// Called after the SQL transaction is released. JSON key ordering is not
+    /// semantic; accepted array order and all resolved startup values are.
+    pub(crate) fn same_admission_payload(
+        &self,
+        accepted: &TurnRuntimeSnapshotRecord,
+    ) -> Result<bool> {
+        self.validate_storage_size()?;
+        accepted.validate_storage_size()?;
+        if self.turn_id != accepted.turn_id
+            || self.thread_id != accepted.thread_id
+            || self.workspace_id != accepted.workspace_id
+            || self.model != accepted.model
+            || self.provider_name != accepted.provider_name
+            || self.reasoning_effort != accepted.reasoning_effort
+        {
+            return Ok(false);
+        }
+        for (candidate, original) in [
+            (
+                Some(self.mode_json.as_str()),
+                Some(accepted.mode_json.as_str()),
+            ),
+            (
+                self.agent_skill_versions_json.as_deref(),
+                accepted.agent_skill_versions_json.as_deref(),
+            ),
+            (
+                self.ordinary_skill_catalog_json.as_deref(),
+                accepted.ordinary_skill_catalog_json.as_deref(),
+            ),
+            (
+                Some(self.hook_runtime_context_json.as_str()),
+                Some(accepted.hook_runtime_context_json.as_str()),
+            ),
+            (
+                Some(self.workspace_skill_policies_json.as_str()),
+                Some(accepted.workspace_skill_policies_json.as_str()),
+            ),
+            (
+                Some(self.input_json.as_str()),
+                Some(accepted.input_json.as_str()),
+            ),
+            (
+                Some(self.capabilities_json.as_str()),
+                Some(accepted.capabilities_json.as_str()),
+            ),
+            (
+                Some(self.resolved_artifacts_json.as_str()),
+                Some(accepted.resolved_artifacts_json.as_str()),
+            ),
+            (
+                Some(self.runtime_environment_json.as_str()),
+                Some(accepted.runtime_environment_json.as_str()),
+            ),
+            (
+                Some(self.history_json.as_str()),
+                Some(accepted.history_json.as_str()),
+            ),
+        ] {
+            match (candidate, original) {
+                (None, None) => {}
+                (Some(candidate), Some(original)) => {
+                    let candidate: serde_json::Value =
+                        serde_json::from_str(candidate).map_err(|_| {
+                            anyhow::anyhow!("native snapshot candidate JSON is invalid")
+                        })?;
+                    let original: serde_json::Value = serde_json::from_str(original)
+                        .map_err(|_| anyhow::anyhow!("accepted native snapshot JSON is invalid"))?;
+                    if candidate != original {
+                        return Ok(false);
+                    }
+                }
+                _ => return Ok(false),
+            }
+        }
+        Ok(true)
+    }
+}
+
+pub async fn upsert_turn_runtime_snapshot<C: ConnectionTrait>(
+    db: &C,
+    snapshot: NewTurnRuntimeSnapshot,
+) -> Result<TurnRuntimeSnapshotRecord> {
+    let turn_id = snapshot.turn_id.clone();
+    turn_runtime_snapshot::Entity::insert(prepare_snapshot_row(snapshot))
+        .on_conflict(
+            OnConflict::column(turn_runtime_snapshot::Column::TurnId)
+                .update_columns([
+                    turn_runtime_snapshot::Column::ThreadId,
+                    turn_runtime_snapshot::Column::WorkspaceId,
+                    turn_runtime_snapshot::Column::ModeJson,
+                    turn_runtime_snapshot::Column::Model,
+                    turn_runtime_snapshot::Column::ProviderName,
+                    turn_runtime_snapshot::Column::ReasoningEffort,
+                    turn_runtime_snapshot::Column::AgentSkillVersionsJson,
+                    turn_runtime_snapshot::Column::OrdinarySkillCatalogJson,
+                    turn_runtime_snapshot::Column::HookRuntimeContextJson,
+                    turn_runtime_snapshot::Column::WorkspaceSkillPoliciesJson,
+                    turn_runtime_snapshot::Column::InputJson,
+                    turn_runtime_snapshot::Column::CapabilitiesJson,
+                    turn_runtime_snapshot::Column::ResolvedArtifactsJson,
+                    turn_runtime_snapshot::Column::RuntimeEnvironmentJson,
+                    turn_runtime_snapshot::Column::HistoryJson,
+                    turn_runtime_snapshot::Column::UpdatedAt,
+                ])
+                .to_owned(),
+        )
+        .exec(db)
+        .await
+        .context("failed to upsert turn_runtime_snapshot row")?;
 
     find_turn_runtime_snapshot(db, turn_id.as_str())
         .await?
