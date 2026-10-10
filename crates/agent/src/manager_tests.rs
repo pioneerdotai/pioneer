@@ -8117,7 +8117,7 @@ async fn phase_09_context_budget_truncates_predictably() {
 }
 
 #[tokio::test]
-async fn phase_09_failed_context_hook_yields_diagnostic_and_empty_context() {
+async fn phase_09_required_context_failure_aborts_before_compile_and_provider() {
     let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
     let provider = Arc::new(CaptureAgentProvider::default());
     let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
@@ -8141,6 +8141,86 @@ async fn phase_09_failed_context_hook_yields_diagnostic_and_empty_context() {
         "phase 09 context failure",
     )
     .await;
+    assert_turn_failed(&observed, "required prompt-context preparation failed");
+    assert!(provider.snapshot_requests().is_empty());
+    let calls = snapshot_hook_calls(&calls);
+    assert!(
+        calls
+            .iter()
+            .any(|call| call.phase == HookPhase::TurnPrePromptContext)
+    );
+    assert!(
+        !calls
+            .iter()
+            .any(|call| call.phase == HookPhase::TurnPrePromptCompile)
+    );
+}
+
+#[tokio::test]
+async fn phase_09_fail_closed_context_failure_aborts_before_compile_and_provider() {
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let provider = Arc::new(CaptureAgentProvider::default());
+    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+    manager
+        .set_hook_runtime(Some(recording_hook_runtime_with_phase_failures(
+            calls.clone(),
+            Vec::new(),
+            HookFailurePolicy::FailClosed,
+            vec![HookPhase::TurnPrePromptContext],
+        )))
+        .await;
+
+    let observed = start_simple_turn(
+        &manager,
+        "thr_phase09_context_fail_closed",
+        "ws_phase09_context_fail_closed",
+        "turn_phase09_context_fail_closed",
+        ThreadMode::Agent,
+        "capture",
+        "phase 09 context failure",
+    )
+    .await;
+    assert_turn_failed(&observed, "required prompt-context preparation failed");
+    assert!(provider.snapshot_requests().is_empty());
+    let calls = snapshot_hook_calls(&calls);
+    assert!(
+        calls
+            .iter()
+            .any(|call| call.phase == HookPhase::TurnPrePromptContext)
+    );
+    assert!(
+        !calls
+            .iter()
+            .any(|call| call.phase == HookPhase::TurnPrePromptCompile)
+    );
+}
+
+#[tokio::test]
+async fn phase_09_explicit_best_effort_context_failure_can_continue() {
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let provider = Arc::new(CaptureAgentProvider::default());
+    let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
+    let manager = AgentManager::new(registry, test_tool_loop_config());
+    manager
+        .set_hook_runtime(Some(recording_hook_runtime_with_phase_failures(
+            calls.clone(),
+            Vec::new(),
+            HookFailurePolicy::BestEffort,
+            vec![HookPhase::TurnPrePromptContext],
+        )))
+        .await;
+
+    let observed = start_simple_turn(
+        &manager,
+        "thr_phase09_context_best_effort",
+        "ws_phase09_context_best_effort",
+        "turn_phase09_context_best_effort",
+        ThreadMode::Agent,
+        "capture",
+        "phase 09 context failure",
+    )
+    .await;
     assert_turn_completed(&observed);
 
     let calls = snapshot_hook_calls(&calls);
@@ -8150,9 +8230,7 @@ async fn phase_09_failed_context_hook_yields_diagnostic_and_empty_context() {
         .expect("pre-prompt-compile hook called");
     let set = &pre_prompt_compile.prompt_context_set;
     assert!(set.entries.is_empty());
-    assert!(set.diagnostics.iter().any(|diagnostic| {
-        diagnostic.code.as_str() == "prompt_context.runtime_failed" && diagnostic.safe_for_user
-    }));
+    assert!(!set.diagnostics.is_empty());
     let requests = provider.snapshot_requests();
     assert_eq!(requests.len(), 1);
     let prompt = requests[0]
@@ -16450,4 +16528,258 @@ async fn cancellation_context_freezes_interrupted_policy_request_handlers_and_cl
         receiver.acknowledge_last(Ok(()));
         manager.remove_thread(thread).await;
     }
+}
+
+struct UnavailableRequiredTaskTools;
+#[async_trait::async_trait]
+impl TaskToolProvider for UnavailableRequiredTaskTools {
+    fn terminal_cleanup_runtime_contract(&self) -> &'static str {
+        "pioneer.test.required-task-preparation.v1"
+    }
+    async fn materialize_task_tools(
+        &self,
+        _: TaskTurnContext,
+    ) -> Result<TaskToolMaterialization, String> {
+        Err("fixture required task service SECRET unavailable".into())
+    }
+    async fn pending_attached_tasks(
+        &self,
+        _: TaskTurnContext,
+    ) -> Result<Vec<super::PendingAttachedTask>, String> {
+        Ok(Vec::new())
+    }
+    async fn review_required_attached_task_observations(
+        &self,
+        _: TaskTurnContext,
+    ) -> Result<Vec<ReviewRequiredTaskObservation>, String> {
+        Ok(Vec::new())
+    }
+    async fn terminal_attached_task_observations(
+        &self,
+        _: TaskTurnContext,
+    ) -> Result<Vec<super::TerminalTaskObservation>, String> {
+        Ok(Vec::new())
+    }
+    async fn cleanup_attached_tasks(&self, _: TaskTurnContext, _: String) -> Result<(), String> {
+        Ok(())
+    }
+    async fn cleanup_attached_tasks_idempotent(
+        &self,
+        _: &str,
+        _: TaskTurnContext,
+        _: String,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn required_task_materialization_failure_cannot_become_an_empty_accepted_manifest() {
+    let provider = Arc::new(CaptureAgentProvider::default());
+    let manager = AgentManager::new(
+        Arc::new(ProviderRegistry::with_provider("capture", provider.clone())),
+        test_tool_loop_config(),
+    );
+    manager
+        .set_task_tool_provider(Some(Arc::new(UnavailableRequiredTaskTools)))
+        .await;
+    let observed = start_simple_turn(
+        &manager,
+        "r05-required-task-thread",
+        "r05-workspace",
+        "r05-required-task-turn",
+        ThreadMode::Agent,
+        "capture",
+        "use required task tooling",
+    )
+    .await;
+    assert_turn_blocked(&observed, "required task tooling could not be materialized");
+    assert!(provider.snapshot_requests().is_empty());
+    assert!(
+        !observed
+            .iter()
+            .any(|event| matches!(event, AgentEvent::TurnCapabilitiesResolved { .. }))
+    );
+    assert!(!format!("{observed:?}").contains("SECRET"));
+}
+
+#[tokio::test]
+async fn required_aggregate_tool_failure_never_dispatches_builtin_only_fallback() {
+    for tool_name in ["request_tools", "required_extension_missing_handler"] {
+        let provider = Arc::new(CaptureAgentProvider::default());
+        let manager = AgentManager::new(
+            Arc::new(ProviderRegistry::with_provider("capture", provider.clone())),
+            test_tool_loop_config(),
+        );
+        let bundle = ToolExtensionBundle {
+            specs: vec![ConfiguredToolSpec::new(
+                ToolSpec::new(
+                    tool_name,
+                    "required extension",
+                    json!({"type":"object", "properties":{}}),
+                    PayloadKind::Function,
+                ),
+                ExecutionClass::Shared,
+                dynamic_unknown_output_policy(),
+            )],
+            handlers: vec![],
+        };
+        manager
+            .set_task_tool_provider(Some(Arc::new(StaticTaskToolProvider {
+                bundle,
+                runtime_contract: "pioneer.test.required-aggregate.v1",
+            })))
+            .await;
+        let observed = start_simple_turn(
+            &manager,
+            "r05-aggregate-thread",
+            "r05-workspace",
+            "r05-aggregate-turn",
+            ThreadMode::Agent,
+            "capture",
+            "keep all required extensions",
+        )
+        .await;
+        assert_turn_blocked(&observed, "required tool runtime could not be constructed");
+        assert!(provider.snapshot_requests().is_empty());
+        assert!(
+            !observed
+                .iter()
+                .any(|event| matches!(event, AgentEvent::TurnCapabilitiesResolved { .. }))
+        );
+    }
+}
+
+#[tokio::test]
+async fn required_context_helpers_preserve_runtime_policy_on_both_phases() {
+    use super::hooks::{
+        AgentTurnHookContext, EffectiveTurnPolicySet, EffectiveTurnPromptContextSet,
+        run_agent_turn_post_preflight_prompt_context_hook_phase,
+        run_agent_turn_prompt_context_hook_phase,
+    };
+    for phase in [
+        HookPhase::TurnPrePromptContext,
+        HookPhase::TurnPostPreflightPromptContext,
+    ] {
+        for policy in [
+            HookFailurePolicy::Required,
+            HookFailurePolicy::FailClosed,
+            HookFailurePolicy::BestEffort,
+            HookFailurePolicy::Skip,
+            HookFailurePolicy::Fallback,
+        ] {
+            let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let runtime = recording_hook_runtime_with_phase_failures_and_fallback(
+                calls.clone(),
+                Vec::new(),
+                policy,
+                vec![phase],
+                vec![prompt_context_contribution(
+                    "r05.context.fallback",
+                    "r05",
+                    10,
+                    "required fallback",
+                )],
+            );
+            let context = AgentTurnHookContext::new("r05-ws", "r05-thread", "r05-turn");
+            let result = if phase == HookPhase::TurnPrePromptContext {
+                run_agent_turn_prompt_context_hook_phase(
+                    Some(&runtime),
+                    &context,
+                    &EffectiveTurnPolicySet::empty(),
+                    pioneer_hooks::TurnPrePromptContextHookInput::from_parts(
+                        "input",
+                        Some("model"),
+                        Some("fixture"),
+                    ),
+                )
+                .await
+            } else {
+                run_agent_turn_post_preflight_prompt_context_hook_phase(
+                    Some(&runtime),
+                    &context,
+                    &EffectiveTurnPolicySet::empty(),
+                    &EffectiveTurnPromptContextSet::empty(),
+                    pioneer_hooks::TurnPostPreflightPromptContextHookInput::from_parts(
+                        "input",
+                        Some("model"),
+                        Some("fixture"),
+                    ),
+                )
+                .await
+            };
+            assert_eq!(
+                result.is_ok(),
+                !matches!(
+                    policy,
+                    HookFailurePolicy::Required | HookFailurePolicy::FailClosed
+                ),
+                "{phase:?} {policy:?}"
+            );
+            if policy == HookFailurePolicy::Fallback {
+                assert_eq!(
+                    result.unwrap().clone_hook_prompt_context_set().entries[0]
+                        .content
+                        .as_str(),
+                    "required fallback"
+                );
+            }
+            assert_eq!(snapshot_hook_calls(&calls).len(), 1);
+        }
+    }
+}
+
+#[tokio::test]
+async fn invalid_required_context_request_never_reaches_hook_runtime() {
+    use super::hooks::{
+        AgentTurnHookContext, EffectiveTurnPolicySet, EffectiveTurnPromptContextSet,
+        run_agent_turn_post_preflight_prompt_context_hook_phase,
+        run_agent_turn_prompt_context_hook_phase,
+    };
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let runtime = recording_hook_runtime(
+        calls.clone(),
+        Vec::new(),
+        HookFailurePolicy::BestEffort,
+        false,
+    );
+    let context = AgentTurnHookContext::with_runtime_context(
+        "r05-ws",
+        "r05-thread",
+        "r05-turn",
+        super::AgentTurnHookRuntimeContext {
+            actor_id: Some(String::new()),
+            ..Default::default()
+        },
+    );
+    assert!(
+        run_agent_turn_prompt_context_hook_phase(
+            Some(&runtime),
+            &context,
+            &EffectiveTurnPolicySet::empty(),
+            pioneer_hooks::TurnPrePromptContextHookInput::from_parts(
+                "input",
+                Some("model"),
+                Some("fixture")
+            )
+        )
+        .await
+        .is_err()
+    );
+    assert!(
+        run_agent_turn_post_preflight_prompt_context_hook_phase(
+            Some(&runtime),
+            &context,
+            &EffectiveTurnPolicySet::empty(),
+            &EffectiveTurnPromptContextSet::empty(),
+            pioneer_hooks::TurnPostPreflightPromptContextHookInput::from_parts(
+                "input",
+                Some("model"),
+                Some("fixture")
+            )
+        )
+        .await
+        .is_err()
+    );
+    assert!(snapshot_hook_calls(&calls).is_empty());
 }

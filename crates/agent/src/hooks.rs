@@ -511,13 +511,6 @@ impl EffectiveTurnPromptContextSet {
         Self::default()
     }
 
-    pub(super) fn from_hook_prompt_context_set(contexts: HookPromptContextSet) -> Self {
-        Self {
-            contexts,
-            manifest: EffectiveTurnPromptManifestHookMetadata::empty(),
-        }
-    }
-
     pub(super) fn from_hook_prompt_context_set_and_manifest(
         contexts: HookPromptContextSet,
         manifest: EffectiveTurnPromptManifestHookMetadata,
@@ -833,32 +826,23 @@ pub(super) async fn run_agent_turn_prompt_context_hook_phase(
     context: &AgentTurnHookContext,
     policy_set: &EffectiveTurnPolicySet,
     input: TurnPrePromptContextHookInput,
-) -> EffectiveTurnPromptContextSet {
+) -> Result<EffectiveTurnPromptContextSet, AgentTurnHookError> {
     let _startup_hooks = pioneer_observability::turn_startup::current_stage(
         pioneer_observability::turn_startup::Stage::HookContext,
     );
     let Some(runtime) = runtime else {
-        return EffectiveTurnPromptContextSet::empty();
+        return Ok(EffectiveTurnPromptContextSet::empty());
     };
 
     let empty_prompt_context_set = EffectiveTurnPromptContextSet::empty();
-    let request = match build_phase_request_with_input(
+    let request = build_phase_request_with_input(
         context,
         HookPhase::TurnPrePromptContext,
         policy_set,
         &empty_prompt_context_set,
         HookInput::turn_pre_prompt_context(input),
-    ) {
-        Ok(request) => request,
-        Err(error) => {
-            warn!(
-                phase = %HookPhase::TurnPrePromptContext,
-                error = %error,
-                "agent turn prompt context hook phase failed to build request; continuing with empty context"
-            );
-            return runtime_failed_prompt_context_set();
-        }
-    };
+    )
+    .map_err(AgentTurnHookError::InvalidContext)?;
 
     match runtime.run_phase(request).await {
         Ok(mut response) => {
@@ -878,14 +862,16 @@ pub(super) async fn run_agent_turn_prompt_context_hook_phase(
                 &response.runs,
                 &prompt_context_set,
             );
-            EffectiveTurnPromptContextSet::from_hook_prompt_context_set_and_manifest(
-                prompt_context_set,
-                manifest,
+            Ok(
+                EffectiveTurnPromptContextSet::from_hook_prompt_context_set_and_manifest(
+                    prompt_context_set,
+                    manifest,
+                ),
             )
         }
         Err(error) => {
             warn_hook_prompt_context_runtime_error(HookPhase::TurnPrePromptContext, &error);
-            runtime_failed_prompt_context_set()
+            Err(AgentTurnHookError::Runtime(error))
         }
     }
 }
@@ -896,31 +882,22 @@ pub(super) async fn run_agent_turn_post_preflight_prompt_context_hook_phase(
     policy_set: &EffectiveTurnPolicySet,
     prompt_context_set: &EffectiveTurnPromptContextSet,
     input: TurnPostPreflightPromptContextHookInput,
-) -> EffectiveTurnPromptContextSet {
+) -> Result<EffectiveTurnPromptContextSet, AgentTurnHookError> {
     let _startup_hooks = pioneer_observability::turn_startup::current_stage(
         pioneer_observability::turn_startup::Stage::HookPostPreflight,
     );
     let Some(runtime) = runtime else {
-        return prompt_context_set.clone();
+        return Ok(prompt_context_set.clone());
     };
 
-    let request = match build_phase_request_with_input(
+    let request = build_phase_request_with_input(
         context,
         HookPhase::TurnPostPreflightPromptContext,
         policy_set,
         prompt_context_set,
         HookInput::turn_post_preflight_prompt_context(input),
-    ) {
-        Ok(request) => request,
-        Err(error) => {
-            warn!(
-                phase = %HookPhase::TurnPostPreflightPromptContext,
-                error = %error,
-                "agent turn post-preflight prompt context hook phase failed to build request; preserving existing prompt context"
-            );
-            return prompt_context_set.clone();
-        }
-    };
+    )
+    .map_err(AgentTurnHookError::InvalidContext)?;
 
     match runtime.run_phase(request).await {
         Ok(mut response) => {
@@ -942,15 +919,15 @@ pub(super) async fn run_agent_turn_post_preflight_prompt_context_hook_phase(
                 &response.runs,
                 &post_preflight_context_set,
             );
-            prompt_context_set
-                .with_additional_prompt_context_phase(post_preflight_context_set, manifest)
+            Ok(prompt_context_set
+                .with_additional_prompt_context_phase(post_preflight_context_set, manifest))
         }
         Err(error) => {
             warn_hook_prompt_context_runtime_error(
                 HookPhase::TurnPostPreflightPromptContext,
                 &error,
             );
-            prompt_context_set.clone()
+            Err(AgentTurnHookError::Runtime(error))
         }
     }
 }
@@ -1748,12 +1725,6 @@ fn missing_tool_bundle_artifact_diagnostic(bundle_id: &str) -> HookDiagnostic {
     }
 }
 
-fn runtime_failed_prompt_context_set() -> EffectiveTurnPromptContextSet {
-    EffectiveTurnPromptContextSet::from_hook_prompt_context_set(
-        HookPromptContextSet::runtime_failed(),
-    )
-}
-
 fn current_unix_timestamp() -> i64 {
     match SystemTime::now().duration_since(UNIX_EPOCH) {
         Ok(duration) => i64::try_from(duration.as_secs()).unwrap_or(i64::MAX),
@@ -1940,7 +1911,7 @@ fn warn_hook_prompt_context_runtime_error(phase: HookPhase, error: &HookRuntimeE
             warn!(
                 phase = %phase,
                 error_kind = "registry",
-                "agent turn prompt context hook phase failed; continuing with empty context"
+                "required prompt context phase failed; preparation stopped"
             );
         }
         HookRuntimeError::MissingHandler {
@@ -1954,7 +1925,7 @@ fn warn_hook_prompt_context_runtime_error(phase: HookPhase, error: &HookRuntimeE
                 subscription_id = %subscription_id,
                 hook_id = %hook_id,
                 error_kind = "missing_handler",
-                "agent turn prompt context hook phase failed; continuing with empty context"
+                "required prompt context phase failed; preparation stopped"
             );
         }
         HookRuntimeError::HookFailed {
@@ -1972,7 +1943,7 @@ fn warn_hook_prompt_context_runtime_error(phase: HookPhase, error: &HookRuntimeE
                 retryable = error.retryable,
                 safe_for_user = error.safe_for_user,
                 error_kind = "hook_failed",
-                "agent turn prompt context hook phase failed; continuing with empty context"
+                "required prompt context phase failed; preparation stopped"
             );
         }
         HookRuntimeError::HookTimedOut {
@@ -1988,7 +1959,7 @@ fn warn_hook_prompt_context_runtime_error(phase: HookPhase, error: &HookRuntimeE
                 hook_id = %hook_id,
                 timeout_ms = *timeout_ms,
                 error_kind = "hook_timed_out",
-                "agent turn prompt context hook phase failed; continuing with empty context"
+                "required prompt context phase failed; preparation stopped"
             );
         }
         HookRuntimeError::HookFailedClosed {
@@ -2006,7 +1977,7 @@ fn warn_hook_prompt_context_runtime_error(phase: HookPhase, error: &HookRuntimeE
                 retryable = error.retryable,
                 safe_for_user = error.safe_for_user,
                 error_kind = "hook_failed_closed",
-                "agent turn prompt context hook phase failed; continuing with empty context"
+                "required prompt context phase failed; preparation stopped"
             );
         }
         HookRuntimeError::MissingFallbackContribution {
@@ -2020,7 +1991,7 @@ fn warn_hook_prompt_context_runtime_error(phase: HookPhase, error: &HookRuntimeE
                 subscription_id = %subscription_id,
                 hook_id = %hook_id,
                 error_kind = "missing_fallback_contribution",
-                "agent turn prompt context hook phase failed; continuing with empty context"
+                "required prompt context phase failed; preparation stopped"
             );
         }
         HookRuntimeError::InvalidExecutionPolicy {
@@ -2036,7 +2007,7 @@ fn warn_hook_prompt_context_runtime_error(phase: HookPhase, error: &HookRuntimeE
                 hook_id = %hook_id,
                 reason = %reason,
                 error_kind = "invalid_execution_policy",
-                "agent turn prompt context hook phase failed; continuing with empty context"
+                "required prompt context phase failed; preparation stopped"
             );
         }
         HookRuntimeError::MissingDependency {
@@ -2050,7 +2021,7 @@ fn warn_hook_prompt_context_runtime_error(phase: HookPhase, error: &HookRuntimeE
                 subscription_id = %subscription_id,
                 dependency_id = %dependency_id,
                 error_kind = "missing_dependency",
-                "agent turn prompt context hook phase failed; continuing with empty context"
+                "required prompt context phase failed; preparation stopped"
             );
         }
         HookRuntimeError::DependencyCycle {
@@ -2062,7 +2033,7 @@ fn warn_hook_prompt_context_runtime_error(phase: HookPhase, error: &HookRuntimeE
                 error_phase = %error_phase,
                 subscription_count = subscription_ids.len(),
                 error_kind = "dependency_cycle",
-                "agent turn prompt context hook phase failed; continuing with empty context"
+                "required prompt context phase failed; preparation stopped"
             );
         }
         HookRuntimeError::DurablePersistenceUnavailable {
@@ -2074,7 +2045,7 @@ fn warn_hook_prompt_context_runtime_error(phase: HookPhase, error: &HookRuntimeE
                 error_phase = %error_phase,
                 operation = *operation,
                 error_kind = "durable_persistence_unavailable",
-                "agent turn prompt context hook phase failed; continuing with empty context"
+                "required prompt context phase failed; preparation stopped"
             );
         }
         HookRuntimeError::DurableExecutionIncomplete {
@@ -2091,7 +2062,7 @@ fn warn_hook_prompt_context_runtime_error(phase: HookPhase, error: &HookRuntimeE
                 timed_out_runs,
                 incomplete_runs,
                 error_kind = "durable_execution_incomplete",
-                "agent turn prompt context hook phase failed; continuing with empty context"
+                "required prompt context phase failed; preparation stopped"
             );
         }
     }

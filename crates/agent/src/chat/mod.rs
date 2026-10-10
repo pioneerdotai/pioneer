@@ -101,8 +101,7 @@ use pioneer_tools::{
     ToolLoopBudgetReason, ToolLoopGuard, ToolLoopGuardDecision, ToolLoopRoundAction,
     ToolNoProgressGuard, ToolNoProgressGuardConfig, ToolNoProgressPreflightDecision, ToolOutcome,
     ToolRecoveryView, ToolResultEnvelope, ToolResultView, ToolRetryController, ToolRetryDecision,
-    ToolRetryObservation, build_builtin_tools_with_security_snapshot,
-    build_tools_with_environment_and_security_snapshot, classify_tool_error,
+    ToolRetryObservation, build_tools_with_environment_and_security_snapshot, classify_tool_error,
 };
 use serde_json::{Value as JsonValue, json};
 use sha2::{Digest, Sha256};
@@ -3030,29 +3029,17 @@ async fn materialize_task_tooling(
     workspace_id: &str,
     thread_id: &str,
     turn_id: &str,
-) -> TaskToolMaterialization {
+) -> Result<TaskToolMaterialization, String> {
     let Some(provider) = provider else {
-        return TaskToolMaterialization::default();
+        return Ok(TaskToolMaterialization::default());
     };
-    match provider
+    provider
         .materialize_task_tools(TaskTurnContext {
             workspace_id: workspace_id.to_owned(),
             thread_id: thread_id.to_owned(),
             turn_id: turn_id.to_owned(),
         })
         .await
-    {
-        Ok(materialization) => materialization,
-        Err(error) => {
-            warn!(
-                thread_id,
-                turn_id,
-                error = error.as_str(),
-                "failed to materialize task orchestration tools"
-            );
-            TaskToolMaterialization::default()
-        }
-    }
 }
 
 async fn materialize_turn_tooling(
@@ -3629,7 +3616,10 @@ async fn execute_agent_provider_response(
             Some(provider.name().to_owned()),
         ),
     )
-    .await;
+    .await
+    .map_err(|_| {
+        ChatTurnError::Terminal("required prompt-context preparation failed".to_owned())
+    })?;
 
     let normalized_capabilities = normalize_turn_capabilities(capabilities);
 
@@ -3843,24 +3833,26 @@ async fn execute_agent_provider_response(
         }
     }
 
-    emit_capability_resolution_events(
-        event_tx.as_ref(),
-        workspace_id,
-        thread_id,
-        turn_id,
-        accepted_capabilities.as_slice(),
-        rejected_capabilities.as_slice(),
-        mcp_materialization.mcp_bindings.as_slice(),
-    )
-    .await?;
-    emit_mcp_resolution_diagnostics(
-        event_tx.as_ref(),
-        workspace_id,
-        thread_id,
-        turn_id,
-        mcp_materialization.diagnostics.as_slice(),
-    )
-    .await?;
+    if !provider_tool_calling {
+        emit_capability_resolution_events(
+            event_tx.as_ref(),
+            workspace_id,
+            thread_id,
+            turn_id,
+            accepted_capabilities.as_slice(),
+            rejected_capabilities.as_slice(),
+            mcp_materialization.mcp_bindings.as_slice(),
+        )
+        .await?;
+        emit_mcp_resolution_diagnostics(
+            event_tx.as_ref(),
+            workspace_id,
+            thread_id,
+            turn_id,
+            mcp_materialization.diagnostics.as_slice(),
+        )
+        .await?;
+    }
     let capability_diagnostics = capability_manifest_diagnostics(rejected_capabilities.as_slice());
 
     let mut skills_prompt = normalize_optional_prompt(Some(skills_resolution.prompt.clone()));
@@ -3873,6 +3865,9 @@ async fn execute_agent_provider_response(
             turn_id,
         )
         .await
+        .map_err(|_| {
+            ChatTurnError::Blocked("required task tooling could not be materialized".to_owned())
+        })?
     } else {
         TaskToolMaterialization::default()
     };
@@ -3989,7 +3984,12 @@ async fn execute_agent_provider_response(
                 &effective_prompt_context_set,
                 active_recall_input,
             )
-            .await;
+            .await
+            .map_err(|_| {
+                ChatTurnError::Terminal(
+                    "required post-preflight context preparation failed".to_owned(),
+                )
+            })?;
         }
 
         let effective_prompt_section_set = run_agent_turn_prompt_compile_hook_phase(
@@ -4247,47 +4247,39 @@ async fn execute_agent_provider_response(
         permission_profile.clone(),
     );
     let runtime_environment = runtime_environment.into_iter().collect::<BTreeMap<_, _>>();
-    let tools = match build_tools_with_environment_and_security_snapshot(
+    let tools = build_tools_with_environment_and_security_snapshot(
         workdir.clone(),
         turn_id.to_owned(),
         permission_context.clone(),
         tool_loop_config.web.clone(),
         tool_loop_config.computer_use.clone(),
         extension_bundles,
-        runtime_environment.clone(),
+        runtime_environment,
         execution_security_snapshot.clone(),
-    ) {
-        Ok(tools) => tools,
-        Err(error) => {
-            warn!(
-                thread_id,
-                turn_id,
-                error = %error,
-                "failed to build tool runtime with extensions; continuing with built-ins only"
-            );
-            build_tools_with_environment_and_security_snapshot(
-                workdir.clone(),
-                turn_id.to_owned(),
-                permission_context.clone(),
-                tool_loop_config.web.clone(),
-                tool_loop_config.computer_use.clone(),
-                Vec::new(),
-                runtime_environment,
-                execution_security_snapshot.clone(),
-            )
-            .unwrap_or_else(|_| {
-                build_builtin_tools_with_security_snapshot(
-                    workdir.clone(),
-                    turn_id.to_owned(),
-                    permission_context.clone(),
-                    tool_loop_config.web.clone(),
-                    tool_loop_config.computer_use.clone(),
-                    execution_security_snapshot,
-                )
-            })
-        }
-    }
+    )
+    .map_err(|_| {
+        ChatTurnError::Blocked("required tool runtime could not be constructed".to_owned())
+    })?
     .with_permission_approval_broker(permission_approval_broker);
+
+    emit_capability_resolution_events(
+        event_tx.as_ref(),
+        workspace_id,
+        thread_id,
+        turn_id,
+        accepted_capabilities.as_slice(),
+        rejected_capabilities.as_slice(),
+        mcp_materialization.mcp_bindings.as_slice(),
+    )
+    .await?;
+    emit_mcp_resolution_diagnostics(
+        event_tx.as_ref(),
+        workspace_id,
+        thread_id,
+        turn_id,
+        mcp_materialization.diagnostics.as_slice(),
+    )
+    .await?;
 
     // One trusted provider capability decision owns native filesystem-tool
     // visibility for this turn.  Apply it before preflight so the core index,
@@ -4457,7 +4449,10 @@ async fn execute_agent_provider_response(
             &effective_prompt_context_set,
             active_recall_input,
         )
-        .await;
+        .await
+        .map_err(|_| {
+            ChatTurnError::Terminal("required post-preflight context preparation failed".to_owned())
+        })?;
     }
 
     let effective_prompt_section_set = run_agent_turn_prompt_compile_hook_phase(

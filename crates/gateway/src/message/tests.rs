@@ -54954,7 +54954,7 @@ fn agents_doc_turn_prompt_uses_root_inheritance_and_folder_override() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn agent_skill_snapshot_failure_retries_the_gateway_path_without_overlay() {
+async fn agent_skill_snapshot_failure_preserves_overlay_and_retries_identical_payload() {
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
     let session_manager = Arc::new(SessionManager::new());
@@ -54980,11 +54980,11 @@ async fn agent_skill_snapshot_failure_retries_the_gateway_path_without_overlay()
         .await
         .expect("conditional Agent pin failure trigger must install");
 
-    let turn_id = "turn_agent_pin_fail_soft";
+    let turn_id = "turn_agent_pin_fail_closed";
     ensure_test_superuser_execution_turn(
         &processor,
         workspace_id.as_str(),
-        "thread_agent_pin_fail_soft",
+        "thread_agent_pin_fail_closed",
         turn_id,
     )
     .await;
@@ -55006,9 +55006,10 @@ async fn agent_skill_snapshot_failure_retries_the_gateway_path_without_overlay()
         text_elements: Vec::new(),
     }];
 
+    let accepted_overlay = overlay.clone();
     processor
         .persist_turn_runtime_snapshot_with_optional_agent_overlay(
-            "thread_agent_pin_fail_soft",
+            "thread_agent_pin_fail_closed",
             workspace_id.as_str(),
             turn_id,
             ThreadMode::Agent,
@@ -55025,21 +55026,56 @@ async fn agent_skill_snapshot_failure_retries_the_gateway_path_without_overlay()
             &mut overlay,
         )
         .await
-        .expect("optional Agent pin failure must preserve the base Gateway turn path");
+        .expect_err("required Agent pin persistence failure must abort preparation");
 
-    assert!(
-        overlay.is_empty(),
-        "the caller must receive the same base-only overlay used by the persisted snapshot"
+    assert_eq!(
+        overlay, accepted_overlay,
+        "persistence failure cannot weaken accepted skills"
     );
+    assert!(
+        crud_store
+            .get_turn_runtime_snapshot(turn_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    crud_store
+        .database_connection()
+        .execute_unprepared("DROP TRIGGER reject_gateway_agent_pin_snapshot")
+        .await
+        .unwrap();
+    processor
+        .persist_turn_runtime_snapshot_with_optional_agent_overlay(
+            "thread_agent_pin_fail_closed",
+            workspace_id.as_str(),
+            turn_id,
+            ThreadMode::Agent,
+            &pioneer_agent::AgentTurnHookRuntimeContext::default(),
+            "o4-mini",
+            "openai",
+            None,
+            &workspace_skill_policies,
+            input.as_slice(),
+            &[],
+            &[],
+            &runtime_environment,
+            &[],
+            &mut overlay,
+        )
+        .await
+        .expect("same payload may be retried after the transient storage fault clears");
+
+    assert_eq!(overlay, accepted_overlay);
     let snapshot = crud_store
         .get_turn_runtime_snapshot(turn_id)
         .await
-        .expect("base-only runtime snapshot lookup must succeed")
-        .expect("base-only runtime snapshot must be authoritative");
-    assert!(
-        snapshot.agent_skill_versions_json.is_none(),
-        "the fail-soft retry must not retain a partial Agent pin"
-    );
+        .unwrap()
+        .unwrap();
+    let restored =
+        crate::turn_runtime_snapshot::agent_skill_version_pins_from_snapshot(&snapshot).unwrap();
+    assert_eq!(restored.len(), 1);
+    assert_eq!(restored[0].version_id, overlay[0].version_id);
+    assert_eq!(restored[0].fingerprint, overlay[0].fingerprint);
 }
 
 async fn persist_agent_skill_snapshot_for_resolution_test(

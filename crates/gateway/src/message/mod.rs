@@ -4230,58 +4230,26 @@ impl MessageProcessor {
         resolved_artifacts: &[ResolvedArtifactInput],
         runtime_environment: &HashMap<String, String>,
         history: &[ChatMessage],
-        agent_skill_overlay: &mut Vec<pioneer_skills::AgentSkillRuntimeEntry>,
+        agent_skill_overlay: &[pioneer_skills::AgentSkillRuntimeEntry],
     ) -> anyhow::Result<()> {
-        match self
-            .persist_turn_runtime_snapshot(
-                thread_id,
-                workspace_id,
-                turn_id,
-                mode,
-                hook_runtime_context,
-                model,
-                provider_name,
-                reasoning_effort,
-                workspace_skill_policies,
-                input,
-                capabilities,
-                resolved_artifacts,
-                runtime_environment,
-                history,
-                agent_skill_overlay.as_slice(),
-            )
-            .await
-        {
-            Ok(()) => Ok(()),
-            Err(error) if !agent_skill_overlay.is_empty() => {
-                warn!(
-                    workspace_id,
-                    turn_id,
-                    error = %format!("{error:#}"),
-                    "failed to persist Agent skill pins; retrying authoritative base-only snapshot"
-                );
-                agent_skill_overlay.clear();
-                self.persist_turn_runtime_snapshot(
-                    thread_id,
-                    workspace_id,
-                    turn_id,
-                    mode,
-                    hook_runtime_context,
-                    model,
-                    provider_name,
-                    reasoning_effort,
-                    workspace_skill_policies,
-                    input,
-                    capabilities,
-                    resolved_artifacts,
-                    runtime_environment,
-                    history,
-                    &[],
-                )
-                .await
-            }
-            Err(error) => Err(error),
-        }
+        self.persist_turn_runtime_snapshot(
+            thread_id,
+            workspace_id,
+            turn_id,
+            mode,
+            hook_runtime_context,
+            model,
+            provider_name,
+            reasoning_effort,
+            workspace_skill_policies,
+            input,
+            capabilities,
+            resolved_artifacts,
+            runtime_environment,
+            history,
+            agent_skill_overlay,
+        )
+        .await
     }
 
     pub(crate) fn native_api_provider_supports_agent_skill_overlay(
