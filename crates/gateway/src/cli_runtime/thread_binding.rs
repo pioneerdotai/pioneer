@@ -2421,7 +2421,6 @@ mod tests {
         .await
         .unwrap();
         db.execute_unprepared(r#"INSERT INTO turn_input(id,turn_id,input_index,input_type,text,payload) VALUES ('message-input','message',0,'text','sent history','{"type":"text","text":"sent history","textElements":[]}')"#).await.unwrap();
-        db.execute_unprepared("INSERT INTO compaction_input_revision(source_id,turn_id,revision,present,capture_order) VALUES ('message-input','message',1,1,1)").await.unwrap();
         let input = store
             .compaction_source_metadata_page(
                 "ws_cli_binding",
@@ -2452,9 +2451,11 @@ mod tests {
             version: input.version,
         };
         db.execute_unprepared("UPDATE turn SET message_revision=1,message_deleted_at=CURRENT_TIMESTAMP WHERE id='message'").await.unwrap();
-        // Model the durable source revision/presence change made by Message
-        // deletion, so the existing current-source guard sees the real drift.
-        db.execute_unprepared("UPDATE compaction_input_revision SET revision=2,present=0 WHERE source_id='message-input'").await.unwrap();
+        // Let the deletion trigger update source revision/presence, so the
+        // existing current-source guard sees the actual delivered input drift.
+        db.execute_unprepared("DELETE FROM turn_input WHERE id='message-input'")
+            .await
+            .unwrap();
         let binding = store
             .get_cli_runtime_thread_binding("thread")
             .await
@@ -2553,7 +2554,15 @@ mod tests {
     async fn newer_unacknowledged_dispatch_prevents_deleted_message_skip() {
         let (store, _) = deleted_message_fixture().await;
         let db = store.database_connection();
-        db.execute_unprepared("INSERT INTO turn_cli_runtime_binding(turn_id,thread_id,continuation_thread_id,workspace_id,runtime_id,runtime_kind,native_thread_id,status,created_at,updated_at) SELECT 'uncertain-child','child',continuation_thread_id,workspace_id,runtime_id,runtime_kind,native_thread_id,'starting','1970-01-01 00:05:00+00:00','1970-01-01 00:05:00+00:00' FROM turn_cli_runtime_binding WHERE turn_id='cli'").await.unwrap();
+        // Bind dates through SeaORM, just as the accepted dispatch does. A
+        // hand-written date string can sort differently in SQLite's TEXT column.
+        db.execute_raw(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Sqlite,
+            "INSERT INTO turn_cli_runtime_binding(turn_id,thread_id,continuation_thread_id,workspace_id,runtime_id,runtime_kind,native_thread_id,status,created_at,updated_at) SELECT 'uncertain-child','child',continuation_thread_id,workspace_id,runtime_id,runtime_kind,native_thread_id,'starting',?,? FROM turn_cli_runtime_binding WHERE turn_id='cli'",
+            [unix_to_datetime(300).into(), unix_to_datetime(300).into()],
+        ))
+        .await
+        .unwrap();
         for status in ["starting", "failed", "interrupted", "completed"] {
             db.execute_unprepared(&format!("UPDATE turn_cli_runtime_binding SET status='{status}' WHERE turn_id='uncertain-child'")).await.unwrap();
             assert_eq!(resolve_message(&store).await.as_deref(), Some("message"));
@@ -2576,8 +2585,8 @@ mod tests {
                 "UPDATE turn_cli_runtime_attempt SET status='completed' WHERE turn_id='cli'",
             ),
             (
-                "UPDATE turn_execution SET status='running' WHERE turn_id='cli'",
-                "UPDATE turn_execution SET status='completed' WHERE turn_id='cli'",
+                "UPDATE turn_execution SET status='running',completed_at=NULL WHERE turn_id='cli'",
+                "UPDATE turn_execution SET status='completed',completed_at=started_at WHERE turn_id='cli'",
             ),
             (
                 "UPDATE turn_cli_runtime_attempt SET native_turn_id=NULL WHERE turn_id='cli'",

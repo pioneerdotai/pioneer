@@ -32150,6 +32150,15 @@ async fn detached_composer_work_matches_full_parent_llm_request_end_to_end_impl(
         tool_loop_config,
     )
     .await;
+    // Compare both routes against fixed history. Background episodic recall
+    // can index a current user message for one route before the other starts.
+    harness
+        .processor
+        .apply_thread_episodic_runtime_config(crate::thread_episodic::ThreadEpisodicRuntimeConfig {
+            recall_enabled: false,
+            ..Default::default()
+        })
+        .await;
     harness.processor.bind_task_bridge().await;
     harness.processor.start_task_event_listener().await;
 
