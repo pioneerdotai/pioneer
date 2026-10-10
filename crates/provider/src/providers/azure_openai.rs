@@ -389,7 +389,7 @@ impl AzureOpenAiProvider {
         self
     }
 
-    fn validate_connection(&self, requires_deployment: bool) -> Result<()> {
+    pub(crate) fn validate_connection(&self, requires_deployment: bool) -> Result<()> {
         if self.base_url.is_none()
             && (self.resource_name.is_empty()
                 || !self

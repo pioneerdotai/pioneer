@@ -246,28 +246,25 @@ fn create_provider_with_timeout_policy_inner(
             let resource = std::env::var("AZURE_OPENAI_RESOURCE").unwrap_or_default();
             let deployment = std::env::var("AZURE_OPENAI_DEPLOYMENT").unwrap_or_default();
             let version = std::env::var("AZURE_OPENAI_API_VERSION").ok();
-            if let Some(base_url) = base_url {
-                Ok(Box::new(
-                    AzureOpenAiProvider::with_base_url_and_timeout_policy(
-                        api_key,
-                        resource,
-                        deployment,
-                        base_url,
-                        timeout_policy,
-                    )
-                    .with_version_override(version.as_deref()),
-                ))
+            let provider = if let Some(base_url) = base_url {
+                AzureOpenAiProvider::with_base_url_and_timeout_policy(
+                    api_key,
+                    resource,
+                    deployment,
+                    base_url,
+                    timeout_policy,
+                )
             } else {
-                Ok(Box::new(
-                    AzureOpenAiProvider::with_timeout_policy(
-                        api_key,
-                        resource,
-                        deployment,
-                        timeout_policy,
-                    )
-                    .with_version_override(version.as_deref()),
-                ))
+                AzureOpenAiProvider::with_timeout_policy(
+                    api_key,
+                    resource,
+                    deployment,
+                    timeout_policy,
+                )
             }
+            .with_version_override(version.as_deref());
+            provider.validate_connection(true)?;
+            Ok(Box::new(provider))
         }
 
         "deepseek" => Ok(Box::new(
