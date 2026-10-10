@@ -1119,6 +1119,30 @@ pub async fn find_turn_binding<C: ConnectionTrait>(
         .transpose()
 }
 
+/// A receipt cannot rule out a newer dispatch (including an unknown RPC
+/// outcome). Use the continuation-owner index and return only one identifier;
+/// never load or parse the thread's older input mappings. Timestamp ties are
+/// deliberately inconclusive.
+pub async fn has_dispatch_at_or_after<C: ConnectionTrait>(
+    db: &C,
+    source: &CliRuntimeTurnBindingRecord,
+) -> Result<bool> {
+    use turn_cli_runtime_binding::Column;
+    Ok(turn_cli_runtime_binding::Entity::find()
+        .select_only()
+        .column(Column::TurnId)
+        .filter(Column::WorkspaceId.eq(source.workspace_id.clone()))
+        .filter(Column::RuntimeId.eq(source.runtime_id.clone()))
+        .filter(Column::ContinuationThreadId.eq(source.continuation_thread_id.clone()))
+        .filter(Column::CreatedAt.gte(source.created_at))
+        .filter(Column::TurnId.ne(source.turn_id.clone()))
+        .into_tuple::<String>()
+        .one(db)
+        .await
+        .context("failed to check newer CLI dispatch evidence")?
+        .is_some())
+}
+
 pub async fn set_turn_mcp_metadata<C: ConnectionTrait>(
     db: &C,
     turn_id: &str,

@@ -341,7 +341,8 @@ struct CliRuntimeResumeCursor {
 
 const TURN_INPUT_CONTEXT_BASIS_FIELD: &str = "pioneerContextBasis";
 
-/// Resolve the provider frontier past attempts that stopped before dispatch.
+/// Resolve the predecessor past attempts that stopped before dispatch and
+/// deleted Message turns proved absent from the provider's delivered context.
 /// The caller holds the continuation lease. A durable CLI binding/attempt is
 /// written before provider start; its presence forbids skipping an uncertain RPC.
 pub(crate) async fn previous_delivered_parent_turn(
@@ -358,6 +359,10 @@ pub(crate) async fn previous_delivered_parent_turn(
             TurnStatus::Blocked | TurnStatus::Failed | TurnStatus::Interrupted
         )
     };
+    // Decode the current receipt and its one sent mapping at most once, even
+    // when several adjacent Messages were deleted. This is delivery evidence,
+    // not another search for a provider continuation frontier.
+    let mut delivered_message_turns = None;
     for _ in 0..16 {
         let Some(id) = previous.as_deref() else {
             return Ok(None);
@@ -366,6 +371,34 @@ pub(crate) async fn previous_delivered_parent_turn(
             .get_turn(thread, id)
             .await?
             .context("CLI predecessor missing")?;
+        if turn.turn_kind == TurnKind::Conversation
+            && turn.mode == pioneer_protocol::ThreadMode::Message
+            && turn.status == TurnStatus::Completed
+            && turn.message_deleted
+        {
+            if store.get_turn_execution(id).await?.is_some()
+                || store.get_cli_runtime_turn_binding(id).await?.is_some()
+                || store.latest_cli_runtime_turn_attempt(id).await?.is_some()
+            {
+                return Ok(previous);
+            }
+            if delivered_message_turns.is_none() {
+                delivered_message_turns = Some(message_delivery_evidence(store, thread).await?);
+            }
+            if !delivered_message_turns.as_ref().is_some_and(|evidence| {
+                evidence
+                    .as_ref()
+                    .is_some_and(|turns| !turns.contains(&(thread.to_owned(), id.to_owned())))
+            }) {
+                return Ok(previous);
+            }
+            previous = store
+                .turn_before_launch_and_intervening_by_creation_order(thread, id, id)
+                .await?
+                .context("CLI predecessor Message order missing")?
+                .0;
+            continue;
+        }
         if !unsuccessful(turn.status) || turn.message_revision != 0 || turn.message_deleted {
             return Ok(previous);
         }
@@ -449,6 +482,143 @@ pub(crate) async fn previous_delivered_parent_turn(
             .0;
     }
     bail!("too many undispatched CLI attempts; continuation requires inspection")
+}
+
+/// Only a complete modern receipt, corroborated by its durable sent mapping
+/// and terminal execution/attempt, can prove negative Message delivery. A
+/// later durable dispatch fence makes the receipt inconclusive, even without
+/// an acknowledgement or native turn ID. The caller still validates the
+/// resolved predecessor's entire basis and revalidates it before dispatch.
+async fn message_delivery_evidence(
+    store: &CrudStore,
+    thread: &str,
+) -> Result<Option<std::collections::BTreeSet<(String, String)>>> {
+    let Some(binding) = store.get_cli_runtime_thread_binding(thread).await? else {
+        return Ok(None);
+    };
+    let cursor =
+        deserialize_cli_runtime_json::<CliRuntimeResumeCursor>(&binding.resume_cursor_json)?;
+    let Some(receipt) = cursor.pioneer_context else {
+        return Ok(None);
+    };
+    if binding.status != "active"
+        || receipt.version != CONTEXT_RECEIPT_VERSION
+        || receipt.native_thread_id != binding.native_thread_id
+        || receipt.completed_turn_id.as_deref() != Some(receipt.accepted_turn_id.as_str())
+        || receipt.context_owner_thread_id.is_none()
+        || receipt.context_history_json.is_none()
+    {
+        return Ok(None);
+    }
+    let Some(source) = store
+        .get_cli_runtime_turn_binding(&receipt.accepted_turn_id)
+        .await?
+    else {
+        return Ok(None);
+    };
+    if source.status != "completed"
+        || source.native_turn_id.is_none()
+        || source.continuation_thread_id != thread
+        || source.workspace_id != binding.workspace_id
+        || source.runtime_id != binding.runtime_id
+        || source.runtime_kind != binding.runtime_kind
+        || source.native_thread_id != binding.native_thread_id
+        || store.has_cli_runtime_dispatch_at_or_after(&source).await?
+    {
+        return Ok(None);
+    }
+    if !store
+        .get_turn_execution(&source.turn_id)
+        .await?
+        .is_some_and(|execution| {
+            execution.executor_kind == pioneer_crud::TurnExecutorKind::CliRuntime
+                && execution.status == pioneer_crud::TurnExecutionStatus::Completed
+        })
+        || !store
+            .latest_cli_runtime_turn_attempt(&source.turn_id)
+            .await?
+            .is_some_and(|attempt| {
+                attempt.status == pioneer_crud::CliRuntimeTurnAttemptStatus::Completed
+                    && attempt.runtime_id == source.runtime_id
+                    && attempt.runtime_kind == source.runtime_kind
+                    && attempt.native_thread_id == source.native_thread_id
+                    && attempt.native_turn_id == source.native_turn_id
+            })
+    {
+        return Ok(None);
+    }
+    let Some(sent) = sent_context_basis_from_input_mapping(&source.input_mapping_json)? else {
+        return Ok(None);
+    };
+    if sent.pending_turn.turn_id != receipt.accepted_turn_id
+        || sent
+            .pending_turn
+            .thread_id
+            .as_deref()
+            .unwrap_or(&sent.completed.execution_thread_id)
+            != source.thread_id
+        || sent.pending_turn.message_revision != receipt.accepted_turn_revision
+        || sent.pending_turn.message_deleted != receipt.accepted_turn_deleted
+        || receipt.context_owner_thread_id.as_deref()
+            != Some(sent.completed.execution_thread_id.as_str())
+        || receipt.context_history_json.as_deref() != Some(sent.completed.history_json.as_str())
+    {
+        return Ok(None);
+    }
+    let descriptor: pioneer_compaction::frozen::FrozenHistoryRef =
+        serde_json::from_str(&sent.completed.history_json)?;
+    if descriptor.messages > 0
+        && (sent.completed.delivered_sources.is_empty() || receipt.delivered_sources.is_empty())
+    {
+        return Ok(None);
+    }
+    let sources = receipt
+        .delivered_sources
+        .iter()
+        .chain(&sent.completed.delivered_sources)
+        .map(|source| {
+            (
+                source.source_thread_id.clone(),
+                pioneer_compaction::SourceRef {
+                    scope: source.scope.clone(),
+                    id: source.id.clone(),
+                    version: source.version.clone(),
+                },
+            )
+        })
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let Some(mut turns) = crate::compaction::frozen::provider_history_source_turns(
+        store,
+        &binding.workspace_id,
+        &sources,
+    )
+    .await?
+    else {
+        return Ok(None);
+    };
+    turns.insert((source.thread_id, receipt.accepted_turn_id));
+    if let Some(head) = receipt.continuation_head {
+        turns.insert((
+            head.thread_id.unwrap_or_else(|| thread.to_owned()),
+            head.turn_id,
+        ));
+    }
+    for delivered in receipt
+        .delivered_turns
+        .iter()
+        .chain(&sent.completed.delivered_turns)
+    {
+        turns.insert((
+            delivered
+                .thread_id
+                .clone()
+                .unwrap_or_else(|| sent.completed.execution_thread_id.clone()),
+            delivered.turn_id.clone(),
+        ));
+    }
+    Ok(Some(turns))
 }
 
 pub(crate) fn provider_receipt_head_state(
@@ -1972,7 +2142,7 @@ mod tests {
         NewCliRuntimeThreadBinding,
     };
     use sea_orm::entity::prelude::DateTimeWithTimeZone;
-    use sea_orm::{Database, DatabaseConnection};
+    use sea_orm::{ConnectionTrait, Database, DatabaseConnection};
     use serde_json::json;
     use std::sync::Mutex;
     use std::time::Duration;
@@ -2075,6 +2245,398 @@ mod tests {
         chrono::DateTime::from_timestamp(timestamp, 0)
             .expect("valid timestamp")
             .fixed_offset()
+    }
+
+    async fn deleted_message_fixture() -> (CrudStore, FakeCliRuntimeThreadClient) {
+        let (_connection, store) = setup_store().await;
+        let db = store.database_connection();
+        for sql in [
+            "INSERT INTO workspace(id,name,is_active,is_current) VALUES ('ws_cli_binding','fixture',1,1)",
+            "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES ('thread','ws_cli_binding','','agent','gpt-5','cli_runtime:codex','active','user','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+            "INSERT INTO turn(id,thread_id,status,turn_kind,origin,send_mode,created_at,updated_at) VALUES ('cli','thread','completed','conversation','user','agent','1970-01-01 00:01:40+00:00','1970-01-01 00:01:40+00:00')",
+            "INSERT INTO turn(id,thread_id,status,turn_kind,origin,send_mode,message_revision,message_deleted_at,created_at,updated_at) VALUES ('message','thread','completed','conversation','user','message',1,CURRENT_TIMESTAMP,'1970-01-01 00:03:20+00:00','1970-01-01 00:03:20+00:00')",
+            "INSERT INTO turn_execution(turn_id,thread_id,workspace_id,executor_kind,status,owner_id,owner_generation,lease_until,heartbeat_at,started_at,completed_at,created_at,updated_at) SELECT id,thread_id,'ws_cli_binding','cli_runtime','completed','fixture',1,created_at,created_at,created_at,updated_at,created_at,updated_at FROM turn WHERE id='cli'",
+            "INSERT INTO turn_cli_runtime_attempt(id,turn_id,attempt_index,runtime_id,runtime_kind,native_thread_id,native_turn_id,status,started_at,completed_at,created_at,updated_at) SELECT 'attempt',id,0,'codex','codex','cli-thread-started','provider-cli','completed',created_at,updated_at,created_at,updated_at FROM turn WHERE id='cli'",
+        ] {
+            db.execute_unprepared(sql).await.unwrap();
+        }
+        let client = FakeCliRuntimeThreadClient::new();
+        *client.resume_result.lock().unwrap() = Ok(open_snapshot("cli-thread-started"));
+        open_cli_runtime_thread_binding(&store, &client, open_request("thread", 100))
+            .await
+            .unwrap();
+        let descriptor = pioneer_compaction::frozen::FrozenHistoryRef {
+            format: 1,
+            manifest_id: "empty-cli-history".into(),
+            messages: 0,
+            identity_sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                .into(),
+        };
+        store
+            .compaction_begin_frozen_history("ws_cli_binding", "thread", &descriptor)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .compaction_finish_frozen_history("ws_cli_binding", "thread", &descriptor)
+                .await
+                .unwrap()
+        );
+        let sent = super::CliRuntimeSentContextBasis {
+            completed: super::cli_runtime_context_basis(
+                "thread",
+                "thread",
+                serde_json::to_string(&descriptor).unwrap(),
+                &[],
+            ),
+            pending_turn: super::CliRuntimeDeliveredTurn {
+                turn_id: "cli".into(),
+                thread_id: Some("thread".into()),
+                message_revision: 0,
+                message_deleted: false,
+            },
+        };
+        store
+            .upsert_cli_runtime_turn_binding(pioneer_crud::NewCliRuntimeTurnBinding {
+                turn_id: "cli".into(),
+                thread_id: "thread".into(),
+                continuation_thread_id: "thread".into(),
+                workspace_id: "ws_cli_binding".into(),
+                runtime_id: "codex".into(),
+                runtime_kind: "codex".into(),
+                native_thread_id: "cli-thread-started".into(),
+                native_turn_id: Some("provider-cli".into()),
+                request_id: None,
+                status: "completed".into(),
+                model: Some("gpt-5".into()),
+                cwd: Some("/tmp/project".into()),
+                sandbox_json: None,
+                approval_policy: None,
+                input_mapping_json: super::persist_sent_context_basis_in_input_mapping(
+                    r#"{"input":[]}"#,
+                    &sent,
+                )
+                .unwrap(),
+                created_at: unix_to_datetime(100),
+                updated_at: unix_to_datetime(100),
+            })
+            .await
+            .unwrap();
+        super::record_cli_runtime_completed_context(
+            &store,
+            "thread",
+            "cli-thread-started",
+            sent.pending_turn.clone(),
+            sent,
+            unix_to_datetime(100),
+        )
+        .await
+        .unwrap();
+        (store, client)
+    }
+
+    async fn resolve_message(store: &CrudStore) -> Option<String> {
+        super::previous_delivered_parent_turn(store, "thread", Some("message".into()))
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn deleted_undelivered_message_keeps_confirmed_cli_session() {
+        let (store, client) = deleted_message_fixture().await;
+        assert_eq!(resolve_message(&store).await.as_deref(), Some("cli"));
+        store.database_connection().execute_unprepared("INSERT INTO turn(id,thread_id,status,turn_kind,origin,send_mode,message_revision,message_deleted_at,created_at,updated_at) SELECT 'message-two',thread_id,status,turn_kind,origin,send_mode,message_revision,message_deleted_at,'1970-01-01 00:04:10+00:00',updated_at FROM turn WHERE id='message'").await.unwrap();
+        assert_eq!(
+            super::previous_delivered_parent_turn(&store, "thread", Some("message-two".into()))
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("cli")
+        );
+        let binding = store
+            .get_cli_runtime_thread_binding("thread")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            binding_has_current_context(
+                &store,
+                &binding,
+                "ws_cli_binding",
+                "thread",
+                Some(("cli", 0, false))
+            )
+            .await
+            .unwrap()
+        );
+        let resumed = open_cli_runtime_thread_binding(&store, &client, open_request("thread", 300))
+            .await
+            .unwrap();
+        assert_eq!(resumed.mode, CLIAgentRuntimeThreadBindingOpenMode::Resumed);
+        assert_eq!(resumed.binding.native_thread_id, binding.native_thread_id);
+        assert_eq!(client.starts.lock().unwrap().len(), 1);
+        assert_eq!(client.resumes.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn deleted_directly_delivered_message_keeps_head_conflict_check() {
+        let (store, _) = deleted_message_fixture().await;
+        store.database_connection().execute_unprepared(
+            "INSERT INTO turn_cli_runtime_binding(turn_id,thread_id,continuation_thread_id,workspace_id,runtime_id,runtime_kind,native_thread_id,native_turn_id,status,created_at,updated_at) SELECT 'message',thread_id,continuation_thread_id,workspace_id,runtime_id,runtime_kind,native_thread_id,'provider-message','completed',created_at,updated_at FROM turn_cli_runtime_binding WHERE turn_id='cli'",
+        ).await.unwrap();
+        assert_eq!(resolve_message(&store).await.as_deref(), Some("message"));
+        let mut binding = store
+            .get_cli_runtime_thread_binding("thread")
+            .await
+            .unwrap()
+            .unwrap();
+        let mut cursor: serde_json::Value =
+            serde_json::from_str(&binding.resume_cursor_json).unwrap();
+        cursor["pioneerContext"]["acceptedTurnId"] = json!("message");
+        cursor["pioneerContext"]["completedTurnId"] = json!("message");
+        binding.resume_cursor_json = serde_json::to_string(&cursor).unwrap();
+        assert!(
+            provider_receipt_conflicts_with_head(&binding, Some(("message", 1, true))).unwrap()
+        );
+        assert!(
+            !binding_has_current_context(
+                &store,
+                &binding,
+                "ws_cli_binding",
+                "thread",
+                Some(("message", 1, true))
+            )
+            .await
+            .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn deleted_message_in_sent_history_is_not_skipped() {
+        let (store, _) = deleted_message_fixture().await;
+        let db = store.database_connection();
+        db.execute_unprepared(
+            "UPDATE turn SET message_revision=0,message_deleted_at=NULL WHERE id='message'",
+        )
+        .await
+        .unwrap();
+        db.execute_unprepared(r#"INSERT INTO turn_input(id,turn_id,input_index,input_type,text,payload) VALUES ('message-input','message',0,'text','sent history','{"type":"text","text":"sent history","textElements":[]}')"#).await.unwrap();
+        let input = store
+            .compaction_source_metadata_page(
+                "ws_cli_binding",
+                "thread",
+                "message",
+                pioneer_crud::compaction::PagedSource::Input,
+                0,
+            )
+            .await
+            .unwrap()
+            .entries
+            .remove(0)
+            .reference;
+        assert!(
+            store
+                .compaction_sources_current(
+                    "ws_cli_binding",
+                    "thread",
+                    std::slice::from_ref(&input)
+                )
+                .await
+                .unwrap()
+        );
+        let source = super::CliRuntimeDeliveredSource {
+            source_thread_id: "thread".into(),
+            scope: input.scope,
+            id: input.id,
+            version: input.version,
+        };
+        db.execute_unprepared("UPDATE turn SET message_revision=1,message_deleted_at=CURRENT_TIMESTAMP WHERE id='message'").await.unwrap();
+        // Let the deletion trigger update source revision/presence, so the
+        // existing current-source guard sees the actual delivered input drift.
+        db.execute_unprepared("DELETE FROM turn_input WHERE id='message-input'")
+            .await
+            .unwrap();
+        let binding = store
+            .get_cli_runtime_thread_binding("thread")
+            .await
+            .unwrap()
+            .unwrap();
+        let mut cursor: serde_json::Value =
+            serde_json::from_str(&binding.resume_cursor_json).unwrap();
+        // The Message has no execution of its own. Its input was part of a
+        // later provider request's history, with the original sent revision.
+        cursor["pioneerContext"]["deliveredSources"] = json!([source.clone()]);
+        store
+            .update_cli_runtime_thread_resume_cursor(
+                "thread",
+                &binding.native_thread_id,
+                &binding.resume_cursor_json,
+                serde_json::to_string(&cursor).unwrap(),
+                unix_to_datetime(300),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resolve_message(&store).await.as_deref(), Some("message"));
+        let updated = store
+            .get_cli_runtime_thread_binding("thread")
+            .await
+            .unwrap()
+            .unwrap();
+        let basis = super::completed_context_basis_from_binding(&updated)
+            .unwrap()
+            .unwrap();
+        assert!(
+            !super::completed_context_basis_is_current(&store, "ws_cli_binding", &basis)
+                .await
+                .unwrap()
+        );
+        // Also consult the durable sent mapping when the receipt lacks this
+        // source, rather than treating one absent receipt entry as proof.
+        let turn_binding = store
+            .get_cli_runtime_turn_binding("cli")
+            .await
+            .unwrap()
+            .unwrap();
+        let mut mapping: serde_json::Value =
+            serde_json::from_str(&turn_binding.input_mapping_json).unwrap();
+        mapping["pioneerContextBasis"]["deliveredSources"] = json!([source]);
+        db.execute_raw(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Sqlite,
+            "UPDATE turn_cli_runtime_binding SET input_mapping_json=? WHERE turn_id='cli'",
+            [serde_json::to_string(&mapping).unwrap().into()],
+        ))
+        .await
+        .unwrap();
+        cursor["pioneerContext"]["deliveredSources"] = json!([]);
+        store
+            .update_cli_runtime_thread_resume_cursor(
+                "thread",
+                &updated.native_thread_id,
+                &updated.resume_cursor_json,
+                serde_json::to_string(&cursor).unwrap(),
+                unix_to_datetime(301),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resolve_message(&store).await.as_deref(), Some("message"));
+    }
+
+    #[tokio::test]
+    async fn ordinary_message_native_and_completed_task_are_not_skipped() {
+        let (store, _) = deleted_message_fixture().await;
+        let db = store.database_connection();
+        for (change, restore) in [
+            (
+                "UPDATE turn SET message_deleted_at=NULL WHERE id='message'",
+                "UPDATE turn SET message_deleted_at=CURRENT_TIMESTAMP WHERE id='message'",
+            ),
+            (
+                "UPDATE turn SET send_mode='agent' WHERE id='message'",
+                "UPDATE turn SET send_mode='message' WHERE id='message'",
+            ),
+            (
+                "UPDATE turn SET turn_kind='task_run' WHERE id='message'",
+                "UPDATE turn SET turn_kind='conversation' WHERE id='message'",
+            ),
+            (
+                "INSERT INTO turn_execution(turn_id,thread_id,workspace_id,executor_kind,status,owner_id,owner_generation,lease_until,heartbeat_at,started_at,completed_at,created_at,updated_at) SELECT 'message',thread_id,workspace_id,'native_agent',status,owner_id,owner_generation,lease_until,heartbeat_at,started_at,completed_at,created_at,updated_at FROM turn_execution WHERE turn_id='cli'",
+                "DELETE FROM turn_execution WHERE turn_id='message'",
+            ),
+        ] {
+            db.execute_unprepared(change).await.unwrap();
+            assert_eq!(resolve_message(&store).await.as_deref(), Some("message"));
+            db.execute_unprepared(restore).await.unwrap();
+        }
+        assert_eq!(resolve_message(&store).await.as_deref(), Some("cli"));
+    }
+
+    #[tokio::test]
+    async fn newer_unacknowledged_dispatch_prevents_deleted_message_skip() {
+        let (store, _) = deleted_message_fixture().await;
+        let db = store.database_connection();
+        // Bind dates through SeaORM, just as the accepted dispatch does. A
+        // hand-written date string can sort differently in SQLite's TEXT column.
+        db.execute_raw(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Sqlite,
+            "INSERT INTO turn_cli_runtime_binding(turn_id,thread_id,continuation_thread_id,workspace_id,runtime_id,runtime_kind,native_thread_id,status,created_at,updated_at) SELECT 'uncertain-child','child',continuation_thread_id,workspace_id,runtime_id,runtime_kind,native_thread_id,'starting',?,? FROM turn_cli_runtime_binding WHERE turn_id='cli'",
+            [unix_to_datetime(300).into(), unix_to_datetime(300).into()],
+        ))
+        .await
+        .unwrap();
+        for status in ["starting", "failed", "interrupted", "completed"] {
+            db.execute_unprepared(&format!("UPDATE turn_cli_runtime_binding SET status='{status}' WHERE turn_id='uncertain-child'")).await.unwrap();
+            assert_eq!(resolve_message(&store).await.as_deref(), Some("message"));
+        }
+        db.execute_unprepared("UPDATE turn_cli_runtime_binding SET created_at=(SELECT created_at FROM turn_cli_runtime_binding WHERE turn_id='cli') WHERE turn_id='uncertain-child'").await.unwrap();
+        assert_eq!(
+            resolve_message(&store).await.as_deref(),
+            Some("message"),
+            "timestamp ties are inconclusive"
+        );
+    }
+
+    #[tokio::test]
+    async fn incomplete_delivery_evidence_does_not_skip_deleted_message() {
+        let (store, _) = deleted_message_fixture().await;
+        let db = store.database_connection();
+        for (change, restore) in [
+            (
+                "UPDATE turn_cli_runtime_attempt SET status='running' WHERE turn_id='cli'",
+                "UPDATE turn_cli_runtime_attempt SET status='completed' WHERE turn_id='cli'",
+            ),
+            (
+                "UPDATE turn_execution SET status='running',completed_at=NULL WHERE turn_id='cli'",
+                "UPDATE turn_execution SET status='completed',completed_at=started_at WHERE turn_id='cli'",
+            ),
+            (
+                "UPDATE turn_cli_runtime_attempt SET native_turn_id=NULL WHERE turn_id='cli'",
+                "UPDATE turn_cli_runtime_attempt SET native_turn_id='provider-cli' WHERE turn_id='cli'",
+            ),
+        ] {
+            db.execute_unprepared(change).await.unwrap();
+            assert_eq!(resolve_message(&store).await.as_deref(), Some("message"));
+            db.execute_unprepared(restore).await.unwrap();
+        }
+        let source = store
+            .get_cli_runtime_turn_binding("cli")
+            .await
+            .unwrap()
+            .unwrap();
+        db.execute_unprepared("UPDATE turn_cli_runtime_binding SET input_mapping_json=json_remove(input_mapping_json,'$.pioneerContextBasis') WHERE turn_id='cli'").await.unwrap();
+        assert_eq!(resolve_message(&store).await.as_deref(), Some("message"));
+        db.execute_raw(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Sqlite,
+            "UPDATE turn_cli_runtime_binding SET input_mapping_json=? WHERE turn_id='cli'",
+            [source.input_mapping_json.into()],
+        ))
+        .await
+        .unwrap();
+        assert_eq!(resolve_message(&store).await.as_deref(), Some("cli"));
+        db.execute_unprepared("DELETE FROM turn_cli_runtime_attempt WHERE turn_id='cli'")
+            .await
+            .unwrap();
+        assert_eq!(resolve_message(&store).await.as_deref(), Some("message"));
+    }
+
+    #[tokio::test]
+    async fn deleted_message_skip_preserves_undispatched_cli_attempt_skip() {
+        let (store, _) = deleted_message_fixture().await;
+        let db = store.database_connection();
+        db.execute_unprepared("INSERT INTO turn(id,thread_id,status,turn_kind,origin,send_mode,created_at,updated_at) VALUES ('undispatched','thread','blocked','conversation','user','agent','1970-01-01 00:02:30+00:00','1970-01-01 00:02:30+00:00')").await.unwrap();
+        db.execute_unprepared("INSERT INTO turn_execution(turn_id,thread_id,workspace_id,executor_kind,status,owner_id,owner_generation,lease_until,heartbeat_at,started_at,completed_at,created_at,updated_at) SELECT 'undispatched',thread_id,workspace_id,executor_kind,'blocked',owner_id,owner_generation,lease_until,heartbeat_at,started_at,completed_at,created_at,updated_at FROM turn_execution WHERE turn_id='cli'").await.unwrap();
+        for status in ["blocked", "failed", "interrupted"] {
+            db.execute_unprepared(&format!(
+                "UPDATE turn SET status='{status}' WHERE id='undispatched'"
+            ))
+            .await
+            .unwrap();
+            db.execute_unprepared(&format!(
+                "UPDATE turn_execution SET status='{status}' WHERE turn_id='undispatched'"
+            ))
+            .await
+            .unwrap();
+            assert_eq!(resolve_message(&store).await.as_deref(), Some("cli"));
+        }
     }
 
     #[test]
