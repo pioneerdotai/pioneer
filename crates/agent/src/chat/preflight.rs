@@ -263,6 +263,7 @@ pub(crate) struct PreflightUsageContext {
     pub workspace: String,
     pub thread: String,
     pub turn: String,
+    pub window_index: u32,
 }
 
 #[derive(Clone)]
@@ -295,8 +296,38 @@ pub(crate) struct TurnPreflightOrchestratorInput {
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct TurnPreflightOrchestratorResult {
+    pub publication_failure: Option<pioneer_protocol::TurnFailureDisposition>,
+    pub usage: PreflightBudgetUsage,
     pub local_modules: TurnPreflightLocalModulePlans,
     pub plan: TurnPreflightPlan,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct PreflightBudgetUsage {
+    pub attempts: u32,
+    pub known_tokens: u64,
+    pub unknown: bool,
+}
+
+impl PreflightBudgetUsage {
+    fn observe(&mut self, usage: Option<&PreflightAttemptUsage>) {
+        self.attempts = self.attempts.saturating_add(1);
+        match usage.filter(|usage| usage.schema_version == 1) {
+            Some(usage) => {
+                self.known_tokens = self.known_tokens.saturating_add(usage.known_tokens);
+                self.unknown |= !usage.available;
+            }
+            None => self.unknown = true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct PreflightAttemptUsage {
+    pub schema_version: u32,
+    pub known_tokens: u64,
+    pub available: bool,
 }
 
 pub(crate) async fn run_turn_preflight_orchestrator(
@@ -347,9 +378,29 @@ pub(crate) async fn run_turn_preflight_orchestrator(
         )),
     };
 
+    let mut usage = PreflightBudgetUsage::default();
+    match &provider_result {
+        TurnPreflightProviderCallResult::Success(success) => {
+            usage.observe(success.provider_call.provider_usage.as_ref())
+        }
+        TurnPreflightProviderCallResult::Failure(failure) => {
+            for attempt in &failure.attempts {
+                usage.observe(attempt.provider_call.provider_usage.as_ref());
+            }
+        }
+    }
+    let publication_failure = match &provider_result {
+        TurnPreflightProviderCallResult::Success(_) => None,
+        TurnPreflightProviderCallResult::Failure(failure) => failure
+            .attempts
+            .iter()
+            .find_map(|attempt| attempt.publication_failure),
+    };
     let plan = compose_turn_preflight_plan(&local_modules, provider_result);
 
     TurnPreflightOrchestratorResult {
+        publication_failure,
+        usage,
         local_modules,
         plan,
     }
@@ -435,6 +486,7 @@ pub(crate) struct TurnPreflightProviderFailure {
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct TurnPreflightProviderAttemptFailure {
+    pub publication_failure: Option<pioneer_protocol::TurnFailureDisposition>,
     pub fallback_reason: TurnPreflightFallbackReason,
     pub diagnostic: TurnPreflightDiagnostic,
     pub provider_call: TurnPreflightProviderCallMetadata,
@@ -747,59 +799,68 @@ async fn call_turn_preflight_provider_once(
     let observation = super::provider::ProviderAttemptObservation::new(
         endpoint.provider.as_ref(),
         &endpoint.model,
-    );
-    if let Some(context) = usage_context {
-        if observation
-            .publish(
-                &context.events,
-                &context.workspace,
-                &context.thread,
-                &context.turn,
-                None,
-            )
-            .await
-            .is_err()
-        {
-            return Err(turn_preflight_attempt_failure(
-                TurnPreflightFallbackReason::ProviderError,
-                "preflight.usage.persistence_failed",
-                "usage observation could not be persisted".into(),
-                endpoint,
-                attempt,
-                input_chars,
-                0,
-                elapsed_ms(started),
-            ));
-        }
-    }
-    let response = tokio::time::timeout(
-        Duration::from_millis(timeout_ms.max(1)),
-        request_turn_preflight_provider_json(
-            endpoint.provider.as_ref(),
-            request,
-            Some(&observation),
-            max_output_chars,
-            attempt,
-        ),
     )
-    .await;
-
-    if let Some(context) = usage_context {
-        if observation
-            .publish(
-                &context.events,
-                &context.workspace,
-                &context.thread,
-                &context.turn,
-                Some(matches!(&response, Ok(Ok(_)))),
+    .with_window_index(usage_context.map(|context| context.window_index));
+    let observation = if let Some(context) = usage_context {
+        observation.with_publication(
+            &context.events,
+            &context.workspace,
+            &context.thread,
+            &context.turn,
+        )
+    } else {
+        observation
+    };
+    let duration = Duration::from_millis(timeout_ms.max(1));
+    let mut policy = pioneer_provider::ProviderTimeoutPolicy::default();
+    policy.first_chunk_timeout = duration;
+    policy.non_stream_request_timeout = duration;
+    policy.max_stream_duration = Some(duration);
+    let context = observation
+        .context(policy, endpoint.provider.capabilities().streaming)
+        .map_err(|_| {
+            turn_preflight_attempt_failure(
+                TurnPreflightFallbackReason::ValidationError,
+                "preflight.timeout_policy.invalid",
+                "preflight timeout policy is invalid".into(),
+                endpoint,
+                attempt,
+                input_chars,
+                0,
+                elapsed_ms(started),
             )
-            .await
-            .is_err()
-        {
+        })?;
+    let deadline = context.deadline;
+    let result = pioneer_provider::with_provider_attempt_context(context, async {
+        if let Some(context) = usage_context {
+            if observation
+                .publish(
+                    &context.events,
+                    &context.workspace,
+                    &context.thread,
+                    &context.turn,
+                    None,
+                )
+                .await
+                .is_err()
+            {
+                return Err(turn_preflight_attempt_failure(
+                    TurnPreflightFallbackReason::ProviderError,
+                    "preflight.usage.persistence_failed",
+                    "usage observation could not be persisted".into(),
+                    endpoint,
+                    attempt,
+                    input_chars,
+                    0,
+                    elapsed_ms(started),
+                ));
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
             return Err(turn_preflight_attempt_failure(
-                TurnPreflightFallbackReason::ProviderError,
-                "preflight.usage.persistence_failed",
-                "usage observation could not be persisted".into(),
+                TurnPreflightFallbackReason::Timeout,
+                "preflight.provider.timeout",
+                "preflight attempt deadline exceeded before dispatch".into(),
                 endpoint,
                 attempt,
                 input_chars,
@@ -807,156 +868,209 @@ async fn call_turn_preflight_provider_once(
                 elapsed_ms(started),
             ));
         }
-    }
-    let elapsed_ms = elapsed_ms(started);
-    let raw = match response {
-        Err(_) => {
+        let response = tokio::time::timeout_at(
+            deadline,
+            request_turn_preflight_provider_json(
+                endpoint.provider.as_ref(),
+                request,
+                Some(&observation),
+                max_output_chars,
+                attempt,
+            ),
+        )
+        .await;
+
+        if let Some(context) = usage_context {
+            if observation
+                .publish(
+                    &context.events,
+                    &context.workspace,
+                    &context.thread,
+                    &context.turn,
+                    Some(matches!(&response, Ok(Ok(_)))),
+                )
+                .await
+                .is_err()
+            {
+                return Err(turn_preflight_attempt_failure(
+                    TurnPreflightFallbackReason::ProviderError,
+                    "preflight.usage.persistence_failed",
+                    "usage observation could not be persisted".into(),
+                    endpoint,
+                    attempt,
+                    input_chars,
+                    0,
+                    elapsed_ms(started),
+                ));
+            }
+        }
+        let elapsed_ms = elapsed_ms(started);
+        let raw = match response {
+            Err(_) => {
+                let description =
+                    TurnPreflightSafeFailure::local("provider_timeout", "provider_timeout");
+                tracing::warn!(
+                    target: "pioneer::turn_preflight",
+                    stage = description.stage,
+                    cause_code = description.cause_code,
+                    provider = endpoint.provider_name,
+                    model = endpoint.model,
+                    attempt,
+                    timeout_ms,
+                    elapsed_ms,
+                    input_chars,
+                    message = %description,
+                );
+                return Err(turn_preflight_attempt_failure(
+                    TurnPreflightFallbackReason::Timeout,
+                    "preflight.provider.timeout",
+                    description.to_string(),
+                    endpoint,
+                    attempt,
+                    input_chars,
+                    0,
+                    elapsed_ms,
+                ));
+            }
+            Ok(Err(error)) => {
+                return Err(turn_preflight_request_attempt_failure(
+                    error,
+                    endpoint,
+                    attempt,
+                    elapsed_ms,
+                    input_chars,
+                ));
+            }
+            Ok(Ok(raw)) => raw,
+        };
+
+        let output_chars = raw.chars().count();
+        if output_chars > max_output_chars {
             let description =
-                TurnPreflightSafeFailure::local("provider_timeout", "provider_timeout");
-            tracing::warn!(
+                TurnPreflightSafeFailure::local("response_size_validation", "output_too_large");
+            tracing::error!(
                 target: "pioneer::turn_preflight",
                 stage = description.stage,
                 cause_code = description.cause_code,
                 provider = endpoint.provider_name,
                 model = endpoint.model,
                 attempt,
-                timeout_ms,
                 elapsed_ms,
                 input_chars,
+                output_chars,
+                max_output_chars,
+                response_bytes = raw.len(),
+                response_sha256 = %turn_preflight_response_sha256(raw.as_str()),
                 message = %description,
             );
             return Err(turn_preflight_attempt_failure(
-                TurnPreflightFallbackReason::Timeout,
-                "preflight.provider.timeout",
+                TurnPreflightFallbackReason::ValidationError,
+                "preflight.provider.output_too_large",
                 description.to_string(),
-                endpoint,
-                attempt,
-                input_chars,
-                0,
-                elapsed_ms,
-            ));
-        }
-        Ok(Err(error)) => {
-            return Err(turn_preflight_request_attempt_failure(
-                error,
-                endpoint,
-                attempt,
-                elapsed_ms,
-                input_chars,
-            ));
-        }
-        Ok(Ok(raw)) => raw,
-    };
-
-    let output_chars = raw.chars().count();
-    if output_chars > max_output_chars {
-        let description =
-            TurnPreflightSafeFailure::local("response_size_validation", "output_too_large");
-        tracing::error!(
-            target: "pioneer::turn_preflight",
-            stage = description.stage,
-            cause_code = description.cause_code,
-            provider = endpoint.provider_name,
-            model = endpoint.model,
-            attempt,
-            elapsed_ms,
-            input_chars,
-            output_chars,
-            max_output_chars,
-            response_bytes = raw.len(),
-            response_sha256 = %turn_preflight_response_sha256(raw.as_str()),
-            message = %description,
-        );
-        return Err(turn_preflight_attempt_failure(
-            TurnPreflightFallbackReason::ValidationError,
-            "preflight.provider.output_too_large",
-            description.to_string(),
-            endpoint,
-            attempt,
-            input_chars,
-            output_chars,
-            elapsed_ms,
-        ));
-    }
-
-    let plan = parse_provider_turn_preflight_plan_json_classified(raw.as_str()).map_err(
-        |(fallback_reason, _error)| {
-            let (code, message) = match fallback_reason {
-                TurnPreflightFallbackReason::InvalidJson => {
-                    let description =
-                        TurnPreflightSafeFailure::local("response_json_parse", "invalid_json");
-                    tracing::error!(
-                        target: "pioneer::turn_preflight",
-                        stage = description.stage,
-                        cause_code = description.cause_code,
-                        provider = endpoint.provider_name,
-                        model = endpoint.model,
-                        attempt,
-                        elapsed_ms,
-                        input_chars,
-                        output_chars,
-                        response_bytes = raw.len(),
-                        response_sha256 = %turn_preflight_response_sha256(raw.as_str()),
-                        message = %description,
-                    );
-                    ("preflight.provider.invalid_json", description.to_string())
-                }
-                TurnPreflightFallbackReason::ValidationError => {
-                    let description = TurnPreflightSafeFailure::local(
-                        "response_schema_validation",
-                        "invalid_preflight_plan",
-                    );
-                    tracing::error!(
-                        target: "pioneer::turn_preflight",
-                        stage = description.stage,
-                        cause_code = description.cause_code,
-                        provider = endpoint.provider_name,
-                        model = endpoint.model,
-                        attempt,
-                        elapsed_ms,
-                        input_chars,
-                        output_chars,
-                        response_bytes = raw.len(),
-                        response_sha256 = %turn_preflight_response_sha256(raw.as_str()),
-                        message = %description,
-                    );
-                    (
-                        "preflight.provider.validation_error",
-                        description.to_string(),
-                    )
-                }
-                TurnPreflightFallbackReason::Timeout
-                | TurnPreflightFallbackReason::ProviderError => {
-                    unreachable!(
-                        "parse classification only returns invalid_json or validation_error"
-                    )
-                }
-            };
-            turn_preflight_attempt_failure(
-                fallback_reason,
-                code,
-                message,
                 endpoint,
                 attempt,
                 input_chars,
                 output_chars,
                 elapsed_ms,
-            )
-        },
-    )?;
+            ));
+        }
 
-    Ok(TurnPreflightProviderSuccess {
-        plan,
-        provider_call: TurnPreflightProviderCallMetadata {
-            provider: endpoint.provider_name.clone(),
-            model: endpoint.model.clone(),
-            attempt,
-            input_chars,
-            output_chars,
-            elapsed_ms,
-        },
-        diagnostics: Vec::new(),
+        let plan = parse_provider_turn_preflight_plan_json_classified(raw.as_str()).map_err(
+            |(fallback_reason, _error)| {
+                let (code, message) = match fallback_reason {
+                    TurnPreflightFallbackReason::InvalidJson => {
+                        let description =
+                            TurnPreflightSafeFailure::local("response_json_parse", "invalid_json");
+                        tracing::error!(
+                            target: "pioneer::turn_preflight",
+                            stage = description.stage,
+                            cause_code = description.cause_code,
+                            provider = endpoint.provider_name,
+                            model = endpoint.model,
+                            attempt,
+                            elapsed_ms,
+                            input_chars,
+                            output_chars,
+                            response_bytes = raw.len(),
+                            response_sha256 = %turn_preflight_response_sha256(raw.as_str()),
+                            message = %description,
+                        );
+                        ("preflight.provider.invalid_json", description.to_string())
+                    }
+                    TurnPreflightFallbackReason::ValidationError => {
+                        let description = TurnPreflightSafeFailure::local(
+                            "response_schema_validation",
+                            "invalid_preflight_plan",
+                        );
+                        tracing::error!(
+                            target: "pioneer::turn_preflight",
+                            stage = description.stage,
+                            cause_code = description.cause_code,
+                            provider = endpoint.provider_name,
+                            model = endpoint.model,
+                            attempt,
+                            elapsed_ms,
+                            input_chars,
+                            output_chars,
+                            response_bytes = raw.len(),
+                            response_sha256 = %turn_preflight_response_sha256(raw.as_str()),
+                            message = %description,
+                        );
+                        (
+                            "preflight.provider.validation_error",
+                            description.to_string(),
+                        )
+                    }
+                    TurnPreflightFallbackReason::Timeout
+                    | TurnPreflightFallbackReason::ProviderError => {
+                        unreachable!(
+                            "parse classification only returns invalid_json or validation_error"
+                        )
+                    }
+                };
+                turn_preflight_attempt_failure(
+                    fallback_reason,
+                    code,
+                    message,
+                    endpoint,
+                    attempt,
+                    input_chars,
+                    output_chars,
+                    elapsed_ms,
+                )
+            },
+        )?;
+
+        Ok(TurnPreflightProviderSuccess {
+            plan,
+            provider_call: TurnPreflightProviderCallMetadata {
+                provider_usage: None,
+                provider: endpoint.provider_name.clone(),
+                model: endpoint.model.clone(),
+                attempt,
+                input_chars,
+                output_chars,
+                elapsed_ms,
+            },
+            diagnostics: Vec::new(),
+        })
     })
+    .await;
+    let usage = PreflightAttemptUsage {
+        schema_version: 1,
+        known_tokens: observation.known_token_count(),
+        available: observation.token_count().is_some(),
+    };
+    result
+        .map(|mut success: TurnPreflightProviderSuccess| {
+            success.provider_call.provider_usage = Some(usage.clone());
+            success
+        })
+        .map_err(|mut failure: TurnPreflightProviderAttemptFailure| {
+            failure.publication_failure = observation.publication_failure();
+            failure.provider_call.provider_usage = Some(usage);
+            failure
+        })
 }
 
 fn turn_preflight_chat_request(model: &str, prompt: String) -> ChatRequest {
@@ -978,7 +1092,7 @@ fn turn_preflight_chat_request(model: &str, prompt: String) -> ChatRequest {
 async fn request_turn_preflight_provider_json(
     provider: &dyn Provider,
     request: ChatRequest,
-    observation: Option<&super::provider::ProviderAttemptObservation>,
+    observation: Option<&super::provider::ProviderAttemptObservation<'_>>,
     max_output_chars: usize,
     _attempt: u32,
 ) -> anyhow::Result<String> {
@@ -1006,20 +1120,37 @@ async fn request_turn_preflight_provider_json(
     let request = evaluated.request;
     let limits = ProviderResponseLimits::default();
     if provider.capabilities().streaming {
-        let mut stream = provider.stream_chat(request).await.map_err(|error| {
-            if let Some(observation) = observation {
-                observation.observe_error(&error);
-            }
-            TurnPreflightProviderRequestFailure::provider_error(
-                provider,
-                "provider_stream_start",
-                ProviderFailureStage::Connect,
-                error,
-            )
-        })?;
+        let mut stream =
+            super::provider::await_provider_dispatch(true, provider.stream_chat(request))
+                .await
+                .map_err(|error| {
+                    if let Some(observation) = observation {
+                        observation.observe_error(&error);
+                    }
+                    TurnPreflightProviderRequestFailure::provider_error(
+                        provider,
+                        "provider_stream_start",
+                        ProviderFailureStage::Connect,
+                        error,
+                    )
+                })?;
         let mut text = String::new();
         let mut completed = false;
-        while let Some(chunk) = futures_util::StreamExt::next(&mut stream).await {
+        loop {
+            let next = super::provider::await_provider_dispatch(false, async {
+                Ok(futures_util::StreamExt::next(&mut stream).await)
+            })
+            .await
+            .map_err(|error| {
+                TurnPreflightProviderRequestFailure::provider_error(
+                    provider,
+                    "provider_stream_item",
+                    ProviderFailureStage::MidStream,
+                    error,
+                )
+                .with_response_prefix(text.as_str())
+            })?;
+            let Some(chunk) = next else { break };
             let chunk = chunk.map_err(|error| {
                 if let Some(observation) = observation {
                     observation.observe_error(&error);
@@ -1038,7 +1169,10 @@ async fn request_turn_preflight_provider_json(
                 .with_response_prefix(text.as_str())
             })?;
             if let (Some(observation), Some(usage)) = (observation, &chunk.usage) {
-                observation.observe(usage);
+                observation
+                    .observe_and_publish(usage)
+                    .await
+                    .map_err(|_| anyhow::anyhow!("preflight usage commit unavailable"))?;
             }
             limits.validate_stream_chunk(&chunk).map_err(|error| {
                 TurnPreflightProviderRequestFailure::response_validation(
@@ -1087,6 +1221,7 @@ async fn request_turn_preflight_provider_json(
                 )
                 .into());
             }
+            tokio::task::yield_now().await;
         }
         if !completed {
             return Err(TurnPreflightProviderRequestFailure::provider_error(
@@ -1101,19 +1236,24 @@ async fn request_turn_preflight_provider_json(
         return Ok(text);
     }
 
-    let response = provider.chat(request).await.map_err(|error| {
-        if let Some(observation) = observation {
-            observation.observe_error(&error);
-        }
-        TurnPreflightProviderRequestFailure::provider_error(
-            provider,
-            "provider_non_stream_response",
-            ProviderFailureStage::Connect,
-            error,
-        )
-    })?;
+    let response = super::provider::await_provider_dispatch(false, provider.chat(request))
+        .await
+        .map_err(|error| {
+            if let Some(observation) = observation {
+                observation.observe_error(&error);
+            }
+            TurnPreflightProviderRequestFailure::provider_error(
+                provider,
+                "provider_non_stream_response",
+                ProviderFailureStage::Connect,
+                error,
+            )
+        })?;
     if let (Some(observation), Some(usage)) = (observation, &response.usage) {
-        observation.observe(usage);
+        observation
+            .observe_and_publish(usage)
+            .await
+            .map_err(|_| anyhow::anyhow!("preflight usage commit unavailable"))?;
     }
     validate_preflight_completion(Some(&response.termination), !response.tool_calls.is_empty())
         .map_err(|error| {
@@ -1195,9 +1335,11 @@ fn turn_preflight_attempt_failure(
     elapsed_ms: u64,
 ) -> TurnPreflightProviderAttemptFailure {
     TurnPreflightProviderAttemptFailure {
+        publication_failure: None,
         fallback_reason,
         diagnostic: diagnostic(code, Some(message.as_str())),
         provider_call: TurnPreflightProviderCallMetadata {
+            provider_usage: None,
             provider: endpoint.provider_name.clone(),
             model: endpoint.model.clone(),
             attempt,
@@ -1425,6 +1567,8 @@ pub(crate) struct TurnPreflightDiagnostics {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct TurnPreflightProviderCallMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_usage: Option<PreflightAttemptUsage>,
     pub provider: String,
     pub model: String,
     pub attempt: u32,
@@ -2230,6 +2374,135 @@ fn validate_bounded_text(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test(start_paused = true)]
+    async fn preflight_initial_usage_ack_spends_attempt_deadline_without_dispatch() {
+        let provider = FakePreflightProvider::text("fixture", "{}");
+        let endpoint = provider_endpoint(provider.clone(), "fixture", "fixture");
+        let events = Arc::new(super::super::AgentEventHub::new());
+        let context = PreflightUsageContext {
+            events: events.clone(),
+            workspace: "ws".into(),
+            thread: "thread".into(),
+            turn: "turn".into(),
+            window_index: 1,
+        };
+        let started = tokio::time::Instant::now();
+        let ((result, elapsed), ()) = tokio::join!(
+            async {
+                let result = call_turn_preflight_provider_once(
+                    &endpoint,
+                    Some(&context),
+                    "fixture",
+                    1,
+                    50,
+                    4096,
+                    7,
+                )
+                .await;
+                (result, started.elapsed())
+            },
+            async {
+                let mut receiver = events.take_durable_receiver().await.unwrap();
+                receiver.recv().await.unwrap();
+                tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+                receiver.acknowledge_last(Ok(()));
+            }
+        );
+        assert_eq!(elapsed, std::time::Duration::from_millis(50));
+        assert_eq!(
+            result.err().unwrap().publication_failure,
+            Some(pioneer_protocol::TurnFailureDisposition::Transient)
+        );
+        assert!(provider.requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn preflight_usage_commit_rejection_prevents_dispatch_and_preserves_disposition() {
+        use pioneer_protocol::TurnFailureDisposition;
+        use pioneer_runtime_events::DurableCommitRejection;
+        for (rejection, expected) in [
+            (
+                DurableCommitRejection::permanent("fixture", "fixture"),
+                TurnFailureDisposition::Permanent,
+            ),
+            (
+                DurableCommitRejection::retryable("fixture", "fixture"),
+                TurnFailureDisposition::Transient,
+            ),
+            (
+                DurableCommitRejection::superseded_by_durable_interruption(),
+                TurnFailureDisposition::Permanent,
+            ),
+        ] {
+            let provider = FakePreflightProvider::text("fixture", "{}");
+            let endpoint = provider_endpoint(provider.clone(), "fixture", "fixture");
+            let events = Arc::new(super::super::AgentEventHub::new());
+            let context = PreflightUsageContext {
+                events: events.clone(),
+                workspace: "ws".into(),
+                thread: "thread".into(),
+                turn: "turn".into(),
+                window_index: 1,
+            };
+            let (result, ()) = tokio::join!(
+                call_turn_preflight_provider_once(
+                    &endpoint,
+                    Some(&context),
+                    "fixture",
+                    1,
+                    1000,
+                    4096,
+                    7
+                ),
+                async {
+                    let mut receiver = events.take_durable_receiver().await.unwrap();
+                    let event = receiver.recv().await.unwrap();
+                    assert!(matches!(
+                        event,
+                        pioneer_protocol::AgentDurableEvent::ItemStarted { .. }
+                    ));
+                    receiver.acknowledge_last(Err(rejection));
+                }
+            );
+            let failure = result.err().expect("publication must reject preflight");
+            assert_eq!(failure.publication_failure, Some(expected));
+            assert!(provider.requests().is_empty());
+            let error = super::super::ensure_preflight_usage_committed(failure.publication_failure)
+                .unwrap_err();
+            assert!(match expected {
+                TurnFailureDisposition::Permanent =>
+                    matches!(error, super::super::ChatTurnError::Terminal(_)),
+                TurnFailureDisposition::Transient =>
+                    matches!(error, super::super::ChatTurnError::Transient(_)),
+                TurnFailureDisposition::Unknown => false,
+            });
+        }
+    }
+
+    #[test]
+    fn failed_and_unknown_preflight_usage_preserve_attempt_count_and_lower_bound() {
+        let mut usage = super::PreflightBudgetUsage::default();
+        usage.observe(Some(&super::PreflightAttemptUsage {
+            schema_version: 1,
+            known_tokens: 75,
+            available: false,
+        }));
+        usage.observe(None);
+        usage.observe(Some(&super::PreflightAttemptUsage {
+            schema_version: 2,
+            known_tokens: 999,
+            available: true,
+        }));
+        assert_eq!(
+            usage,
+            super::PreflightBudgetUsage {
+                attempts: 3,
+                known_tokens: 75,
+                unknown: true
+            }
+        );
+    }
+
     use super::*;
     use pioneer_hooks::TurnPrePromptContextHookInput;
     use pioneer_memory::hooks::{
@@ -2934,6 +3207,7 @@ mod tests {
 
     fn sample_provider_call_metadata(attempt: u32) -> TurnPreflightProviderCallMetadata {
         TurnPreflightProviderCallMetadata {
+            provider_usage: None,
             provider: if attempt == 1 {
                 "configured-provider".to_owned()
             } else {
@@ -2971,6 +3245,7 @@ mod tests {
             fallback_reason,
             attempts: vec![
                 TurnPreflightProviderAttemptFailure {
+                    publication_failure: None,
                     fallback_reason: TurnPreflightFallbackReason::ProviderError,
                     diagnostic: diagnostic(
                         "preflight.provider.error",
@@ -2979,6 +3254,7 @@ mod tests {
                     provider_call: sample_provider_call_metadata(1),
                 },
                 TurnPreflightProviderAttemptFailure {
+                    publication_failure: None,
                     fallback_reason,
                     diagnostic: diagnostic(
                         "preflight.provider.invalid_json",
@@ -4484,6 +4760,7 @@ mod tests {
                 input_chars: 1200,
                 output_chars: 0,
                 elapsed_ms: 30_000,
+                provider_usage: None,
             }),
         );
 
@@ -4515,6 +4792,7 @@ mod tests {
     #[test]
     fn final_preflight_plan_can_represent_provider_owned_memory_plan() {
         let provider_call = TurnPreflightProviderCallMetadata {
+            provider_usage: None,
             provider: "openai".to_owned(),
             model: "gpt-test".to_owned(),
             attempt: 1,

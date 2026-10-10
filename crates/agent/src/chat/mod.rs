@@ -606,6 +606,7 @@ struct ChatExecutionWindowStats {
     executed_tool_success_count: u32,
     executed_tool_failed_count: u32,
     provider_token_count: Option<u64>,
+    provider_token_usage_unknown: bool,
 }
 
 impl ChatExecutionWindowStats {
@@ -618,6 +619,7 @@ impl ChatExecutionWindowStats {
             executed_tool_success_count: 0,
             executed_tool_failed_count: 0,
             provider_token_count: None,
+            provider_token_usage_unknown: false,
         }
     }
 
@@ -636,7 +638,21 @@ impl ChatExecutionWindowStats {
                     .unwrap_or_default()
                     .saturating_add(provider_token_count),
             );
+        } else {
+            self.provider_token_usage_unknown = true;
         }
+    }
+
+    fn record_preflight(&mut self, usage: preflight::PreflightBudgetUsage) {
+        self.agent_round_count = self.agent_round_count.saturating_add(usage.attempts);
+        if usage.attempts > 0 {
+            self.provider_token_count = Some(
+                self.provider_token_count
+                    .unwrap_or_default()
+                    .saturating_add(usage.known_tokens),
+            );
+        }
+        self.provider_token_usage_unknown |= usage.unknown;
     }
 
     fn record_executed_tools(&mut self, results: &[ExecutedToolResult]) {
@@ -679,16 +695,20 @@ impl ChatExecutionWindowStats {
         exhausted_limit: Option<u64>,
         exhausted_observed: Option<u64>,
     ) -> ExecutionCheckpointProviderBudgetSummary {
-        build_execution_checkpoint_provider_budget_summary(ExecutionCheckpointProviderBudgetInput {
-            model: Some(model.to_owned()),
-            model_provider: Some(model_provider.to_owned()),
-            agent_round_count: self.agent_round_count,
-            tool_call_count: self.requested_tool_call_count,
-            provider_token_count: self.provider_token_count,
-            exhaustion_reason: Some(reason),
-            exhausted_limit,
-            exhausted_observed,
-        })
+        let mut summary = build_execution_checkpoint_provider_budget_summary(
+            ExecutionCheckpointProviderBudgetInput {
+                model: Some(model.to_owned()),
+                model_provider: Some(model_provider.to_owned()),
+                agent_round_count: self.agent_round_count,
+                tool_call_count: self.requested_tool_call_count,
+                provider_token_count: self.provider_token_count,
+                exhaustion_reason: Some(reason),
+                exhausted_limit,
+                exhausted_observed,
+            },
+        );
+        summary.provider_usage_available &= !self.provider_token_usage_unknown;
+        summary
     }
 
     fn checkpoint_tool_summary(&self) -> ExecutionCheckpointToolSummary {
@@ -986,6 +1006,24 @@ fn agent_event_error(error: AgentEventHubError) -> ChatTurnError {
             ChatTurnError::Terminal(message)
         }
         _ => ChatTurnError::Transient(message),
+    }
+}
+
+fn ensure_preflight_usage_committed(
+    failure: Option<pioneer_protocol::TurnFailureDisposition>,
+) -> Result<(), ChatTurnError> {
+    use pioneer_protocol::TurnFailureDisposition;
+    match failure {
+        None => Ok(()),
+        Some(TurnFailureDisposition::Permanent) => Err(ChatTurnError::Terminal(
+            "preflight durable usage was rejected".to_owned(),
+        )),
+        Some(TurnFailureDisposition::Transient) => Err(ChatTurnError::Transient(
+            "preflight durable usage is unavailable".to_owned(),
+        )),
+        Some(TurnFailureDisposition::Unknown) => Err(ChatTurnError::Blocked(
+            "preflight durable usage outcome is unknown".to_owned(),
+        )),
     }
 }
 
@@ -2091,6 +2129,7 @@ async fn run_agent_turn_preflight_stage(
     workspace_id: &str,
     thread_id: &str,
     turn_id: &str,
+    window_index: u32,
     hook_runtime_context: &AgentTurnHookRuntimeContext,
     input_text: &str,
 ) -> TurnPreflightOrchestratorResult {
@@ -2176,6 +2215,7 @@ async fn run_agent_turn_preflight_stage(
             workspace: workspace_id.into(),
             thread: thread_id.into(),
             turn: turn_id.into(),
+            window_index,
         }),
         provider_registry,
         workspace_id: workspace_id.to_owned(),
@@ -2685,6 +2725,8 @@ pub(super) async fn execute_chat_turn_flow(
     recovery: Option<RecoveryAttemptContext>,
     event_tx: Arc<AgentEventHub>,
 ) -> Result<ChatTurnOutcome, ChatTurnError> {
+    let preparation_started = Instant::now();
+    let preparation_started_at_unix_ms = Local::now().timestamp_millis();
     if mode == ThreadMode::Message {
         return Err(ChatTurnError::Terminal(
             "message turns must complete in gateway admission without provider execution"
@@ -2759,6 +2801,8 @@ pub(super) async fn execute_chat_turn_flow(
                 runtime_environment,
                 retained_provider_history,
                 execution_window_index,
+                preparation_started,
+                preparation_started_at_unix_ms,
                 execution_checkpoint_context,
                 permission_profile,
                 execution_security_snapshot,
@@ -2801,6 +2845,7 @@ pub(super) async fn execute_chat_turn_flow(
                 &thinking_item_id,
                 &message_item_id,
                 tool_loop_config.provider,
+                None,
                 event_tx.clone(),
             )
             .await;
@@ -2876,6 +2921,7 @@ async fn execute_standard_provider_response(
     thinking_item_id: &str,
     message_item_id: &str,
     provider_timeout_policy: ProviderTimeoutPolicy,
+    accounting: Option<&mut ChatExecutionWindowStats>,
     event_tx: Arc<AgentEventHub>,
 ) -> Result<String, ChatTurnError> {
     let mut messages = history;
@@ -2909,7 +2955,7 @@ async fn execute_standard_provider_response(
     };
     let work = async {
         if provider.capabilities().streaming && !force_non_stream {
-            provider::stream_provider_response(
+            provider::stream_provider_response_accounted(
                 provider,
                 request,
                 workspace_id,
@@ -2919,10 +2965,11 @@ async fn execute_standard_provider_response(
                 message_item_id,
                 provider_timeout_policy,
                 event_tx.as_ref(),
+                accounting,
             )
             .await
         } else {
-            provider::non_stream_provider_response(
+            provider::non_stream_provider_response_with_policy(
                 provider,
                 request,
                 workspace_id,
@@ -2930,7 +2977,9 @@ async fn execute_standard_provider_response(
                 turn_id,
                 thinking_item_id,
                 message_item_id,
+                provider_timeout_policy,
                 event_tx.as_ref(),
+                accounting,
             )
             .await
         }
@@ -3491,6 +3540,8 @@ async fn execute_agent_provider_response(
     runtime_environment: HashMap<String, String>,
     retained_provider_history: Vec<RetainedProviderHistoryMessage>,
     execution_window_index: u32,
+    preparation_started: Instant,
+    preparation_started_at_unix_ms: i64,
     execution_checkpoint_context: Option<ExecutionCheckpointContext>,
     permission_profile: TurnPermissionProfileSnapshot,
     execution_security_snapshot: Option<TurnExecutionSecuritySnapshot>,
@@ -3514,6 +3565,16 @@ async fn execute_agent_provider_response(
     message_item_id: &str,
     event_tx: Arc<AgentEventHub>,
 ) -> Result<ChatTurnOutcome, ChatTurnError> {
+    let mut window_stats = ChatExecutionWindowStats::new(execution_window_index);
+    window_stats.started_at_unix_ms = preparation_started_at_unix_ms;
+    emit_execution_window_started(
+        workspace_id,
+        thread_id,
+        turn_id,
+        &window_stats,
+        event_tx.as_ref(),
+    )
+    .await?;
     let workdir = workdir_from_execution_security_snapshot(execution_security_snapshot.as_ref())?;
     let filesystem_prompt_snapshot = execution_security_snapshot.clone();
 
@@ -3906,11 +3967,14 @@ async fn execute_agent_provider_response(
             workspace_id,
             thread_id,
             turn_id,
+            execution_window_index,
             &hook_runtime_context,
             user_input_text.as_str(),
         )
         .await;
 
+        window_stats.record_preflight(turn_preflight.usage);
+        ensure_preflight_usage_committed(turn_preflight.publication_failure)?;
         trace_agent_turn_preflight(thread_id, turn_id, &turn_preflight, &[]);
 
         if let Some(active_recall_input) = preflight_active_recall_prompt_context_input(
@@ -4011,6 +4075,44 @@ async fn execute_agent_provider_response(
         )
         .await?;
 
+        let mut guard = ToolLoopGuard::new_execution_window_with_started_at(
+            tool_loop_config.execution_windows.window.clone(),
+            "",
+            preparation_started,
+        );
+        guard.record_preflight_provider_usage(
+            turn_preflight.usage.attempts,
+            turn_preflight.usage.known_tokens,
+            turn_preflight.usage.unknown,
+        );
+        let round_plan = guard
+            .begin_provider_round()
+            .map_err(ChatTurnError::Terminal)?;
+        if let Some(budget_exceeded) = round_plan.budget_exceeded {
+            let continuation = build_budget_execution_window_continuation(
+                workspace_id,
+                thread_id,
+                turn_id,
+                input,
+                &post_turn_model,
+                &post_turn_model_provider,
+                &window_stats,
+                &budget_exceeded,
+                Default::default(),
+                &[],
+            );
+            emit_execution_window_exhausted_and_checkpointed(
+                workspace_id,
+                thread_id,
+                turn_id,
+                &window_stats,
+                &continuation,
+                event_tx.as_ref(),
+            )
+            .await?;
+            return Ok(ChatTurnOutcome::NeedsContinuation(continuation));
+        }
+
         let result = execute_standard_provider_response(
             context_session,
             provider,
@@ -4029,6 +4131,7 @@ async fn execute_agent_provider_response(
             initial_thinking_item_id.as_str(),
             message_item_id,
             tool_loop_config.provider,
+            Some(&mut window_stats),
             event_tx.clone(),
         )
         .await;
@@ -4253,11 +4356,14 @@ async fn execute_agent_provider_response(
         workspace_id,
         thread_id,
         turn_id,
+        execution_window_index,
         &hook_runtime_context,
         user_input_text.as_str(),
     )
     .await;
 
+    window_stats.record_preflight(turn_preflight.usage);
+    ensure_preflight_usage_committed(turn_preflight.publication_failure)?;
     let mut requested_tool_names = restored_requested_tool_names(
         execution_checkpoint_context.as_ref(),
         workspace_id,
@@ -4537,9 +4643,15 @@ async fn execute_agent_provider_response(
     let mut observed_review_required_signatures = BTreeSet::<String>::new();
     let mut observed_terminal_task_ids = BTreeSet::<String>::new();
     let window_budget = &tool_loop_config.execution_windows.window;
-    let mut tool_loop_guard = ToolLoopGuard::new_execution_window(
+    let mut tool_loop_guard = ToolLoopGuard::new_execution_window_with_started_at(
         window_budget.clone(),
         tool_loop_final_answer_instruction(),
+        preparation_started,
+    );
+    tool_loop_guard.record_preflight_provider_usage(
+        turn_preflight.usage.attempts,
+        turn_preflight.usage.known_tokens,
+        turn_preflight.usage.unknown,
     );
     let mut tool_retry_controller = ToolRetryController::new(tool_loop_config.retry.clone());
     let restored_no_progress_state = execution_checkpoint_context
@@ -4555,15 +4667,6 @@ async fn execute_agent_provider_response(
     let mut post_turn_assistant_text = String::new();
     let mut post_turn_tool_events = Vec::new();
     let mut post_turn_domain_events = Vec::new();
-    let mut window_stats = ChatExecutionWindowStats::new(execution_window_index);
-    emit_execution_window_started(
-        workspace_id,
-        thread_id,
-        turn_id,
-        &window_stats,
-        event_tx.as_ref(),
-    )
-    .await?;
 
     let turn_result: Result<AgentProviderLoopOutcome, (ChatTurnError, String)> = async {
         let mut current_thinking_id = initial_thinking_item_id;
@@ -4918,7 +5021,8 @@ async fn execute_agent_provider_response(
                 (prepared.request, Some(prepared.receipt))
             } else { (request, None) };
             messages = request.messages.clone();
-            let round = await_context_request(context_session, provider::request_agent_round(
+            let tokens_before_round = window_stats.provider_token_count.unwrap_or(0);
+            let round = await_context_request(context_session, provider::request_agent_round_accounted(
                 provider,
                 request,
                 workspace_id,
@@ -4928,6 +5032,7 @@ async fn execute_agent_provider_response(
                 force_non_stream,
                 tool_loop_config.provider,
                 event_tx.as_ref(),
+                Some(&mut window_stats),
             ))
             .await
             .map_err(|e| (e, current_thinking_id.clone()))?;
@@ -4943,7 +5048,6 @@ async fn execute_agent_provider_response(
                 append_text_fragment(&mut post_turn_assistant_text, round.text.as_str());
             }
 
-            window_stats.record_provider_round(round.tool_calls.len(), round.provider_token_count);
 
             if !round_plan.tools_enabled
                 && !round.tool_calls.is_empty()
@@ -5117,7 +5221,7 @@ async fn execute_agent_provider_response(
             match tool_loop_guard.after_provider_round_with_usage(
                 round_plan.tools_enabled,
                 round.tool_calls.len(),
-                round.provider_token_count,
+                round.provider_token_count.or(Some(window_stats.provider_token_count.unwrap_or(0).saturating_sub(tokens_before_round))),
             ) {
                 ToolLoopGuardDecision::Continue => {}
                 ToolLoopGuardDecision::RequestContinuation { budget_exceeded } => {

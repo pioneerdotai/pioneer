@@ -3801,6 +3801,7 @@ fn unique_temp_dir(prefix: &str) -> PathBuf {
 
 fn test_agent_event_from_durable(event: AgentDurableEvent) -> Option<AgentEvent> {
     match event {
+        AgentDurableEvent::ProviderUsageObserved { .. } => None,
         AgentDurableEvent::ToolOutputRecorded { notification, .. } => {
             Some(AgentEvent::ItemDelta(notification))
         }

@@ -242,16 +242,41 @@ impl ToolLoopGuard {
         budget: ExecutionWindowBudgetConfig,
         final_no_tools_instruction: impl Into<String>,
     ) -> Self {
+        Self::new_execution_window_with_started_at(
+            budget,
+            final_no_tools_instruction,
+            std::time::Instant::now(),
+        )
+    }
+
+    pub fn new_execution_window_with_started_at(
+        budget: ExecutionWindowBudgetConfig,
+        final_no_tools_instruction: impl Into<String>,
+        started_at: std::time::Instant,
+    ) -> Self {
         Self {
             budget: budget.normalized(),
             tool_capable_rounds: 0,
             total_tool_calls: 0,
             provider_token_count: 0,
             provider_token_usage_unknown: false,
-            started_at: std::time::Instant::now(),
+            started_at,
             final_no_tools_mode: false,
             final_no_tools_instruction: final_no_tools_instruction.into(),
         }
+    }
+
+    /// Initial provider work spends the same window allowance. Unknown usage
+    /// remains explicit; confirmed counters still form a useful lower bound.
+    pub fn record_preflight_provider_usage(
+        &mut self,
+        attempts: u32,
+        known_tokens: u64,
+        unknown: bool,
+    ) {
+        self.tool_capable_rounds = self.tool_capable_rounds.saturating_add(attempts);
+        self.provider_token_count = self.provider_token_count.saturating_add(known_tokens);
+        self.provider_token_usage_unknown |= unknown;
     }
 
     pub fn begin_provider_round(&mut self) -> Result<ToolLoopRoundPlan, String> {
@@ -336,13 +361,12 @@ impl ToolLoopGuard {
         elapsed_ms: u64,
     ) -> ToolLoopGuardDecision {
         match provider_token_count {
-            Some(provider_token_count) if !self.provider_token_usage_unknown => {
+            Some(provider_token_count) => {
                 self.provider_token_count = self
                     .provider_token_count
                     .saturating_add(provider_token_count);
             }
             None => self.provider_token_usage_unknown = true,
-            Some(_) => {}
         }
 
         if !tools_enabled {
@@ -397,7 +421,6 @@ impl ToolLoopGuard {
         }
 
         if let Some(limit) = self.budget.max_provider_tokens_per_window
-            && !self.provider_token_usage_unknown
             && self.provider_token_count >= limit
         {
             return Some(ToolLoopBudgetExceeded {
@@ -511,6 +534,27 @@ mod tests {
     }
 
     #[test]
+    fn preflight_spends_rounds_tokens_and_preparation_time_before_main_dispatch() {
+        let budget = ExecutionWindowBudgetConfig {
+            max_agent_rounds_per_window: 2,
+            max_provider_tokens_per_window: Some(100),
+            max_wall_clock_ms_per_window: Some(100),
+            ..Default::default()
+        };
+        for (attempts, tokens, elapsed, reason) in [
+            (2, 0, 0, ToolLoopBudgetReason::AgentRoundsExceeded),
+            (1, 100, 0, ToolLoopBudgetReason::ProviderTokensExceeded),
+            (1, 50, 100, ToolLoopBudgetReason::WallClockExceeded),
+        ] {
+            let mut guard = ToolLoopGuard::new_execution_window(budget.clone(), "");
+            guard.record_preflight_provider_usage(attempts, tokens, true);
+            let plan = guard.begin_provider_round_at(elapsed).unwrap();
+            assert_eq!(plan.action, ToolLoopRoundAction::RequestContinuation);
+            assert_eq!(plan.budget_exceeded.unwrap().reason, reason);
+        }
+    }
+
+    #[test]
     fn elapsed_window_requests_continuation_before_next_provider_round() {
         let mut guard = ToolLoopGuard::new_execution_window(
             ExecutionWindowBudgetConfig {
@@ -619,7 +663,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_provider_usage_does_not_guess_a_token_budget() {
+    fn unknown_provider_usage_preserves_the_confirmed_token_lower_bound() {
         let mut guard = ToolLoopGuard::new_execution_window(
             ExecutionWindowBudgetConfig {
                 max_agent_rounds_per_window: 8,
@@ -642,7 +686,12 @@ mod tests {
 
         assert!(matches!(
             guard.after_provider_round_at(second.tools_enabled, 1, Some(100), 0),
-            ToolLoopGuardDecision::Continue
+            ToolLoopGuardDecision::RequestContinuation {
+                budget_exceeded: ToolLoopBudgetExceeded {
+                    reason: ToolLoopBudgetReason::ProviderTokensExceeded,
+                    ..
+                }
+            }
         ));
     }
 

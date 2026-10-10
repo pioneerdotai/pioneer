@@ -249,7 +249,7 @@ async fn repair_turns_completed_after_final_agent_message(
 async fn repair_terminal_turn_execution_windows(
     connection: impl Into<SqliteDatabase>,
 ) -> Result<u64> {
-    let store = pioneer_crud::CrudStore::new(connection);
+    let store = pioneer_crud::CrudStore::new(connection).with_maintenance_access();
     store
         .close_active_execution_windows_for_terminal_turns(chrono::Utc::now().fixed_offset())
         .await

@@ -7523,6 +7523,19 @@ impl CrudStore {
             ),
             _ => None,
         };
+        // Pure preparation from the immutable event payload; the transaction
+        // revalidates its window identity/status and commits this with the checkpoint.
+        let checkpoint_usage_available = match &transition {
+            NativeExecutionWindowTransition::Checkpointed { checkpoint, .. } => Some(
+                checkpoint
+                    .payload_json
+                    .get("provider_budget")
+                    .and_then(|budget| budget.get("provider_usage_available"))
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
+            ),
+            _ => None,
+        };
         let checkpoint_payload_bytes = prepared_checkpoint
             .as_ref()
             .map(|checkpoint| checkpoint.payload_bytes());
@@ -7894,6 +7907,10 @@ impl CrudStore {
                                 )?,
                             )
                             .await?;
+                            turn_execution_window::commit_checkpoint_usage_availability(
+                                &transaction, window.id.as_str(),
+                                checkpoint_usage_available.context("missing checkpoint usage availability")?,
+                            ).await?;
                         }
                         NativeExecutionWindowTransition::Continued {
                             notification,
@@ -8099,12 +8116,161 @@ impl CrudStore {
         turn_execution_window::latest_turn_execution_window(&self.connection, turn_id).await
     }
 
+    /// Final usage closes only the exact still-active window of a terminal Turn.
+    /// Receipt decoding and metadata serialization are completed before writer admission.
+    pub async fn close_terminal_execution_window_with_usage(
+        &self,
+        expected: &TurnExecutionWindowRecord,
+        status: pioneer_protocol::ExecutionWindowStatus,
+        stats: TurnExecutionWindowStatsRecord,
+    ) -> Result<bool> {
+        use pioneer_protocol::{ExecutionWindowStatus, TurnStatus};
+        let turn_status = match status {
+            ExecutionWindowStatus::Completed => TurnStatus::Completed,
+            ExecutionWindowStatus::Failed => TurnStatus::Failed,
+            ExecutionWindowStatus::Interrupted => TurnStatus::Interrupted,
+            ExecutionWindowStatus::Blocked => TurnStatus::Blocked,
+            _ => anyhow::bail!("execution-window usage close requires terminal status"),
+        };
+        let prepared = turn_execution_window::prepare_turn_execution_window_stats_transition(
+            expected.status,
+            status,
+            None,
+            stats,
+        )?;
+        self.run_serialized_write(|| {
+            let prepared = prepared.clone();
+            async move {
+                let transaction = self.connection.begin().await?;
+                let result: Result<bool> = async {
+                    let Some(current) = turn_execution_window::latest_turn_execution_window_model(
+                        &transaction,
+                        &expected.turn_id,
+                    )
+                    .await?
+                    else {
+                        return Ok(false);
+                    };
+                    if current.id != expected.id
+                        || current.updated_at != expected.updated_at
+                        || current.agent_round_count != i64::from(expected.agent_round_count)
+                        || current.tool_call_count != i64::from(expected.tool_call_count)
+                        || u64::try_from(current.provider_token_count).ok()
+                            != Some(expected.provider_token_count)
+                        || current.status
+                            != convention::execution_window_status_to_db(expected.status)
+                    {
+                        return Ok(false);
+                    }
+                    let terminal =
+                        pioneer_entity::turn::Entity::find_by_id(expected.turn_id.clone())
+                            .filter(
+                                pioneer_entity::turn::Column::Status
+                                    .eq(convention::turn_status_to_db(turn_status)),
+                            )
+                            .one(&transaction)
+                            .await?
+                            .is_some();
+                    if !terminal {
+                        return Ok(false);
+                    }
+                    turn_execution_window::transition_window_with_prepared_stats(
+                        &transaction,
+                        &current.id,
+                        prepared,
+                    )
+                    .await?;
+                    Ok(true)
+                }
+                .await;
+                match result {
+                    Ok(changed) => {
+                        transaction.commit().await?;
+                        Ok(changed)
+                    }
+                    Err(error) => {
+                        let _ = transaction.rollback().await;
+                        Err(error)
+                    }
+                }
+            }
+        })
+        .await
+    }
+
     pub async fn aggregate_turn_execution_window_usage(
         &self,
         turn_id: &str,
     ) -> Result<TurnExecutionWindowUsageAggregateRecord> {
-        turn_execution_window::aggregate_turn_execution_window_usage(&self.connection, turn_id)
-            .await
+        let mut aggregate = TurnExecutionWindowUsageAggregateRecord::default();
+        let mut after_index = 0u32;
+        loop {
+            let batch =
+                turn_execution_window::window_usage_batch(&self.connection, turn_id, after_index)
+                    .await?;
+            if batch.is_empty() {
+                break;
+            }
+            let mut records = Vec::with_capacity(batch.len());
+            for row in batch {
+                let mut window = turn_execution_window::window_record_from_model(row)?;
+                after_index = window.window_index;
+                if matches!(
+                    window.status,
+                    pioneer_protocol::ExecutionWindowStatus::Running
+                        | pioneer_protocol::ExecutionWindowStatus::Exhausted
+                ) {
+                    let (attempts, tokens, available) = self
+                        .summarize_execution_window_provider_usage(turn_id, window.window_index)
+                        .await?;
+                    if attempts > 0 {
+                        window.agent_round_count = window.agent_round_count.max(attempts);
+                        window.provider_token_count = window.provider_token_count.max(tokens);
+                        window.metadata_json = serde_json::Value::Object(
+                            window
+                                .metadata_json
+                                .as_object()
+                                .cloned()
+                                .unwrap_or_default(),
+                        );
+                        window.metadata_json["accountingSchemaVersion"] = serde_json::json!(1);
+                        window.metadata_json["providerUsageAvailable"] =
+                            serde_json::json!(available && attempts >= window.agent_round_count);
+                    }
+                }
+                records.push(window);
+            }
+            let next = turn_execution_window::aggregate_turn_execution_window_records(&records);
+            aggregate.total_windows = aggregate.total_windows.saturating_add(next.total_windows);
+            aggregate.latest_window_index =
+                aggregate.latest_window_index.max(next.latest_window_index);
+            aggregate.total_agent_rounds = aggregate
+                .total_agent_rounds
+                .saturating_add(next.total_agent_rounds);
+            aggregate.total_tool_calls = aggregate
+                .total_tool_calls
+                .saturating_add(next.total_tool_calls);
+            aggregate.total_provider_tokens = aggregate
+                .total_provider_tokens
+                .saturating_add(next.total_provider_tokens);
+            aggregate.provider_token_usage_unknown |= next.provider_token_usage_unknown;
+            aggregate.total_wall_clock_ms = aggregate
+                .total_wall_clock_ms
+                .saturating_add(next.total_wall_clock_ms);
+            aggregate.wall_clock_window_count = aggregate
+                .wall_clock_window_count
+                .saturating_add(next.wall_clock_window_count);
+            aggregate.consecutive_no_progress_windows =
+                if next.consecutive_no_progress_windows == next.total_windows {
+                    aggregate
+                        .consecutive_no_progress_windows
+                        .saturating_add(next.consecutive_no_progress_windows)
+                } else {
+                    next.consecutive_no_progress_windows
+                };
+            tokio::task::yield_now().await;
+        }
+        Ok(aggregate)
     }
 
     pub async fn mark_turn_execution_window_exhausted(
@@ -8202,14 +8368,101 @@ impl CrudStore {
         &self,
         now: DateTimeWithTimeZone,
     ) -> Result<u64> {
-        self.run_serialized_write(|| async {
-            turn_execution_window::close_active_execution_windows_for_terminal_turns(
+        let mut cursor: Option<String> = None;
+        let mut repaired = 0u64;
+        loop {
+            let batch = turn_execution_window::terminal_active_window_batch(
                 &self.connection,
-                now,
+                cursor.as_deref(),
             )
-            .await
-        })
-        .await
+            .await?;
+            if batch.is_empty() {
+                break;
+            }
+            cursor = batch.last().map(|window| window.id.clone());
+            for raw_window in batch {
+                let window = turn_execution_window::window_record_from_model(raw_window)?;
+                let Some((_, turn)) = self.get_turn(&window.thread_id, &window.turn_id).await?
+                else {
+                    continue;
+                };
+                let Some(status) =
+                    turn_execution_window::terminal_window_status_for_turn_status(turn.status)
+                else {
+                    continue;
+                };
+                let counts = self
+                    .count_turn_execution_window_terminal_items_since(
+                        &window.turn_id,
+                        window.started_at,
+                    )
+                    .await?;
+                let (attempts, tokens, available) = self
+                    .summarize_execution_window_provider_usage(&window.turn_id, window.window_index)
+                    .await?;
+                let rounds = window.agent_round_count.max(if attempts > 0 {
+                    attempts
+                } else {
+                    counts.agent_round_count
+                });
+                let mut metadata = turn_execution_window::repaired_terminal_turn_window_metadata(
+                    &window.metadata_json,
+                    status,
+                    turn.error.as_deref(),
+                );
+                metadata["accountingSchemaVersion"] = serde_json::json!(1);
+                metadata["providerUsageAvailable"] =
+                    serde_json::json!(available && attempts >= rounds);
+                repaired += u64::from(
+                    self.close_terminal_execution_window_with_usage(
+                        &window,
+                        status,
+                        TurnExecutionWindowStatsRecord {
+                            agent_round_count: rounds,
+                            tool_call_count: window.tool_call_count.max(counts.tool_call_count),
+                            provider_token_count: window.provider_token_count.max(tokens),
+                            metadata_json: metadata,
+                            completed_at: now,
+                            updated_at: now,
+                        },
+                    )
+                    .await?,
+                );
+            }
+            tokio::task::yield_now().await;
+        }
+        Ok(repaired)
+    }
+
+    /// One current row per admitted observation. Parse only after each bounded
+    /// reader quantum is released; terminal fencing makes its source immutable.
+    pub async fn summarize_execution_window_provider_usage(
+        &self,
+        turn_id: &str,
+        window_index: u32,
+    ) -> Result<(u32, u64, bool)> {
+        let mut attempts = 0u32;
+        let mut tokens = 0u64;
+        let mut available = true;
+        let mut cursor: Option<String> = None;
+        loop {
+            let batch = self
+                .execution_window_usage_observation_batch(turn_id, window_index, cursor.as_deref())
+                .await?;
+            if batch.is_empty() {
+                break;
+            }
+            cursor = batch.last().map(|(id, _)| id.clone());
+            for (_, payload) in batch {
+                attempts = attempts.saturating_add(1);
+                let (known, complete) =
+                    turn_execution_window::provider_usage_observation_tokens(&payload);
+                tokens = tokens.saturating_add(known);
+                available &= complete;
+            }
+            tokio::task::yield_now().await;
+        }
+        Ok((attempts, tokens, available))
     }
 
     pub async fn count_turn_execution_window_terminal_items(
@@ -8229,6 +8482,22 @@ impl CrudStore {
             &self.connection,
             turn_id,
             started_at,
+        )
+        .await
+    }
+
+    /// Bounded raw observations; decoding happens after the reader is released.
+    pub async fn execution_window_usage_observation_batch(
+        &self,
+        turn_id: &str,
+        window_index: u32,
+        after_item_id: Option<&str>,
+    ) -> Result<Vec<(String, String)>> {
+        turn_execution_window::execution_window_usage_observation_batch(
+            &self.connection,
+            turn_id,
+            window_index,
+            after_item_id,
         )
         .await
     }
@@ -39869,6 +40138,206 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn usage_observation_pages_deduplicate_snapshots_and_terminal_close_revalidates() {
+        let store = test_store_with_workspace("ws_usage_pages").await;
+        let timestamp = 1_700_000_000;
+        let thread = sample_thread("ws_usage_pages", "thr_usage_pages", timestamp);
+        let turn = sample_turn("turn_usage_pages");
+        store
+            .materialize_turn_start(
+                &thread,
+                SandboxMode::FullAccess,
+                &turn,
+                &[],
+                pioneer_protocol::PersistedActorRef::System,
+            )
+            .await
+            .unwrap();
+        let at = unix_to_datetime(timestamp);
+        let window = store
+            .create_turn_execution_window(
+                NewTurnExecutionWindowRecord {
+                    workspace_id: thread.workspace_id.clone(),
+                    thread_id: thread.id.clone(),
+                    turn_id: turn.id.clone(),
+                    window_index: 1,
+                    status: ExecutionWindowStatus::Running,
+                    exhaustion_reason: None,
+                    agent_round_count: 0,
+                    tool_call_count: 0,
+                    provider_token_count: 0,
+                    metadata_json: serde_json::json!({"runtimeWindowId":"runtime_usage_1"}),
+                    started_at: at,
+                },
+                at,
+                at,
+            )
+            .await
+            .unwrap();
+        let liveness = store.get_turn_liveness(&turn.id).await.unwrap();
+        for index in 0..130 {
+            let item = pioneer_protocol::TurnItem::SystemEvent {
+                id: format!("usage_{index:04}"),
+                level: pioneer_protocol::SystemEventLevel::Info,
+                message: "Provider usage observation".into(),
+                code: Some("provider_usage".into()),
+                details: Some(
+                    serde_json::json!({"schema_version":1,"window_index":1,"status":"started",
+                    "usage":{"input_tokens":10,"output_tokens":2}}),
+                ),
+            };
+            store
+                .materialize_item_started(
+                    pioneer_protocol::ItemStartedNotification {
+                        workspace_id: thread.workspace_id.clone(),
+                        thread_id: thread.id.clone(),
+                        turn_id: turn.id.clone(),
+                        item: item.clone(),
+                    },
+                    timestamp + 1,
+                )
+                .await
+                .unwrap();
+            store
+                .materialize_item_updated(
+                    pioneer_protocol::ItemUpdatedNotification {
+                        workspace_id: thread.workspace_id.clone(),
+                        thread_id: thread.id.clone(),
+                        turn_id: turn.id.clone(),
+                        item,
+                    },
+                    timestamp + 2,
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            store.get_turn_liveness(&turn.id).await.unwrap(),
+            liveness,
+            "billing snapshots are not semantic progress"
+        );
+        let first = store
+            .execution_window_usage_observation_batch(&turn.id, 1, None)
+            .await
+            .unwrap();
+        assert_eq!(first.len(), 128);
+        let second = store
+            .execution_window_usage_observation_batch(&turn.id, 1, Some(&first.last().unwrap().0))
+            .await
+            .unwrap();
+        assert_eq!(second.len(), 2);
+        assert!(
+            store
+                .execution_window_usage_observation_batch(&turn.id, 2, None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        // A multibyte payload below 64K characters still exceeds the byte cap.
+        let oversize = pioneer_protocol::TurnItem::SystemEvent {
+            id: "usage_oversize".into(),
+            level: pioneer_protocol::SystemEventLevel::Info,
+            message: "🧪".repeat(20_000),
+            code: Some("provider_usage".into()),
+            details: Some(serde_json::json!({"schema_version":1,"window_index":1,
+                "status":"completed","usage":{"input_tokens":999,"output_tokens":999}})),
+        };
+        store
+            .materialize_item_started(
+                pioneer_protocol::ItemStartedNotification {
+                    workspace_id: thread.workspace_id.clone(),
+                    thread_id: thread.id.clone(),
+                    turn_id: turn.id.clone(),
+                    item: oversize,
+                },
+                timestamp + 2,
+            )
+            .await
+            .unwrap();
+        let oversized_page = store
+            .execution_window_usage_observation_batch(&turn.id, 1, Some("usage_0129"))
+            .await
+            .unwrap();
+        assert_eq!(
+            oversized_page,
+            vec![("usage_oversize".into(), String::new())]
+        );
+        let active_usage = store
+            .aggregate_turn_execution_window_usage(&turn.id)
+            .await
+            .unwrap();
+        assert_eq!(active_usage.total_agent_rounds, 131);
+        assert_eq!(active_usage.total_provider_tokens, 1560);
+        assert!(
+            active_usage.provider_token_usage_unknown,
+            "unfinished attempts cannot claim complete usage"
+        );
+        let stats = TurnExecutionWindowStatsRecord {
+            agent_round_count: 131,
+            tool_call_count: 0,
+            provider_token_count: 1560,
+            metadata_json: serde_json::json!({"accountingSchemaVersion":1,"providerUsageAvailable":false}),
+            completed_at: unix_to_datetime(timestamp + 3),
+            updated_at: unix_to_datetime(timestamp + 3),
+        };
+        assert!(
+            !store
+                .close_terminal_execution_window_with_usage(
+                    &window,
+                    ExecutionWindowStatus::Failed,
+                    stats.clone()
+                )
+                .await
+                .unwrap()
+        );
+        store
+            .update_turn_status(
+                &thread.id,
+                &turn.id,
+                TurnStatus::Failed,
+                Some("fixture"),
+                timestamp + 3,
+            )
+            .await
+            .unwrap();
+        let mut stale = window.clone();
+        stale.agent_round_count = 1;
+        assert!(
+            !store
+                .close_terminal_execution_window_with_usage(
+                    &stale,
+                    ExecutionWindowStatus::Failed,
+                    stats.clone()
+                )
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .with_maintenance_access()
+                .close_active_execution_windows_for_terminal_turns(unix_to_datetime(timestamp + 3))
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .with_maintenance_access()
+                .close_active_execution_windows_for_terminal_turns(unix_to_datetime(timestamp + 4))
+                .await
+                .unwrap(),
+            0,
+            "restart repair is idempotent"
+        );
+        let restored = store
+            .aggregate_turn_execution_window_usage(&turn.id)
+            .await
+            .unwrap();
+        assert_eq!(restored.total_provider_tokens, 1560);
+        assert!(restored.provider_token_usage_unknown);
+    }
+
+    #[tokio::test]
     async fn native_execution_window_transition_rejects_gaps_and_rolls_back_invalid_checkpoint() {
         let (store, _, _) = test_store_with_started_turn(
             "ws_native_window",
@@ -40094,6 +40563,19 @@ mod tests {
             )
             .await
             .expect("valid checkpoint should commit");
+        let checkpointed_window = store
+            .latest_turn_execution_window("turn_native_window")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            checkpointed_window.metadata_json["accountingSchemaVersion"],
+            1
+        );
+        assert_eq!(
+            checkpointed_window.metadata_json["providerUsageAvailable"], false,
+            "legacy checkpoint cannot claim complete usage"
+        );
 
         let same_identity_conflicting_payload =
             serde_json::json!({"window": 1, "state": "same-id-conflict"});
@@ -47779,6 +48261,212 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn declared_silent_work_policy_is_atomic_owned_and_lease_only_renewable() {
+        let (store, thread, turn) =
+            test_store_with_started_turn("ws_work_policy", "thr_work_policy", "turn_work_policy")
+                .await;
+        let at = 1_700_000_000;
+        let item_id = "call_work_policy";
+        let observation = pioneer_protocol::ToolObservation {
+            trace_id: "trace_work_policy".into(),
+            turn_id: turn.id.clone(),
+            tool_call_id: item_id.into(),
+            attempt_id: 1,
+            pipeline_stage: "runtime.call.started".into(),
+            ts_unix_ms: at * 1000,
+            mono_ns: 0,
+            event_seq: 1,
+        };
+        let item = TurnItem::DynamicToolCall {
+            id: item_id.into(),
+            tool_name: "mcp_silent_work".into(),
+            arguments: serde_json::json!({}),
+            status: ToolCallStatus::InProgress,
+            recovery_policy: None,
+            execution_class: pioneer_protocol::TurnItemExecutionClass::Standard,
+            output_policy: ToolOutputPolicySnapshot::for_tool_name("mcp_silent_work"),
+            display: ToolDisplayPayload::Hidden,
+            storage: ToolStoragePayload::Metadata {
+                metadata: ToolMetadata::empty(),
+            },
+            recovery: None,
+            success: None,
+            outcome: None,
+            observation: Some(observation),
+        };
+        store
+            .materialize_item_started_with_attempt_deadlines(
+                ItemStartedNotification {
+                    workspace_id: thread.workspace_id.clone(),
+                    thread_id: thread.id.clone(),
+                    turn_id: turn.id.clone(),
+                    item,
+                },
+                at,
+                TurnItemAttemptDeadlines {
+                    lease_expires_at_unix: Some(at + 120),
+                    idle_deadline_at_unix: Some(at + 90),
+                    hard_deadline_at_unix: Some(at + 300),
+                },
+            )
+            .await
+            .unwrap();
+        let liveness = store.get_turn_liveness(&turn.id).await.unwrap();
+        let policy = ToolMetadata::from_json(
+            serde_json::json!({"schemaVersion":1,"deadlineAtUnixMs":(at + 602)*1000}),
+        );
+        let notification = pioneer_protocol::ItemDeltaNotification {
+            workspace_id: thread.workspace_id.clone(),
+            thread_id: thread.id.clone(),
+            turn_id: turn.id.clone(),
+            item_id: item_id.into(),
+            delta: String::new(),
+            stream: Some(pioneer_protocol::ItemDeltaStream::ToolProgress),
+            payload: Some(
+                serde_json::json!({"kind":"progress","stage":"attempt_work_started","metadata":policy,
+                "observation":{"trace_id":"trace_work_policy","turn_id":turn.id,"tool_call_id":item_id,"attempt_id":1}}),
+            ),
+            markdown: None,
+            markdown_version: None,
+        };
+        let mut wrong = notification.clone();
+        wrong.payload.as_mut().unwrap()["observation"]["trace_id"] =
+            serde_json::json!("wrong_trace");
+        assert!(
+            store
+                .record_tool_output("wrong_owner", &wrong)
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .tool_output_page(&thread.workspace_id, &thread.id, &turn.id, item_id, 0)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            !store
+                .has_native_tool_work_policy(&turn.id, item_id)
+                .await
+                .unwrap()
+        );
+        store
+            .record_tool_output("work_policy", &notification)
+            .await
+            .unwrap();
+        store
+            .record_tool_output("work_policy", &notification)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .record_tool_output("second_epoch", &notification)
+                .await
+                .is_err(),
+            "another receipt identity cannot reset this attempt's epoch"
+        );
+        let mut wrong_attempt = notification.clone();
+        wrong_attempt.payload.as_mut().unwrap()["observation"]["attempt_id"] = serde_json::json!(2);
+        assert!(
+            store
+                .record_tool_output("wrong_attempt", &wrong_attempt)
+                .await
+                .is_err()
+        );
+
+        assert!(
+            store
+                .has_native_tool_work_policy(&turn.id, item_id)
+                .await
+                .unwrap()
+        );
+        // A rehydrated facade reads the same durable policy; no in-process cache.
+        let restored = CrudStore::new(store.connection.clone());
+        assert!(
+            restored
+                .has_native_tool_work_policy(&turn.id, item_id)
+                .await
+                .unwrap()
+        );
+        store
+            .heartbeat_turn_item_attempt(
+                &turn.id,
+                item_id,
+                TurnItemType::DynamicToolCall,
+                at + 400,
+                Some(at + 520),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let attempt = pioneer_entity::turn_item_attempt::Entity::find()
+            .filter(pioneer_entity::turn_item_attempt::Column::TurnId.eq(&turn.id))
+            .filter(pioneer_entity::turn_item_attempt::Column::ItemId.eq(item_id))
+            .one(&store.connection)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(attempt.idle_deadline_at, Some(unix_to_datetime(at + 602)));
+        assert_eq!(attempt.hard_deadline_at, Some(unix_to_datetime(at + 602)));
+        assert_eq!(store.get_turn_liveness(&turn.id).await.unwrap(), liveness);
+        assert!(
+            store
+                .list_timeout_candidates(at + 450, 10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "declared silent work must not reach generic 90/300s horizon"
+        );
+        store
+            .heartbeat_turn_item_attempt(
+                &turn.id,
+                item_id,
+                TurnItemType::DynamicToolCall,
+                at + 600,
+                Some(at + 720),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .list_timeout_candidates(at + 603, 10)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "owner renewal cannot evade declared work cap"
+        );
+        store
+            .update_turn_status(
+                &thread.id,
+                &turn.id,
+                TurnStatus::Failed,
+                Some("fixture"),
+                at + 604,
+            )
+            .await
+            .unwrap();
+        assert!(
+            store
+                .record_tool_output("late_policy", &notification)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .tool_output_page(&thread.workspace_id, &thread.id, &turn.id, item_id, 0)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn item_started_can_atomically_persist_attempt_deadlines() {
         let store = test_store_with_workspace("ws_attempt_deadlines").await;
         let timestamp = 1_700_000_000;
@@ -51149,7 +51837,9 @@ mod tests {
                 total_wall_clock_ms: 12_000,
                 wall_clock_window_count: 2,
                 total_provider_tokens: 21,
-                provider_token_usage_unknown: false,
+                // Legacy counts remain a confirmed lower bound; no legacy
+                // availability marker can assert complete accounting.
+                provider_token_usage_unknown: true,
                 consecutive_no_progress_windows: 0,
             }
         );

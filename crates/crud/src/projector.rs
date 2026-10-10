@@ -187,7 +187,14 @@ impl TurnProjector {
                     .await?;
             }
             TurnEventPayload::ItemUpdated(payload) => {
-                let status = terminal_turn_item_status_from_payload(&payload.item);
+                let status = if matches!(&payload.item, pioneer_protocol::TurnItem::SystemEvent {
+                    code: Some(code), details: Some(details), ..
+                } if code == "provider_usage" && details["status"].as_str() == Some("started"))
+                {
+                    crate::convention::TURN_ITEM_STATUS_IN_PROGRESS
+                } else {
+                    terminal_turn_item_status_from_payload(&payload.item)
+                };
                 prepared.item = Some(turn::prepare_turn_item_projection(
                     payload.turn_id.as_str(),
                     &payload.item,
@@ -1168,17 +1175,20 @@ fn liveness_observation_from_payload(
         TurnEventPayload::ItemStarted(payload) => {
             item_id = Some(payload.item.item_id().to_owned());
             item_type = Some(turn_item_type_to_db(payload.item.item_type()).to_owned());
-            true
+            !matches!(&payload.item, pioneer_protocol::TurnItem::SystemEvent { code: Some(code), .. }
+                if code == "provider_usage")
         }
         TurnEventPayload::ItemCompleted(payload) => {
             item_id = Some(payload.item.item_id().to_owned());
             item_type = Some(turn_item_type_to_db(payload.item.item_type()).to_owned());
-            true
+            !matches!(&payload.item, pioneer_protocol::TurnItem::SystemEvent { code: Some(code), .. }
+                if code == "provider_usage")
         }
         TurnEventPayload::ItemUpdated(payload) => {
             item_id = Some(payload.item.item_id().to_owned());
             item_type = Some(turn_item_type_to_db(payload.item.item_type()).to_owned());
-            true
+            !matches!(&payload.item, pioneer_protocol::TurnItem::SystemEvent { code: Some(code), .. }
+                if code == "provider_usage")
         }
         TurnEventPayload::TurnExecutionWindowStarted(_)
         | TurnEventPayload::TurnExecutionWindowCheckpointed(_)

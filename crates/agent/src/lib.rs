@@ -1267,6 +1267,7 @@ impl TurnExecutionUsageCounters {
             }
         }
 
+        self.provider_token_usage_unknown |= !payload.provider_budget.provider_usage_available;
         match payload
             .window
             .provider_token_count

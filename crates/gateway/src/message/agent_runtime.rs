@@ -347,6 +347,9 @@ fn durable_event_thread_id(event: &AgentDurableEvent) -> Option<&str> {
         AgentDurableEvent::ToolOutputRecorded { notification, .. } => {
             Some(notification.thread_id.as_str())
         }
+        AgentDurableEvent::ProviderUsageObserved { notification } => {
+            Some(notification.thread_id.as_str())
+        }
         AgentDurableEvent::ItemStarted { notification } => Some(notification.thread_id.as_str()),
         AgentDurableEvent::ItemCompleted { notification }
         | AgentDurableEvent::TurnFinalizationPrepared { notification, .. } => {
@@ -405,6 +408,9 @@ fn durable_event_turn_id(event: &AgentDurableEvent) -> Option<&str> {
         }
         AgentDurableEvent::TurnPermissionAudit { event } => Some(event.turn_id.as_str()),
         AgentDurableEvent::ToolOutputRecorded { notification, .. } => {
+            Some(notification.turn_id.as_str())
+        }
+        AgentDurableEvent::ProviderUsageObserved { notification } => {
             Some(notification.turn_id.as_str())
         }
         AgentDurableEvent::ItemStarted { notification } => Some(notification.turn_id.as_str()),
@@ -693,43 +699,36 @@ impl MessageProcessor {
             .crud_store
             .count_turn_execution_window_terminal_items_since(turn_id, window.started_at.clone())
             .await?;
+        let (observed_attempts, observed_tokens, mut usage_available) = self
+            .crud_store
+            .summarize_execution_window_provider_usage(turn_id, window.window_index)
+            .await?;
+        let accounted_rounds = window.agent_round_count.max(if observed_attempts > 0 {
+            observed_attempts
+        } else {
+            counts.agent_round_count
+        });
+        usage_available &= observed_attempts >= accounted_rounds;
+        let mut metadata = execution_window_terminal_metadata(
+            &window.metadata_json,
+            terminal_status,
+            terminal_reason,
+        );
+        metadata["accountingSchemaVersion"] = serde_json::json!(1);
+        metadata["providerUsageAvailable"] = serde_json::json!(usage_available);
         let now = now_db_timestamp();
         let stats = pioneer_crud::TurnExecutionWindowStatsRecord {
-            agent_round_count: window.agent_round_count.max(counts.agent_round_count),
+            agent_round_count: accounted_rounds,
             tool_call_count: window.tool_call_count.max(counts.tool_call_count),
-            provider_token_count: window.provider_token_count,
-            metadata_json: execution_window_terminal_metadata(
-                &window.metadata_json,
-                terminal_status,
-                terminal_reason,
-            ),
+            provider_token_count: window.provider_token_count.max(observed_tokens),
+            metadata_json: metadata,
             completed_at: now,
             updated_at: now,
         };
 
-        match terminal_status {
-            pioneer_protocol::ExecutionWindowStatus::Completed => {
-                self.crud_store
-                    .mark_turn_execution_window_completed(window.id.as_str(), stats)
-                    .await?;
-            }
-            pioneer_protocol::ExecutionWindowStatus::Failed => {
-                self.crud_store
-                    .mark_turn_execution_window_failed(window.id.as_str(), stats)
-                    .await?;
-            }
-            pioneer_protocol::ExecutionWindowStatus::Interrupted => {
-                self.crud_store
-                    .mark_turn_execution_window_interrupted(window.id.as_str(), stats)
-                    .await?;
-            }
-            pioneer_protocol::ExecutionWindowStatus::Blocked => {
-                self.crud_store
-                    .mark_turn_execution_window_blocked(window.id.as_str(), None, stats)
-                    .await?;
-            }
-            _ => {}
-        }
+        self.crud_store
+            .close_terminal_execution_window_with_usage(&window, terminal_status, stats)
+            .await?;
 
         Ok(())
     }
@@ -3970,6 +3969,29 @@ impl MessageProcessor {
                 );
                 true
             }),
+            AgentDurableEvent::ProviderUsageObserved { notification } => {
+                message_future(async move {
+                    if !matches!(&notification.item, TurnItem::SystemEvent {code: Some(code), details: Some(details), .. }
+                    if code == "provider_usage" && details["schema_version"].as_u64() == Some(1))
+                    {
+                        return false;
+                    }
+                    match self
+                        .materialize_native_agent_turn_event(
+                            pioneer_crud::CanonicalTurnEventPayload::ItemUpdated(notification),
+                            now_timestamp_secs(),
+                            None,
+                        )
+                        .await
+                    {
+                        Ok(()) => true,
+                        Err(error) => {
+                            warn!(error = %error, "failed to persist provider usage observation");
+                            false
+                        }
+                    }
+                })
+            }
             AgentDurableEvent::ItemCompleted { notification } => message_future(async move {
                 let mut notification = notification;
                 self.enrich_item_completed_markdown(&mut notification).await;

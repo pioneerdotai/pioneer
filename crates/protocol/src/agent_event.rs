@@ -1,13 +1,13 @@
 use crate::{
     ItemCompletedNotification, ItemDeltaNotification, ItemDeltaStream, ItemStartedNotification,
     ItemToolRetryExhaustedNotification, ItemToolRetryResolvedNotification,
-    ItemToolRetryScheduledNotification, McpTurnBindingSummary, ProviderFailureDetails, SkillId,
-    TaskEvent, TaskEventPayload, ThreadLineage, ToolOutputPolicySnapshot, TurnCapabilityKind,
-    TurnExecutionWindowBlockedNotification, TurnExecutionWindowCheckpointedNotification,
-    TurnExecutionWindowContinuedNotification, TurnExecutionWindowExhaustedNotification,
-    TurnExecutionWindowStartedNotification, TurnItemType, TurnPermissionActionKind,
-    TurnPermissionDecisionReason, TurnPermissionMode, TurnPermissionProfileSource,
-    TurnToolLoopBudgetExceededNotification,
+    ItemToolRetryScheduledNotification, ItemUpdatedNotification, McpTurnBindingSummary,
+    ProviderFailureDetails, SkillId, TaskEvent, TaskEventPayload, ThreadLineage,
+    ToolOutputPolicySnapshot, TurnCapabilityKind, TurnExecutionWindowBlockedNotification,
+    TurnExecutionWindowCheckpointedNotification, TurnExecutionWindowContinuedNotification,
+    TurnExecutionWindowExhaustedNotification, TurnExecutionWindowStartedNotification, TurnItemType,
+    TurnPermissionActionKind, TurnPermissionDecisionReason, TurnPermissionMode,
+    TurnPermissionProfileSource, TurnToolLoopBudgetExceededNotification,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -149,6 +149,10 @@ pub enum AgentDurableEvent {
     },
     ItemCompleted {
         notification: ItemCompletedNotification,
+    },
+    /// Cumulative provider usage for an existing observation, never another charge.
+    ProviderUsageObserved {
+        notification: ItemUpdatedNotification,
     },
     /// Complete accepted provider response captured before terminal Turn
     /// publication. Gateway persists this intent and later commits the item
@@ -528,6 +532,9 @@ impl AgentDurableEvent {
             Self::ToolOutputRecorded { notification, .. } => DurableEventCausalityKey::Turn {
                 turn_id: notification.turn_id.clone(),
             },
+            Self::ProviderUsageObserved { notification } => DurableEventCausalityKey::Turn {
+                turn_id: notification.turn_id.clone(),
+            },
             Self::ItemStarted { notification } => DurableEventCausalityKey::Turn {
                 turn_id: notification.turn_id.clone(),
             },
@@ -593,6 +600,7 @@ impl AgentDurableEvent {
             | Self::NativeCancellationContextPrepared { .. }
             | Self::NativeTerminalEffectsPrepared { .. }
             | Self::ToolOutputRecorded { .. }
+            | Self::ProviderUsageObserved { .. }
             | Self::ItemStarted { .. }
             | Self::ItemToolRetryScheduled { .. }
             | Self::ItemToolRetryResolved { .. }

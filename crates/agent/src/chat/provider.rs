@@ -16,7 +16,6 @@ use pioneer_provider::{
 };
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::time::timeout;
 
 struct NativeProviderRoundMetric {
     started: Instant,
@@ -67,6 +66,44 @@ impl<'a> FailureTarget<'a> {
 fn total_token_usage(usage: Option<&TokenUsage>) -> Option<u64> {
     let usage = usage?;
     usage.input_tokens?.checked_add(usage.output_tokens?)
+}
+
+pub(super) async fn await_provider_dispatch<T>(
+    stream: bool,
+    future: impl std::future::Future<Output = anyhow::Result<T>>,
+) -> anyhow::Result<T> {
+    let Some(context) = pioneer_provider::current_provider_attempt_context() else {
+        return future.await;
+    };
+    let deadline = if stream {
+        context.first_output_deadline
+    } else {
+        context.deadline
+    };
+    let timeout_error = || {
+        let mut classification = ProviderFailureClassification::new(if stream {
+            ProviderFailureClass::StreamStall
+        } else {
+            ProviderFailureClass::NetworkTransient
+        });
+        classification.provider_code = Some(
+            if stream {
+                "provider_first_output_deadline_exceeded"
+            } else {
+                "provider_attempt_deadline_exceeded"
+            }
+            .to_owned(),
+        );
+        anyhow::Error::new(pioneer_provider::failure::ProviderTransportFailure { classification })
+    };
+    if context.cancellation.is_cancelled() || tokio::time::Instant::now() >= deadline {
+        return Err(timeout_error());
+    }
+    tokio::select! {
+        biased;
+        _ = context.cancellation.cancelled() => Err(timeout_error()),
+        result = tokio::time::timeout_at(deadline, future) => result.map_err(|_| timeout_error())?,
+    }
 }
 
 fn bind_replay_to_response_target(
@@ -166,7 +203,7 @@ async fn request_agent_round_observed(
     force_non_stream: bool,
     provider_timeout_policy: ProviderTimeoutPolicy,
     event_tx: &AgentEventHub,
-    observation: &ProviderAttemptObservation,
+    observation: &ProviderAttemptObservation<'_>,
 ) -> Result<AgentRoundResponse, ChatTurnError> {
     pioneer_observability::turn_startup::dispatched(turn_id);
     let mut lifecycle_metric = NativeProviderRoundMetric::start();
@@ -183,8 +220,7 @@ async fn request_agent_round_observed(
                 turn_id,
                 pioneer_observability::turn_startup::Stage::ProviderConnect,
             );
-            provider
-                .stream_chat_with_diagnostics(request)
+            await_provider_dispatch(true, provider.stream_chat_with_diagnostics(request))
                 .await
                 .map_err(|error| {
                     observation.observe_error(&error);
@@ -234,7 +270,7 @@ async fn request_agent_round_observed(
                 }
                 if let Some(snapshot) = &chunk.usage {
                     usage.get_or_insert_with(Default::default).update(snapshot);
-                    observation.observe(snapshot);
+                    observation.observe_and_publish(snapshot).await?;
                 }
                 if chunk.provider_replay_state.is_some() {
                     provider_replay_state = chunk.provider_replay_state.take();
@@ -358,20 +394,22 @@ async fn request_agent_round_observed(
 
     let model_name = request.model.clone();
 
-    let mut response = provider.chat(request).await.map_err(|error| {
-        observation.observe_error(&error);
-        adapter_error_for_target(
-            FailureTarget::new(thinking_item_id, TurnItemType::Reasoning),
-            provider.as_ref(),
-            model_name.as_str(),
-            ProviderTransportKind::NonStream,
-            ProviderFailureStage::Connect,
-            "provider chat error",
-            &error,
-        )
-    })?;
+    let mut response = await_provider_dispatch(false, provider.chat(request))
+        .await
+        .map_err(|error| {
+            observation.observe_error(&error);
+            adapter_error_for_target(
+                FailureTarget::new(thinking_item_id, TurnItemType::Reasoning),
+                provider.as_ref(),
+                model_name.as_str(),
+                ProviderTransportKind::NonStream,
+                ProviderFailureStage::Connect,
+                "provider chat error",
+                &error,
+            )
+        })?;
     if let Some(usage) = &response.usage {
-        observation.observe(usage);
+        observation.observe_and_publish(usage).await?;
     }
     bind_replay_to_response_target(
         &mut response.provider_replay_state,
@@ -460,7 +498,7 @@ async fn stream_provider_response_observed(
     message_item_id: &str,
     provider_timeout_policy: ProviderTimeoutPolicy,
     event_tx: &AgentEventHub,
-    observation: &ProviderAttemptObservation,
+    observation: &ProviderAttemptObservation<'_>,
 ) -> Result<(String, Option<pioneer_provider::TokenUsage>), ChatTurnError> {
     pioneer_observability::turn_startup::dispatched(turn_id);
     let mut lifecycle_metric = NativeProviderRoundMetric::start();
@@ -476,8 +514,7 @@ async fn stream_provider_response_observed(
             turn_id,
             pioneer_observability::turn_startup::Stage::ProviderConnect,
         );
-        provider
-            .stream_chat_with_diagnostics(request)
+        await_provider_dispatch(true, provider.stream_chat_with_diagnostics(request))
             .await
             .map_err(|error| {
                 observation.observe_error(&error);
@@ -538,7 +575,7 @@ async fn stream_provider_response_observed(
 
             if let Some(snapshot) = &chunk_usage {
                 usage.get_or_insert_with(Default::default).update(snapshot);
-                observation.observe(snapshot);
+                observation.observe_and_publish(snapshot).await?;
             }
             if chunk_replay.is_some() {
                 provider_replay_state = chunk_replay;
@@ -846,27 +883,29 @@ async fn non_stream_provider_response_observed(
     thinking_item_id: &str,
     message_item_id: &str,
     event_tx: &AgentEventHub,
-    observation: &ProviderAttemptObservation,
+    observation: &ProviderAttemptObservation<'_>,
 ) -> Result<(String, Option<pioneer_provider::TokenUsage>), ChatTurnError> {
     pioneer_observability::turn_startup::dispatched(turn_id);
     let mut lifecycle_metric = NativeProviderRoundMetric::start();
     let model_name = request.model.clone();
 
-    let mut response = provider.chat(request).await.map_err(|error| {
-        observation.observe_error(&error);
-        adapter_error_for_target(
-            FailureTarget::new(thinking_item_id, TurnItemType::Reasoning),
-            provider.as_ref(),
-            model_name.as_str(),
-            ProviderTransportKind::NonStream,
-            ProviderFailureStage::Connect,
-            "provider error",
-            &error,
-        )
-    })?;
+    let mut response = await_provider_dispatch(false, provider.chat(request))
+        .await
+        .map_err(|error| {
+            observation.observe_error(&error);
+            adapter_error_for_target(
+                FailureTarget::new(thinking_item_id, TurnItemType::Reasoning),
+                provider.as_ref(),
+                model_name.as_str(),
+                ProviderTransportKind::NonStream,
+                ProviderFailureStage::Connect,
+                "provider error",
+                &error,
+            )
+        })?;
 
     if let Some(usage) = &response.usage {
-        observation.observe(usage);
+        observation.observe_and_publish(usage).await?;
     }
     bind_replay_to_response_target(
         &mut response.provider_replay_state,
@@ -1270,7 +1309,7 @@ async fn read_next_stream_chunk<S>(
     provider: &Arc<dyn Provider>,
     model_name: &str,
     provider_timeout_policy: ProviderTimeoutPolicy,
-    observation: &ProviderAttemptObservation,
+    observation: &ProviderAttemptObservation<'_>,
 ) -> Result<Option<StreamChunk>, ChatTurnError>
 where
     S: Stream<Item = anyhow::Result<StreamChunk>> + Unpin,
@@ -1287,9 +1326,34 @@ where
         provider_timeout_policy.first_chunk_timeout
     };
 
-    let next_chunk = timeout(wait, async {
+    let context = match pioneer_provider::current_provider_attempt_context() {
+        Some(context) => context,
+        None => pioneer_provider::ProviderAttemptContext::from_started(
+            provider_timeout_policy,
+            true,
+            observation.started,
+        )
+        .map_err(|_| {
+            ChatTurnError::Terminal("provider attempt timeout policy is out of range".into())
+        })?,
+    };
+    let stage_deadline = if *seen_any_chunk {
+        let now = tokio::time::Instant::now();
+        now + wait.min(context.deadline.saturating_duration_since(now))
+    } else {
+        context.first_output_deadline
+    };
+    let deadline = stage_deadline.min(context.deadline);
+    let next_chunk = tokio::time::timeout_at(deadline, async {
         loop {
-            let next = stream.next().await;
+            if context.cancellation.is_cancelled() || tokio::time::Instant::now() >= deadline {
+                return Err(());
+            }
+            let next = tokio::select! {
+                biased;
+                _ = context.cancellation.cancelled() => return Err(()),
+                next = stream.next() => next,
+            };
             if let Some(Ok(chunk)) = &next {
                 let identity_only = !chunk.is_final
                     && chunk.delta.is_empty()
@@ -1310,17 +1374,29 @@ where
                     // Correlation evidence must survive without resetting the
                     // request's first/inter-chunk deadline or counting as progress.
                     observation.observe(chunk.usage.as_ref().expect("identity usage"));
+                    tokio::task::yield_now().await;
                     continue;
                 }
             }
-            break next;
+            break Ok(next);
         }
     })
     .await
+    .unwrap_or(Err(()))
     .map_err(|_| {
         let mut classification =
             ProviderFailureClassification::new(ProviderFailureClass::StreamStall);
         classification.request_id = diagnostics.request_id();
+        classification.provider_code = Some(
+            if deadline == context.deadline {
+                "provider_attempt_deadline_exceeded"
+            } else if *seen_any_chunk {
+                "provider_idle_deadline_exceeded"
+            } else {
+                "provider_first_output_deadline_exceeded"
+            }
+            .to_owned(),
+        );
         provider_failure_error_with_classification(
             target.item_id,
             target.item_type,
@@ -1337,8 +1413,6 @@ where
         return Ok(None);
     };
 
-    *seen_any_chunk = true;
-
     let chunk = chunk_result.map_err(|error| {
         observation.observe_error(&error);
         adapter_error_for_target(
@@ -1352,6 +1426,13 @@ where
         )
     })?;
 
+    *seen_any_chunk |= !chunk.delta.is_empty()
+        || chunk
+            .reasoning_delta
+            .as_ref()
+            .is_some_and(|text| !text.is_empty())
+        || !chunk.tool_calls.is_empty()
+        || chunk.is_final;
     Ok(Some(chunk))
 }
 
@@ -3251,23 +3332,121 @@ fn observe_startup_chunk(turn_id: &str, chunk: &pioneer_provider::StreamChunk) {
 /// One item per physical chat dispatch; snapshots are never additional charges.
 /// Start records survive cancellation. Only provider-reported partial counters
 /// survive error; no usage is invented for a failed connect or missing terminal.
-pub(super) struct ProviderAttemptObservation {
+pub(super) struct ProviderAttemptObservation<'a> {
+    publication: Option<(&'a AgentEventHub, String, String, String)>,
+    publication_failure: std::sync::atomic::AtomicU8,
+    started: tokio::time::Instant,
     id: String,
+    window_index: Option<u32>,
     provider: String,
     model: String,
     api: String,
     route: Option<String>,
     usage: std::sync::Mutex<TokenUsage>,
 }
-impl ProviderAttemptObservation {
+impl<'a> ProviderAttemptObservation<'a> {
     pub(super) fn new(provider: &dyn Provider, model: &str) -> Self {
         Self {
+            publication: None,
+            publication_failure: std::sync::atomic::AtomicU8::new(0),
+            started: tokio::time::Instant::now(),
             id: super::generate_id(super::TURN_ITEM_ID_LEN),
+            window_index: None,
             provider: provider.name().to_owned(),
             model: model.to_owned(),
             api: provider.usage_api().to_owned(),
             route: provider.usage_route(),
             usage: std::sync::Mutex::new(TokenUsage::default()),
+        }
+    }
+    pub(super) fn with_window_index(mut self, window_index: Option<u32>) -> Self {
+        self.window_index = window_index;
+        self
+    }
+    pub(super) fn with_publication(
+        mut self,
+        events: &'a AgentEventHub,
+        workspace: &str,
+        thread: &str,
+        turn: &str,
+    ) -> Self {
+        self.publication = Some((
+            events,
+            workspace.to_owned(),
+            thread.to_owned(),
+            turn.to_owned(),
+        ));
+        self
+    }
+    pub(super) async fn observe_and_publish(
+        &self,
+        snapshot: &TokenUsage,
+    ) -> Result<(), ChatTurnError> {
+        let changed = {
+            let mut usage = self.usage.lock().expect("usage observation");
+            let previous = (usage.input_tokens, usage.output_tokens);
+            usage.update(snapshot);
+            previous != (usage.input_tokens, usage.output_tokens)
+        };
+        if changed && let Some((events, workspace, thread, turn)) = &self.publication {
+            let item = self.item(None);
+            let result = Self::publish_usage_event(
+                events,
+                AgentDurableEvent::ProviderUsageObserved {
+                    notification: pioneer_protocol::ItemUpdatedNotification {
+                        workspace_id: workspace.clone(),
+                        thread_id: thread.clone(),
+                        turn_id: turn.clone(),
+                        item,
+                    },
+                },
+            )
+            .await;
+            if let Err(error) = &result {
+                self.record_publication_failure(error);
+            }
+            result?;
+        }
+        Ok(())
+    }
+    async fn publish_usage_event(
+        events: &AgentEventHub,
+        event: AgentDurableEvent,
+    ) -> Result<(), ChatTurnError> {
+        let publish = super::emit_durable_event(events, event);
+        let Some(context) = pioneer_provider::current_provider_attempt_context() else {
+            return publish.await;
+        };
+        let unavailable =
+            || ChatTurnError::Transient("provider usage commit exceeded attempt deadline".into());
+        if context.cancellation.is_cancelled() || tokio::time::Instant::now() >= context.deadline {
+            return Err(unavailable());
+        }
+        tokio::select! {
+            biased;
+            _ = context.cancellation.cancelled() => Err(unavailable()),
+            result = tokio::time::timeout_at(context.deadline, publish) => result.map_err(|_| unavailable())?,
+        }
+    }
+    fn record_publication_failure(&self, error: &ChatTurnError) {
+        let kind = match error {
+            ChatTurnError::Terminal(_) => 3,
+            ChatTurnError::Transient(_) => 1,
+            _ => 2,
+        };
+        self.publication_failure
+            .fetch_max(kind, std::sync::atomic::Ordering::Relaxed);
+    }
+    pub(super) fn publication_failure(&self) -> Option<pioneer_protocol::TurnFailureDisposition> {
+        use pioneer_protocol::TurnFailureDisposition;
+        match self
+            .publication_failure
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            0 => None,
+            1 => Some(TurnFailureDisposition::Transient),
+            3 => Some(TurnFailureDisposition::Permanent),
+            _ => Some(TurnFailureDisposition::Unknown),
         }
     }
     pub(super) fn observe(&self, snapshot: &TokenUsage) {
@@ -3281,6 +3460,43 @@ impl ProviderAttemptObservation {
             self.observe(snapshot);
         }
     }
+    pub(super) fn known_token_count(&self) -> u64 {
+        let usage = self.usage.lock().expect("usage observation");
+        usage
+            .input_tokens
+            .unwrap_or(0)
+            .saturating_add(usage.output_tokens.unwrap_or(0))
+    }
+    pub(super) fn token_count(&self) -> Option<u64> {
+        total_token_usage(Some(&self.usage.lock().expect("usage observation")))
+    }
+    pub(super) fn context(
+        &self,
+        policy: ProviderTimeoutPolicy,
+        streaming: bool,
+    ) -> anyhow::Result<pioneer_provider::ProviderAttemptContext> {
+        pioneer_provider::ProviderAttemptContext::from_started(policy, streaming, self.started)
+    }
+    fn item(&self, completed: Option<bool>) -> TurnItem {
+        let mut usage = self.usage.lock().expect("usage observation").clone();
+        if let Some(raw) = &usage.raw_usage {
+            usage.raw_usage = Some(pioneer_provider::usage::bounded_usage(raw));
+        }
+        TurnItem::SystemEvent {
+            id: self.id.clone(),
+            level: pioneer_protocol::SystemEventLevel::Info,
+            message: "Provider usage observation".into(),
+            code: Some("provider_usage".into()),
+            details: Some(serde_json::json!({"schema_version":1,
+                "nativeMethod":"provider/usage/observed", "observation_id":self.id,
+                "physical_attempt_id":usage.physical_attempt_id,
+                "window_index":self.window_index,
+                "request_sent":serde_json::Value::Null,
+                "provider":self.provider,"model":self.model,"api":self.api,"route":self.route,
+                "status":match completed {None=>"started",Some(true)=>"completed",Some(false)=>"failed"},
+                "complete":completed == Some(true),"usage":usage})),
+        }
+    }
     pub(super) async fn publish(
         &self,
         events: &AgentEventHub,
@@ -3289,23 +3505,7 @@ impl ProviderAttemptObservation {
         turn: &str,
         completed: Option<bool>,
     ) -> Result<(), ChatTurnError> {
-        let mut usage = self.usage.lock().expect("usage observation").clone();
-        if let Some(raw) = &usage.raw_usage {
-            usage.raw_usage = Some(pioneer_provider::usage::bounded_usage(raw));
-        }
-        let item = TurnItem::SystemEvent {
-            id: self.id.clone(),
-            level: pioneer_protocol::SystemEventLevel::Info,
-            message: "Provider usage observation".into(),
-            code: Some("provider_usage".into()),
-            details: Some(serde_json::json!({"schema_version":1,
-                "nativeMethod":"provider/usage/observed", "observation_id":self.id,
-                "physical_attempt_id":usage.physical_attempt_id,
-                "request_sent":serde_json::Value::Null,
-                "provider":self.provider,"model":self.model,"api":self.api,"route":self.route,
-                "status":match completed {None=>"started",Some(true)=>"completed",Some(false)=>"failed"},
-                "complete":completed == Some(true),"usage":usage})),
-        };
+        let item = self.item(completed);
         let event = if completed.is_none() {
             AgentDurableEvent::ItemStarted {
                 notification: ItemStartedNotification {
@@ -3325,10 +3525,15 @@ impl ProviderAttemptObservation {
                 },
             }
         };
-        super::emit_durable_event(events, event).await
+        let result = Self::publish_usage_event(events, event).await;
+        if let Err(error) = &result {
+            self.record_publication_failure(error);
+        }
+        result
     }
 }
 
+#[cfg(test)]
 pub(super) async fn request_agent_round(
     provider: &Arc<dyn Provider>,
     request: ChatRequest,
@@ -3340,11 +3545,7 @@ pub(super) async fn request_agent_round(
     provider_timeout_policy: ProviderTimeoutPolicy,
     event_tx: &AgentEventHub,
 ) -> Result<AgentRoundResponse, ChatTurnError> {
-    let observation = ProviderAttemptObservation::new(provider.as_ref(), &request.model);
-    observation
-        .publish(event_tx, workspace_id, thread_id, turn_id, None)
-        .await?;
-    let result = request_agent_round_observed(
+    request_agent_round_accounted(
         provider,
         request,
         workspace_id,
@@ -3354,21 +3555,77 @@ pub(super) async fn request_agent_round(
         force_non_stream,
         provider_timeout_policy,
         event_tx,
-        &observation,
+        None,
     )
-    .await;
-    observation
-        .publish(
-            event_tx,
+    .await
+}
+
+pub(super) async fn request_agent_round_accounted(
+    provider: &Arc<dyn Provider>,
+    request: ChatRequest,
+    workspace_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+    thinking_item_id: &str,
+    force_non_stream: bool,
+    provider_timeout_policy: ProviderTimeoutPolicy,
+    event_tx: &AgentEventHub,
+    accounting: Option<&mut super::ChatExecutionWindowStats>,
+) -> Result<AgentRoundResponse, ChatTurnError> {
+    let observation = ProviderAttemptObservation::new(provider.as_ref(), &request.model)
+        .with_window_index(accounting.as_ref().map(|stats| stats.window_index))
+        .with_publication(event_tx, workspace_id, thread_id, turn_id);
+    let context = pioneer_provider::ProviderAttemptContext::from_started(
+        provider_timeout_policy,
+        provider.capabilities().streaming && !force_non_stream,
+        observation.started,
+    )
+    .map_err(|_| {
+        ChatTurnError::Terminal("provider attempt timeout policy is out of range".into())
+    })?;
+    let mut observation_started = false;
+    let result = pioneer_provider::with_provider_attempt_context(context, async {
+        observation
+            .publish(event_tx, workspace_id, thread_id, turn_id, None)
+            .await?;
+        observation_started = true;
+        request_agent_round_observed(
+            provider,
+            request,
             workspace_id,
             thread_id,
             turn_id,
-            Some(result.is_ok()),
+            thinking_item_id,
+            force_non_stream,
+            provider_timeout_policy,
+            event_tx,
+            &observation,
         )
-        .await?;
+        .await
+    })
+    .await;
+    if let Some(stats) = accounting {
+        stats.record_provider_round(
+            result.as_ref().map_or(0, |round| round.tool_calls.len()),
+            Some(observation.known_token_count()),
+        );
+        stats.provider_token_usage_unknown |= observation.token_count().is_none();
+    }
+    if observation_started {
+        observation
+            .publish(
+                event_tx,
+                workspace_id,
+                thread_id,
+                turn_id,
+                Some(result.is_ok()),
+            )
+            .await?;
+    }
     result
 }
 
+#[cfg(test)]
 pub(super) async fn stream_provider_response(
     provider: &Arc<dyn Provider>,
     request: ChatRequest,
@@ -3379,12 +3636,8 @@ pub(super) async fn stream_provider_response(
     message_item_id: &str,
     provider_timeout_policy: ProviderTimeoutPolicy,
     event_tx: &AgentEventHub,
-) -> Result<(String, Option<pioneer_provider::TokenUsage>), ChatTurnError> {
-    let observation = ProviderAttemptObservation::new(provider.as_ref(), &request.model);
-    observation
-        .publish(event_tx, workspace_id, thread_id, turn_id, None)
-        .await?;
-    let result = stream_provider_response_observed(
+) -> Result<(String, Option<TokenUsage>), ChatTurnError> {
+    stream_provider_response_accounted(
         provider,
         request,
         workspace_id,
@@ -3394,22 +3647,12 @@ pub(super) async fn stream_provider_response(
         message_item_id,
         provider_timeout_policy,
         event_tx,
-        &observation,
+        None,
     )
-    .await;
-    observation
-        .publish(
-            event_tx,
-            workspace_id,
-            thread_id,
-            turn_id,
-            Some(result.is_ok()),
-        )
-        .await?;
-    result
+    .await
 }
 
-pub(super) async fn non_stream_provider_response(
+pub(super) async fn stream_provider_response_accounted(
     provider: &Arc<dyn Provider>,
     request: ChatRequest,
     workspace_id: &str,
@@ -3417,33 +3660,118 @@ pub(super) async fn non_stream_provider_response(
     turn_id: &str,
     thinking_item_id: &str,
     message_item_id: &str,
+    provider_timeout_policy: ProviderTimeoutPolicy,
     event_tx: &AgentEventHub,
+    accounting: Option<&mut super::ChatExecutionWindowStats>,
 ) -> Result<(String, Option<pioneer_provider::TokenUsage>), ChatTurnError> {
-    let observation = ProviderAttemptObservation::new(provider.as_ref(), &request.model);
-    observation
-        .publish(event_tx, workspace_id, thread_id, turn_id, None)
-        .await?;
-    let result = non_stream_provider_response_observed(
-        provider,
-        request,
-        workspace_id,
-        thread_id,
-        turn_id,
-        thinking_item_id,
-        message_item_id,
-        event_tx,
-        &observation,
+    let observation = ProviderAttemptObservation::new(provider.as_ref(), &request.model)
+        .with_window_index(accounting.as_ref().map(|stats| stats.window_index))
+        .with_publication(event_tx, workspace_id, thread_id, turn_id);
+    let context = pioneer_provider::ProviderAttemptContext::from_started(
+        provider_timeout_policy,
+        true,
+        observation.started,
     )
-    .await;
-    observation
-        .publish(
-            event_tx,
+    .map_err(|_| {
+        ChatTurnError::Terminal("provider attempt timeout policy is out of range".into())
+    })?;
+    let mut observation_started = false;
+    let result = pioneer_provider::with_provider_attempt_context(context, async {
+        observation
+            .publish(event_tx, workspace_id, thread_id, turn_id, None)
+            .await?;
+        observation_started = true;
+        stream_provider_response_observed(
+            provider,
+            request,
             workspace_id,
             thread_id,
             turn_id,
-            Some(result.is_ok()),
+            thinking_item_id,
+            message_item_id,
+            provider_timeout_policy,
+            event_tx,
+            &observation,
         )
-        .await?;
+        .await
+    })
+    .await;
+    if let Some(stats) = accounting {
+        stats.record_provider_round(0, Some(observation.known_token_count()));
+        stats.provider_token_usage_unknown |= observation.token_count().is_none();
+    }
+    if observation_started {
+        observation
+            .publish(
+                event_tx,
+                workspace_id,
+                thread_id,
+                turn_id,
+                Some(result.is_ok()),
+            )
+            .await?;
+    }
+    result
+}
+
+pub(super) async fn non_stream_provider_response_with_policy(
+    provider: &Arc<dyn Provider>,
+    request: ChatRequest,
+    workspace_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+    thinking_item_id: &str,
+    message_item_id: &str,
+    provider_timeout_policy: ProviderTimeoutPolicy,
+    event_tx: &AgentEventHub,
+    accounting: Option<&mut super::ChatExecutionWindowStats>,
+) -> Result<(String, Option<TokenUsage>), ChatTurnError> {
+    let observation = ProviderAttemptObservation::new(provider.as_ref(), &request.model)
+        .with_window_index(accounting.as_ref().map(|stats| stats.window_index))
+        .with_publication(event_tx, workspace_id, thread_id, turn_id);
+    let context = pioneer_provider::ProviderAttemptContext::from_started(
+        provider_timeout_policy,
+        false,
+        observation.started,
+    )
+    .map_err(|_| {
+        ChatTurnError::Terminal("provider attempt timeout policy is out of range".into())
+    })?;
+    let mut observation_started = false;
+    let result = pioneer_provider::with_provider_attempt_context(context, async {
+        observation
+            .publish(event_tx, workspace_id, thread_id, turn_id, None)
+            .await?;
+        observation_started = true;
+        non_stream_provider_response_observed(
+            provider,
+            request,
+            workspace_id,
+            thread_id,
+            turn_id,
+            thinking_item_id,
+            message_item_id,
+            event_tx,
+            &observation,
+        )
+        .await
+    })
+    .await;
+    if let Some(stats) = accounting {
+        stats.record_provider_round(0, Some(observation.known_token_count()));
+        stats.provider_token_usage_unknown |= observation.token_count().is_none();
+    }
+    if observation_started {
+        observation
+            .publish(
+                event_tx,
+                workspace_id,
+                thread_id,
+                turn_id,
+                Some(result.is_ok()),
+            )
+            .await?;
+    }
     result
 }
 
@@ -3488,6 +3816,279 @@ mod terminal_boundary_tests {
             Ok(Box::pin(futures_util::stream::iter(chunks)))
         }
     }
+
+    struct SlowNonStreamProvider;
+    #[async_trait]
+    impl Provider for SlowNonStreamProvider {
+        fn name(&self) -> &str {
+            "slow-non-stream"
+        }
+        fn capabilities(&self) -> pioneer_provider::ProviderCapabilities {
+            Default::default()
+        }
+        async fn chat(&self, _: ChatRequest) -> anyhow::Result<pioneer_provider::ChatResponse> {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            anyhow::bail!("unexpected completion after configured deadline")
+        }
+        async fn stream_chat(
+            &self,
+            _: ChatRequest,
+        ) -> anyhow::Result<futures_util::stream::BoxStream<'static, anyhow::Result<StreamChunk>>>
+        {
+            anyhow::bail!("unexpected streaming")
+        }
+    }
+    #[tokio::test(start_paused = true)]
+    async fn non_stream_attempt_uses_configured_timeout_and_accounts_failure_once() {
+        let provider: Arc<dyn Provider> = Arc::new(SlowNonStreamProvider);
+        let hub = AgentEventHub::new();
+        let mut policy = ProviderTimeoutPolicy::default();
+        policy.non_stream_request_timeout = std::time::Duration::from_millis(50);
+        let mut stats = super::super::ChatExecutionWindowStats::new(1);
+        let started = tokio::time::Instant::now();
+        let (result, _) = tokio::join!(
+            non_stream_provider_response_with_policy(
+                &provider,
+                request(),
+                "ws",
+                "thread",
+                "turn",
+                "thinking",
+                "message",
+                policy,
+                &hub,
+                Some(&mut stats),
+            ),
+            acknowledge_round_events(&hub)
+        );
+        assert_eq!(started.elapsed(), std::time::Duration::from_millis(50));
+        assert!(
+            matches!(result, Err(ChatTurnError::ProviderFailure { failure, .. })
+            if failure.class == ProviderFailureClass::NetworkTransient)
+        );
+        assert_eq!(stats.agent_round_count, 1);
+        assert_eq!(stats.provider_token_count, Some(0));
+        assert!(stats.provider_token_usage_unknown);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ready_identity_flood_yields_and_retains_the_first_output_deadline() {
+        let provider: Arc<dyn Provider> = Arc::new(SlowNonStreamProvider);
+        let mut policy = ProviderTimeoutPolicy::default();
+        policy.first_chunk_timeout = std::time::Duration::from_millis(100);
+        let observation = ProviderAttemptObservation::new(provider.as_ref(), "fixture");
+        let context = observation.context(policy, true).unwrap();
+        let mut identity = StreamChunk::delta("");
+        identity.usage = Some(TokenUsage {
+            request_id: Some("req-identity".into()),
+            ..Default::default()
+        });
+        let mut stream = futures_util::stream::repeat(identity).map(Ok::<_, anyhow::Error>);
+        let mut seen = false;
+        let (result, ()) = tokio::join!(
+            pioneer_provider::with_provider_attempt_context(context, async {
+                read_next_stream_chunk(
+                    &mut stream,
+                    &mut seen,
+                    &Default::default(),
+                    FailureTarget::new("item", TurnItemType::Reasoning),
+                    &provider,
+                    "fixture",
+                    policy,
+                    &observation,
+                )
+                .await
+            }),
+            async {
+                tokio::time::advance(std::time::Duration::from_millis(100)).await;
+            }
+        );
+        assert!(
+            matches!(result, Err(ChatTurnError::ProviderFailure { failure, .. })
+            if failure.class == ProviderFailureClass::StreamStall)
+        );
+        assert!(!seen);
+        assert_eq!(
+            observation.usage.lock().unwrap().request_id.as_deref(),
+            Some("req-identity")
+        );
+        assert_eq!(observation.token_count(), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn expired_stream_deadline_does_not_poll_even_a_ready_chunk() {
+        let provider: Arc<dyn Provider> = Arc::new(SlowNonStreamProvider);
+        let policy = ProviderTimeoutPolicy::default();
+        let observation = ProviderAttemptObservation::new(provider.as_ref(), "fixture");
+        let context = observation.context(policy, true).unwrap();
+        tokio::time::advance(context.first_output_deadline - tokio::time::Instant::now()).await;
+        let polls = Arc::new(AtomicUsize::new(0));
+        let counter = polls.clone();
+        let mut stream = futures_util::stream::poll_fn(move |_| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            std::task::Poll::Ready(Some(Ok(StreamChunk::delta("too late"))))
+        });
+        let result = pioneer_provider::with_provider_attempt_context(context, async {
+            read_next_stream_chunk(
+                &mut stream,
+                &mut false,
+                &Default::default(),
+                FailureTarget::new("item", TurnItemType::Reasoning),
+                &provider,
+                "fixture",
+                policy,
+                &observation,
+            )
+            .await
+        })
+        .await;
+        assert!(
+            matches!(result, Err(ChatTurnError::ProviderFailure { failure, .. })
+            if failure.class == ProviderFailureClass::StreamStall)
+        );
+        assert_eq!(polls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn late_headers_do_not_grant_a_second_first_output_budget() {
+        let provider: Arc<dyn Provider> = Arc::new(FixtureProvider {
+            chunks: vec![],
+            fail: false,
+            attempts: Arc::new(AtomicUsize::new(0)),
+        });
+        let mut policy = ProviderTimeoutPolicy::default();
+        policy.first_chunk_timeout = std::time::Duration::from_millis(100);
+        policy.max_stream_duration = Some(std::time::Duration::from_millis(500));
+        let observation = ProviderAttemptObservation::new(provider.as_ref(), "fixture");
+        let context = pioneer_provider::ProviderAttemptContext::from_started(
+            policy,
+            true,
+            observation.started,
+        )
+        .unwrap();
+        let started = observation.started;
+        let error = pioneer_provider::with_provider_attempt_context(context, async {
+            await_provider_dispatch(true, async {
+                tokio::time::sleep(std::time::Duration::from_millis(90)).await;
+                Ok(())
+            })
+            .await
+            .unwrap();
+            let mut stream = Box::pin(futures_util::stream::once(async {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                Ok(StreamChunk::delta("meaningful"))
+            }));
+            let mut seen = false;
+            read_next_stream_chunk(
+                &mut stream,
+                &mut seen,
+                &Default::default(),
+                FailureTarget::new("item", TurnItemType::Reasoning),
+                &provider,
+                "fixture",
+                policy,
+                &observation,
+            )
+            .await
+            .unwrap_err()
+        })
+        .await;
+        assert_eq!(started.elapsed(), std::time::Duration::from_millis(100));
+        assert!(
+            matches!(error, ChatTurnError::ProviderFailure { failure, .. }
+            if failure.stage == ProviderFailureStage::FirstChunk
+                && failure.provider_code.as_deref() == Some("provider_first_output_deadline_exceeded"))
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn meaningful_chunks_cannot_extend_absolute_attempt_cap() {
+        let provider: Arc<dyn Provider> = Arc::new(FixtureProvider {
+            chunks: vec![],
+            fail: false,
+            attempts: Arc::new(AtomicUsize::new(0)),
+        });
+        let mut policy = ProviderTimeoutPolicy::default();
+        policy.first_chunk_timeout = std::time::Duration::from_millis(20);
+        policy.inter_chunk_idle_timeout = std::time::Duration::from_millis(20);
+        policy.max_stream_duration = Some(std::time::Duration::from_millis(35));
+        let observation = ProviderAttemptObservation::new(provider.as_ref(), "fixture");
+        let context = pioneer_provider::ProviderAttemptContext::from_started(
+            policy,
+            true,
+            observation.started,
+        )
+        .unwrap();
+        let started = observation.started;
+        let error = pioneer_provider::with_provider_attempt_context(context, async {
+            let mut stream = Box::pin(futures_util::stream::unfold((), |_| async {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                Some((Ok(StreamChunk::delta("x")), ()))
+            }));
+            let mut seen = false;
+            for _ in 0..3 {
+                assert!(
+                    read_next_stream_chunk(
+                        &mut stream,
+                        &mut seen,
+                        &Default::default(),
+                        FailureTarget::new("item", TurnItemType::Reasoning),
+                        &provider,
+                        "fixture",
+                        policy,
+                        &observation
+                    )
+                    .await
+                    .unwrap()
+                    .is_some()
+                );
+            }
+            read_next_stream_chunk(
+                &mut stream,
+                &mut seen,
+                &Default::default(),
+                FailureTarget::new("item", TurnItemType::Reasoning),
+                &provider,
+                "fixture",
+                policy,
+                &observation,
+            )
+            .await
+            .unwrap_err()
+        })
+        .await;
+        assert_eq!(started.elapsed(), std::time::Duration::from_millis(35));
+        assert!(
+            matches!(error, ChatTurnError::ProviderFailure { failure, .. }
+            if failure.provider_code.as_deref() == Some("provider_attempt_deadline_exceeded"))
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn expired_attempt_never_dispatches_the_next_stage() {
+        let context =
+            pioneer_provider::ProviderAttemptContext::new(ProviderTimeoutPolicy::default(), true)
+                .unwrap();
+        tokio::time::advance(
+            context
+                .first_output_deadline
+                .saturating_duration_since(tokio::time::Instant::now()),
+        )
+        .await;
+        let dispatched = AtomicUsize::new(0);
+        let result = pioneer_provider::with_provider_attempt_context(
+            context.clone(),
+            await_provider_dispatch(true, async {
+                dispatched.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }),
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(dispatched.load(Ordering::SeqCst), 0);
+        assert!(context.cancellation.is_cancelled());
+    }
+
     fn request() -> ChatRequest {
         ChatRequest {
             model: "fixture".into(),

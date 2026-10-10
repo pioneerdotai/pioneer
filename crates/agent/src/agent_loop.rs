@@ -1971,6 +1971,7 @@ fn loop_durable_event_kind(event: &AgentDurableEvent) -> &'static str {
         AgentDurableEvent::TurnProviderHistoryAppended { .. } => "turn_provider_history_appended",
         AgentDurableEvent::ItemStarted { .. } => "item_started",
         AgentDurableEvent::ItemCompleted { .. } => "item_completed",
+        AgentDurableEvent::ProviderUsageObserved { .. } => "provider_usage_observed",
         AgentDurableEvent::TurnFinalizationPrepared { .. } => "turn_finalization_prepared",
         AgentDurableEvent::ItemToolRetryScheduled { .. } => "item_tool_retry_scheduled",
         AgentDurableEvent::ItemToolRetryResolved { .. } => "item_tool_retry_resolved",
