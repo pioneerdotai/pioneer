@@ -122,6 +122,9 @@ impl ErrorClassifier for DefaultErrorClassifier {
     }
 
     fn classify_error(&self, invocation: &ToolInvocation, error: &ToolError) -> ToolOutcome {
+        if matches!(error, ToolError::ResponseLimitExceeded) {
+            return response_limit_outcome();
+        }
         if matches!(error, ToolError::TimedOut) {
             return attempt_timeout_outcome();
         }
@@ -150,6 +153,7 @@ impl ErrorClassifier for DefaultErrorClassifier {
         }
 
         match error {
+            ToolError::ResponseLimitExceeded => response_limit_outcome(),
             ToolError::TimedOut => attempt_timeout_outcome(),
             ToolError::InvalidArguments(_) => ToolOutcome::recoverable(
                 ToolErrorClass::InvalidArguments,
@@ -190,6 +194,15 @@ impl ErrorClassifier for DefaultErrorClassifier {
     }
 }
 
+fn response_limit_outcome() -> ToolOutcome {
+    ToolOutcome::recoverable(
+        ToolErrorClass::NeedsNarrowing,
+        "Response exceeded bounded read limits. Narrow the query or use a smaller source before retrying.",
+        true,
+        Some("response_read_limit".to_owned()),
+    )
+}
+
 fn attempt_timeout_outcome() -> ToolOutcome {
     ToolOutcome::recoverable(
         ToolErrorClass::Timeout,
@@ -219,6 +232,7 @@ fn classify_native_file_tool_error(tool_name: &str, error: &ToolError) -> ToolOu
     }
 
     match error {
+        ToolError::ResponseLimitExceeded => response_limit_outcome(),
         ToolError::TimedOut => attempt_timeout_outcome(),
         ToolError::InvalidArguments(message) => ToolOutcome::recoverable(
             ToolErrorClass::InvalidArguments,
@@ -426,6 +440,7 @@ fn classify_mcp_result(raw_output_json: &JsonValue, success: bool) -> ToolOutcom
 
 fn classify_mcp_error(invocation: &ToolInvocation, error: &ToolError) -> ToolOutcome {
     match error {
+        ToolError::ResponseLimitExceeded => response_limit_outcome(),
         ToolError::TimedOut => attempt_timeout_outcome(),
         ToolError::InvalidArguments(_) => ToolOutcome::fatal(
             ToolErrorClass::InvalidArguments,
@@ -774,6 +789,7 @@ fn classify_computer_use_result(raw_output_json: &JsonValue, success: bool) -> T
 
 fn classify_computer_use_error(error: &ToolError) -> ToolOutcome {
     match error {
+        ToolError::ResponseLimitExceeded => response_limit_outcome(),
         ToolError::TimedOut => attempt_timeout_outcome(),
         ToolError::InvalidArguments(message) => {
             let lower = message.to_lowercase();
@@ -997,6 +1013,7 @@ fn computer_use_failure_outcome(failure_class: &'static str, stopped: bool) -> T
 
 fn classify_shell_error(error: &ToolError) -> ToolOutcome {
     match error {
+        ToolError::ResponseLimitExceeded => response_limit_outcome(),
         ToolError::TimedOut => attempt_timeout_outcome(),
         ToolError::InvalidArguments(_) => ToolOutcome::recoverable(
             ToolErrorClass::InvalidArguments,
@@ -1049,6 +1066,7 @@ fn classify_shell_error(error: &ToolError) -> ToolOutcome {
 
 fn classify_web_error(error: &ToolError) -> ToolOutcome {
     match error {
+        ToolError::ResponseLimitExceeded => response_limit_outcome(),
         ToolError::TimedOut => attempt_timeout_outcome(),
         ToolError::InvalidArguments(_) => ToolOutcome::recoverable(
             ToolErrorClass::InvalidArguments,
@@ -1158,6 +1176,34 @@ fn classify_shell_error_class(stderr_lower: &str) -> ToolErrorClass {
 mod tests {
     use super::*;
     use crate::shell_format::{ExecPayloadInput, build_exec_model_payload};
+
+    #[test]
+    fn strict_response_limit_requires_narrower_work_and_never_claims_success() {
+        let outcome = DefaultErrorClassifier.classify_error(
+            &invocation_for("web_search"),
+            &ToolError::ResponseLimitExceeded,
+        );
+        assert_eq!(outcome.status, ToolOutcomeStatus::RecoverableError);
+        assert_eq!(outcome.error_class, Some(ToolErrorClass::NeedsNarrowing));
+        assert!(outcome.incomplete);
+        let observation = crate::retry_controller::ToolRetryObservation::from_tool_outcome(
+            "search",
+            "web_search",
+            1,
+            "web_search",
+            "{}",
+            false,
+            outcome,
+        );
+        let decision = crate::retry_controller::ToolRetryController::new(
+            crate::retry_controller::ToolRetryBudgetConfig::default(),
+        )
+        .decide(&[observation]);
+        assert!(matches!(
+            decision,
+            crate::retry_controller::ToolRetryDecision::Exhausted { .. }
+        ));
+    }
 
     fn invocation_for(tool_name: &str) -> ToolInvocation {
         ToolInvocation {

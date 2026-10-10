@@ -3368,6 +3368,10 @@ fn map_shared_tool_error(error: pioneer_tools::ToolError) -> TurnMcpInvocationEr
     use pioneer_tools::ToolError;
 
     let (code, message) = match error {
+        ToolError::ResponseLimitExceeded => (
+            TurnMcpInvocationErrorCode::ExecutionFailed,
+            "MCP response exceeds bounded read limits".to_owned(),
+        ),
         ToolError::TimedOut => (
             TurnMcpInvocationErrorCode::TimedOut,
             "MCP tool attempt deadline exceeded".to_owned(),

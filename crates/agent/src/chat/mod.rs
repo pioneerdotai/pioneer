@@ -85,11 +85,10 @@ use pioneer_protocol::{
     generate_id,
 };
 use pioneer_provider::{
-    AttachmentDataSource, CanonicalProviderRoundEnvelope, ChatMessage, ChatRequest,
-    CompiledPromptPayload, InputContentType, MessageAttachment, MessageContentPart,
-    NativeFileToolCapability, NativePatchWireShape, Provider, ProviderCallIdentity,
-    ProviderRegistry, ProviderTimeoutPolicy, ProviderToolCall, ReasoningConfig, ToolDefinition,
-    infer_mime_from_reference,
+    CanonicalProviderRoundEnvelope, ChatMessage, ChatRequest, CompiledPromptPayload,
+    InputContentType, MessageAttachment, MessageContentPart, NativeFileToolCapability,
+    NativePatchWireShape, Provider, ProviderCallIdentity, ProviderRegistry, ProviderTimeoutPolicy,
+    ProviderToolCall, ReasoningConfig, ToolDefinition, infer_mime_from_reference,
 };
 use pioneer_skills::{
     ExcludedSkill, ResolvedSkill, SkillExcludedReason, SkillExplicitRef, SkillPolicyKey,
@@ -6943,98 +6942,41 @@ fn content_part_for_resolved_artifact(resolved: &ResolvedArtifactInput) -> Messa
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum ComputerUseSnapshotScope {
-    Session(u64),
-    UnknownSnapshot,
-}
-
-fn computer_use_snapshot_scope(message: &ChatMessage) -> Option<ComputerUseSnapshotScope> {
+// A frame can supersede another only with an authoritative successful outcome
+// and the same explicit session. Legacy/unknown results remain semantic input.
+fn computer_use_snapshot_scope(message: &ChatMessage) -> Option<u64> {
     if message.role != pioneer_provider::Role::Tool
         || message.name.as_deref() != Some("computer_use")
         || !message.has_attachments()
+        || message.tool_outcome.and_then(|outcome| outcome.is_error()) != Some(false)
     {
         return None;
     }
-
-    let payload = match serde_json::from_str::<JsonValue>(message.content.as_str()) {
-        Ok(payload) => payload,
-        Err(_) => return Some(ComputerUseSnapshotScope::UnknownSnapshot),
-    };
-
-    match payload.get("action").and_then(JsonValue::as_str) {
-        Some("snapshot") | None => {
-            let session_id = payload.get("session_id").and_then(JsonValue::as_u64);
-            Some(
-                session_id
-                    .map(ComputerUseSnapshotScope::Session)
-                    .unwrap_or(ComputerUseSnapshotScope::UnknownSnapshot),
-            )
-        }
-        _ => None,
+    let payload = serde_json::from_str::<JsonValue>(&message.content).ok()?;
+    if payload.get("action").and_then(JsonValue::as_str) != Some("snapshot") {
+        return None;
     }
+    payload.get("session_id").and_then(JsonValue::as_u64)
 }
 
 fn retain_agent_attachment_messages(messages: &mut [ChatMessage]) {
-    let attachment_budget_bytes = pioneer_provider::default_attachment_pipeline_config()
-        .max_total_bytes_per_request
-        .max(1);
-    retain_agent_attachment_messages_with_budget(messages, attachment_budget_bytes);
-}
-
-fn retain_agent_attachment_messages_with_budget(
-    messages: &mut [ChatMessage],
-    attachment_budget_bytes: usize,
-) {
-    let mut latest_snapshot_index: HashMap<ComputerUseSnapshotScope, usize> = HashMap::new();
-
+    let mut latest_snapshot_index = HashMap::new();
     for (index, message) in messages.iter().enumerate().rev() {
-        if let Some(scope) = computer_use_snapshot_scope(message) {
-            latest_snapshot_index.entry(scope).or_insert(index);
+        if let Some(session) = computer_use_snapshot_scope(message) {
+            latest_snapshot_index.entry(session).or_insert(index);
         }
     }
-
     for (index, message) in messages.iter_mut().enumerate() {
-        if !message.has_attachments() {
-            continue;
-        }
-
-        if let Some(scope) = computer_use_snapshot_scope(message)
-            && latest_snapshot_index.get(&scope).copied() != Some(index)
+        if let Some(session) = computer_use_snapshot_scope(message)
+            && latest_snapshot_index.get(&session).copied() != Some(index)
         {
+            // This mutates the request projection, not full tool_result_v2 history.
             message.content_parts.clear();
+            message.content.push_str("\n[Earlier screenshot omitted: a later successful snapshot of this session follows.]");
         }
     }
-
-    let mut total_attachment_bytes = estimated_total_attachment_bytes(messages);
-    if total_attachment_bytes <= attachment_budget_bytes {
-        return;
-    }
-
-    let snapshot_indices = messages
-        .iter()
-        .enumerate()
-        .filter_map(|(index, message)| {
-            (message.has_attachments() && computer_use_snapshot_scope(message).is_some())
-                .then_some(index)
-        })
-        .collect::<Vec<_>>();
-
-    for index in snapshot_indices {
-        if total_attachment_bytes <= attachment_budget_bytes {
-            break;
-        }
-        if messages[index].content_parts.is_empty() {
-            continue;
-        }
-        let removed_bytes = estimated_message_attachment_bytes(&messages[index]);
-        messages[index].content_parts.clear();
-        if removed_bytes > 0 {
-            total_attachment_bytes = total_attachment_bytes.saturating_sub(removed_bytes);
-        } else {
-            total_attachment_bytes = estimated_total_attachment_bytes(messages);
-        }
-    }
+    // Never drop current state to meet guessed bytes. The existing provider's
+    // actual prepared-request admission must explicitly reject excess input.
 }
 
 fn retain_chat_mode_attachment_messages(messages: &mut [ChatMessage]) {
@@ -7058,44 +7000,6 @@ fn retain_chat_mode_attachment_messages(messages: &mut [ChatMessage]) {
     }
 }
 
-fn estimated_total_attachment_bytes(messages: &[ChatMessage]) -> usize {
-    messages
-        .iter()
-        .map(estimated_message_attachment_bytes)
-        .sum::<usize>()
-}
-
-fn estimated_message_attachment_bytes(message: &ChatMessage) -> usize {
-    message
-        .content_parts
-        .iter()
-        .map(estimated_attachment_part_bytes)
-        .sum::<usize>()
-}
-
-fn estimated_attachment_part_bytes(part: &MessageContentPart) -> usize {
-    let attachment = match part {
-        MessageContentPart::Text { .. } => return 0,
-        MessageContentPart::File { file } => file,
-        MessageContentPart::Image { image } => image,
-        MessageContentPart::Audio { audio } => audio,
-        MessageContentPart::Video { video } => video,
-    };
-
-    if let Some(size_bytes) = attachment.size_bytes {
-        return usize::try_from(size_bytes).unwrap_or(usize::MAX);
-    }
-
-    match &attachment.source {
-        AttachmentDataSource::Path { path } => std::fs::metadata(path.as_str())
-            .ok()
-            .and_then(|meta| usize::try_from(meta.len()).ok())
-            .unwrap_or(0),
-        AttachmentDataSource::Bytes { base64_data } => base64_data.len().saturating_mul(3) / 4,
-        AttachmentDataSource::Url { .. } | AttachmentDataSource::Reference { .. } => 0,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
@@ -7109,9 +7013,8 @@ mod tests {
         deterministic_tool_item_id, materialize_mcp_tooling, native_filesystem_scope,
         native_provider_tool_definition, normalize_turn_capabilities, readable_agent_skill_overlay,
         resolve_skill_capability_summary, retain_agent_attachment_messages,
-        retain_agent_attachment_messages_with_budget, retain_chat_mode_attachment_messages,
-        review_required_observation_payload, review_required_observation_signature,
-        runtime_sections_with_artifact_reference_policy,
+        retain_chat_mode_attachment_messages, review_required_observation_payload,
+        review_required_observation_signature, runtime_sections_with_artifact_reference_policy,
         runtime_sections_with_execution_continuation_context,
         sync_review_action_tools_to_observations, workdir_from_execution_security_snapshot,
     };
@@ -9512,7 +9415,9 @@ mod tests {
             name: Some("computer_use".to_owned()),
             tool_calls: None,
             provider_replay_state: None,
-            tool_outcome: None,
+            tool_outcome: Some(pioneer_provider::ToolResultOutcome::new(
+                pioneer_provider::ToolResultStatus::Ok,
+            )),
         }
     }
 
@@ -9822,7 +9727,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_policy_prunes_snapshots_before_pinned_files_when_budget_exceeded() {
+    fn agent_policy_preserves_current_snapshots_even_when_they_exceed_byte_budget() {
         let mut messages = vec![
             ChatMessage {
                 provenance: None,
@@ -9841,12 +9746,76 @@ mod tests {
             computer_use_snapshot_message("call_3", 1, "/tmp/s1-2.png"),
         ];
 
-        retain_agent_attachment_messages_with_budget(&mut messages, 700_000);
+        retain_agent_attachment_messages(&mut messages);
 
         assert_eq!(messages[0].content_parts.len(), 1);
         assert!(messages[1].content_parts.is_empty());
-        assert!(messages[2].content_parts.is_empty());
+        assert_eq!(messages[2].content_parts.len(), 1);
         assert_eq!(messages[3].content_parts.len(), 1);
+        assert!(messages[1].content.contains("Earlier screenshot omitted"));
+    }
+
+    #[test]
+    fn current_visual_over_budget_is_explicitly_rejected_by_actual_admission() {
+        let bytes = [1_u8; 64];
+        let mut frame = computer_use_snapshot_message("current", 1, "/current.png");
+        if let MessageContentPart::Image { image } = &mut frame.content_parts[0] {
+            image.source = pioneer_provider::attachments::owned_bytes_source(&bytes);
+            image.size_bytes = Some(bytes.len() as u64);
+        }
+        let mut messages = vec![frame];
+        retain_agent_attachment_messages(&mut messages);
+        assert!(messages[0].has_attachments());
+        let config = pioneer_provider::attachments::AttachmentPipelineConfig {
+            max_total_bytes_per_request: 32,
+            ..Default::default()
+        };
+        let mut capabilities = pioneer_provider::ProviderCapabilities::default();
+        capabilities.vision = true;
+        capabilities.input_types.image = pioneer_provider::InputTypeSupport::data_url_inline_only();
+        let error = pioneer_provider::attachments::prepare_messages_for_provider_with_config(
+            "fixture",
+            &capabilities,
+            &messages,
+            &config,
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("ATTACHMENT_TOO_LARGE")
+                || error
+                    .to_string()
+                    .contains("ATTACHMENT_TOTAL_BUDGET_EXCEEDED")
+        );
+        assert!(messages[0].has_attachments());
+    }
+
+    #[test]
+    fn unknown_failed_and_unscoped_frames_cannot_prove_supersession() {
+        for outcome in [
+            None,
+            Some(pioneer_provider::ToolResultOutcome::new(
+                pioneer_provider::ToolResultStatus::RecoverableError,
+            )),
+            Some(pioneer_provider::ToolResultOutcome {
+                schema_version: 2,
+                status: pioneer_provider::ToolResultStatus::Ok,
+            }),
+        ] {
+            let mut messages = vec![
+                computer_use_snapshot_message("old", 1, "/old.png"),
+                computer_use_snapshot_message("new", 1, "/new.png"),
+            ];
+            messages[1].tool_outcome = outcome;
+            retain_agent_attachment_messages(&mut messages);
+            assert!(messages.iter().all(ChatMessage::has_attachments));
+        }
+        let mut messages = vec![
+            computer_use_snapshot_message("old", 1, "/old.png"),
+            computer_use_snapshot_message("new", 1, "/new.png"),
+        ];
+        messages[1].content = r#"{"action":"snapshot"}"#.to_owned();
+        retain_agent_attachment_messages(&mut messages);
+        assert!(messages.iter().all(ChatMessage::has_attachments));
     }
 
     #[test]

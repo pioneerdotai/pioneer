@@ -1,6 +1,6 @@
 use super::http::{
     BufferedHttpRequest, build_http_client, execute_buffered_http_request, map_http_request_error,
-    validate_http_url,
+    read_stream_bounded, validate_http_url,
 };
 use crate::WebToolsConfig;
 use crate::apply_patch::file_mutation::{
@@ -480,6 +480,46 @@ fn parse_json_args<T: for<'de> Deserialize<'de>>(payload: ToolPayload) -> Result
     }
 }
 
+async fn read_search_body(
+    response: reqwest::Response,
+    remaining_bytes: &mut usize,
+) -> Result<Vec<u8>, ToolError> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > *remaining_bytes as u64)
+    {
+        return Err(ToolError::ResponseLimitExceeded);
+    }
+    read_stream_bounded(response.bytes_stream(), remaining_bytes).await
+}
+
+fn parse_search_json(body: &[u8]) -> Result<JsonValue, ToolError> {
+    let payload = serde_json::from_slice(body)
+        .map_err(|_| ToolError::execution_failed("duckduckgo instant API JSON invalid"))?;
+    fn visit(value: &JsonValue, depth: usize, count: &mut usize) -> Result<(), ToolError> {
+        *count += 1;
+        if depth > 32 || *count > 4096 {
+            return Err(ToolError::ResponseLimitExceeded);
+        }
+        match value {
+            JsonValue::Array(values) => {
+                for child in values {
+                    visit(child, depth + 1, count)?;
+                }
+            }
+            JsonValue::Object(values) => {
+                for child in values.values() {
+                    visit(child, depth + 1, count)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+    visit(&payload, 0, &mut 0)?;
+    Ok(payload)
+}
+
 async fn search_duckduckgo(
     query: &str,
     max_results: usize,
@@ -490,41 +530,55 @@ async fn search_duckduckgo(
     config: &WebToolsConfig,
     security_snapshot: Option<&TurnExecutionSecuritySnapshot>,
 ) -> Result<Vec<WebSearchResult>, ToolError> {
-    let direct = search_duckduckgo_html(
-        query,
-        max_results,
-        region,
-        safesearch,
-        freshness,
-        max_snippet_chars,
-        config,
-        security_snapshot,
-    )
-    .await;
-
-    match direct {
-        Ok(results) if !results.is_empty() => Ok(results),
-        Ok(_) => {
-            search_duckduckgo_instant_api(
-                query,
-                max_results,
-                max_snippet_chars,
-                config,
-                security_snapshot,
-            )
-            .await
+    let timeout_ms = config
+        .default_timeout_ms
+        .clamp(1, config.hard_max_timeout_ms.max(1));
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+    let mut remaining_bytes = config
+        .default_fetch_max_bytes
+        .clamp(1, config.hard_fetch_max_bytes.clamp(1, 8 * 1024 * 1024));
+    let result = tokio::time::timeout_at(deadline, async {
+        let direct = search_duckduckgo_html(
+            query,
+            max_results,
+            region,
+            safesearch,
+            freshness,
+            max_snippet_chars,
+            config,
+            security_snapshot,
+            &mut remaining_bytes,
+        )
+        .await;
+        match direct {
+            Ok(results) if !results.is_empty() => Ok(results),
+            // Never turn limits, Stop or admission rejection into another request.
+            Err(
+                error @ (ToolError::ResponseLimitExceeded
+                | ToolError::TimedOut
+                | ToolError::Cancelled(_)
+                | ToolError::Rejected(_)),
+            ) => Err(error),
+            Ok(_) | Err(ToolError::ExecutionFailed(_)) => {
+                search_duckduckgo_instant_api(
+                    query,
+                    max_results,
+                    max_snippet_chars,
+                    config,
+                    security_snapshot,
+                    &mut remaining_bytes,
+                )
+                .await
+            }
+            Err(error) => Err(error),
         }
-        Err(_) => {
-            search_duckduckgo_instant_api(
-                query,
-                max_results,
-                max_snippet_chars,
-                config,
-                security_snapshot,
-            )
-            .await
-        }
+    })
+    .await
+    .map_err(|_| ToolError::TimedOut)?;
+    if tokio::time::Instant::now() >= deadline {
+        return Err(ToolError::TimedOut);
     }
+    result
 }
 
 async fn search_duckduckgo_html(
@@ -536,6 +590,7 @@ async fn search_duckduckgo_html(
     max_snippet_chars: usize,
     config: &WebToolsConfig,
     security_snapshot: Option<&TurnExecutionSecuritySnapshot>,
+    remaining_bytes: &mut usize,
 ) -> Result<Vec<WebSearchResult>, ToolError> {
     enforce_network_url(
         security_snapshot,
@@ -594,15 +649,14 @@ async fn search_duckduckgo_html(
         .map_err(|error| map_http_request_error(error, "duckduckgo request failed"))?;
 
     let status = response.status().as_u16();
-    let body = response.text().await.map_err(|error| {
-        ToolError::execution_failed(format!("duckduckgo response decode failed: {error}"))
-    })?;
-
     if status >= 400 {
         return Err(ToolError::execution_failed(format!(
             "duckduckgo returned HTTP {status}"
         )));
     }
+    let body = read_search_body(response, remaining_bytes).await?;
+    let body = std::str::from_utf8(&body)
+        .map_err(|_| ToolError::execution_failed("duckduckgo response encoding invalid"))?;
 
     if body.contains("anomaly-modal")
         || body.contains("Unfortunately, bots use DuckDuckGo too")
@@ -613,15 +667,20 @@ async fn search_duckduckgo_html(
         ));
     }
 
-    let mut results = parse_duckduckgo_html_results(body.as_str(), max_snippet_chars);
-    if results.len() > max_results {
-        results.truncate(max_results);
-    }
-    Ok(results)
+    parse_duckduckgo_html_results(body, max_snippet_chars, max_results)
 }
 
-fn parse_duckduckgo_html_results(body: &str, max_snippet_chars: usize) -> Vec<WebSearchResult> {
+fn parse_duckduckgo_html_results(
+    body: &str,
+    max_snippet_chars: usize,
+    max_results: usize,
+) -> Result<Vec<WebSearchResult>, ToolError> {
     let doc = Html::parse_document(body);
+    for (index, node) in doc.tree.nodes().enumerate() {
+        if index >= 16_384 || node.ancestors().take(65).count() > 64 {
+            return Err(ToolError::ResponseLimitExceeded);
+        }
+    }
 
     let item_selector = Selector::parse("div.result").expect("valid selector");
     let title_selector = Selector::parse("a.result__a").expect("valid selector");
@@ -630,6 +689,9 @@ fn parse_duckduckgo_html_results(body: &str, max_snippet_chars: usize) -> Vec<We
 
     let mut results = Vec::new();
     for (idx, item) in doc.select(&item_selector).enumerate() {
+        if results.len() >= max_results {
+            break;
+        }
         let Some(anchor) = item.select(&title_selector).next() else {
             continue;
         };
@@ -663,7 +725,7 @@ fn parse_duckduckgo_html_results(body: &str, max_snippet_chars: usize) -> Vec<We
         });
     }
 
-    results
+    Ok(results)
 }
 
 async fn search_duckduckgo_instant_api(
@@ -672,6 +734,7 @@ async fn search_duckduckgo_instant_api(
     max_snippet_chars: usize,
     config: &WebToolsConfig,
     security_snapshot: Option<&TurnExecutionSecuritySnapshot>,
+    remaining_bytes: &mut usize,
 ) -> Result<Vec<WebSearchResult>, ToolError> {
     enforce_network_url(
         security_snapshot,
@@ -689,7 +752,7 @@ async fn search_duckduckgo_instant_api(
         security_snapshot,
         "web_search",
     )?;
-    let payload = client
+    let response = client
         .get(config.ddg_instant_api_url.as_str())
         .query(&[
             ("q", query),
@@ -699,12 +762,15 @@ async fn search_duckduckgo_instant_api(
         ])
         .send()
         .await
-        .map_err(|error| map_http_request_error(error, "duckduckgo instant API request failed"))?
-        .json::<JsonValue>()
-        .await
-        .map_err(|error| {
-            ToolError::execution_failed(format!("duckduckgo instant API decode failed: {error}"))
-        })?;
+        .map_err(|error| map_http_request_error(error, "duckduckgo instant API request failed"))?;
+    let status = response.status().as_u16();
+    if status >= 400 {
+        return Err(ToolError::execution_failed(format!(
+            "duckduckgo instant API returned HTTP {status}"
+        )));
+    }
+    let body = read_search_body(response, remaining_bytes).await?;
+    let payload = parse_search_json(&body)?;
 
     let mut results = Vec::new();
 
@@ -731,15 +797,16 @@ async fn search_duckduckgo_instant_api(
         });
     }
 
+    let mut capacity_remaining = results.len() < max_results;
     let mut push_result = |title: String, url: String, snippet: String| {
         if results.len() >= max_results {
-            return;
+            return false;
         }
         if results.iter().any(|item| item.url == url) {
-            return;
+            return true;
         }
         if !(url.starts_with("http://") || url.starts_with("https://")) {
-            return;
+            return true;
         }
         let favicon = default_favicon_url(url.as_str());
         results.push(WebSearchResult {
@@ -750,6 +817,7 @@ async fn search_duckduckgo_instant_api(
             snippet: truncate_chars(snippet.as_str(), max_snippet_chars).0,
             source: "duckduckgo_instant_api".to_owned(),
         });
+        results.len() < max_results
     };
 
     if let Some(array) = payload.get("Results").and_then(JsonValue::as_array) {
@@ -774,11 +842,16 @@ async fn search_duckduckgo_instant_api(
                 .filter(|value| !value.is_empty())
                 .unwrap_or(text.as_str())
                 .to_owned();
-            push_result(title, url, text);
+            if !push_result(title, url, text) {
+                capacity_remaining = false;
+                break;
+            }
         }
     }
 
-    if let Some(array) = payload.get("RelatedTopics").and_then(JsonValue::as_array) {
+    if capacity_remaining
+        && let Some(array) = payload.get("RelatedTopics").and_then(JsonValue::as_array)
+    {
         collect_related_topics(array, &mut push_result);
     }
 
@@ -795,13 +868,15 @@ async fn search_duckduckgo_instant_api(
     Ok(results)
 }
 
-fn collect_related_topics<F>(items: &[JsonValue], push_result: &mut F)
+fn collect_related_topics<F>(items: &[JsonValue], push_result: &mut F) -> bool
 where
-    F: FnMut(String, String, String),
+    F: FnMut(String, String, String) -> bool,
 {
     for item in items {
         if let Some(nested) = item.get("Topics").and_then(JsonValue::as_array) {
-            collect_related_topics(nested, push_result);
+            if !collect_related_topics(nested, push_result) {
+                return false;
+            }
             continue;
         }
         let url = item
@@ -824,8 +899,11 @@ where
             .filter(|value| !value.is_empty())
             .unwrap_or(text.as_str())
             .to_owned();
-        push_result(title, url, text);
+        if !push_result(title, url, text) {
+            return false;
+        }
     }
+    true
 }
 
 fn normalize_duckduckgo_result_url(raw: &str) -> String {
@@ -1917,3 +1995,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "web_r04_tests.rs"]
+mod r04_tests;
