@@ -21,6 +21,98 @@ use std::path::Path;
 
 pub(crate) const MAX_CLI_TURN_INPUT_FRAME_BYTES: usize = 8 * 1024 * 1024;
 
+// Codex rust-v0.159.2 (also 0.144.1): protocol/src/user_input.rs defines the cap;
+// app-server/src/request_processors/turn_processor.rs::turn_start_inner
+// sums app-server-protocol/src/protocol/v2/turn.rs::UserInput::text_char_count.
+// Only Text.text participates, across ALL items, in Unicode scalar values.
+// 0.159.2 also counts toolOutput text; Pioneer does not send that field.
+pub(crate) const MAX_CODEX_INPUT_TEXT_CHARS: usize = 1 << 20;
+
+pub(crate) fn codex_input_text_chars(input: &[CLIRuntimeTurnInputItem]) -> usize {
+    input.iter().fold(0_usize, |total, item| {
+        total.saturating_add(match item {
+            CLIRuntimeTurnInputItem::Text { text } => text.chars().count(),
+            CLIRuntimeTurnInputItem::Image { .. }
+            | CLIRuntimeTurnInputItem::LocalImage { .. }
+            | CLIRuntimeTurnInputItem::Skill { .. } => 0,
+        })
+    })
+}
+
+pub(crate) struct CodexTransferHistoryBudget {
+    history_chars: usize,
+    available_chars: usize,
+    token_ceiling: u64,
+    fraction: u64,
+}
+
+impl CodexTransferHistoryBudget {
+    pub(crate) fn from_prepared_input(
+        full: &CLIRuntimeTurnInputMapping,
+        current: &CLIRuntimeTurnInputMapping,
+    ) -> Option<Self> {
+        let full_chars = codex_input_text_chars(&full.input);
+        if full_chars <= MAX_CODEX_INPUT_TEXT_CHARS {
+            return None;
+        }
+        let current_chars = codex_input_text_chars(&current.input);
+        Some(Self {
+            history_chars: full_chars.saturating_sub(current_chars).max(1),
+            available_chars: MAX_CODEX_INPUT_TEXT_CHARS.saturating_sub(current_chars),
+            token_ceiling: u64::MAX,
+            fraction: 1,
+        })
+    }
+
+    pub(crate) fn with_token_target(mut self, ceiling: u64, fraction: u64) -> Self {
+        self.token_ceiling = ceiling;
+        self.fraction = fraction.max(1);
+        self
+    }
+
+    fn history_token_target(&self, history_tokens: u64) -> u64 {
+        // A planning hint based on the measured request, not a characters/token
+        // conversion or admission proof. Summaries can have another density;
+        // the caller MUST rebuild and validate the actual input after the runner.
+        (history_tokens as u128 * self.available_chars as u128
+            / self.history_chars as u128
+            / u128::from(self.fraction))
+        .min(u128::from(self.token_ceiling))
+        .max(1) as u64
+    }
+
+    pub(crate) fn fixed_input_tokens(
+        &self,
+        budget: &pioneer_compaction::ModelBudget,
+        history_tokens: u64,
+        output_reserve: u64,
+    ) -> u64 {
+        // Use the shared runner's existing measurement. No extra tokenization
+        // or history reconstruction is needed to choose the transfer target.
+        let desired = self.history_token_target(history_tokens);
+        Self::input_capacity(budget, output_reserve).saturating_sub(desired)
+    }
+
+    pub(crate) fn available_input_tokens(
+        &self,
+        budget: &pioneer_compaction::ModelBudget,
+        output_reserve: u64,
+        fixed_input_tokens: u64,
+    ) -> u64 {
+        Self::input_capacity(budget, output_reserve).saturating_sub(fixed_input_tokens)
+    }
+
+    fn input_capacity(budget: &pioneer_compaction::ModelBudget, output_reserve: u64) -> u64 {
+        // Account for the shared runner's 5% padding and actual output reserve.
+        // context - desired would make a small size-driven target impossible.
+        let padded_capacity = budget
+            .context
+            .saturating_sub(output_reserve)
+            .min(budget.input_limit.unwrap_or(u64::MAX));
+        (u128::from(padded_capacity) * 100 / 105) as u64
+    }
+}
+
 pub(crate) struct CLIRuntimeContextBuildInput<'a> {
     pub workspace_id: &'a str,
     pub thread_id: &'a str,
@@ -298,6 +390,13 @@ pub(crate) fn validate_cli_runtime_turn_input_frame(
     max_input_tokens: Option<u64>,
     runtime_kind: pioneer_protocol::CLIAgentRuntimeKind,
 ) -> Result<()> {
+    if runtime_kind == pioneer_protocol::CLIAgentRuntimeKind::Codex {
+        let actual_chars = codex_input_text_chars(&mapping.input);
+        anyhow::ensure!(
+            actual_chars <= MAX_CODEX_INPUT_TEXT_CHARS,
+            "Codex input contains {actual_chars} Unicode scalar values across Text items, exceeding the maximum length of {MAX_CODEX_INPUT_TEXT_CHARS} characters"
+        );
+    }
     // Include the turn envelope fields that accompany input at the adapter
     // boundary. Claude additionally performs an exact post-materialization
     // check after LocalImage paths have become base64 blocks.
@@ -844,6 +943,138 @@ mod tests {
         .unwrap_err();
         let error = format!("{error:#}");
         assert!(error.contains("selected model limit of 128"));
+    }
+
+    #[test]
+    fn codex_input_limit_counts_unicode_text_across_items_at_the_exact_boundary() {
+        let root = temp_workspace("codex-input-chars");
+        let mut plan = compile_cli_runtime_delivery_plan(
+            root.as_path(),
+            CLIRuntimeContextBuildInput {
+                workspace_id: "workspace_1",
+                thread_id: "thread_1",
+                initiating_thread_id: "thread_1",
+                turn_id: "turn_1",
+                runtime_id: "codex",
+                runtime_label: "Codex CLI",
+                runtime_kind: CLIAgentRuntimeKind::Codex,
+                model: Some("test-model"),
+                cwd: Some(root.to_str().unwrap()),
+                permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
+                history: None,
+                selected_skill_names: &[],
+                selected_capabilities: None,
+            },
+        )
+        .unwrap();
+        // Provider instructions are a separate field, outside Codex's input cap.
+        plan.provider_instructions.text = "i".repeat(super::MAX_CODEX_INPUT_TEXT_CHARS + 1);
+        for chars in [
+            super::MAX_CODEX_INPUT_TEXT_CHARS - 1,
+            super::MAX_CODEX_INPUT_TEXT_CHARS,
+            super::MAX_CODEX_INPUT_TEXT_CHARS + 1,
+        ] {
+            let first = "😀".repeat(chars / 2);
+            // Two scalar values, one grapheme: a letter and combining accent.
+            let second_chars = chars - chars / 2;
+            let second = format!(
+                "{}{}",
+                "e\u{301}".repeat(second_chars / 2),
+                if second_chars % 2 == 1 { "Ж" } else { "" },
+            );
+            let mapping = CLIRuntimeTurnInputMapping {
+                input: vec![
+                    CLIRuntimeTurnInputItem::Text { text: first },
+                    CLIRuntimeTurnInputItem::Text { text: second },
+                    CLIRuntimeTurnInputItem::Image {
+                        url: "url".repeat(64),
+                    },
+                    CLIRuntimeTurnInputItem::LocalImage {
+                        path: "missing.png".into(),
+                    },
+                    CLIRuntimeTurnInputItem::Skill {
+                        name: "skill".into(),
+                        path: "path".repeat(64),
+                    },
+                ],
+                diagnostics: Vec::new(),
+            };
+            assert_eq!(super::codex_input_text_chars(&mapping.input), chars);
+            assert!(
+                serde_json::to_vec(&mapping.input).unwrap().len()
+                    < super::MAX_CLI_TURN_INPUT_FRAME_BYTES
+            );
+            let result = validate_cli_runtime_turn_input_frame(
+                &mapping,
+                &plan,
+                None,
+                CLIAgentRuntimeKind::Codex,
+            );
+            if chars <= super::MAX_CODEX_INPUT_TEXT_CHARS {
+                result.unwrap();
+            } else {
+                let error = result.unwrap_err().to_string();
+                assert!(error.contains("1048577 Unicode scalar values"));
+                assert!(error.contains("maximum length of 1048576 characters"));
+            }
+            // Claude still admits the same textual request under the frame cap.
+            let mut claude = mapping.clone();
+            claude
+                .input
+                .retain(|item| !matches!(item, CLIRuntimeTurnInputItem::LocalImage { .. }));
+            validate_cli_runtime_turn_input_frame(
+                &claude,
+                &plan,
+                None,
+                CLIAgentRuntimeKind::Claude,
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn codex_history_budget_uses_prepared_text_and_current_input_headroom() {
+        let mapping = |text: String| CLIRuntimeTurnInputMapping {
+            input: vec![CLIRuntimeTurnInputItem::Text { text }],
+            diagnostics: Vec::new(),
+        };
+        let current = mapping("current".into());
+        assert!(
+            super::CodexTransferHistoryBudget::from_prepared_input(&current, &current,).is_none()
+        );
+        let full = mapping(format!(
+            "{}current",
+            "x".repeat(super::MAX_CODEX_INPUT_TEXT_CHARS)
+        ));
+        let small =
+            super::CodexTransferHistoryBudget::from_prepared_input(&full, &current).unwrap();
+        let near_limit = mapping("y".repeat(super::MAX_CODEX_INPUT_TEXT_CHARS - 1_024));
+        let tight_full = mapping(format!(
+            "{}{}",
+            "x".repeat(super::MAX_CODEX_INPUT_TEXT_CHARS),
+            "y".repeat(super::MAX_CODEX_INPUT_TEXT_CHARS - 1_024)
+        ));
+        let tight =
+            super::CodexTransferHistoryBudget::from_prepared_input(&tight_full, &near_limit)
+                .unwrap();
+        assert!(tight.history_token_target(10_000) < small.history_token_target(10_000));
+        let retry = super::CodexTransferHistoryBudget::from_prepared_input(&full, &current)
+            .unwrap()
+            .with_token_target(u64::MAX, 4);
+        assert!(retry.history_token_target(10_000) < small.history_token_target(10_000));
+        let desired = tight.history_token_target(10_000);
+        for input_limit in [None, Some(900_000)] {
+            let model = pioneer_compaction::ModelBudget::new(Some(1_000_000), input_limit, None);
+            let reserve = model.output_reserve(None).unwrap();
+            let fixed = tight.fixed_input_tokens(&model, 10_000, reserve);
+            assert!(model.fits(fixed + desired, reserve, false));
+            assert!(!model.fits(fixed + 10_000, reserve, false));
+            assert_eq!(
+                tight.available_input_tokens(&model, reserve, fixed),
+                desired
+            );
+        }
+        assert_eq!(small.available_chars, super::MAX_CODEX_INPUT_TEXT_CHARS - 7);
     }
 
     #[test]

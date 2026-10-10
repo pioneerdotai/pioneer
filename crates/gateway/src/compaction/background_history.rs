@@ -155,6 +155,7 @@ pub(crate) async fn prepare_completed_history(
         None,
         None,
         0,
+        None,
         std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         None,
         &mut diagnostic,
@@ -183,6 +184,7 @@ pub(crate) async fn prepare_completed_history_owned(
     original_deadline: Option<u64>,
     target_output_cap: Option<u32>,
     fixed_input_tokens: u64,
+    codex_history_budget: Option<crate::cli_runtime::context::CodexTransferHistoryBudget>,
     suspending: Arc<std::sync::atomic::AtomicBool>,
     accepted_projection: Option<super::frozen::PreparedHistory>,
     diagnostic: &mut HistoryCheckDiagnostic,
@@ -359,6 +361,19 @@ pub(crate) async fn prepare_completed_history_owned(
         };
         diagnostic.stage = "budget".into();
         let full = completed_history_request_projection(request, budget.clone())?;
+        let fixed_input_tokens = if current.transport == Transport::Codex {
+            codex_history_budget
+                .as_ref()
+                .map_or(fixed_input_tokens, |transfer| {
+                    transfer.fixed_input_tokens(
+                        &budget,
+                        full.estimated_input_tokens,
+                        full.output_reserve,
+                    )
+                })
+        } else {
+            fixed_input_tokens
+        };
         diagnostic.estimated_input_tokens = Some(
             full.estimated_input_tokens
                 .saturating_add(fixed_input_tokens),
@@ -424,6 +439,13 @@ pub(crate) async fn prepare_completed_history_owned(
             .context
             .saturating_sub(full.output_reserve)
             .saturating_sub(fixed);
+        let available = if current.transport == Transport::Codex {
+            codex_history_budget.as_ref().map_or(available, |transfer| {
+                transfer.available_input_tokens(&budget, full.output_reserve, fixed)
+            })
+        } else {
+            available
+        };
         let goal = summarizer
             .model_budget()
             .summarizer_cap(u64::MAX)?

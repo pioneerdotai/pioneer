@@ -25872,11 +25872,43 @@ async fn first_composer_cli_answer_has_no_parent_predecessor_impl() {
 fn oversized_cli_history_is_compacted_before_a_new_provider_session_starts() {
     run_standard_stack_message_test(
         "CLI transfer compacts a request larger than eight MiB",
-        oversized_cli_history_is_compacted_before_a_new_provider_session_starts_impl(),
+        cli_input_admission_impl(CliInputAdmissionCase::Frame),
     );
 }
 
-async fn oversized_cli_history_is_compacted_before_a_new_provider_session_starts_impl() {
+#[test]
+fn codex_character_overflow_compacts_history_and_rechecks_the_sent_input() {
+    run_standard_stack_message_test(
+        "Codex character admission with a protected current input",
+        cli_input_admission_impl(CliInputAdmissionCase::History),
+    );
+}
+
+#[test]
+fn oversized_codex_current_input_stops_before_compaction_and_dispatch() {
+    run_standard_stack_message_test(
+        "Codex oversized current input",
+        cli_input_admission_impl(CliInputAdmissionCase::Current),
+    );
+}
+
+#[test]
+fn fitting_codex_input_does_not_compact_or_recapture_history() {
+    run_standard_stack_message_test(
+        "Codex fitting input",
+        cli_input_admission_impl(CliInputAdmissionCase::Fits),
+    );
+}
+
+#[derive(Clone, Copy)]
+enum CliInputAdmissionCase {
+    Frame,
+    History,
+    Current,
+    Fits,
+}
+
+async fn cli_input_admission_impl(case: CliInputAdmissionCase) {
     let (tx, mut rx) = mpsc::channel(128);
     let sessions = Arc::new(SessionManager::new());
     let connection = register_authenticated_test_connection(sessions.as_ref(), tx).await;
@@ -25896,7 +25928,7 @@ async fn oversized_cli_history_is_compacted_before_a_new_provider_session_starts
         "echo",
         summarizer.clone(),
     ));
-    providers.insert("openai", summarizer).unwrap();
+    providers.insert("openai", summarizer.clone()).unwrap();
     let processor = Arc::new(with_enabled_test_cli_runtime_catalog(
         MessageProcessor::new(
             Arc::new(ThreadManager::new("test-model", "openai")),
@@ -25930,8 +25962,16 @@ async fn oversized_cli_history_is_compacted_before_a_new_provider_session_starts
         .await;
     let thread = "oversized-cli-transfer";
     let mut raw_bytes = 0_usize;
-    for index in 0..12 {
-        let text = format!("HISTORICAL HUGE CHUNK {index:02} {}", "x".repeat(730_000));
+    let (history_turns, chunk_chars) = match case {
+        CliInputAdmissionCase::Frame => (12, 730_000),
+        CliInputAdmissionCase::History => (2, 64 * 1024),
+        CliInputAdmissionCase::Current | CliInputAdmissionCase::Fits => (1, 32),
+    };
+    for index in 0..history_turns {
+        let text = format!(
+            "HISTORICAL HUGE CHUNK {index:02} {}",
+            "x".repeat(chunk_chars)
+        );
         raw_bytes += text.len();
         seed_completed_task_parent_with_inputs(
             &processor,
@@ -25946,7 +25986,9 @@ async fn oversized_cli_history_is_compacted_before_a_new_provider_session_starts
         )
         .await;
     }
-    assert!(raw_bytes > crate::cli_runtime::context::MAX_CLI_TURN_INPUT_FRAME_BYTES);
+    if matches!(case, CliInputAdmissionCase::Frame) {
+        assert!(raw_bytes > crate::cli_runtime::context::MAX_CLI_TURN_INPUT_FRAME_BYTES);
+    }
     open_persisted_child_for_test(
         &processor,
         connection,
@@ -25959,20 +26001,122 @@ async fn oversized_cli_history_is_compacted_before_a_new_provider_session_starts
     let turn = "oversized-cli-target";
     cli.set_next_native_turn_id("oversized-provider-turn").await;
     let request_id = generate_test_request_id("oversized-transfer", turn);
+    let current_input = match case {
+        CliInputAdmissionCase::History => format!(
+            "CURRENT AFTER BIG HISTORY {}",
+            "y".repeat(crate::cli_runtime::context::MAX_CODEX_INPUT_TEXT_CHARS - 64 * 1024),
+        ),
+        CliInputAdmissionCase::Current => {
+            "y".repeat(crate::cli_runtime::context::MAX_CODEX_INPUT_TEXT_CHARS / 2 + 1)
+        }
+        _ => "CURRENT AFTER BIG HISTORY".to_owned(),
+    };
+    let mut input = vec![json!({"type":"text","text":current_input})];
+    if matches!(case, CliInputAdmissionCase::Current) {
+        // Each Text item must fit Pioneer's byte limit while their combined
+        // character count exceeds Codex's limit, even without carried history.
+        input.push(json!({
+            "type":"text",
+            "text":"y".repeat(crate::cli_runtime::context::MAX_CODEX_INPUT_TEXT_CHARS / 2),
+        }));
+    }
     let context = sessions.connection_context(connection).await.unwrap();
-    Arc::clone(&processor).process_owned_request(context, json!({
+    let payload = json!({
         "jsonrpc":"2.0", "id":request_id, "method":"turn/start",
         "params":{"thread_id":thread,"turn_id":turn,
-            "input":[{"type":"text","text":"CURRENT AFTER BIG HISTORY"}],
+            "input":input,
             "mode":"Agent","model":"gpt-5",
             "execution_backend":{"type":"cliAgentRuntime","runtime_id":"codex","runtime_kind":CLIAgentRuntimeKind::Codex},
             "permission_profile":pioneer_protocol::TurnPermissionProfileSelection::full_access()}
-    }).to_string()).await;
+    });
+    if matches!(case, CliInputAdmissionCase::Current) {
+        let params: pioneer_protocol::TurnStartParams =
+            serde_json::from_value(payload["params"].clone()).unwrap();
+        pioneer_protocol::validate_turn_execution_envelope(&params)
+            .expect("oversized Codex fixture must pass Pioneer's execution envelope");
+    }
+    let payload = payload.to_string();
+    if matches!(case, CliInputAdmissionCase::Current) {
+        let (_, admission_events) = crate::public_error::test_support::capture_events_async(
+            Arc::clone(&processor).process_owned_request(context, payload),
+        )
+        .await;
+        let error = recv_error_by_id(&mut rx, &request_id).await;
+        let public = assert_public_error(
+            &error,
+            PublicErrorCode::Internal,
+            PublicErrorStage::Admission,
+        );
+        let event = admission_events
+            .iter()
+            .find(|event| {
+                matches!(event.contexts.get("Rust Tracing Fields"),
+                Some(sentry::protocol::Context::Other(fields))
+                if fields.get("correlation_id") == Some(&json!(public.correlation_id)))
+            })
+            .expect("oversized input must report its correlated admission diagnostic");
+        crate::public_error::test_support::assert_correlated(event, &public);
+        let sentry::protocol::Context::Other(fields) = &event.contexts["Rust Tracing Fields"]
+        else {
+            panic!("admission diagnostic must contain tracing fields");
+        };
+        let diagnostic = fields["raw_diagnostic"]
+            .as_str()
+            .expect("admission diagnostic must be text");
+        assert!(diagnostic.contains("1048576 characters"), "{diagnostic}");
+        assert!(diagnostic.contains("current CLI input"), "{diagnostic}");
+        let encoded = serde_json::to_string(&error).unwrap();
+        assert!(!encoded.contains("1048576 characters"));
+        assert!(!encoded.contains("current CLI input"));
+        assert!(cli.turn_starts.lock().await.is_empty());
+        assert_eq!(summarizer.call_count(), 0);
+        assert!(
+            store
+                .compaction_head(&crate::compaction::native_owner(&workspace, thread))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            processor.cli_transfer_capture_count.load(Ordering::SeqCst),
+            1
+        );
+        return;
+    }
+    Arc::clone(&processor)
+        .process_owned_request(context, payload)
+        .await;
     let response = recv_response_by_id(&mut rx, &request_id).await;
     let accepted: TurnStartResponse = serde_json::from_value(response.result).unwrap();
     assert_eq!(accepted.turn.id, turn);
     let starts = wait_for_cli_runtime_turn_starts(&cli, 1).await;
+    assert_eq!(starts.len(), 1);
+    let sent: Vec<pioneer_cli_agent_runtime::input::CLIRuntimeTurnInputItem> =
+        serde_json::from_value(starts[0].input.clone()).unwrap();
+    assert!(
+        crate::cli_runtime::context::codex_input_text_chars(&sent)
+            <= crate::cli_runtime::context::MAX_CODEX_INPUT_TEXT_CHARS
+    );
+    assert!(sent.iter().any(|item| matches!(item,
+        pioneer_cli_agent_runtime::input::CLIRuntimeTurnInputItem::Text { text }
+        if text == &current_input)));
     let input = starts[0].input.to_string();
+    if matches!(case, CliInputAdmissionCase::Fits) {
+        assert!(input.contains("HISTORICAL HUGE CHUNK 00"));
+        assert_eq!(summarizer.call_count(), 0);
+        assert_eq!(
+            processor.cli_transfer_capture_count.load(Ordering::SeqCst),
+            1
+        );
+        assert!(
+            store
+                .compaction_head(&crate::compaction::native_owner(&workspace, thread))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        return;
+    }
     assert!(input.contains("CURRENT AFTER BIG HISTORY"));
     assert!(
         input.contains("PUBLISHED HUGE HISTORY SUMMARY"),
@@ -26000,6 +26144,36 @@ async fn oversized_cli_history_is_compacted_before_a_new_provider_session_starts
         head.is_some(),
         "oversized transfer must publish a real checkpoint"
     );
+    if matches!(case, CliInputAdmissionCase::History) {
+        assert!(
+            raw_bytes + current_input.len()
+                > crate::cli_runtime::context::MAX_CODEX_INPUT_TEXT_CHARS
+        );
+        assert!(
+            raw_bytes + current_input.len()
+                < crate::cli_runtime::context::MAX_CLI_TURN_INPUT_FRAME_BYTES
+        );
+        assert!((2..=3).contains(&processor.cli_transfer_capture_count.load(Ordering::SeqCst)));
+        assert!(!input.contains("HISTORICAL HUGE CHUNK 01"));
+        let requests = summarizer.snapshot_requests();
+        assert!(!requests.is_empty());
+        for marker in ["HISTORICAL HUGE CHUNK 00", "HISTORICAL HUGE CHUNK 01"] {
+            assert!(
+                requests.iter().any(|request| request
+                    .messages
+                    .iter()
+                    .any(|message| message.content.contains(marker))),
+                "covered history must reach the shared summarizer: {marker}"
+            );
+        }
+        assert!(requests.iter().all(|request| {
+            request
+                .messages
+                .iter()
+                .all(|message| !message.content.contains("CURRENT AFTER BIG HISTORY"))
+        }));
+        return;
+    }
     complete_recorded_cli_task_turn(
         &processor,
         cli.as_ref(),
@@ -26634,6 +26808,7 @@ async fn accepted_task_cli_transfer_compacts_without_later_parent_history_impl(
             None,
             0,
             deadline_ms,
+            None,
             prepared,
         )
         .await
@@ -70608,6 +70783,7 @@ async fn completed_command_history_fits_real_background_preflight_after_projecti
         None,
         Some(512),
         0,
+        None,
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
         None,
         &mut diagnostic,
@@ -70716,6 +70892,7 @@ async fn genuinely_large_command_history_compacts_through_real_background_prefli
         None,
         Some(512),
         0,
+        None,
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
         None,
         &mut diagnostic,
@@ -76828,6 +77005,7 @@ async fn production_background_preflight_ignores_technical_noise_but_budgets_rea
                 None,
                 None,
                 fixed_input_tokens,
+                None,
                 Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 None,
                 &mut diagnostic,
@@ -77380,6 +77558,7 @@ async fn background_history_preflight_budgets_task_input_copy_once_near_threshol
         None,
         Some(512),
         0,
+        None,
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
         None,
         &mut baseline,
@@ -77503,6 +77682,7 @@ async fn background_history_preflight_budgets_task_input_copy_once_near_threshol
         None,
         Some(512),
         fitting_fixed,
+        None,
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
         None,
         &mut fitting,
@@ -77533,6 +77713,7 @@ async fn background_history_preflight_budgets_task_input_copy_once_near_threshol
         None,
         Some(512),
         fixed,
+        None,
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
         None,
         &mut overflowing,
@@ -78865,6 +79046,7 @@ async fn background_completed_history_projects_reasoning_before_fit_and_compacti
         None,
         None,
         0,
+        None,
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
         None,
         &mut fitting,
@@ -78894,6 +79076,7 @@ async fn background_completed_history_projects_reasoning_before_fit_and_compacti
         None,
         None,
         fixed,
+        None,
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
         None,
         &mut compacted,
@@ -79188,6 +79371,7 @@ async fn background_deepseek_effort_matches_provider_preflight_and_token_boundar
             None,
             None,
             0,
+            None,
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
             None,
             &mut diagnostic,
@@ -79246,6 +79430,7 @@ async fn background_deepseek_effort_matches_provider_preflight_and_token_boundar
         None,
         None,
         compaction_fixed,
+        None,
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
         None,
         &mut diagnostic,
