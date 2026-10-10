@@ -26007,19 +26007,35 @@ async fn cli_input_admission_impl(case: CliInputAdmissionCase) {
             "y".repeat(crate::cli_runtime::context::MAX_CODEX_INPUT_TEXT_CHARS - 64 * 1024),
         ),
         CliInputAdmissionCase::Current => {
-            "y".repeat(crate::cli_runtime::context::MAX_CODEX_INPUT_TEXT_CHARS + 1)
+            "y".repeat(crate::cli_runtime::context::MAX_CODEX_INPUT_TEXT_CHARS / 2 + 1)
         }
         _ => "CURRENT AFTER BIG HISTORY".to_owned(),
     };
+    let mut input = vec![json!({"type":"text","text":current_input})];
+    if matches!(case, CliInputAdmissionCase::Current) {
+        // Each Text item must fit Pioneer's byte limit while their combined
+        // character count exceeds Codex's limit, even without carried history.
+        input.push(json!({
+            "type":"text",
+            "text":"y".repeat(crate::cli_runtime::context::MAX_CODEX_INPUT_TEXT_CHARS / 2),
+        }));
+    }
     let context = sessions.connection_context(connection).await.unwrap();
     let payload = json!({
         "jsonrpc":"2.0", "id":request_id, "method":"turn/start",
         "params":{"thread_id":thread,"turn_id":turn,
-            "input":[{"type":"text","text":current_input}],
+            "input":input,
             "mode":"Agent","model":"gpt-5",
             "execution_backend":{"type":"cliAgentRuntime","runtime_id":"codex","runtime_kind":CLIAgentRuntimeKind::Codex},
             "permission_profile":pioneer_protocol::TurnPermissionProfileSelection::full_access()}
-    }).to_string();
+    });
+    if matches!(case, CliInputAdmissionCase::Current) {
+        let params: pioneer_protocol::TurnStartParams =
+            serde_json::from_value(payload["params"].clone()).unwrap();
+        pioneer_protocol::validate_turn_execution_envelope(&params)
+            .expect("oversized Codex fixture must pass Pioneer's execution envelope");
+    }
+    let payload = payload.to_string();
     if matches!(case, CliInputAdmissionCase::Current) {
         let (_, admission_events) = crate::public_error::test_support::capture_events_async(
             Arc::clone(&processor).process_owned_request(context, payload),
