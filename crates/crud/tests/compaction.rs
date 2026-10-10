@@ -601,6 +601,30 @@ async fn candidate_fixture(
     source_epochs: std::collections::BTreeMap<String, u64>,
     prepare_manifest: bool,
 ) -> Checkpoint {
+    let checkpoint = candidate_admission_fixture(
+        store,
+        op,
+        expected,
+        assertion,
+        source_epochs,
+        prepare_manifest,
+    )
+    .await;
+    store
+        .compaction_save_candidate(&checkpoint, 0)
+        .await
+        .unwrap();
+    checkpoint
+}
+
+async fn candidate_admission_fixture(
+    store: &CrudStore,
+    op: &str,
+    expected: Option<&str>,
+    assertion: &SourceAssertion,
+    source_epochs: std::collections::BTreeMap<String, u64>,
+    prepare_manifest: bool,
+) -> Checkpoint {
     let selection = ModelSelection {
         transport: Transport::Api,
         instance: "p".into(),
@@ -659,10 +683,6 @@ async fn candidate_fixture(
         selection,
         projection_version: 1,
     };
-    store
-        .compaction_save_candidate(&checkpoint, 0)
-        .await
-        .unwrap();
     checkpoint
 }
 #[tokio::test]
@@ -675,8 +695,9 @@ async fn append_survives_atomic_apply_and_restart_does_not_regenerate_or_reapply
             .compaction_manifest_page("op-a", false, 0, 0)
             .await
             .unwrap()
-            .is_empty(),
-        "legacy assertion publication has no manifest"
+            .len()
+            == 1,
+        "raw assertion publication saves exact historical ownership"
     );
     source(&store, "source-b", 2, "appended after snapshot").await;
     assert_eq!(
@@ -1968,6 +1989,21 @@ async fn frozen_history_is_paged_immutable_scoped_and_restart_safe() {
         )
         .await
         .unwrap();
+    // R1: the committed prefix is visible in the logical view before ready;
+    // physical allocation beyond next is not part of the logical stream.
+    let visible = store
+        .database_connection()
+        .query_one_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "SELECT COUNT(*) AS n FROM compaction_frozen_message WHERE manifest_id=?",
+            [descriptor.manifest_id.clone().into()],
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get::<i64>("", "n")
+        .unwrap();
+    assert_eq!(visible, 128);
     assert!(
         store
             .compaction_frozen_history_owner("ws", &descriptor)
@@ -2685,7 +2721,7 @@ async fn task_basis_scope_requires_exact_execution_snapshot_and_lineage() {
             .unwrap(),
         None
     );
-    db.execute_unprepared("INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at) VALUES ('run','task','ws','thread','not read by metadata lookup',CURRENT_TIMESTAMP)").await.unwrap();
+    db.execute_unprepared("WITH frozen_root_fixture(run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at) AS (VALUES ('run','task','ws','thread','not read by metadata lookup',CURRENT_TIMESTAMP)) INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at,frozen_manifest_id) SELECT run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at,CASE WHEN json_valid(history_json) THEN CASE WHEN json_type(history_json)='object' THEN json_extract(history_json,'$.manifest_id') ELSE NULL END ELSE NULL END FROM frozen_root_fixture").await.unwrap();
     assert_eq!(
         store
             .compaction_task_basis_thread("ws", "child", "child-turn")
@@ -2737,7 +2773,7 @@ async fn task_basis_scope_requires_exact_execution_snapshot_and_lineage() {
     );
     db.execute_raw(Statement::from_sql_and_values(
         DbBackend::Sqlite,
-        "UPDATE task_run_conversation_snapshot SET history_json=? WHERE run_id='run'",
+        "WITH root_replacement(history_json) AS (VALUES (?)) UPDATE task_run_conversation_snapshot SET history_json=(SELECT history_json FROM root_replacement),frozen_manifest_id=(SELECT CASE WHEN json_valid(history_json) THEN CASE WHEN json_type(history_json)='object' THEN json_extract(history_json,'$.manifest_id') ELSE NULL END ELSE NULL END FROM root_replacement) WHERE run_id='run'",
         [large.clone().into()],
     ))
     .await
@@ -2927,6 +2963,7 @@ async fn delivered_output_discovery_advances_empty_bounded_quanta() {
 
 #[tokio::test]
 async fn frozen_own_imports_require_exact_output_membership_and_atomic_publication() {
+    let mut frozen_conversion_progress = pioneer_crud::FrozenStorageLifetimeProgress::default();
     use pioneer_compaction::frozen::{FrozenHistoryRef, FrozenMessageRef};
     use sha2::{Digest, Sha256};
     fn descriptor(id: &str, messages: &[FrozenMessageRef]) -> FrozenHistoryRef {
@@ -3244,7 +3281,11 @@ async fn frozen_own_imports_require_exact_output_membership_and_atomic_publicati
             .is_empty()
     );
     for _ in 0..100 {
-        if !store.compact_frozen_storage_quantum().await.unwrap() {
+        if !store
+            .compact_frozen_storage_quantum(&mut frozen_conversion_progress)
+            .await
+            .unwrap()
+        {
             break;
         }
     }
@@ -3358,7 +3399,7 @@ async fn frozen_own_imports_require_exact_output_membership_and_atomic_publicati
         "an arbitrary parent manifest is not an accepted Task basis"
     );
     db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-        "INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at) VALUES ('run-c','task','ws','thread',?,CURRENT_TIMESTAMP)",
+        "WITH frozen_root_fixture(run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at) AS (VALUES ('run-c','task','ws','thread',?,CURRENT_TIMESTAMP)) INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at,frozen_manifest_id) SELECT run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at,CASE WHEN json_valid(history_json) THEN CASE WHEN json_type(history_json)='object' THEN json_extract(history_json,'$.manifest_id') ELSE NULL END ELSE NULL END FROM frozen_root_fixture",
         [serde_json::to_string(&context).unwrap().into()])).await.unwrap();
     assert!(
         store
@@ -3553,7 +3594,7 @@ async fn frozen_own_imports_require_exact_output_membership_and_atomic_publicati
     }
     db.execute_raw(Statement::from_sql_and_values(
         DbBackend::Sqlite,
-        "INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at) VALUES ('run-d','task-d','ws','thread',?,CURRENT_TIMESTAMP)",
+        "WITH frozen_root_fixture(run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at) AS (VALUES ('run-d','task-d','ws','thread',?,CURRENT_TIMESTAMP)) INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at,frozen_manifest_id) SELECT run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at,CASE WHEN json_valid(history_json) THEN CASE WHEN json_type(history_json)='object' THEN json_extract(history_json,'$.manifest_id') ELSE NULL END ELSE NULL END FROM frozen_root_fixture",
         [serde_json::to_string(&context).unwrap().into()],
     ))
     .await
@@ -3691,7 +3732,7 @@ async fn frozen_own_imports_require_exact_output_membership_and_atomic_publicati
         .await
         .unwrap();
     db.execute_unprepared(
-        "UPDATE task_run_conversation_snapshot SET history_json='[]' WHERE run_id='run-c'",
+        "UPDATE task_run_conversation_snapshot SET history_json='[]',frozen_manifest_id=NULL WHERE run_id='run-c'",
     )
     .await
     .unwrap();
@@ -3715,7 +3756,7 @@ async fn frozen_own_imports_require_exact_output_membership_and_atomic_publicati
     );
     db.execute_raw(Statement::from_sql_and_values(
         DbBackend::Sqlite,
-        "UPDATE task_run_conversation_snapshot SET history_json=? WHERE run_id='run-c'",
+        "WITH root_replacement(history_json) AS (VALUES (?)) UPDATE task_run_conversation_snapshot SET history_json=(SELECT history_json FROM root_replacement),frozen_manifest_id=(SELECT CASE WHEN json_valid(history_json) THEN CASE WHEN json_type(history_json)='object' THEN json_extract(history_json,'$.manifest_id') ELSE NULL END ELSE NULL END FROM root_replacement) WHERE run_id='run-c'",
         [serde_json::to_string(&context).unwrap().into()],
     ))
     .await
@@ -3876,26 +3917,33 @@ async fn frozen_own_imports_require_exact_output_membership_and_atomic_publicati
         .compaction_bind_source_projection(&operation.id, &context)
         .await
         .unwrap();
-    // Header identity is pinned with the operation, so mutation cannot widen
-    // the manifest's read-time authority before summarization.
-    db.execute_unprepared(
-        "UPDATE compaction_frozen_history SET imports_sha256='changed' WHERE id='assembled'",
-    )
-    .await
-    .unwrap();
+    // Complete identity is immutable now: an attempted rewrite is rejected
+    // before it can widen the operation's read-time authority. Corrupt legacy
+    // headers remain covered by the predicate/oracle fixtures.
     assert!(
-        !store
+        db.execute_unprepared(
+            "UPDATE compaction_frozen_history SET imports_sha256='changed' WHERE id='assembled'",
+        )
+        .await
+        .is_err()
+    );
+    let pinned: String = db
+        .query_one_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT imports_sha256 FROM compaction_frozen_history WHERE id='assembled'".into(),
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "imports_sha256")
+        .unwrap();
+    assert_eq!(pinned, import_digest);
+    assert!(
+        store
             .compaction_manifest_sources_current(&operation.id)
             .await
             .unwrap()
     );
-    db.execute_raw(Statement::from_sql_and_values(
-        DbBackend::Sqlite,
-        "UPDATE compaction_frozen_history SET imports_sha256=? WHERE id='assembled'",
-        [import_digest.clone().into()],
-    ))
-    .await
-    .unwrap();
     db.execute_unprepared("CREATE TEMP TRIGGER abort_import_commit AFTER UPDATE OF head ON compaction_context BEGIN SELECT RAISE(ABORT,'fixture imported commit rollback'); END").await.unwrap();
     assert!(
         store
@@ -4643,7 +4691,7 @@ async fn frozen_own_import_treats_published_summary_as_atomic_output() {
         }
         db.execute_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
-            "INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at) VALUES ('portion-consumer-run','portion-consumer-task','ws','thread',?,CURRENT_TIMESTAMP)",
+            "WITH frozen_root_fixture(run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at) AS (VALUES ('portion-consumer-run','portion-consumer-task','ws','thread',?,CURRENT_TIMESTAMP)) INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at,frozen_manifest_id) SELECT run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at,CASE WHEN json_valid(history_json) THEN CASE WHEN json_type(history_json)='object' THEN json_extract(history_json,'$.manifest_id') ELSE NULL END ELSE NULL END FROM frozen_root_fixture",
             [serde_json::to_string(&imported).unwrap().into()],
         ))
         .await
@@ -5627,7 +5675,7 @@ async fn legacy_task_snapshot_reference_is_bounded_scoped_and_revision_guarded()
     }
     let body = serde_json::to_string(&vec!["память🦀".repeat(9000)]).unwrap();
     db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-        "INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,history_json,created_at) VALUES ('run','task','ws','thread','turn',?,CURRENT_TIMESTAMP)", [body.clone().into()])).await.unwrap();
+        "WITH frozen_root_fixture(run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,history_json,created_at) AS (VALUES ('run','task','ws','thread','turn',?,CURRENT_TIMESTAMP)) INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,history_json,created_at,frozen_manifest_id) SELECT run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,history_json,created_at,CASE WHEN json_valid(history_json) THEN CASE WHEN json_type(history_json)='object' THEN json_extract(history_json,'$.manifest_id') ELSE NULL END ELSE NULL END FROM frozen_root_fixture", [body.clone().into()])).await.unwrap();
     let source = store
         .compaction_legacy_task_basis_source("ws", "thread", "run")
         .await
@@ -5704,7 +5752,7 @@ async fn legacy_task_snapshot_reference_is_bounded_scoped_and_revision_guarded()
 async fn completed_cli_check_is_atomic_bounded_and_captures_settings_once() {
     let store = store().await;
     let db = store.database_connection();
-    db.execute_unprepared("INSERT INTO turn_cli_runtime_binding(turn_id,thread_id,continuation_thread_id,workspace_id,runtime_id,runtime_kind,native_thread_id,status,model) VALUES('turn','thread','thread','ws','claude','claude','native','running','sonnet')").await.unwrap();
+    db.execute_unprepared("INSERT INTO turn_cli_runtime_binding(turn_id,thread_id,continuation_thread_id,workspace_id,runtime_id,runtime_kind,native_thread_id,status,model,frozen_manifest_id) VALUES('turn','thread','thread','ws','claude','claude','native','running','sonnet',NULL)").await.unwrap();
     assert!(
         store
             .compaction_pending_history_checks()
@@ -6401,6 +6449,7 @@ async fn shared_frozen_growth_is_linear_and_old_revisions_are_unchanged() {
 }
 #[tokio::test]
 async fn legacy_frozen_duplicates_convert_incrementally_without_changing_ids_or_reads() {
+    let mut frozen_conversion_progress = pioneer_crud::FrozenStorageLifetimeProgress::default();
     let store = store().await;
     let refs = shared_refs(300);
     for id in ["a", "b", "c"] {
@@ -6420,9 +6469,13 @@ async fn legacy_frozen_duplicates_convert_incrementally_without_changing_ids_or_
     );
 
     let mut quanta = 0;
-    while store.compact_frozen_storage_quantum().await.unwrap() {
+    while store
+        .compact_frozen_storage_quantum(&mut frozen_conversion_progress)
+        .await
+        .unwrap()
+    {
         quanta += 1;
-        assert!(quanta < 100);
+        assert!(quanta < 512);
         for id in ["a", "b", "c"] {
             assert_eq!(shared_read(&store, id).await, refs);
         }
@@ -6441,7 +6494,140 @@ async fn legacy_frozen_duplicates_convert_incrementally_without_changing_ids_or_
             .unwrap(),
         Some("thread".into())
     );
-    assert!(!store.compact_frozen_storage_quantum().await.unwrap());
+    assert!(
+        !store
+            .compact_frozen_storage_quantum(&mut frozen_conversion_progress)
+            .await
+            .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn old_layout_sizes_and_new_shared_payload_keep_exact_logical_stream() {
+    let store = store().await;
+    let refs = shared_refs(260);
+    shared_capture(&store, "base", &refs, true).await;
+    let descriptor = shared_capture(&store, "legacy", &refs, false).await;
+    let sizes = store.database_connection().query_all_raw(Statement::from_string(DbBackend::Sqlite,"SELECT ordinal,bytes FROM compaction_frozen_message WHERE manifest_id='legacy' ORDER BY ordinal")).await.unwrap();
+    assert_eq!(sizes.len(), refs.len());
+    let mut progress = pioneer_crud::FrozenStorageLifetimeProgress::default();
+    for _ in 0..512 {
+        store
+            .compact_frozen_storage_quantum(&mut progress)
+            .await
+            .unwrap();
+    }
+    assert_eq!(shared_read(&store, "legacy").await, refs);
+    let after = store.database_connection().query_all_raw(Statement::from_string(DbBackend::Sqlite,"SELECT ordinal,bytes FROM compaction_frozen_message WHERE manifest_id='legacy' ORDER BY ordinal")).await.unwrap();
+    assert_eq!(
+        sizes
+            .iter()
+            .map(|r| (
+                r.try_get::<i64>("", "ordinal").unwrap(),
+                r.try_get::<i64>("", "bytes").unwrap()
+            ))
+            .collect::<Vec<_>>(),
+        after
+            .iter()
+            .map(|r| (
+                r.try_get::<i64>("", "ordinal").unwrap(),
+                r.try_get::<i64>("", "bytes").unwrap()
+            ))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        frozen_count(&store, "compaction_frozen_message_data").await,
+        260
+    );
+    assert_eq!(
+        store
+            .compaction_frozen_history_owner("ws", &descriptor)
+            .await
+            .unwrap(),
+        Some("thread".into())
+    );
+}
+
+#[tokio::test]
+async fn duplicate_cleanup_rejects_understated_physical_bytes_after_layout_switch() {
+    let store = store().await;
+    let refs = shared_refs(2);
+    shared_capture(&store, "base", &refs, true).await;
+    shared_capture(&store, "legacy", &refs, false).await;
+    let mut progress = pioneer_crud::FrozenStorageLifetimeProgress::default();
+    let mut activated = false;
+    for _ in 0..128 {
+        store
+            .compact_frozen_storage_quantum(&mut progress)
+            .await
+            .unwrap();
+        let row=store.database_connection().query_one_raw(Statement::from_string(DbBackend::Sqlite,"SELECT active,cleanup_next,cleanup_to FROM compaction_frozen_layout WHERE manifest_id='legacy' AND kind=0")).await.unwrap();
+        if let Some(row) = row {
+            if row.try_get::<i64>("", "active").unwrap() == 1
+                && row.try_get::<i64>("", "cleanup_next").unwrap() == 0
+                && row.try_get::<i64>("", "cleanup_to").unwrap() == 2
+            {
+                activated = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        activated,
+        "fixture must pause after real activation and before cleanup"
+    );
+    store.database_connection().execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,"UPDATE compaction_frozen_message_data SET reference_json=?1,bytes=2 WHERE manifest_id='legacy' AND ordinal=0",[serde_json::json!({"padding":"x".repeat(300_000)}).to_string().into()])).await.unwrap();
+    assert!(
+        store
+            .compact_frozen_storage_quantum(&mut progress)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        frozen_count(&store, "compaction_frozen_message_data").await,
+        4
+    );
+    assert_eq!(shared_read(&store, "base").await, refs);
+}
+
+#[tokio::test]
+async fn restart_staged_copy_next_does_not_publish_wrong_backing() {
+    let store = store().await;
+    let refs = shared_refs(2);
+    shared_capture(&store, "base", &refs, true).await;
+    shared_capture(&store, "staged", &refs, false).await;
+    store.database_connection().execute_unprepared("INSERT INTO compaction_frozen_layout(manifest_id,kind,active,pending,candidate,compared,copy_to,copy_next) VALUES('staged',0,0,1,'base',2,2,2)").await.unwrap();
+    // Plausible old progress with corrupt physical source. Direct rows still
+    // exist, so rejecting activation must keep the old logical layout usable.
+    store.database_connection().execute_unprepared("INSERT INTO compaction_frozen_span(manifest_id,kind,start,end,source_manifest) VALUES('staged',0,0,2,'staged')").await.unwrap();
+    let mut progress = pioneer_crud::FrozenStorageLifetimeProgress::default();
+    let mut rejected = false;
+    for _ in 0..128 {
+        if store
+            .compact_frozen_storage_quantum(&mut progress)
+            .await
+            .is_err()
+        {
+            rejected = true;
+            break;
+        }
+    }
+    assert!(rejected);
+    let state=store.database_connection().query_one_raw(Statement::from_string(DbBackend::Sqlite,"SELECT active,failed FROM compaction_frozen_layout WHERE manifest_id='staged' AND kind=0")).await.unwrap().unwrap();
+    assert_eq!(state.try_get::<i64>("", "active").unwrap(), 0);
+    assert_eq!(state.try_get::<i64>("", "failed").unwrap(), 1);
+    assert!(
+        store
+            .compaction_frozen_history_page("ws", "thread", "staged", 0)
+            .await
+            .is_err(),
+        "corrupt layout is explicit, not empty history"
+    );
+    assert_eq!(
+        frozen_count(&store, "compaction_frozen_message_data").await,
+        4
+    );
+    assert_eq!(shared_read(&store, "base").await, refs);
 }
 
 #[tokio::test]
@@ -6494,6 +6680,7 @@ async fn shared_frozen_append_rollback_and_concurrent_retry_preserve_one_sequenc
 
 #[tokio::test]
 async fn shared_frozen_cleanup_rollback_and_poison_row_do_not_lose_other_history() {
+    let mut frozen_conversion_progress = pioneer_crud::FrozenStorageLifetimeProgress::default();
     let store = store().await;
     let refs = shared_refs(20);
     shared_capture(&store, "a", &refs, true).await;
@@ -6501,8 +6688,12 @@ async fn shared_frozen_cleanup_rollback_and_poison_row_do_not_lose_other_history
     let db = store.database_connection();
     db.execute_unprepared("CREATE TEMP TRIGGER reject_shared_cleanup BEFORE DELETE ON compaction_frozen_message_data BEGIN SELECT RAISE(ABORT,'fixture cleanup rollback'); END").await.unwrap();
     let mut failed = false;
-    for _ in 0..20 {
-        if store.compact_frozen_storage_quantum().await.is_err() {
+    for _ in 0..128 {
+        if store
+            .compact_frozen_storage_quantum(&mut frozen_conversion_progress)
+            .await
+            .is_err()
+        {
             failed = true;
             break;
         }
@@ -6516,8 +6707,12 @@ async fn shared_frozen_cleanup_rollback_and_poison_row_do_not_lose_other_history
     db.execute_unprepared("DROP TRIGGER reject_shared_cleanup")
         .await
         .unwrap();
-    for _ in 0..20 {
-        if !store.compact_frozen_storage_quantum().await.unwrap() {
+    for _ in 0..128 {
+        if !store
+            .compact_frozen_storage_quantum(&mut frozen_conversion_progress)
+            .await
+            .unwrap()
+        {
             break;
         }
     }
@@ -6533,8 +6728,11 @@ async fn shared_frozen_cleanup_rollback_and_poison_row_do_not_lose_other_history
     .await
     .unwrap();
     let mut rejected = 0;
-    for _ in 0..40 {
-        match store.compact_frozen_storage_quantum().await {
+    for _ in 0..128 {
+        match store
+            .compact_frozen_storage_quantum(&mut frozen_conversion_progress)
+            .await
+        {
             Ok(false) => break,
             Ok(true) => {}
             Err(_) => rejected += 1,
@@ -6896,5 +7094,426 @@ async fn history_check_legacy_pages_discard_superseded_turns_and_make_progress()
             .await
             .unwrap()
             .is_empty()
+    );
+}
+
+// proposal-73: written regressions, intentionally not executed before review.
+async fn checkpoint_proof_version(store: &CrudStore, id: &str) -> i64 {
+    store
+        .database_connection()
+        .query_one_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "SELECT proof_version FROM compaction_checkpoint WHERE id=?1",
+            [id.into()],
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "proof_version")
+        .unwrap()
+}
+#[tokio::test]
+async fn raw_assertion_publication_seals_exact_empty_proofs_and_immutable_ownership() {
+    let store = store().await;
+    let assertion = source(&store, "raw-proof-source", 1, "original").await;
+    let cp = candidate(&store, "raw-proof-op", None, &assertion).await;
+    assert_eq!(checkpoint_proof_version(&store, &cp.id).await, 0);
+    let ownership = store
+        .compaction_manifest_page(&cp.operation_id, false, 0, 0)
+        .await
+        .unwrap();
+    assert_eq!(ownership.len(), 1);
+    assert_eq!(ownership[0].source, assertion.reference());
+    assert_eq!(ownership[0].thread_id, "thread");
+    assert_eq!(
+        store
+            .compaction_apply(&cp, None, &[assertion.clone()])
+            .await
+            .unwrap(),
+        CommitOutcome::Applied
+    );
+    assert_eq!(checkpoint_proof_version(&store, &cp.id).await, 1);
+    let db = store.database_connection();
+    for table in [
+        "compaction_checkpoint_replay_alias",
+        "compaction_checkpoint_event_input",
+        "compaction_checkpoint_import",
+    ] {
+        let n: i64 = db
+            .query_one_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                format!("SELECT count(*) AS n FROM {table} WHERE checkpoint_id=?1"),
+                [cp.id.clone().into()],
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get("", "n")
+            .unwrap();
+        assert_eq!(n, 0, "empty set is proven by marker, not row presence");
+    }
+    for sql in [
+        "UPDATE compaction_checkpoint SET proof_version=0 WHERE id=?1",
+        "UPDATE compaction_checkpoint SET previous='forged' WHERE id=?1",
+        "DELETE FROM compaction_coverage WHERE checkpoint_id=?1",
+        "INSERT INTO compaction_checkpoint_event_input(checkpoint_id,source_thread,source_scope,source_id,source_version,role) VALUES(?1,'thread','event:turn','forged','event-revision:1','deleted')",
+    ] {
+        assert!(
+            db.execute_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                sql,
+                [cp.id.clone().into()]
+            ))
+            .await
+            .is_err(),
+            "sealed evidence/links must be immutable"
+        );
+    }
+    assert!(
+        db.execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "DELETE FROM compaction_manifest WHERE operation_id=?1",
+            [cp.operation_id.clone().into()]
+        ))
+        .await
+        .is_err()
+    );
+    assert_eq!(
+        store
+            .compaction_apply(&cp, None, &[assertion])
+            .await
+            .unwrap(),
+        CommitOutcome::AlreadyApplied
+    );
+}
+#[tokio::test]
+async fn raw_assertion_missing_historical_ownership_is_not_empty_proofs() {
+    let store = store().await;
+    let assertion = source(&store, "lost-owner-source", 1, "original").await;
+    // Model an unsealed legacy checkpoint whose ownership was already lost,
+    // before the new candidate writers' atomic immutable portion boundary.
+    // A post-commit DELETE is now correctly rejected by the production guard.
+    let cp = candidate_admission_fixture(
+        &store,
+        "lost-owner-op",
+        None,
+        &assertion,
+        Default::default(),
+        false,
+    )
+    .await;
+    use sha2::{Digest, Sha256};
+    let identity = hex::encode(Sha256::digest(serde_json::to_vec(&cp).unwrap()));
+    let db = store.database_connection();
+    db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+        "INSERT INTO compaction_checkpoint(id,operation_id,owner,portion,summary,identity_sha256,selection,projection_version,format_version,status) VALUES(?1,?2,?3,0,?4,?5,?6,?7,1,'candidate')",
+        [cp.id.clone().into(),cp.operation_id.clone().into(),cp.owner.clone().into(),cp.summary.clone().into(),identity.into(),serde_json::to_string(&cp.selection).unwrap().into(),(cp.projection_version as i64).into()])).await.unwrap();
+    let r = assertion.reference();
+    db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+        "INSERT INTO compaction_coverage(checkpoint_id,source_scope,source_id,source_version) VALUES(?1,?2,?3,?4)",
+        [cp.id.clone().into(),r.scope.into(),r.id.into(),r.version.into()])).await.unwrap();
+    assert!(
+        store
+            .compaction_apply(&cp, None, &[assertion])
+            .await
+            .is_err()
+    );
+    assert_eq!(checkpoint_proof_version(&store, &cp.id).await, 0);
+    assert_eq!(store.compaction_head("owner").await.unwrap(), None);
+}
+#[tokio::test]
+async fn extra_staging_evidence_prevents_seal_and_publication_without_overwrite() {
+    let store = store().await;
+    let assertion = source(&store, "staging-source", 1, "original").await;
+    let cp = candidate(&store, "staging-op", None, &assertion).await;
+    store.database_connection().execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,"INSERT INTO compaction_checkpoint_event_input(checkpoint_id,source_thread,source_scope,source_id,source_version,role) VALUES(?1,'thread','event:turn','poison','event-revision:1','deleted')",[cp.id.clone().into()])).await.unwrap();
+    for _ in 0..2 {
+        assert!(
+            store
+                .compaction_apply(&cp, None, &[assertion.clone()])
+                .await
+                .is_err()
+        );
+        assert_eq!(checkpoint_proof_version(&store, &cp.id).await, 0);
+    }
+    assert_eq!(store.compaction_head("owner").await.unwrap(), None);
+    let n: i64 = store
+        .database_connection()
+        .query_one_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "SELECT count(*) AS n FROM compaction_checkpoint_event_input WHERE checkpoint_id=?1",
+            [cp.id.into()],
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "n")
+        .unwrap();
+    assert_eq!(n, 1, "conflicting staging is not silently repaired");
+}
+#[tokio::test]
+async fn checkpoint_alias_null_identity_is_distinct_from_empty_tool_identity() {
+    let store = store().await;
+    let assertion = source(&store, "alias-source", 1, "original").await;
+    let cp = candidate(&store, "alias-op", None, &assertion).await;
+    let sql = "INSERT INTO compaction_checkpoint_replay_alias(checkpoint_id,covered_thread,covered_scope,covered_id,covered_version,replay_thread,replay_scope,replay_id,replay_version,tool_item_id) VALUES(?1,'thread','event:turn','source','event-revision:1','thread','context:turn','replay','revision:1',?2)";
+    for tool in [None, Some(String::new())] {
+        store
+            .database_connection()
+            .execute_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                sql,
+                [cp.id.clone().into(), tool.into()],
+            ))
+            .await
+            .unwrap();
+    }
+    assert!(
+        store
+            .database_connection()
+            .execute_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                sql,
+                [cp.id.clone().into(), Option::<String>::None.into()]
+            ))
+            .await
+            .is_err()
+    );
+    let n: i64 = store
+        .database_connection()
+        .query_one_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "SELECT count(*) AS n FROM compaction_checkpoint_replay_alias WHERE checkpoint_id=?1",
+            [cp.id.into()],
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "n")
+        .unwrap();
+    assert_eq!(n, 2);
+}
+
+#[tokio::test]
+async fn deadline_saved_ready_candidate_commit_expiry_refuses_resume_without_changing_generation() {
+    use pioneer_compaction::runner::{AttemptPurpose, FailureKind, RunnerPhase, RunnerState};
+    for phase_name in ["Ready", "Candidate", "Commit"] {
+        let store = store().await;
+        let assertion = source(&store, "resume-source", 1, "original").await;
+        let cp = candidate_fixture(
+            &store,
+            "resume-op",
+            None,
+            &assertion,
+            std::collections::BTreeMap::new(),
+            true,
+        )
+        .await;
+        let descriptor = shared_descriptor("resume-origin", &[]);
+        store
+            .compaction_begin_frozen_history("ws", "thread", &descriptor)
+            .await
+            .unwrap();
+        let hold = store
+            .compaction_finish_frozen_history_held("ws", "thread", &descriptor)
+            .await
+            .unwrap();
+        let db = store.database_connection();
+        db.execute_unprepared("INSERT INTO compaction_operation_projection(operation_id,manifest_id,identity_sha256,imports_sha256,import_count) SELECT 'resume-op',id,identity_sha256,imports_sha256,import_count FROM compaction_frozen_history WHERE id='resume-origin'").await.unwrap();
+        let phase = match phase_name {
+            "Ready" => RunnerPhase::Ready {
+                purpose: AttemptPurpose::Portion,
+            },
+            "Candidate" => RunnerPhase::Candidate {
+                checkpoint: cp.id.clone(),
+                final_portion: true,
+            },
+            _ => RunnerPhase::Commit {
+                checkpoint: cp.id.clone(),
+            },
+        };
+        let state = RunnerState {
+            generation: 0,
+            deadline_ms: 1000,
+            attempts: 1,
+            retries: 0,
+            corrections: 0,
+            target_tokens: 10,
+            source_text_projection_version: 0,
+            cursor: Default::default(),
+            previous_checkpoint: Some(cp.id.clone()),
+            phase: RunnerPhase::Failed {
+                kind: FailureKind::Deadline,
+            },
+            resume_phase: Some(phase),
+            observation: None,
+            diagnostic: None,
+        };
+        db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,"INSERT INTO compaction_runner_state(operation_id,generation,state) VALUES('resume-op',0,?1)",[serde_json::to_string(&state).unwrap().into()])).await.unwrap();
+        db.execute_unprepared("UPDATE compaction_operation SET status='failed',outcome='deadline' WHERE id='resume-op'").await.unwrap();
+        drop(hold);
+        if phase_name == "Commit" {
+            assert!(
+                store
+                    .compaction_resume_deadline("resume-op", "turn", 2000)
+                    .await
+                    .unwrap(),
+                "resume first creates a running origin root"
+            );
+            let mut p = pioneer_crud::FrozenStorageLifetimeProgress::default();
+            for _ in 0..500 {
+                let _ = p.quantum(&store).await;
+            }
+            assert!(
+                store
+                    .compaction_bound_source_projection("resume-op")
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+            // Return to proven deadline terminal state at the new generation.
+            let mut terminal = store
+                .compaction_runner_state("resume-op")
+                .await
+                .unwrap()
+                .unwrap();
+            terminal.generation += 1;
+            terminal.phase = RunnerPhase::Failed {
+                kind: FailureKind::Deadline,
+            };
+            terminal.resume_phase = Some(RunnerPhase::Commit {
+                checkpoint: cp.id.clone(),
+            });
+            db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,"UPDATE compaction_runner_state SET generation=?1,state=?2 WHERE operation_id='resume-op'",[(terminal.generation as i64).into(),serde_json::to_string(&terminal).unwrap().into()])).await.unwrap();
+            db.execute_unprepared("UPDATE compaction_operation SET status='failed',outcome='deadline' WHERE id='resume-op'").await.unwrap();
+        }
+        // Isolated fixture expiry models the durable winner before dispatch.
+        db.execute_unprepared(
+            "UPDATE compaction_frozen_history SET expired=1 WHERE id='resume-origin'",
+        )
+        .await
+        .unwrap();
+        let before = store
+            .compaction_runner_state("resume-op")
+            .await
+            .unwrap()
+            .unwrap();
+        let error = store
+            .compaction_resume_deadline("resume-op", "turn", 4000)
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("expired"), "{phase_name}");
+        assert_eq!(
+            store
+                .compaction_runner_state("resume-op")
+                .await
+                .unwrap()
+                .unwrap(),
+            before
+        );
+        assert_eq!(
+            store
+                .compaction_operation("resume-op")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "failed"
+        );
+    }
+}
+
+#[tokio::test]
+async fn legacy_large_raw_admission_and_coverage_are_paged_not_poisoned_by_aggregate_bytes() {
+    let recorded: RecordedStatements = Default::default();
+    let store = store_recording_statements(Some(recorded.clone())).await;
+    let mut assertions = Vec::new();
+    for i in 0..128 {
+        assertions.push(
+            source(
+                &store,
+                &format!("raw-{i:04}-{}", "x".repeat(3072)),
+                i + 1,
+                "{}",
+            )
+            .await,
+        );
+    }
+    let mut cp = candidate_admission_fixture(
+        &store,
+        "raw-large-op",
+        None,
+        &assertions[0],
+        Default::default(),
+        false,
+    )
+    .await;
+    cp.coverage = assertions.iter().map(SourceAssertion::reference).collect();
+    let db = store.database_connection();
+    let row = db
+        .query_one_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT snapshot FROM compaction_operation WHERE id='raw-large-op'".into(),
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    let mut snapshot: OperationSnapshot =
+        serde_json::from_str(&row.try_get::<String>("", "snapshot").unwrap()).unwrap();
+    snapshot.plan.coverage = cp.coverage.clone();
+    snapshot.plan.compact = (0..cp.coverage.len()).collect();
+    let json = serde_json::to_string(&snapshot).unwrap();
+    assert!(json.len() > SOURCE_PAGE_BYTES);
+    // Original legacy admission predates the small current admission envelope.
+    db.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "UPDATE compaction_operation SET snapshot=?1 WHERE id='raw-large-op'",
+        [json.into()],
+    ))
+    .await
+    .unwrap();
+    recorded.lock().unwrap().clear();
+    store.compaction_save_candidate(&cp, 0).await.unwrap();
+    assert_eq!(
+        store
+            .compaction_checkpoint(&cp.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .coverage,
+        cp.coverage
+    );
+    assert_eq!(
+        store
+            .compaction_checkpoint_edges(&cp.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .coverage
+            .len(),
+        128
+    );
+    assert_eq!(
+        store
+            .compaction_apply(&cp, None, &assertions)
+            .await
+            .unwrap(),
+        CommitOutcome::Applied
+    );
+    assert_eq!(checkpoint_proof_version(&store, &cp.id).await, 1);
+    let statements = recorded.lock().unwrap();
+    let fragments = statements
+        .iter()
+        .filter(|s| s.sql.contains("substr(CAST(o.snapshot AS BLOB)"))
+        .count();
+    assert!(
+        fragments >= 4,
+        "both raw preparation and proof extraction must read multiple fragments"
+    );
+    assert!(
+        !statements
+            .iter()
+            .any(|s| s.sql.starts_with("SELECT owner,snapshot")),
+        "no full snapshot payload read"
     );
 }

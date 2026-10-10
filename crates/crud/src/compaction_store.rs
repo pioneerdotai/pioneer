@@ -297,7 +297,7 @@ impl CrudStore {
     }
     /// Read bounded historical coverage metadata without loading summary text.
     pub async fn compaction_checkpoint_edges(&self, id: &str) -> Result<Option<CheckpointEdges>> {
-        repositories::compaction::compaction_checkpoint_edges(&self.connection, id).await
+        repositories::compaction::compaction_checkpoint_edges(self, id).await
     }
     pub async fn compaction_checkpoint(&self, id: &str) -> Result<Option<Checkpoint>> {
         repositories::compaction::compaction_checkpoint(&self.connection, id).await
@@ -708,6 +708,7 @@ impl CrudStore {
     }
     /// Ready is published only after the bounded writer has filled all exact
     /// ordinals. The content digest is checked by the caller before this CAS.
+    #[cfg(any(test, feature = "test-support"))]
     pub async fn compaction_finish_frozen_history(
         &self,
         workspace: &str,
@@ -720,6 +721,31 @@ impl CrudStore {
             owner_thread,
             descriptor,
         )
+        .await
+    }
+    /// Finish and register the capture handoff before releasing the writer.
+    pub async fn compaction_finish_frozen_history_held(
+        &self,
+        workspace: &str,
+        owner: &str,
+        descriptor: &FrozenHistoryRef,
+    ) -> Result<crate::FrozenReadHold> {
+        self.run_serialized_write(|| async {
+            use sea_orm::TransactionTrait;
+            let tx = self.connection.begin().await?;
+            anyhow::ensure!(
+                repositories::compaction::frozen::compaction_finish_frozen_history(
+                    &tx, workspace, owner, descriptor
+                )
+                .await?,
+                "frozen history publication failed"
+            );
+            crate::frozen_lifetime::exact_header(&tx, workspace, descriptor).await?;
+            let hold =
+                crate::FrozenReadHold::register(&self.frozen_readers, &descriptor.manifest_id);
+            tx.commit().await?;
+            Ok(hold)
+        })
         .await
     }
     pub async fn compaction_frozen_history_owner(
@@ -1430,8 +1456,12 @@ impl CrudStore {
             .await?;
         Ok((messages, imports))
     }
-    pub async fn compact_frozen_storage_quantum(&self) -> Result<bool> {
-        repositories::compaction_frozen_storage::maintain(&self.with_maintenance_access()).await
+    pub async fn compact_frozen_storage_quantum(
+        &self,
+        progress: &mut crate::FrozenStorageLifetimeProgress,
+    ) -> Result<bool> {
+        repositories::compaction_frozen_storage::maintain(&self.with_maintenance_access(), progress)
+            .await
     }
 }
 

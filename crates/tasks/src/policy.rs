@@ -39,6 +39,8 @@ pub struct TaskAgentAuthorizationGrantSeed {
 
 #[derive(Debug, Clone, Default)]
 pub struct TaskCreateContext {
+    /// Capture handoff until the atomic Task/root commit; no database capacity.
+    pub conversation_frozen_hold: Option<Arc<pioneer_crud::FrozenReadHold>>,
     pub actor_id: Option<String>,
     /// When an already-running agent creates a Task, this immutable snapshot
     /// is copied from its execution-bound action binding. Human/System task

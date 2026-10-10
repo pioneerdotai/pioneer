@@ -2214,6 +2214,9 @@ impl TaskService {
                 agent_action: context.agent_action_commit,
             })
             .await?;
+        // The atomic Task/snapshot commit is now the durable root. Release
+        // capture handoff before notification and immediate executor work.
+        drop(context.conversation_frozen_hold);
         self.publish_and_wake(appended).await;
         if let Some(run) = immediate_run {
             self.process_queued_run_once(run).await?;

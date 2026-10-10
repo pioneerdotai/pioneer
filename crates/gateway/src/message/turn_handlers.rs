@@ -672,6 +672,7 @@ struct PreparedCliRuntimeCombinedPreflight {
 }
 
 struct PreparedCliRuntimeDelivery {
+    frozen_hold: Option<pioneer_crud::FrozenReadHold>,
     plan: pioneer_promt::CompiledInstructionDeliveryPlan,
     sent_context_basis: Option<crate::cli_runtime::thread_binding::CliRuntimeSentContextBasis>,
 }
@@ -6047,6 +6048,7 @@ impl MessageProcessor {
                 .map(|skill| skill.install_name.clone())
                 .collect::<Vec<_>>();
             let PreparedCliRuntimeDelivery {
+                frozen_hold: cli_basis_hold,
                 plan: delivery_plan,
                 sent_context_basis,
             } = match self
@@ -6514,6 +6516,8 @@ impl MessageProcessor {
                 ));
                 return;
             }
+            // Sent mapping is now the durable root; provider awaits need no temporary pin.
+            drop(cli_basis_hold);
             let native_turn_input = match serde_json::to_value(&input_mapping.input) {
                 Ok(input) => input,
                 Err(error) => {
@@ -9089,6 +9093,12 @@ impl MessageProcessor {
                     });
                     (None, basis, None)
                 };
+            let continuity_hold = if accepted_projection.is_none() {
+                if let Some(sent) = &sent_context_basis {
+                    crate::compaction::frozen::acquire_history_json(self.crud_store.as_ref(),
+                        outcome.started_notification.workspace_id.as_str(), &sent.completed.history_json).await?
+                } else { None }
+            } else { None };
             if continuation_thread_id != outcome.started_notification.thread_id
                 && let Some(sent) = sent_context_basis.as_mut()
             {
@@ -9260,6 +9270,7 @@ impl MessageProcessor {
                 return Err(error);
             }
             Ok(PreparedCliRuntimeDelivery {
+                frozen_hold: accepted_projection.as_mut().and_then(|prepared| prepared.frozen_hold.take()).or(continuity_hold),
                 plan,
                 sent_context_basis,
             })

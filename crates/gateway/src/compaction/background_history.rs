@@ -248,6 +248,7 @@ pub(crate) async fn prepare_completed_history_owned(
             }
         };
         let super::frozen::PreparedHistory {
+            frozen_hold: _frozen_hold,
             descriptor,
             mut messages,
             accepted_scopes: allowed,

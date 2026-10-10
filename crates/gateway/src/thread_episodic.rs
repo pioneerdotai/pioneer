@@ -15654,7 +15654,7 @@ mod tests {
                     workspace_id: workspace_id.clone(),
                     conversation_thread_id: parent_thread_id.to_owned(),
                     source_turn_id: Some(parent_turn_id.to_owned()),
-                    history_json: "{}".to_owned(),
+                    history_json: "[]".to_owned(),
                     created_at: fixed_datetime_from_unix(1_700_000_000),
                 },
             )

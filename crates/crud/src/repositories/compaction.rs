@@ -32,10 +32,7 @@ pub use history::{
     TaskInputCopyAlias, event_projection_metadata,
 };
 pub use lifecycle::PreparedCompactionLifecycle;
-use pioneer_compaction::{
-    Checkpoint, FORMAT_VERSION, OperationSnapshot, SourceRef,
-    frozen::{FrozenEventInputRole, FrozenMessageRef},
-};
+use pioneer_compaction::{Checkpoint, FORMAT_VERSION, OperationSnapshot, SourceRef};
 use pioneer_entity::{
     compaction_checkpoint, compaction_context, compaction_coverage, compaction_event_revision,
     compaction_execution_stop, compaction_input_revision, compaction_item_revision,
@@ -1503,6 +1500,7 @@ pub(crate) async fn compaction_save_candidate(
     let selection = serde_json::to_string(&checkpoint.selection)?;
     let identity = checkpoint_identity(checkpoint)?;
     let projection = i64::try_from(checkpoint.projection_version)?;
+    let raw_ownership = super::checkpoint_proofs::prepare_raw_ownership(store, checkpoint).await?;
     let coverage: Vec<_> = checkpoint
         .coverage
         .iter()
@@ -1536,7 +1534,11 @@ pub(crate) async fn compaction_save_candidate(
                 .one(&txn)
                 .await?;
             ensure!(running.is_some(), "operation is not running");
+            if let Some(rows) = &raw_ownership {
+                super::checkpoint_proofs::write_raw_ownership(&txn, checkpoint, rows).await?;
+            }
             compaction_checkpoint::Entity::insert(compaction_checkpoint::ActiveModel {
+                proof_version: sea_orm::Set(0),
                 id: sea_orm::Set((checkpoint.id.clone()).to_owned()),
                 operation_id: sea_orm::Set((checkpoint.operation_id.clone()).to_owned()),
                 owner: sea_orm::Set((checkpoint.owner.clone()).to_owned()),
@@ -1609,81 +1611,366 @@ pub(crate) async fn compaction_save_candidate(
         .await
 }
 
+// These existing reader-predicate fixtures intentionally model corrupt legacy
+// headers that predate the complete-identity guard. Seed that historical state
+// atomically and restore the exact production DDL before any repository read;
+// no production transition or race fixture runs with a weakened guard.
+#[cfg(test)]
+pub(super) async fn seed_legacy_frozen_header(db: &pioneer_sqlite::SqliteDatabase, sql: &str) {
+    let ddl: String = db.query_one_raw(sqlite_specific_sql(
+        "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='frozen_complete_identity'", []))
+        .await.unwrap().unwrap().try_get("", "sql").unwrap();
+    let tx = db.begin().await.unwrap();
+    tx.execute_unprepared("DROP TRIGGER frozen_complete_identity")
+        .await
+        .unwrap();
+    tx.execute_unprepared(sql).await.unwrap();
+    tx.execute_unprepared(&ddl).await.unwrap();
+    tx.commit().await.unwrap();
+}
+
+/// One keyset page, with the byte gate in the payload statement. The cursor
+/// includes the full coverage identity (scope/id/version). Ownership is grouped
+/// by that same identity only after indexed extrema prove one exact thread.
+/// A full checkpoint retains its historical domain bound, not a page byte cap.
+pub(super) struct CheckpointTopologyRead {
+    pub row: CheckpointEdgesRow,
+    coverage: std::collections::BTreeSet<SourceRef>,
+    ownership: std::collections::BTreeMap<SourceRef, std::collections::BTreeSet<String>>,
+    after: Option<SourceRef>,
+    reading_ownership: bool,
+    pub done: bool,
+    // At most one open -> closed restart. Replayed pages must agree with
+    // every previously observed key/owner before accepting the frozen set.
+    observed: Option<Box<CheckpointTopologyRead>>,
+}
+impl CheckpointTopologyRead {
+    pub async fn new<C: ConnectionTrait>(db: &C, id: &str) -> Result<Option<Self>> {
+        Ok(checkpoint_row(db, id).await?.map(|row| Self {
+            row,
+            coverage: Default::default(),
+            ownership: Default::default(),
+            after: None,
+            reading_ownership: false,
+            done: false,
+            observed: None,
+        }))
+    }
+    pub async fn step<C: ConnectionTrait>(&mut self, db: &C) -> Result<()> {
+        if self.done {
+            return Ok(());
+        }
+        #[cfg(test)]
+        super::compaction_runner::record_proof_preparation_check(&self.row.operation_id, true);
+        if self.refresh(db).await? {
+            return Ok(());
+        }
+        let rows = db.query_all_raw(self.page_statement()?).await?;
+        // Close can occur during the payload statement, including its EOF.
+        // Discard that page and restart before exposing a mixed result.
+        if self.refresh(db).await? {
+            return Ok(());
+        }
+        // The NULL row distinguishes an exhausted page from an oversized first
+        // record without ever returning that record's strings to the process.
+        let first = rows
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("topology page missing size sentinel"))?;
+        let count: i64 = first.try_get("", "n")?;
+        ensure!(
+            first.try_get::<i64>("", "invalid")? == 0,
+            "checkpoint coverage lost or has ambiguous historical manifest ownership"
+        );
+        if first
+            .try_get::<Option<String>>("", "source_scope")?
+            .is_none()
+        {
+            ensure!(
+                count == 0,
+                "checkpoint single topology record exceeds byte quantum"
+            );
+            if let Some(observed) = &self.observed {
+                ensure!(
+                    if self.reading_ownership {
+                        observed.ownership.is_empty()
+                    } else {
+                        observed.coverage.is_empty()
+                    },
+                    "checkpoint lost previously observed topology at close"
+                );
+            }
+            if !self.reading_ownership {
+                self.reading_ownership = true;
+                self.after = None;
+            } else {
+                ensure!(
+                    self.ownership.keys().eq(self.coverage.iter())
+                        && self.ownership.values().all(|owners| owners.len() == 1),
+                    "checkpoint coverage lost its historical manifest ownership"
+                );
+                self.done = true;
+            }
+            return Ok(());
+        }
+        let page_rows = rows.len();
+        let mut loaded = 0_usize;
+        for item in rows {
+            let source = SourceRef {
+                scope: item.try_get("", "source_scope")?,
+                id: item.try_get("", "source_id")?,
+                version: item.try_get("", "source_version")?,
+            };
+            let thread: String = item.try_get("", "source_thread")?;
+            loaded += source.scope.len() + source.id.len() + source.version.len() + thread.len();
+            ensure!(
+                !source.scope.is_empty() && !source.id.is_empty() && !source.version.is_empty(),
+                "invalid checkpoint coverage identity"
+            );
+            if let Some(observed) = &mut self.observed {
+                if self.reading_ownership {
+                    // Ownership observations precede the original full cursor.
+                    if observed.after.as_ref().is_some_and(|last| &source <= last)
+                        && observed.reading_ownership
+                    {
+                        ensure!(
+                            observed.ownership.remove(&source)
+                                == Some(std::collections::BTreeSet::from([thread.clone()])),
+                            "checkpoint historical owner changed at close"
+                        );
+                    }
+                } else if observed.reading_ownership
+                    || observed.coverage.last().is_some_and(|last| &source <= last)
+                {
+                    ensure!(
+                        observed.coverage.remove(&source),
+                        "checkpoint coverage changed at close"
+                    );
+                }
+            }
+            if self.reading_ownership {
+                ensure!(!thread.is_empty(), "invalid historical source thread");
+                let owners = self.ownership.entry(source.clone()).or_default();
+                owners.insert(thread.clone());
+                ensure!(owners.len() == 1, "ambiguous historical manifest ownership");
+            } else {
+                ensure!(
+                    self.coverage.insert(source.clone()),
+                    "duplicate checkpoint coverage identity"
+                );
+            }
+            ensure!(
+                self.coverage.len() <= CHECKPOINT_SOURCE_LIMIT
+                    && self.ownership.len() <= CHECKPOINT_SOURCE_LIMIT,
+                "checkpoint exceeds supported source domain"
+            );
+            self.after = Some(source);
+        }
+        ensure!(
+            page_rows <= SOURCE_PAGE_ROWS as usize && loaded <= SOURCE_PAGE_BYTES,
+            "topology SQL page exceeded its payload quantum"
+        );
+        #[cfg(test)]
+        super::compaction_runner::record_topology_page(&self.row.operation_id, page_rows, loaded);
+        Ok(())
+    }
+    async fn refresh<C: ConnectionTrait>(&mut self, db: &C) -> Result<bool> {
+        let current = refresh_checkpoint_row(db, &self.row).await?;
+        if self.row.coverage_closed == 0 && current.coverage_closed == 1 {
+            ensure!(self.observed.is_none(), "repeated checkpoint close");
+            let old = std::mem::replace(
+                self,
+                Self {
+                    row: current,
+                    coverage: Default::default(),
+                    ownership: Default::default(),
+                    after: None,
+                    reading_ownership: false,
+                    done: false,
+                    observed: None,
+                },
+            );
+            self.observed = Some(Box::new(old));
+            return Ok(true);
+        }
+        self.row = current;
+        Ok(false)
+    }
+
+    pub(super) fn page_statement(&self) -> Result<Statement> {
+        let (scope, id, version) = self
+            .after
+            .as_ref()
+            .map(|s| (s.scope.clone(), s.id.clone(), s.version.clone()))
+            .unwrap_or_default();
+        // Seek coverage keys first, before ownership lookup. Two indexed
+        // thread extrema prove the sole owner, including duplicates at other
+        // ordinals, without a checkpoint-wide DISTINCT join or sort.
+        let range = if self.after.is_some() {
+            "AND (source_scope,source_id,source_version)>(?3,?4,?5)"
+        } else {
+            ""
+        };
+        let coverage = format!(
+            "SELECT source_scope,source_id,source_version FROM compaction_coverage WHERE checkpoint_id=?1 {range} ORDER BY source_scope,source_id,source_version LIMIT ?6"
+        );
+        let owner = |descending: bool| {
+            format!(
+                "(SELECT m.source_thread FROM compaction_manifest m WHERE m.operation_id=?2 AND m.reference_only=0 AND m.source_scope=v.source_scope AND m.source_id=v.source_id AND m.source_version=v.source_version ORDER BY m.source_thread {} LIMIT 1)",
+                if descending { "DESC" } else { "ASC" }
+            )
+        };
+        let ownership = if self.reading_ownership {
+            format!(
+                "SELECT v.*,{0} AS source_thread,{1} AS last_thread FROM coverage_page v",
+                owner(false),
+                owner(true)
+            )
+        } else {
+            "SELECT v.*,'' AS source_thread,'' AS last_thread FROM coverage_page v".into()
+        };
+        let sql = format!(
+            "WITH coverage_page AS MATERIALIZED ({coverage}), owners AS MATERIALIZED ({ownership}), page AS MATERIALIZED (SELECT *,length(CAST(source_scope AS BLOB))+length(CAST(source_id AS BLOB))+length(CAST(source_version AS BLOB))+length(CAST(source_thread AS BLOB)) AS bytes FROM owners), budget AS (SELECT *,sum(bytes) OVER (ORDER BY source_scope,source_id,source_version,source_thread ROWS UNBOUNDED PRECEDING) AS used FROM page), stats AS (SELECT count(*) AS n,COALESCE(sum(source_thread IS NULL OR last_thread IS NULL OR source_thread<>last_thread),0) AS invalid FROM page) SELECT b.source_scope,b.source_id,b.source_version,b.source_thread,stats.n,stats.invalid FROM stats LEFT JOIN budget b ON stats.invalid=0 AND b.used<=?7 ORDER BY b.source_scope,b.source_id,b.source_version,b.source_thread"
+        );
+        Ok(sqlite_specific_sql(
+            &sql,
+            vec![
+                self.row.id.clone().into(),
+                self.row.operation_id.clone().into(),
+                scope.into(),
+                id.into(),
+                version.into(),
+                SOURCE_PAGE_ROWS.into(),
+                i64::try_from(SOURCE_PAGE_BYTES)?.into(),
+            ],
+        ))
+    }
+    pub fn finish(self) -> Result<CheckpointTopology> {
+        ensure!(self.done, "checkpoint topology read incomplete");
+        Ok(CheckpointTopology {
+            row: self.row,
+            ownership: self.ownership,
+        })
+    }
+}
+
 async fn checkpoint_coverage<C: ConnectionTrait>(db: &C, id: &str) -> Result<Vec<SourceRef>> {
-    use sea_orm::{ColumnTrait, QueryOrder, QuerySelect};
-    let rows = compaction_coverage::Entity::find()
-        .select_only()
-        .column(compaction_coverage::Column::SourceScope)
-        .column(compaction_coverage::Column::SourceId)
-        .column(compaction_coverage::Column::SourceVersion)
-        .filter(compaction_coverage::Column::CheckpointId.eq(id))
-        .order_by_asc(compaction_coverage::Column::SourceScope)
-        .order_by_asc(compaction_coverage::Column::SourceId)
-        .limit(CHECKPOINT_SOURCE_LIMIT as u64 + 1)
-        .into_tuple::<(String, String, String)>()
-        .all(db)
-        .await?;
-    ensure!(
-        rows.len() <= CHECKPOINT_SOURCE_LIMIT,
-        "checkpoint coverage exceeds supported quantum"
-    );
-    Ok(rows
-        .into_iter()
-        .map(|(scope, id, version)| SourceRef { scope, id, version })
-        .collect())
+    let mut read = CheckpointTopologyRead::new(db, id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("checkpoint coverage identity missing"))?;
+    // Coverage-only callers do not need manifest ownership. Each read releases
+    // capacity; maintenance uses step directly instead of this foreground loop.
+    while !read.reading_ownership {
+        read.step(db).await?;
+    }
+    Ok(read.coverage.into_iter().collect())
 }
 
 /// Coverage discovery must not read summary text before source authorization.
+#[derive(Clone)]
+pub(super) struct CheckpointTopology {
+    pub row: CheckpointEdgesRow,
+    pub ownership: std::collections::BTreeMap<SourceRef, std::collections::BTreeSet<String>>,
+}
+
+pub(super) async fn checkpoint_row<C: ConnectionTrait>(
+    db: &C,
+    id: &str,
+) -> Result<Option<CheckpointEdgesRow>> {
+    CheckpointEdgesRow::find_by_statement(sqlite_specific_sql(
+        "SELECT p.id,p.proof_version,(p.portion<o.next_portion) AS coverage_closed,p.status,p.owner,c.workspace_id,c.thread_id,p.identity_sha256,p.previous,p.format_version,p.operation_id,projection.manifest_id FROM compaction_checkpoint p JOIN compaction_operation o ON o.id=p.operation_id AND o.owner=p.owner JOIN compaction_context c ON c.owner=p.owner LEFT JOIN compaction_operation_projection projection ON projection.operation_id=p.operation_id WHERE p.id=? LIMIT 1",[id.into()])).one(db).await.map_err(Into::into)
+}
+
+/// Only close and seal may advance this reader observation. Status remains
+/// exact: publication/Stop is a control transition, not an identity refresh.
+/// The closed portion guards the full coverage and selected ownership set.
+pub(super) async fn refresh_checkpoint_row<C: ConnectionTrait>(
+    db: &C,
+    observed: &CheckpointEdgesRow,
+) -> Result<CheckpointEdgesRow> {
+    let current = checkpoint_row(db, &observed.id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("checkpoint identity disappeared during read"))?;
+    ensure!(
+        matches!(observed.proof_version, 0 | 1)
+            && matches!(current.proof_version, 0 | 1)
+            && matches!(observed.coverage_closed, 0 | 1)
+            && matches!(current.coverage_closed, 0 | 1)
+            && current.proof_version >= observed.proof_version
+            && current.coverage_closed >= observed.coverage_closed
+            && (current.proof_version == 0 || current.coverage_closed == 1),
+        "unsupported or regressed checkpoint readiness"
+    );
+    let mut identity = current.clone();
+    identity.proof_version = observed.proof_version;
+    identity.coverage_closed = observed.coverage_closed;
+    ensure!(
+        identity == *observed,
+        "checkpoint identity changed between topology pages"
+    );
+    Ok(current)
+}
+
+/// Reverse readers need exactly one dependency's ownership, not every source.
+pub(super) async fn checkpoint_source_owner<C: ConnectionTrait>(
+    db: &C,
+    row: &CheckpointEdgesRow,
+    source: &SourceRef,
+) -> Result<String> {
+    let owner = |descending: bool| {
+        format!(
+            "(SELECT m.source_thread FROM compaction_manifest m WHERE m.operation_id=?2 AND m.reference_only=0 AND m.source_scope=?3 AND m.source_id=?4 AND m.source_version=?5 ORDER BY m.source_thread {} LIMIT 1)",
+            if descending { "DESC" } else { "ASC" }
+        )
+    };
+    let sql = format!(
+        "WITH owners AS MATERIALIZED (SELECT {} AS first,{} AS last WHERE EXISTS(SELECT 1 FROM compaction_coverage WHERE checkpoint_id=?1 AND source_scope=?3 AND source_id=?4 AND source_version=?5)) SELECT first AS source_thread FROM owners WHERE first=last AND length(CAST(first AS BLOB)) BETWEEN 1 AND ?6",
+        owner(false),
+        owner(true)
+    );
+    let item = db
+        .query_one_raw(sqlite_specific_sql(
+            &sql,
+            [
+                row.id.clone().into(),
+                row.operation_id.clone().into(),
+                source.scope.clone().into(),
+                source.id.clone().into(),
+                source.version.clone().into(),
+                i64::try_from(SOURCE_PAGE_BYTES)?.into(),
+            ],
+        ))
+        .await?
+        .ok_or_else(|| {
+            anyhow::anyhow!("missing, ambiguous or oversized historical source owner")
+        })?;
+    Ok(item.try_get("", "source_thread")?)
+}
+
+/// Historical coverage and ownership lookup does not read frozen input bytes.
+pub(super) async fn checkpoint_topology<C: ConnectionTrait>(
+    db: &C,
+    id: &str,
+) -> Result<Option<CheckpointTopology>> {
+    let Some(mut read) = CheckpointTopologyRead::new(db, id).await? else {
+        return Ok(None);
+    };
+    while !read.done {
+        read.step(db).await?;
+    }
+    Ok(Some(read.finish()?))
+}
+
 pub(crate) async fn compaction_checkpoint_edges(
-    db: &pioneer_sqlite::SqliteDatabase,
+    store: &CrudStore,
     id: &str,
 ) -> Result<Option<CheckpointEdges>> {
-    let Some(row) = CheckpointEdgesRow::find_by_statement(sqlite_specific_sql(
-        "SELECT p.owner,c.workspace_id,c.thread_id,p.identity_sha256,p.previous,p.format_version,p.operation_id,projection.manifest_id FROM compaction_checkpoint p JOIN compaction_context c ON c.owner=p.owner LEFT JOIN compaction_operation_projection projection ON projection.operation_id=p.operation_id WHERE p.id=? LIMIT 1",
-        [id.into()],
-    ))
-    .one(db)
-    .await?
+    let Some(CheckpointTopology { row, ownership }) =
+        checkpoint_topology(&store.connection, id).await?
     else {
         return Ok(None);
     };
-    let coverage = HistoricalCoverageRow::find_by_statement(sqlite_specific_sql(
-        "SELECT DISTINCT v.source_scope,v.source_id,v.source_version,m.source_thread FROM compaction_coverage v JOIN compaction_manifest m ON m.operation_id=? AND m.reference_only=0 AND m.source_scope=v.source_scope AND m.source_id=v.source_id AND m.source_version=v.source_version WHERE v.checkpoint_id=? ORDER BY v.source_scope,v.source_id,m.source_thread LIMIT ?",
-        [
-            row.operation_id.clone().into(),
-            id.into(),
-            i64::try_from(CHECKPOINT_SOURCE_LIMIT + 1)?.into(),
-        ],
-    ))
-    .all(db)
-    .await?;
-    let exact_coverage = checkpoint_coverage(db, id).await?;
-    let exact_coverage = exact_coverage
-        .into_iter()
-        .collect::<std::collections::BTreeSet<_>>();
-    let mut ownership =
-        std::collections::BTreeMap::<SourceRef, std::collections::BTreeSet<String>>::new();
-    for covered in coverage {
-        ownership
-            .entry(SourceRef {
-                scope: covered.source_scope,
-                id: covered.source_id,
-                version: covered.source_version,
-            })
-            .or_default()
-            .insert(covered.source_thread);
-    }
-    ensure!(
-        ownership
-            .keys()
-            .cloned()
-            .collect::<std::collections::BTreeSet<_>>()
-            == exact_coverage
-            && ownership.values().all(|threads| threads.len() == 1),
-        "checkpoint coverage lost its historical manifest ownership"
-    );
     let (replay_aliases, event_input_evidence) =
-        checkpoint_projection_metadata(db, &row, &ownership).await?;
+        checkpoint_projection_metadata(store, &row, &ownership).await?;
     Ok(Some(CheckpointEdges {
         owner: row.owner,
         workspace_id: row.workspace_id,
@@ -1737,46 +2024,43 @@ pub(crate) async fn compaction_checkpoint_edges(
     }))
 }
 
-#[derive(FromQueryResult)]
-struct CheckpointEdgesRow {
-    owner: String,
-    workspace_id: String,
-    thread_id: String,
-    identity_sha256: String,
-    previous: Option<String>,
-    format_version: i64,
-    operation_id: String,
-    manifest_id: Option<String>,
+#[derive(Clone, Debug, PartialEq, Eq, FromQueryResult)]
+pub(super) struct CheckpointEdgesRow {
+    pub id: String,
+    pub proof_version: i64,
+    /// Existing portion boundary; prevents a legacy repair mixing read pages.
+    pub coverage_closed: i64,
+    pub status: String,
+    pub owner: String,
+    pub workspace_id: String,
+    pub thread_id: String,
+    pub identity_sha256: String,
+    pub previous: Option<String>,
+    pub format_version: i64,
+    pub operation_id: String,
+    pub manifest_id: Option<String>,
 }
 
-#[derive(FromQueryResult)]
-struct HistoricalCoverageRow {
-    source_scope: String,
-    source_id: String,
-    source_version: String,
-    source_thread: String,
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+pub(super) struct HistoricalReplayAliasRow {
+    pub covered_thread: String,
+    pub replay_thread: String,
+    pub covered_scope: String,
+    pub covered_id: String,
+    pub covered_version: String,
+    pub replay_scope: String,
+    pub replay_id: String,
+    pub replay_version: String,
+    pub tool_item_id: Option<String>,
 }
 
-#[derive(PartialEq, Eq, PartialOrd, Ord)]
-struct HistoricalReplayAliasRow {
-    covered_thread: String,
-    replay_thread: String,
-    covered_scope: String,
-    covered_id: String,
-    covered_version: String,
-    replay_scope: String,
-    replay_id: String,
-    replay_version: String,
-    tool_item_id: Option<String>,
-}
-
-#[derive(PartialEq, Eq, PartialOrd, Ord)]
-struct HistoricalEventInputEvidenceRow {
-    source_thread: String,
-    source_scope: String,
-    source_id: String,
-    source_version: String,
-    role: String,
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+pub(super) struct HistoricalEventInputEvidenceRow {
+    pub source_thread: String,
+    pub source_scope: String,
+    pub source_id: String,
+    pub source_version: String,
+    pub role: String,
 }
 
 // Published operation projections and their logical frozen messages are immutable.
@@ -1786,175 +2070,70 @@ struct HistoricalEventInputEvidenceRow {
 // query stream spans pages: reader capacity is released before references are decoded and
 // the next page is requested.
 async fn checkpoint_projection_metadata(
-    db: &pioneer_sqlite::SqliteDatabase,
+    store: &CrudStore,
     checkpoint_row: &CheckpointEdgesRow,
     ownership: &std::collections::BTreeMap<SourceRef, std::collections::BTreeSet<String>>,
 ) -> Result<(
     Vec<HistoricalReplayAliasRow>,
     Vec<HistoricalEventInputEvidenceRow>,
 )> {
-    let Some(manifest) = checkpoint_row.manifest_id.as_deref() else {
-        return Ok((Vec::new(), Vec::new()));
+    let mut scan = match super::checkpoint_proofs::OriginScan::new(
+        store,
+        checkpoint_row.clone(),
+        ownership.clone(),
+    )
+    .await?
+    {
+        super::checkpoint_proofs::OriginRead::Legacy(scan) => scan,
+        super::checkpoint_proofs::OriginRead::Permanent(topology) => {
+            let current = refresh_metadata_topology(store, checkpoint_row, ownership).await?;
+            ensure!(
+                current == topology.row,
+                "checkpoint changed before permanent metadata"
+            );
+            let metadata = super::checkpoint_proofs::permanent_metadata(
+                store,
+                topology.row,
+                topology.ownership,
+            )
+            .await?;
+            return Ok((
+                metadata.aliases.into_iter().collect(),
+                metadata.events.into_iter().collect(),
+            ));
+        }
     };
-    let mut aliases = std::collections::BTreeSet::new();
-    let mut evidence = std::collections::BTreeSet::new();
-    let mut start = 0_i64;
-    loop {
-        let sizes = db
-            .query_all_raw(checkpoint_projection_page_sizes_statement(manifest, start))
-            .await?;
-        if sizes.is_empty() {
-            break;
-        }
-        let mut end = start;
-        let mut bytes = 0_usize;
-        for size in sizes {
-            let ordinal: i64 = size.try_get("", "ordinal")?;
-            let size: i64 = size.try_get("", "bytes")?;
-            ensure!(
-                (0..=SOURCE_PAGE_BYTES as i64).contains(&size),
-                "invalid frozen reference size"
-            );
-            if bytes + size as usize > SOURCE_PAGE_BYTES {
-                break;
-            }
-            ensure!(ordinal == end, "frozen history ordinal gap");
-            bytes += size as usize;
-            end = ordinal
-                .checked_add(1)
-                .ok_or_else(|| anyhow::anyhow!("frozen ordinal overflow"))?;
-        }
-        ensure!(
-            end > start,
-            "frozen projection metadata page made no progress"
-        );
-        let rows = db
-            .query_all_raw(checkpoint_projection_page_statement(manifest, start, end))
-            .await?;
-        #[cfg(test)]
-        checkpoint_projection_page_test_pause(db, manifest).await;
-        ensure!(
-            rows.len() <= SOURCE_PAGE_ROWS as usize,
-            "frozen projection metadata page exceeds row quantum"
-        );
-        let mut loaded_bytes = 0_usize;
-        let mut expected = start;
-        for row in rows {
-            let ordinal: i64 = row.try_get("", "ordinal")?;
-            let json: String = row.try_get("", "reference_json")?;
-            let row_bytes: i64 = row.try_get("", "bytes")?;
-            ensure!(ordinal == expected, "frozen history ordinal gap");
-            ensure!(
-                row_bytes >= 0 && json.len() <= row_bytes as usize,
-                "invalid frozen reference size"
-            );
-            loaded_bytes = loaded_bytes
-                .checked_add(row_bytes as usize)
-                .ok_or_else(|| anyhow::anyhow!("frozen reference byte count overflow"))?;
-            ensure!(
-                loaded_bytes <= SOURCE_PAGE_BYTES,
-                "frozen projection metadata page exceeds byte quantum"
-            );
-            expected += 1;
-
-            // Decode only after the bounded query has released its reader reservation.
-            let reference: FrozenMessageRef = serde_json::from_str(&json)?;
-            reference.validate()?;
-            let selected_sources = reference
-                .sources
-                .iter()
-                .filter(|source| {
-                    ownership.get(*source).is_some_and(|threads| {
-                        threads.len() == 1 && threads.contains(&reference.source_thread)
-                    })
-                })
-                .collect::<Vec<_>>();
-            for source in selected_sources {
-                for edge in reference.publication_edges_for(source) {
-                    aliases.insert(HistoricalReplayAliasRow {
-                        covered_thread: edge.covered_thread,
-                        replay_thread: edge.replay_thread,
-                        covered_scope: edge.covered.scope,
-                        covered_id: edge.covered.id,
-                        covered_version: edge.covered.version,
-                        replay_scope: edge.replay.scope,
-                        replay_id: edge.replay.id,
-                        replay_version: edge.replay.version,
-                        tool_item_id: edge.tool_item_id,
-                    });
-                }
-            }
-            if reference.sources.len() == 1
-                && let Some(role) = reference.event_input_role
-            {
-                let source = &reference.sources[0];
-                if ownership.get(source).is_some_and(|threads| {
-                    threads.len() == 1 && threads.contains(&reference.source_thread)
-                }) {
-                    evidence.insert(HistoricalEventInputEvidenceRow {
-                        source_thread: reference.source_thread.clone(),
-                        source_scope: source.scope.clone(),
-                        source_id: source.id.clone(),
-                        source_version: source.version.clone(),
-                        role: match role {
-                            FrozenEventInputRole::Authoritative => "authoritative",
-                            FrozenEventInputRole::Deleted => "deleted",
-                            FrozenEventInputRole::InputCopy => "input_copy",
-                        }
-                        .to_owned(),
-                    });
-                }
-            }
-        }
-        ensure!(
-            expected == end,
-            "frozen projection metadata page is incomplete"
-        );
-        ensure!(
-            aliases.len() <= CHECKPOINT_SOURCE_LIMIT,
-            "checkpoint replay aliases exceed supported quantum"
-        );
-        ensure!(
-            evidence.len() <= CHECKPOINT_SOURCE_LIMIT,
-            "checkpoint event-input evidence exceeds supported quantum"
-        );
-        #[cfg(test)]
-        record_checkpoint_projection_page_test_read(
-            db,
-            manifest,
-            start,
-            end,
-            usize::try_from(end - start)?,
-            loaded_bytes,
-        );
-        start = end;
+    while !scan.done() {
+        scan.step(store).await?;
     }
-    let mut aliases = aliases.into_iter().collect::<Vec<_>>();
-    aliases.sort_by(|left, right| {
-        (&left.replay_scope, &left.replay_id, &left.replay_thread).cmp(&(
-            &right.replay_scope,
-            &right.replay_id,
-            &right.replay_thread,
-        ))
-    });
-    let mut evidence = evidence.into_iter().collect::<Vec<_>>();
-    evidence.sort_by(|left, right| {
-        (
-            &left.source_scope,
-            &left.source_id,
-            &left.source_thread,
-            &left.source_version,
-            &left.role,
-        )
-            .cmp(&(
-                &right.source_scope,
-                &right.source_id,
-                &right.source_thread,
-                &right.source_version,
-                &right.role,
-            ))
-    });
-    Ok((aliases, evidence))
+    refresh_metadata_topology(store, checkpoint_row, ownership).await?;
+    Ok((
+        scan.metadata.aliases.into_iter().collect(),
+        scan.metadata.events.into_iter().collect(),
+    ))
+}
+
+// Foreground only: a close after topology EOF/acquire must not promote an open
+// observation into authoritative sealed ownership. Recheck the exact frozen set
+// in released-capacity pages. GraphPreparation already closes before its scan.
+async fn refresh_metadata_topology(
+    store: &CrudStore,
+    observed: &CheckpointEdgesRow,
+    ownership: &std::collections::BTreeMap<SourceRef, std::collections::BTreeSet<String>>,
+) -> Result<CheckpointEdgesRow> {
+    let current = refresh_checkpoint_row(&store.connection, observed).await?;
+    if observed.coverage_closed == 0 && current.coverage_closed == 1 {
+        let frozen = checkpoint_topology(&store.connection, &current.id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("closed checkpoint disappeared"))?;
+        let latest = refresh_checkpoint_row(&store.connection, &current).await?;
+        ensure!(
+            frozen.ownership == *ownership,
+            "checkpoint historical topology changed after close"
+        );
+        return Ok(latest);
+    }
+    Ok(current)
 }
 
 #[cfg(test)]
@@ -2053,7 +2232,7 @@ fn checkpoint_projection_page_test_observers() -> &'static CheckpointProjectionP
 }
 
 #[cfg(test)]
-fn record_checkpoint_projection_page_test_read(
+pub(super) fn record_checkpoint_projection_page_test_read(
     database: &pioneer_sqlite::SqliteDatabase,
     manifest: &str,
     start: i64,
@@ -2194,7 +2373,8 @@ pub(super) async fn checkpoint_projection_page_test_pause(
 pub(super) fn checkpoint_projection_page_sizes_statement(manifest: &str, start: i64) -> Statement {
     sqlite_specific_sql(
         "SELECT d.ordinal,d.bytes FROM compaction_frozen_message_data d \
-         WHERE d.manifest_id=? AND d.ordinal>=? \
+         JOIN compaction_frozen_history h ON h.id=d.manifest_id \
+         WHERE h.expired=0 AND h.ready=1 AND h.message_count>=0 AND h.import_count>=0 AND h.next_ordinal=h.message_count AND h.next_import=h.import_count AND d.ordinal>=0 AND d.ordinal<h.message_count AND d.manifest_id=? AND d.ordinal>=? \
            AND NOT EXISTS (SELECT 1 FROM compaction_frozen_layout l \
                            WHERE l.manifest_id=d.manifest_id AND l.kind=0 AND l.active=1) \
          UNION ALL \
@@ -2203,7 +2383,8 @@ pub(super) fn checkpoint_projection_page_sizes_statement(manifest: &str, start: 
            ON d.manifest_id=s.source_manifest AND d.ordinal>=s.start AND d.ordinal<s.end \
          JOIN compaction_frozen_layout l \
            ON l.manifest_id=s.manifest_id AND l.kind=s.kind AND l.active=1 \
-         WHERE s.manifest_id=? AND s.kind=0 AND d.ordinal>=? \
+         JOIN compaction_frozen_history h ON h.id=s.manifest_id \
+         WHERE h.expired=0 AND h.ready=1 AND h.message_count>=0 AND h.import_count>=0 AND h.next_ordinal=h.message_count AND h.next_import=h.import_count AND d.ordinal>=0 AND d.ordinal<h.message_count AND s.manifest_id=? AND s.kind=0 AND d.ordinal>=? \
          ORDER BY ordinal LIMIT ?",
         [
             manifest.into(),
@@ -2222,7 +2403,8 @@ pub(super) fn checkpoint_projection_page_statement(
 ) -> Statement {
     sqlite_specific_sql(
         "SELECT d.ordinal,d.reference_json,d.bytes FROM compaction_frozen_message_data d \
-         WHERE d.manifest_id=? AND d.ordinal>=? AND d.ordinal<? \
+         JOIN compaction_frozen_history h ON h.id=d.manifest_id \
+         WHERE h.expired=0 AND h.ready=1 AND h.message_count>=0 AND h.import_count>=0 AND h.next_ordinal=h.message_count AND h.next_import=h.import_count AND d.ordinal>=0 AND d.ordinal<h.message_count AND d.manifest_id=? AND d.ordinal>=? AND d.ordinal<? AND d.bytes BETWEEN 0 AND 262144 AND length(CAST(d.reference_json AS BLOB))=d.bytes \
            AND NOT EXISTS (SELECT 1 FROM compaction_frozen_layout l \
                            WHERE l.manifest_id=d.manifest_id AND l.kind=0 AND l.active=1) \
          UNION ALL \
@@ -2231,7 +2413,8 @@ pub(super) fn checkpoint_projection_page_statement(
            ON d.manifest_id=s.source_manifest AND d.ordinal>=s.start AND d.ordinal<s.end \
          JOIN compaction_frozen_layout l \
            ON l.manifest_id=s.manifest_id AND l.kind=s.kind AND l.active=1 \
-         WHERE s.manifest_id=? AND s.kind=0 AND d.ordinal>=? AND d.ordinal<? \
+         JOIN compaction_frozen_history h ON h.id=s.manifest_id \
+         WHERE h.expired=0 AND h.ready=1 AND h.message_count>=0 AND h.import_count>=0 AND h.next_ordinal=h.message_count AND h.next_import=h.import_count AND d.ordinal>=0 AND d.ordinal<h.message_count AND s.manifest_id=? AND s.kind=0 AND d.ordinal>=? AND d.ordinal<? AND d.bytes BETWEEN 0 AND 262144 AND length(CAST(d.reference_json AS BLOB))=d.bytes \
          ORDER BY ordinal",
         [
             manifest.into(),
@@ -2345,6 +2528,7 @@ pub(crate) async fn compaction_checkpoint_metadata<C: ConnectionTrait>(
         projection_version,
         format_version,
     )) = compaction_checkpoint::Entity::find_by_id(id)
+        .filter(Expr::cust("length(CAST(selection AS BLOB)) <= 262144"))
         .select_only()
         .column(compaction_checkpoint::Column::Id)
         .column(compaction_checkpoint::Column::OperationId)
@@ -2400,10 +2584,7 @@ pub(crate) async fn compaction_apply(
         ))
         .await?
         .is_some();
-    if has_projection {
-        super::compaction_runner::validate_publication_checkpoint_graph(store, &checkpoint.id)
-            .await?;
-    }
+    super::checkpoint_proofs::prepare_graph(store, &checkpoint.id).await?;
     ensure!(
         assertions.len() <= CHECKPOINT_SOURCE_LIMIT
             && assertions.iter().map(|s| s.payload.len()).sum::<usize>() <= SOURCE_PAGE_BYTES,
@@ -2422,6 +2603,7 @@ pub(crate) async fn compaction_apply(
             let txn = store.connection.begin().await?;
             let exact = compaction_checkpoint::Entity::find().select_only().column(compaction_checkpoint::Column::Id).filter(Expr::col(compaction_checkpoint::Column::Id).eq(Expr::Value(checkpoint.id.clone().into())).and(Expr::col(compaction_checkpoint::Column::IdentitySha256).eq(Expr::Value(identity.clone().into())))).into_tuple::<String>().one(&txn).await?;
             ensure!(exact.is_some(), "candidate identity mismatch");
+            ensure!(txn.query_one_raw(sqlite_specific_sql("SELECT 1 FROM compaction_checkpoint WHERE id=? AND proof_version=1 LIMIT 1", [checkpoint.id.clone().into()])).await?.is_some(), "candidate proofs not ready");
             let op = compaction_operation::Entity::find()
             .select_only()
             .column(compaction_operation::Column::Status)

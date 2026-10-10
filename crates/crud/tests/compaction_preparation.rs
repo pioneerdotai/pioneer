@@ -431,6 +431,7 @@ async fn preparation_cursor_and_insertions_roll_back_together_and_workers_conver
 
 #[tokio::test]
 async fn cancelled_preparation_reopens_from_disk_with_a_physical_read_only_pool() {
+    let mut frozen_conversion_progress = pioneer_crud::FrozenStorageLifetimeProgress::default();
     use pioneer_sqlite::{SqliteDatabase, sqlite_read_only_connection_url};
     use sea_orm::{ConnectOptions, TransactionTrait};
     pioneer_sqlite::zstd::register_auto_extension_once().unwrap();
@@ -494,6 +495,15 @@ async fn cancelled_preparation_reopens_from_disk_with_a_physical_read_only_pool(
         .record_tool_output("physical-output", &output)
         .await
         .unwrap();
+    // Complete bounded scope discovery while no frozen rows exist. The
+    // cancellation below then waits for a real conversion writer, not a
+    // metadata-only prerequisite read.
+    for _ in 0..64 {
+        store
+            .compact_frozen_storage_quantum(&mut frozen_conversion_progress)
+            .await
+            .unwrap();
+    }
     let reference: pioneer_compaction::frozen::FrozenMessageRef = serde_json::from_value(serde_json::json!({
         "logical_turn_id":"turn", "source_thread":"thread", "context_thread":null, "unit_id":"u",
         "sources":[{"scope":"event:turn","id":"event-1","version":"event-revision:1"}],
@@ -549,7 +559,7 @@ async fn cancelled_preparation_reopens_from_disk_with_a_physical_read_only_pool(
     assert!(
         tokio::time::timeout(
             std::time::Duration::from_millis(50),
-            store.compact_frozen_storage_quantum()
+            store.compact_frozen_storage_quantum(&mut frozen_conversion_progress)
         )
         .await
         .is_err()
@@ -582,13 +592,19 @@ async fn cancelled_preparation_reopens_from_disk_with_a_physical_read_only_pool(
         0
     );
     for _ in 0..4 {
-        assert!(store.compact_frozen_storage_quantum().await.unwrap());
+        assert!(
+            store
+                .compact_frozen_storage_quantum(&mut frozen_conversion_progress)
+                .await
+                .unwrap()
+        );
     }
     drop(store);
     drop(database);
     drop(setup);
     // Reopen the file: no in-memory cursor or worker survives this boundary.
     let reopened = CrudStore::new(Database::connect(url).await.unwrap()).with_maintenance_access();
+    let mut frozen_conversion_progress = pioneer_crud::FrozenStorageLifetimeProgress::default();
     let rows = reopened
         .tool_output_page("ws", "thread", "turn", "persisted-shell", 0)
         .await
@@ -598,10 +614,11 @@ async fn cancelled_preparation_reopens_from_disk_with_a_physical_read_only_pool(
         rows.iter()
             .all(|(_, row)| row.text == "before cancellation")
     );
-    for _ in 0..30 {
-        if !reopened.compact_frozen_storage_quantum().await.unwrap() {
-            break;
-        }
+    for _ in 0..512 {
+        reopened
+            .compact_frozen_storage_quantum(&mut frozen_conversion_progress)
+            .await
+            .unwrap();
     }
     assert_eq!(
         scalar(
@@ -828,6 +845,7 @@ async fn history_check_retry_survives_disk_reopen_and_cancelled_writer_admission
     drop(database);
     drop(setup);
     let reopened = CrudStore::new(Database::connect(url).await.unwrap()).with_maintenance_access();
+    let mut frozen_conversion_progress = pioneer_crud::FrozenStorageLifetimeProgress::default();
     assert!(
         reopened
             .compaction_due_history_checks(60999)

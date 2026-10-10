@@ -6893,6 +6893,12 @@ async fn load_task_execution_conversation_scope(
                 .get_task_run_conversation_snapshot(retry_of_run_id)
                 .await?
         {
+            let _retry_hold = crate::compaction::frozen::acquire_history_json(
+                &history_store,
+                &snapshot.workspace_id,
+                &snapshot.history_json,
+            )
+            .await?;
             restore_task_run_conversation_snapshot(
                 &history_store,
                 &snapshot,
@@ -7125,6 +7131,12 @@ async fn restore_task_run_conversation_snapshot_literal_fields(
         conversation_thread,
         source_turn_id,
     )?;
+    let _frozen_hold = crate::compaction::frozen::acquire_history_json(
+        store,
+        &snapshot.workspace_id,
+        &snapshot.history_json,
+    )
+    .await?;
     let allowed = crate::compaction::frozen::accepted_history_scopes(
         store,
         &snapshot.workspace_id,
@@ -7259,6 +7271,7 @@ mod prepared_snapshot_tests {
         .await
         .unwrap();
         crate::compaction::frozen::PreparedHistory {
+            frozen_hold: None,
             descriptor,
             messages,
             accepted_scopes: BTreeSet::from(["parent".to_owned()]),
@@ -7935,6 +7948,12 @@ async fn restore_task_run_conversation_snapshot_fields(
         conversation_thread,
         source_turn_id,
     )?;
+    let _frozen_hold = crate::compaction::frozen::acquire_history_json(
+        store,
+        &snapshot.workspace_id,
+        &snapshot.history_json,
+    )
+    .await?;
     let allowed = crate::compaction::frozen::accepted_history_scopes(
         store,
         &snapshot.workspace_id,

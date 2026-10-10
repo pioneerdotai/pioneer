@@ -105,7 +105,7 @@ async fn fixture() -> Fixture {
         "INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES ('run','task','run',1,1,'running','agent')",
         "INSERT INTO task_run_turn(id,task_id,run_id,thread_id,turn_id,kind,round,sequence,status,created_at) VALUES ('execution','task','run','child','child-turn','initial',0,1,'running',CURRENT_TIMESTAMP)",
         "INSERT INTO thread_lineage(child_thread_id,parent_thread_id,root_thread_id,depth,created_at) VALUES ('child','parent','parent',1,CURRENT_TIMESTAMP)",
-        "INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at) VALUES ('run','task','ws','parent','[\"accepted\"]',CURRENT_TIMESTAMP)",
+        "WITH frozen_root_fixture(run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at) AS (VALUES ('run','task','ws','parent','[\"accepted\"]',CURRENT_TIMESTAMP)) INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at,frozen_manifest_id) SELECT run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at,CASE WHEN json_valid(history_json) THEN CASE WHEN json_type(history_json)='object' THEN json_extract(history_json,'$.manifest_id') ELSE NULL END ELSE NULL END FROM frozen_root_fixture",
     ] {
         db.execute_unprepared(sql).await.unwrap();
     }
@@ -218,7 +218,7 @@ async fn install_canonical_sources(db: &SqliteDatabase) {
 async fn install_checkpoint_and_task_basis(db: &SqliteDatabase) {
     for sql in [
         "INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES ('basis-run','task','basis-run',1,2,'succeeded','agent')",
-        "INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at) VALUES ('basis-run','task','ws','source-thread','[]',CURRENT_TIMESTAMP)",
+        "WITH frozen_root_fixture(run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at) AS (VALUES ('basis-run','task','ws','source-thread','[]',CURRENT_TIMESTAMP)) INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at,frozen_manifest_id) SELECT run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at,CASE WHEN json_valid(history_json) THEN CASE WHEN json_type(history_json)='object' THEN json_extract(history_json,'$.manifest_id') ELSE NULL END ELSE NULL END FROM frozen_root_fixture",
         "INSERT INTO compaction_context(workspace_id,thread_id,owner,format_version) VALUES ('ws','source-thread','checkpoint-owner',1)",
         "INSERT INTO compaction_operation(id,owner,fingerprint,status,snapshot,deadline_ms) VALUES ('checkpoint-operation','checkpoint-owner','checkpoint-fixture','completed','{}',1)",
         "INSERT INTO compaction_checkpoint(id,operation_id,owner,portion,summary,identity_sha256,selection,projection_version,format_version,status) VALUES ('checkpoint-source','checkpoint-operation','checkpoint-owner',0,'fixture','checkpoint-version','{}',0,1,'applied')",
@@ -573,7 +573,7 @@ async fn accepted_import_current_checks_task_basis_revision_and_legacy_json_inde
 
     db.execute_raw(Statement::from_sql_and_values(
         DbBackend::Sqlite,
-        "UPDATE task_run_conversation_snapshot SET history_json=? WHERE run_id='basis-run'",
+        "WITH root_replacement(history_json) AS (VALUES (?)) UPDATE task_run_conversation_snapshot SET history_json=(SELECT history_json FROM root_replacement),frozen_manifest_id=(SELECT CASE WHEN json_valid(history_json) THEN CASE WHEN json_type(history_json)='object' THEN json_extract(history_json,'$.manifest_id') ELSE NULL END ELSE NULL END FROM root_replacement) WHERE run_id='basis-run'",
         ["  {}".into()],
     ))
     .await
@@ -588,7 +588,7 @@ async fn accepted_import_current_checks_task_basis_revision_and_legacy_json_inde
 
     db.execute_raw(Statement::from_sql_and_values(
         DbBackend::Sqlite,
-        "UPDATE task_run_conversation_snapshot SET history_json=? WHERE run_id='basis-run'",
+        "WITH root_replacement(history_json) AS (VALUES (?)) UPDATE task_run_conversation_snapshot SET history_json=(SELECT history_json FROM root_replacement),frozen_manifest_id=(SELECT CASE WHEN json_valid(history_json) THEN CASE WHEN json_type(history_json)='object' THEN json_extract(history_json,'$.manifest_id') ELSE NULL END ELSE NULL END FROM root_replacement) WHERE run_id='basis-run'",
         [" \t[1]".into()],
     ))
     .await
@@ -603,7 +603,7 @@ async fn accepted_import_current_checks_task_basis_revision_and_legacy_json_inde
 
     db.execute_raw(Statement::from_sql_and_values(
         DbBackend::Sqlite,
-        "UPDATE task_run_conversation_snapshot SET history_json=? WHERE run_id='basis-run'",
+        "WITH root_replacement(history_json) AS (VALUES (?)) UPDATE task_run_conversation_snapshot SET history_json=(SELECT history_json FROM root_replacement),frozen_manifest_id=(SELECT CASE WHEN json_valid(history_json) THEN CASE WHEN json_type(history_json)='object' THEN json_extract(history_json,'$.manifest_id') ELSE NULL END ELSE NULL END FROM root_replacement) WHERE run_id='basis-run'",
         ["   [1]".into()],
     ))
     .await
@@ -764,15 +764,17 @@ async fn accepted_import_current_preserves_every_outer_binding() {
     )
     .await
     .unwrap();
-    db.execute_unprepared("UPDATE compaction_frozen_history SET ready=0 WHERE id='outer-bindings'")
-        .await
-        .unwrap();
+    crate::repositories::compaction::seed_legacy_frozen_header(
+        &db,
+        "UPDATE compaction_frozen_history SET ready=0 WHERE id='outer-bindings'",
+    )
+    .await;
     assert_matches_oracle(&db, &import, false, "not ready").await;
-    db.execute_unprepared(
+    crate::repositories::compaction::seed_legacy_frozen_header(
+        &db,
         "UPDATE compaction_frozen_history SET ready=1,next_import=0 WHERE id='outer-bindings'",
     )
-    .await
-    .unwrap();
+    .await;
     assert_matches_oracle(&db, &import, false, "incomplete import cursor").await;
 }
 
@@ -794,8 +796,9 @@ async fn install_shared_manifest(db: &SqliteDatabase, source: &SourceRef) -> Pre
     .await
     .unwrap();
     for sql in [
-        "INSERT INTO compaction_frozen_layout(manifest_id,kind,active,pending) VALUES ('shared-logical',1,1,0)",
+        "INSERT INTO compaction_frozen_layout(manifest_id,kind,active,pending) VALUES ('shared-logical',1,0,1)",
         "INSERT INTO compaction_frozen_span(manifest_id,kind,start,end,source_manifest) VALUES ('shared-logical',1,0,1,'shared-physical')",
+        "UPDATE compaction_frozen_layout SET active=1,pending=0 WHERE manifest_id='shared-logical' AND kind=1",
     ] {
         db.execute_unprepared(sql).await.unwrap();
     }
