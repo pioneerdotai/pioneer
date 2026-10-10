@@ -15625,6 +15625,35 @@ mod tests {
         let child_item_id = format!("user_{child_turn_id}");
         let run_id = "run_projection_child";
         let source_text = "shared async task input";
+        // Snapshot admission binds the exact Task, run and workspace, even
+        // when the history is empty. Seed those parents before the snapshot.
+        pioneer_entity::task::Entity::insert(pioneer_entity::task::ActiveModel {
+            id: sea_orm::Set("task_projection_child".to_owned()),
+            workspace_id: sea_orm::Set(workspace_id.clone()),
+            owner_kind: sea_orm::Set("thread".to_owned()),
+            owner_id: sea_orm::Set(Some(parent_thread_id.to_owned())),
+            executor_kind: sea_orm::Set("agent".to_owned()),
+            status: sea_orm::Set("running".to_owned()),
+            title: sea_orm::Set("Projection child".to_owned()),
+            goal: sea_orm::Set(source_text.to_owned()),
+            ..Default::default()
+        })
+        .exec(&crud_store.database_connection())
+        .await
+        .expect("task should insert");
+        pioneer_entity::task_run::Entity::insert(pioneer_entity::task_run::ActiveModel {
+            id: sea_orm::Set(run_id.to_owned()),
+            task_id: sea_orm::Set("task_projection_child".to_owned()),
+            run_group_id: sea_orm::Set(run_id.to_owned()),
+            attempt_number: sea_orm::Set(1),
+            run_number: sea_orm::Set(1),
+            status: sea_orm::Set("running".to_owned()),
+            executor_kind: sea_orm::Set("agent".to_owned()),
+            ..Default::default()
+        })
+        .exec(&crud_store.database_connection())
+        .await
+        .expect("task run should insert");
         crud_store
             .upsert_task_run_turn(pioneer_protocol::TaskRunTurn {
                 id: "task_run_turn_projection_child".to_owned(),
