@@ -245,6 +245,15 @@ impl ProviderTimeoutPolicy {
     pub const DEFAULT_FIRST_CHUNK_TIMEOUT_SECS: u64 = 180;
     pub const DEFAULT_INTER_CHUNK_IDLE_TIMEOUT_SECS: u64 = 180;
     pub const DEFAULT_NON_STREAM_REQUEST_TIMEOUT_SECS: u64 = 120;
+    /// Safety cap for one stream when no workload override was configured.
+    /// This is independent of the Turn's soft checkpoint threshold/lifetime.
+    pub const DEFAULT_MAX_STREAM_DURATION_SECS: u64 = 30 * 60;
+
+    pub fn stream_attempt_duration(self) -> Duration {
+        self.max_stream_duration
+            .unwrap_or(Duration::from_secs(Self::DEFAULT_MAX_STREAM_DURATION_SECS))
+            .max(Duration::from_millis(1))
+    }
 
     pub fn from_secs(
         connect_timeout_secs: u64,
@@ -261,6 +270,42 @@ impl ProviderTimeoutPolicy {
             max_stream_duration: max_stream_duration_secs
                 .map(|secs| Duration::from_secs(secs.max(1))),
         }
+    }
+}
+
+/// In-memory ownership for one physical request. Every transport stage spends
+/// the same monotonic allowance; none may create a new first-output budget.
+#[derive(Clone, Debug)]
+pub struct ProviderAttemptContext {
+    pub first_output_deadline: tokio::time::Instant,
+    pub deadline: tokio::time::Instant,
+    pub cancellation: tokio_util::sync::CancellationToken,
+}
+
+impl ProviderAttemptContext {
+    pub fn new(policy: ProviderTimeoutPolicy, streaming: bool) -> anyhow::Result<Self> {
+        Self::from_started(policy, streaming, tokio::time::Instant::now())
+    }
+
+    pub fn from_started(
+        policy: ProviderTimeoutPolicy,
+        streaming: bool,
+        started: tokio::time::Instant,
+    ) -> anyhow::Result<Self> {
+        let cap = if streaming {
+            policy.stream_attempt_duration()
+        } else {
+            policy.non_stream_request_timeout
+        }
+        .max(Duration::from_millis(1));
+        let deadline = started
+            .checked_add(cap)
+            .ok_or_else(|| anyhow::anyhow!("provider attempt timeout policy is out of range"))?;
+        Ok(Self {
+            first_output_deadline: started + policy.first_chunk_timeout.min(cap),
+            deadline,
+            cancellation: tokio_util::sync::CancellationToken::new(),
+        })
     }
 }
 

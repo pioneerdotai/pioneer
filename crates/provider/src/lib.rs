@@ -44,7 +44,9 @@ pub use file_tools::{
     NativePatchWireShape, apply_patch_tool_schema, read_file_tool_schema,
     select_native_file_tool_capability,
 };
-pub use http::validate_proxy_url;
+pub use http::{
+    current_provider_attempt_context, validate_proxy_url, with_provider_attempt_context,
+};
 pub use registry::{
     ProviderAuthorityFingerprint, ProviderAuthorityRevoked, ProviderRegistry,
     ProviderRegistryCapacityExceeded, ProviderRegistryDefinitionCapacityExceeded,
@@ -56,9 +58,9 @@ pub use types::{
     ChatRequest, ChatResponse, CompiledPromptPayload, EmbeddingRequest, EmbeddingResponse,
     InputContentType, InputTypeSupport, MessageAttachment, MessageContentPart, MessageProvenance,
     MessageSourceAlias, MessageSourceIdentity, MessageSourceRef, ModelInputItem,
-    ProviderCallIdentity, ProviderCapabilities, ProviderFailureClassification,
-    ProviderHttpErrorBodyTooLarge, ProviderInputCapabilities, ProviderReplayState,
-    ProviderResponseLimits, ProviderResponseTooLarge, ProviderStream, ProviderStreamDiagnostics,
-    ProviderTermination, ProviderTimeoutPolicy, ProviderToolCall, ReasoningConfig, ReasoningEffort,
-    Role, StreamChunk, TokenUsage, ToolChoice, ToolDefinition,
+    ProviderAttemptContext, ProviderCallIdentity, ProviderCapabilities,
+    ProviderFailureClassification, ProviderHttpErrorBodyTooLarge, ProviderInputCapabilities,
+    ProviderReplayState, ProviderResponseLimits, ProviderResponseTooLarge, ProviderStream,
+    ProviderStreamDiagnostics, ProviderTermination, ProviderTimeoutPolicy, ProviderToolCall,
+    ReasoningConfig, ReasoningEffort, Role, StreamChunk, TokenUsage, ToolChoice, ToolDefinition,
 };
