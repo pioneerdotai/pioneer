@@ -79,7 +79,7 @@ pub struct CheckpointEdges {
 /// A source as it belonged to the operation that published a checkpoint.
 /// `source_version` is historical evidence, not a request to resolve today's
 /// canonical row at that version.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HistoricalSourceRef {
     pub source_thread: String,
     pub source: SourceRef,
@@ -92,7 +92,7 @@ pub struct HistoricalReplayAlias {
     pub tool_item_id: Option<String>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HistoricalEventInputEvidence {
     pub source: HistoricalSourceRef,
     pub role: String,
