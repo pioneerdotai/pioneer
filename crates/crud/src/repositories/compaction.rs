@@ -36,9 +36,9 @@ use pioneer_compaction::{Checkpoint, FORMAT_VERSION, OperationSnapshot, SourceRe
 use pioneer_entity::{
     compaction_checkpoint, compaction_context, compaction_coverage, compaction_event_revision,
     compaction_execution_stop, compaction_input_revision, compaction_item_revision,
-    compaction_operation, compaction_projection_epoch, compaction_source_revision,
-    task_run_conversation_snapshot, thread, turn, turn_event, turn_input, turn_item,
-    turn_llm_context,
+    compaction_operation, compaction_operation_projection, compaction_projection_epoch,
+    compaction_source_revision, task_run_conversation_snapshot, thread, turn, turn_event,
+    turn_input, turn_item, turn_llm_context,
 };
 pub use runner::{ManifestEntry, RunnerPlanRecord};
 #[cfg(any(test, feature = "test-support"))]
@@ -1876,8 +1876,103 @@ pub(super) async fn checkpoint_row<C: ConnectionTrait>(
     db: &C,
     id: &str,
 ) -> Result<Option<CheckpointEdgesRow>> {
-    CheckpointEdgesRow::find_by_statement(sqlite_specific_sql(
-        "SELECT p.id,p.proof_version,(p.portion<o.next_portion) AS coverage_closed,p.status,p.owner,c.workspace_id,c.thread_id,p.identity_sha256,p.previous,p.format_version,p.operation_id,projection.manifest_id FROM compaction_checkpoint p JOIN compaction_operation o ON o.id=p.operation_id AND o.owner=p.owner JOIN compaction_context c ON c.owner=p.owner LEFT JOIN compaction_operation_projection projection ON projection.operation_id=p.operation_id WHERE p.id=? LIMIT 1",[id.into()])).one(db).await.map_err(Into::into)
+    let query = Query::select()
+        .from(compaction_checkpoint::Entity)
+        .columns(
+            [
+                compaction_checkpoint::Column::Id,
+                compaction_checkpoint::Column::ProofVersion,
+                compaction_checkpoint::Column::Status,
+                compaction_checkpoint::Column::Owner,
+                compaction_checkpoint::Column::IdentitySha256,
+                compaction_checkpoint::Column::Previous,
+                compaction_checkpoint::Column::FormatVersion,
+                compaction_checkpoint::Column::OperationId,
+            ]
+            .map(|column| (compaction_checkpoint::Entity, column)),
+        )
+        .expr_as(
+            Expr::col((
+                compaction_checkpoint::Entity,
+                compaction_checkpoint::Column::Portion,
+            ))
+            .lt(Expr::col((
+                compaction_operation::Entity,
+                compaction_operation::Column::NextPortion,
+            ))),
+            Alias::new("coverage_closed"),
+        )
+        .columns(
+            [
+                compaction_context::Column::WorkspaceId,
+                compaction_context::Column::ThreadId,
+            ]
+            .map(|column| (compaction_context::Entity, column)),
+        )
+        .column((
+            compaction_operation_projection::Entity,
+            compaction_operation_projection::Column::ManifestId,
+        ))
+        .join(
+            JoinType::InnerJoin,
+            compaction_operation::Entity,
+            Expr::col((
+                compaction_operation::Entity,
+                compaction_operation::Column::Id,
+            ))
+            .eq(Expr::col((
+                compaction_checkpoint::Entity,
+                compaction_checkpoint::Column::OperationId,
+            )))
+            .and(
+                Expr::col((
+                    compaction_operation::Entity,
+                    compaction_operation::Column::Owner,
+                ))
+                .eq(Expr::col((
+                    compaction_checkpoint::Entity,
+                    compaction_checkpoint::Column::Owner,
+                ))),
+            ),
+        )
+        .join(
+            JoinType::InnerJoin,
+            compaction_context::Entity,
+            Expr::col((
+                compaction_context::Entity,
+                compaction_context::Column::Owner,
+            ))
+            .eq(Expr::col((
+                compaction_checkpoint::Entity,
+                compaction_checkpoint::Column::Owner,
+            ))),
+        )
+        .join(
+            JoinType::LeftJoin,
+            compaction_operation_projection::Entity,
+            Expr::col((
+                compaction_operation_projection::Entity,
+                compaction_operation_projection::Column::OperationId,
+            ))
+            .eq(Expr::col((
+                compaction_checkpoint::Entity,
+                compaction_checkpoint::Column::OperationId,
+            ))),
+        )
+        .and_where(
+            Expr::col((
+                compaction_checkpoint::Entity,
+                compaction_checkpoint::Column::Id,
+            ))
+            .eq(id),
+        )
+        .limit(1)
+        .to_owned();
+    db.query_one(&query)
+        .await?
+        .map(|row| CheckpointEdgesRow::from_query_result(&row, ""))
+        .transpose()
+        .map_err(Into::into)
 }
 
 /// Only close and seal may advance this reader observation. Status remains
@@ -2576,14 +2671,14 @@ pub(crate) async fn compaction_apply(
     // exact source assertions are the publication proof. If an operation did
     // bind a frozen projection, require its graph to be readable as the runner
     // publication path does; otherwise the legacy CAS remains unchanged.
-    let has_projection = store
-        .connection
-        .query_one_raw(sqlite_specific_sql(
-            "SELECT 1 FROM compaction_operation_projection WHERE operation_id=? LIMIT 1",
-            [checkpoint.operation_id.clone().into()],
-        ))
-        .await?
-        .is_some();
+    let has_projection =
+        compaction_operation_projection::Entity::find_by_id(&checkpoint.operation_id)
+            .select_only()
+            .column(compaction_operation_projection::Column::OperationId)
+            .into_tuple::<String>()
+            .one(&store.connection)
+            .await?
+            .is_some();
     super::checkpoint_proofs::prepare_graph(store, &checkpoint.id).await?;
     ensure!(
         assertions.len() <= CHECKPOINT_SOURCE_LIMIT
@@ -2603,7 +2698,8 @@ pub(crate) async fn compaction_apply(
             let txn = store.connection.begin().await?;
             let exact = compaction_checkpoint::Entity::find().select_only().column(compaction_checkpoint::Column::Id).filter(Expr::col(compaction_checkpoint::Column::Id).eq(Expr::Value(checkpoint.id.clone().into())).and(Expr::col(compaction_checkpoint::Column::IdentitySha256).eq(Expr::Value(identity.clone().into())))).into_tuple::<String>().one(&txn).await?;
             ensure!(exact.is_some(), "candidate identity mismatch");
-            ensure!(txn.query_one_raw(sqlite_specific_sql("SELECT 1 FROM compaction_checkpoint WHERE id=? AND proof_version=1 LIMIT 1", [checkpoint.id.clone().into()])).await?.is_some(), "candidate proofs not ready");
+            ensure!(compaction_checkpoint::Entity::find_by_id(&checkpoint.id).select_only().column(compaction_checkpoint::Column::Id)
+                .filter(compaction_checkpoint::Column::ProofVersion.eq(1)).into_tuple::<String>().one(&txn).await?.is_some(), "candidate proofs not ready");
             let op = compaction_operation::Entity::find()
             .select_only()
             .column(compaction_operation::Column::Status)

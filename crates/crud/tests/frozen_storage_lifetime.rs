@@ -2,10 +2,26 @@
 use migration::{Migrator, MigratorTrait};
 use pioneer_compaction::frozen::FrozenHistoryRef;
 use pioneer_crud::{CrudStore, FrozenStorageLifetimeProgress};
-use sea_orm::{ConnectionTrait, Database, DbBackend, Statement, TransactionTrait};
+use sea_orm::{ConnectionTrait, DbBackend, Statement, TransactionTrait};
 
 async fn db_fixture(legacy: bool) -> sea_orm::DatabaseConnection {
-    let db = Database::connect("sqlite::memory:").await.unwrap();
+    let mut options = sea_orm::ConnectOptions::new("sqlite::memory:");
+    options.max_connections(1).min_connections(1);
+    let db = sea_orm::Database::connect(options).await.unwrap();
+    db.execute_unprepared("PRAGMA foreign_keys=OFF")
+        .await
+        .unwrap();
+    let pragma: i64 = db
+        .query_one_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "PRAGMA foreign_keys",
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "foreign_keys")
+        .unwrap();
+    assert_eq!(pragma, 0, "production single writer uses FK OFF");
     let last = Migrator::migrations().len() - 1;
     Migrator::up(&db, if legacy { Some(last as u32) } else { None })
         .await

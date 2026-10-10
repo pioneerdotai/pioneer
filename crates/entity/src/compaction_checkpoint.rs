@@ -27,6 +27,15 @@ pub struct Model {
     pub format_version: i64,
     #[sea_orm(column_type = "Text")]
     pub status: String,
+    #[serde(skip)]
+    #[sea_orm(has_many)]
+    pub replay_aliases: HasMany<super::compaction_checkpoint_replay_alias::Entity>,
+    #[serde(skip)]
+    #[sea_orm(has_many)]
+    pub event_inputs: HasMany<super::compaction_checkpoint_event_input::Entity>,
+    #[serde(skip)]
+    #[sea_orm(has_many)]
+    pub imports: HasMany<super::compaction_checkpoint_import::Entity>,
     #[sea_orm(has_many)]
     pub compaction_coverages: HasMany<super::compaction_coverage::Entity>,
     #[sea_orm(

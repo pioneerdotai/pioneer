@@ -4,8 +4,18 @@ use super::{checkpoint_proofs, compaction};
 use crate::{CrudStore, frozen_lifetime::PreparedFrozenRoot};
 use anyhow::{Result, ensure};
 use pioneer_compaction::runner::{RunnerPhase, RunnerState};
-use pioneer_entity::compaction_frozen_history as history;
-use sea_orm::{ConnectionTrait, DbBackend, EntityTrait, Statement, TransactionTrait};
+use pioneer_entity::{
+    compaction_checkpoint as checkpoint, compaction_context as context,
+    compaction_coverage as coverage, compaction_frozen_history as history,
+    compaction_frozen_layout as layout, compaction_frozen_span as span,
+    compaction_operation as operation, compaction_operation_projection as projection,
+    compaction_runner_state as runner, task, task_run_conversation_snapshot as task_input,
+};
+use sea_orm::sea_query::{Alias, Expr, ExprTrait, Func, JoinType, Order, Query, UnionType};
+use sea_orm::{
+    ColumnTrait, Condition, ConnectionTrait, DbBackend, EntityTrait, QueryFilter, QueryOrder,
+    QuerySelect, QueryTrait, Statement, TransactionTrait,
+};
 use std::collections::{BTreeSet, VecDeque};
 
 const FRAGMENT_BYTES: i64 = 64 * 1024;
@@ -16,10 +26,14 @@ const META_ROWS: u64 = 64;
 const LEGACY_LOCATOR_BYTES: i64 = FRAGMENT_BYTES * 128;
 
 /// Owned by one existing maintenance worker, and dropped on cancellation.
-/// Creating this value does not enable lifetime maintenance in the Gateway.
+/// Each discovery family reaches EOF once per pass; completed families yield
+/// while the other bounded preparations finish.
 #[derive(Default)]
 pub struct FrozenStorageLifetimeProgress {
     phase: usize,
+    pass_done: [bool; 6],
+    locator_done: [bool; 4],
+    physical_done: [bool; 2],
     scope: ScopeDiscovery,
     locators: [String; 4],
     locator_kind: usize,
@@ -57,6 +71,8 @@ struct LocatorRead {
 impl LocatorRead {
     async fn step(&mut self, store: &CrudStore) -> Result<bool> {
         let (table, key, field) = ROOTS[self.kind];
+        // SQLite BLOB fragment, fixed actual-byte budget; sentinel/identity CAS
+        // below stays typed and never compares the accumulated JSON in writer.
         if i64::try_from(self.bytes.len())? < self.size {
             let row = store.connection.query_one_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
                 format!("SELECT substr(CAST({field} AS BLOB),?3,?4) AS fragment FROM {table} WHERE {key}=?1 AND workspace_id=?2 AND frozen_manifest_id='' AND length(CAST({field} AS BLOB))=?5 LIMIT 1"),
@@ -86,23 +102,65 @@ impl LocatorRead {
         // All JSON/root-identity mutations have already cut over to ID/NULL.
         // Metadata-only changes keep ''. Delete/recreate cannot regain ''.
         // No updated_at comparison or large JSON comparison under writer.
-        store.run_serialized_write(|| async {
-            let tx = store.connection.begin().await?;
-            let current = tx.query_one_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-                format!("SELECT 1 FROM {table} WHERE {key}=?1 AND workspace_id=?2 AND frozen_manifest_id='' LIMIT 1"),
-                [self.id.clone().into(),self.workspace.clone().into()])).await?;
-            if current.is_some() {
-                prepared.verify(&tx,&self.workspace).await?;
-                if self.kind==0 {
-                    ensure!(tx.query_one_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-                        "SELECT 1 FROM task_run_conversation_snapshot s JOIN task t ON t.id=s.task_id AND t.workspace_id=s.workspace_id WHERE s.run_id=?1 LIMIT 1",[self.id.clone().into()])).await?.is_some(),"legacy Task scope is missing");
+        store
+            .run_serialized_write(|| async {
+                let tx = store.connection.begin().await?;
+                let locator_guard = Condition::all()
+                    .add(Expr::col(Alias::new(key)).eq(&self.id))
+                    .add(Expr::col(Alias::new("workspace_id")).eq(&self.workspace))
+                    .add(Expr::col(Alias::new("frozen_manifest_id")).eq(""));
+                let current = tx
+                    .query_one(
+                        &Query::select()
+                            .expr(Expr::val(1))
+                            .from(Alias::new(table))
+                            .cond_where(locator_guard.clone())
+                            .limit(1)
+                            .to_owned(),
+                    )
+                    .await?;
+                if current.is_some() {
+                    prepared.verify(&tx, &self.workspace).await?;
+                    if self.kind == 0 {
+                        let parent = Query::select()
+                            .expr(Expr::val(1))
+                            .from(task_input::Entity)
+                            .join(
+                                JoinType::InnerJoin,
+                                task::Entity,
+                                Expr::col((task::Entity, task::Column::Id))
+                                    .eq(Expr::col((task_input::Entity, task_input::Column::TaskId)))
+                                    .and(Expr::col((task::Entity, task::Column::WorkspaceId)).eq(
+                                        Expr::col((
+                                            task_input::Entity,
+                                            task_input::Column::WorkspaceId,
+                                        )),
+                                    )),
+                            )
+                            .and_where(
+                                Expr::col((task_input::Entity, task_input::Column::RunId))
+                                    .eq(&self.id),
+                            )
+                            .limit(1)
+                            .to_owned();
+                        ensure!(
+                            tx.query_one(&parent).await?.is_some(),
+                            "legacy Task scope is missing"
+                        );
+                    }
+                    tx.execute(
+                        &Query::update()
+                            .table(Alias::new(table))
+                            .value(Alias::new("frozen_manifest_id"), prepared.locator())
+                            .cond_where(locator_guard)
+                            .to_owned(),
+                    )
+                    .await?;
                 }
-                tx.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-                    format!("UPDATE {table} SET frozen_manifest_id=?3 WHERE {key}=?1 AND workspace_id=?2 AND frozen_manifest_id=''"),
-                    [self.id.clone().into(),self.workspace.clone().into(),prepared.locator().into()])).await?;
-            }
-            tx.commit().await?; Ok(())
-        }).await?;
+                tx.commit().await?;
+                Ok(())
+            })
+            .await?;
         Ok(true)
     }
 }
@@ -161,8 +219,36 @@ impl Reachability {
                 topology.workspace_id == self.workspace && topology.format_version == 1,
                 "reverse graph scope corrupt"
             );
-            self.reachable=store.connection.query_one_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-                "SELECT 1 FROM compaction_checkpoint c JOIN compaction_operation o ON o.id=c.operation_id AND o.owner=c.owner WHERE c.id=?1 AND (c.status='applied' OR (c.status='retained' AND o.status='completed')) LIMIT 1",[id.clone().into()])).await?.is_some();
+            let published = Query::select()
+                .expr(Expr::val(1))
+                .from(checkpoint::Entity)
+                .join(
+                    JoinType::InnerJoin,
+                    operation::Entity,
+                    Expr::col((operation::Entity, operation::Column::Id))
+                        .eq(Expr::col((
+                            checkpoint::Entity,
+                            checkpoint::Column::OperationId,
+                        )))
+                        .and(
+                            Expr::col((operation::Entity, operation::Column::Owner))
+                                .eq(Expr::col((checkpoint::Entity, checkpoint::Column::Owner))),
+                        ),
+                )
+                .and_where(Expr::col((checkpoint::Entity, checkpoint::Column::Id)).eq(&id))
+                .and_where(
+                    Expr::col((checkpoint::Entity, checkpoint::Column::Status))
+                        .eq("applied")
+                        .or(Expr::col((checkpoint::Entity, checkpoint::Column::Status))
+                            .eq("retained")
+                            .and(
+                                Expr::col((operation::Entity, operation::Column::Status))
+                                    .eq("completed"),
+                            )),
+                )
+                .limit(1)
+                .to_owned();
+            self.reachable = store.connection.query_one(&published).await?.is_some();
             self.current = Some((id, 0, String::new(), BTreeSet::new()));
             return Ok(());
         }
@@ -171,19 +257,75 @@ impl Reachability {
             .await?
             .ok_or_else(|| anyhow::anyhow!("reverse checkpoint removed"))?;
         let row = &topology;
-        let sql = if *branch == 0 {
-            "SELECT p.id,p.owner,c.workspace_id,c.thread_id FROM compaction_checkpoint p LEFT JOIN compaction_context c ON c.owner=p.owner WHERE p.previous=?1 AND p.id>?2 ORDER BY p.id LIMIT ?3"
+        let mut query = Query::select();
+        if *branch == 0 {
+            query
+                .from(checkpoint::Entity)
+                .columns(
+                    [checkpoint::Column::Id, checkpoint::Column::Owner]
+                        .map(|col| (checkpoint::Entity, col)),
+                )
+                .columns(
+                    [context::Column::WorkspaceId, context::Column::ThreadId]
+                        .map(|col| (context::Entity, col)),
+                )
+                .join(
+                    JoinType::LeftJoin,
+                    context::Entity,
+                    Expr::col((context::Entity, context::Column::Owner))
+                        .eq(Expr::col((checkpoint::Entity, checkpoint::Column::Owner))),
+                )
+                .and_where(
+                    Expr::col((checkpoint::Entity, checkpoint::Column::Previous)).eq(id.clone()),
+                )
+                .and_where(
+                    Expr::col((checkpoint::Entity, checkpoint::Column::Id)).gt(after.clone()),
+                )
+                .order_by((checkpoint::Entity, checkpoint::Column::Id), Order::Asc);
         } else {
-            "SELECT v.checkpoint_id AS id,v.source_scope,v.source_version,c.workspace_id FROM compaction_coverage v LEFT JOIN compaction_checkpoint p ON p.id=v.checkpoint_id LEFT JOIN compaction_context c ON c.owner=p.owner WHERE v.source_id=?1 AND v.source_scope LIKE 'checkpoint:%' AND v.checkpoint_id>?2 ORDER BY v.checkpoint_id LIMIT ?3"
-        };
-        let page = store
-            .connection
-            .query_all_raw(Statement::from_sql_and_values(
-                DbBackend::Sqlite,
-                sql,
-                [id.clone().into(), after.clone().into(), 1_i64.into()],
-            ))
-            .await?;
+            query
+                .from(coverage::Entity)
+                .expr_as(
+                    Expr::col((coverage::Entity, coverage::Column::CheckpointId)),
+                    Alias::new("id"),
+                )
+                .columns(
+                    [
+                        coverage::Column::SourceScope,
+                        coverage::Column::SourceVersion,
+                    ]
+                    .map(|col| (coverage::Entity, col)),
+                )
+                .column((context::Entity, context::Column::WorkspaceId))
+                .join(
+                    JoinType::LeftJoin,
+                    checkpoint::Entity,
+                    Expr::col((checkpoint::Entity, checkpoint::Column::Id)).eq(Expr::col((
+                        coverage::Entity,
+                        coverage::Column::CheckpointId,
+                    ))),
+                )
+                .join(
+                    JoinType::LeftJoin,
+                    context::Entity,
+                    Expr::col((context::Entity, context::Column::Owner))
+                        .eq(Expr::col((checkpoint::Entity, checkpoint::Column::Owner))),
+                )
+                .and_where(Expr::col((coverage::Entity, coverage::Column::SourceId)).eq(id.clone()))
+                .and_where(
+                    Expr::col((coverage::Entity, coverage::Column::SourceScope))
+                        .like("checkpoint:%"),
+                )
+                .and_where(
+                    Expr::col((coverage::Entity, coverage::Column::CheckpointId)).gt(after.clone()),
+                )
+                .order_by(
+                    (coverage::Entity, coverage::Column::CheckpointId),
+                    Order::Asc,
+                );
+        }
+        query.limit(1);
+        let page = store.connection.query_all(&query).await?;
         for item in &page {
             let incoming: String = item.try_get("", "id")?;
             ensure!(
@@ -312,8 +454,20 @@ impl ExpiryPreparation {
         }
         if !self.operations_done {
             // One bounded saved state per quantum, decoded after reader release.
-            let row=store.connection.query_one_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-                "SELECT b.operation_id,o.owner,o.status,r.generation,CASE WHEN length(CAST(r.state AS BLOB))<=?3 THEN r.state END AS state,x.workspace_id FROM compaction_operation_projection b LEFT JOIN compaction_operation o ON o.id=b.operation_id LEFT JOIN compaction_context x ON x.owner=o.owner LEFT JOIN compaction_runner_state r ON r.operation_id=o.id WHERE b.manifest_id=?1 AND b.operation_id>?2 ORDER BY b.operation_id LIMIT 1",[self.header.id.clone().into(),self.operations_after.clone().into(),(256_i64*1024).into()])).await?;
+            let row = store.connection.query_one(&Query::select().from(projection::Entity)
+                .column((projection::Entity,projection::Column::OperationId))
+                .columns([operation::Column::Owner,operation::Column::Status].map(|c| (operation::Entity,c)))
+                .column((runner::Entity,runner::Column::Generation)).column((context::Entity,context::Column::WorkspaceId))
+                .expr_as(Expr::cust("CASE WHEN length(CAST(compaction_runner_state.state AS BLOB))<=262144 THEN compaction_runner_state.state END"),Alias::new("state"))
+                .join(JoinType::LeftJoin,operation::Entity,
+                    Expr::col((operation::Entity,operation::Column::Id)).eq(Expr::col((projection::Entity,projection::Column::OperationId))))
+                .join(JoinType::LeftJoin,context::Entity,
+                    Expr::col((context::Entity,context::Column::Owner)).eq(Expr::col((operation::Entity,operation::Column::Owner))))
+                .join(JoinType::LeftJoin,runner::Entity,
+                    Expr::col((runner::Entity,runner::Column::OperationId)).eq(Expr::col((operation::Entity,operation::Column::Id))))
+                .and_where(Expr::col((projection::Entity,projection::Column::ManifestId)).eq(&self.header.id))
+                .and_where(Expr::col((projection::Entity,projection::Column::OperationId)).gt(&self.operations_after))
+                .order_by((projection::Entity,projection::Column::OperationId),Order::Asc).limit(1).to_owned()).await?;
             if let Some(row) = row {
                 ensure!(
                     row.try_get::<String>("", "workspace_id")? == self.header.workspace_id,
@@ -335,11 +489,59 @@ impl ExpiryPreparation {
                     status,
                     generation,
                 };
-                store.run_serialized_write(||async{
-                    let tx=store.connection.begin().await?;
-                    tx.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,r#"UPDATE compaction_operation_projection SET terminal_generation=?3 WHERE operation_id=?1 AND manifest_id=?2 AND EXISTS(SELECT 1 FROM compaction_operation o JOIN compaction_runner_state r ON r.operation_id=o.id JOIN compaction_context x ON x.owner=o.owner WHERE o.id=?1 AND o.owner=?4 AND o.status=?5 AND r.generation=?3 AND x.workspace_id=?6)"#,[binding.id.clone().into(),self.header.id.clone().into(),binding.generation.into(),binding.owner.clone().into(),binding.status.clone().into(),self.header.workspace_id.clone().into()])).await?;
-                    tx.commit().await?;Ok(())
-                }).await?;
+                store
+                    .run_serialized_write(|| async {
+                        let tx = store.connection.begin().await?;
+                        let current = Query::select()
+                            .expr(Expr::val(1))
+                            .from(operation::Entity)
+                            .join(
+                                JoinType::InnerJoin,
+                                runner::Entity,
+                                Expr::col((runner::Entity, runner::Column::OperationId))
+                                    .eq(Expr::col((operation::Entity, operation::Column::Id))),
+                            )
+                            .join(
+                                JoinType::InnerJoin,
+                                context::Entity,
+                                Expr::col((context::Entity, context::Column::Owner))
+                                    .eq(Expr::col((operation::Entity, operation::Column::Owner))),
+                            )
+                            .and_where(
+                                Expr::col((operation::Entity, operation::Column::Id))
+                                    .eq(&binding.id),
+                            )
+                            .and_where(
+                                Expr::col((operation::Entity, operation::Column::Owner))
+                                    .eq(&binding.owner),
+                            )
+                            .and_where(
+                                Expr::col((operation::Entity, operation::Column::Status))
+                                    .eq(&binding.status),
+                            )
+                            .and_where(
+                                Expr::col((runner::Entity, runner::Column::Generation))
+                                    .eq(binding.generation),
+                            )
+                            .and_where(
+                                Expr::col((context::Entity, context::Column::WorkspaceId))
+                                    .eq(&self.header.workspace_id),
+                            )
+                            .to_owned();
+                        projection::Entity::update_many()
+                            .col_expr(
+                                projection::Column::TerminalGeneration,
+                                Expr::val(binding.generation),
+                            )
+                            .filter(projection::Column::OperationId.eq(&binding.id))
+                            .filter(projection::Column::ManifestId.eq(&self.header.id))
+                            .filter(Expr::exists(current))
+                            .exec(&tx)
+                            .await?;
+                        tx.commit().await?;
+                        Ok(())
+                    })
+                    .await?;
                 return Ok(false);
             }
             self.operations_done = true;
@@ -357,8 +559,29 @@ impl ExpiryPreparation {
             return Ok(false);
         }
         if !self.checkpoints_done {
-            let row=store.connection.query_one_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-                "SELECT c.id FROM compaction_checkpoint c JOIN compaction_operation_projection b ON b.operation_id=c.operation_id WHERE b.manifest_id=?1 AND c.id>?2 AND c.proof_version<>1 ORDER BY c.id LIMIT 1",[self.header.id.clone().into(),self.checkpoint_after.clone().into()])).await?;
+            let query = Query::select()
+                .column((checkpoint::Entity, checkpoint::Column::Id))
+                .from(checkpoint::Entity)
+                .join(
+                    JoinType::InnerJoin,
+                    projection::Entity,
+                    Expr::col((projection::Entity, projection::Column::OperationId)).eq(Expr::col(
+                        (checkpoint::Entity, checkpoint::Column::OperationId),
+                    )),
+                )
+                .and_where(
+                    Expr::col((projection::Entity, projection::Column::ManifestId))
+                        .eq(&self.header.id),
+                )
+                .and_where(
+                    Expr::col((checkpoint::Entity, checkpoint::Column::Id))
+                        .gt(&self.checkpoint_after),
+                )
+                .and_where(Expr::col((checkpoint::Entity, checkpoint::Column::ProofVersion)).ne(1))
+                .order_by((checkpoint::Entity, checkpoint::Column::Id), Order::Asc)
+                .limit(1)
+                .to_owned();
+            let row = store.connection.query_one(&query).await?;
             if let Some(row) = row {
                 let id: String = row.try_get("", "id")?;
                 self.checkpoint_after = id.clone();
@@ -409,31 +632,203 @@ fn healthy(alias: &str) -> String {
     )
 }
 async fn expire(store: &CrudStore, header: &history::Model) -> Result<()> {
-    store.run_serialized_write(||async {
-        let tx=store.connection.begin().await?;
-        let h=history::Entity::find_by_id(&header.id).one(&tx).await?.ok_or_else(||anyhow::anyhow!("expiry header missing"))?;
-        crate::frozen_lifetime::logical_bounds(&h)?;
-        ensure!(h.ready==1 && h==*header,"expiry header changed");
-        if store.frozen_readers.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains_key(&h.id) {tx.commit().await?;return Ok(());}
-        let guard=tx.query_one_raw(Statement::from_sql_and_values(DbBackend::Sqlite,format!("SELECT 1 FROM compaction_frozen_history h WHERE h.id=?1 AND ({}) LIMIT 1",root_predicate("h")),[h.id.clone().into()])).await?;
-        if guard.is_some() {tx.commit().await?;return Ok(());}
-        // The per-binding terminal generation was verified in bounded steps.
-        // All state/status writes invalidate it before becoming visible.
-        let active=tx.query_one_raw(Statement::from_sql_and_values(DbBackend::Sqlite,r#"
-SELECT 1 FROM compaction_operation_projection b LEFT JOIN compaction_operation o ON o.id=b.operation_id
-LEFT JOIN compaction_runner_state r ON r.operation_id=o.id LEFT JOIN compaction_context x ON x.owner=o.owner
-WHERE b.manifest_id=?1 AND (o.id IS NULL OR o.status NOT IN ('completed','failed','cancelled','stale')
- OR r.operation_id IS NULL OR b.terminal_generation IS NULL OR b.terminal_generation<>r.generation
- OR x.workspace_id IS NULL OR x.workspace_id<>?2) LIMIT 1"#,[h.id.clone().into(),h.workspace_id.clone().into()])).await?;
-        if active.is_some(){tx.commit().await?;return Ok(());}
-        let unsealed_public=tx.query_one_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-            "SELECT 1 FROM compaction_operation_projection b JOIN compaction_checkpoint c ON c.operation_id=b.operation_id JOIN compaction_operation o ON o.id=b.operation_id WHERE b.manifest_id=?1 AND c.proof_version<>1 AND (c.status='applied' OR (c.status='retained' AND o.status='completed')) LIMIT 1",[h.id.clone().into()])).await?;
-        if unsealed_public.is_some(){tx.commit().await?;return Ok(());}
-        let transitions=tx.query_one_raw(Statement::from_sql_and_values(DbBackend::Sqlite,"SELECT 1 FROM compaction_frozen_layout l WHERE (l.manifest_id=?1 OR l.candidate=?1) AND (l.active<>1 OR l.pending<>0 OR l.failed<>0 OR l.copy_next<COALESCE(l.copy_to,0)) LIMIT 1",[h.id.clone().into()])).await?;
-        if transitions.is_some() {tx.commit().await?;return Ok(());}
-        tx.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,"UPDATE compaction_frozen_history SET expired=1 WHERE id=?1 AND expired=0 AND ready=1 AND next_ordinal=message_count AND next_import=import_count",[h.id.clone().into()])).await?;
-        tx.commit().await?;Ok(())
-    }).await
+    store
+        .run_serialized_write(|| async {
+            let tx = store.connection.begin().await?;
+            let h = history::Entity::find_by_id(&header.id)
+                .one(&tx)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("expiry header missing"))?;
+            crate::frozen_lifetime::logical_bounds(&h)?;
+            ensure!(h.ready == 1 && h == *header, "expiry header changed");
+            if store
+                .frozen_readers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(&h.id)
+            {
+                tx.commit().await?;
+                return Ok(());
+            }
+            let guard = tx
+                .query_one(
+                    &Query::select()
+                        .expr(Expr::val(1))
+                        .from_as(history::Entity, Alias::new("h"))
+                        .and_where(Expr::col((Alias::new("h"), history::Column::Id)).eq(&h.id))
+                        .and_where(Expr::cust(root_predicate("h")))
+                        .limit(1)
+                        .to_owned(),
+                )
+                .await?;
+            if guard.is_some() {
+                tx.commit().await?;
+                return Ok(());
+            }
+            // The per-binding terminal generation was verified in bounded steps.
+            // All state/status writes invalidate it before becoming visible.
+            let active = tx
+                .query_one(
+                    &Query::select()
+                        .expr(Expr::val(1))
+                        .from(projection::Entity)
+                        .join(
+                            JoinType::LeftJoin,
+                            operation::Entity,
+                            Expr::col((operation::Entity, operation::Column::Id)).eq(Expr::col((
+                                projection::Entity,
+                                projection::Column::OperationId,
+                            ))),
+                        )
+                        .join(
+                            JoinType::LeftJoin,
+                            runner::Entity,
+                            Expr::col((runner::Entity, runner::Column::OperationId))
+                                .eq(Expr::col((operation::Entity, operation::Column::Id))),
+                        )
+                        .join(
+                            JoinType::LeftJoin,
+                            context::Entity,
+                            Expr::col((context::Entity, context::Column::Owner))
+                                .eq(Expr::col((operation::Entity, operation::Column::Owner))),
+                        )
+                        .and_where(
+                            Expr::col((projection::Entity, projection::Column::ManifestId))
+                                .eq(&h.id),
+                        )
+                        .cond_where(
+                            Condition::any()
+                                .add(
+                                    Expr::col((operation::Entity, operation::Column::Id)).is_null(),
+                                )
+                                .add(
+                                    Expr::col((operation::Entity, operation::Column::Status))
+                                        .is_not_in(["completed", "failed", "cancelled", "stale"]),
+                                )
+                                .add(
+                                    Expr::col((runner::Entity, runner::Column::OperationId))
+                                        .is_null(),
+                                )
+                                .add(
+                                    Expr::col((
+                                        projection::Entity,
+                                        projection::Column::TerminalGeneration,
+                                    ))
+                                    .is_null(),
+                                )
+                                .add(
+                                    Expr::col((
+                                        projection::Entity,
+                                        projection::Column::TerminalGeneration,
+                                    ))
+                                    .ne(Expr::col((runner::Entity, runner::Column::Generation))),
+                                )
+                                .add(
+                                    Expr::col((context::Entity, context::Column::WorkspaceId))
+                                        .is_null(),
+                                )
+                                .add(
+                                    Expr::col((context::Entity, context::Column::WorkspaceId))
+                                        .ne(&h.workspace_id),
+                                ),
+                        )
+                        .limit(1)
+                        .to_owned(),
+                )
+                .await?;
+            if active.is_some() {
+                tx.commit().await?;
+                return Ok(());
+            }
+            let unsealed_public = tx
+                .query_one(
+                    &Query::select()
+                        .expr(Expr::val(1))
+                        .from(projection::Entity)
+                        .join(
+                            JoinType::InnerJoin,
+                            checkpoint::Entity,
+                            Expr::col((checkpoint::Entity, checkpoint::Column::OperationId)).eq(
+                                Expr::col((projection::Entity, projection::Column::OperationId)),
+                            ),
+                        )
+                        .join(
+                            JoinType::InnerJoin,
+                            operation::Entity,
+                            Expr::col((operation::Entity, operation::Column::Id)).eq(Expr::col((
+                                projection::Entity,
+                                projection::Column::OperationId,
+                            ))),
+                        )
+                        .and_where(
+                            Expr::col((projection::Entity, projection::Column::ManifestId))
+                                .eq(&h.id),
+                        )
+                        .and_where(
+                            Expr::col((checkpoint::Entity, checkpoint::Column::ProofVersion)).ne(1),
+                        )
+                        .and_where(
+                            Expr::col((checkpoint::Entity, checkpoint::Column::Status))
+                                .eq("applied")
+                                .or(Expr::col((checkpoint::Entity, checkpoint::Column::Status))
+                                    .eq("retained")
+                                    .and(
+                                        Expr::col((operation::Entity, operation::Column::Status))
+                                            .eq("completed"),
+                                    )),
+                        )
+                        .limit(1)
+                        .to_owned(),
+                )
+                .await?;
+            if unsealed_public.is_some() {
+                tx.commit().await?;
+                return Ok(());
+            }
+            let transitions = layout::Entity::find()
+                .select_only()
+                .column(layout::Column::ManifestId)
+                .filter(
+                    Condition::any()
+                        .add(layout::Column::ManifestId.eq(&h.id))
+                        .add(layout::Column::Candidate.eq(&h.id)),
+                )
+                .filter(
+                    Condition::any()
+                        .add(layout::Column::Active.ne(1))
+                        .add(layout::Column::Pending.ne(0))
+                        .add(layout::Column::Failed.ne(0))
+                        .add(Expr::col(layout::Column::CopyNext).lt(Func::coalesce([
+                            Expr::col(layout::Column::CopyTo),
+                            Expr::val(0),
+                        ]))),
+                )
+                .into_tuple::<String>()
+                .one(&tx)
+                .await?;
+            if transitions.is_some() {
+                tx.commit().await?;
+                return Ok(());
+            }
+            history::Entity::update_many()
+                .col_expr(history::Column::Expired, Expr::val(1))
+                .filter(history::Column::Id.eq(&h.id))
+                .filter(history::Column::Expired.eq(0))
+                .filter(history::Column::Ready.eq(1))
+                .filter(
+                    Expr::col(history::Column::NextOrdinal)
+                        .eq(Expr::col(history::Column::MessageCount)),
+                )
+                .filter(
+                    Expr::col(history::Column::NextImport)
+                        .eq(Expr::col(history::Column::ImportCount)),
+                )
+                .exec(&tx)
+                .await?;
+            tx.commit().await?;
+            Ok(())
+        })
+        .await
 }
 
 /// Metadata-only geometry walk; no frozen payload is read. Complete headers
@@ -505,12 +900,29 @@ impl SweepPreparation {
         if !self.discovered {
             // Discover the entire known backing set, not only overlapping
             // ordinals: a corrupt logical layout protects its whole container.
-            let page=store.connection.query_all_raw(Statement::from_sql_and_values(DbBackend::Sqlite,"SELECT start,manifest_id FROM compaction_frozen_span WHERE source_manifest=?1 AND kind=?2 AND (start>?3 OR (start=?3 AND manifest_id>?4)) ORDER BY start,manifest_id LIMIT ?5",[self.key.manifest.clone().into(),self.key.kind.into(),self.after.0.into(),self.after.1.clone().into(),(META_ROWS as i64).into()])).await?;
-            for row in &page {
-                let start: i64 = row.try_get("", "start")?;
-                let id: String = row.try_get("", "manifest_id")?;
-                self.after = (start, id.clone());
-                self.checks.push_back(id);
+            let page = span::Entity::find()
+                .select_only()
+                .columns([span::Column::Start, span::Column::ManifestId])
+                .filter(span::Column::SourceManifest.eq(&self.key.manifest))
+                .filter(span::Column::Kind.eq(self.key.kind))
+                .filter(
+                    Condition::any()
+                        .add(span::Column::Start.gt(self.after.0))
+                        .add(
+                            Condition::all()
+                                .add(span::Column::Start.eq(self.after.0))
+                                .add(span::Column::ManifestId.gt(&self.after.1)),
+                        ),
+                )
+                .order_by_asc(span::Column::Start)
+                .order_by_asc(span::Column::ManifestId)
+                .limit(META_ROWS)
+                .into_tuple::<(i64, String)>()
+                .all(&store.connection)
+                .await?;
+            for (start, id) in &page {
+                self.after = (*start, id.clone());
+                self.checks.push_back(id.clone());
             }
             self.discovered = page.len() < META_ROWS as usize;
             return Ok(false);
@@ -570,6 +982,9 @@ pub(super) async fn delete_free_key<C: ConnectionTrait>(
     };
     let health = healthy("h");
     let unknown = unknown_predicate("p");
+    // Specialized SQLite physical retention DELETE: exact PK/bytes plus the
+    // direct/shared/pending/corrupt union, also used by duplicate-prefix cleanup.
+    // Keep this range predicate intact; ordinary discovery/markers are typed.
     let sql = format!(
         r#"DELETE FROM {data} AS d WHERE d.manifest_id=?1 AND d.ordinal=?2 AND d.bytes=?3
 AND length(CAST(d.{payload} AS BLOB))=d.bytes {import_key}
@@ -595,14 +1010,15 @@ AND NOT EXISTS(SELECT 1 FROM compaction_frozen_span s JOIN compaction_frozen_his
 }
 
 impl FrozenStorageLifetimeProgress {
-    /// Exactly one phase step. Payload reads are one fragment/page per step;
-    /// rotating keysets revisit previously held rows after roots disappear.
+    /// Exactly one bounded phase step. False means every discovery family has
+    /// completed this pass, not that one phase happened to be empty. Rotating
+    /// keysets revisit previously held rows on the next pass.
     pub async fn quantum(&mut self, store: &CrudStore) -> Result<bool> {
         let store = store.with_maintenance_access();
         let phase = self.phase;
         self.phase = (self.phase + 1) % 6;
-        if matches!(phase, 2 | 3 | 4) && !self.scope.done {
-            return Ok(false);
+        if self.pass_done[phase] || (matches!(phase, 2 | 3 | 4) && !self.scope.done) {
+            return Ok(true);
         }
         let result = match phase {
             0 => self.locator_quantum(&store).await,
@@ -634,7 +1050,17 @@ impl FrozenStorageLifetimeProgress {
                 _ => {}
             }
         }
-        result
+        let more = result?;
+        if !more {
+            self.pass_done[phase] = true;
+        }
+        if self.pass_done.iter().all(|done| *done) {
+            self.pass_done = [false; 6];
+            self.locator_done = [false; 4];
+            self.physical_done = [false; 2];
+            return Ok(false);
+        }
+        Ok(true)
     }
     pub(super) async fn conversion_scope(&mut self, store: &CrudStore) -> Result<bool> {
         if !self.scope.done {
@@ -652,15 +1078,24 @@ impl FrozenStorageLifetimeProgress {
         }
         let kind = self.locator_kind;
         self.locator_kind = (kind + 1) % 4;
+        if self.locator_done[kind] {
+            return Ok(true);
+        }
         let (table, key, field) = ROOTS[kind];
         if self.locator_pending[kind].is_empty() {
             // Page actual PK metadata, not a filtered LIMIT that could walk an
             // unbounded number of already-verified records in one read.
-            let page=store.connection.query_all_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-                format!("SELECT {key} AS id,workspace_id,frozen_manifest_id,CASE WHEN frozen_manifest_id='' THEN length(CAST({field} AS BLOB)) ELSE 0 END AS size FROM {table} WHERE {key}>?1 ORDER BY {key} LIMIT 64"),[self.locators[kind].clone().into()])).await?;
+            let query = Query::select().from(Alias::new(table))
+                .expr_as(Expr::col(Alias::new(key)), Alias::new("id"))
+                .columns([Alias::new("workspace_id"), Alias::new("frozen_manifest_id")])
+                .expr_as(Expr::cust(format!("CASE WHEN frozen_manifest_id='' THEN length(CAST({field} AS BLOB)) ELSE 0 END")), Alias::new("size"))
+                .and_where(Expr::col(Alias::new(key)).gt(&self.locators[kind]))
+                .order_by(Alias::new(key), Order::Asc).limit(META_ROWS).to_owned();
+            let page = store.connection.query_all(&query).await?;
             if page.is_empty() {
                 self.locators[kind].clear();
-                return Ok(false);
+                self.locator_done[kind] = true;
+                return Ok(!self.locator_done.iter().all(|done| *done));
             }
             for row in page {
                 let id: String = row.try_get("", "id")?;
@@ -707,8 +1142,51 @@ impl FrozenStorageLifetimeProgress {
         // Page headers before choosing public roots; no full filtered scan
         // when all old checkpoints have already been sealed.
         if self.proof_pending.is_empty() {
-            let page=store.connection.query_all_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-                "SELECT c.id,c.proof_version,c.status,o.status AS operation_status,b.operation_id AS bound FROM compaction_checkpoint c LEFT JOIN compaction_operation o ON o.id=c.operation_id AND o.owner=c.owner LEFT JOIN compaction_operation_projection b ON b.operation_id=c.operation_id WHERE c.id>?1 ORDER BY c.id LIMIT 64",[self.proof_after.clone().into()])).await?;
+            let query = Query::select()
+                .from(checkpoint::Entity)
+                .columns(
+                    [
+                        checkpoint::Column::Id,
+                        checkpoint::Column::ProofVersion,
+                        checkpoint::Column::Status,
+                    ]
+                    .map(|column| (checkpoint::Entity, column)),
+                )
+                .expr_as(
+                    Expr::col((operation::Entity, operation::Column::Status)),
+                    Alias::new("operation_status"),
+                )
+                .expr_as(
+                    Expr::col((projection::Entity, projection::Column::OperationId)),
+                    Alias::new("bound"),
+                )
+                .join(
+                    JoinType::LeftJoin,
+                    operation::Entity,
+                    Expr::col((operation::Entity, operation::Column::Id))
+                        .eq(Expr::col((
+                            checkpoint::Entity,
+                            checkpoint::Column::OperationId,
+                        )))
+                        .and(
+                            Expr::col((operation::Entity, operation::Column::Owner))
+                                .eq(Expr::col((checkpoint::Entity, checkpoint::Column::Owner))),
+                        ),
+                )
+                .join(
+                    JoinType::LeftJoin,
+                    projection::Entity,
+                    Expr::col((projection::Entity, projection::Column::OperationId)).eq(Expr::col(
+                        (checkpoint::Entity, checkpoint::Column::OperationId),
+                    )),
+                )
+                .and_where(
+                    Expr::col((checkpoint::Entity, checkpoint::Column::Id)).gt(&self.proof_after),
+                )
+                .order_by((checkpoint::Entity, checkpoint::Column::Id), Order::Asc)
+                .limit(META_ROWS)
+                .to_owned();
+            let page = store.connection.query_all(&query).await?;
             if page.is_empty() {
                 self.proof_after.clear();
                 return Ok(false);
@@ -742,9 +1220,17 @@ impl FrozenStorageLifetimeProgress {
             }
             return Ok(true);
         }
-        let row=store.connection.query_one_raw(Statement::from_sql_and_values(DbBackend::Sqlite,"SELECT id FROM compaction_frozen_history WHERE expired=0 AND ready=1 AND id>?1 ORDER BY id LIMIT 1",[self.expiry_after.clone().into()])).await?;
-        if let Some(row) = row {
-            let id: String = row.try_get("", "id")?;
+        let row = history::Entity::find()
+            .select_only()
+            .column(history::Column::Id)
+            .filter(history::Column::Expired.eq(0))
+            .filter(history::Column::Ready.eq(1))
+            .filter(history::Column::Id.gt(&self.expiry_after))
+            .order_by_asc(history::Column::Id)
+            .into_tuple::<String>()
+            .one(&store.connection)
+            .await?;
+        if let Some(id) = row {
             self.expiry_after = id.clone();
             let header = history::Entity::find_by_id(&id)
                 .one(&store.connection)
@@ -767,6 +1253,9 @@ impl FrozenStorageLifetimeProgress {
         }
         let kind = self.physical_kind;
         self.physical_kind = (kind + 1) % 2;
+        if self.physical_done[kind] {
+            return Ok(true);
+        }
         let table = if kind == 0 {
             "compaction_frozen_message_data"
         } else {
@@ -779,16 +1268,33 @@ impl FrozenStorageLifetimeProgress {
         } else {
             "reference_json"
         };
-        let (predicate, values) = if self.physical_after[kind].is_some() {
-            (
-                "(manifest_id,ordinal)>(?1,?2)",
-                vec![manifest.into(), ordinal.into()],
-            )
-        } else {
-            ("1", vec![])
-        };
-        let row=store.connection.query_one_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-            format!("SELECT manifest_id,ordinal,bytes,{extra} AS message_ordinal,length(CAST({field} AS BLOB)) AS actual_bytes FROM {table} WHERE {predicate} ORDER BY manifest_id,ordinal LIMIT 1"),values)).await?;
+        let mut query = Query::select();
+        query
+            .from(Alias::new(table))
+            .columns([
+                Alias::new("manifest_id"),
+                Alias::new("ordinal"),
+                Alias::new("bytes"),
+            ])
+            .expr_as(Expr::cust(extra), Alias::new("message_ordinal"))
+            .expr_as(
+                Expr::cust(format!("length(CAST({field} AS BLOB))")),
+                Alias::new("actual_bytes"),
+            );
+        if self.physical_after[kind].is_some() {
+            query.and_where(
+                Expr::tuple([
+                    Expr::col(Alias::new("manifest_id")),
+                    Expr::col(Alias::new("ordinal")),
+                ])
+                .gt(Expr::tuple([Expr::val(manifest), Expr::val(ordinal)])),
+            );
+        }
+        query
+            .order_by(Alias::new("manifest_id"), Order::Asc)
+            .order_by(Alias::new("ordinal"), Order::Asc)
+            .limit(1);
+        let row = store.connection.query_one(&query).await?;
         if let Some(row) = row {
             let manifest: String = row.try_get("", "manifest_id")?;
             let ordinal: i64 = row.try_get("", "ordinal")?;
@@ -810,7 +1316,8 @@ impl FrozenStorageLifetimeProgress {
             Ok(true)
         } else {
             self.physical_after[kind] = None;
-            Ok(false)
+            self.physical_done[kind] = true;
+            Ok(!self.physical_done.iter().all(|done| *done))
         }
     }
     async fn discard_quantum(&mut self, store: &CrudStore) -> Result<bool> {
@@ -827,14 +1334,75 @@ impl FrozenStorageLifetimeProgress {
             self.discard = None;
             return Ok(true);
         }
-        let row=store.connection.query_one_raw(Statement::from_sql_and_values(DbBackend::Sqlite,r#"
-SELECT c.id,c.owner,c.operation_id,c.identity_sha256,o.status,r.generation,r.state,b.manifest_id
-FROM compaction_checkpoint c JOIN compaction_operation o ON o.id=c.operation_id AND o.owner=c.owner
-JOIN compaction_operation_projection b ON b.operation_id=o.id JOIN compaction_frozen_history h ON h.id=b.manifest_id
-JOIN compaction_runner_state r ON r.operation_id=o.id
-WHERE c.id>?1 AND h.expired=1 AND o.status IN ('failed','cancelled','stale') AND c.status<>'applied'
- AND length(CAST(r.state AS BLOB))<=?2
-ORDER BY c.id LIMIT 1"#,[self.discard_after.clone().into(),(256_i64*1024).into()])).await?;
+        let row = store
+            .connection
+            .query_one(
+                &Query::select()
+                    .from(checkpoint::Entity)
+                    .column((checkpoint::Entity, checkpoint::Column::Id))
+                    .column((operation::Entity, operation::Column::Status))
+                    .columns(
+                        [runner::Column::Generation, runner::Column::State]
+                            .map(|c| (runner::Entity, c)),
+                    )
+                    .column((projection::Entity, projection::Column::ManifestId))
+                    .join(
+                        JoinType::InnerJoin,
+                        operation::Entity,
+                        Expr::col((operation::Entity, operation::Column::Id))
+                            .eq(Expr::col((
+                                checkpoint::Entity,
+                                checkpoint::Column::OperationId,
+                            )))
+                            .and(
+                                Expr::col((operation::Entity, operation::Column::Owner))
+                                    .eq(Expr::col((checkpoint::Entity, checkpoint::Column::Owner))),
+                            ),
+                    )
+                    .join(
+                        JoinType::InnerJoin,
+                        projection::Entity,
+                        Expr::col((projection::Entity, projection::Column::OperationId))
+                            .eq(Expr::col((operation::Entity, operation::Column::Id))),
+                    )
+                    .join(
+                        JoinType::InnerJoin,
+                        history::Entity,
+                        Expr::col((history::Entity, history::Column::Id)).eq(Expr::col((
+                            projection::Entity,
+                            projection::Column::ManifestId,
+                        ))),
+                    )
+                    .join(
+                        JoinType::InnerJoin,
+                        runner::Entity,
+                        Expr::col((runner::Entity, runner::Column::OperationId))
+                            .eq(Expr::col((operation::Entity, operation::Column::Id))),
+                    )
+                    .and_where(
+                        Expr::col((checkpoint::Entity, checkpoint::Column::Id))
+                            .gt(&self.discard_after),
+                    )
+                    .and_where(Expr::col((history::Entity, history::Column::Expired)).eq(1))
+                    .and_where(
+                        Expr::col((operation::Entity, operation::Column::Status)).is_in([
+                            "failed",
+                            "cancelled",
+                            "stale",
+                        ]),
+                    )
+                    .and_where(
+                        Expr::col((checkpoint::Entity, checkpoint::Column::Status)).ne("applied"),
+                    )
+                    .and_where(
+                        Expr::cust("length(CAST(compaction_runner_state.state AS BLOB))")
+                            .lte(256_i64 * 1024),
+                    )
+                    .order_by((checkpoint::Entity, checkpoint::Column::Id), Order::Asc)
+                    .limit(1)
+                    .to_owned(),
+            )
+            .await?;
         let Some(row) = row else {
             self.discard_after.clear();
             return Ok(false);
@@ -890,33 +1458,136 @@ impl DiscardPreparation {
                 "length(CAST(source_thread AS BLOB))+length(CAST(source_scope AS BLOB))+length(CAST(source_id AS BLOB))+length(CAST(source_version AS BLOB))+length(CAST(role AS BLOB))",
             ),
         ] {
-            if let Some(row)=store.connection.query_one_raw(Statement::from_sql_and_values(DbBackend::Sqlite,format!("SELECT rowid AS key,{size} AS bytes FROM {table} WHERE checkpoint_id=?1 ORDER BY rowid LIMIT 1"),[self.id.clone().into()])).await? {
-                let bytes:i64=row.try_get("","bytes")?;
-                ensure!((0..=1024*1024).contains(&bytes),"staging row size unsupported");
-                if total+bytes<=1024*1024 { total+=bytes; keys.push((table,row.try_get::<i64>("","key")?,size,bytes)); }
-            }
-        }
-        store.run_serialized_write(||async{
-            let tx=store.connection.begin().await?;
-            if store.frozen_readers.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains_key(&self.manifest){tx.commit().await?;return Ok(());}
-            let eligible=tx.query_one_raw(Statement::from_sql_and_values(DbBackend::Sqlite,r#"
-SELECT 1 FROM compaction_checkpoint c JOIN compaction_operation o ON o.id=c.operation_id
-JOIN compaction_runner_state r ON r.operation_id=o.id JOIN compaction_operation_projection b ON b.operation_id=o.id
-JOIN compaction_frozen_history h ON h.id=b.manifest_id
-WHERE c.id=?1 AND c.status<>'applied' AND o.status=?2 AND r.generation IS ?3 AND h.id=?4 AND h.expired=1
-AND NOT EXISTS(SELECT 1 FROM compaction_checkpoint p WHERE p.previous=c.id)
-AND NOT EXISTS(SELECT 1 FROM compaction_coverage v WHERE v.source_id=c.id AND v.source_scope LIKE 'checkpoint:%')
-LIMIT 1"#,[self.id.clone().into(),self.status.clone().into(),self.generation.into(),self.manifest.clone().into()])).await?;
-            if eligible.is_some(){
-                // Demote first, commit the marker and bounded rows atomically.
-                // A crash can leave marker 0, never ready over partial proofs.
-                tx.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,"UPDATE compaction_checkpoint SET proof_version=0 WHERE id=?1 AND proof_version=1",[self.id.clone().into()])).await?;
-                for (table,key,size,bytes) in &keys {
-                    tx.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,format!("DELETE FROM {table} WHERE checkpoint_id=?1 AND rowid=?2 AND ({size})=?3"),[self.id.clone().into(),(*key).into(),(*bytes).into()])).await?;
+            let row = store
+                .connection
+                .query_one(
+                    &Query::select()
+                        .from(Alias::new(table))
+                        .expr_as(Expr::col(Alias::new("rowid")), Alias::new("key"))
+                        .expr_as(Expr::cust(size), Alias::new("bytes"))
+                        .and_where(Expr::col(Alias::new("checkpoint_id")).eq(&self.id))
+                        .order_by(Alias::new("rowid"), Order::Asc)
+                        .limit(1)
+                        .to_owned(),
+                )
+                .await?;
+            if let Some(row) = row {
+                let bytes: i64 = row.try_get("", "bytes")?;
+                ensure!(
+                    (0..=1024 * 1024).contains(&bytes),
+                    "staging row size unsupported"
+                );
+                if total + bytes <= 1024 * 1024 {
+                    total += bytes;
+                    keys.push((table, row.try_get::<i64>("", "key")?, size, bytes));
                 }
             }
-            tx.commit().await?;Ok(())
-        }).await?;
+        }
+        store
+            .run_serialized_write(|| async {
+                let tx = store.connection.begin().await?;
+                if store
+                    .frozen_readers
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .contains_key(&self.manifest)
+                {
+                    tx.commit().await?;
+                    return Ok(());
+                }
+                let incoming_previous = checkpoint::Entity::find()
+                    .select_only()
+                    .column(checkpoint::Column::Id)
+                    .filter(checkpoint::Column::Previous.eq(&self.id))
+                    .into_query();
+                let incoming_foreign = coverage::Entity::find()
+                    .select_only()
+                    .column(coverage::Column::CheckpointId)
+                    .filter(coverage::Column::SourceId.eq(&self.id))
+                    .filter(coverage::Column::SourceScope.like("checkpoint:%"))
+                    .into_query();
+                let mut eligible = Query::select();
+                eligible
+                    .expr(Expr::val(1))
+                    .from(checkpoint::Entity)
+                    .join(
+                        JoinType::InnerJoin,
+                        operation::Entity,
+                        Expr::col((operation::Entity, operation::Column::Id)).eq(Expr::col((
+                            checkpoint::Entity,
+                            checkpoint::Column::OperationId,
+                        ))),
+                    )
+                    .join(
+                        JoinType::InnerJoin,
+                        runner::Entity,
+                        Expr::col((runner::Entity, runner::Column::OperationId))
+                            .eq(Expr::col((operation::Entity, operation::Column::Id))),
+                    )
+                    .join(
+                        JoinType::InnerJoin,
+                        projection::Entity,
+                        Expr::col((projection::Entity, projection::Column::OperationId))
+                            .eq(Expr::col((operation::Entity, operation::Column::Id))),
+                    )
+                    .join(
+                        JoinType::InnerJoin,
+                        history::Entity,
+                        Expr::col((history::Entity, history::Column::Id)).eq(Expr::col((
+                            projection::Entity,
+                            projection::Column::ManifestId,
+                        ))),
+                    )
+                    .and_where(Expr::col((checkpoint::Entity, checkpoint::Column::Id)).eq(&self.id))
+                    .and_where(
+                        Expr::col((checkpoint::Entity, checkpoint::Column::Status)).ne("applied"),
+                    )
+                    .and_where(
+                        Expr::col((operation::Entity, operation::Column::Status)).eq(&self.status),
+                    )
+                    .and_where(Expr::col((history::Entity, history::Column::Id)).eq(&self.manifest))
+                    .and_where(Expr::col((history::Entity, history::Column::Expired)).eq(1))
+                    .and_where(Expr::exists(incoming_previous).not())
+                    .and_where(Expr::exists(incoming_foreign).not());
+                match self.generation {
+                    Some(generation) => {
+                        eligible.and_where(
+                            Expr::col((runner::Entity, runner::Column::Generation)).eq(generation),
+                        );
+                    }
+                    None => {
+                        eligible.and_where(
+                            Expr::col((runner::Entity, runner::Column::Generation)).is_null(),
+                        );
+                    }
+                }
+                eligible.limit(1);
+                let eligible = tx.query_one(&eligible).await?;
+                if eligible.is_some() {
+                    // Demote first, commit the marker and bounded rows atomically.
+                    // A crash can leave marker 0, never ready over partial proofs.
+                    checkpoint::Entity::update_many()
+                        .col_expr(checkpoint::Column::ProofVersion, Expr::val(0))
+                        .filter(checkpoint::Column::Id.eq(&self.id))
+                        .filter(checkpoint::Column::ProofVersion.eq(1))
+                        .exec(&tx)
+                        .await?;
+                    for (table, key, size, bytes) in &keys {
+                        tx.execute(
+                            &Query::delete()
+                                .from_table(Alias::new(*table))
+                                .and_where(Expr::col(Alias::new("checkpoint_id")).eq(&self.id))
+                                .and_where(Expr::col(Alias::new("rowid")).eq(*key))
+                                .and_where(Expr::cust(*size).eq(*bytes))
+                                .to_owned(),
+                        )
+                        .await?;
+                    }
+                }
+                tx.commit().await?;
+                Ok(())
+            })
+            .await?;
         Ok(())
     }
 }
@@ -938,48 +1609,41 @@ impl ScopeDiscovery {
         if self.done {
             return Ok(false);
         }
-        let sql = match self.family {
-            0 => {
-                "SELECT id AS manifest_id,0 AS kind FROM compaction_frozen_history WHERE id>?1 ORDER BY id LIMIT 1"
-            }
-            1 => {
-                "SELECT manifest_id,kind FROM compaction_frozen_layout WHERE manifest_id>?1 OR (manifest_id=?1 AND kind>?2) ORDER BY manifest_id,kind LIMIT 1"
-            }
-            2 => {
-                "SELECT manifest_id,0 AS kind FROM compaction_frozen_message_data WHERE manifest_id>?1 ORDER BY manifest_id,ordinal LIMIT 1"
-            }
-            3 => {
-                "SELECT manifest_id,1 AS kind FROM compaction_frozen_import_data WHERE manifest_id>?1 ORDER BY manifest_id,ordinal LIMIT 1"
-            }
-            4 => {
-                "SELECT id AS manifest_id,0 AS kind FROM compaction_operation WHERE id>?1 ORDER BY id LIMIT 1"
-            }
-            _ => {
-                "SELECT id AS manifest_id,0 AS kind FROM compaction_checkpoint WHERE id>?1 ORDER BY id LIMIT 1"
-            }
+        let (table, key) = match self.family {
+            0 => ("compaction_frozen_history", "id"),
+            1 => ("compaction_frozen_layout", "manifest_id"),
+            2 => ("compaction_frozen_message_data", "manifest_id"),
+            3 => ("compaction_frozen_import_data", "manifest_id"),
+            4 => ("compaction_operation", "id"),
+            _ => ("compaction_checkpoint", "id"),
         };
-        let sql = if !self.started {
-            sql.replace("WHERE id>?1", "WHERE ?1 IS NOT NULL")
-                .replace(
-                    "WHERE manifest_id>?1 OR (manifest_id=?1 AND kind>?2)",
-                    "WHERE ?1 IS NOT NULL AND ?2 IS NOT NULL",
-                )
-                .replace("WHERE manifest_id>?1", "WHERE ?1 IS NOT NULL")
-        } else {
-            sql.to_owned()
-        };
-        let mut values = vec![self.after.clone().into()];
+        let mut query = Query::select();
+        query
+            .from(Alias::new(table))
+            .expr_as(Expr::col(Alias::new(key)), Alias::new("manifest_id"));
         if self.family == 1 {
-            values.push(self.kind.into());
+            query.column(Alias::new("kind"));
+        } else {
+            query.expr_as(Expr::val(i64::from(self.family == 3)), Alias::new("kind"));
         }
-        let row = store
-            .connection
-            .query_one_raw(Statement::from_sql_and_values(
-                DbBackend::Sqlite,
-                sql,
-                values,
-            ))
-            .await?;
+        if self.started {
+            let mut after = Expr::col(Alias::new(key)).gt(&self.after);
+            if self.family == 1 {
+                after = after.or(Expr::col(Alias::new(key))
+                    .eq(&self.after)
+                    .and(Expr::col(Alias::new("kind")).gt(self.kind)));
+            }
+            query.and_where(after);
+        }
+        query.order_by(Alias::new(key), Order::Asc);
+        if self.family == 1 {
+            query.order_by(Alias::new("kind"), Order::Asc);
+        }
+        if matches!(self.family, 2 | 3) {
+            query.order_by(Alias::new("ordinal"), Order::Asc);
+        }
+        query.limit(1);
+        let row = store.connection.query_one(&query).await?;
         let Some(row) = row else {
             self.family += 1;
             self.after.clear();
@@ -993,21 +1657,51 @@ impl ScopeDiscovery {
         let id: String = row.try_get("", "manifest_id")?;
         let kind: i64 = row.try_get("", "kind")?;
         if self.family >= 4 {
-            let sql = if self.family == 4 {
-                "SELECT x.workspace_id FROM compaction_operation o JOIN compaction_context x ON x.owner=o.owner WHERE o.id=?1 AND x.workspace_id<>'' UNION ALL SELECT h.workspace_id FROM compaction_operation_projection b JOIN compaction_frozen_history h ON h.id=b.manifest_id WHERE b.operation_id=?1 AND h.workspace_id<>'' LIMIT 1"
+            let node = Alias::new("node");
+            let mut scoped = Query::select();
+            let mut bound = Query::select();
+            if self.family == 4 {
+                scoped.from_as(operation::Entity, node.clone());
+                bound
+                    .from(projection::Entity)
+                    .and_where(projection::Column::OperationId.eq(&id));
             } else {
-                "SELECT x.workspace_id FROM compaction_checkpoint c JOIN compaction_context x ON x.owner=c.owner WHERE c.id=?1 AND x.workspace_id<>'' UNION ALL SELECT h.workspace_id FROM compaction_checkpoint c JOIN compaction_operation_projection b ON b.operation_id=c.operation_id JOIN compaction_frozen_history h ON h.id=b.manifest_id WHERE c.id=?1 AND h.workspace_id<>'' LIMIT 1"
-            };
+                scoped.from_as(checkpoint::Entity, node.clone());
+                bound
+                    .from(checkpoint::Entity)
+                    .join(
+                        JoinType::InnerJoin,
+                        projection::Entity,
+                        Expr::col((projection::Entity, projection::Column::OperationId)).eq(
+                            Expr::col((checkpoint::Entity, checkpoint::Column::OperationId)),
+                        ),
+                    )
+                    .and_where(Expr::col((checkpoint::Entity, checkpoint::Column::Id)).eq(&id));
+            }
+            scoped
+                .column((context::Entity, context::Column::WorkspaceId))
+                .join(
+                    JoinType::InnerJoin,
+                    context::Entity,
+                    Expr::col((context::Entity, context::Column::Owner))
+                        .eq(Expr::col((node.clone(), Alias::new("owner")))),
+                )
+                .and_where(Expr::col((node, Alias::new("id"))).eq(&id))
+                .and_where(Expr::col((context::Entity, context::Column::WorkspaceId)).ne(""));
+            bound
+                .column((history::Entity, history::Column::WorkspaceId))
+                .join(
+                    JoinType::InnerJoin,
+                    history::Entity,
+                    Expr::col((history::Entity, history::Column::Id)).eq(Expr::col((
+                        projection::Entity,
+                        projection::Column::ManifestId,
+                    ))),
+                )
+                .and_where(Expr::col((history::Entity, history::Column::WorkspaceId)).ne(""));
+            scoped.union(UnionType::All, bound).limit(1);
             ensure!(
-                store
-                    .connection
-                    .query_one_raw(Statement::from_sql_and_values(
-                        DbBackend::Sqlite,
-                        sql,
-                        [id.clone().into()]
-                    ))
-                    .await?
-                    .is_some(),
+                store.connection.query_one(&scoped).await?.is_some(),
                 "legacy operation/checkpoint scope unknown; cleanup waits for repair"
             );
             self.after = id;
@@ -1015,13 +1709,54 @@ impl ScopeDiscovery {
             self.started = true;
             return Ok(true);
         }
-        let known=store.connection.query_one_raw(Statement::from_sql_and_values(DbBackend::Sqlite,r#"
-SELECT h.workspace_id FROM compaction_frozen_history h WHERE h.id=?1 AND h.workspace_id<>''
-UNION ALL SELECT h.workspace_id FROM compaction_frozen_layout l JOIN compaction_frozen_history h ON h.id=l.manifest_id WHERE l.candidate=?1 AND h.workspace_id<>''
-UNION ALL SELECT h.workspace_id FROM compaction_frozen_layout l JOIN compaction_frozen_history h ON h.id=l.candidate WHERE l.manifest_id=?1 AND h.workspace_id<>''
-UNION ALL SELECT h.workspace_id FROM compaction_frozen_span s JOIN compaction_frozen_history h ON h.id=s.manifest_id WHERE s.source_manifest=?1 AND h.workspace_id<>''
-UNION ALL SELECT h.workspace_id FROM compaction_frozen_span s JOIN compaction_frozen_history h ON h.id=s.source_manifest WHERE s.manifest_id=?1 AND h.workspace_id<>''
-LIMIT 1"#,[id.clone().into()])).await?;
+        let mut known = Query::select();
+        known
+            .column((history::Entity, history::Column::WorkspaceId))
+            .from(history::Entity)
+            .and_where(history::Column::Id.eq(&id))
+            .and_where(history::Column::WorkspaceId.ne(""));
+        for reverse in [false, true] {
+            let (to, predicate) = if reverse {
+                (layout::Column::Candidate, layout::Column::ManifestId)
+            } else {
+                (layout::Column::ManifestId, layout::Column::Candidate)
+            };
+            let branch = Query::select()
+                .column((history::Entity, history::Column::WorkspaceId))
+                .from(layout::Entity)
+                .join(
+                    JoinType::InnerJoin,
+                    history::Entity,
+                    Expr::col((history::Entity, history::Column::Id))
+                        .eq(Expr::col((layout::Entity, to))),
+                )
+                .and_where(Expr::col((layout::Entity, predicate)).eq(&id))
+                .and_where(Expr::col((history::Entity, history::Column::WorkspaceId)).ne(""))
+                .to_owned();
+            known.union(UnionType::All, branch);
+        }
+        for reverse in [false, true] {
+            let (header, predicate) = if reverse {
+                (span::Column::SourceManifest, span::Column::ManifestId)
+            } else {
+                (span::Column::ManifestId, span::Column::SourceManifest)
+            };
+            let branch = Query::select()
+                .column((history::Entity, history::Column::WorkspaceId))
+                .from(span::Entity)
+                .join(
+                    JoinType::InnerJoin,
+                    history::Entity,
+                    Expr::col((history::Entity, history::Column::Id))
+                        .eq(Expr::col((span::Entity, header))),
+                )
+                .and_where(Expr::col((span::Entity, predicate)).eq(&id))
+                .and_where(Expr::col((history::Entity, history::Column::WorkspaceId)).ne(""))
+                .to_owned();
+            known.union(UnionType::All, branch);
+        }
+        known.limit(1);
+        let known = store.connection.query_one(&known).await?;
         ensure!(
             known.is_some(),
             "legacy frozen dependency scope unknown; cleanup waits for repair"
@@ -1045,7 +1780,23 @@ mod tests {
     use sea_orm::Database;
     use sha2::{Digest, Sha256};
     async fn fixture(published: bool) -> (CrudStore, FrozenHistoryRef) {
-        let db = Database::connect("sqlite::memory:").await.unwrap();
+        let mut options = sea_orm::ConnectOptions::new("sqlite::memory:");
+        options.max_connections(1).min_connections(1);
+        let db = sea_orm::Database::connect(options).await.unwrap();
+        db.execute_unprepared("PRAGMA foreign_keys=OFF")
+            .await
+            .unwrap();
+        let pragma: i64 = db
+            .query_one_raw(Statement::from_string(
+                DbBackend::Sqlite,
+                "PRAGMA foreign_keys",
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get("", "foreign_keys")
+            .unwrap();
+        assert_eq!(pragma, 0, "production single writer uses FK OFF");
         Migrator::up(&db, None).await.unwrap();
         for sql in [
             "INSERT INTO workspace(id,name,is_active,is_current) VALUES('ws','fixture',1,1)",
@@ -1199,6 +1950,109 @@ mod tests {
         panic!("bounded expiry preparation must finish");
     }
     #[tokio::test]
+    async fn empty_phase_and_completed_scope_are_not_idle_while_lifetime_work_is_pending() {
+        let (store, _) = fixture(true).await;
+        let mut progress = FrozenStorageLifetimeProgress::default();
+        progress.scope.done = true;
+        progress.phase = 5;
+        assert!(
+            progress.quantum(&store).await.unwrap(),
+            "completed scope is only one family's EOF"
+        );
+        let mut idle = false;
+        for _ in 0..10_000 {
+            if !progress.quantum(&store).await.unwrap() {
+                idle = true;
+                assert!(
+                    progress.proof.is_none()
+                        && progress.expiry.is_none()
+                        && progress.sweep.is_none()
+                        && progress.discard.is_none()
+                );
+                assert!(
+                    progress
+                        .locator_pending
+                        .iter()
+                        .all(|pending| pending.is_empty())
+                );
+                break;
+            }
+        }
+        assert!(
+            idle,
+            "held metadata must eventually reach a full bounded discovery EOF"
+        );
+        assert_eq!(
+            value(&store, "compaction_checkpoint_event_input", "cp-1").await,
+            1
+        );
+        let h = history::Entity::find_by_id("origin")
+            .one(&store.connection)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(h.expired, 1);
+        assert!(
+            progress.quantum(&store).await.unwrap(),
+            "idle bits reset for cyclic held-key revisit"
+        );
+    }
+
+    #[tokio::test]
+    async fn fk_off_orphan_checkpoint_header_scope_and_malformed_edges_fail_closed() {
+        for corruption in ["operation", "header", "scope", "dependency"] {
+            let (store, h) = fixture(true).await;
+            let sql = match corruption {
+                "operation" => "DELETE FROM compaction_operation WHERE id='op'",
+                "header" => "DELETE FROM compaction_frozen_history WHERE id='origin'",
+                "scope" => "DELETE FROM compaction_context WHERE owner='owner'",
+                _ => "UPDATE compaction_checkpoint SET previous='missing' WHERE id='cp-1'",
+            };
+            store.connection.execute_unprepared(sql).await.unwrap();
+            let mut graph = checkpoint_proofs::GraphPreparation::new("cp-1");
+            let mut refused = false;
+            for _ in 0..500 {
+                if graph.step(&store).await.is_err() {
+                    refused = true;
+                    break;
+                }
+                if graph.finished() {
+                    break;
+                }
+            }
+            assert!(
+                refused,
+                "{corruption}: explicit graph/identity checks must reject without FK enforcement"
+            );
+            drop(graph);
+            if corruption == "header" {
+                assert!(store.acquire_frozen_header("ws", &h).await.is_err());
+            }
+            let bytes:i64 = store.connection.query_one_raw(Statement::from_string(DbBackend::Sqlite,
+                "SELECT bytes FROM compaction_frozen_message_data WHERE manifest_id='origin' AND ordinal=0"))
+                .await.unwrap().unwrap().try_get("","bytes").unwrap();
+            delete_key(
+                &store,
+                &PhysicalKey {
+                    manifest: h.manifest_id.clone(),
+                    kind: 0,
+                    ordinal: 0,
+                    bytes,
+                },
+            )
+            .await
+            .unwrap();
+            let n:i64 = store.connection.query_one_raw(Statement::from_string(DbBackend::Sqlite,"SELECT count(*) AS n FROM compaction_frozen_message_data WHERE manifest_id='origin'"))
+                .await.unwrap().unwrap().try_get("","n").unwrap();
+            assert_eq!(n, 2, "refusal preserves actual frozen payloads");
+            assert_eq!(
+                value(&store, "compaction_checkpoint_event_input", "cp-1").await,
+                0
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn cancelled_queued_acquire_never_registers_a_late_reader() {
         let (store, h) = fixture(false).await;
         let held = store.connection.begin().await.unwrap();
@@ -1225,7 +2079,23 @@ mod tests {
     #[tokio::test]
     async fn fragment_scan_cas_checks_real_replacement_recreate_and_metadata_orders() {
         for mutation in ["replace", "recreate", "metadata"] {
-            let db = Database::connect("sqlite::memory:").await.unwrap();
+            let mut options = sea_orm::ConnectOptions::new("sqlite::memory:");
+            options.max_connections(1).min_connections(1);
+            let db = Database::connect(options).await.unwrap();
+            db.execute_unprepared("PRAGMA foreign_keys=OFF")
+                .await
+                .unwrap();
+            let pragma: i64 = db
+                .query_one_raw(Statement::from_string(
+                    DbBackend::Sqlite,
+                    "PRAGMA foreign_keys",
+                ))
+                .await
+                .unwrap()
+                .unwrap()
+                .try_get("", "foreign_keys")
+                .unwrap();
+            assert_eq!(pragma, 0, "production single writer uses FK OFF");
             Migrator::up(&db, Some((Migrator::migrations().len() - 1) as u32))
                 .await
                 .unwrap();

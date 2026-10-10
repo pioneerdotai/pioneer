@@ -1708,18 +1708,18 @@ pub(crate) async fn compaction_runner_transition(
             }
             if let Some(cp) = candidate {
                 let portion = i64::try_from(next.attempts)?;
-                txn.execute_raw(sea_orm::Statement::from_sql_and_values(
-                    sea_orm::DbBackend::Sqlite,
-                    "UPDATE compaction_operation SET next_portion=max(next_portion,?2) WHERE id=?1",
-                    [
-                        cp.operation_id.clone().into(),
-                        portion
-                            .checked_add(1)
-                            .ok_or_else(|| anyhow::anyhow!("candidate portion overflow"))?
-                            .into(),
-                    ],
-                ))
-                .await?;
+                let next_portion = portion
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow::anyhow!("candidate portion overflow"))?;
+                compaction_operation::Entity::update_many()
+                    .col_expr(
+                        compaction_operation::Column::NextPortion,
+                        Expr::val(next_portion),
+                    )
+                    .filter(compaction_operation::Column::Id.eq(&cp.operation_id))
+                    .filter(compaction_operation::Column::NextPortion.lt(next_portion))
+                    .exec(&txn)
+                    .await?;
             }
 
             if let Some(query) = &identity_query {
@@ -2328,9 +2328,18 @@ pub(crate) async fn compaction_apply_runner(
                 txn.rollback().await?;
                 return Ok(super::compaction::CommitOutcome::Stale);
             }
-            let proof_ready = txn.query_one_raw(Statement::from_sql_and_values(sea_orm::DbBackend::Sqlite,
-                "SELECT 1 FROM compaction_checkpoint WHERE id=?1 AND operation_id=?2 AND proof_version=1 LIMIT 1",[checkpoint.clone().into(),operation.into()])).await?;
-            if proof_ready.is_none() { txn.rollback().await?; return Ok(super::compaction::CommitOutcome::Stale); }
+            let proof_ready = compaction_checkpoint::Entity::find_by_id(checkpoint)
+                .select_only()
+                .column(compaction_checkpoint::Column::Id)
+                .filter(compaction_checkpoint::Column::OperationId.eq(operation))
+                .filter(compaction_checkpoint::Column::ProofVersion.eq(1))
+                .into_tuple::<String>()
+                .one(&txn)
+                .await?;
+            if proof_ready.is_none() {
+                txn.rollback().await?;
+                return Ok(super::compaction::CommitOutcome::Stale);
+            }
 
             let changed = compaction_context::Entity::update_many()
                 .col_expr(

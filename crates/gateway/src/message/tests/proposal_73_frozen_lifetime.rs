@@ -5,7 +5,7 @@ use pioneer_compaction::{
     ModelSelection, OperationSnapshot, SourceRef, Transport,
 };
 use pioneer_crud::compaction::{ManifestEntry, PagedSource, frozen_import_identity};
-use sea_orm::{ConnectionTrait, DbBackend, Statement};
+use sea_orm::{ConnectionTrait, DbBackend, Statement, TransactionTrait};
 use sha2::{Digest, Sha256};
 
 struct Fits;
@@ -35,6 +35,7 @@ impl crate::compaction::CompactionObserver for Silent {
     }
 }
 struct FrozenFixture {
+    _directory: tempfile::TempDir,
     h: Phase13CompactionHarness,
     origin: pioneer_compaction::frozen::FrozenHistoryRef,
     checkpoint: String,
@@ -137,6 +138,7 @@ async fn delivery(h: &Phase13CompactionHarness, id: &str, thread: &str, turn: &s
 #[derive(Clone, Copy)]
 enum CorrectionFixture {
     Normal,
+    WorkerLegacy,
     Aggregate { legacy: bool },
     UnderstatedOutput { shared: bool },
 }
@@ -149,7 +151,39 @@ async fn fixture_with_correction(mode: CorrectionFixture) -> FrozenFixture {
             .with_valid_summary_completion()
             .with_summary_marker("P73 PERMANENT SUMMARY"),
     );
-    let h = setup_phase_13_compaction_harness(phase_13_provider_registry(provider.clone())).await;
+    let (directory, workspace_manager, crud_store, workspace_id) =
+        setup_pooled_file_workspace_manager().await;
+    let processor = Arc::new(MessageProcessor::new(
+        Arc::new(ThreadManager::new("test-model", "openai")),
+        phase_13_provider_registry(provider.clone()),
+        Arc::new(SessionManager::new()),
+        workspace_manager,
+        crud_store.clone(),
+        test_gateway_secrets(),
+        phase_13_summary_config(),
+        test_tool_loop_config(),
+    ));
+    let h = Phase13CompactionHarness {
+        processor,
+        crud_store,
+        workspace_id,
+    };
+    let tx = h.crud_store.database_connection().begin().await.unwrap();
+    let pragma: i64 = tx
+        .query_one_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "PRAGMA foreign_keys",
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "foreign_keys")
+        .unwrap();
+    assert_eq!(
+        pragma, 0,
+        "lifetime/proof fixtures use the production writer FK policy"
+    );
+    tx.commit().await.unwrap();
     materialize(
         &h,
         "p73-source",
@@ -278,6 +312,12 @@ async fn fixture_with_correction(mode: CorrectionFixture) -> FrozenFixture {
                 .sum::<usize>()
                 > pioneer_crud::compaction::SOURCE_PAGE_BYTES
         );
+    }
+    if matches!(mode, CorrectionFixture::WorkerLegacy) {
+        // Automatic conversion is active too. Give the origin a distinct first
+        // unit (before computing its identity) so the retained output cannot
+        // legitimately borrow this origin's physical prefix during the test.
+        refs[0].unit_id = format!("worker-origin:{}", refs[0].unit_id);
     }
     let mut digest = Sha256::new();
     for reference in &refs {
@@ -564,13 +604,17 @@ async fn fixture_with_correction(mode: CorrectionFixture) -> FrozenFixture {
             drop(hold);
             drop(imports);
             return FrozenFixture {
+                _directory: directory,
                 h,
                 origin,
                 checkpoint: cp.id,
                 output,
             };
         }
-        if matches!(mode, CorrectionFixture::Aggregate { legacy: true }) {
+        if matches!(
+            mode,
+            CorrectionFixture::Aggregate { legacy: true } | CorrectionFixture::WorkerLegacy
+        ) {
             // Persisted pre-upgrade publication, before proof_version existed.
             let applied = commit.applied(&cp.id).unwrap();
             db.execute_raw(Statement::from_sql_and_values(
@@ -605,31 +649,33 @@ async fn fixture_with_correction(mode: CorrectionFixture) -> FrozenFixture {
             ))
             .await
             .unwrap();
-            let mut progress = pioneer_crud::FrozenStorageLifetimeProgress::default();
-            let mut sealed = false;
-            for _ in 0..40_000 {
-                progress.quantum(&h.crud_store).await.unwrap();
-                let marker: i64 = db
-                    .query_one_raw(Statement::from_sql_and_values(
-                        DbBackend::Sqlite,
-                        "SELECT proof_version FROM compaction_checkpoint WHERE id=?1",
-                        [cp.id.clone().into()],
-                    ))
-                    .await
-                    .unwrap()
-                    .unwrap()
-                    .try_get("", "proof_version")
-                    .unwrap();
-                if marker == 1 {
-                    sealed = true;
-                    break;
+            if !matches!(mode, CorrectionFixture::WorkerLegacy) {
+                let mut progress = pioneer_crud::FrozenStorageLifetimeProgress::default();
+                let mut sealed = false;
+                for _ in 0..40_000 {
+                    progress.quantum(&h.crud_store).await.unwrap();
+                    let marker: i64 = db
+                        .query_one_raw(Statement::from_sql_and_values(
+                            DbBackend::Sqlite,
+                            "SELECT proof_version FROM compaction_checkpoint WHERE id=?1",
+                            [cp.id.clone().into()],
+                        ))
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .try_get("", "proof_version")
+                        .unwrap();
+                    if marker == 1 {
+                        sealed = true;
+                        break;
+                    }
                 }
+                assert!(
+                    sealed,
+                    "legacy large origin must backfill through bounded maintenance steps"
+                );
+                drop(progress);
             }
-            assert!(
-                sealed,
-                "legacy large origin must backfill through bounded maintenance steps"
-            );
-            drop(progress);
         } else {
             assert_eq!(
                 h.crud_store
@@ -652,10 +698,15 @@ async fn fixture_with_correction(mode: CorrectionFixture) -> FrozenFixture {
         .unwrap()
         .try_get("", "n")
         .unwrap();
-    assert!(n > 0, "A/B must exercise nonempty permanent imports");
+    if matches!(mode, CorrectionFixture::WorkerLegacy) {
+        assert_eq!(n, 0, "restart fixture starts before legacy proof backfill");
+    } else {
+        assert!(n > 0, "A/B must exercise nonempty permanent imports");
+    }
     drop(hold);
     drop(imports);
     FrozenFixture {
+        _directory: directory,
         h,
         origin,
         checkpoint,
@@ -1271,4 +1322,108 @@ async fn selected_import_understated_retained_output_direct_and_shared_fails_bef
     for shared in [false, true] {
         let _ = fixture_with_correction(CorrectionFixture::UnderstatedOutput { shared }).await;
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn automatic_frozen_worker_restart_prepares_legacy_proofs_expires_and_sweeps_with_fk_off() {
+    let f = fixture_with_correction(CorrectionFixture::WorkerLegacy).await;
+    let db = f.h.crud_store.database_connection();
+    // Run the actual production loop, cancel it, and restart with fresh private
+    // progress. No fixture calls quantum: durable markers must survive restart.
+    for restart in 0..2 {
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let worker = tokio::spawn(crate::database::maintenance::run_frozen_worker_for_test(
+            f.h.crud_store.clone(),
+            cancellation.clone(),
+        ));
+        let mut swept = false;
+        let mut interrupted_staging = false;
+        for _ in 0..20_000 {
+            tokio::time::advance(Duration::from_millis(100)).await;
+            tokio::task::yield_now().await;
+            let row = db.query_one_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+                "SELECT h.expired,c.proof_version,(SELECT count(*) FROM compaction_frozen_message_data WHERE manifest_id=h.id)+(SELECT count(*) FROM compaction_frozen_import_data WHERE manifest_id=h.id) AS n FROM compaction_frozen_history h JOIN compaction_checkpoint c ON c.id=?2 WHERE h.id=?1",
+                [f.origin.manifest_id.clone().into(), f.checkpoint.clone().into()])).await.unwrap().unwrap();
+            swept = row.try_get::<i64>("", "expired").unwrap() == 1
+                && row.try_get::<i64>("", "proof_version").unwrap() == 1
+                && row.try_get::<i64>("", "n").unwrap() == 0;
+            let selected: i64 = db
+                .query_one_raw(Statement::from_sql_and_values(
+                    DbBackend::Sqlite,
+                    "SELECT count(*) AS n FROM compaction_checkpoint_import WHERE checkpoint_id=?1",
+                    [f.checkpoint.clone().into()],
+                ))
+                .await
+                .unwrap()
+                .unwrap()
+                .try_get("", "n")
+                .unwrap();
+            interrupted_staging =
+                selected > 0 && row.try_get::<i64>("", "proof_version").unwrap() == 0;
+            if (restart == 0 && interrupted_staging) || (restart == 1 && swept) {
+                break;
+            }
+        }
+        cancellation.cancel();
+        worker.await.unwrap();
+        if restart == 0 {
+            assert!(
+                interrupted_staging,
+                "restart interrupts real nonempty unsealed preparation"
+            );
+        }
+        if restart == 1 {
+            assert!(
+                swept,
+                "automatic worker must finish legacy preparation and physical deletion"
+            );
+        }
+    }
+    let n: i64 = db
+        .query_one_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "SELECT count(*) AS n FROM compaction_checkpoint_import WHERE checkpoint_id=?1",
+            [f.checkpoint.clone().into()],
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "n")
+        .unwrap();
+    assert!(n > 0, "nonempty permanent evidence survives sweep");
+    assert!(
+        !f.h.crud_store
+            .compaction_frozen_history_page(
+                &f.h.workspace_id,
+                "p73-source",
+                &f.output.history.manifest_id,
+                0
+            )
+            .await
+            .unwrap()
+            .is_empty(),
+        "retained output remains readable"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn idle_frozen_worker_cancellation_interrupts_backoff_without_detached_work() {
+    let (_directory, _, store, _) = setup_pooled_file_workspace_manager().await;
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let worker = tokio::spawn(crate::database::maintenance::run_frozen_worker_for_test(
+        store,
+        cancellation.clone(),
+    ));
+    // Empty discovery reaches the idle round; cancellation must wake the actual
+    // production sleep select rather than waiting for its 60 second timer.
+    for _ in 0..100 {
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+    }
+    assert!(!worker.is_finished());
+    cancellation.cancel();
+    tokio::time::timeout(Duration::from_millis(1), worker)
+        .await
+        .unwrap()
+        .unwrap();
 }

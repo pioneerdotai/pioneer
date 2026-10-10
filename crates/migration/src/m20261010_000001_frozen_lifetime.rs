@@ -1,5 +1,6 @@
 //! Schema only: no legacy scan, backfill, expiry or physical cleanup.
 use sea_orm_migration::prelude::*;
+use sea_orm_migration::sea_query::{Expr, ExprTrait, Func};
 #[derive(DeriveMigrationName)]
 pub struct Migration;
 #[async_trait::async_trait]
@@ -8,52 +9,402 @@ impl MigrationTrait for Migration {
         Some(true)
     }
     async fn up(&self, m: &SchemaManager) -> Result<(), DbErr> {
-        m.get_connection().execute_unprepared(r#"ALTER TABLE compaction_checkpoint ADD COLUMN proof_version INTEGER NOT NULL DEFAULT 0 CHECK (proof_version IN (0,1))"#).await?;
-        m.get_connection().execute_unprepared(r#"ALTER TABLE compaction_frozen_history ADD COLUMN expired INTEGER NOT NULL DEFAULT 0 CHECK (expired IN (0,1))"#).await?;
+        m.alter_table(
+            Table::alter()
+                .table(Alias::new("compaction_checkpoint"))
+                .add_column(
+                    ColumnDef::new(Alias::new("proof_version"))
+                        .integer()
+                        .not_null()
+                        .default(0)
+                        .check(Expr::col(Alias::new("proof_version")).is_in([0, 1])),
+                )
+                .to_owned(),
+        )
+        .await?;
+        m.alter_table(
+            Table::alter()
+                .table(Alias::new("compaction_frozen_history"))
+                .add_column(
+                    ColumnDef::new(Alias::new("expired"))
+                        .integer()
+                        .not_null()
+                        .default(0)
+                        .check(Expr::col(Alias::new("expired")).is_in([0, 1])),
+                )
+                .to_owned(),
+        )
+        .await?;
+        // SQLite row triggers have no SeaQuery builder. They enforce local
+        // guards even on the production FK OFF writer. Views below encode the
+        // SQLite direct/shared UNION layout and logical bounds.
         m.get_connection().execute_unprepared(r#"CREATE TRIGGER frozen_expired_monotonic BEFORE UPDATE OF expired ON compaction_frozen_history WHEN OLD.expired=1 AND NEW.expired<>1 BEGIN SELECT RAISE(ABORT, 'frozen expiry is irreversible'); END"#).await?;
-        m.get_connection().execute_unprepared(r#"ALTER TABLE task_run_conversation_snapshot ADD COLUMN frozen_manifest_id TEXT DEFAULT ''"#).await?;
-        m.get_connection().execute_unprepared(r#"CREATE INDEX task_run_conversation_snapshot_frozen_root ON task_run_conversation_snapshot(frozen_manifest_id,workspace_id,task_id)"#).await?;
-        m.get_connection().execute_unprepared(r#"ALTER TABLE turn_runtime_snapshot ADD COLUMN frozen_manifest_id TEXT DEFAULT ''"#).await?;
-        m.get_connection().execute_unprepared(r#"CREATE INDEX turn_runtime_snapshot_frozen_root ON turn_runtime_snapshot(frozen_manifest_id,workspace_id)"#).await?;
-        m.get_connection().execute_unprepared(r#"ALTER TABLE thread_cli_runtime_binding ADD COLUMN frozen_manifest_id TEXT DEFAULT ''"#).await?;
-        m.get_connection().execute_unprepared(r#"CREATE INDEX thread_cli_runtime_binding_frozen_root ON thread_cli_runtime_binding(frozen_manifest_id,workspace_id)"#).await?;
-        m.get_connection().execute_unprepared(r#"ALTER TABLE turn_cli_runtime_binding ADD COLUMN frozen_manifest_id TEXT DEFAULT ''"#).await?;
-        m.get_connection().execute_unprepared(r#"CREATE INDEX turn_cli_runtime_binding_frozen_root ON turn_cli_runtime_binding(frozen_manifest_id,workspace_id)"#).await?;
-        m.get_connection().execute_unprepared(r#"CREATE TABLE compaction_checkpoint_replay_alias (checkpoint_id TEXT NOT NULL, covered_thread TEXT NOT NULL, covered_scope TEXT NOT NULL, covered_id TEXT NOT NULL, covered_version TEXT NOT NULL, replay_thread TEXT NOT NULL, replay_scope TEXT NOT NULL, replay_id TEXT NOT NULL, replay_version TEXT NOT NULL, tool_item_id TEXT, FOREIGN KEY(checkpoint_id) REFERENCES compaction_checkpoint(id))"#).await?;
-        m.get_connection().execute_unprepared(r#"CREATE UNIQUE INDEX checkpoint_replay_alias_identity ON compaction_checkpoint_replay_alias(checkpoint_id,covered_thread,covered_scope,covered_id,covered_version,replay_thread,replay_scope,replay_id,replay_version, (tool_item_id IS NULL), COALESCE(tool_item_id,''))"#).await?;
-        m.get_connection().execute_unprepared(r#"CREATE TABLE compaction_checkpoint_event_input (checkpoint_id TEXT NOT NULL, source_thread TEXT NOT NULL, source_scope TEXT NOT NULL, source_id TEXT NOT NULL, source_version TEXT NOT NULL, role TEXT NOT NULL CHECK(role IN ('authoritative','deleted','input_copy')), PRIMARY KEY(checkpoint_id,source_thread,source_scope,source_id,source_version), FOREIGN KEY(checkpoint_id) REFERENCES compaction_checkpoint(id))"#).await?;
-        m.get_connection().execute_unprepared(r#"CREATE TABLE compaction_checkpoint_import (checkpoint_id TEXT NOT NULL, import_ordinal INTEGER NOT NULL CHECK (import_ordinal>=0), message_ordinal INTEGER NOT NULL CHECK (message_ordinal>=0), target_source_thread TEXT NOT NULL, context_thread TEXT NOT NULL, target_checkpoint_json TEXT, proof_json TEXT NOT NULL, bytes INTEGER NOT NULL CHECK (bytes>=0), PRIMARY KEY(checkpoint_id,import_ordinal), FOREIGN KEY(checkpoint_id) REFERENCES compaction_checkpoint(id))"#).await?;
-        m.get_connection().execute_unprepared(r#"CREATE INDEX checkpoint_proof_operation ON compaction_checkpoint(operation_id,proof_version,status)"#).await?;
+        m.alter_table(
+            Table::alter()
+                .table(Alias::new("task_run_conversation_snapshot"))
+                .add_column(
+                    ColumnDef::new(Alias::new("frozen_manifest_id"))
+                        .text()
+                        .null()
+                        .default(""),
+                )
+                .to_owned(),
+        )
+        .await?;
+        m.create_index(
+            Index::create()
+                .name("task_run_conversation_snapshot_frozen_root")
+                .table(Alias::new("task_run_conversation_snapshot"))
+                .col("frozen_manifest_id")
+                .col("workspace_id")
+                .col("task_id")
+                .to_owned(),
+        )
+        .await?;
+        m.alter_table(
+            Table::alter()
+                .table(Alias::new("turn_runtime_snapshot"))
+                .add_column(
+                    ColumnDef::new(Alias::new("frozen_manifest_id"))
+                        .text()
+                        .null()
+                        .default(""),
+                )
+                .to_owned(),
+        )
+        .await?;
+        m.create_index(
+            Index::create()
+                .name("turn_runtime_snapshot_frozen_root")
+                .table(Alias::new("turn_runtime_snapshot"))
+                .col("frozen_manifest_id")
+                .col("workspace_id")
+                .to_owned(),
+        )
+        .await?;
+        m.alter_table(
+            Table::alter()
+                .table(Alias::new("thread_cli_runtime_binding"))
+                .add_column(
+                    ColumnDef::new(Alias::new("frozen_manifest_id"))
+                        .text()
+                        .null()
+                        .default(""),
+                )
+                .to_owned(),
+        )
+        .await?;
+        m.create_index(
+            Index::create()
+                .name("thread_cli_runtime_binding_frozen_root")
+                .table(Alias::new("thread_cli_runtime_binding"))
+                .col("frozen_manifest_id")
+                .col("workspace_id")
+                .to_owned(),
+        )
+        .await?;
+        m.alter_table(
+            Table::alter()
+                .table(Alias::new("turn_cli_runtime_binding"))
+                .add_column(
+                    ColumnDef::new(Alias::new("frozen_manifest_id"))
+                        .text()
+                        .null()
+                        .default(""),
+                )
+                .to_owned(),
+        )
+        .await?;
+        m.create_index(
+            Index::create()
+                .name("turn_cli_runtime_binding_frozen_root")
+                .table(Alias::new("turn_cli_runtime_binding"))
+                .col("frozen_manifest_id")
+                .col("workspace_id")
+                .to_owned(),
+        )
+        .await?;
+        m.create_table(
+            Table::create()
+                .table(Alias::new("compaction_checkpoint_replay_alias"))
+                .col(
+                    ColumnDef::new(Alias::new("checkpoint_id"))
+                        .text()
+                        .not_null(),
+                )
+                .col(
+                    ColumnDef::new(Alias::new("covered_thread"))
+                        .text()
+                        .not_null(),
+                )
+                .col(
+                    ColumnDef::new(Alias::new("covered_scope"))
+                        .text()
+                        .not_null(),
+                )
+                .col(ColumnDef::new(Alias::new("covered_id")).text().not_null())
+                .col(
+                    ColumnDef::new(Alias::new("covered_version"))
+                        .text()
+                        .not_null(),
+                )
+                .col(
+                    ColumnDef::new(Alias::new("replay_thread"))
+                        .text()
+                        .not_null(),
+                )
+                .col(ColumnDef::new(Alias::new("replay_scope")).text().not_null())
+                .col(ColumnDef::new(Alias::new("replay_id")).text().not_null())
+                .col(
+                    ColumnDef::new(Alias::new("replay_version"))
+                        .text()
+                        .not_null(),
+                )
+                .col(ColumnDef::new(Alias::new("tool_item_id")).text().null())
+                .foreign_key(
+                    ForeignKey::create()
+                        .from(
+                            Alias::new("compaction_checkpoint_replay_alias"),
+                            Alias::new("checkpoint_id"),
+                        )
+                        .to(Alias::new("compaction_checkpoint"), Alias::new("id")),
+                )
+                .to_owned(),
+        )
+        .await?;
+        m.create_index(
+            Index::create()
+                .name("checkpoint_replay_alias_identity")
+                .table(Alias::new("compaction_checkpoint_replay_alias"))
+                .unique()
+                .col("checkpoint_id")
+                .col("covered_thread")
+                .col("covered_scope")
+                .col("covered_id")
+                .col("covered_version")
+                .col("replay_thread")
+                .col("replay_scope")
+                .col("replay_id")
+                .col("replay_version")
+                .col(Expr::col(Alias::new("tool_item_id")).is_null())
+                .col(Func::coalesce([
+                    Expr::col(Alias::new("tool_item_id")),
+                    Expr::val(""),
+                ]))
+                .to_owned(),
+        )
+        .await?;
+        m.create_table(
+            Table::create()
+                .table(Alias::new("compaction_checkpoint_event_input"))
+                .col(
+                    ColumnDef::new(Alias::new("checkpoint_id"))
+                        .text()
+                        .not_null(),
+                )
+                .col(
+                    ColumnDef::new(Alias::new("source_thread"))
+                        .text()
+                        .not_null(),
+                )
+                .col(ColumnDef::new(Alias::new("source_scope")).text().not_null())
+                .col(ColumnDef::new(Alias::new("source_id")).text().not_null())
+                .col(
+                    ColumnDef::new(Alias::new("source_version"))
+                        .text()
+                        .not_null(),
+                )
+                .col(ColumnDef::new(Alias::new("role")).text().not_null().check(
+                    Expr::col(Alias::new("role")).is_in(["authoritative", "deleted", "input_copy"]),
+                ))
+                .primary_key(
+                    Index::create()
+                        .col("checkpoint_id")
+                        .col("source_thread")
+                        .col("source_scope")
+                        .col("source_id")
+                        .col("source_version"),
+                )
+                .foreign_key(
+                    ForeignKey::create()
+                        .from(
+                            Alias::new("compaction_checkpoint_event_input"),
+                            Alias::new("checkpoint_id"),
+                        )
+                        .to(Alias::new("compaction_checkpoint"), Alias::new("id")),
+                )
+                .to_owned(),
+        )
+        .await?;
+        m.create_table(
+            Table::create()
+                .table(Alias::new("compaction_checkpoint_import"))
+                .col(
+                    ColumnDef::new(Alias::new("checkpoint_id"))
+                        .text()
+                        .not_null(),
+                )
+                .col(
+                    ColumnDef::new(Alias::new("import_ordinal"))
+                        .integer()
+                        .not_null()
+                        .check(Expr::col(Alias::new("import_ordinal")).gte(0)),
+                )
+                .col(
+                    ColumnDef::new(Alias::new("message_ordinal"))
+                        .integer()
+                        .not_null()
+                        .check(Expr::col(Alias::new("message_ordinal")).gte(0)),
+                )
+                .col(
+                    ColumnDef::new(Alias::new("target_source_thread"))
+                        .text()
+                        .not_null(),
+                )
+                .col(
+                    ColumnDef::new(Alias::new("context_thread"))
+                        .text()
+                        .not_null(),
+                )
+                .col(
+                    ColumnDef::new(Alias::new("target_checkpoint_json"))
+                        .text()
+                        .null(),
+                )
+                .col(ColumnDef::new(Alias::new("proof_json")).text().not_null())
+                .col(
+                    ColumnDef::new(Alias::new("bytes"))
+                        .integer()
+                        .not_null()
+                        .check(Expr::col(Alias::new("bytes")).gte(0)),
+                )
+                .primary_key(Index::create().col("checkpoint_id").col("import_ordinal"))
+                .foreign_key(
+                    ForeignKey::create()
+                        .from(
+                            Alias::new("compaction_checkpoint_import"),
+                            Alias::new("checkpoint_id"),
+                        )
+                        .to(Alias::new("compaction_checkpoint"), Alias::new("id")),
+                )
+                .to_owned(),
+        )
+        .await?;
+        m.create_index(
+            Index::create()
+                .name("checkpoint_proof_operation")
+                .table(Alias::new("compaction_checkpoint"))
+                .col("operation_id")
+                .col("proof_version")
+                .col("status")
+                .to_owned(),
+        )
+        .await?;
         // A shared input can bind arbitrarily many terminal operations. This
         // derived generation avoids parsing every saved runner or holding N
         // writer reservations in the final indexed expiry guard. Not authority:
         // every operation/runner mutation invalidates it atomically.
-        m.get_connection().execute_unprepared(r#"ALTER TABLE compaction_operation_projection ADD COLUMN terminal_generation INTEGER CHECK(terminal_generation IS NULL OR terminal_generation>=0)"#).await?;
+        m.alter_table(
+            Table::alter()
+                .table(Alias::new("compaction_operation_projection"))
+                .add_column(
+                    ColumnDef::new(Alias::new("terminal_generation"))
+                        .integer()
+                        .null()
+                        .check(
+                            Expr::col(Alias::new("terminal_generation"))
+                                .is_null()
+                                .or(Expr::col(Alias::new("terminal_generation")).gte(0)),
+                        ),
+                )
+                .to_owned(),
+        )
+        .await?;
         m.get_connection().execute_unprepared(r#"CREATE TRIGGER projection_terminal_reset BEFORE UPDATE OF operation_id,manifest_id,identity_sha256,imports_sha256,import_count ON compaction_operation_projection BEGIN UPDATE compaction_operation_projection SET terminal_generation=NULL WHERE operation_id=OLD.operation_id; END"#).await?;
         m.get_connection().execute_unprepared(r#"CREATE TRIGGER operation_terminal_reset BEFORE UPDATE OF id,owner,status ON compaction_operation BEGIN UPDATE compaction_operation_projection SET terminal_generation=NULL WHERE operation_id=OLD.id; END"#).await?;
         m.get_connection().execute_unprepared(r#"CREATE TRIGGER runner_terminal_reset_update BEFORE UPDATE OF operation_id,generation,state ON compaction_runner_state BEGIN UPDATE compaction_operation_projection SET terminal_generation=NULL WHERE operation_id=OLD.operation_id; END"#).await?;
         m.get_connection().execute_unprepared(r#"CREATE TRIGGER runner_terminal_reset_insert BEFORE INSERT ON compaction_runner_state BEGIN UPDATE compaction_operation_projection SET terminal_generation=NULL WHERE operation_id=NEW.operation_id; END"#).await?;
         m.get_connection().execute_unprepared(r#"CREATE TRIGGER runner_terminal_reset_delete BEFORE DELETE ON compaction_runner_state BEGIN UPDATE compaction_operation_projection SET terminal_generation=NULL WHERE operation_id=OLD.operation_id; END"#).await?;
-        m.get_connection().execute_unprepared(r#"CREATE INDEX projection_frozen_origin ON compaction_operation_projection(manifest_id,operation_id)"#).await?;
-        m.get_connection()
-            .execute_unprepared(
-                r#"CREATE INDEX task_output_frozen_root ON compaction_task_output(manifest_id)"#,
-            )
-            .await?;
-        m.get_connection().execute_unprepared(r#"CREATE INDEX checkpoint_incoming_previous ON compaction_checkpoint(previous,id)"#).await?;
-        m.get_connection().execute_unprepared(r#"CREATE INDEX coverage_incoming_checkpoint ON compaction_coverage(source_id,source_scope,source_version,checkpoint_id)"#).await?;
+        m.create_index(
+            Index::create()
+                .name("projection_frozen_origin")
+                .table(Alias::new("compaction_operation_projection"))
+                .col("manifest_id")
+                .col("operation_id")
+                .to_owned(),
+        )
+        .await?;
+        m.create_index(
+            Index::create()
+                .name("task_output_frozen_root")
+                .table(Alias::new("compaction_task_output"))
+                .col("manifest_id")
+                .to_owned(),
+        )
+        .await?;
+        m.create_index(
+            Index::create()
+                .name("checkpoint_incoming_previous")
+                .table(Alias::new("compaction_checkpoint"))
+                .col("previous")
+                .col("id")
+                .to_owned(),
+        )
+        .await?;
+        m.create_index(
+            Index::create()
+                .name("coverage_incoming_checkpoint")
+                .table(Alias::new("compaction_coverage"))
+                .col("source_id")
+                .col("source_scope")
+                .col("source_version")
+                .col("checkpoint_id")
+                .to_owned(),
+        )
+        .await?;
         // Existing pending(kind,manifest) index cannot seek reverse candidates.
         // Scoped missing-origin lookup must not scan unrelated contexts or
         // sealed checkpoints. Existing owner/id and operation/proof indexes
         // do not serve workspace -> owner -> unproved checkpoint discovery.
-        m.get_connection()
-            .execute_unprepared(
-                r#"CREATE INDEX context_frozen_scope ON compaction_context(workspace_id,owner)"#,
-            )
-            .await?;
-        m.get_connection().execute_unprepared(r#"CREATE INDEX checkpoint_unproved_owner ON compaction_checkpoint(owner,proof_version,operation_id)"#).await?;
-        m.get_connection().execute_unprepared(r#"CREATE INDEX frozen_layout_candidate ON compaction_frozen_layout(candidate,kind,manifest_id)"#).await?;
-        m.get_connection().execute_unprepared(r#"CREATE INDEX frozen_expiry_discovery ON compaction_frozen_history(expired,ready,id)"#).await?;
+        m.create_index(
+            Index::create()
+                .name("context_frozen_scope")
+                .table(Alias::new("compaction_context"))
+                .col("workspace_id")
+                .col("owner")
+                .to_owned(),
+        )
+        .await?;
+        m.create_index(
+            Index::create()
+                .name("checkpoint_unproved_owner")
+                .table(Alias::new("compaction_checkpoint"))
+                .col("owner")
+                .col("proof_version")
+                .col("operation_id")
+                .to_owned(),
+        )
+        .await?;
+        m.create_index(
+            Index::create()
+                .name("frozen_layout_candidate")
+                .table(Alias::new("compaction_frozen_layout"))
+                .col("candidate")
+                .col("kind")
+                .col("manifest_id")
+                .to_owned(),
+        )
+        .await?;
+        m.create_index(
+            Index::create()
+                .name("frozen_expiry_discovery")
+                .table(Alias::new("compaction_frozen_history"))
+                .col("expired")
+                .col("ready")
+                .col("id")
+                .to_owned(),
+        )
+        .await?;
         m.get_connection()
             .execute_unprepared("DROP VIEW compaction_frozen_message")
             .await?;
@@ -107,10 +458,26 @@ impl MigrationTrait for Migration {
         // Exact historical owner lookup needs indexed first/last thread seeks
         // for one source, even with dense duplicate ordinals. Extend the
         // existing source lookup index rather than add a redundant prefix.
-        m.get_connection()
-            .execute_unprepared("DROP INDEX IF EXISTS compaction_manifest_source")
-            .await?;
-        m.get_connection().execute_unprepared("CREATE INDEX compaction_manifest_source ON compaction_manifest(operation_id,reference_only,source_scope,source_id,source_version,source_thread)").await?;
+        m.drop_index(
+            Index::drop()
+                .name("compaction_manifest_source")
+                .if_exists()
+                .to_owned(),
+        )
+        .await?;
+        m.create_index(
+            Index::create()
+                .name("compaction_manifest_source")
+                .table(Alias::new("compaction_manifest"))
+                .col("operation_id")
+                .col("reference_only")
+                .col("source_scope")
+                .col("source_id")
+                .col("source_version")
+                .col("source_thread")
+                .to_owned(),
+        )
+        .await?;
         // next_portion is the existing candidate write-set boundary. Closing
         // a portion freezes its identity/coverage/selected manifest ownership
         // before paged preparation; exact candidate retries remain allowed.

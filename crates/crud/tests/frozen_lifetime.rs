@@ -1,10 +1,26 @@
 //! Future isolated fixtures. Deliberately not executed/compiled before review.
 use migration::{Migrator, MigratorTrait};
 use pioneer_crud::CrudStore;
-use sea_orm::{ConnectionTrait, Database, DbBackend, Statement};
+use sea_orm::{ConnectionTrait, DbBackend, Statement};
 
 async fn fixture() -> CrudStore {
-    let db = Database::connect("sqlite::memory:").await.unwrap();
+    let mut options = sea_orm::ConnectOptions::new("sqlite::memory:");
+    options.max_connections(1).min_connections(1);
+    let db = sea_orm::Database::connect(options).await.unwrap();
+    db.execute_unprepared("PRAGMA foreign_keys=OFF")
+        .await
+        .unwrap();
+    let pragma: i64 = db
+        .query_one_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "PRAGMA foreign_keys",
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "foreign_keys")
+        .unwrap();
+    assert_eq!(pragma, 0, "production single writer uses FK OFF");
     Migrator::up(&db, None).await.unwrap();
     let store = CrudStore::new(db);
     let db = store.database_connection();
