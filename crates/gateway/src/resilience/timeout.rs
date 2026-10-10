@@ -477,13 +477,21 @@ impl TimeoutSupervisor {
                 item_type,
             ),
         };
-        let (lease_expires_at, idle_deadline_at, hard_deadline_at) = policy.deadlines(now_unix);
-        let rolls_hard_deadline = matches!(
-            hard_deadline_mode(execution_class, stored_item_type),
-            HardDeadlineMode::RollingOnConfirmedActivity
-        ) && (execution_class != TurnItemExecutionClass::DurableWait
-            || activity_kind == CONFIRMED_EXTERNAL_ACTIVITY_KIND);
-        let next_hard_deadline_at = rolls_hard_deadline.then_some(hard_deadline_at);
+        let has_work_policy = self
+            .crud_store
+            .has_native_tool_work_policy(turn_id, item_id)
+            .await?;
+        let mut deadlines = heartbeat_deadlines(
+            policy,
+            execution_class,
+            stored_item_type,
+            activity_kind,
+            now_unix,
+        );
+        if has_work_policy {
+            deadlines.idle_deadline_at_unix = None;
+            deadlines.hard_deadline_at_unix = None;
+        }
         let _ = self
             .crud_store
             .heartbeat_turn_item_attempt_with_activity_kind(
@@ -491,9 +499,9 @@ impl TimeoutSupervisor {
                 item_id,
                 item_type,
                 now_unix,
-                Some(lease_expires_at),
-                Some(idle_deadline_at),
-                next_hard_deadline_at,
+                deadlines.lease_expires_at_unix,
+                deadlines.idle_deadline_at_unix,
+                deadlines.hard_deadline_at_unix,
                 activity_kind,
             )
             .await?;
@@ -659,10 +667,18 @@ impl TimeoutSupervisor {
                 HardDeadlineMode::RollingOnConfirmedActivity
             )
             .then_some(hard_deadline_at);
+            let has_work_policy = self
+                .crud_store
+                .has_native_tool_work_policy(&attempt.turn_id, &attempt.item_id)
+                .await?;
             let deadlines = TurnItemAttemptDeadlines {
                 lease_expires_at_unix: Some(lease_expires_at),
-                idle_deadline_at_unix: Some(idle_deadline_at),
-                hard_deadline_at_unix: next_hard_deadline_at,
+                idle_deadline_at_unix: (!has_work_policy).then_some(idle_deadline_at),
+                hard_deadline_at_unix: if has_work_policy {
+                    None
+                } else {
+                    next_hard_deadline_at
+                },
             };
             if self
                 .crud_store
@@ -715,6 +731,25 @@ impl TimeoutSupervisor {
     }
 }
 
+fn heartbeat_deadlines(
+    policy: TimeoutPolicy,
+    execution_class: TurnItemExecutionClass,
+    item_type: TurnItemType,
+    activity_kind: &str,
+    now_unix: i64,
+) -> TurnItemAttemptDeadlines {
+    let (lease, idle, hard) = policy.deadlines(now_unix);
+    let confirmed = activity_kind == CONFIRMED_EXTERNAL_ACTIVITY_KIND;
+    TurnItemAttemptDeadlines {
+        lease_expires_at_unix: Some(lease),
+        idle_deadline_at_unix: confirmed.then_some(idle),
+        hard_deadline_at_unix: (confirmed
+            && hard_deadline_mode(execution_class, item_type)
+                == HardDeadlineMode::RollingOnConfirmedActivity)
+            .then_some(hard),
+    }
+}
+
 fn saturating_add_secs(base: i64, seconds: u64) -> i64 {
     base.saturating_add(i64::try_from(seconds).unwrap_or(i64::MAX))
 }
@@ -723,6 +758,48 @@ fn saturating_add_secs(base: i64, seconds: u64) -> i64 {
 mod tests {
     use super::*;
     use pioneer_protocol::{SystemEventLevel, TurnItem, TurnItemTimeoutReason, TurnItemType};
+
+    #[test]
+    fn owner_lease_renewal_cannot_move_idle_or_work_deadlines() {
+        let policy = TimeoutPolicy {
+            lease_secs: 10,
+            idle_secs: 20,
+            hard_secs: 30,
+        };
+        for class in [
+            TurnItemExecutionClass::Standard,
+            TurnItemExecutionClass::DurableWait,
+            TurnItemExecutionClass::ContextCompaction,
+        ] {
+            let owner = heartbeat_deadlines(
+                policy,
+                class,
+                TurnItemType::CommandExecution,
+                "item/heartbeat",
+                100,
+            );
+            assert_eq!(owner.lease_expires_at_unix, Some(110));
+            assert_eq!(owner.idle_deadline_at_unix, None);
+            assert_eq!(owner.hard_deadline_at_unix, None);
+        }
+        let confirmed = heartbeat_deadlines(
+            policy,
+            TurnItemExecutionClass::Standard,
+            TurnItemType::CommandExecution,
+            CONFIRMED_EXTERNAL_ACTIVITY_KIND,
+            100,
+        );
+        assert_eq!(confirmed.idle_deadline_at_unix, Some(120));
+        assert_eq!(confirmed.hard_deadline_at_unix, Some(130));
+        let bounded = heartbeat_deadlines(
+            policy,
+            TurnItemExecutionClass::Standard,
+            TurnItemType::DynamicToolCall,
+            CONFIRMED_EXTERNAL_ACTIVITY_KIND,
+            100,
+        );
+        assert_eq!(bounded.hard_deadline_at_unix, None);
+    }
 
     fn timeout_candidate() -> TimeoutCandidate {
         TimeoutCandidate {

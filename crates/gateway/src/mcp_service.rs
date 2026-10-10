@@ -3368,6 +3368,10 @@ fn map_shared_tool_error(error: pioneer_tools::ToolError) -> TurnMcpInvocationEr
     use pioneer_tools::ToolError;
 
     let (code, message) = match error {
+        ToolError::TimedOut => (
+            TurnMcpInvocationErrorCode::TimedOut,
+            "MCP tool attempt deadline exceeded".to_owned(),
+        ),
         ToolError::InvalidArguments(_) => (
             TurnMcpInvocationErrorCode::InvalidRequest,
             "MCP invocation arguments are invalid".to_owned(),

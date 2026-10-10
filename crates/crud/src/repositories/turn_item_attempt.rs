@@ -184,19 +184,24 @@ pub async fn heartbeat_running_attempt<C: ConnectionTrait>(
         return Ok(false);
     };
 
-    let mut update = turn_item_attempt::Entity::update_many()
-        .col_expr(
-            turn_item_attempt::Column::LastHeartbeatAt,
-            Expr::value(Some(heartbeat_at)),
-        )
-        .col_expr(
+    let mut update = turn_item_attempt::Entity::update_many().col_expr(
+        turn_item_attempt::Column::LastHeartbeatAt,
+        Expr::value(Some(heartbeat_at)),
+    );
+    // A heartbeat renews only supplied horizons. None preserves work policy;
+    // explicit initial configuration remains the owner of deadline clearing.
+    if let Some(lease) = next_lease_expires_at {
+        update = update.col_expr(
             turn_item_attempt::Column::LeaseExpiresAt,
-            Expr::value(next_lease_expires_at),
-        )
-        .col_expr(
-            turn_item_attempt::Column::IdleDeadlineAt,
-            Expr::value(next_idle_deadline_at),
+            Expr::value(Some(lease)),
         );
+    }
+    if let Some(idle) = next_idle_deadline_at {
+        update = update.col_expr(
+            turn_item_attempt::Column::IdleDeadlineAt,
+            Expr::value(Some(idle)),
+        );
+    }
     if let Some(hard_deadline_at) = next_hard_deadline_at {
         update = update.col_expr(
             turn_item_attempt::Column::HardDeadlineAt,
@@ -224,15 +229,15 @@ pub async fn heartbeat_running_attempt<C: ConnectionTrait>(
         return Ok(false);
     }
 
-    turn_item::Entity::update_many()
-        .col_expr(
-            turn_item::Column::LastHeartbeatAt,
-            Expr::value(Some(heartbeat_at)),
-        )
-        .col_expr(
-            turn_item::Column::LeaseExpiresAt,
-            Expr::value(next_lease_expires_at),
-        )
+    let mut item_update = turn_item::Entity::update_many().col_expr(
+        turn_item::Column::LastHeartbeatAt,
+        Expr::value(Some(heartbeat_at)),
+    );
+    if let Some(lease) = next_lease_expires_at {
+        item_update =
+            item_update.col_expr(turn_item::Column::LeaseExpiresAt, Expr::value(Some(lease)));
+    }
+    item_update
         .col_expr(turn_item::Column::UpdatedAt, Expr::value(heartbeat_at))
         .filter(turn_item::Column::TurnId.eq(turn_id.to_owned()))
         .filter(turn_item::Column::ItemId.eq(item_id.to_owned()))

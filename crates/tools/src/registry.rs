@@ -8,6 +8,15 @@ use std::sync::Arc;
 
 #[async_trait]
 pub trait ToolHandler: Send + Sync {
+    /// One execution attempt, after authorization. Concrete handlers may use
+    /// their frozen workload policy instead of the native default.
+    fn attempt_work_budget(
+        &self,
+        invocation: &ToolInvocation,
+    ) -> Result<std::time::Duration, ToolError> {
+        crate::orchestrator::tool_attempt_work_budget(invocation)
+    }
+
     async fn handle(
         &self,
         invocation: ToolInvocation,
@@ -26,6 +35,16 @@ impl ToolRegistry {
 
     pub fn has_handler(&self, tool_name: &str) -> bool {
         self.handlers.contains_key(tool_name)
+    }
+
+    pub(crate) fn attempt_work_budget(
+        &self,
+        invocation: &ToolInvocation,
+    ) -> Result<std::time::Duration, ToolError> {
+        self.handlers
+            .get(invocation.tool_name.as_str())
+            .ok_or_else(|| ToolError::NotFound(invocation.tool_name.clone()))?
+            .attempt_work_budget(invocation)
     }
 
     pub async fn dispatch(

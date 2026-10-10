@@ -406,7 +406,11 @@ fn protocol_delta_from_tool_delta(
             })),
         )),
         ToolDeltaPayload::Progress { stage, metadata } => Some((
-            stage.clone(),
+            if stage == "attempt_work_started" {
+                String::new()
+            } else {
+                stage.clone()
+            },
             ItemDeltaStream::ToolProgress,
             Some(serde_json::json!({
                 "kind": "progress",

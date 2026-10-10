@@ -3909,6 +3909,7 @@ pub(crate) fn sanitize_agent_tool_error(error: ToolError) -> ToolError {
     }
 
     match error {
+        ToolError::TimedOut => ToolError::TimedOut,
         // This exact public code is assigned at decoding boundaries. Unknown
         // InvalidArguments also include semantic failures after decoding.
         ToolError::InvalidArguments(message) if message == "agent_invalid_arguments" => {

@@ -1,5 +1,12 @@
 use crate::CrudStore;
 impl CrudStore {
+    pub async fn has_native_tool_work_policy(
+        &self,
+        turn_id: &str,
+        item_id: &str,
+    ) -> anyhow::Result<bool> {
+        crate::repositories::tool_output::has_native_tool_work_policy(self, turn_id, item_id).await
+    }
     pub async fn record_tool_output(
         &self,
         id: &str,

@@ -122,6 +122,9 @@ impl ErrorClassifier for DefaultErrorClassifier {
     }
 
     fn classify_error(&self, invocation: &ToolInvocation, error: &ToolError) -> ToolOutcome {
+        if matches!(error, ToolError::TimedOut) {
+            return attempt_timeout_outcome();
+        }
         if is_native_file_tool(invocation.tool_name.as_str()) {
             return classify_native_file_tool_error(invocation.tool_name.as_str(), error);
         }
@@ -147,6 +150,7 @@ impl ErrorClassifier for DefaultErrorClassifier {
         }
 
         match error {
+            ToolError::TimedOut => attempt_timeout_outcome(),
             ToolError::InvalidArguments(_) => ToolOutcome::recoverable(
                 ToolErrorClass::InvalidArguments,
                 "Fix tool arguments and call the tool again.",
@@ -186,6 +190,15 @@ impl ErrorClassifier for DefaultErrorClassifier {
     }
 }
 
+fn attempt_timeout_outcome() -> ToolOutcome {
+    ToolOutcome::recoverable(
+        ToolErrorClass::Timeout,
+        "Tool attempt reached its bounded work deadline. Inspect partial state and change the strategy before retrying.",
+        true,
+        Some("attempt_deadline".to_owned()),
+    )
+}
+
 fn is_native_file_tool(tool_name: &str) -> bool {
     matches!(
         tool_name,
@@ -206,6 +219,7 @@ fn classify_native_file_tool_error(tool_name: &str, error: &ToolError) -> ToolOu
     }
 
     match error {
+        ToolError::TimedOut => attempt_timeout_outcome(),
         ToolError::InvalidArguments(message) => ToolOutcome::recoverable(
             ToolErrorClass::InvalidArguments,
             format!(
@@ -412,6 +426,7 @@ fn classify_mcp_result(raw_output_json: &JsonValue, success: bool) -> ToolOutcom
 
 fn classify_mcp_error(invocation: &ToolInvocation, error: &ToolError) -> ToolOutcome {
     match error {
+        ToolError::TimedOut => attempt_timeout_outcome(),
         ToolError::InvalidArguments(_) => ToolOutcome::fatal(
             ToolErrorClass::InvalidArguments,
             Some("MCP tool arguments were invalid for the materialized schema.".to_owned()),
@@ -759,6 +774,7 @@ fn classify_computer_use_result(raw_output_json: &JsonValue, success: bool) -> T
 
 fn classify_computer_use_error(error: &ToolError) -> ToolOutcome {
     match error {
+        ToolError::TimedOut => attempt_timeout_outcome(),
         ToolError::InvalidArguments(message) => {
             let lower = message.to_lowercase();
             if lower.contains("session_id") {
@@ -981,6 +997,7 @@ fn computer_use_failure_outcome(failure_class: &'static str, stopped: bool) -> T
 
 fn classify_shell_error(error: &ToolError) -> ToolOutcome {
     match error {
+        ToolError::TimedOut => attempt_timeout_outcome(),
         ToolError::InvalidArguments(_) => ToolOutcome::recoverable(
             ToolErrorClass::InvalidArguments,
             "Shell tool arguments are invalid. Fix args and retry.",
@@ -1032,6 +1049,7 @@ fn classify_shell_error(error: &ToolError) -> ToolOutcome {
 
 fn classify_web_error(error: &ToolError) -> ToolOutcome {
     match error {
+        ToolError::TimedOut => attempt_timeout_outcome(),
         ToolError::InvalidArguments(_) => ToolOutcome::recoverable(
             ToolErrorClass::InvalidArguments,
             "Web tool arguments are invalid. Fix parameters and retry.",
