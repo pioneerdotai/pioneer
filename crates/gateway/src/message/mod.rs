@@ -1096,25 +1096,6 @@ impl MessageProcessor {
                 resilience_config.context_compaction_timeout,
             ),
         ));
-        let recovery_coordinator = Arc::new(
-            RecoveryCoordinator::new(
-                crud_store.clone(),
-                agent_manager.clone(),
-                provider_registry.clone(),
-                RecoveryPolicyRegistry::with_command_execution_timeout_config(
-                    resilience_config.command_execution_timeout,
-                ),
-                normalized_tool_loop_config.clone(),
-            )
-            .with_authorization_invalidation_hub(authorization_invalidation_hub.clone())
-            .with_execution_leases(execution_leases.clone())
-            .with_turn_execution_owner_id(turn_execution_owner_id.clone()),
-        );
-        let cli_runtime_command_heartbeats = CliRuntimeCommandHeartbeatTracker::new(
-            resilience_config
-                .cli_runtime_command_heartbeat
-                .interval_secs,
-        );
         let artifact_service = Arc::new(ArtifactService::new_with_policies(
             crud_store.clone(),
             Arc::new(LocalArtifactBlobStore::new(runtime_home.clone())),
@@ -1125,6 +1106,26 @@ impl MessageProcessor {
                 readable_copy_ttl_secs: artifacts_config.readable_copy_ttl_secs,
             },
         ));
+        let recovery_coordinator = Arc::new(
+            RecoveryCoordinator::new(
+                crud_store.clone(),
+                agent_manager.clone(),
+                provider_registry.clone(),
+                RecoveryPolicyRegistry::with_command_execution_timeout_config(
+                    resilience_config.command_execution_timeout,
+                ),
+                normalized_tool_loop_config.clone(),
+            )
+            .with_artifact_service(artifact_service.clone())
+            .with_authorization_invalidation_hub(authorization_invalidation_hub.clone())
+            .with_execution_leases(execution_leases.clone())
+            .with_turn_execution_owner_id(turn_execution_owner_id.clone()),
+        );
+        let cli_runtime_command_heartbeats = CliRuntimeCommandHeartbeatTracker::new(
+            resilience_config
+                .cli_runtime_command_heartbeat
+                .interval_secs,
+        );
         let artifact_uploads = Arc::new(artifacts::upload::ArtifactUploadSessionManager::new(
             runtime_home.join("artifacts").join("upload_sessions"),
         ));
@@ -2270,6 +2271,8 @@ impl MessageProcessor {
             self.workspace_manager
                 .with_database(crud_store.database_connection()),
         );
+        scoped.artifact_service =
+            Arc::new(self.artifact_service.with_crud_store(crud_store.clone()));
         scoped.timeout_supervisor =
             Arc::new(self.timeout_supervisor.with_crud_store(crud_store.clone()));
         scoped.recovery_coordinator = Arc::new(
@@ -4050,18 +4053,17 @@ impl MessageProcessor {
             }
             let summary = self
                 .artifact_service
-                .get_artifact(workspace_id, artifact_id, Some(version_id))
+                .get_exact_artifact_ref(workspace_id, artifact_id, version_id)
                 .await
                 .map_err(|_| anyhow::anyhow!("artifact reference is unavailable"))?;
-            if summary.workspace_id != workspace_id
-                || summary.artifact.artifact_id != *artifact_id
-                || summary.artifact.version_id.as_deref() != Some(version_id)
-                || summary.artifact.status != pioneer_protocol::ArtifactStatus::Ready
+            if summary.artifact_id != *artifact_id
+                || summary.version_id.as_deref() != Some(version_id)
+                || summary.status != pioneer_protocol::ArtifactStatus::Ready
             {
                 anyhow::bail!("artifact reference is unavailable");
             }
 
-            let durable_scope_matches = pioneer_crud::resolve_artifact_authorization_scope(
+            let durable_scope_matches = pioneer_crud::resolve_native_artifact_authorization_scope(
                 &database,
                 artifact_id,
                 Some(workspace_id),
@@ -4081,18 +4083,29 @@ impl MessageProcessor {
             // the generic resolver may not materialize that binding yet. Its
             // existing direct thread scope is still authoritative only when
             // every stored binding agrees with the exact target thread.
-            let direct_thread_scope_matches = summary.primary_thread_id.as_deref()
-                == Some(thread_id)
-                && summary.bindings.iter().all(|binding| {
-                    binding.workspace_id == workspace_id
-                        && binding.thread_id.as_deref() == Some(thread_id)
-                });
+            let direct_thread_scope_matches = self
+                .crud_store
+                .native_input_direct_scope_matches(workspace_id, artifact_id, thread_id)
+                .await?;
             if !durable_scope_matches && !direct_thread_scope_matches {
                 anyhow::bail!("artifact reference is unavailable");
             }
         }
 
         Ok(())
+    }
+
+    async fn resolve_owned_provider_artifact_inputs(
+        &self,
+        workspace_id: &str,
+        input: &[pioneer_protocol::UserInput],
+    ) -> anyhow::Result<Vec<ResolvedArtifactInput>> {
+        crate::turn_runtime_snapshot::resolve_owned_artifact_inputs(
+            self.artifact_service.as_ref(),
+            workspace_id,
+            input,
+        )
+        .await
     }
 
     async fn resolve_provider_artifact_inputs(
@@ -4671,6 +4684,7 @@ impl MessageProcessor {
                 RecoveryPolicyRegistry::default(),
                 normalized_tool_loop_config.clone(),
             )
+            .with_artifact_service(artifact_service.clone())
             .with_authorization_invalidation_hub(authorization_invalidation_hub.clone())
             .with_execution_leases(execution_leases.clone())
             .with_turn_execution_owner_id(turn_execution_owner_id.clone()),

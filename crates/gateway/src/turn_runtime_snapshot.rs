@@ -29,7 +29,18 @@ pub(crate) fn validate_runtime_snapshot_for_resume(
     let _: AgentTurnHookRuntimeContext =
         from_snapshot_json(&snapshot.hook_runtime_context_json, "hook runtime context")?;
     restore_workspace_skill_policies(&snapshot.workspace_skill_policies_json)?;
-    let _: Vec<UserInput> = from_snapshot_json(&snapshot.input_json, "turn input")?;
+    let input: Vec<UserInput> = from_snapshot_json(&snapshot.input_json, "turn input")?;
+    anyhow::ensure!(
+        input.iter().all(|value| match value {
+            UserInput::Text { .. } | UserInput::Mention { .. } => true,
+            UserInput::Artifact {
+                version_id: Some(version),
+                ..
+            } => !version.is_empty(),
+            _ => false,
+        }),
+        "legacy mutable media has no immutable accepted identity"
+    );
     restored_execution_capabilities(&snapshot.capabilities_json)?;
     let _: Vec<ResolvedArtifactInput> =
         from_snapshot_json(&snapshot.resolved_artifacts_json, "resolved artifacts")?;
@@ -99,6 +110,19 @@ pub(crate) fn new_turn_runtime_snapshot(
     history: &[ChatMessage],
     agent_skill_overlay: &[AgentSkillRuntimeEntry],
 ) -> Result<NewTurnRuntimeSnapshot> {
+    let mut canonical_artifacts = resolved_artifacts.to_vec();
+    for resolved in &mut canonical_artifacts {
+        anyhow::ensure!(
+            resolved
+                .version_id
+                .as_deref()
+                .is_some_and(|v| !v.is_empty()),
+            "artifact snapshot requires exact version"
+        );
+        resolved.attachment.source = pioneer_provider::AttachmentDataSource::Reference {
+            reference: format!("pioneer-artifact:{}", resolved.artifact_id),
+        };
+    }
     let now = chrono::Utc::now().fixed_offset();
     Ok(NewTurnRuntimeSnapshot {
         turn_id: turn_id.to_owned(),
@@ -116,7 +140,7 @@ pub(crate) fn new_turn_runtime_snapshot(
         )?,
         input_json: to_snapshot_json(input, "turn input")?,
         capabilities_json: execution_capabilities_json(capabilities)?,
-        resolved_artifacts_json: to_snapshot_json(resolved_artifacts, "resolved artifacts")?,
+        resolved_artifacts_json: to_snapshot_json(&canonical_artifacts, "resolved artifacts")?,
         runtime_environment_json: to_snapshot_json(runtime_environment, "runtime environment")?,
         history_json: to_snapshot_json(history, "conversation history")?,
         created_at: now,
@@ -124,8 +148,332 @@ pub(crate) fn new_turn_runtime_snapshot(
     })
 }
 
+fn accepted_media_name(
+    locator: &str,
+    local: bool,
+    kind: pioneer_provider::InputContentType,
+) -> String {
+    // The filename is semantic input, never a public diagnostic or source URL.
+    let name = if local {
+        std::path::Path::new(locator)
+            .file_name()
+            .and_then(|v| v.to_str())
+            .map(str::to_owned)
+    } else {
+        url::Url::parse(locator).ok().and_then(|url| {
+            url.path_segments()
+                .and_then(|mut parts| parts.next_back())
+                .filter(|v| !v.is_empty())
+                .map(str::to_owned)
+        })
+    };
+    name.filter(|name| name.len() <= 255 && !name.chars().any(char::is_control))
+        .unwrap_or_else(|| {
+            match kind {
+                pioneer_provider::InputContentType::Image => "accepted-image",
+                pioneer_provider::InputContentType::Audio => "accepted-audio",
+                pioneer_provider::InputContentType::Video => "accepted-video",
+                _ => "accepted-file",
+            }
+            .to_owned()
+        })
+}
+
+pub(crate) async fn capture_native_media_inputs(
+    artifacts: &pioneer_artifacts::ArtifactService,
+    providers: &pioneer_provider::ProviderRegistry,
+    workspace: &str,
+    thread: &str,
+    provider: &str,
+    input: &[UserInput],
+    security: &TurnExecutionSecuritySnapshot,
+    actor: &pioneer_protocol::PersistedActorRef,
+) -> Result<Vec<UserInput>> {
+    use pioneer_protocol::{ArtifactCreatedByKind, ArtifactKind};
+    use pioneer_provider::{InputContentType as Kind, MessageAttachment};
+    let config = pioneer_provider::default_attachment_pipeline_config();
+    let mut remaining = config.max_total_bytes_per_request;
+    let context = pioneer_provider::ProviderAttemptContext::new(
+        pioneer_provider::ProviderTimeoutPolicy::default(),
+        false,
+    )?;
+    let mut result = Vec::with_capacity(input.len());
+    let mut count = 0;
+    for value in input {
+        anyhow::ensure!(
+            !context.cancellation.is_cancelled() && tokio::time::Instant::now() < context.deadline,
+            "immutable media ingress deadline exceeded"
+        );
+        let (locator, kind, local) = match value {
+            UserInput::LocalImage { path } => (path, Kind::Image, true),
+            UserInput::LocalFile { path } => (path, Kind::File, true),
+            UserInput::LocalAudio { path } => (path, Kind::Audio, true),
+            UserInput::LocalVideo { path } => (path, Kind::Video, true),
+            UserInput::Image { url } => (url, Kind::Image, false),
+            UserInput::File { url } => (url, Kind::File, false),
+            UserInput::Audio { url } => (url, Kind::Audio, false),
+            UserInput::Video { url } => (url, Kind::Video, false),
+            UserInput::Artifact {
+                artifact_id,
+                version_id,
+            } => {
+                count += 1;
+                anyhow::ensure!(
+                    count <= config.max_attachments_per_request,
+                    "media input count limit exceeded"
+                );
+                let version = version_id
+                    .as_deref()
+                    .filter(|version| !version.is_empty())
+                    .context("exact artifact input version required")?;
+                let summary = artifacts
+                    .get_exact_artifact_ref(workspace, artifact_id, version)
+                    .await?;
+                let size =
+                    usize::try_from(summary.size_bytes.context("artifact size is unknown")?)?;
+                anyhow::ensure!(
+                    size <= config.max_bytes_per_attachment,
+                    "media input byte limit exceeded"
+                );
+                remaining = remaining
+                    .checked_sub(size)
+                    .context("media aggregate limit exceeded")?;
+                result.push(value.clone());
+                continue;
+            }
+            _ => {
+                result.push(value.clone());
+                continue;
+            }
+        };
+        count += 1;
+        anyhow::ensure!(
+            count <= config.max_attachments_per_request,
+            "media input count limit exceeded"
+        );
+        let limit = remaining.min(config.max_bytes_per_attachment);
+        let mime = pioneer_provider::infer_mime_from_reference(locator, kind);
+        let bytes = if local {
+            pioneer_tools::FilePolicyChecker::read_accepted_bytes(
+                security.clone(),
+                locator.into(),
+                limit,
+                context.clone(),
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!("authorized media file capture failed"))?
+        } else {
+            pioneer_tools::enforce_network_url(Some(security), locator, "native media ingress")
+                .map_err(|_| anyhow::anyhow!("authorized media URL capture denied"))?;
+            let authority = providers
+                .authority_fingerprint_for_workspace(workspace, provider)?
+                .as_str()
+                .to_owned();
+            let attachment = MessageAttachment::from_url(locator, &mime);
+            pioneer_provider::with_provider_attempt_context(
+                pioneer_provider::ProviderAttemptContext {
+                    cancellation: context.cancellation.child_token(),
+                    ..context.clone()
+                },
+                pioneer_provider::attachments::read_accepted_source_bytes(
+                    provider,
+                    authority,
+                    &attachment,
+                    kind,
+                    &config,
+                    limit,
+                ),
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!("authorized media URL capture failed"))?
+        };
+        remaining = remaining
+            .checked_sub(bytes.len())
+            .context("media aggregate limit exceeded")?;
+        let summary = artifacts
+            .ingest_bytes(pioneer_artifacts::IngestArtifactBytesRequest {
+                workspace_id: workspace.to_owned(),
+                primary_thread_id: Some(thread.to_owned()),
+                bytes,
+                display_name: accepted_media_name(locator, local, kind),
+                kind: match kind {
+                    Kind::Image => ArtifactKind::Image,
+                    Kind::Audio => ArtifactKind::Audio,
+                    Kind::Video => ArtifactKind::Video,
+                    _ => ArtifactKind::File,
+                },
+                mime_type: Some(mime),
+                created_by_kind: match actor {
+                    pioneer_protocol::PersistedActorRef::Principal(_) => {
+                        ArtifactCreatedByKind::User
+                    }
+                    pioneer_protocol::PersistedActorRef::AgentExecution(_) => {
+                        ArtifactCreatedByKind::Agent
+                    }
+                    pioneer_protocol::PersistedActorRef::System => ArtifactCreatedByKind::System,
+                },
+                created_by_actor_id: match actor {
+                    pioneer_protocol::PersistedActorRef::Principal(id) => Some(id.to_string()),
+                    pioneer_protocol::PersistedActorRef::AgentExecution(id) => Some(id.to_string()),
+                    pioneer_protocol::PersistedActorRef::System => None,
+                },
+                binding: None,
+                metadata: Default::default(),
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("immutable media ingress commit failed"))?;
+        result.push(UserInput::Artifact {
+            artifact_id: summary.artifact.artifact_id,
+            version_id: summary.artifact.version_id,
+        });
+    }
+    anyhow::ensure!(
+        count <= config.max_attachments_per_request,
+        "media input count limit exceeded"
+    );
+    anyhow::ensure!(
+        !context.cancellation.is_cancelled() && tokio::time::Instant::now() < context.deadline,
+        "immutable media ingress deadline exceeded"
+    );
+    Ok(result)
+}
+
+pub(crate) async fn materialize_owned_history(
+    artifacts: &pioneer_artifacts::ArtifactService,
+    workspace_id: &str,
+    mut history: Vec<ChatMessage>,
+) -> Result<Vec<ChatMessage>> {
+    pioneer_observability::turn_startup::scope_current_stage(pioneer_observability::turn_startup::Stage::HistoryArtifacts, async {
+            let config = pioneer_provider::default_attachment_pipeline_config();
+            let mut remaining = config.max_total_bytes_per_request;
+            let mut count = 0;
+            for (message_index, message) in history.iter_mut().enumerate() {
+                for (part_index, part) in message.content_parts.iter_mut().enumerate() {
+                    let expected_kind = part.kind();
+                    let attachment = match part {
+                        pioneer_provider::MessageContentPart::Image { image } => image,
+                        pioneer_provider::MessageContentPart::File { file } => file,
+                        pioneer_provider::MessageContentPart::Audio { audio } => audio,
+                        pioneer_provider::MessageContentPart::Video { video } => video,
+                        pioneer_provider::MessageContentPart::Text { .. } => continue,
+                    };
+                    let Some(artifact) = attachment.artifact.as_ref() else {
+                        continue;
+                    };
+                    anyhow::ensure!(
+                        artifact.workspace_id.is_empty() || artifact.workspace_id == workspace_id,
+                        "historical attachment {message_index}:{part_index} belongs to another workspace"
+                    );
+                    let version_id = artifact.artifact_version_id.as_deref().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "historical attachment {message_index}:{part_index} has no accepted artifact version"
+                        )
+                    })?;
+                    count += 1;
+                    anyhow::ensure!(count <= config.max_attachments_per_request, "historical media count limit exceeded");
+                    let resolved = artifacts
+                        .resolve_owned_provider_attachment(
+                            workspace_id,
+                            artifact.artifact_id.as_str(),
+                            version_id,
+                            remaining.min(config.max_bytes_per_attachment),
+                        )
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "failed to materialize accepted historical artifact `{}` version `{version_id}`",
+                                artifact.artifact_id
+                            )
+                        })?;
+                    anyhow::ensure!(
+                        resolved.version_id.as_deref() == Some(version_id),
+                        "historical artifact resolver changed the accepted version"
+                    );
+                    anyhow::ensure!(resolved.content_type == expected_kind,
+                        "historical attachment kind changed after accepted capture");
+                    remaining = remaining.checked_sub(usize::try_from(resolved.attachment.size_bytes.unwrap_or(u64::MAX))?)
+                        .context("historical media aggregate byte limit exceeded")?;
+                    anyhow::ensure!(attachment.sha256.as_ref().is_none_or(|hash| resolved.attachment.sha256.as_ref() == Some(hash)),
+                        "historical accepted media hash changed");
+                    anyhow::ensure!(attachment.size_bytes.is_none_or(|size| resolved.attachment.size_bytes == Some(size)),
+                        "historical accepted media size changed");
+                    anyhow::ensure!(attachment.mime_type == resolved.attachment.mime_type,
+                        "historical accepted media MIME changed");
+                    *attachment = resolved.attachment;
+                }
+            }
+            Ok(history)
+        })
+        .await
+}
+
+pub(crate) async fn resolve_owned_artifact_inputs(
+    artifacts: &pioneer_artifacts::ArtifactService,
+    workspace_id: &str,
+    input: &[UserInput],
+) -> Result<Vec<ResolvedArtifactInput>> {
+    let config = pioneer_provider::default_attachment_pipeline_config();
+    let mut remaining = config.max_total_bytes_per_request;
+    let mut resolved = Vec::new();
+    for value in input {
+        match value {
+            UserInput::Artifact {
+                artifact_id,
+                version_id,
+            } => {
+                anyhow::ensure!(
+                    resolved.len() < config.max_attachments_per_request,
+                    "artifact input count exceeds limit"
+                );
+                let version = version_id
+                    .as_deref()
+                    .filter(|v| !v.is_empty())
+                    .context("native artifact input requires exact accepted version")?;
+                let owned = artifacts
+                    .resolve_owned_provider_attachment(
+                        workspace_id,
+                        artifact_id,
+                        version,
+                        remaining.min(config.max_bytes_per_attachment),
+                    )
+                    .await
+                    .map_err(|_| {
+                        anyhow::anyhow!(
+                            "exact artifact input is unavailable or exceeds read limits"
+                        )
+                    })?;
+                let size = usize::try_from(owned.attachment.size_bytes.unwrap_or(u64::MAX))?;
+                remaining = remaining
+                    .checked_sub(size)
+                    .context("artifact input aggregate limit exceeded")?;
+                resolved.push(ResolvedArtifactInput {
+                    artifact_id: owned.artifact_id,
+                    version_id: owned.version_id,
+                    content_type: owned.content_type,
+                    attachment: owned.attachment,
+                });
+            }
+            UserInput::Image { .. }
+            | UserInput::LocalImage { .. }
+            | UserInput::File { .. }
+            | UserInput::LocalFile { .. }
+            | UserInput::Audio { .. }
+            | UserInput::LocalAudio { .. }
+            | UserInput::Video { .. }
+            | UserInput::LocalVideo { .. } => {
+                bail!(
+                    "legacy mutable media has no accepted immutable artifact; explicit resubmission required"
+                );
+            }
+            _ => {}
+        }
+    }
+    Ok(resolved)
+}
+
 pub(crate) async fn restored_recovery_turn_request_from_snapshot(
     store: &CrudStore,
+    artifacts: Option<&pioneer_artifacts::ArtifactService>,
     snapshot: &TurnRuntimeSnapshotRecord,
     permission_profile: TurnPermissionProfileSnapshot,
     execution_security_snapshot: TurnExecutionSecuritySnapshot,
@@ -133,6 +481,57 @@ pub(crate) async fn restored_recovery_turn_request_from_snapshot(
 ) -> Result<RestoredRecoveryTurnRequest> {
     let (hook_runtime_context, history) =
         restored_conversation_scope_from_snapshot(store, snapshot).await?;
+    let input: Vec<UserInput> = from_snapshot_json(&snapshot.input_json, "turn input")?;
+    let (resolved_artifacts, history) = if let Some(artifacts) = artifacts {
+        let fresh =
+            resolve_owned_artifact_inputs(artifacts, &snapshot.workspace_id, &input).await?;
+        let recorded: Vec<ResolvedArtifactInput> =
+            from_snapshot_json(&snapshot.resolved_artifacts_json, "resolved artifacts")?;
+        for expected in &recorded {
+            let current = fresh
+                .iter()
+                .find(|current| {
+                    current.artifact_id == expected.artifact_id
+                        && current.version_id == expected.version_id
+                })
+                .context("snapshot artifact identity changed")?;
+            anyhow::ensure!(
+                current.content_type == expected.content_type
+                    && current.attachment.mime_type == expected.attachment.mime_type
+                    && expected
+                        .attachment
+                        .sha256
+                        .as_ref()
+                        .is_none_or(|hash| current.attachment.sha256.as_ref() == Some(hash))
+                    && expected
+                        .attachment
+                        .size_bytes
+                        .is_none_or(|size| current.attachment.size_bytes == Some(size)),
+                "snapshot accepted media contract changed"
+            );
+        }
+        (
+            fresh,
+            materialize_owned_history(artifacts, &snapshot.workspace_id, history).await?,
+        )
+    } else {
+        anyhow::ensure!(
+            !input.iter().any(|value| matches!(
+                value,
+                UserInput::Artifact { .. }
+                    | UserInput::LocalImage { .. }
+                    | UserInput::LocalFile { .. }
+                    | UserInput::LocalAudio { .. }
+                    | UserInput::LocalVideo { .. }
+                    | UserInput::Image { .. }
+                    | UserInput::File { .. }
+                    | UserInput::Audio { .. }
+                    | UserInput::Video { .. }
+            )) && !history.iter().any(ChatMessage::has_attachments),
+            "native artifact restore owner is unavailable"
+        );
+        (Vec::new(), history)
+    };
     Ok(RestoredRecoveryTurnRequest {
         turn_id: snapshot.turn_id.clone(),
         execution_window_index: 1,
@@ -154,12 +553,9 @@ pub(crate) async fn restored_recovery_turn_request_from_snapshot(
             skills: Vec::new(),
         },
         agent_skill_overlay,
-        input: from_snapshot_json(&snapshot.input_json, "turn input")?,
+        input,
         capabilities: restored_execution_capabilities(&snapshot.capabilities_json)?,
-        resolved_artifacts: from_snapshot_json(
-            &snapshot.resolved_artifacts_json,
-            "resolved artifacts",
-        )?,
+        resolved_artifacts,
         runtime_environment: from_snapshot_json(
             &snapshot.runtime_environment_json,
             "runtime environment",
@@ -665,3 +1061,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "turn_runtime_snapshot_r04_tests.rs"]
+mod r04_media_tests;

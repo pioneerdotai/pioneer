@@ -5954,15 +5954,20 @@ fn canonical_provider_messages_for_artifact_parity(
             let Some(_artifact) = attachment.artifact.as_ref() else {
                 continue;
             };
-            let pioneer_provider::AttachmentDataSource::Path { path } = &attachment.source else {
-                continue;
+            // Native ownership uses immutable bytes; CLI keeps its readable copy.
+            // Across roots parity remains the exact hash, not artifact handles.
+            let bytes = match &attachment.source {
+                pioneer_provider::AttachmentDataSource::Path { path } => {
+                    std::fs::read(path).expect("CLI parity copy")
+                }
+                pioneer_provider::AttachmentDataSource::Bytes { base64_data } => {
+                    use base64::Engine;
+                    base64::engine::general_purpose::STANDARD
+                        .decode(base64_data)
+                        .expect("native owned parity bytes")
+                }
+                _ => continue,
             };
-
-            // Artifact resolution deliberately creates a fresh per-turn staging path. Exact
-            // root isolation also requires distinct handles when equivalent bytes are attached
-            // from independent roots, so provider parity is defined by verified content here.
-            let bytes =
-                std::fs::read(path).expect("materialized parity artifact should be readable");
             let sha256 = hex::encode(Sha256::digest(bytes.as_slice()));
             if let Some(expected_sha256) = attachment.sha256.as_deref() {
                 assert_eq!(

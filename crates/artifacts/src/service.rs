@@ -188,6 +188,32 @@ struct ArtifactReadBlobDescriptor {
 }
 
 impl ArtifactService {
+    pub fn with_crud_store(&self, store: Arc<CrudStore>) -> Self {
+        let mut scoped = self.clone();
+        scoped.store = store;
+        scoped
+    }
+
+    /// Exact bounded metadata without loading all historical bindings.
+    pub async fn get_exact_artifact_ref(
+        &self,
+        workspace: &str,
+        artifact: &str,
+        version: &str,
+    ) -> ArtifactResult<ArtifactRef> {
+        validate_workspace_id(workspace)?;
+        validate_non_empty("artifact_id", artifact)?;
+        validate_non_empty("version_id", version)?;
+        let key = (artifact.to_owned(), version.to_owned());
+        self.store
+            .list_exact_artifact_refs(workspace, &[key.clone()])
+            .await?
+            .remove(&key)
+            .ok_or_else(|| ArtifactError::InvalidRequest {
+                message: "exact artifact version is unavailable".to_owned(),
+            })
+    }
+
     pub fn new(store: Arc<CrudStore>, blob_store: Arc<dyn ArtifactBlobStore>) -> Self {
         Self {
             store,
@@ -629,18 +655,19 @@ impl ArtifactService {
         validate_workspace_id(&params.workspace_id)?;
         validate_non_empty("artifact_id", &params.artifact_id)?;
         let max_read_bytes = max_read_bytes.max(1);
-        let summary = self
-            .get_artifact(
-                params.workspace_id.as_str(),
-                params.artifact_id.as_str(),
-                params.version_id.as_deref(),
-            )
-            .await?;
-        if summary.artifact.status != ArtifactStatus::Ready {
+        let artifact = if let Some(version) = params.version_id.as_deref() {
+            self.get_exact_artifact_ref(&params.workspace_id, &params.artifact_id, version)
+                .await?
+        } else {
+            self.get_artifact(&params.workspace_id, &params.artifact_id, None)
+                .await?
+                .artifact
+        };
+        if artifact.status != ArtifactStatus::Ready {
             return Err(ArtifactError::InvalidRequest {
                 message: format!(
                     "artifact `{}` is not ready for read: {:?}",
-                    params.artifact_id, summary.artifact.status
+                    params.artifact_id, artifact.status
                 ),
             });
         }
@@ -681,7 +708,7 @@ impl ArtifactService {
         let len = u64::try_from(bytes.len()).unwrap_or_default();
 
         Ok(ArtifactBoundedReadResult {
-            artifact: summary.artifact,
+            artifact: artifact,
             offset,
             len,
             total_size_bytes,
@@ -1221,6 +1248,89 @@ mod tests {
             service,
             store,
             _temp: temp,
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_owned_media_survives_readable_copy_gc_and_preserves_all_kinds() {
+        let harness = setup().await;
+        let canonical = b"immutable original bytes";
+        for (kind, content_type) in [
+            (ArtifactKind::Image, InputContentType::Image),
+            (ArtifactKind::File, InputContentType::File),
+            (ArtifactKind::Audio, InputContentType::Audio),
+            (ArtifactKind::Video, InputContentType::Video),
+        ] {
+            let summary = harness
+                .service
+                .ingest_bytes(IngestArtifactBytesRequest {
+                    workspace_id: "ws_a".to_owned(),
+                    primary_thread_id: None,
+                    bytes: canonical.to_vec(),
+                    display_name: "owned.bin".to_owned(),
+                    kind,
+                    mime_type: Some("application/octet-stream".to_owned()),
+                    created_by_kind: ArtifactCreatedByKind::User,
+                    created_by_actor_id: None,
+                    binding: None,
+                    metadata: BTreeMap::new(),
+                })
+                .await
+                .unwrap();
+            let artifact = &summary.artifact.artifact_id;
+            let version = summary.artifact.version_id.as_deref().unwrap();
+            let stale = harness
+                .service
+                .resolve_provider_attachment("ws_a", artifact, Some(version))
+                .await
+                .unwrap();
+            let AttachmentDataSource::Path { path } = stale.attachment.source else {
+                panic!("legacy copy");
+            };
+            let owned = harness
+                .service
+                .resolve_owned_provider_attachment("ws_a", artifact, version, 1024)
+                .await
+                .unwrap();
+            let root = LocalArtifactBlobStore::new(harness._temp.path()).artifact_root();
+            let report =
+                crate::readable_copy::execute_readable_copy_gc(&root, "ws_a", i64::MAX / 2, 0)
+                    .await
+                    .unwrap();
+            assert!(report.deleted_dirs > 0);
+            assert!(!std::path::Path::new(&path).exists());
+            let cold = harness
+                .service
+                .resolve_owned_provider_attachment("ws_a", artifact, version, 1024)
+                .await
+                .unwrap();
+            assert_eq!(owned, cold);
+            assert_eq!(cold.content_type, content_type);
+            assert_eq!(
+                cold.attachment.source,
+                pioneer_provider::attachments::owned_bytes_source(canonical)
+            );
+            assert!(
+                harness
+                    .service
+                    .resolve_owned_provider_attachment("ws_b", artifact, version, 1024)
+                    .await
+                    .is_err()
+            );
+            assert!(
+                harness
+                    .service
+                    .resolve_owned_provider_attachment("ws_a", artifact, version, 4)
+                    .await
+                    .is_err()
+            );
+            assert!(
+                harness
+                    .service
+                    .resolve_owned_provider_attachment("ws_a", artifact, "missing-version", 1024)
+                    .await
+                    .is_err()
+            );
         }
     }
 

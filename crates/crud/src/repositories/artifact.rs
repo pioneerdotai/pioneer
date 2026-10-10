@@ -1444,6 +1444,150 @@ pub async fn list_projections<C: ConnectionTrait>(
     rows.into_iter().map(projection_record_from_model).collect()
 }
 
+/// Prepared outside the serialized writer; commit revalidates exact identity,
+/// current readiness and binding authority before insertion in the Turn txn.
+#[derive(Clone)]
+pub(crate) struct PreparedNativeInputBinding {
+    workspace: String,
+    thread: String,
+    turn: String,
+    artifact: String,
+    version: String,
+    model: artifact_binding::ActiveModel,
+}
+
+pub(crate) fn prepare_native_input_binding(
+    workspace: &str,
+    thread: &str,
+    turn: &str,
+    artifact: &str,
+    version: &str,
+    index: i64,
+    created_at: DateTimeWithTimeZone,
+) -> PreparedNativeInputBinding {
+    PreparedNativeInputBinding {
+        workspace: workspace.to_owned(),
+        thread: thread.to_owned(),
+        turn: turn.to_owned(),
+        artifact: artifact.to_owned(),
+        version: version.to_owned(),
+        model: artifact_binding::ActiveModel {
+            id: Set(generate_id(21)),
+            artifact_id: Set(artifact.to_owned()),
+            artifact_version_id: Set(Some(version.to_owned())),
+            workspace_id: Set(workspace.to_owned()),
+            thread_id: Set(Some(thread.to_owned())),
+            turn_id: Set(Some(turn.to_owned())),
+            message_id: Set(None),
+            turn_item_id: Set(None),
+            tool_call_id: Set(None),
+            task_id: Set(None),
+            task_run_id: Set(None),
+            binding_kind: Set("user_input".to_owned()),
+            direction: Set("input".to_owned()),
+            role: Set(Some("user".to_owned())),
+            item_index: Set(Some(index)),
+            created_at: Set(created_at),
+            metadata_json: Set("{}".to_owned()),
+        },
+    }
+}
+
+pub(crate) async fn apply_native_input_binding<C: ConnectionTrait>(
+    db: &C,
+    prepared: PreparedNativeInputBinding,
+) -> anyhow::Result<()> {
+    let _artifact = artifact::Entity::find_by_id(&prepared.artifact)
+        .filter(artifact::Column::WorkspaceId.eq(&prepared.workspace))
+        .filter(artifact::Column::Status.eq("ready"))
+        .filter(artifact::Column::DeletedAt.is_null())
+        .one(db)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("accepted media artifact is unavailable"))?;
+    let exists = artifact_version::Entity::find_by_id(&prepared.version)
+        .filter(artifact_version::Column::ArtifactId.eq(&prepared.artifact))
+        .filter(artifact_version::Column::WorkspaceId.eq(&prepared.workspace))
+        .one(db)
+        .await?
+        .is_some();
+    anyhow::ensure!(exists, "accepted media exact version is unavailable");
+    let target_root = crate::resolve_artifact_binding_authorization_root(
+        db,
+        &prepared.workspace,
+        Some(&prepared.thread),
+        Some(&prepared.turn),
+        None,
+        None,
+    )
+    .await?;
+    let scope = crate::resolve_native_artifact_authorization_scope(
+        db,
+        &prepared.artifact,
+        Some(&prepared.workspace),
+        None,
+    )
+    .await?;
+    let scope_matches =
+        scope.is_some_and(|scope| scope.thread_id == target_root && target_root.is_some());
+    let direct_matches = native_input_direct_scope_matches(
+        db,
+        &prepared.workspace,
+        &prepared.artifact,
+        &prepared.thread,
+    )
+    .await?;
+    anyhow::ensure!(
+        target_root.is_some() && (scope_matches || direct_matches),
+        "accepted media binding authority changed"
+    );
+    // A replay of the same accepted event never creates another ownership pin.
+    if artifact_binding::Entity::find()
+        .filter(artifact_binding::Column::ArtifactId.eq(&prepared.artifact))
+        .filter(artifact_binding::Column::ArtifactVersionId.eq(&prepared.version))
+        .filter(artifact_binding::Column::WorkspaceId.eq(&prepared.workspace))
+        .filter(artifact_binding::Column::ThreadId.eq(&prepared.thread))
+        .filter(artifact_binding::Column::TurnId.eq(&prepared.turn))
+        .filter(artifact_binding::Column::BindingKind.eq("user_input"))
+        .filter(artifact_binding::Column::ItemIndex.eq(prepared.model.item_index.clone().unwrap()))
+        .one(db)
+        .await?
+        .is_none()
+    {
+        prepared.model.insert(db).await?;
+    }
+    Ok(())
+}
+
+pub async fn native_input_direct_scope_matches<C: ConnectionTrait>(
+    db: &C,
+    workspace: &str,
+    artifact_id: &str,
+    thread: &str,
+) -> anyhow::Result<bool> {
+    if artifact::Entity::find_by_id(artifact_id)
+        .filter(artifact::Column::WorkspaceId.eq(workspace))
+        .filter(artifact::Column::PrimaryThreadId.eq(thread))
+        .filter(artifact::Column::Status.eq("ready"))
+        .filter(artifact::Column::DeletedAt.is_null())
+        .one(db)
+        .await?
+        .is_none()
+    {
+        return Ok(false);
+    }
+    let foreign = artifact_binding::Entity::find()
+        .filter(artifact_binding::Column::ArtifactId.eq(artifact_id))
+        .filter(
+            sea_orm::Condition::any()
+                .add(artifact_binding::Column::WorkspaceId.ne(workspace))
+                .add(artifact_binding::Column::ThreadId.ne(thread))
+                .add(artifact_binding::Column::ThreadId.is_null()),
+        )
+        .count(db)
+        .await?;
+    Ok(foreign == 0)
+}
+
 pub async fn find_active_external_ref<C: ConnectionTrait>(
     db: &C,
     key: &ArtifactExternalRefKey,
@@ -1513,6 +1657,37 @@ pub async fn upsert_external_ref<C: ConnectionTrait>(
         source,
     })
     .map(external_ref_record_from_model)
+}
+
+pub async fn compare_delete_external_ref<C: ConnectionTrait>(
+    db: &C,
+    key: &ArtifactExternalRefKey,
+    rejected_external_id: &str,
+) -> ArtifactCrudResult<bool> {
+    validate_external_ref_key(key)?;
+    validate_non_empty("rejected_external_id", rejected_external_id)?;
+    let mut query = artifact_external_ref::Entity::delete_many()
+        .filter(artifact_external_ref::Column::WorkspaceId.eq(&key.workspace_id))
+        .filter(artifact_external_ref::Column::ArtifactId.eq(&key.artifact_id))
+        .filter(artifact_external_ref::Column::Provider.eq(&key.provider))
+        .filter(artifact_external_ref::Column::TransportKind.eq(&key.transport_kind))
+        .filter(artifact_external_ref::Column::ExternalId.eq(rejected_external_id));
+    query = match &key.artifact_version_id {
+        Some(version) => query.filter(artifact_external_ref::Column::ArtifactVersionId.eq(version)),
+        None => query.filter(artifact_external_ref::Column::ArtifactVersionId.is_null()),
+    };
+    query = match &key.model_family {
+        Some(model) => query.filter(artifact_external_ref::Column::ModelFamily.eq(model)),
+        None => query.filter(artifact_external_ref::Column::ModelFamily.is_null()),
+    };
+    let result = query
+        .exec(db)
+        .await
+        .map_err(|source| ArtifactCrudError::Database {
+            message: "failed to invalidate exact rejected external ref".to_owned(),
+            source,
+        })?;
+    Ok(result.rows_affected > 0)
 }
 
 pub async fn prune_expired_external_refs<C: ConnectionTrait>(

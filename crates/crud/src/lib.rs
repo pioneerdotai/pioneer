@@ -141,7 +141,7 @@ pub use repositories::authorization_scope::{
     ThreadAuthorizationScope, ThreadStartAuthorizationScope, TurnAuthorizationScope,
     WorkspaceAuthorizationScope, list_abandoned_runtime_draft_artifact_ids,
     resolve_artifact_authorization_scope, resolve_artifact_binding_authorization_root,
-    resolve_persisted_capability_authorization_scope,
+    resolve_native_artifact_authorization_scope, resolve_persisted_capability_authorization_scope,
     resolve_runtime_draft_artifact_authorization_scope, resolve_session_authorization_scope,
     resolve_task_authorization_scope, resolve_thread_authorization_scope,
     resolve_thread_start_authorization_scope, resolve_turn_authorization_scope,
@@ -9046,6 +9046,36 @@ impl CrudStore {
                     .await
                     .map_err(Into::into)
             }
+        })
+        .await
+    }
+
+    pub async fn native_input_direct_scope_matches(
+        &self,
+        workspace: &str,
+        artifact: &str,
+        thread: &str,
+    ) -> Result<bool> {
+        artifact_repository::native_input_direct_scope_matches(
+            &self.connection,
+            workspace,
+            artifact,
+            thread,
+        )
+        .await
+    }
+
+    pub async fn compare_delete_artifact_external_ref(
+        &self,
+        key: &ArtifactExternalRefKey,
+        rejected_id: &str,
+    ) -> Result<bool> {
+        let key = key.clone();
+        let rejected_id = rejected_id.to_owned();
+        self.run_serialized_write(|| async {
+            artifact_repository::compare_delete_external_ref(&self.connection, &key, &rejected_id)
+                .await
+                .map_err(Into::into)
         })
         .await
     }
@@ -29553,6 +29583,57 @@ impl CrudStore {
         let claim_expires_at =
             unix_to_datetime(event_timestamp_secs.saturating_add(TURN_EVENT_PROJECTION_LEASE_SECS));
 
+        let mut input_bindings = Vec::new();
+        if admission.is_some()
+            && execution.as_ref().is_some_and(|owner| {
+                matches!(
+                    owner.executor_kind,
+                    TurnExecutorKind::NativeAgent | TurnExecutorKind::ApiProvider
+                )
+            })
+        {
+            for event in &events {
+                if let TurnEventPayload::TurnStarted(started) = event {
+                    for (index, input) in started.input.iter().enumerate() {
+                        anyhow::ensure!(
+                            matches!(
+                                input,
+                                UserInput::Text { .. }
+                                    | UserInput::Mention { .. }
+                                    | UserInput::Artifact {
+                                        version_id: Some(_),
+                                        ..
+                                    }
+                            ),
+                            "native media admission requires immutable exact input"
+                        );
+                        if let UserInput::Artifact {
+                            artifact_id,
+                            version_id: Some(version),
+                        } = input
+                        {
+                            anyhow::ensure!(
+                                !version.is_empty(),
+                                "native media admission requires exact version"
+                            );
+                            anyhow::ensure!(
+                                input_bindings.len() < 64,
+                                "native media input count exceeds limit"
+                            );
+                            input_bindings.push(artifact_repository::prepare_native_input_binding(
+                                &started.thread.workspace_id,
+                                &started.thread.id,
+                                &started.turn.id,
+                                artifact_id,
+                                version,
+                                index as i64,
+                                created_at,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
         self.run_serialized_write(|| {
             self.materialize_turn_events_atomically_once(
                 events.clone(),
@@ -29566,6 +29647,7 @@ impl CrudStore {
                 agent_action.clone(),
                 execution_graph.clone(),
                 agent_turn_response.clone(),
+                input_bindings.clone(),
             )
         })
         .await
@@ -29606,6 +29688,7 @@ impl CrudStore {
         agent_action: Option<AgentCommitInput>,
         execution_graph: Option<AgentExecutionGraphCommitInput>,
         agent_turn_response: Option<AgentTurnResponseInput>,
+        input_bindings: Vec<artifact_repository::PreparedNativeInputBinding>,
     ) -> Result<Option<AgentExecutionGraphCommitResult>> {
         if events.len() > MAX_ATOMIC_TURN_EVENT_BATCH_SIZE {
             bail!("atomic Turn event batch exceeds {MAX_ATOMIC_TURN_EVENT_BATCH_SIZE} events");
@@ -29735,6 +29818,15 @@ impl CrudStore {
                     false,
                 )
                 .await
+            {
+                let _ = transaction.rollback().await;
+                return Err(error);
+            }
+        }
+
+        for binding in input_bindings {
+            if let Err(error) =
+                artifact_repository::apply_native_input_binding(&transaction, binding).await
             {
                 let _ = transaction.rollback().await;
                 return Err(error);
@@ -55522,6 +55614,9 @@ mod tests {
                 if audit.event_kind == TurnPermissionAuditEventKind::ProfileSelected
         )));
     }
+
+    #[path = "native_media_admission_tests.rs"]
+    mod native_media_admission_tests;
 
     #[tokio::test]
     async fn authorized_admission_rolls_back_on_owner_failure_and_replay_preserves_receipt() {

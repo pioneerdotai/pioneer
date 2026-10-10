@@ -2626,7 +2626,7 @@ impl MessageProcessor {
             }
         };
         drop(startup_persist);
-        let outcome = outcome_result.map_err(|error| {
+        let mut outcome = outcome_result.map_err(|error| {
             TurnStartFailure::internal(format!("failed to start turn: {error:#}"))
         })?;
         let effective_reasoning_effort = match self
@@ -2837,6 +2837,46 @@ impl MessageProcessor {
         } else {
             None
         };
+        // The original digest remains the idempotency identity. Accepted durable
+        // semantic input is replaced only with exact immutable artifact refs.
+        match crate::turn_runtime_snapshot::capture_native_media_inputs(
+            self.artifact_service.as_ref(),
+            self.provider_registry.as_ref(),
+            &outcome.materialization.thread.workspace_id,
+            &outcome.materialization.thread.id,
+            &outcome.materialization.thread.model_provider,
+            &outcome.materialization.input,
+            &execution_security_snapshot,
+            &request_actor,
+        )
+        .await
+        {
+            Ok(input) => outcome.materialization.input = input,
+            Err(_) => {
+                self.thread_manager
+                    .rollback_turn_start(outcome.rollback_context.clone())
+                    .await;
+                return Err(TurnStartFailure::unavailable(
+                    "media input could not be captured under the authorized bounded policy",
+                ));
+            }
+        }
+        if self
+            .validate_turn_artifact_user_inputs(
+                &outcome.materialization.thread.workspace_id,
+                &outcome.materialization.thread.id,
+                &outcome.materialization.input,
+            )
+            .await
+            .is_err()
+        {
+            self.thread_manager
+                .rollback_turn_start(outcome.rollback_context.clone())
+                .await;
+            return Err(TurnStartFailure::unavailable(
+                "captured media artifact is unavailable",
+            ));
+        }
         let persisted = message_future(persist_admitted_turn_start(
             self.crud_store.as_ref(),
             self.provider_registry.as_ref(),
@@ -3017,7 +3057,7 @@ impl MessageProcessor {
                 pioneer_observability::turn_startup::Stage::Artifacts,
             );
             match self
-                .resolve_provider_artifact_inputs(
+                .resolve_owned_provider_artifact_inputs(
                     outcome.started_notification.workspace_id.as_str(),
                     outcome.materialization.input.as_slice(),
                 )
@@ -3355,7 +3395,7 @@ impl MessageProcessor {
             })
             .collect::<HashMap<_, _>>();
         let resolved_artifacts = self
-            .resolve_provider_artifact_inputs(
+            .resolve_owned_provider_artifact_inputs(
                 outcome.started_notification.workspace_id.as_str(),
                 outcome.materialization.input.as_slice(),
             )
@@ -9283,74 +9323,13 @@ impl MessageProcessor {
     pub(crate) async fn materialize_historical_artifacts(
         &self,
         workspace_id: &str,
-        mut history: Vec<ChatMessage>,
+        history: Vec<ChatMessage>,
     ) -> anyhow::Result<Vec<ChatMessage>> {
-        scope_current_stage(Stage::HistoryArtifacts, async {
-            for (message_index, message) in history.iter_mut().enumerate() {
-                for (part_index, part) in message.content_parts.iter_mut().enumerate() {
-                    let (attachment, expected_image) = match part {
-                        pioneer_provider::MessageContentPart::Image { image } => (image, true),
-                        pioneer_provider::MessageContentPart::File { file } => (file, false),
-                        pioneer_provider::MessageContentPart::Text { .. }
-                        | pioneer_provider::MessageContentPart::Audio { .. }
-                        | pioneer_provider::MessageContentPart::Video { .. } => continue,
-                    };
-                    let Some(artifact) = attachment.artifact.as_ref() else {
-                        continue;
-                    };
-                    if !matches!(
-                        &attachment.source,
-                        pioneer_provider::AttachmentDataSource::Reference { reference }
-                            if reference == &format!("pioneer-artifact:{}", artifact.artifact_id)
-                    ) {
-                        continue;
-                    }
-                    anyhow::ensure!(
-                        artifact.workspace_id.is_empty() || artifact.workspace_id == workspace_id,
-                        "historical attachment {message_index}:{part_index} belongs to another workspace"
-                    );
-                    let version_id = artifact.artifact_version_id.as_deref().ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "historical attachment {message_index}:{part_index} has no accepted artifact version"
-                        )
-                    })?;
-                    let resolved = self
-                        .artifact_service
-                        .resolve_provider_attachment(
-                            workspace_id,
-                            artifact.artifact_id.as_str(),
-                            Some(version_id),
-                        )
-                        .await
-                        .with_context(|| {
-                            format!(
-                                "failed to materialize accepted historical artifact `{}` version `{version_id}`",
-                                artifact.artifact_id
-                            )
-                        })?;
-                    anyhow::ensure!(
-                        resolved.version_id.as_deref() == Some(version_id),
-                        "historical artifact resolver changed the accepted version"
-                    );
-                    let resolved_is_image = match resolved.content_type {
-                        pioneer_provider::InputContentType::Image => true,
-                        pioneer_provider::InputContentType::File
-                        | pioneer_provider::InputContentType::Text => false,
-                        pioneer_provider::InputContentType::Audio
-                        | pioneer_provider::InputContentType::Video => anyhow::bail!(
-                            "historical artifact {message_index}:{part_index} has unsupported content type {:?}",
-                            resolved.content_type
-                        ),
-                    };
-                    anyhow::ensure!(
-                        resolved_is_image == expected_image,
-                        "historical attachment kind changed after accepted capture"
-                    );
-                    *attachment = resolved.attachment;
-                }
-            }
-            Ok(history)
-        })
+        crate::turn_runtime_snapshot::materialize_owned_history(
+            self.artifact_service.as_ref(),
+            workspace_id,
+            history,
+        )
         .await
     }
 

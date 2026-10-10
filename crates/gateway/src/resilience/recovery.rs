@@ -496,6 +496,7 @@ pub struct RuntimeFailureCandidate {
 
 #[derive(Clone)]
 pub struct RecoveryCoordinator {
+    artifact_service: Option<Arc<pioneer_artifacts::ArtifactService>>,
     crud_store: Arc<CrudStore>,
     agent_manager: Arc<AgentManager>,
     policy_registry: RecoveryPolicyRegistry,
@@ -735,6 +736,7 @@ impl RecoveryCoordinator {
             crate::authorization::AuthorizationInvalidationHub::durable(crud_store.clone()),
         );
         Self {
+            artifact_service: None,
             crud_store,
             agent_manager,
             policy_registry,
@@ -750,8 +752,20 @@ impl RecoveryCoordinator {
         }
     }
 
+    pub(crate) fn with_artifact_service(
+        mut self,
+        service: Arc<pioneer_artifacts::ArtifactService>,
+    ) -> Self {
+        self.artifact_service = Some(service);
+        self
+    }
+
     pub(crate) fn with_crud_store(&self, crud_store: Arc<CrudStore>) -> Self {
         let mut scoped = self.clone();
+        scoped.artifact_service = self
+            .artifact_service
+            .as_ref()
+            .map(|service| Arc::new(service.with_crud_store(crud_store.clone())));
         scoped.crud_store = crud_store;
         scoped
     }
@@ -3166,6 +3180,7 @@ impl RecoveryCoordinator {
         let mut request =
             match crate::turn_runtime_snapshot::restored_recovery_turn_request_from_snapshot(
                 self.crud_store.as_ref(),
+                self.artifact_service.as_deref(),
                 &snapshot,
                 turn.permission_profile,
                 match self

@@ -6,7 +6,7 @@ use pioneer_entity::{
     task, task_execution_admission, task_run, thread, thread_lineage, turn, workspace,
 };
 use pioneer_protocol::{PersistedActorRef, PrincipalId};
-use sea_orm::{ColumnTrait, Condition, ConnectionTrait, EntityTrait, QueryFilter};
+use sea_orm::{ColumnTrait, Condition, ConnectionTrait, EntityTrait, QueryFilter, QuerySelect};
 
 use super::identity::actor_ref_from_db;
 use super::membership::{PersistedThreadAccessClass, persisted_thread_access_class_from_db};
@@ -175,6 +175,40 @@ pub async fn resolve_artifact_authorization_scope<C: ConnectionTrait>(
     expected_workspace_id: Option<&str>,
     expected_thread_id: Option<&str>,
 ) -> Result<Option<ArtifactAuthorizationScope>> {
+    resolve_artifact_authorization_scope_inner(
+        db,
+        artifact_id,
+        expected_workspace_id,
+        expected_thread_id,
+        None,
+    )
+    .await
+}
+
+/// Native admission has a finite binding cardinality and fails explicitly above it.
+pub async fn resolve_native_artifact_authorization_scope<C: ConnectionTrait>(
+    db: &C,
+    artifact_id: &str,
+    expected_workspace_id: Option<&str>,
+    expected_thread_id: Option<&str>,
+) -> Result<Option<ArtifactAuthorizationScope>> {
+    resolve_artifact_authorization_scope_inner(
+        db,
+        artifact_id,
+        expected_workspace_id,
+        expected_thread_id,
+        Some(4096),
+    )
+    .await
+}
+
+async fn resolve_artifact_authorization_scope_inner<C: ConnectionTrait>(
+    db: &C,
+    artifact_id: &str,
+    expected_workspace_id: Option<&str>,
+    expected_thread_id: Option<&str>,
+    max_bindings: Option<u64>,
+) -> Result<Option<ArtifactAuthorizationScope>> {
     let Some(model) = artifact::Entity::find_by_id(artifact_id.to_owned())
         .one(db)
         .await
@@ -191,11 +225,19 @@ pub async fn resolve_artifact_authorization_scope<C: ConnectionTrait>(
         return Ok(None);
     };
 
-    let bindings = artifact_binding::Entity::find()
-        .filter(artifact_binding::Column::ArtifactId.eq(model.id.clone()))
+    let mut query = artifact_binding::Entity::find()
+        .filter(artifact_binding::Column::ArtifactId.eq(model.id.clone()));
+    if let Some(limit) = max_bindings {
+        query = query.limit(limit + 1);
+    }
+    let bindings = query
         .all(db)
         .await
         .context("failed to load artifact authorization bindings")?;
+    anyhow::ensure!(
+        max_bindings.is_none_or(|limit| bindings.len() as u64 <= limit),
+        "native media binding cardinality limit exceeded"
+    );
     let mut thread_ids = BTreeSet::new();
     if let Some(thread_id) = model.primary_thread_id.as_ref() {
         let Some(root_thread_id) = artifact_authorization_root_thread_id(
