@@ -2142,7 +2142,7 @@ mod tests {
         NewCliRuntimeThreadBinding,
     };
     use sea_orm::entity::prelude::DateTimeWithTimeZone;
-    use sea_orm::{Database, DatabaseConnection};
+    use sea_orm::{ConnectionTrait, Database, DatabaseConnection};
     use serde_json::json;
     use std::sync::Mutex;
     use std::time::Duration;
