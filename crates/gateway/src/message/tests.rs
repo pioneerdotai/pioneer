@@ -26012,18 +26012,46 @@ async fn cli_input_admission_impl(case: CliInputAdmissionCase) {
         _ => "CURRENT AFTER BIG HISTORY".to_owned(),
     };
     let context = sessions.connection_context(connection).await.unwrap();
-    Arc::clone(&processor).process_owned_request(context, json!({
+    let payload = json!({
         "jsonrpc":"2.0", "id":request_id, "method":"turn/start",
         "params":{"thread_id":thread,"turn_id":turn,
             "input":[{"type":"text","text":current_input}],
             "mode":"Agent","model":"gpt-5",
             "execution_backend":{"type":"cliAgentRuntime","runtime_id":"codex","runtime_kind":CLIAgentRuntimeKind::Codex},
             "permission_profile":pioneer_protocol::TurnPermissionProfileSelection::full_access()}
-    }).to_string()).await;
+    }).to_string();
     if matches!(case, CliInputAdmissionCase::Current) {
+        let (_, admission_events) = crate::public_error::test_support::capture_events_async(
+            Arc::clone(&processor).process_owned_request(context, payload),
+        )
+        .await;
         let error = recv_error_by_id(&mut rx, &request_id).await;
-        assert!(error.error.message.contains("1048576 characters"));
-        assert!(error.error.message.contains("current CLI input"));
+        let public = assert_public_error(
+            &error,
+            PublicErrorCode::Internal,
+            PublicErrorStage::Admission,
+        );
+        let event = admission_events
+            .iter()
+            .find(|event| {
+                matches!(event.contexts.get("Rust Tracing Fields"),
+                Some(sentry::protocol::Context::Other(fields))
+                if fields.get("correlation_id") == Some(&json!(public.correlation_id)))
+            })
+            .expect("oversized input must report its correlated admission diagnostic");
+        crate::public_error::test_support::assert_correlated(event, &public);
+        let sentry::protocol::Context::Other(fields) = &event.contexts["Rust Tracing Fields"]
+        else {
+            panic!("admission diagnostic must contain tracing fields");
+        };
+        let diagnostic = fields["raw_diagnostic"]
+            .as_str()
+            .expect("admission diagnostic must be text");
+        assert!(diagnostic.contains("1048576 characters"), "{diagnostic}");
+        assert!(diagnostic.contains("current CLI input"), "{diagnostic}");
+        let encoded = serde_json::to_string(&error).unwrap();
+        assert!(!encoded.contains("1048576 characters"));
+        assert!(!encoded.contains("current CLI input"));
         assert!(cli.turn_starts.lock().await.is_empty());
         assert_eq!(summarizer.call_count(), 0);
         assert!(
@@ -26039,6 +26067,9 @@ async fn cli_input_admission_impl(case: CliInputAdmissionCase) {
         );
         return;
     }
+    Arc::clone(&processor)
+        .process_owned_request(context, payload)
+        .await;
     let response = recv_response_by_id(&mut rx, &request_id).await;
     let accepted: TurnStartResponse = serde_json::from_value(response.result).unwrap();
     assert_eq!(accepted.turn.id, turn);
