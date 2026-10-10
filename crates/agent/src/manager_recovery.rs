@@ -1,6 +1,4 @@
 use super::{ActiveTurnRequest, RecoveryAttemptRequest};
-use pioneer_protocol::{TurnCapabilityKind, UserInput};
-use pioneer_provider::InputContentType;
 
 pub(super) fn apply_recovery_adjustments(
     turn_request: &mut ActiveTurnRequest,
@@ -16,27 +14,8 @@ pub(super) fn apply_recovery_adjustments(
     turn_request.execution_options.context_overflow_recovery = request.compact_history;
     turn_request.execution_options.context_recovery_deadline_ms =
         request.context_recovery_deadline_ms;
-    if request.disable_tool_calling {
-        turn_request.capabilities.retain(|capability| {
-            !matches!(
-                capability.kind,
-                TurnCapabilityKind::McpServer { .. } | TurnCapabilityKind::McpTool { .. }
-            )
-        });
-    }
-    if request.disable_image_input {
-        turn_request.input.retain(|input| {
-            !matches!(
-                input,
-                UserInput::Image { .. } | UserInput::LocalImage { .. }
-            )
-        });
-        turn_request
-            .resolved_artifacts
-            .retain(|artifact| artifact.content_type != InputContentType::Image);
-    }
     turn_request.execution_options.force_non_stream = request.force_non_stream;
-    turn_request.execution_options.disable_tool_calling = request.disable_tool_calling;
+    // Legacy adjustment flags never grant permission to drop accepted semantics.
     turn_request.execution_options.continue_generation_hint = request.continue_generation;
     turn_request.retained_provider_history = request.retained_provider_history.clone();
     turn_request.execution_checkpoint_context = request.execution_checkpoint_context.clone();
@@ -63,7 +42,7 @@ mod tests {
         build_execution_checkpoint_payload,
     };
     use pioneer_provider::ChatMessage;
-    use pioneer_provider::MessageAttachment;
+    use pioneer_provider::{InputContentType, MessageAttachment};
     use std::collections::HashMap;
 
     fn empty_skill_catalog() -> pioneer_skills::SkillCatalogSnapshot {
@@ -279,7 +258,7 @@ mod tests {
     }
 
     #[test]
-    fn recovery_adjustments_downgrade_unsupported_tools_and_images() {
+    fn recovery_adjustments_preserve_inputs_despite_legacy_degradation_flags() {
         let mut turn_request = ActiveTurnRequest {
             turn_id: "turn_downgrade".to_owned(),
             execution_window_index: 1,
@@ -381,17 +360,17 @@ mod tests {
 
         apply_recovery_adjustments(&mut turn_request, &request);
 
-        assert!(turn_request.execution_options.disable_tool_calling);
-        assert_eq!(turn_request.input.len(), 1);
-        assert_eq!(turn_request.capabilities.len(), 1);
+        assert!(!turn_request.execution_options.disable_tool_calling);
+        assert_eq!(turn_request.input.len(), 3);
+        assert_eq!(turn_request.capabilities.len(), 3);
         assert!(matches!(
             turn_request.capabilities[0].kind,
             TurnCapabilityKind::Skill { .. }
         ));
-        assert_eq!(turn_request.resolved_artifacts.len(), 1);
+        assert_eq!(turn_request.resolved_artifacts.len(), 2);
         assert_eq!(
             turn_request.resolved_artifacts[0].content_type,
-            InputContentType::File
+            InputContentType::Image
         );
     }
 }

@@ -1052,7 +1052,7 @@ impl RecoveryCoordinator {
         )])
     }
 
-    pub async fn record_cli_runtime_attempt_failure(
+    pub async fn record_runtime_attempt_failure(
         &self,
         recovery_job_id: &str,
         recovery_attempt_id: &str,
@@ -4368,17 +4368,9 @@ impl RecoveryCoordinator {
                         .to_owned(),
                 );
             }
-            ProviderFailureClass::UnsupportedToolCalling => {
-                if provider_snapshot_field(job, "transport") == Some("stream") {
-                    plan.force_non_stream = true;
-                }
-                plan.disable_tool_calling = true;
-            }
-            ProviderFailureClass::UnsupportedImageInput => {
-                if provider_snapshot_field(job, "transport") == Some("stream") {
-                    plan.force_non_stream = true;
-                }
-                plan.disable_image_input = true;
+            ProviderFailureClass::UnsupportedToolCalling
+            | ProviderFailureClass::UnsupportedImageInput => {
+                plan.terminal_reason = Some("accepted input or required tools are unsupported; recovery cannot weaken the turn contract".to_owned());
             }
             ProviderFailureClass::Unknown => {
                 plan.terminal_reason = Some(
@@ -7265,7 +7257,7 @@ mod tests {
         );
 
         let failure_events = coordinator
-            .record_cli_runtime_attempt_failure(
+            .record_runtime_attempt_failure(
                 request.job_id.as_str(),
                 request.recovery_attempt_id.as_str(),
                 "replacement native turn disconnected".to_owned(),
@@ -10954,7 +10946,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unsupported_tool_calling_plan_disables_tools_without_terminal_reason() {
+    async fn unsupported_tool_calling_plan_preserves_semantics_and_rejects_retry() {
         let (_crud_store, coordinator) = setup_coordinator().await;
         let job = provider_plan_job(ProviderFailureClass::UnsupportedToolCalling, "stream");
 
@@ -10963,14 +10955,14 @@ mod tests {
             .await
             .expect("unsupported tool-calling plan should build");
 
-        assert!(plan.disable_tool_calling);
-        assert!(plan.force_non_stream);
+        assert!(!plan.disable_tool_calling);
+        assert!(!plan.force_non_stream);
         assert!(!plan.disable_image_input);
-        assert!(plan.terminal_reason.is_none());
+        assert!(plan.terminal_reason.is_some());
     }
 
     #[tokio::test]
-    async fn unsupported_image_input_plan_removes_images_without_terminal_reason() {
+    async fn unsupported_image_input_plan_preserves_semantics_and_rejects_retry() {
         let (_crud_store, coordinator) = setup_coordinator().await;
         let job = provider_plan_job(ProviderFailureClass::UnsupportedImageInput, "non_stream");
 
@@ -10979,10 +10971,10 @@ mod tests {
             .await
             .expect("unsupported image-input plan should build");
 
-        assert!(plan.disable_image_input);
+        assert!(!plan.disable_image_input);
         assert!(!plan.disable_tool_calling);
         assert!(!plan.force_non_stream);
-        assert!(plan.terminal_reason.is_none());
+        assert!(plan.terminal_reason.is_some());
     }
 
     #[tokio::test]
