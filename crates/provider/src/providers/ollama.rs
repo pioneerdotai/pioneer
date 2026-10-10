@@ -387,7 +387,8 @@ impl OllamaProvider {
             self.timeout_policy,
         )
         .send()
-        .await?;
+        .await
+        .map_err(crate::failure::safe_transport_error)?;
         if !response.status().is_success() {
             return Err(Self::api_error(response).await);
         }
@@ -421,18 +422,7 @@ impl OllamaProvider {
     }
 
     async fn api_error(response: reqwest::Response) -> anyhow::Error {
-        let status = response.status();
-        let body = match crate::http::read_response_text_bounded(
-            response,
-            16 * 1024,
-            "provider_error_body",
-        )
-        .await
-        {
-            Ok(body) => body,
-            Err(error) => return error,
-        };
-        anyhow!("Ollama API error ({status}): {body}")
+        crate::failure::http_error(response).await
     }
 }
 
@@ -749,7 +739,8 @@ impl crate::traits::Provider for OllamaProvider {
         let request_builder = self.client.post(self.chat_url()).json(&api_request);
         let response = crate::http::non_stream_request(request_builder, self.timeout_policy)
             .send()
-            .await?;
+            .await
+            .map_err(crate::failure::safe_transport_error)?;
 
         if !response.status().is_success() {
             return Err(Self::api_error(response).await);
@@ -802,7 +793,8 @@ impl crate::traits::Provider for OllamaProvider {
         let request_builder = self.client.get(self.tags_url());
         let response = crate::http::non_stream_request(request_builder, self.timeout_policy)
             .send()
-            .await?;
+            .await
+            .map_err(crate::failure::safe_transport_error)?;
 
         if !response.status().is_success() {
             return Err(Self::api_error(response).await);

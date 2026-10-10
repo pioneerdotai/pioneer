@@ -80,13 +80,8 @@ pub(crate) async fn send_stream_request(
     let send = stream_request(builder, policy).send();
     tokio::time::timeout(policy.first_chunk_timeout, send)
         .await
-        .map_err(|_| {
-            anyhow!(
-                "provider stream timed out before response headers after {:?}",
-                policy.first_chunk_timeout
-            )
-        })?
-        .map_err(Into::into)
+        .map_err(|_| crate::failure::transport_timeout_error())?
+        .map_err(crate::failure::safe_transport_error)
 }
 
 pub(crate) async fn read_response_bytes_bounded(
@@ -120,7 +115,7 @@ pub(crate) async fn read_response_bytes_bounded(
     let mut body = Vec::with_capacity(capacity);
     let mut byte_stream = response.bytes_stream();
     while let Some(chunk) = byte_stream.next().await {
-        let chunk = chunk?;
+        let chunk = chunk.map_err(crate::failure::safe_transport_error)?;
         let observed = body.len().saturating_add(chunk.len());
         if observed > limit {
             let limit_error = ProviderResponseTooLarge::new(component, limit, observed);
@@ -145,7 +140,7 @@ pub(crate) async fn read_response_text_bounded(
     component: &'static str,
 ) -> Result<String> {
     let body = read_response_bytes_bounded(response, limit, component).await?;
-    String::from_utf8(body).context("provider response body was not valid UTF-8")
+    String::from_utf8(body).map_err(|_| anyhow!("provider response body was not valid UTF-8"))
 }
 
 pub(crate) async fn read_response_json_bounded<T: DeserializeOwned>(
@@ -154,7 +149,8 @@ pub(crate) async fn read_response_json_bounded<T: DeserializeOwned>(
     component: &'static str,
 ) -> Result<T> {
     let body = read_response_bytes_bounded(response, limits.max_transport_bytes, component).await?;
-    serde_json::from_slice(body.as_slice()).context("provider response body was not valid JSON")
+    serde_json::from_slice(body.as_slice())
+        .map_err(|_| anyhow!("provider response body was not valid JSON"))
 }
 
 /// Wrap a provider stream with the same hard byte limit used for non-stream
@@ -200,7 +196,7 @@ pub(crate) fn bounded_response_stream(
                         Some((Ok(chunk), Some((byte_stream, observed))))
                     }
                 }
-                Some(Err(error)) => Some((Err(error.into()), None)),
+                Some(Err(error)) => Some((Err(crate::failure::safe_transport_error(error)), None)),
                 None => None,
             }
         },

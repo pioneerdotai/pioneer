@@ -32,8 +32,7 @@ use serde::{Deserialize, Serialize};
 use sha2::Digest;
 
 use pioneer_protocol::{
-    ProviderFailureClass, ProviderFailureStage, ProviderModelCapabilities, ProviderModelInfo,
-    ProviderModelLimits,
+    ProviderFailureClass, ProviderModelCapabilities, ProviderModelInfo, ProviderModelLimits,
 };
 
 pub(crate) const BASE_URL: &str = "https://api.openai.com/v1";
@@ -324,6 +323,7 @@ impl StreamDelta {
 #[derive(Debug, Deserialize)]
 struct StreamError {
     #[serde(default)]
+    #[cfg_attr(not(test), allow(dead_code))] // parsed only; never diagnostic or policy input
     message: Option<String>,
     #[serde(default)]
     code: Option<serde_json::Value>,
@@ -332,6 +332,7 @@ struct StreamError {
 }
 
 impl StreamError {
+    #[cfg(test)]
     fn description(self) -> String {
         let mut parts = Vec::new();
         if let Some(message) = self.message.filter(|message| !message.is_empty()) {
@@ -394,35 +395,27 @@ impl OpenAiFileUploadError {
     }
 
     fn http(status: reqwest::StatusCode, body: &str, retry_after_ms: Option<u64>) -> Self {
-        let lower = body.to_ascii_lowercase();
-        let code = crate::failure::extract_provider_code(body);
-        let class = crate::failure::classify_provider_failure_class(
-            lower.as_str(),
-            ProviderFailureStage::Connect,
-            Some(status.as_u16()),
-            code.as_deref(),
-        );
-        Self::new(
-            class,
-            Some(status.as_u16()),
-            retry_after_ms.or_else(|| crate::failure::extract_retry_after_ms(&lower)),
-        )
+        let value = serde_json::from_str::<serde_json::Value>(body).ok();
+        let code = value
+            .as_ref()
+            .and_then(|value| value.get("error"))
+            .and_then(|error| error.get("code"))
+            .and_then(serde_json::Value::as_str);
+        let mut classification =
+            crate::failure::classify_transport_status(Some(status.as_u16()), code);
+        classification.retry_after_ms = retry_after_ms;
+        Self { classification }
     }
 
     fn transport(error: &reqwest::Error) -> Self {
         let status = error.status().map(|status| status.as_u16());
-        let class = crate::failure::classify_provider_failure_class(
-            "",
-            ProviderFailureStage::Connect,
-            status,
-            None,
-        );
-        let class = if class == ProviderFailureClass::Unknown {
-            ProviderFailureClass::NetworkTransient
-        } else {
-            class
-        };
-        Self::new(class, status, None)
+        let mut classification = crate::failure::classify_transport_status(status, None);
+        classification.is_network_error =
+            error.is_connect() || error.is_timeout() || error.is_body();
+        if status.is_none() && classification.is_network_error {
+            classification.class = ProviderFailureClass::NetworkTransient;
+        }
+        Self { classification }
     }
 
     fn response() -> Self {
@@ -615,8 +608,9 @@ impl OpenAiProvider {
                             .headers()
                             .get(reqwest::header::RETRY_AFTER)
                             .and_then(|value| value.to_str().ok())
-                            .and_then(|value| value.trim().parse::<u64>().ok())
-                            .map(|seconds| seconds.saturating_mul(1000));
+                            .and_then(|value| {
+                                crate::failure::retry_after_ms(value, chrono::Utc::now())
+                            });
                         let body = match crate::http::read_response_text_bounded(
                             response,
                             16 * 1024,
@@ -967,18 +961,7 @@ impl OpenAiProvider {
     }
 
     async fn api_error(response: reqwest::Response) -> anyhow::Error {
-        let status = response.status();
-        let body = match crate::http::read_response_text_bounded(
-            response,
-            16 * 1024,
-            "provider_error_body",
-        )
-        .await
-        {
-            Ok(body) => body,
-            Err(error) => return error,
-        };
-        anyhow!("OpenAI API error ({status}): {body}")
+        crate::failure::http_error(response).await
     }
 }
 
@@ -1082,7 +1065,12 @@ impl OpenAiProvider {
                                     .and_then(serde_json::Value::as_u64)
                                     .and_then(|code| u16::try_from(code).ok());
                                 let outcome = crate::failure::native_chat_stream_error(
-                                    &error.description(),
+                                    error
+                                        .code
+                                        .as_ref()
+                                        .and_then(serde_json::Value::as_str)
+                                        .or(error.error_type.as_deref())
+                                        .unwrap_or_default(),
                                     status,
                                 );
                                 let _ = tx.send(Err(outcome)).await;
@@ -1235,6 +1223,7 @@ impl crate::traits::Provider for OpenAiProvider {
         error
             .downcast_ref::<OpenAiFileUploadError>()
             .map(|upload| upload.classification.clone())
+            .or_else(|| crate::failure::classify_transport_error(error))
             .or_else(|| crate::failure::classify_stream_error(error))
     }
 
@@ -1262,7 +1251,8 @@ impl crate::traits::Provider for OpenAiProvider {
             .json(&api_request);
         let response = crate::http::non_stream_request(request_builder, self.timeout_policy)
             .send()
-            .await?;
+            .await
+            .map_err(crate::failure::safe_transport_error)?;
 
         if !response.status().is_success() {
             return Err(Self::api_error(response).await);
@@ -1382,7 +1372,8 @@ impl crate::traits::Provider for OpenAiProvider {
             .header("Authorization", format!("Bearer {}", self.api_key));
         let response = crate::http::non_stream_request(request_builder, self.timeout_policy)
             .send()
-            .await?;
+            .await
+            .map_err(crate::failure::safe_transport_error)?;
 
         if !response.status().is_success() {
             return Err(Self::api_error(response).await);
@@ -1438,7 +1429,8 @@ impl crate::traits::Provider for OpenAiProvider {
             .json(&api_request);
         let response = crate::http::non_stream_request(request_builder, self.timeout_policy)
             .send()
-            .await?;
+            .await
+            .map_err(crate::failure::safe_transport_error)?;
 
         if !response.status().is_success() {
             return Err(Self::api_error(response).await);

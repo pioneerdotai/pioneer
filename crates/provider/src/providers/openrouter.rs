@@ -349,8 +349,7 @@ impl ResponseFailureFacts {
                 .headers()
                 .get(reqwest::header::RETRY_AFTER)
                 .and_then(|value| value.to_str().ok())
-                .and_then(|value| value.parse::<u64>().ok())
-                .map(|seconds| seconds.saturating_mul(1000)),
+                .and_then(|value| crate::failure::retry_after_ms(value, chrono::Utc::now())),
         }
     }
 
@@ -396,8 +395,12 @@ impl ResponseFailureFacts {
         }
         failure.classification.http_status =
             self.http_status.or(failure.classification.http_status);
-        failure.classification.is_network_error =
-            error.chain().any(|cause| cause.is::<reqwest::Error>());
+        if let Some(source) = crate::failure::classify_transport_error(&error) {
+            failure.classification.is_network_error = source.is_network_error;
+            if source.http_status.is_none() {
+                failure.classification.class = source.class;
+            }
+        }
         // No source chain: FromUtf8Error owns raw bytes, serde errors can own
         // provider-controlled values, and reqwest errors can carry secret URLs.
         failure.into()
@@ -435,18 +438,13 @@ impl OpenRouterFailure {
         legacy_description: &str,
         stage: ProviderFailureStage,
     ) -> Self {
-        let provider_code = crate::failure::extract_provider_code(legacy_description);
-        let lower = legacy_description.to_ascii_lowercase();
-        let class = crate::failure::classify_provider_failure_class(
-            &lower,
-            stage,
-            status,
-            provider_code.as_deref(),
-        );
-        let mut classification = crate::types::ProviderFailureClassification::new(class);
-        classification.http_status = status;
-        classification.retry_after_ms =
-            retry_after_ms.or_else(|| crate::failure::extract_retry_after_ms(&lower));
+        let _ = (legacy_description, stage);
+        let code = error
+            .as_ref()
+            .and_then(|error| error.code.as_ref())
+            .and_then(serde_json::Value::as_str);
+        let mut classification = crate::failure::classify_transport_status(status, code);
+        classification.retry_after_ms = retry_after_ms;
         classification.error_reason = error
             .and_then(|error| error.metadata)
             .and_then(|metadata| metadata.error_type);
@@ -500,10 +498,18 @@ impl OpenRouterFailure {
         if error.is::<crate::types::ProviderResponseTooLarge>() {
             failure.classification.class = pioneer_protocol::ProviderFailureClass::ProviderRejected;
         }
+        if let Some(source) = crate::failure::classify_transport_error(&error) {
+            let request_id = failure.classification.request_id.clone();
+            failure.classification = source;
+            failure.classification.request_id = failure.classification.request_id.or(request_id);
+        } else if incomplete.is_some() {
+            failure.classification.class = pioneer_protocol::ProviderFailureClass::StreamTruncated;
+        }
         failure.incomplete = incomplete;
         failure.into()
     }
 
+    #[cfg(test)]
     fn http(
         body: &str,
         status: u16,
@@ -1047,24 +1053,7 @@ impl OpenRouterProvider {
     }
 
     async fn api_error(response: reqwest::Response) -> anyhow::Error {
-        let facts = ResponseFailureFacts::capture(&response);
-        let body = match crate::http::read_response_text_bounded(
-            response,
-            16 * 1024,
-            "provider_error_body",
-        )
-        .await
-        {
-            Ok(body) => body,
-            Err(error) => return facts.failure(error, ProviderFailureStage::Connect),
-        };
-        OpenRouterFailure::http(
-            &body,
-            facts.http_status.expect("non-success response"),
-            facts.retry_after_ms,
-            facts.request_id,
-        )
-        .into()
+        crate::failure::http_error(response).await
     }
 
     async fn list_model_entries(
@@ -1073,7 +1062,8 @@ impl OpenRouterProvider {
     ) -> Result<Vec<OpenRouterModelEntry>> {
         let response = crate::http::non_stream_request(request_builder, self.timeout_policy)
             .send()
-            .await?;
+            .await
+            .map_err(crate::failure::safe_transport_error)?;
 
         if !response.status().is_success() {
             return Err(Self::api_error(response).await);
@@ -1399,6 +1389,8 @@ impl crate::traits::Provider for OpenRouterProvider {
         error
             .downcast_ref::<OpenRouterFailure>()
             .map(|failure| failure.classification.clone())
+            .or_else(|| crate::failure::classify_transport_error(error))
+            .or_else(|| crate::failure::classify_stream_error(error))
     }
 
     fn name(&self) -> &str {
@@ -1445,7 +1437,8 @@ impl crate::traits::Provider for OpenRouterProvider {
         );
         crate::http::non_stream_request(request_builder, self.timeout_policy)
             .send()
-            .await?
+            .await
+            .map_err(crate::failure::safe_transport_error)?
             .error_for_status()?;
         Ok(crate::ProviderWarmupOutcome::Completed)
     }
@@ -1471,7 +1464,8 @@ impl crate::traits::Provider for OpenRouterProvider {
         .json(&api_request);
         let response = crate::http::non_stream_request(request_builder, self.timeout_policy)
             .send()
-            .await?;
+            .await
+            .map_err(crate::failure::safe_transport_error)?;
 
         let header_usage = TokenUsage::default().with_native_id(
             response
@@ -1713,7 +1707,8 @@ impl crate::traits::Provider for OpenRouterProvider {
         );
         let response = crate::http::non_stream_request(request_builder, self.timeout_policy)
             .send()
-            .await?;
+            .await
+            .map_err(crate::failure::safe_transport_error)?;
 
         if !response.status().is_success() {
             return Err(Self::api_error(response).await);
@@ -3032,25 +3027,25 @@ mod tests {
         for (error, expected) in [
             (
                 anyhow!("connection reset private_fixture"),
-                ProviderFailureClass::NetworkTransient,
+                ProviderFailureClass::Unknown,
             ),
             (
                 anyhow!("provider stream ended before a terminal marker"),
-                ProviderFailureClass::StreamStall,
+                ProviderFailureClass::Unknown,
             ),
             (
                 ProviderStreamIncomplete::EofWithoutTerminalMarker.into(),
-                ProviderFailureClass::StreamStall,
+                ProviderFailureClass::StreamTruncated,
             ),
             (
                 ProviderStreamIncomplete::DoneWithoutFinishReason.into(),
-                ProviderFailureClass::StreamStall,
+                ProviderFailureClass::StreamTruncated,
             ),
             (
                 IncrementalLineDecoder::default()
                     .push(&[0xff, b'\n'])
                     .unwrap_err(),
-                ProviderFailureClass::StreamStall,
+                ProviderFailureClass::Unknown,
             ),
             (
                 crate::types::ProviderResponseTooLarge::new("provider_stream", 10, 11).into(),

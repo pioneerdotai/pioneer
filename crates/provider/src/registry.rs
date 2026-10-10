@@ -13,10 +13,7 @@ use futures_util::{StreamExt, stream::BoxStream};
 use sha2::{Digest, Sha256};
 
 use crate::factory::create_provider_with_timeout_policy_and_proxy_and_base_url_and_authority;
-use crate::failure::{
-    classify_http_error_body_too_large, classify_provider_failure_class, extract_provider_code,
-    extract_retry_after_ms,
-};
+
 use crate::traits::{Provider, ProviderWarmupOutcome};
 use crate::types::{
     ChatRequest, ChatResponse, EmbeddingRequest, EmbeddingResponse, ProviderCapabilities,
@@ -212,30 +209,10 @@ impl Error for RedactedEndpointError {
     }
 }
 
-fn endpoint_error_status(error: &anyhow::Error) -> Option<u16> {
-    if let Some(status) = error.downcast_ref::<crate::types::ProviderHttpErrorBodyTooLarge>() {
-        return Some(status.status);
-    }
-    for cause in error.chain() {
-        if let Some(request) = cause.downcast_ref::<reqwest::Error>()
-            && let Some(status) = request.status()
-        {
-            return Some(status.as_u16());
-        }
-    }
-    // The supported adapters format non-success responses as `API error
-    // (429 Too Many Requests): ...`. Parse only that fixed prefix, never an
-    // arbitrary three-digit sequence in a provider-controlled body or URL.
-    let message = format!("{error:#}");
-    let rest = message.split_once("API error (")?.1;
-    let status = rest.get(..3)?.parse::<u16>().ok()?;
-    (100..600).contains(&status).then_some(status)
-}
-
 fn redacted_endpoint_error(
     inner: &dyn Provider,
     error: anyhow::Error,
-    stage: ProviderFailureStage,
+    _stage: ProviderFailureStage,
 ) -> anyhow::Error {
     if error.is::<RedactedEndpointError>() {
         return error;
@@ -247,44 +224,12 @@ fn redacted_endpoint_error(
     // Adapters can supply structured status even when their error does not
     // contain a reqwest source or the usual `API error (...)` prefix.
     let adapter_classification = inner.classify_failure(&error);
-    let status = adapter_classification
-        .as_ref()
-        .and_then(|classification| classification.http_status)
-        .or_else(|| endpoint_error_status(&error));
-    let is_network = error.chain().any(|cause| cause.is::<reqwest::Error>())
-        || adapter_classification
-            .as_ref()
-            .is_some_and(|value| value.is_network_error);
-    let raw_message = format!("{error:#}");
-    let lower = raw_message.to_ascii_lowercase();
-    let provider_code = extract_provider_code(&raw_message);
-    let mut class =
-        classify_provider_failure_class(&lower, stage, status, provider_code.as_deref());
-    if let Some(oversized) = error.downcast_ref::<crate::types::ProviderHttpErrorBodyTooLarge>() {
-        class = classify_http_error_body_too_large(oversized.status).class;
-    } else if error.is::<crate::types::ProviderResponseTooLarge>() {
-        class = ProviderFailureClass::ProviderRejected;
-    } else if class == ProviderFailureClass::Unknown && is_network {
-        class = ProviderFailureClass::NetworkTransient;
-    }
-    let mut classification =
-        adapter_classification.unwrap_or_else(|| ProviderFailureClassification::new(class));
-    // Preserve the old custom-endpoint reqwest fallback even when the adapter
-    // has already discarded the unsafe source and retained only transport facts.
-    if classification.class == ProviderFailureClass::Unknown && classification.is_network_error {
-        classification.class = ProviderFailureClass::NetworkTransient;
-    }
-    classification.http_status = classification.http_status.or(status);
-    // `retry-after` is useful for recovery. Retain only the numeric interval.
-    classification.retry_after_ms = classification
-        .retry_after_ms
-        .or_else(|| extract_retry_after_ms(&lower));
-    // Provider-supplied codes may themselves contain the endpoint path.
-    classification.provider_code =
-        crate::failure::anthropic_stream_error(&error).and_then(|native| {
-            (native != crate::failure::AnthropicStreamError::Unknown)
-                .then(|| native.code().to_owned())
-        });
+    let classification = crate::failure::classify_transport_error(&error)
+        .or(adapter_classification)
+        .or_else(|| crate::failure::classify_stream_error(&error))
+        .unwrap_or_else(|| ProviderFailureClassification::new(ProviderFailureClass::Unknown));
+    let status = classification.http_status;
+    let is_network = classification.is_network_error;
     let message = if is_network {
         "provider network request failed"
     } else if status.is_some() {
@@ -3210,7 +3155,7 @@ mod tests {
             accepted_tx.send(()).unwrap();
             release_rx.await.unwrap();
             let body = format!("{{\"error\":\"rate limit at {response_url}; retry-after: 3\"}}");
-            stream.write_all(format!("HTTP/1.1 429 Too Many Requests\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            stream.write_all(format!("HTTP/1.1 429 Too Many Requests\r\nRetry-After: 3\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
         });
         let request_provider = provider.clone();
         let request = tokio::spawn(async move { request_provider.chat(chat_request()).await });
@@ -3329,32 +3274,32 @@ mod tests {
         use crate::failure::provider_stream_incomplete;
         let provider = EchoProvider::new();
         for (message, class) in [
-            ("connection reset", ProviderFailureClass::NetworkTransient),
+            ("connection reset", ProviderFailureClass::Unknown),
             (
                 "API error (429 Too Many Requests): rate limit",
-                ProviderFailureClass::RateLimit,
+                ProviderFailureClass::Unknown,
             ),
             (
                 "API error (403 Forbidden): permission denied",
-                ProviderFailureClass::AuthOrPermission,
+                ProviderFailureClass::Unknown,
             ),
             (
                 "API error (400 Bad Request): invalid request",
-                ProviderFailureClass::ProviderRejected,
+                ProviderFailureClass::Unknown,
             ),
-            ("stream stall", ProviderFailureClass::StreamStall),
+            ("stream stall", ProviderFailureClass::Unknown),
             (
                 "malformed OpenRouter SSE frame",
-                ProviderFailureClass::StreamStall,
+                ProviderFailureClass::Unknown,
             ),
             (
                 "provider sent payload after finish_reason",
-                ProviderFailureClass::StreamStall,
+                ProviderFailureClass::Unknown,
             ),
             // Identical text alone is deliberately insufficient proof.
             (
                 "provider stream ended before a terminal marker",
-                ProviderFailureClass::StreamStall,
+                ProviderFailureClass::Unknown,
             ),
         ] {
             let error = redacted_endpoint_error(
@@ -3449,7 +3394,7 @@ mod tests {
         let provider = registry.get_or_create_for_workspace("a", "gemini").unwrap();
         for (streaming, expected_class, expected_status) in [
             (false, ProviderFailureClass::RateLimit, 429),
-            (true, ProviderFailureClass::UnsupportedStreaming, 400),
+            (true, ProviderFailureClass::ProviderRejected, 400),
         ] {
             let error = if streaming {
                 provider
@@ -3484,7 +3429,7 @@ mod tests {
             let mut request = [0u8; 8192];
             socket.read(&mut request).await.unwrap();
             let body = serde_json::json!({
-                "error": {"message": format!("maximum context length exceeded at {echoed_url}")}
+                "error": {"code": "context_length_exceeded", "message": format!("maximum context length exceeded at {echoed_url}")}
             })
             .to_string();
             socket.write_all(format!(

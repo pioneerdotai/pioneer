@@ -73,7 +73,8 @@ pub trait Provider: Send + Sync {
     /// retried, while transport/HTTP transient failures are classified by the
     /// shared provider-neutral fallback before endpoint errors are redacted.
     fn classify_failure(&self, error: &anyhow::Error) -> Option<ProviderFailureClassification> {
-        crate::failure::classify_stream_error(error)
+        crate::failure::classify_transport_error(error)
+            .or_else(|| crate::failure::classify_stream_error(error))
     }
 
     /// Materialize and locally budget the media that this request will send.

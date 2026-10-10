@@ -1,8 +1,291 @@
 //! Provider-neutral failure classification shared by transport redaction and agent fallback.
-//! Raw adapter text is classified before it is discarded by the endpoint boundary.
+//! Only transport facts and controlled machine codes select recovery policy.
 
 use crate::types::ProviderFailureClassification;
 use pioneer_protocol::{ProviderFailureClass, ProviderFailureStage};
+
+/// Facts captured at the transport boundary. No upstream text or source chain
+/// is retained: even Debug and chained anyhow formatting are safe.
+#[derive(Debug, Clone)]
+pub struct ProviderTransportFailure {
+    pub classification: ProviderFailureClassification,
+}
+
+impl std::fmt::Display for ProviderTransportFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("provider request failed")?;
+        if let Some(status) = self.classification.http_status {
+            write!(f, " (HTTP {status})")?;
+        }
+        Ok(())
+    }
+}
+impl std::error::Error for ProviderTransportFailure {}
+
+/// Status is authoritative. Only controlled machine codes refine an ordinary
+/// request rejection; provider-controlled prose never selects recovery.
+pub fn classify_transport_status(
+    status: Option<u16>,
+    code: Option<&str>,
+) -> ProviderFailureClassification {
+    let mut result = ProviderFailureClassification::new(match status {
+        Some(429) => ProviderFailureClass::RateLimit,
+        Some(500..=599) => ProviderFailureClass::Provider5xx,
+        Some(401 | 403) => ProviderFailureClass::AuthOrPermission,
+        Some(413) => ProviderFailureClass::ContextTooLarge,
+        Some(400 | 422) => match code {
+            Some("context_length_exceeded" | "prompt_too_long") => {
+                ProviderFailureClass::ContextTooLarge
+            }
+            Some("unsupported_image_input") => ProviderFailureClass::UnsupportedImageInput,
+            Some("unsupported_tool_calling") => ProviderFailureClass::UnsupportedToolCalling,
+            Some("unsupported_streaming") => ProviderFailureClass::UnsupportedStreaming,
+            Some("unsupported_parameter") => ProviderFailureClass::UnsupportedParameter,
+            Some("model_not_found") => ProviderFailureClass::ModelNotFound,
+            _ => ProviderFailureClass::ProviderRejected,
+        },
+        Some(404) if code == Some("model_not_found") => ProviderFailureClass::ModelNotFound,
+        Some(400..=499) => ProviderFailureClass::ProviderRejected,
+        _ => ProviderFailureClass::Unknown,
+    });
+    result.http_status = status;
+    result.provider_code = code
+        .filter(|code| {
+            matches!(
+                *code,
+                "context_length_exceeded"
+                    | "prompt_too_long"
+                    | "unsupported_image_input"
+                    | "unsupported_tool_calling"
+                    | "unsupported_streaming"
+                    | "unsupported_parameter"
+                    | "model_not_found"
+                    | "invalid_api_key"
+                    | "rate_limit_exceeded"
+                    | "file_not_found"
+                    | "file_expired"
+                    | "invalid_request_error"
+                    | "authentication_error"
+                    | "permission_error"
+                    | "overloaded_error"
+            )
+        })
+        .map(str::to_owned);
+    result
+}
+
+pub(crate) fn retry_after_ms(value: &str, now: chrono::DateTime<chrono::Utc>) -> Option<u64> {
+    if let Ok(seconds) = value.trim().parse::<u64>() {
+        return Some(seconds.saturating_mul(1000));
+    }
+    let date = chrono::DateTime::parse_from_rfc2822(value.trim())
+        .map(|date| date.with_timezone(&chrono::Utc))
+        .ok()
+        .or_else(|| {
+            ["%A, %d-%b-%y %H:%M:%S GMT", "%a %b %e %H:%M:%S %Y"]
+                .into_iter()
+                .find_map(|format| {
+                    chrono::NaiveDateTime::parse_from_str(value.trim(), format)
+                        .ok()
+                        .map(|date| date.and_utc())
+                })
+        })?;
+    Some(date.signed_duration_since(now).num_milliseconds().max(0) as u64)
+}
+
+pub(crate) fn transport_timeout_error() -> anyhow::Error {
+    let mut classification =
+        ProviderFailureClassification::new(ProviderFailureClass::NetworkTransient);
+    classification.is_network_error = true;
+    ProviderTransportFailure { classification }.into()
+}
+
+pub(crate) async fn http_error(response: reqwest::Response) -> anyhow::Error {
+    let status = response.status().as_u16();
+    let header_id = ["x-generation-id", "x-request-id"]
+        .into_iter()
+        .find_map(|name| {
+            response
+                .headers()
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| {
+                    pioneer_protocol::ProviderRequestId::try_from(value.to_owned()).ok()
+                })
+        });
+    let retry = response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| retry_after_ms(value, chrono::Utc::now()));
+    // Parsing is bounded before allocation. Bad/oversized bodies still retain
+    // the original status and headers, without retaining the parsing error.
+    let body = crate::http::read_response_bytes_bounded(response, 16 * 1024, "provider_error_body")
+        .await
+        .ok();
+    let value = body
+        .as_deref()
+        .and_then(|body| serde_json::from_slice::<serde_json::Value>(body).ok());
+    let code = value
+        .as_ref()
+        .and_then(|value| value.get("error"))
+        .and_then(|error| error.get("code").or_else(|| error.get("type")))
+        .and_then(serde_json::Value::as_str);
+    let mut classification = classify_transport_status(Some(status), code);
+    classification.retry_after_ms = retry;
+    classification.request_id = value
+        .as_ref()
+        .and_then(|value| value.get("id"))
+        .and_then(serde_json::Value::as_str)
+        .and_then(|id| pioneer_protocol::ProviderRequestId::try_from(id.to_owned()).ok())
+        .or(header_id);
+    classification.error_reason = value
+        .as_ref()
+        .and_then(|value| value.get("error"))
+        .and_then(|error| error.get("metadata"))
+        .and_then(|metadata| metadata.get("error_type"))
+        .and_then(serde_json::Value::as_str)
+        .and_then(pioneer_protocol::ProviderErrorReason::from_openrouter_code);
+    ProviderTransportFailure { classification }.into()
+}
+
+pub fn classify_transport_error(error: &anyhow::Error) -> Option<ProviderFailureClassification> {
+    if let Some(typed) = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<ProviderTransportFailure>())
+    {
+        return Some(typed.classification.clone());
+    }
+    if let Some(oversized) = error.downcast_ref::<crate::ProviderHttpErrorBodyTooLarge>() {
+        return Some(classify_transport_status(Some(oversized.status), None));
+    }
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<reqwest::Error>())
+        .map(|transport| {
+            let mut classification =
+                classify_transport_status(transport.status().map(|status| status.as_u16()), None);
+            classification.is_network_error =
+                transport.is_connect() || transport.is_timeout() || transport.is_body();
+            if classification.http_status.is_none() && classification.is_network_error {
+                classification.class = ProviderFailureClass::NetworkTransient;
+            }
+            classification
+        })
+}
+
+pub(crate) fn safe_transport_error(error: reqwest::Error) -> anyhow::Error {
+    let error = anyhow::Error::new(error);
+    ProviderTransportFailure {
+        classification: classify_transport_error(&error)
+            .unwrap_or_else(|| ProviderFailureClassification::new(ProviderFailureClass::Unknown)),
+    }
+    .into()
+}
+
+#[cfg(test)]
+mod transport_contract_tests {
+    use super::*;
+
+    #[test]
+    fn status_is_authoritative_and_unknown_codes_are_not_retained() {
+        for code in [
+            None,
+            Some("unsupported_image_input"),
+            Some("rate limit secret-token"),
+            Some("model_not_found"),
+        ] {
+            assert_eq!(
+                classify_transport_status(Some(503), code).class,
+                ProviderFailureClass::Provider5xx
+            );
+            assert_eq!(
+                classify_transport_status(Some(401), code).class,
+                ProviderFailureClass::AuthOrPermission
+            );
+        }
+        assert_eq!(
+            classify_transport_status(Some(404), None).class,
+            ProviderFailureClass::ProviderRejected
+        );
+        assert_eq!(
+            classify_transport_status(Some(404), Some("model_not_found")).class,
+            ProviderFailureClass::ModelNotFound
+        );
+        assert!(
+            classify_transport_status(Some(400), Some("secret-token"))
+                .provider_code
+                .is_none()
+        );
+        assert_eq!(
+            classify_transport_status(None, None).class,
+            ProviderFailureClass::Unknown
+        );
+    }
+
+    #[test]
+    fn retry_header_seconds_and_http_date_share_the_same_interval() {
+        let now = chrono::DateTime::parse_from_rfc2822("Wed, 21 Oct 2015 07:28:00 GMT")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert_eq!(retry_after_ms(" 120 ", now), Some(120_000));
+        assert_eq!(
+            retry_after_ms("Wed, 21 Oct 2015 07:30:00 GMT", now),
+            Some(120_000)
+        );
+        assert_eq!(
+            retry_after_ms("Wed, 21 Oct 2015 07:27:00 GMT", now),
+            Some(0)
+        );
+        assert_eq!(retry_after_ms("secret unrelated 120", now), None);
+    }
+
+    #[tokio::test]
+    async fn http_boundary_drops_body_and_preserves_headers_even_when_body_is_oversized() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for body in [
+            "credential=secret-token rate limit unsupported image input".to_owned(),
+            "secret-token".repeat(2000),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0u8; 2048];
+                socket.read(&mut request).await.unwrap();
+                let response = format!(
+                    "HTTP/1.1 503 Service Unavailable\r\nRetry-After: 7\r\nx-request-id: req-safe\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                // Oversized bodies can close the reader before the full write.
+                let _ = socket.write_all(response.as_bytes()).await;
+            });
+            let response = reqwest::Client::builder()
+                .no_proxy()
+                .build()
+                .unwrap()
+                .get(format!("http://{address}/private-secret-path"))
+                .send()
+                .await
+                .unwrap();
+            let error = http_error(response).await;
+            let classification = classify_transport_error(&error).unwrap();
+            assert_eq!(classification.class, ProviderFailureClass::Provider5xx);
+            assert_eq!(classification.http_status, Some(503));
+            assert_eq!(classification.retry_after_ms, Some(7000));
+            for rendered in [
+                format!("{error}"),
+                format!("{error:?}"),
+                format!("{error:#}"),
+            ] {
+                assert!(!rendered.contains("secret-token"));
+                assert!(!rendered.contains("private-secret-path"));
+            }
+            assert_eq!(error.chain().count(), 1);
+            server.await.unwrap();
+        }
+    }
+}
 
 /// Confirmed protocol completion failure, detected by a stream decoder.
 /// This contains no response, endpoint or provider-controlled detail.
@@ -103,7 +386,7 @@ pub fn classify_stream_error(error: &anyhow::Error) -> Option<ProviderFailureCla
         .chain()
         .find_map(|cause| cause.downcast_ref::<NativeChatStreamError>())
     {
-        return Some(ProviderFailureClassification::new(native.class));
+        return Some(native.classification.clone());
     }
     if let Some(native) = error
         .chain()
@@ -122,30 +405,41 @@ pub fn classify_stream_error(error: &anyhow::Error) -> Option<ProviderFailureCla
 
 /// Classify native Chat error details once, then discard all provider-controlled
 /// text. Numeric event codes are classification hints, never HTTP status metadata.
-pub(crate) fn native_chat_stream_error(detail: &str, native_status: Option<u16>) -> anyhow::Error {
-    let class = classify_provider_failure_class(
-        &detail.to_ascii_lowercase(),
-        ProviderFailureStage::Connect,
-        native_status.filter(|status| (100..600).contains(status)),
-        None,
+pub(crate) fn native_chat_stream_error(code: &str, native_status: Option<u16>) -> anyhow::Error {
+    let mut classification = classify_transport_status(
+        native_status
+            .filter(|status| (100..600).contains(status))
+            .or(Some(400)),
+        Some(code),
     );
-    NativeChatStreamError {
-        class: if class == ProviderFailureClass::Unknown {
-            ProviderFailureClass::ProviderRejected
-        } else {
-            class
-        },
+    if native_status.is_none() {
+        classification.class = match code {
+            "rate_limit_exceeded" => ProviderFailureClass::RateLimit,
+            "invalid_api_key" | "authentication_error" | "permission_error" => {
+                ProviderFailureClass::AuthOrPermission
+            }
+            "overloaded_error" => ProviderFailureClass::Provider5xx,
+            _ => classification.class,
+        };
     }
-    .into()
+    classification.http_status = None;
+    if classification.class == ProviderFailureClass::Unknown {
+        classification.class = ProviderFailureClass::ProviderRejected;
+    }
+    NativeChatStreamError { classification }.into()
 }
 
 #[derive(Debug)]
 struct NativeChatStreamError {
-    class: ProviderFailureClass,
+    classification: ProviderFailureClassification,
 }
 impl std::fmt::Display for NativeChatStreamError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Chat Completions stream failed ({:?})", self.class)
+        write!(
+            f,
+            "Chat Completions stream failed ({:?})",
+            self.classification.class
+        )
     }
 }
 impl std::error::Error for NativeChatStreamError {}
@@ -199,196 +493,15 @@ pub fn classify_http_error_body_too_large(status: u16) -> ProviderFailureClassif
     classification
 }
 
-/// Classify already-lowercased adapter text using the established agent fallback.
-/// Callers with a typed HTTP status should pass it instead of inferring one
-/// from a URL or server-controlled body.
+/// Compatibility entry point: only typed status and allowlisted code select
+/// policy. The obsolete message/stage arguments have no classification effect.
 pub fn classify_provider_failure_class(
-    message_lower: &str,
-    stage: ProviderFailureStage,
+    _message_lower: &str,
+    _stage: ProviderFailureStage,
     http_status: Option<u16>,
     provider_code: Option<&str>,
 ) -> ProviderFailureClass {
-    if matches!(
-        stage,
-        ProviderFailureStage::FirstChunk | ProviderFailureStage::MidStream
-    ) && message_lower.contains("stream stall")
-    {
-        return ProviderFailureClass::StreamStall;
-    }
-    if message_lower.contains("stream truncated") {
-        return ProviderFailureClass::StreamTruncated;
-    }
-    if message_lower.contains("max_output_tokens")
-        || message_lower.contains("maximum output tokens")
-        || message_lower.contains("output token limit")
-    {
-        return ProviderFailureClass::MaxOutputTokens;
-    }
-    if message_lower.contains("prompt too long")
-        || message_lower.contains("context length")
-        || message_lower.contains("maximum context")
-        || message_lower.contains("context too long")
-        || message_lower.contains("context window")
-        || http_status == Some(413)
-    {
-        return ProviderFailureClass::ContextTooLarge;
-    }
-    if http_status == Some(429) || message_lower.contains("rate limit") {
-        return ProviderFailureClass::RateLimit;
-    }
-    if http_status.is_some_and(|status| (500..600).contains(&status)) {
-        return ProviderFailureClass::Provider5xx;
-    }
-    if http_status == Some(401)
-        || (http_status == Some(403)
-            && (message_lower.contains("token expired")
-                || message_lower.contains("token revoked")
-                || message_lower.contains("unauthorized")
-                || message_lower.contains("authentication")))
-        || provider_code
-            .map(|value| {
-                value.contains("invalid_api_key")
-                    || value.contains("auth")
-                    || value.contains("token_expired")
-            })
-            .unwrap_or(false)
-    {
-        return ProviderFailureClass::AuthExpired;
-    }
-    if is_image_input_capability_mismatch(message_lower) {
-        return ProviderFailureClass::UnsupportedImageInput;
-    }
-    if is_tool_calling_capability_mismatch(message_lower) {
-        return ProviderFailureClass::UnsupportedToolCalling;
-    }
-    if is_streaming_capability_mismatch(message_lower) {
-        return ProviderFailureClass::UnsupportedStreaming;
-    }
-    if is_unsupported_parameter(message_lower, provider_code) {
-        return ProviderFailureClass::UnsupportedParameter;
-    }
-    if is_generic_capability_mismatch(message_lower) {
-        return ProviderFailureClass::UnsupportedCapability;
-    }
-    if http_status == Some(404)
-        || message_lower.contains("model not found")
-        || message_lower.contains("unknown model")
-        || message_lower.contains("no such model")
-    {
-        return ProviderFailureClass::ModelNotFound;
-    }
-    if http_status == Some(403)
-        || message_lower.contains("permission denied")
-        || message_lower.contains("forbidden")
-    {
-        return ProviderFailureClass::AuthOrPermission;
-    }
-    if is_malformed_provider_request(message_lower, provider_code) {
-        return ProviderFailureClass::MalformedProviderRequest;
-    }
-    if http_status == Some(400)
-        || message_lower.contains("invalid request")
-        || message_lower.contains("bad request")
-    {
-        return ProviderFailureClass::ProviderRejected;
-    }
-    if message_lower.contains("error sending request")
-        || message_lower.contains("connection")
-        || message_lower.contains("dns")
-        || message_lower.contains("timed out")
-        || message_lower.contains("tunnel error")
-        || message_lower.contains("unexpected end of file")
-        || message_lower.contains("connection reset")
-        || message_lower.contains("broken pipe")
-    {
-        return ProviderFailureClass::NetworkTransient;
-    }
-    if matches!(
-        stage,
-        ProviderFailureStage::FirstChunk | ProviderFailureStage::MidStream
-    ) {
-        return ProviderFailureClass::StreamStall;
-    }
-    ProviderFailureClass::Unknown
-}
-
-fn is_image_input_capability_mismatch(message_lower: &str) -> bool {
-    message_lower.contains("image input")
-        && (message_lower.contains("no endpoints found")
-            || message_lower.contains("does not support")
-            || message_lower.contains("not support")
-            || message_lower.contains("unsupported"))
-}
-
-fn is_tool_calling_capability_mismatch(message_lower: &str) -> bool {
-    (message_lower.contains("tool call")
-        || message_lower.contains("tool use")
-        || message_lower.contains("function call")
-        || message_lower.contains("tools"))
-        && (message_lower.contains("does not support")
-            || message_lower.contains("not support")
-            || message_lower.contains("unsupported")
-            || message_lower.contains("no endpoints found"))
-}
-
-fn is_streaming_capability_mismatch(message_lower: &str) -> bool {
-    // Match the capability itself, not words such as "upstream" or a
-    // transport wrapper ("provider stream error: unsupported history").
-    [
-        "does not support streaming",
-        "does not support stream",
-        "not support streaming",
-        "streaming is not supported",
-        "stream is not supported",
-        "streaming not supported",
-        "stream not supported",
-        "unsupported streaming",
-        "unsupported stream",
-        "streaming unsupported",
-        "stream unsupported",
-        "streaming disabled",
-    ]
-    .iter()
-    .any(|pattern| message_lower.contains(pattern))
-}
-
-fn is_unsupported_parameter(message_lower: &str, provider_code: Option<&str>) -> bool {
-    provider_code
-        .map(|value| {
-            value.contains("unsupported_parameter")
-                || value.contains("unknown_parameter")
-                || value.contains("unrecognized_parameter")
-        })
-        .unwrap_or(false)
-        || message_lower.contains("unsupported parameter")
-        || message_lower.contains("unknown parameter")
-        || message_lower.contains("unrecognized parameter")
-        || message_lower.contains("unrecognized request argument")
-        || message_lower.contains("extra inputs are not permitted")
-}
-
-fn is_generic_capability_mismatch(message_lower: &str) -> bool {
-    (message_lower.contains("does not support")
-        || message_lower.contains("not support")
-        || message_lower.contains("unsupported"))
-        && (message_lower.contains("capability")
-            || message_lower.contains("feature")
-            || message_lower.contains("modality")
-            || message_lower.contains("endpoint"))
-}
-
-fn is_malformed_provider_request(message_lower: &str, provider_code: Option<&str>) -> bool {
-    provider_code
-        .map(|value| {
-            value.contains("invalid_request_error")
-                || value.contains("invalid_request")
-                || value.contains("bad_request")
-        })
-        .unwrap_or(false)
-        && (message_lower.contains("schema")
-            || message_lower.contains("malformed")
-            || message_lower.contains("invalid json")
-            || message_lower.contains("parse"))
+    classify_transport_status(http_status, provider_code).class
 }
 
 /// Extract an untrusted provider code for classification; do not publish it
@@ -431,7 +544,7 @@ mod replay_classification_tests {
                     message,
                     ProviderFailureStage::Connect,
                     Some(400),
-                    None
+                    Some("unsupported_streaming")
                 ),
                 ProviderFailureClass::UnsupportedStreaming,
             );
@@ -471,5 +584,17 @@ mod native_stream_privacy_tests {
             ProviderFailureClass::ProviderRejected
         );
         assert!(!format!("{chat:?}").contains("private"));
+    }
+
+    #[test]
+    fn native_machine_code_is_preserved_without_inventing_http_status() {
+        let error = native_chat_stream_error("rate_limit_exceeded", None);
+        let failure = classify_stream_error(&error).unwrap();
+        assert_eq!(failure.class, ProviderFailureClass::RateLimit);
+        assert_eq!(
+            failure.provider_code.as_deref(),
+            Some("rate_limit_exceeded")
+        );
+        assert!(failure.http_status.is_none());
     }
 }

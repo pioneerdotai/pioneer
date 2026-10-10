@@ -197,8 +197,26 @@ fn evict_oldest_if_full(map: &mut HashMap<AttachmentOperationAuthority, CircuitS
     }
 }
 
+// A poisoned bookkeeping map is untrusted; discard it, retaining no stale
+// denial. This does not alter authority keys, TTL or cardinality limits.
+fn lock_breakers()
+-> std::sync::MutexGuard<'static, HashMap<AttachmentOperationAuthority, CircuitState>> {
+    lock_breaker_map(breakers())
+}
+
+fn lock_breaker_map(
+    breakers: &Mutex<HashMap<AttachmentOperationAuthority, CircuitState>>,
+) -> std::sync::MutexGuard<'_, HashMap<AttachmentOperationAuthority, CircuitState>> {
+    breakers.lock().unwrap_or_else(|poison| {
+        let mut map = poison.into_inner();
+        map.clear();
+        breakers.clear_poison();
+        map
+    })
+}
+
 fn circuit_open_for(operation_key: &AttachmentOperationAuthority) -> Option<Duration> {
-    let mut map = breakers().lock().expect("circuit breaker lock poisoned");
+    let mut map = lock_breakers();
     let now = Instant::now();
     prune_breakers(&mut map, now);
     let state = map.get_mut(operation_key)?;
@@ -214,12 +232,12 @@ fn circuit_open_for(operation_key: &AttachmentOperationAuthority) -> Option<Dura
 }
 
 fn record_success(operation_key: &AttachmentOperationAuthority) {
-    let mut map = breakers().lock().expect("circuit breaker lock poisoned");
+    let mut map = lock_breakers();
     map.remove(operation_key);
 }
 
 fn record_failure(operation_key: &AttachmentOperationAuthority, policy: &AttachmentRuntimePolicy) {
-    let mut map = breakers().lock().expect("circuit breaker lock poisoned");
+    let mut map = lock_breakers();
     let now = Instant::now();
     prune_breakers(&mut map, now);
     if !map.contains_key(operation_key) {
@@ -270,7 +288,9 @@ where
             }
             Err(error) => {
                 let reason = error.message();
-                record_failure(operation_key, policy);
+                if error.is_retryable() {
+                    record_failure(operation_key, policy);
+                }
                 observability::emit_upload_fail(
                     provider,
                     operation,
@@ -330,7 +350,9 @@ where
             }
             Err(error) => {
                 let reason = error.message();
-                record_failure(operation_key, policy);
+                if error.is_retryable() {
+                    record_failure(operation_key, policy);
+                }
                 observability::emit_upload_fail(
                     provider,
                     operation,
@@ -441,10 +463,38 @@ mod tests {
             "opens-after-threshold",
         );
         let _ = execute_with_retry_blocking::<(), _>("test", "op", &key, &policy, |_| {
-            Err(AttachmentOperationError::non_retryable(anyhow!("boom")))
+            Err(AttachmentOperationError::retryable(anyhow!("boom")))
         });
         let err = execute_with_retry_blocking::<(), _>("test", "op", &key, &policy, |_| Ok(()))
             .expect_err("circuit breaker should block operation");
         assert!(err.to_string().contains("ATTACHMENT_CIRCUIT_BREAKER_OPEN"));
+    }
+    #[test]
+    fn permanent_rejections_never_open_transient_breaker() {
+        let mut policy = test_policy();
+        policy.circuit_breaker.failure_threshold = 1;
+        let key = AttachmentOperationAuthority::new("runtime-tests-permanent", "resolve", "input");
+        for _ in 0..8 {
+            let result = execute_with_retry_blocking::<(), _>("test", "op", &key, &policy, |_| {
+                Err(AttachmentOperationError::non_retryable(anyhow!(
+                    "invalid input"
+                )))
+            });
+            assert!(result.is_err());
+            assert!(circuit_open_for(&key).is_none());
+        }
+        assert!(execute_with_retry_blocking("test", "op", &key, &policy, |_| Ok(())).is_ok());
+    }
+
+    #[test]
+    fn poisoned_bookkeeping_recovers_without_repeated_panic() {
+        let map = Mutex::new(HashMap::new());
+        let _ = std::panic::catch_unwind(|| {
+            let _map = map.lock().unwrap_or_else(|error| error.into_inner());
+            panic!("inject bookkeeping poison");
+        });
+        assert!(lock_breaker_map(&map).is_empty());
+        assert!(lock_breaker_map(&map).is_empty());
+        assert!(!map.is_poisoned());
     }
 }
