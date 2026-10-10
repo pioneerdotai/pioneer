@@ -52,7 +52,9 @@ pub struct NewTurnRuntimeSnapshot {
 pub async fn upsert_turn_runtime_snapshot<C: ConnectionTrait>(
     db: &C,
     snapshot: NewTurnRuntimeSnapshot,
+    root: &crate::frozen_lifetime::PreparedFrozenRoot,
 ) -> Result<TurnRuntimeSnapshotRecord> {
+    root.verify(db, &snapshot.workspace_id).await?;
     let turn_id = snapshot.turn_id.clone();
     turn_runtime_snapshot::Entity::insert(turn_runtime_snapshot::ActiveModel {
         turn_id: Set(snapshot.turn_id),
@@ -70,6 +72,7 @@ pub async fn upsert_turn_runtime_snapshot<C: ConnectionTrait>(
         resolved_artifacts_json: Set(snapshot.resolved_artifacts_json),
         runtime_environment_json: Set(snapshot.runtime_environment_json),
         history_json: Set(snapshot.history_json),
+        frozen_manifest_id: Set(root.locator()),
         created_at: Set(snapshot.created_at),
         updated_at: Set(snapshot.updated_at),
     })
@@ -90,6 +93,7 @@ pub async fn upsert_turn_runtime_snapshot<C: ConnectionTrait>(
                 turn_runtime_snapshot::Column::ResolvedArtifactsJson,
                 turn_runtime_snapshot::Column::RuntimeEnvironmentJson,
                 turn_runtime_snapshot::Column::HistoryJson,
+                turn_runtime_snapshot::Column::FrozenManifestId,
                 turn_runtime_snapshot::Column::UpdatedAt,
             ])
             .to_owned(),

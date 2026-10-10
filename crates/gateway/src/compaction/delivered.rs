@@ -253,6 +253,7 @@ impl MessageProcessor {
     /// generation that admitted all foreign originals. Runtime callers switch
     /// to this entry point together with accepted-source CAS support.
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     pub(crate) async fn capture_authorized_task_basis(
         &self,
         store: &CrudStore,

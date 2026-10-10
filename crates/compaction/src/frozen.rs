@@ -74,6 +74,31 @@ impl ReplayAliasGraph {
         Ok(())
     }
 
+    /// Bounded maintenance equivalent of validate_targets; cursor is private
+    /// request/worker progress, never a saved authority or publication fence.
+    pub fn validate_targets_page(
+        &self,
+        leaves: &BTreeSet<ScopedReplaySource>,
+        after: Option<&ScopedReplaySource>,
+    ) -> anyhow::Result<(Option<ScopedReplaySource>, bool)> {
+        use std::ops::Bound::{Excluded, Unbounded};
+        let mut cursor = after.cloned();
+        let mut count = 0;
+        for target in self
+            .targets
+            .range((after.map_or(Unbounded, Excluded), Unbounded))
+            .take(128)
+        {
+            anyhow::ensure!(
+                leaves.contains(target),
+                "checkpoint replay alias is outside historical coverage"
+            );
+            cursor = Some(target.clone());
+            count += 1;
+        }
+        Ok((cursor, count < 128))
+    }
+
     pub fn into_parts(
         self,
     ) -> (

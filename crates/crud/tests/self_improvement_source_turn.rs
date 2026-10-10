@@ -598,13 +598,16 @@ async fn seed_successful_collaborative_delivery(
                 '{child_thread_id}', '{parent_thread_id}', '{parent_thread_id}', 1, 'task_run',
                 '{parent_thread_id}', '{lineage_parent_turn_id}'
             );
-            INSERT INTO task_run_conversation_snapshot (
+            WITH frozen_root_fixture(
                 run_id, task_id, workspace_id, conversation_thread_id, source_turn_id,
                 history_json
-            ) VALUES (
+            ) AS (VALUES (
                 '{run_id}', '{task_id}', '{workspace_id}', '{parent_thread_id}',
                 '{parent_turn_id}', '[]'
-            );
+            )) INSERT INTO task_run_conversation_snapshot(
+                run_id, task_id, workspace_id, conversation_thread_id, source_turn_id,
+                history_json
+            ,frozen_manifest_id) SELECT run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,history_json,CASE WHEN json_valid(history_json) THEN CASE WHEN json_type(history_json)='object' THEN json_extract(history_json,'$.manifest_id') ELSE NULL END ELSE NULL END FROM frozen_root_fixture;
             INSERT INTO task_run_turn (
                 id, task_id, run_id, thread_id, turn_id, kind, round, sequence, status,
                 completed_at

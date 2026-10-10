@@ -16,6 +16,8 @@ pub struct Model {
     #[sea_orm(column_type = "Text")]
     pub imports_sha256: String,
     pub import_count: i64,
+    /// Derived terminal classification, invalidated by operation/runner writes.
+    pub terminal_generation: Option<i64>,
     #[sea_orm(
         belongs_to,
         from = "manifest_id",

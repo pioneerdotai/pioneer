@@ -11755,7 +11755,7 @@ async fn assert_concurrent_collaborative_tasks_receive_independent_frozen_comman
             vec![parent_thread_id.into(), parent_thread_id.into()],
         ),
         (
-            "INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at) VALUES ('recapture-run','recapture-task',?,?,?,CURRENT_TIMESTAMP)",
+            "WITH frozen_root_fixture(run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at) AS (VALUES ('recapture-run','recapture-task',?,?,?,CURRENT_TIMESTAMP)) INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at,frozen_manifest_id) SELECT run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at,CASE WHEN json_valid(history_json) THEN CASE WHEN json_type(history_json)='object' THEN json_extract(history_json,'$.manifest_id') ELSE NULL END ELSE NULL END FROM frozen_root_fixture",
             vec![
                 workspace_id.clone().into(),
                 parent_thread_id.into(),
@@ -28746,7 +28746,7 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_i
                 ),
                 (
                     format!(
-                        "INSERT INTO turn_cli_runtime_binding(turn_id,thread_id,continuation_thread_id,workspace_id,runtime_id,runtime_kind,native_thread_id,status) SELECT '{child_turn}','{child}',continuation_thread_id,workspace_id,runtime_id,runtime_kind,native_thread_id,'starting' FROM turn_cli_runtime_binding WHERE turn_id='{}'",
+                        "INSERT INTO turn_cli_runtime_binding(turn_id,thread_id,continuation_thread_id,workspace_id,runtime_id,runtime_kind,native_thread_id,status,frozen_manifest_id) SELECT '{child_turn}','{child}',continuation_thread_id,workspace_id,runtime_id,runtime_kind,native_thread_id,'starting',NULL FROM turn_cli_runtime_binding WHERE turn_id='{}'",
                         lineage.child_turn_id
                     ),
                     format!("DELETE FROM turn_cli_runtime_binding WHERE turn_id='{child_turn}'"),
@@ -77522,7 +77522,7 @@ async fn background_history_preflight_budgets_task_input_copy_once_near_threshol
     }
     db.execute_raw(sea_orm::Statement::from_sql_and_values(
         sea_orm::DbBackend::Sqlite,
-        "INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,history_json,created_at) VALUES ('background-run','background-task',?,'background-parent','background-parent-turn',?,CURRENT_TIMESTAMP)",
+        "WITH frozen_root_fixture(run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,history_json,created_at) AS (VALUES ('background-run','background-task',?,'background-parent','background-parent-turn',?,CURRENT_TIMESTAMP)) INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,history_json,created_at,frozen_manifest_id) SELECT run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,history_json,created_at,CASE WHEN json_valid(history_json) THEN CASE WHEN json_type(history_json)='object' THEN json_extract(history_json,'$.manifest_id') ELSE NULL END ELSE NULL END FROM frozen_root_fixture",
         [workspace.into(), parent_basis.clone().into()],
     ))
     .await
@@ -81990,3 +81990,6 @@ fn native_cancellation_race_fallback_preserves_materialization_error_and_require
 
 #[path = "tests/task_start_failure.rs"]
 mod task_start_failure;
+
+#[path = "tests/frozen_history_lifetime.rs"]
+mod frozen_history_lifetime;

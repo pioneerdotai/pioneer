@@ -9,65 +9,79 @@ use pioneer_entity::{
     task_run_conversation_snapshot, task_run_turn, thread_lineage, turn,
 };
 use sea_orm::sea_query::{Expr, ExprTrait, JoinType, OnConflict, Query};
-use sea_orm::{ConnectionTrait, TransactionTrait};
+use sea_orm::{ConnectionTrait, QueryTrait, TransactionTrait};
+
+/// Historical identity lookup deliberately survives durable input expiry.
+/// Callers needing bytes must use the available-input boundary below.
+pub(super) async fn projection_identity<C: ConnectionTrait>(
+    db: &C,
+    operation: &str,
+) -> Result<Option<(FrozenHistoryRef, compaction_frozen_history::Model)>> {
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+    let Some(binding) = compaction_operation_projection::Entity::find_by_id(operation)
+        .one(db)
+        .await?
+    else {
+        return Ok(None);
+    };
+    let header = compaction_frozen_history::Entity::find_by_id(&binding.manifest_id)
+        .one(db)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("compaction origin header missing"))?;
+    let context_exists = compaction_context::Entity::find()
+        .filter(compaction_context::Column::WorkspaceId.eq(&header.workspace_id))
+        .filter(Expr::exists(
+            compaction_operation::Entity::find()
+                .select_only()
+                .column(compaction_operation::Column::Id)
+                .filter(compaction_operation::Column::Id.eq(operation))
+                .filter(
+                    Expr::col((
+                        compaction_operation::Entity,
+                        compaction_operation::Column::Owner,
+                    ))
+                    .eq(Expr::col((
+                        compaction_context::Entity,
+                        compaction_context::Column::Owner,
+                    ))),
+                )
+                .into_query(),
+        ))
+        .one(db)
+        .await?
+        .is_some();
+    ensure!(
+        context_exists
+            && header.message_count >= 0
+            && header.import_count >= 0
+            && header.identity_sha256 == binding.identity_sha256
+            && header.imports_sha256 == binding.imports_sha256
+            && header.import_count == binding.import_count,
+        "compaction origin binding mismatch"
+    );
+    let descriptor = FrozenHistoryRef {
+        format: 1,
+        manifest_id: header.id.clone(),
+        identity_sha256: header.identity_sha256.clone(),
+        messages: u64::try_from(header.message_count)?,
+    };
+    Ok(Some((descriptor, header)))
+}
 
 pub(crate) async fn compaction_bound_source_projection<C: ConnectionTrait>(
     db: &C,
     operation: &str,
 ) -> Result<Option<FrozenHistoryRef>> {
-    use pioneer_entity::{
-        compaction_frozen_history as history, compaction_operation_projection as projection,
+    let Some((descriptor, header)) = projection_identity(db, operation).await? else {
+        return Ok(None);
     };
-    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QuerySelect};
-    let row = projection::Entity::find_by_id(operation)
-        .inner_join(history::Entity)
-        .select_only()
-        .column_as(Expr::col((history::Entity, history::Column::Id)), "id")
-        .column_as(
-            Expr::col((history::Entity, history::Column::IdentitySha256)),
-            "identity_sha256",
-        )
-        .column_as(
-            Expr::col((history::Entity, history::Column::MessageCount)),
-            "message_count",
-        )
-        .filter(history::Column::Ready.eq(1_i64))
-        .filter(
-            Expr::col((history::Entity, history::Column::IdentitySha256)).eq(Expr::col((
-                projection::Entity,
-                projection::Column::IdentitySha256,
-            ))),
-        )
-        .filter(
-            Expr::col((history::Entity, history::Column::ImportsSha256)).eq(Expr::col((
-                projection::Entity,
-                projection::Column::ImportsSha256,
-            ))),
-        )
-        .filter(
-            Expr::col((history::Entity, history::Column::ImportCount)).eq(Expr::col((
-                projection::Entity,
-                projection::Column::ImportCount,
-            ))),
-        )
-        .filter(
-            Expr::col((history::Entity, history::Column::NextImport)).eq(Expr::col((
-                projection::Entity,
-                projection::Column::ImportCount,
-            ))),
-        )
-        .into_tuple::<(String, String, i64)>()
-        .one(db)
-        .await?;
-    row.map(|(manifest_id, identity_sha256, messages)| {
-        Ok(FrozenHistoryRef {
-            format: 1,
-            manifest_id,
-            identity_sha256,
-            messages: u64::try_from(messages)?,
-        })
-    })
-    .transpose()
+    ensure!(
+        header.expired == 0,
+        "compaction_origin_expired: сохранённый input освобождён; resume недоступен"
+    );
+    crate::frozen_lifetime::logical_bounds(&header)?;
+    ensure!(header.ready == 1, "compaction origin is incomplete");
+    Ok(Some(descriptor))
 }
 
 /// Serialization is outside writer capacity. The writer revalidates the
@@ -339,6 +353,7 @@ pub(crate) async fn compaction_bind_source_projection(
                         identity_sha256: sea_orm::Set(identity_sha256),
                         imports_sha256: sea_orm::Set(imports_sha256),
                         import_count: sea_orm::Set(import_count),
+                        terminal_generation: sea_orm::Set(None),
                     },
                 )
                 .on_conflict(

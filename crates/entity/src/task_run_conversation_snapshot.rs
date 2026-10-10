@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "task_run_conversation_snapshot")]
 pub struct Model {
+    #[sea_orm(column_type = "Text", nullable)]
+    pub frozen_manifest_id: Option<String>,
     #[sea_orm(primary_key, auto_increment = false)]
     pub run_id: String,
     pub task_id: String,
