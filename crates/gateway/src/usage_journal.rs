@@ -118,6 +118,19 @@ impl Provider for JournalProvider {
     fn capabilities(&self) -> ProviderCapabilities {
         self.inner.capabilities()
     }
+    fn capture_model_contract_with_limit(
+        &self,
+        model: &str,
+        limit: usize,
+    ) -> anyhow::Result<pioneer_provider::AcceptedProviderModelContract> {
+        self.inner.capture_model_contract_with_limit(model, limit)
+    }
+    fn model_catalog_for_request(
+        &self,
+        model: &str,
+    ) -> anyhow::Result<Arc<pioneer_provider::catalog::ModelCatalog>> {
+        self.inner.model_catalog_for_request(model)
+    }
     fn model_tool_support(&self, model: &str) -> pioneer_provider::ModelToolSupport {
         self.inner.model_tool_support(model)
     }

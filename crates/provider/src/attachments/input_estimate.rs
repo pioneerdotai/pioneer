@@ -75,47 +75,49 @@ async fn prepare_owned(
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
         super::runtime::with_blocking_work_context(context, || {
-            super::runtime::check_work()?;
-            let mut media = Vec::with_capacity(prepared.attachments.len());
-            for attachment in prepared.attachments {
+            super::admission::blocking_scope(admission.clone(), || {
                 super::runtime::check_work()?;
-                let tokens = estimate(&provider, &request.model, &attachment)?;
-                let bytes = attachment_bytes(&attachment)?;
-                let part = request
-                    .messages
-                    .get_mut(attachment.message_index)
-                    .and_then(|message| message.content_parts.get_mut(attachment.part_index))
-                    .context("materialized media lost its request position")?;
-                let target = match part {
-                    MessageContentPart::Image { image } => image,
-                    MessageContentPart::Audio { audio } => audio,
-                    MessageContentPart::Video { video } => video,
-                    MessageContentPart::File { file } => file,
-                    MessageContentPart::Text { .. } => {
-                        anyhow::bail!("materialized media points to text")
+                let mut media = Vec::with_capacity(prepared.attachments.len());
+                for attachment in prepared.attachments {
+                    super::runtime::check_work()?;
+                    let tokens = estimate(&provider, &request.model, &attachment)?;
+                    let bytes = attachment_bytes(&attachment)?;
+                    let part = request
+                        .messages
+                        .get_mut(attachment.message_index)
+                        .and_then(|message| message.content_parts.get_mut(attachment.part_index))
+                        .context("materialized media lost its request position")?;
+                    let target = match part {
+                        MessageContentPart::Image { image } => image,
+                        MessageContentPart::Audio { audio } => audio,
+                        MessageContentPart::Video { video } => video,
+                        MessageContentPart::File { file } => file,
+                        MessageContentPart::Text { .. } => {
+                            anyhow::bail!("materialized media points to text")
+                        }
+                    };
+                    // Pin the bytes that were actually estimated. A later provider pass
+                    // can neither re-fetch an edited URL nor reopen a changed file.
+                    // Exact artifact identity is preserved for the existing upload cache.
+                    if let Some(state) = &admission {
+                        state.pin(&attachment)?;
                     }
-                };
-                // Pin the bytes that were actually estimated. A later provider pass
-                // can neither re-fetch an edited URL nor reopen a changed file.
-                // Exact artifact identity is preserved for the existing upload cache.
-                if let Some(state) = &admission {
-                    state.pin(&attachment)?;
+                    target.source = AttachmentDataSource::Bytes {
+                        base64_data: STANDARD.encode(bytes),
+                    };
+                    target.mime_type = attachment.mime_type;
+                    target.name = Some(attachment.name);
+                    target.size_bytes = Some(attachment.size_bytes as u64);
+                    target.sha256 = Some(attachment.sha256);
+                    media.push(MediaInputEstimate {
+                        message: attachment.message_index,
+                        part: attachment.part_index,
+                        input_tokens: tokens.max(1),
+                    });
                 }
-                target.source = AttachmentDataSource::Bytes {
-                    base64_data: STANDARD.encode(bytes),
-                };
-                target.mime_type = attachment.mime_type;
-                target.name = Some(attachment.name);
-                target.size_bytes = Some(attachment.size_bytes as u64);
-                target.sha256 = Some(attachment.sha256);
-                media.push(MediaInputEstimate {
-                    message: attachment.message_index,
-                    part: attachment.part_index,
-                    input_tokens: tokens.max(1),
-                });
-            }
-            super::runtime::check_work()?;
-            Ok(PreparedInputBudget { request, media })
+                super::runtime::check_work()?;
+                Ok(PreparedInputBudget { request, media })
+            })
         })
     })
     .await

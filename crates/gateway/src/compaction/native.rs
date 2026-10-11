@@ -314,7 +314,7 @@ async fn prepare_native_projection_with_prepared(
     }
     // This deadline includes reader/writer queues and admission, not just LLM time.
     let prepared = async {
-        let catalog = pioneer_provider::catalog::model_catalog()?;
+        let catalog = context.provider.model_catalog_for_request(&request.model)?;
         let version = store
             .compaction_projection_version(workspace, thread)
             .await?;

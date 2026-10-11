@@ -1602,7 +1602,7 @@ impl std::io::Write for JsonByteCounter {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderCapabilities {
     pub streaming: bool,
     pub vision: bool,

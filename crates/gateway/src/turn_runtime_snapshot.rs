@@ -109,6 +109,21 @@ fn restored_ordinary_skill_catalog(
     Ok(stored.catalog)
 }
 
+pub(crate) fn restored_provider_model_contract(
+    snapshot: &TurnRuntimeSnapshotRecord,
+) -> Result<pioneer_provider::AcceptedProviderModelContract> {
+    let contract = pioneer_provider::AcceptedProviderModelContract::from_json(
+        snapshot
+            .provider_model_contract_json
+            .as_deref()
+            .context("accepted model contract is unavailable in legacy snapshot")?,
+    )?;
+    let provider = pioneer_provider::provider_definition(&snapshot.provider_name)
+        .map_or(snapshot.provider_name.as_str(), |d| d.name);
+    contract.require_selection(provider, &snapshot.model)?;
+    Ok(contract)
+}
+
 /// Structural compatibility is separate from existence and fresh authorization.
 /// No DB access occurs here, so a decode rejection cannot hide a failed read.
 pub(crate) fn validate_runtime_snapshot_for_resume(
@@ -116,6 +131,7 @@ pub(crate) fn validate_runtime_snapshot_for_resume(
 ) -> Result<()> {
     snapshot.validate_storage_size()?;
     restored_ordinary_skill_catalog(snapshot)?;
+    restored_provider_model_contract(snapshot)?;
     let _: ThreadMode = from_snapshot_json(&snapshot.mode_json, "thread mode")?;
     let _: AgentTurnHookRuntimeContext =
         from_snapshot_json(&snapshot.hook_runtime_context_json, "hook runtime context")?;
@@ -283,6 +299,7 @@ pub(crate) fn new_turn_runtime_snapshot(
         reasoning_effort: reasoning_effort.map(str::to_owned),
         agent_skill_versions_json,
         ordinary_skill_catalog_json,
+        provider_model_contract_json: None,
         hook_runtime_context_json: to_snapshot_json_bounded(
             hook_runtime_context,
             "hook runtime context",
@@ -776,6 +793,7 @@ pub(crate) async fn restored_recovery_turn_request_from_snapshot(
         model: snapshot.model.clone(),
         provider_name: snapshot.provider_name.clone(),
         azure_connection,
+        provider_model_contract: Some(restored_provider_model_contract(snapshot)?),
         reasoning: snapshot
             .reasoning_effort
             .as_deref()
@@ -1069,6 +1087,13 @@ fn to_snapshot_json_bounded<T: Serialize + ?Sized>(
                     "runtime snapshot encoded byte limit exceeded",
                 ));
             }
+            let next_len = self.bytes.len() + bytes.len();
+            if next_len > self.bytes.capacity() {
+                let capacity = next_len
+                    .max(self.bytes.capacity().saturating_mul(2))
+                    .min(self.limit);
+                self.bytes.reserve_exact(capacity - self.bytes.len());
+            }
             self.bytes.extend_from_slice(bytes);
             Ok(bytes.len())
         }
@@ -1117,6 +1142,37 @@ mod tests {
     const VERSION_ONE: &str = "111111111111111111111";
     const VERSION_TWO: &str = "222222222222222222222";
 
+    pub(crate) fn model_contract_json(provider: &str, model: &str) -> String {
+        struct Selection<'a>(&'a str);
+        #[async_trait::async_trait]
+        impl pioneer_provider::Provider for Selection<'_> {
+            fn name(&self) -> &str {
+                self.0
+            }
+            async fn chat(
+                &self,
+                _: pioneer_provider::ChatRequest,
+            ) -> anyhow::Result<pioneer_provider::ChatResponse> {
+                anyhow::bail!("restore-only fixture does not dispatch")
+            }
+            async fn stream_chat(
+                &self,
+                _: pioneer_provider::ChatRequest,
+            ) -> anyhow::Result<
+                futures_util::stream::BoxStream<
+                    'static,
+                    anyhow::Result<pioneer_provider::StreamChunk>,
+                >,
+            > {
+                anyhow::bail!("restore-only fixture does not dispatch")
+            }
+        }
+        pioneer_provider::Provider::capture_model_contract(&Selection(provider), model)
+            .unwrap()
+            .to_json()
+            .unwrap()
+    }
+
     pub(super) fn runtime_snapshot(
         agent_skill_versions_json: Option<String>,
     ) -> TurnRuntimeSnapshotRecord {
@@ -1130,6 +1186,7 @@ mod tests {
             provider_name: "provider".to_owned(),
             reasoning_effort: None,
             agent_skill_versions_json,
+            provider_model_contract_json: Some(model_contract_json("provider", "model")),
             ordinary_skill_catalog_json: Some(
                 r#"{"schema_version":1,"catalog":{"version":0,"generated_at_unix":0,"skills":[]}}"#
                     .into(),
@@ -1152,6 +1209,16 @@ mod tests {
         snapshot.mode_json = serde_json::to_string(&pioneer_protocol::ThreadMode::Agent).unwrap();
         assert!(super::validate_runtime_snapshot_for_resume(&snapshot).is_ok());
         let original = snapshot.clone();
+        snapshot.provider_model_contract_json = None;
+        assert!(super::validate_runtime_snapshot_for_resume(&snapshot).is_err());
+        snapshot = original.clone();
+        let mut profile: serde_json::Value =
+            serde_json::from_str(snapshot.provider_model_contract_json.as_deref().unwrap())
+                .unwrap();
+        profile["schema_version"] = 2.into();
+        snapshot.provider_model_contract_json = Some(profile.to_string());
+        assert!(super::validate_runtime_snapshot_for_resume(&snapshot).is_err());
+        snapshot = original.clone();
         snapshot.input_json = "{\"incomplete\":true}".into();
         assert!(super::validate_runtime_snapshot_for_resume(&snapshot).is_err());
         snapshot = original.clone();

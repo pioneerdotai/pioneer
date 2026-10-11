@@ -1266,6 +1266,10 @@ impl crate::traits::Provider for OpenAiProvider {
         Some(self.authority_fingerprint.as_str())
     }
 
+    fn model_tool_support(&self, model: &str) -> crate::ModelToolSupport {
+        crate::tools::policy::chat_tool_model_support(self.name(), model)
+    }
+
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities {
             streaming: true,

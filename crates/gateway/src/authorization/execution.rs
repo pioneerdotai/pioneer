@@ -1670,6 +1670,25 @@ impl ExecutionAuthorizationContext {
         validate_provider_connection(provider, grant.azure_connection.as_ref())
     }
 
+    pub(crate) fn require_provider_instance(
+        &self,
+        provider: &dyn pioneer_provider::Provider,
+        model: &str,
+    ) -> Result<()> {
+        self.require_provider_binding(provider.name(), model)?;
+        let grant = self
+            .grant_manifest
+            .provider
+            .as_ref()
+            .context("native provider grant is unavailable")?;
+        anyhow::ensure!(
+            provider.authority_fingerprint() == Some(grant.authority_fingerprint.as_str())
+                && provider.resolved_azure_connection().as_ref() == grant.azure_connection.as_ref(),
+            "provider instance differs from the accepted execution authority"
+        );
+        Ok(())
+    }
+
     pub(crate) fn verify_current_provider_authority(
         &self,
         registry: &pioneer_provider::ProviderRegistry,

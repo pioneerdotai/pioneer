@@ -55,6 +55,9 @@ pub(crate) fn tool_support_with_catalog(
     model: &str,
     catalog: Option<&crate::catalog::ModelCatalog>,
 ) -> Option<bool> {
+    if chat_tool_model_support(provider, model) == crate::ModelToolSupport::Unsupported {
+        return Some(false);
+    }
     let context = DISCOVERY_TOOLS
         .try_with(|(owner, public, c)| {
             (owner == policy_id(provider)).then(|| (*public, c.get(model).copied()))
@@ -68,6 +71,20 @@ pub(crate) fn tool_support_with_catalog(
             .then(|| catalog.and_then(|c| c.tool_support(provider, model)))
             .flatten(),
     )
+}
+
+/// Existing Chat protocol constraint, shared with adapter-owned model evidence.
+/// Opaque Azure deployment names remain Unknown, never inferred from a brand.
+pub(crate) fn chat_tool_model_support(provider: &str, model: &str) -> crate::ModelToolSupport {
+    if matches!(policy_id(provider), "openai" | "azure-openai")
+        && ["gpt-6-astra", "gpt-6.1-sol"]
+            .iter()
+            .any(|prefix| model == *prefix || model.starts_with(&format!("{prefix}-")))
+    {
+        crate::ModelToolSupport::Unsupported
+    } else {
+        crate::ModelToolSupport::Unknown
+    }
 }
 
 fn validate_tool_name(provider: &str, name: &str) -> Result<()> {
@@ -190,11 +207,7 @@ pub(crate) fn prepare_request_with_catalog(
     }
     // These families expose the tools field on Responses, not Chat, even if
     // a caller disables new calls. Azure opaque deployments cannot be inferred.
-    if matches!(provider, "openai" | "azure-openai")
-        && ["gpt-6-astra", "gpt-6.1-sol"]
-            .iter()
-            .any(|p| request.model == *p || request.model.starts_with(&format!("{p}-")))
-    {
+    if chat_tool_model_support(provider, &request.model) == crate::ModelToolSupport::Unsupported {
         bail!("provider `{provider}`: this model requires Responses API for tools");
     }
     // Published Messages contract: these families reject forced tool use even

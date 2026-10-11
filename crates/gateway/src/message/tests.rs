@@ -30863,6 +30863,7 @@ async fn legacy_cli_input_mapping_cannot_prove_a_later_message_edit_impl() {
             provider_name: "cli_runtime:codex".to_owned(),
             reasoning_effort: None,
             agent_skill_versions_json: None,
+            provider_model_contract_json: None,
             ordinary_skill_catalog_json: Some(
                 r#"{"schema_version":1,"catalog":{"version":0,"generated_at_unix":0,"skills":[]}}"#
                     .into(),
@@ -55258,6 +55259,28 @@ async fn agent_skill_snapshot_failure_preserves_overlay_and_retries_identical_pa
         text_elements: Vec::new(),
     }];
 
+    // This storage-fault scenario admits o4-mini; the generic execution
+    // fixture's test-model grant must be rebound before testing that write.
+    let encoded = crud_store
+        .get_turn_execution_authorization_context(turn_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut authority =
+        crate::authorization::ExecutionAuthorizationContext::from_persisted_json(&encoded).unwrap();
+    authority.bind_test_provider_authority(
+        "openai",
+        "o4-mini",
+        processor
+            .provider_registry
+            .authority_fingerprint_for_workspace(&workspace_id, "openai")
+            .unwrap()
+            .as_str(),
+    );
+    crud_store
+        .set_turn_execution_authorization_context(turn_id, &authority.to_persisted_json().unwrap())
+        .await
+        .unwrap();
     let accepted_overlay = overlay.clone();
     processor
         .persist_turn_runtime_snapshot_with_optional_agent_overlay(

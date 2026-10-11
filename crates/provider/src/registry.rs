@@ -340,7 +340,21 @@ impl AuthorityBoundProvider {
             .collect();
     }
 
+    fn request_public_catalog(&self) -> bool {
+        crate::model_contract::current().map_or(self.use_public_catalog, |contract| {
+            contract.public_catalog()
+        })
+    }
+    fn request_input_admission(&self) -> Arc<crate::attachments::admission::AdmissionState> {
+        crate::model_contract::current().map_or_else(
+            || self.input_admission.clone(),
+            |contract| Arc::new(self.input_admission.frozen(&contract)),
+        )
+    }
     fn discovery_reasoning_snapshot(&self) -> BTreeMap<String, crate::generation::NativeReasoning> {
+        if let Some(contract) = crate::model_contract::current() {
+            return contract.reasoning();
+        }
         self.discovery_reasoning
             .read()
             .expect("discovery reasoning lock")
@@ -348,6 +362,9 @@ impl AuthorityBoundProvider {
     }
 
     fn discovery_tool_snapshot(&self) -> BTreeMap<String, bool> {
+        if let Some(contract) = crate::model_contract::current() {
+            return contract.tools();
+        }
         self.discovery_tools
             .read()
             .expect("discovery tools lock")
@@ -355,6 +372,12 @@ impl AuthorityBoundProvider {
     }
 
     fn ensure_not_revoked(&self) -> Result<()> {
+        if let Some(contract) = crate::model_contract::current() {
+            contract.require_provider_authority(
+                self.name(),
+                Some(self.authority_fingerprint.as_str()),
+            )?;
+        }
         if self.revoked.load(Ordering::Acquire) {
             return Err(ProviderAuthorityRevoked.into());
         }
@@ -377,7 +400,7 @@ impl AuthorityBoundProvider {
         // as the transport, so a completed foreign round remains portable.
         let mut request = crate::generation::with_native_reasoning(
             self.name(),
-            self.use_public_catalog,
+            self.request_public_catalog(),
             self.discovery_reasoning_snapshot(),
             async { crate::history::project_request_for_provider(self.name(), request) },
         )
@@ -444,6 +467,31 @@ impl Provider for AuthorityBoundProvider {
         self.inner.capabilities()
     }
 
+    fn capture_model_contract_with_limit(
+        &self,
+        model: &str,
+        limit: usize,
+    ) -> Result<crate::AcceptedProviderModelContract> {
+        self.ensure_not_revoked()?;
+        let discovery = self.input_admission.bounded_model(model, limit)?;
+        let tools = discovery.as_ref().and_then(|m| m.capabilities.tool_calling);
+        let native = discovery
+            .as_ref()
+            .and_then(|m| m.capabilities.reasoning.as_ref())
+            .map(|r| r.native.clone())
+            .unwrap_or_default();
+        crate::AcceptedProviderModelContract::capture(
+            self,
+            model,
+            self.use_public_catalog,
+            discovery.as_ref(),
+            tools,
+            native,
+            self.inner.model_tool_support(model),
+            limit,
+        )
+    }
+
     fn model_tool_support(&self, model: &str) -> crate::ModelToolSupport {
         let catalog = crate::catalog::model_catalog().ok();
         self.model_tool_support_with_catalog(model, catalog.as_deref())
@@ -471,12 +519,12 @@ impl Provider for AuthorityBoundProvider {
         let (request, manifest) = self.prepare_tool_wire_request(request).await?;
         let mut prepared = self.public_result(
             crate::attachments::admission::scope(
-                self.input_admission.clone(),
+                self.request_input_admission(),
                 crate::attachments::runtime::with_async_authority_scope(
                     self.authority_fingerprint.as_str().to_owned(),
                     crate::generation::with_native_reasoning(
                         self.name(),
-                        self.use_public_catalog,
+                        self.request_public_catalog(),
                         self.discovery_reasoning_snapshot(),
                         self.inner.prepare_input_budget(request),
                     ),
@@ -495,16 +543,16 @@ impl Provider for AuthorityBoundProvider {
         let mut response = self
             .public_result(
                 crate::attachments::admission::scope(
-                    self.input_admission.clone(),
+                    self.request_input_admission(),
                     crate::attachments::runtime::with_async_authority_scope(
                         self.authority_fingerprint.as_str().to_owned(),
                         crate::tools::policy::with_discovery_tools(
                             self.name(),
-                            self.use_public_catalog,
+                            self.request_public_catalog(),
                             self.discovery_tool_snapshot(),
                             crate::generation::with_native_reasoning(
                                 self.name(),
-                                self.use_public_catalog,
+                                self.request_public_catalog(),
                                 self.discovery_reasoning_snapshot(),
                                 self.inner.chat(request),
                             ),
@@ -539,16 +587,16 @@ impl Provider for AuthorityBoundProvider {
         let mut response = self
             .public_result(
                 crate::attachments::admission::scope(
-                    self.input_admission.clone(),
+                    self.request_input_admission(),
                     crate::attachments::runtime::with_async_authority_scope(
                         self.authority_fingerprint.as_str().to_owned(),
                         crate::tools::policy::with_discovery_tools(
                             self.name(),
-                            self.use_public_catalog,
+                            self.request_public_catalog(),
                             self.discovery_tool_snapshot(),
                             crate::generation::with_native_reasoning(
                                 self.name(),
-                                self.use_public_catalog,
+                                self.request_public_catalog(),
                                 self.discovery_reasoning_snapshot(),
                                 self.inner.stream_chat_with_diagnostics(request),
                             ),

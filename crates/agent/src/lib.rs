@@ -1313,6 +1313,7 @@ pub struct RestoredRecoveryTurnRequest {
     pub model: String,
     pub provider_name: String,
     pub azure_connection: Option<pioneer_provider::AzureResolvedConnection>,
+    pub provider_model_contract: Option<pioneer_provider::AcceptedProviderModelContract>,
     pub reasoning: Option<ReasoningConfig>,
     pub workspace_skill_policies: HashMap<SkillPolicyKey, WorkspaceSkillPolicy>,
     pub skill_catalog: SkillCatalogSnapshot,
@@ -1358,6 +1359,7 @@ struct ActiveTurnRequest {
     model: String,
     provider_name: String,
     azure_connection: Option<pioneer_provider::AzureResolvedConnection>,
+    provider_model_contract: Option<pioneer_provider::AcceptedProviderModelContract>,
     reasoning: Option<ReasoningConfig>,
     workspace_skill_policies: HashMap<SkillPolicyKey, WorkspaceSkillPolicy>,
     skill_catalog: SkillCatalogSnapshot,
@@ -1891,6 +1893,7 @@ enum AgentCommand {
         model: String,
         provider_name: String,
         azure_connection: Option<pioneer_provider::AzureResolvedConnection>,
+        provider_model_contract: Option<pioneer_provider::AcceptedProviderModelContract>,
         reasoning: Option<ReasoningConfig>,
         workspace_skill_policies: HashMap<SkillPolicyKey, WorkspaceSkillPolicy>,
         skill_catalog: SkillCatalogSnapshot,
@@ -3289,6 +3292,7 @@ impl AgentManager {
             model,
             provider_name,
             None,
+            None,
             workspace_skill_policies,
             skill_catalog,
             agent_skill_overlay,
@@ -3459,6 +3463,7 @@ impl AgentManager {
             model,
             provider_name,
             None,
+            None,
             workspace_skill_policies,
             skill_catalog,
             agent_skill_overlay,
@@ -3546,6 +3551,7 @@ impl AgentManager {
             model,
             provider_name,
             None,
+            None,
             workspace_skill_policies,
             skill_catalog,
             agent_skill_overlay,
@@ -3569,6 +3575,11 @@ impl AgentManager {
         request: RestoredRecoveryTurnRequest,
         execution_checkpoint_context: Option<ExecutionCheckpointContext>,
     ) -> Result<(), AgentStartError> {
+        if request.provider_model_contract.is_none() {
+            return Err(AgentStartError::Internal(
+                "native admission is missing its accepted model contract".to_owned(),
+            ));
+        }
         if pioneer_provider::provider_definition(&request.provider_name)
             .is_some_and(|definition| definition.name == "azure-openai")
             && request.azure_connection.is_none()
@@ -3585,6 +3596,7 @@ impl AgentManager {
             &request.model,
             &request.provider_name,
             request.azure_connection,
+            request.provider_model_contract,
             request.workspace_skill_policies,
             request.skill_catalog,
             request.agent_skill_overlay,
@@ -3611,6 +3623,7 @@ impl AgentManager {
         model: &str,
         provider_name: &str,
         azure_connection: Option<pioneer_provider::AzureResolvedConnection>,
+        provider_model_contract: Option<pioneer_provider::AcceptedProviderModelContract>,
         workspace_skill_policies: HashMap<SkillPolicyKey, WorkspaceSkillPolicy>,
         skill_catalog: SkillCatalogSnapshot,
         agent_skill_overlay: Vec<AgentSkillRuntimeEntry>,
@@ -3656,6 +3669,7 @@ impl AgentManager {
             model: model.to_owned(),
             provider_name: provider_name.to_owned(),
             azure_connection,
+            provider_model_contract,
             reasoning,
             workspace_skill_policies,
             skill_catalog,

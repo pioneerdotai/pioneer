@@ -92,6 +92,41 @@ pub trait Provider: Send + Sync {
         }
     }
 
+    fn capture_model_contract(&self, model: &str) -> Result<crate::AcceptedProviderModelContract> {
+        self.capture_model_contract_with_limit(
+            model,
+            pioneer_protocol::TURN_EXECUTION_REQUEST_MAX_BYTES,
+        )
+    }
+    fn capture_model_contract_with_limit(
+        &self,
+        model: &str,
+        limit: usize,
+    ) -> Result<crate::AcceptedProviderModelContract> {
+        // Unbound adapters have no credential-scoped discovery owner. Public
+        // source evidence is not borrowed for an injected/private endpoint.
+        crate::model_contract::AcceptedProviderModelContract::capture(
+            self,
+            model,
+            false,
+            None,
+            None,
+            Default::default(),
+            self.model_tool_support(model),
+            limit,
+        )
+    }
+
+    /// Native budgeting uses the selected provider's accepted catalog even
+    /// when it runs outside the transport future. Ordinary unbound requests
+    /// retain the existing current-catalog contract.
+    fn model_catalog_for_request(
+        &self,
+        _model: &str,
+    ) -> Result<std::sync::Arc<crate::catalog::ModelCatalog>> {
+        crate::catalog::model_catalog()
+    }
+
     fn model_tool_calling(&self, model: &str) -> bool {
         self.model_tool_support(model) == ModelToolSupport::Supported
     }

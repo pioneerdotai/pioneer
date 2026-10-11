@@ -16,6 +16,8 @@ pub mod failure;
 pub mod file_tools;
 mod generation;
 pub mod history;
+mod model_contract;
+pub use model_contract::AcceptedProviderModelContract;
 mod http;
 pub mod providers;
 pub mod reasoning_registry;

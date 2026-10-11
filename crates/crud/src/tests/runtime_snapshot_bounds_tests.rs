@@ -80,6 +80,7 @@ fn candidate_snapshot(
         provider_name: "fixture".into(),
         reasoning_effort: None,
         agent_skill_versions_json: None,
+        provider_model_contract_json: None,
         ordinary_skill_catalog_json: None,
         hook_runtime_context_json: "{}".into(),
         workspace_skill_policies_json: "[]".into(),

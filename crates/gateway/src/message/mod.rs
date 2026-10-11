@@ -4203,6 +4203,43 @@ impl MessageProcessor {
             .context("failed to freeze canonical runtime history")?;
             snapshot.history_json = serde_json::to_string(&descriptor)?;
         }
+        // Fresh authorization selects the same adapter/connection as dispatch;
+        // immutable retries reuse the original selected facts, never a refresh.
+        let context = crate::authorization::ExecutionAuthorizationContext::load_for_turn(
+            self.crud_store.as_ref(),
+            turn_id,
+        )
+        .await?;
+        context.require_provider_binding(provider_name, model)?;
+        anyhow::ensure!(
+            context.workspace_id() == workspace_id,
+            "native snapshot workspace differs from execution authority"
+        );
+        context.verify_current_provider_authority(self.provider_registry.as_ref())?;
+        let provider = match context.provider_azure_connection() {
+            Some(connection) => self
+                .provider_registry
+                .get_or_create_for_workspace_with_frozen_azure(
+                    workspace_id,
+                    provider_name,
+                    connection,
+                )?,
+            None => self
+                .provider_registry
+                .get_or_create_for_workspace(workspace_id, provider_name)?,
+        };
+        context.require_provider_instance(provider.as_ref(), model)?;
+        let profile_byte_budget = snapshot.remaining_storage_bytes()?;
+        let contract =
+            if let Some(accepted) = self.crud_store.get_turn_runtime_snapshot(turn_id).await? {
+                crate::turn_runtime_snapshot::restored_provider_model_contract(&accepted)?
+            } else {
+                provider.capture_model_contract_with_limit(model, profile_byte_budget)?
+            };
+        contract.validate_identity(provider.name(), model, provider.authority_fingerprint())?;
+        let _ = contract.clone().bind(provider)?;
+        snapshot.provider_model_contract_json =
+            Some(contract.to_json_with_limit(profile_byte_budget)?);
         snapshot.validate_storage_size()?;
         self.crud_store
             .insert_native_turn_runtime_snapshot(snapshot)

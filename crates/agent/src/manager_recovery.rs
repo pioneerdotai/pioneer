@@ -71,6 +71,7 @@ mod tests {
                 )
                 .unwrap(),
             ),
+            provider_model_contract: None,
             reasoning: None,
             workspace_skill_policies:
                 HashMap::<pioneer_skills::SkillPolicyKey, WorkspaceSkillPolicy>::new(),
@@ -149,6 +150,7 @@ mod tests {
             model: "test-model".to_owned(),
             provider_name: "test-provider".to_owned(),
             azure_connection: None,
+            provider_model_contract: None,
             reasoning: None,
             workspace_skill_policies:
                 HashMap::<pioneer_skills::SkillPolicyKey, WorkspaceSkillPolicy>::new(),
@@ -279,6 +281,7 @@ mod tests {
             model: "test-model".to_owned(),
             provider_name: "test-provider".to_owned(),
             azure_connection: None,
+            provider_model_contract: None,
             reasoning: None,
             workspace_skill_policies:
                 HashMap::<pioneer_skills::SkillPolicyKey, WorkspaceSkillPolicy>::new(),

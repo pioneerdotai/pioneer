@@ -370,6 +370,7 @@ pub(super) async fn run_agent_loop(
                 model,
                 provider_name,
                 azure_connection,
+                provider_model_contract,
                 reasoning,
                 workspace_skill_policies,
                 skill_catalog,
@@ -412,6 +413,7 @@ pub(super) async fn run_agent_loop(
                     model,
                     provider_name: provider_name.clone(),
                     azure_connection,
+                    provider_model_contract,
                     reasoning,
                     workspace_skill_policies,
                     skill_catalog,
@@ -434,6 +436,8 @@ pub(super) async fn run_agent_loop(
                     &workspace_id,
                     &provider_name,
                     turn_request.azure_connection.as_ref(),
+                    &turn_request.model,
+                    turn_request.provider_model_contract.as_ref(),
                     turn_request.execution_checkpoint_context.is_none(),
                 ) {
                     Ok(p) => p,
@@ -445,6 +449,18 @@ pub(super) async fn run_agent_loop(
                     }
                 };
 
+                if turn_request.provider_model_contract.is_none() {
+                    turn_request.provider_model_contract =
+                        match provider.capture_model_contract(&turn_request.model) {
+                            Ok(contract) => Some(contract),
+                            Err(_) => {
+                                let _ = ack.send(Err(AgentStartError::Internal(
+                                    "native model contract cannot be captured".to_owned(),
+                                )));
+                                continue;
+                            }
+                        };
+                }
                 if turn_request.azure_connection.is_none() {
                     turn_request.azure_connection = provider.resolved_azure_connection();
                 }
@@ -740,6 +756,8 @@ pub(super) async fn run_agent_loop(
                             &workspace_id,
                             &next_turn_request.provider_name,
                             next_turn_request.azure_connection.as_ref(),
+                            &next_turn_request.model,
+                            next_turn_request.provider_model_contract.as_ref(),
                             false,
                         ) {
                             Ok(provider) => provider,
@@ -1204,6 +1222,8 @@ pub(super) async fn run_agent_loop(
                         &workspace_id,
                         &turn_request.provider_name,
                         turn_request.azure_connection.as_ref(),
+                        &turn_request.model,
+                        turn_request.provider_model_contract.as_ref(),
                         false,
                     ) {
                         Ok(provider) => provider,
@@ -1327,6 +1347,8 @@ pub(super) async fn run_agent_loop(
                     &workspace_id,
                     &turn_request.provider_name,
                     turn_request.azure_connection.as_ref(),
+                    &turn_request.model,
+                    turn_request.provider_model_contract.as_ref(),
                     false,
                 ) {
                     Ok(provider) => provider,
@@ -1468,6 +1490,7 @@ pub(super) async fn run_agent_loop(
                     model: turn_request.model,
                     provider_name: turn_request.provider_name,
                     azure_connection: turn_request.azure_connection,
+                    provider_model_contract: turn_request.provider_model_contract,
                     reasoning: turn_request.reasoning,
                     workspace_skill_policies: turn_request.workspace_skill_policies,
                     skill_catalog: turn_request.skill_catalog,
@@ -1506,6 +1529,8 @@ pub(super) async fn run_agent_loop(
                     &workspace_id,
                     &active_request.provider_name,
                     active_request.azure_connection.as_ref(),
+                    &active_request.model,
+                    active_request.provider_model_contract.as_ref(),
                     false,
                 ) {
                     Ok(provider) => provider,
@@ -1591,11 +1616,13 @@ fn resolve_accepted_provider(
     workspace: &str,
     provider: &str,
     connection: Option<&pioneer_provider::AzureResolvedConnection>,
+    model: &str,
+    contract: Option<&pioneer_provider::AcceptedProviderModelContract>,
     initial_direct_start: bool,
 ) -> anyhow::Result<Arc<dyn Provider>> {
     let azure = pioneer_provider::provider_definition(provider)
         .is_some_and(|definition| definition.name == "azure-openai");
-    match (azure, connection) {
+    let resolved = match (azure, connection) {
         (true, Some(connection)) => {
             registry.get_or_create_for_workspace_with_frozen_azure(workspace, provider, connection)
         }
@@ -1604,6 +1631,14 @@ fn resolve_accepted_provider(
         }
         (false, Some(_)) => anyhow::bail!("accepted Azure connection belongs to another provider"),
         _ => registry.get_or_create_for_workspace(workspace, provider),
+    }?;
+    match contract {
+        Some(contract) => {
+            contract.require_selection(resolved.name(), model)?;
+            contract.clone().bind(resolved)
+        }
+        None if initial_direct_start => resolved.capture_model_contract(model)?.bind(resolved),
+        None => anyhow::bail!("native continuation is missing its accepted model contract"),
     }
 }
 
@@ -2318,20 +2353,35 @@ mod tests {
             None,
         )
         .unwrap();
+        let accepted_contract = registry
+            .get_or_create_for_workspace_with_frozen_azure("workspace", "azure-openai", &accepted)
+            .unwrap()
+            .capture_model_contract("deployment-before")
+            .unwrap();
         for initial_direct_start in [false, true] {
             let provider = super::resolve_accepted_provider(
                 &registry,
                 "workspace",
                 "azure-openai",
                 Some(&accepted),
+                "deployment-before",
+                Some(&accepted_contract),
                 initial_direct_start,
             )
             .unwrap();
             assert_eq!(provider.resolved_azure_connection(), Some(accepted.clone()));
         }
         assert!(
-            super::resolve_accepted_provider(&registry, "workspace", "azure-openai", None, false)
-                .is_err()
+            super::resolve_accepted_provider(
+                &registry,
+                "workspace",
+                "azure-openai",
+                None,
+                "deployment-before",
+                Some(&accepted_contract),
+                false
+            )
+            .is_err()
         );
         assert!(
             super::resolve_accepted_provider(
@@ -2339,6 +2389,8 @@ mod tests {
                 "workspace",
                 "openai",
                 Some(&accepted),
+                "deployment-before",
+                Some(&accepted_contract),
                 false
             )
             .is_err()
@@ -2351,6 +2403,8 @@ mod tests {
                 "workspace",
                 "azure-openai",
                 Some(&future),
+                "deployment-before",
+                Some(&accepted_contract),
                 false
             )
             .is_err()

@@ -39,6 +39,8 @@ pub struct Model {
     pub agent_skill_versions_json: Option<String>,
     #[sea_orm(column_type = "Text", nullable)]
     pub ordinary_skill_catalog_json: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub provider_model_contract_json: Option<String>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

@@ -11,7 +11,8 @@ use std::{
 
 pub(crate) struct AdmissionState {
     discovery: RwLock<Arc<Vec<ProviderModelInfo>>>,
-    pins: RwLock<HashMap<(String, String), HashSet<&'static str>>>,
+    pins: Arc<RwLock<HashMap<(String, String), HashSet<&'static str>>>>,
+    accepted_catalog: Option<Arc<crate::catalog::ModelCatalog>>,
     #[cfg(test)]
     pub(crate) catalog: Option<Arc<crate::catalog::ModelCatalog>>,
     #[cfg(test)]
@@ -25,7 +26,8 @@ impl Default for AdmissionState {
     fn default() -> Self {
         Self {
             discovery: RwLock::new(Arc::new(Vec::new())),
-            pins: RwLock::new(HashMap::new()),
+            pins: Arc::new(RwLock::new(HashMap::new())),
+            accepted_catalog: None,
             #[cfg(test)]
             catalog: None,
             #[cfg(test)]
@@ -38,8 +40,53 @@ impl Default for AdmissionState {
     }
 }
 impl AdmissionState {
+    pub(crate) fn accepted_catalog(&self) -> Option<Arc<crate::catalog::ModelCatalog>> {
+        self.accepted_catalog.clone()
+    }
+    pub(crate) fn frozen(&self, contract: &crate::model_contract::RuntimeContract) -> Self {
+        Self {
+            discovery: RwLock::new(Arc::new(contract.discovery.clone().into_iter().collect())),
+            pins: self.pins.clone(),
+            accepted_catalog: Some(contract.catalog.clone()),
+            #[cfg(test)]
+            catalog: self.catalog.clone(),
+            #[cfg(test)]
+            pipeline_config: self.pipeline_config.clone(),
+            #[cfg(test)]
+            url_fixtures: RwLock::new(self.url_fixtures.read().unwrap().clone()),
+            #[cfg(test)]
+            url_reads: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
     pub(crate) fn replace_discovery(&self, models: Vec<ProviderModelInfo>) {
         *self.discovery.write().expect("input discovery lock") = Arc::new(models);
+    }
+    pub(crate) fn bounded_model(
+        &self,
+        id: &str,
+        limit: usize,
+    ) -> anyhow::Result<Option<ProviderModelInfo>> {
+        let guard = self.discovery.read().expect("input discovery lock");
+        let Some(model) = guard.iter().find(|model| model.id == id) else {
+            return Ok(None);
+        };
+        // ProviderModelInfo deliberately omits raw native reasoning on the UI
+        // wire. Keep that source evidence explicitly in the same atomic read.
+        let native = model
+            .capabilities
+            .reasoning
+            .as_ref()
+            .map(|reasoning| &reasoning.native);
+        let encoded = crate::model_contract::bounded_json_with_limit(&(model, native), limit)?;
+        crate::model_contract::validate_json_shape(&encoded)?;
+        let (mut model, native): (
+            ProviderModelInfo,
+            Option<crate::generation::NativeReasoning>,
+        ) = serde_json::from_str(&encoded)?;
+        if let Some(reasoning) = &mut model.capabilities.reasoning {
+            reasoning.native = native.unwrap_or_default();
+        }
+        Ok(Some(model))
     }
     pub(crate) fn model(&self, id: &str) -> Option<ProviderModelInfo> {
         self.discovery
@@ -117,7 +164,7 @@ pub(crate) fn current() -> Option<Arc<AdmissionState>> {
         .ok()
         .or_else(|| BLOCKING_STATE.with(|s| s.borrow().clone()))
 }
-pub(super) fn blocking_scope<T>(
+pub(crate) fn blocking_scope<T>(
     state: Option<Arc<AdmissionState>>,
     operation: impl FnOnce() -> T,
 ) -> T {

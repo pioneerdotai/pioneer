@@ -6860,7 +6860,7 @@ mod tests {
         }];
         let hook_runtime_context = AgentTurnHookRuntimeContext::task("task_snapshot");
 
-        let snapshot = crate::turn_runtime_snapshot::new_turn_runtime_snapshot(
+        let mut snapshot = crate::turn_runtime_snapshot::new_turn_runtime_snapshot(
             thread_id,
             workspace_id,
             turn_id,
@@ -6879,6 +6879,19 @@ mod tests {
             &accepted_catalog,
         )
         .expect("runtime snapshot should serialize");
+        let providers = pioneer_provider::ProviderRegistry::with_provider(
+            "echo",
+            Arc::new(EchoProvider::new()),
+        );
+        snapshot.provider_model_contract_json = Some(
+            providers
+                .get_or_create_for_workspace(workspace_id, "echo")
+                .unwrap()
+                .capture_model_contract("test-model")
+                .unwrap()
+                .to_json()
+                .unwrap(),
+        );
         crud_store
             .upsert_turn_runtime_snapshot(snapshot)
             .await
@@ -8224,6 +8237,7 @@ mod tests {
                 provider_name: "echo".to_owned(),
                 reasoning_effort: None,
                 agent_skill_versions_json: None,
+                provider_model_contract_json: None,
                 ordinary_skill_catalog_json: Some(r#"{"schema_version":1,"catalog":{"version":0,"generated_at_unix":0,"skills":[]}}"#.into()),
                 hook_runtime_context_json: "{}".to_owned(),
                 workspace_skill_policies_json: "[]".to_owned(),
