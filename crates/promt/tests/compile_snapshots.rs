@@ -84,6 +84,7 @@ fn continuation_checkpoint_payload() -> ExecutionCheckpointPayload {
         },
         tool_no_progress: Default::default(),
         requested_tool_names: Vec::new(),
+        native_semantic_state: None,
         strict_obligations: Vec::new(),
     }
 }

@@ -111,10 +111,10 @@ pub use process_policy::{ProcessSpawnPlan, build_process_spawn_plan, resolve_pro
 pub use registry::{ToolHandler, ToolRegistry, ToolRegistryBuilder};
 pub use retry_controller::{
     ToolFailureSignature, ToolRetryBudgetConfig, ToolRetryBudgetKind, ToolRetryBudgetSnapshot,
-    ToolRetryBudgetUsage, ToolRetryClassBudget, ToolRetryController, ToolRetryDecision,
-    ToolRetryEpisodeState, ToolRetryEventDraft, ToolRetryExhaustionReason, ToolRetryObservation,
-    ToolRetryPrompt, ToolRetryPromptEntry, ToolRetryResolution, ToolRetryResolvedEntry,
-    default_tool_retry_class_budgets,
+    ToolRetryBudgetUsage, ToolRetryCheckpoint, ToolRetryCheckpointEpisode, ToolRetryClassBudget,
+    ToolRetryController, ToolRetryDecision, ToolRetryEpisodeState, ToolRetryEventDraft,
+    ToolRetryExhaustionReason, ToolRetryObservation, ToolRetryPrompt, ToolRetryPromptEntry,
+    ToolRetryResolution, ToolRetryResolvedEntry, default_tool_retry_class_budgets,
 };
 pub use router::{RawToolCall, ToolCall, ToolRouter};
 pub use runtime::ToolCallRuntime;

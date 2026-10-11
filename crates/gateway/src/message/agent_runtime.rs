@@ -8712,6 +8712,7 @@ impl MessageProcessor {
                     .unwrap_or(false)
                 })
         });
+        let mut accepted_retry_budget = None;
         if snapshot_compatible {
             let snapshot = snapshot.as_ref().expect("validated snapshot");
             let requirements =
@@ -8723,6 +8724,7 @@ impl MessageProcessor {
                     pioneer_protocol::TURN_EXECUTION_REQUEST_MAX_BYTES,
                 )?
                 .expect("validated completed phase");
+            accepted_retry_budget = Some(requirements.tool_retry_budget);
             if let Some(contract) = requirements.native_agent_action_contract {
                 snapshot_compatible = crate::authorization::BoundAgentActionAdapter::native_launch_contract_can_restore(
                     &self.crud_store, &snapshot.workspace_id, &snapshot.thread_id, turn_id, &contract,
@@ -8754,8 +8756,13 @@ impl MessageProcessor {
             )
             .is_ok_and(|payload| {
                 payload.turn_id == turn_id
-                    && payload.schema_version
-                        == pioneer_protocol::EXECUTION_CHECKPOINT_PAYLOAD_SCHEMA_VERSION
+                    && snapshot.as_ref().is_some_and(|snapshot| {
+                        payload.workspace_id == snapshot.workspace_id
+                            && payload.thread_id == snapshot.thread_id
+                    })
+                    && accepted_retry_budget.as_ref().is_some_and(|budget| {
+                        pioneer_agent::native_semantic_checkpoint_compatible(&payload, budget)
+                    })
             })
         });
         if snapshot_compatible {

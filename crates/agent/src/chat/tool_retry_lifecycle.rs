@@ -13,7 +13,41 @@ pub(super) struct ToolRetryLifecycleTracker {
     next_episode_index: u32,
 }
 
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ToolRetryLifecycleCheckpoint {
+    pub active_episode_id: Option<String>,
+    pub next_episode_index: u32,
+}
+
 impl ToolRetryLifecycleTracker {
+    pub(super) fn checkpoint(&self) -> ToolRetryLifecycleCheckpoint {
+        ToolRetryLifecycleCheckpoint {
+            active_episode_id: self.active_episode_id.clone(),
+            next_episode_index: self.next_episode_index,
+        }
+    }
+
+    pub(super) fn from_checkpoint(
+        turn_id: &str,
+        saved: ToolRetryLifecycleCheckpoint,
+        active: bool,
+    ) -> Result<Self, &'static str> {
+        if saved.next_episode_index == u32::MAX
+            || active != saved.active_episode_id.is_some()
+            || saved.active_episode_id.as_ref().is_some_and(|id| {
+                saved.next_episode_index == 0
+                    || *id != format!("tool_retry_{turn_id}_{}", saved.next_episode_index)
+            })
+        {
+            return Err("retry lifecycle checkpoint is incompatible");
+        }
+        Ok(Self {
+            active_episode_id: saved.active_episode_id,
+            next_episode_index: saved.next_episode_index,
+        })
+    }
+
     fn episode_id_for_scheduled(&mut self, turn_id: &str) -> String {
         if let Some(id) = self.active_episode_id.clone() {
             return id;
@@ -273,4 +307,36 @@ pub(super) async fn emit_tool_retry_drafts(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn continuation_preserves_episode_identity_and_next_index() {
+        let mut original = ToolRetryLifecycleTracker::default();
+        let first = original.episode_id_for_scheduled("turn");
+        let mut restored =
+            ToolRetryLifecycleTracker::from_checkpoint("turn", original.checkpoint(), true)
+                .unwrap();
+        assert_eq!(restored.episode_id_for_scheduled("turn"), first);
+        restored.close();
+        let next = restored.episode_id_for_scheduled("turn");
+        assert_eq!(next, "tool_retry_turn_2");
+        assert_ne!(next, first);
+        assert!(
+            ToolRetryLifecycleTracker::from_checkpoint("foreign", original.checkpoint(), true)
+                .is_err()
+        );
+        assert!(
+            ToolRetryLifecycleTracker::from_checkpoint("turn", original.checkpoint(), false)
+                .is_err()
+        );
+        let saved = ToolRetryLifecycleCheckpoint {
+            active_episode_id: None,
+            next_episode_index: u32::MAX,
+        };
+        assert!(ToolRetryLifecycleTracker::from_checkpoint("turn", saved, false).is_err());
+    }
 }

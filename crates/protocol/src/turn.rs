@@ -2470,7 +2470,7 @@ pub enum ExecutionWindowExhaustionReason {
     RuntimeShutdownContinuation,
 }
 
-pub const EXECUTION_CHECKPOINT_PAYLOAD_SCHEMA_VERSION: u32 = 2;
+pub const EXECUTION_CHECKPOINT_PAYLOAD_SCHEMA_VERSION: u32 = 3;
 pub const EXECUTION_CHECKPOINT_DEFAULT_TOOL_DETAIL_LIMIT: usize = 32;
 pub const EXECUTION_CHECKPOINT_TEXT_PREVIEW_MAX_CHARS: usize = 512;
 pub const EXECUTION_CHECKPOINT_METADATA_MAX_CHARS: usize = 256;
@@ -2500,6 +2500,10 @@ pub struct ExecutionCheckpointPayload {
     /// Resume must revalidate these names against the current tool registry and policy.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub requested_tool_names: Vec<String>,
+    /// Agent-owned bounded semantic state. Missing legacy state cannot authorize
+    /// a native continuation with fresh retry allowances or empty obligations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_semantic_state: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub strict_obligations: Vec<ExecutionCheckpointStrictObligation>,
 }
@@ -2797,6 +2801,7 @@ pub fn build_execution_checkpoint_payload(
         tools,
         tool_no_progress: ExecutionCheckpointToolNoProgressState::default(),
         requested_tool_names: Vec::new(),
+        native_semantic_state: None,
         strict_obligations: obligations,
     }
 }

@@ -6,7 +6,7 @@ use pioneer_protocol::{
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::{
     ActiveModelTrait, ActiveValue, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter,
-    QueryOrder, Set, Unchanged,
+    QueryOrder, QuerySelect, Set, Unchanged,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
@@ -977,11 +977,38 @@ pub(crate) async fn insert_prepared_turn_execution_checkpoint<C: ConnectionTrait
     Ok(())
 }
 
+/// Preserve the selected row, including a poisoned newest row. Filtering it
+/// out would allow recovery to use an older checkpoint with fewer obligations.
+/// NULL in the required String column is an explicit unavailable read outcome;
+/// oversized legacy TEXT never crosses the physical reader boundary.
+fn bounded_checkpoint_query() -> sea_orm::Select<turn_execution_checkpoint::Entity> {
+    use turn_execution_checkpoint::Column as C;
+    turn_execution_checkpoint::Entity::find()
+        .select_only()
+        .columns([
+            C::Id,
+            C::WindowId,
+            C::WorkspaceId,
+            C::ThreadId,
+            C::TurnId,
+            C::CheckpointKind,
+            C::CreatedAt,
+        ])
+        .column_as(
+            sea_orm::sea_query::Expr::cust_with_values(
+                "CASE WHEN length(CAST(payload_json AS BLOB)) <= ? THEN payload_json ELSE NULL END",
+                [TURN_EXECUTION_CHECKPOINT_PAYLOAD_MAX_BYTES as i64],
+            ),
+            C::PayloadJson,
+        )
+}
+
 pub async fn get_turn_execution_checkpoint<C: ConnectionTrait>(
     db: &C,
     checkpoint_id: &str,
 ) -> Result<Option<TurnExecutionCheckpointRecord>> {
-    turn_execution_checkpoint::Entity::find_by_id(checkpoint_id.to_owned())
+    bounded_checkpoint_query()
+        .filter(turn_execution_checkpoint::Column::Id.eq(checkpoint_id.to_owned()))
         .one(db)
         .await
         .context("failed to query turn_execution_checkpoint row")?
@@ -993,7 +1020,8 @@ pub(crate) async fn get_turn_execution_checkpoint_model<C: ConnectionTrait>(
     db: &C,
     checkpoint_id: &str,
 ) -> Result<Option<turn_execution_checkpoint::Model>> {
-    turn_execution_checkpoint::Entity::find_by_id(checkpoint_id.to_owned())
+    bounded_checkpoint_query()
+        .filter(turn_execution_checkpoint::Column::Id.eq(checkpoint_id.to_owned()))
         .one(db)
         .await
         .context("failed to query raw turn_execution_checkpoint row")
@@ -1003,7 +1031,7 @@ pub async fn list_turn_execution_checkpoints_for_window<C: ConnectionTrait>(
     db: &C,
     window_id: &str,
 ) -> Result<Vec<TurnExecutionCheckpointRecord>> {
-    turn_execution_checkpoint::Entity::find()
+    bounded_checkpoint_query()
         .filter(turn_execution_checkpoint::Column::WindowId.eq(window_id.to_owned()))
         .order_by_asc(turn_execution_checkpoint::Column::CreatedAt)
         .all(db)
@@ -1018,7 +1046,7 @@ pub async fn latest_turn_execution_checkpoint_for_turn<C: ConnectionTrait>(
     db: &C,
     turn_id: &str,
 ) -> Result<Option<TurnExecutionCheckpointRecord>> {
-    turn_execution_checkpoint::Entity::find()
+    bounded_checkpoint_query()
         .filter(turn_execution_checkpoint::Column::TurnId.eq(turn_id.to_owned()))
         .order_by_desc(turn_execution_checkpoint::Column::CreatedAt)
         .one(db)
@@ -1228,6 +1256,95 @@ fn active_model_id(value: &ActiveValue<String>) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn legacy_oversized_newest_checkpoint_is_unavailable_without_stale_fallback() {
+        use migration::{Migrator, MigratorTrait};
+        let connection = sea_orm::Database::connect("sqlite::memory:").await.unwrap();
+        Migrator::up(&connection, None).await.unwrap();
+        let store = crate::CrudStore::new(connection).with_maintenance_access();
+        let db = store.database_connection();
+        assert_eq!(
+            db.read_class(),
+            pioneer_sqlite::SqliteReadClass::Maintenance
+        );
+        let now = chrono::Utc::now().fixed_offset();
+        let window = store
+            .create_turn_execution_window(
+                NewTurnExecutionWindowRecord {
+                    workspace_id: "workspace".to_owned(),
+                    thread_id: "thread".to_owned(),
+                    turn_id: "turn".to_owned(),
+                    window_index: 1,
+                    status: ExecutionWindowStatus::Running,
+                    exhaustion_reason: None,
+                    agent_round_count: 0,
+                    tool_call_count: 0,
+                    provider_token_count: 0,
+                    metadata_json: serde_json::json!({}),
+                    started_at: now,
+                },
+                now,
+                now,
+            )
+            .await
+            .unwrap();
+        let first = store
+            .save_turn_execution_checkpoint(NewTurnExecutionCheckpointRecord {
+                id: Some("original".to_owned()),
+                window_id: window.id.clone(),
+                workspace_id: "workspace".to_owned(),
+                thread_id: "thread".to_owned(),
+                turn_id: "turn".to_owned(),
+                checkpoint_kind: TurnExecutionCheckpointKind::WindowExhausted,
+                payload_json: serde_json::json!({"original": true}),
+                created_at: now,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .latest_turn_execution_checkpoint_for_turn("turn")
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            first.id
+        );
+        // Simulate a legacy writer; no production limit is disabled.
+        let poison = serde_json::json!({"text": "界".repeat(TURN_EXECUTION_CHECKPOINT_PAYLOAD_MAX_BYTES / 2)}).to_string();
+        assert!(poison.len() > TURN_EXECUTION_CHECKPOINT_PAYLOAD_MAX_BYTES);
+        db.execute_raw(sea_orm::Statement::from_sql_and_values(sea_orm::DatabaseBackend::Sqlite,
+            "INSERT INTO turn_execution_checkpoint(id,window_id,workspace_id,thread_id,turn_id,checkpoint_kind,payload_json,created_at) VALUES(?,?,?,?,?,?,?,?)",
+            ["poison".into(), window.id.clone().into(), "workspace".into(), "thread".into(), "turn".into(),
+             "window_exhausted".into(), poison.into(), (now + chrono::Duration::seconds(1)).into()],
+        )).await.unwrap();
+        assert!(store.get_turn_execution_checkpoint("poison").await.is_err());
+        assert!(
+            get_turn_execution_checkpoint_model(&db, "poison")
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .latest_turn_execution_checkpoint_for_turn("turn")
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .list_turn_execution_checkpoints_for_window(&window.id)
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .get_turn_execution_checkpoint("original")
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
 
     #[test]
     fn execution_window_status_and_reason_roundtrip_through_db_strings() {

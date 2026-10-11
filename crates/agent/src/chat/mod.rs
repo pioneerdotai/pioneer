@@ -1,5 +1,6 @@
 pub(crate) mod preflight;
 mod provider;
+pub(crate) mod semantic_state;
 mod skill_tools;
 mod skills;
 mod tool_recovery_policy;
@@ -309,13 +310,103 @@ impl<T> Drop for AbortOnDropJoinHandle<T> {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TaskMutationFailure {
     tool_name: String,
+    identity: TaskMutationIdentity,
+    expected_revision: Option<i64>,
     error: String,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TaskMutationIdentity {
+    task_id: Option<String>,
+    operation: TaskMutationOperation,
+    postcondition_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum TaskMutationOperation {
+    Create,
+    Update,
+    Reschedule,
+}
+
+impl TaskMutationIdentity {
+    fn from_result(result: &ExecutedToolResult) -> (Self, Option<i64>) {
+        let operation = match result.tool_name.as_str() {
+            "task_create" => TaskMutationOperation::Create,
+            "task_update" => TaskMutationOperation::Update,
+            _ => TaskMutationOperation::Reschedule,
+        };
+        // Canonical arguments, never the error/display text, identify the
+        // intended postcondition. A concurrency revision is a precondition.
+        let mut value =
+            serde_json::from_str::<JsonValue>(&result.arguments).unwrap_or(JsonValue::Null);
+        let task_id = value
+            .get("taskId")
+            .and_then(JsonValue::as_str)
+            .map(str::to_owned);
+        let expected_revision = value.get("expectedRevision").and_then(JsonValue::as_i64);
+        if let Some(object) = value.as_object_mut() {
+            object.remove("expectedRevision");
+        }
+        let fingerprint = if value.is_object() {
+            let signature = pioneer_tools::ToolFailureSignature::from_arguments(
+                &result.tool_name,
+                &value.to_string(),
+                ToolErrorClass::Unknown,
+            );
+            hex::encode(Sha256::digest(signature.arguments_fingerprint.as_bytes()))
+        } else {
+            // An invalid invocation has no proven shared mutation identity.
+            hex::encode(Sha256::digest(result.item_id.as_bytes()))
+        };
+        (
+            Self {
+                task_id,
+                operation,
+                postcondition_sha256: fingerprint,
+            },
+            expected_revision,
+        )
+    }
+
+    fn confirmed(&self, result: &ExecutedToolResult, expected_revision: Option<i64>) -> bool {
+        if !result.success || result.outcome.status != pioneer_tools::ToolOutcomeStatus::Ok {
+            return false;
+        }
+        let Ok(output) = serde_json::from_str::<JsonValue>(&result.model_visible_text) else {
+            return false;
+        };
+        let output_task = output
+            .get("taskId")
+            .and_then(JsonValue::as_str)
+            .or_else(|| output.pointer("/task/id").and_then(JsonValue::as_str));
+        let Some(output_task) = output_task.filter(|id| !id.is_empty()) else {
+            return false;
+        };
+        if let Some(expected_task) = &self.task_id {
+            if expected_task != output_task {
+                return false;
+            }
+            let revision = output
+                .get("revision")
+                .and_then(JsonValue::as_i64)
+                .or_else(|| output.pointer("/task/revision").and_then(JsonValue::as_i64));
+            return revision.is_some_and(|revision| {
+                revision > 0 && expected_revision.is_none_or(|expected| revision > expected)
+            });
+        }
+        self.operation == TaskMutationOperation::Create
+    }
+}
+
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TaskMutationFinalizationGuard {
     failures_since_last_success: Vec<TaskMutationFailure>,
 }
@@ -491,24 +582,78 @@ fn sync_review_action_tools_to_observations(
 }
 
 impl TaskMutationFinalizationGuard {
-    fn observe(&mut self, result: &ExecutedToolResult) {
+    fn checkpoint_valid(&self) -> bool {
+        self.failures_since_last_success.len() <= 256
+            && self
+                .failures_since_last_success
+                .iter()
+                .enumerate()
+                .all(|(index, failure)| {
+                    let operation_name = match failure.identity.operation {
+                        TaskMutationOperation::Create => "task_create",
+                        TaskMutationOperation::Update => "task_update",
+                        TaskMutationOperation::Reschedule => "task_reschedule",
+                    };
+                    failure.tool_name == operation_name
+                        && failure
+                            .identity
+                            .task_id
+                            .as_ref()
+                            .is_none_or(|id| !id.is_empty() && id.len() <= 256)
+                        && failure.identity.postcondition_sha256.len() == 64
+                        && failure
+                            .identity
+                            .postcondition_sha256
+                            .bytes()
+                            .all(|b| b.is_ascii_hexdigit())
+                        && failure.error.len() <= 4096
+                        && self.failures_since_last_success[..index]
+                            .iter()
+                            .all(|other| other.identity != failure.identity)
+                })
+    }
+
+    fn observe(&mut self, result: &ExecutedToolResult) -> Result<(), ChatTurnError> {
         if !is_guarded_task_mutation_tool(result.tool_name.as_str()) {
-            return;
+            return Ok(());
         }
+        let (identity, expected_revision) = TaskMutationIdentity::from_result(result);
         if result.success {
-            self.failures_since_last_success.clear();
-            return;
+            self.failures_since_last_success.retain(|failure| {
+                failure.identity != identity
+                    || !identity.confirmed(result, failure.expected_revision)
+            });
+            return Ok(());
+        }
+        if let Some(failure) = self
+            .failures_since_last_success
+            .iter_mut()
+            .find(|failure| failure.identity == identity)
+        {
+            failure.expected_revision = match (failure.expected_revision, expected_revision) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                (a, b) => a.or(b),
+            };
+            return Ok(());
+        }
+        if self.failures_since_last_success.len() >= 256 {
+            return Err(ChatTurnError::Blocked(
+                "unresolved task mutation limit exceeded".to_owned(),
+            ));
         }
         self.failures_since_last_success.push(TaskMutationFailure {
             tool_name: result.tool_name.clone(),
-            error: result.model_visible_text.clone(),
+            identity,
+            expected_revision,
+            error: bounded_utf8_suffix(&result.model_visible_text, 4096).to_owned(),
         });
+        Ok(())
     }
 
     fn deterministic_failure_message(&self) -> Option<String> {
         let failure = self.failures_since_last_success.last()?;
         Some(format!(
-            "Task mutation failed and no later task mutation succeeded. Do not report the task as created, updated, or rescheduled. Failed tool: {}. Primary error: {}",
+            "Task mutation has an unresolved postcondition. Do not report this task as created, updated, or rescheduled. Failed tool: {}. Primary error: {}",
             failure.tool_name, failure.error
         ))
     }
@@ -525,7 +670,21 @@ fn append_text_fragment(target: &mut String, fragment: &str) {
     if !target.is_empty() {
         target.push('\n');
     }
-    target.push_str(fragment);
+    target.push_str(bounded_utf8_suffix(
+        fragment,
+        semantic_state::MAX_SUMMARY_TEXT_BYTES,
+    ));
+    if target.len() > semantic_state::MAX_SUMMARY_TEXT_BYTES {
+        *target = bounded_utf8_suffix(target, semantic_state::MAX_SUMMARY_TEXT_BYTES).to_owned();
+    }
+}
+
+fn bounded_utf8_suffix(text: &str, max_bytes: usize) -> &str {
+    let mut start = text.len().saturating_sub(max_bytes);
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    &text[start..]
 }
 
 fn post_turn_tool_event_summary(result: &ExecutedToolResult) -> TurnPostTurnToolEventSummary {
@@ -5025,6 +5184,15 @@ async fn execute_agent_provider_response(
     } else {
         preflight_usage
     };
+    let semantic = semantic_state::NativeSemanticState::restore(
+        execution_checkpoint_context.as_ref(),
+        workspace_id,
+        thread_id,
+        turn_id,
+        execution_window_index,
+        &tool_loop_config.retry,
+        !reused_initial,
+    )?;
     window_stats.record_preflight(preflight_usage);
     let continuation_sections = runtime_sections_with_execution_continuation_context(
         &[],
@@ -5035,7 +5203,7 @@ async fn execute_agent_provider_response(
     );
     let initial_instruction_plan = pioneer_promt::reproject_native_instruction_plan(
         &initial_instruction_plan,
-        None,
+        semantic.applied_retry_instruction.as_deref(),
         provider_tool_calling,
         continuation_sections.first(),
     )
@@ -5058,7 +5226,7 @@ async fn execute_agent_provider_response(
             .begin_provider_round()
             .map_err(ChatTurnError::Terminal)?;
         if let Some(budget_exceeded) = round_plan.budget_exceeded {
-            let continuation = build_budget_execution_window_continuation(
+            let mut continuation = build_budget_execution_window_continuation(
                 workspace_id,
                 thread_id,
                 turn_id,
@@ -5070,6 +5238,7 @@ async fn execute_agent_provider_response(
                 Default::default(),
                 &[],
             );
+            continuation.checkpoint_payload.native_semantic_state = Some(semantic.to_value()?);
             emit_execution_window_exhausted_and_checkpointed(
                 workspace_id,
                 thread_id,
@@ -5281,10 +5450,10 @@ async fn execute_agent_provider_response(
         next_retained_provider_history_sequence(&continuation_provider_history);
     append_recovered_provider_history(&mut messages, continuation_provider_history.clone());
 
-    let mut pending_retry_instruction: Option<String> = None;
-    let mut applied_retry_instruction: Option<String> = None;
-    let mut observed_review_required_signatures = BTreeSet::<String>::new();
-    let mut observed_terminal_task_ids = BTreeSet::<String>::new();
+    let mut pending_retry_instruction = semantic.pending_retry_instruction;
+    let mut applied_retry_instruction = semantic.applied_retry_instruction;
+    let mut observed_review_required_signatures = semantic.observed_review_required_signatures;
+    let mut observed_terminal_task_ids = semantic.observed_terminal_task_ids;
     let window_budget = &tool_loop_config.execution_windows.window;
     let mut tool_loop_guard = ToolLoopGuard::new_execution_window_with_started_at(
         window_budget.clone(),
@@ -5296,7 +5465,11 @@ async fn execute_agent_provider_response(
         preflight_usage.known_tokens,
         preflight_usage.unknown,
     );
-    let mut tool_retry_controller = ToolRetryController::new(tool_loop_config.retry.clone());
+    let mut tool_retry_controller =
+        ToolRetryController::from_checkpoint(tool_loop_config.retry.clone(), semantic.retry)
+            .map_err(|_| {
+                ChatTurnError::Blocked("native retry checkpoint is incompatible".to_owned())
+            })?;
     let restored_no_progress_state = execution_checkpoint_context
         .as_ref()
         .map(|context| context.payload.tool_no_progress.clone())
@@ -5305,11 +5478,38 @@ async fn execute_agent_provider_response(
         ToolNoProgressGuardConfig::default(),
         restored_no_progress_state,
     );
-    let mut tool_retry_lifecycle = ToolRetryLifecycleTracker::default();
-    let mut task_mutation_finalization_guard = TaskMutationFinalizationGuard::default();
-    let mut post_turn_assistant_text = String::new();
-    let mut post_turn_tool_events = Vec::new();
-    let mut post_turn_domain_events = Vec::new();
+    let mut tool_retry_lifecycle = ToolRetryLifecycleTracker::from_checkpoint(
+        turn_id,
+        semantic.retry_lifecycle,
+        tool_retry_controller
+            .state_snapshot()
+            .active_episode
+            .is_some(),
+    )
+    .map_err(|_| ChatTurnError::Blocked("native retry lifecycle is incompatible".to_owned()))?;
+    let mut task_mutation_finalization_guard = semantic.task_mutation_guard;
+    let mut post_turn_assistant_text = semantic.post_turn_assistant_text;
+    let mut post_turn_tool_events = semantic.post_turn_tool_events;
+    let mut post_turn_domain_events = semantic.post_turn_domain_events;
+
+    macro_rules! capture_semantic_state {
+        () => {
+            semantic_state::capture(
+                turn_id,
+                &tool_loop_config.retry,
+                &tool_retry_controller,
+                &tool_retry_lifecycle,
+                &pending_retry_instruction,
+                &applied_retry_instruction,
+                &observed_review_required_signatures,
+                &observed_terminal_task_ids,
+                &task_mutation_finalization_guard,
+                &post_turn_assistant_text,
+                &post_turn_tool_events,
+                &post_turn_domain_events,
+            )
+        };
+    }
 
     let turn_result: Result<AgentProviderLoopOutcome, (ChatTurnError, String)> = async {
         let mut current_thinking_id = initial_thinking_item_id;
@@ -5477,7 +5677,7 @@ async fn execute_agent_provider_response(
                 )
                 .await
                 .map_err(|error| (error, current_thinking_id.clone()))?;
-                let continuation = build_budget_execution_window_continuation(
+                let mut continuation = build_budget_execution_window_continuation(
                     workspace_id,
                     thread_id,
                     turn_id,
@@ -5489,6 +5689,8 @@ async fn execute_agent_provider_response(
                     tool_no_progress_guard.checkpoint_state(),
                     &requested_tool_names,
                 );
+                continuation.checkpoint_payload.native_semantic_state = Some(capture_semantic_state!()
+                    .map_err(|error| (error, current_thinking_id.clone()))?);
                 emit_execution_window_exhausted_and_checkpointed(
                     workspace_id,
                     thread_id,
@@ -5594,7 +5796,7 @@ async fn execute_agent_provider_response(
                 Some(compiled_prompt_payload_from_delivery_plan(&no_tool_instruction_plan))
             };
 
-            let post_turn_assistant_text_len_before_round = post_turn_assistant_text.len();
+            let post_turn_assistant_text_before_round = post_turn_assistant_text.clone();
             let request = ChatRequest {
                     model: model.clone(),
                     messages: messages.clone(),
@@ -5710,7 +5912,7 @@ async fn execute_agent_provider_response(
                     }
                 }
 
-                post_turn_assistant_text = final_text.clone();
+                post_turn_assistant_text = bounded_utf8_suffix(&final_text, semantic_state::MAX_SUMMARY_TEXT_BYTES).to_owned();
                 send_reasoning_completed(
                     workspace_id,
                     thread_id,
@@ -5837,7 +6039,7 @@ async fn execute_agent_provider_response(
                     )
                     .await
                     .map_err(|error| (error, current_thinking_id.clone()))?;
-                    let continuation = build_budget_execution_window_continuation(
+                    let mut continuation = build_budget_execution_window_continuation(
                         workspace_id,
                         thread_id,
                         turn_id,
@@ -5849,7 +6051,9 @@ async fn execute_agent_provider_response(
                         tool_no_progress_guard.checkpoint_state(),
                         &requested_tool_names,
                     );
-                    emit_execution_window_exhausted_and_checkpointed(
+                    continuation.checkpoint_payload.native_semantic_state = Some(capture_semantic_state!()
+                    .map_err(|error| (error, current_thinking_id.clone()))?);
+                emit_execution_window_exhausted_and_checkpointed(
                         workspace_id,
                         thread_id,
                         turn_id,
@@ -6181,7 +6385,7 @@ async fn execute_agent_provider_response(
                     .then(|| no_tool_final_answer_rejection(final_text.as_str()))
                     .flatten();
                 if let Some(rejection) = final_answer_rejection {
-                    post_turn_assistant_text.truncate(post_turn_assistant_text_len_before_round);
+                    post_turn_assistant_text = post_turn_assistant_text_before_round.clone();
                     consecutive_rejected_no_tool_rounds += 1;
 
                     if consecutive_rejected_no_tool_rounds
@@ -6254,8 +6458,7 @@ async fn execute_agent_provider_response(
                     {
                         Ok(TurnFinalizationDecision::Allow) => {}
                         Ok(TurnFinalizationDecision::Retry { instruction }) => {
-                            post_turn_assistant_text
-                                .truncate(post_turn_assistant_text_len_before_round);
+                            post_turn_assistant_text = post_turn_assistant_text_before_round.clone();
                             if !round.reasoning.trim().is_empty() {
                                 send_reasoning_completed(
                                     workspace_id,
@@ -6282,13 +6485,11 @@ async fn execute_agent_provider_response(
                             continue;
                         }
                         Ok(TurnFinalizationDecision::Fail { message }) => {
-                            post_turn_assistant_text
-                                .truncate(post_turn_assistant_text_len_before_round);
+                            post_turn_assistant_text = post_turn_assistant_text_before_round.clone();
                             return Err((ChatTurnError::Terminal(message), current_thinking_id.clone()));
                         }
                         Err(error) => {
-                            post_turn_assistant_text
-                                .truncate(post_turn_assistant_text_len_before_round);
+                            post_turn_assistant_text = post_turn_assistant_text_before_round.clone();
                             return Err((
                                 ChatTurnError::Blocked(format!(
                                     "turn finalization outcome is unavailable: {error}"
@@ -6299,7 +6500,7 @@ async fn execute_agent_provider_response(
                     }
                 }
                 if final_text != round.text {
-                    post_turn_assistant_text = final_text.clone();
+                    post_turn_assistant_text = bounded_utf8_suffix(&final_text, semantic_state::MAX_SUMMARY_TEXT_BYTES).to_owned();
                 }
 
                 send_reasoning_completed(
@@ -7137,7 +7338,8 @@ async fn execute_agent_provider_response(
 
             for result in &executed_results {
                 record_observed_terminal_task_ids(&mut observed_terminal_task_ids, result);
-                task_mutation_finalization_guard.observe(result);
+                task_mutation_finalization_guard.observe(result)
+                    .map_err(|error| (error, current_thinking_id.clone()))?;
             }
             post_turn_tool_events.extend(
                 executed_results
@@ -7150,6 +7352,13 @@ async fn execute_agent_provider_response(
                     .map(post_turn_domain_event_summary_from_tool),
             );
 
+            // A bounded post-turn summary is independent of unresolved guards.
+            if post_turn_tool_events.len() > semantic_state::MAX_SUMMARY_EVENTS {
+                post_turn_tool_events.drain(..post_turn_tool_events.len() - semantic_state::MAX_SUMMARY_EVENTS);
+            }
+            if post_turn_domain_events.len() > semantic_state::MAX_SUMMARY_EVENTS {
+                post_turn_domain_events.drain(..post_turn_domain_events.len() - semantic_state::MAX_SUMMARY_EVENTS);
+            }
             let retry_observations = executed_results
                 .iter()
                 .map(ExecutedToolResult::retry_observation)
@@ -7357,7 +7566,7 @@ async fn execute_agent_provider_response(
                 },
                 other => other,
             };
-            if let Some(continuation) = build_failure_execution_window_continuation(
+            if let Some(mut continuation) = build_failure_execution_window_continuation(
                 workspace_id,
                 thread_id,
                 turn_id,
@@ -7369,6 +7578,8 @@ async fn execute_agent_provider_response(
                 tool_no_progress_guard.checkpoint_state(),
                 &requested_tool_names,
             ) {
+                continuation.checkpoint_payload.native_semantic_state =
+                    Some(capture_semantic_state!()?);
                 emit_execution_window_exhausted_and_checkpointed(
                     workspace_id,
                     thread_id,
@@ -8203,6 +8414,7 @@ mod tests {
                 },
                 tool_no_progress: Default::default(),
                 requested_tool_names: Vec::new(),
+                native_semantic_state: None,
                 strict_obligations: Vec::new(),
             },
         }
@@ -9924,7 +10136,9 @@ mod tests {
     #[test]
     fn task_mutation_finalization_guard_reports_failed_mutation_until_success() {
         let mut guard = TaskMutationFinalizationGuard::default();
-        guard.observe(&task_result("task_create", false, "trigger must be object"));
+        guard
+            .observe(&task_result("task_create", false, "trigger must be object"))
+            .unwrap();
 
         let message = guard
             .deterministic_failure_message()
@@ -9932,8 +10146,178 @@ mod tests {
         assert!(message.contains("task_create"));
         assert!(message.contains("trigger must be object"));
 
-        guard.observe(&task_result("task_create", true, "{\"taskId\":\"abc\"}"));
+        guard
+            .observe(&task_result("task_create", true, "{\"taskId\":\"abc\"}"))
+            .unwrap();
         assert!(guard.deterministic_failure_message().is_none());
+    }
+
+    #[test]
+    fn task_mutation_success_requires_same_task_postcondition_and_newer_revision() {
+        let mut guard = TaskMutationFinalizationGuard::default();
+        let mut failed = task_result("task_update", false, "revision conflict");
+        failed.arguments =
+            r#"{"taskId":"AAAAAAAAAAAAAAAAAAAAA","title":"accepted title","expectedRevision":7}"#
+                .to_owned();
+        guard.observe(&failed).unwrap();
+        let mut unrelated = task_result(
+            "task_update",
+            true,
+            r#"{"task":{"id":"BBBBBBBBBBBBBBBBBBBBB"},"revision":9}"#,
+        );
+        unrelated.arguments =
+            r#"{"taskId":"BBBBBBBBBBBBBBBBBBBBB","title":"accepted title","expectedRevision":8}"#
+                .to_owned();
+        guard.observe(&unrelated).unwrap();
+        assert!(guard.deterministic_failure_message().is_some());
+        unrelated.arguments =
+            r#"{"taskId":"AAAAAAAAAAAAAAAAAAAAA","title":"another title","expectedRevision":8}"#
+                .to_owned();
+        unrelated.model_visible_text =
+            r#"{"task":{"id":"AAAAAAAAAAAAAAAAAAAAA"},"revision":9}"#.to_owned();
+        guard.observe(&unrelated).unwrap();
+        assert!(guard.deterministic_failure_message().is_some());
+        let encoded = serde_json::to_vec(&guard).unwrap();
+        let mut restored: TaskMutationFinalizationGuard = serde_json::from_slice(&encoded).unwrap();
+        assert!(restored.checkpoint_valid());
+        unrelated.arguments =
+            r#"{"taskId":"AAAAAAAAAAAAAAAAAAAAA","title":"accepted title","expectedRevision":8}"#
+                .to_owned();
+        unrelated.model_visible_text =
+            r#"{"task":{"id":"AAAAAAAAAAAAAAAAAAAAA"},"revision":7}"#.to_owned();
+        restored.observe(&unrelated).unwrap();
+        assert!(restored.deterministic_failure_message().is_some());
+        unrelated.model_visible_text =
+            r#"{"task":{"id":"AAAAAAAAAAAAAAAAAAAAA"},"revision":9}"#.to_owned();
+        restored.observe(&unrelated).unwrap();
+        assert!(restored.deterministic_failure_message().is_none());
+    }
+
+    #[test]
+    fn semantic_checkpoint_restores_guidance_guards_and_rejects_legacy_foreign_or_oversized_state()
+    {
+        let budget = pioneer_tools::ToolRetryBudgetConfig::default();
+        let controller = super::ToolRetryController::new(budget.clone());
+        let lifecycle = super::ToolRetryLifecycleTracker::default();
+        let mut guard = TaskMutationFinalizationGuard::default();
+        guard
+            .observe(&task_result("task_create", false, "invalid trigger"))
+            .unwrap();
+        let pending = Some("Retry only the unresolved mutation".to_owned());
+        let applied = Some("Original accepted guidance".to_owned());
+        let reviews = std::collections::BTreeSet::from(["review-original".to_owned()]);
+        let terminal = std::collections::BTreeSet::from(["terminal-original".to_owned()]);
+        let mut context = execution_checkpoint_context_fixture();
+        context.window_index = context.payload.window.window_index;
+        context.payload.native_semantic_state = Some(
+            super::semantic_state::capture(
+                "turn_1",
+                &budget,
+                &controller,
+                &lifecycle,
+                &pending,
+                &applied,
+                &reviews,
+                &terminal,
+                &guard,
+                "Original post-turn summary",
+                &[],
+                &[],
+            )
+            .unwrap(),
+        );
+        let state = super::semantic_state::NativeSemanticState::restore(
+            Some(&context),
+            "workspace_1",
+            "thread_1",
+            "turn_1",
+            context.window_index + 1,
+            &budget,
+            false,
+        )
+        .unwrap();
+        assert_eq!(state.pending_retry_instruction, pending);
+        assert_eq!(state.applied_retry_instruction, applied);
+        assert_eq!(state.observed_review_required_signatures, reviews);
+        assert_eq!(state.observed_terminal_task_ids, terminal);
+        assert!(
+            state
+                .task_mutation_guard
+                .deterministic_failure_message()
+                .is_some()
+        );
+        assert_eq!(state.post_turn_assistant_text, "Original post-turn summary");
+        context.payload.workspace_id = "foreign".to_owned();
+        assert!(
+            super::semantic_state::NativeSemanticState::restore(
+                Some(&context),
+                "workspace_1",
+                "thread_1",
+                "turn_1",
+                2,
+                &budget,
+                false
+            )
+            .is_err()
+        );
+        context.payload.workspace_id = "workspace_1".to_owned();
+        context.payload.native_semantic_state.as_mut().unwrap()["schema_version"] =
+            serde_json::json!(2);
+        assert!(
+            super::semantic_state::NativeSemanticState::restore(
+                Some(&context),
+                "workspace_1",
+                "thread_1",
+                "turn_1",
+                2,
+                &budget,
+                false
+            )
+            .is_err()
+        );
+        context.payload.native_semantic_state = None;
+        assert!(
+            super::semantic_state::NativeSemanticState::restore(
+                Some(&context),
+                "workspace_1",
+                "thread_1",
+                "turn_1",
+                2,
+                &budget,
+                false
+            )
+            .is_err()
+        );
+        assert!(
+            super::semantic_state::NativeSemanticState::restore(
+                None,
+                "workspace_1",
+                "thread_1",
+                "turn_1",
+                1,
+                &budget,
+                false
+            )
+            .is_err()
+        );
+        let oversized = Some("界".repeat(32 * 1024));
+        assert!(
+            super::semantic_state::capture(
+                "turn_1",
+                &budget,
+                &controller,
+                &lifecycle,
+                &oversized,
+                &None,
+                &reviews,
+                &terminal,
+                &guard,
+                "",
+                &[],
+                &[]
+            )
+            .is_err()
+        );
     }
 
     fn temp_dir(name: &str) -> std::path::PathBuf {

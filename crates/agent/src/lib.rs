@@ -11,6 +11,14 @@ mod hooks;
 mod manager_recovery;
 mod native_initial;
 pub use native_initial::{NativeInitialPreparation, NativeInitialResumeRequirements};
+
+/// Read-only structural proof; actual restore still revalidates all authority.
+pub fn native_semantic_checkpoint_compatible(
+    payload: &pioneer_protocol::ExecutionCheckpointPayload,
+    accepted_budget: &pioneer_tools::ToolRetryBudgetConfig,
+) -> bool {
+    chat::semantic_state::checkpoint_compatible(payload, accepted_budget)
+}
 #[cfg(test)]
 mod manager_tests;
 pub mod post_turn;

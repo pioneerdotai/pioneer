@@ -39,6 +39,7 @@ pub(crate) struct AcceptedNativeInitialOutputs {
 pub struct NativeInitialResumeRequirements {
     pub native_agent_action_contract: Option<String>,
     pub mcp_projection: Option<(String, usize)>,
+    pub tool_retry_budget: pioneer_tools::ToolRetryBudgetConfig,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -218,6 +219,7 @@ impl NativeInitialPreparation {
             .iter()
             .any(|e| e.domain.as_str() == "mcp");
         Ok(Some(NativeInitialResumeRequirements {
+            tool_retry_budget: outputs.config.retry.clone(),
             native_agent_action_contract: has_turn_owner
                 .then_some(outputs.native_agent_action_contract)
                 .flatten(),
