@@ -235,6 +235,41 @@ async fn completion_live_delivery(
         .unwrap()
 }
 
+async fn deliver_completion_live(
+    processor: &MessageProcessor,
+    store: &CrudStore,
+    turn_id: &str,
+) -> pioneer_crud::ClaimedTurnEventDeliveryRecord {
+    let completion = completion_live_delivery(store, turn_id).await;
+    let now = std::cmp::max(completion.next_run_at.timestamp(), now_timestamp_secs());
+    // Each claim admits only the eligible causal head for a Turn. Deliver its
+    // predecessors through the real consumer before claiming the completion.
+    for _ in 0..64 {
+        let deliveries = processor
+            .crud_store
+            .claim_due_turn_event_deliveries(pioneer_crud::NATIVE_TURN_EVENT_LIVE_CONSUMER, now, 64)
+            .await
+            .unwrap();
+        assert!(
+            !deliveries.is_empty(),
+            "completion delivery must have an eligible causal head"
+        );
+        let mut completion_claim = None;
+        for delivery in deliveries {
+            if delivery.id == completion.id {
+                completion_claim = Some(delivery.clone());
+            }
+            processor
+                .process_claimed_native_turn_event_delivery(delivery)
+                .await;
+        }
+        if let Some(claim) = completion_claim {
+            return claim;
+        }
+    }
+    panic!("completion must be reached within the fixture's bounded delivery batch");
+}
+
 async fn cancel(
     processor: &MessageProcessor,
     connection: ConnectionId,
@@ -837,10 +872,7 @@ async fn exercise(kind: TurnExecutorKind, scenario: Scenario, delivery_before_ro
             }
             if delivery_before_rollback {
                 assert!(projected_before_ack);
-                delivery_processor
-                    .process_due_native_turn_event_deliveries(now_timestamp_secs(), 64)
-                    .await
-                    .unwrap();
+                let _ = deliver_completion_live(&delivery_processor, &store, turn).await;
                 let delivery = completion_live_delivery(&store, turn).await;
                 assert_eq!(
                     delivery.status, "failed",
@@ -871,17 +903,27 @@ async fn exercise(kind: TurnExecutorKind, scenario: Scenario, delivery_before_ro
         })
         .await
         .unwrap();
-        let mut saw_error = false;
+        let mut saw_response = false;
         let mut saw_snapshot = false;
-        while !saw_error || (projected_before_ack && !saw_snapshot) {
+        while !saw_response || (projected_before_ack && !saw_snapshot) {
             let payload = recv_text_timeout(&mut rx, Duration::from_secs(10)).await;
             let value: JsonValue = serde_json::from_str(&payload).unwrap();
             if value.get("id").and_then(JsonValue::as_str) == Some(&id) {
-                assert!(
-                    value.get("error").is_some(),
-                    "losing cancellation must report failure"
-                );
-                saw_error = true;
+                if projected_before_ack {
+                    // The rollback boundary has synchronized accepted Completed.
+                    // turn/cancel idempotently returns that existing outcome.
+                    let response: TurnCancelResponse =
+                        serde_json::from_value(value["result"].clone()).unwrap();
+                    assert_eq!(response.workspace_id, workspace);
+                    assert_eq!(response.thread_id, thread);
+                    assert_eq!(response.turn, completed);
+                } else {
+                    assert!(
+                        value.get("error").is_some(),
+                        "unprojected completion leaves cancellation rejected"
+                    );
+                }
+                saw_response = true;
             } else {
                 saw_snapshot |= apply_completion_notification(&client, value, &completed);
             }
@@ -904,10 +946,7 @@ async fn exercise(kind: TurnExecutorKind, scenario: Scenario, delivery_before_ro
         if !projected_before_ack {
             // Live delivery can precede aggregate projection. Keep its real
             // obligation until it can synchronize the rolled-back control state.
-            delivery_processor
-                .process_due_native_turn_event_deliveries(now_timestamp_secs(), 64)
-                .await
-                .unwrap();
+            let _ = deliver_completion_live(&delivery_processor, &store, turn).await;
             let delivery = completion_live_delivery(&store, turn).await;
             assert_eq!(delivery.status, "failed");
             assert!(delivery.delivered_at.is_none());
@@ -936,29 +975,7 @@ async fn exercise(kind: TurnExecutorKind, scenario: Scenario, delivery_before_ro
         );
         // Drive the existing outbox using its recorded deadline. This also
         // retries a delivery which encountered provisional Interrupted earlier.
-        let delivery = completion_live_delivery(&store, turn).await;
-        let deliveries = delivery_processor
-            .crud_store
-            .claim_due_turn_event_deliveries(
-                pioneer_crud::NATIVE_TURN_EVENT_LIVE_CONSUMER,
-                std::cmp::max(delivery.next_run_at.timestamp(), now_timestamp_secs()),
-                64,
-            )
-            .await
-            .unwrap();
-        let mut completion_delivery = None;
-        for delivery in deliveries {
-            if matches!(&delivery.event.payload, pioneer_crud::CanonicalTurnEventPayload::TurnCompleted(n)
-                if n.turn.id == turn)
-            {
-                completion_delivery = Some(delivery.clone());
-            }
-            delivery_processor
-                .process_claimed_native_turn_event_delivery(delivery)
-                .await;
-        }
-        let completion_delivery =
-            completion_delivery.expect("canonical completion must be claimable");
+        let completion_delivery = deliver_completion_live(&delivery_processor, &store, turn).await;
         let mut saw_completed = false;
         while !saw_completed || !saw_snapshot {
             let payload = recv_text_timeout(&mut rx, Duration::from_secs(10)).await;
