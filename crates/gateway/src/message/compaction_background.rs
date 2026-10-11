@@ -564,6 +564,7 @@ impl MessageProcessor {
                 Some(captured.deadline_ms),
                 captured.target_output_cap,
                 captured.fixed_input_tokens,
+                None,
                 suspending,
                 None,
                 diagnostic,
