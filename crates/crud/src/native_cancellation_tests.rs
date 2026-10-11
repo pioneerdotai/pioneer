@@ -2636,7 +2636,7 @@ async fn native_recovery_pre_start_and_refusal_share_attempt_owner_and_terminal_
                     workspace_id: plan.workspace_id.clone(),
                     executor_kind: kind,
                     executor_key: Some("test-provider".into()),
-                    status: TurnExecutionStatus::Recovering,
+                    status: TurnExecutionStatus::Running,
                     owner_id: OWNER.into(),
                     lease_until: unix_to_datetime(NOW + 100),
                     created_at: unix_to_datetime(NOW),
@@ -2644,7 +2644,18 @@ async fn native_recovery_pre_start_and_refusal_share_attempt_owner_and_terminal_
             )
             .await
             .unwrap();
+            assert!(
+                repositories::turn_execution::mark_recovering_owned(
+                    &store.connection,
+                    &turn.id,
+                    OWNER,
+                    unix_to_datetime(NOW),
+                )
+                .await
+                .unwrap()
+            );
             let execution = store.get_turn_execution(&turn.id).await.unwrap().unwrap();
+            assert_eq!(execution.status, TurnExecutionStatus::Recovering);
             let job = store
                 .enqueue_recovery_job(
                     turn.id.clone(),
