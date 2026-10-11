@@ -53,7 +53,8 @@ impl MemoryActiveRecallPlannerFallbackPolicy {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MemoryActiveRecallPlannerConfig {
     pub enabled: bool,
     pub timeout_ms: u64,
@@ -86,7 +87,8 @@ impl MemoryActiveRecallPlannerConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MemoryActiveRecallConfig {
     pub mode: MemoryActiveRecallMode,
     pub timeout_ms: u64,
@@ -122,7 +124,8 @@ impl MemoryActiveRecallConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MemoryPostTurnExtractorConfig {
     pub enabled: bool,
     pub provider_enabled: bool,
@@ -184,7 +187,8 @@ impl MemoryPostTurnExtractorConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MemoryLoopConfig {
     pub deterministic_recall_enabled: bool,
     pub tools_enabled: bool,

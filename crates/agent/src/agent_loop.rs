@@ -371,6 +371,7 @@ pub(super) async fn run_agent_loop(
                 provider_name,
                 azure_connection,
                 provider_model_contract,
+                initial_preparation,
                 reasoning,
                 workspace_skill_policies,
                 skill_catalog,
@@ -394,7 +395,7 @@ pub(super) async fn run_agent_loop(
                     continue;
                 }
 
-                let runtime_snapshot = runtime_dependencies.snapshot().await;
+                let mut runtime_snapshot = runtime_dependencies.snapshot().await;
 
                 let execution_window_index = execution_checkpoint_context
                     .as_ref()
@@ -414,6 +415,7 @@ pub(super) async fn run_agent_loop(
                     provider_name: provider_name.clone(),
                     azure_connection,
                     provider_model_contract,
+                    initial_preparation,
                     reasoning,
                     workspace_skill_policies,
                     skill_catalog,
@@ -449,6 +451,11 @@ pub(super) async fn run_agent_loop(
                     }
                 };
 
+                if let Some(initial) = &turn_request.initial_preparation
+                    && let Some(config) = initial.frozen_config().await
+                {
+                    runtime_snapshot.tool_loop_config = config;
+                }
                 if turn_request.provider_model_contract.is_none() {
                     turn_request.provider_model_contract =
                         match provider.capture_model_contract(&turn_request.model) {
@@ -456,6 +463,38 @@ pub(super) async fn run_agent_loop(
                             Err(_) => {
                                 let _ = ack.send(Err(AgentStartError::Internal(
                                     "native model contract cannot be captured".to_owned(),
+                                )));
+                                continue;
+                            }
+                        };
+                }
+                if turn_request.initial_preparation.is_none() {
+                    if turn_request.execution_checkpoint_context.is_some() {
+                        let _ = ack.send(Err(AgentStartError::Internal(
+                            "native continuation initial preparation is unavailable".to_owned(),
+                        )));
+                        continue;
+                    }
+                    turn_request.initial_preparation =
+                        match super::NativeInitialPreparation::new_admission_json(
+                            &workspace_id,
+                            &thread_id,
+                            &turn_id,
+                            pioneer_protocol::TURN_EXECUTION_REQUEST_MAX_BYTES,
+                        )
+                        .and_then(|json| {
+                            super::NativeInitialPreparation::restore(
+                                &json,
+                                &workspace_id,
+                                &thread_id,
+                                &turn_id,
+                                pioneer_protocol::TURN_EXECUTION_REQUEST_MAX_BYTES,
+                            )
+                        }) {
+                            Ok(initial) => Some(initial),
+                            Err(_) => {
+                                let _ = ack.send(Err(AgentStartError::Internal(
+                                    "native initial preparation cannot be captured".to_owned(),
                                 )));
                                 continue;
                             }
@@ -1480,7 +1519,7 @@ pub(super) async fn run_agent_loop(
                     continue;
                 }
 
-                let runtime_snapshot = runtime_dependencies.snapshot().await;
+                let mut runtime_snapshot = runtime_dependencies.snapshot().await;
 
                 let mut active_request = ActiveTurnRequest {
                     turn_id: turn_request.turn_id.clone(),
@@ -1491,6 +1530,7 @@ pub(super) async fn run_agent_loop(
                     provider_name: turn_request.provider_name,
                     azure_connection: turn_request.azure_connection,
                     provider_model_contract: turn_request.provider_model_contract,
+                    initial_preparation: turn_request.initial_preparation,
                     reasoning: turn_request.reasoning,
                     workspace_skill_policies: turn_request.workspace_skill_policies,
                     skill_catalog: turn_request.skill_catalog,
@@ -1508,6 +1548,11 @@ pub(super) async fn run_agent_loop(
                     execution_security_snapshot: turn_request.execution_security_snapshot,
                 };
 
+                if let Some(initial) = &active_request.initial_preparation
+                    && let Some(config) = initial.frozen_config().await
+                {
+                    runtime_snapshot.tool_loop_config = config;
+                }
                 super::apply_recovery_adjustments(&mut active_request, &recovery_request);
                 if let Some(error) = recovery_execution_window_admission_error(
                     &active_request,
@@ -1709,7 +1754,7 @@ fn spawn_turn_task(
 
         let NativeTurnRuntimeSnapshot {
             context_controller,
-            generation: _,
+            generation,
             tool_loop_config,
             mcp_tool_provider,
             turn_tool_provider,
@@ -1775,6 +1820,8 @@ fn spawn_turn_task(
             turn_request.execution_options.disable_tool_calling,
             turn_request.execution_options.continue_generation_hint,
             tool_loop_config,
+            turn_request.initial_preparation,
+            generation,
             mcp_tool_provider,
             turn_tool_provider,
             turn_finalization_provider,
@@ -1930,6 +1977,8 @@ async fn execute_turn_flow(
     disable_tool_calling: bool,
     continue_generation_hint: bool,
     tool_loop_config: ToolLoopConfig,
+    initial_preparation: Option<super::NativeInitialPreparation>,
+    runtime_generation: u64,
     mcp_tool_provider: Option<Arc<dyn AgentMcpToolProvider>>,
     turn_tool_provider: Option<Arc<dyn TurnToolProvider>>,
     turn_finalization_provider: Option<Arc<dyn TurnFinalizationProvider>>,
@@ -1988,6 +2037,8 @@ async fn execute_turn_flow(
                     disable_tool_calling,
                     continue_generation_hint,
                     tool_loop_config,
+                    initial_preparation,
+                    runtime_generation,
                     mcp_tool_provider,
                     turn_tool_provider,
                     turn_finalization_provider,
@@ -2049,6 +2100,7 @@ enum LoopDurableCommitOutcome {
 fn loop_durable_event_kind(event: &AgentDurableEvent) -> &'static str {
     match event {
         AgentDurableEvent::ToolOutputRecorded { .. } => "tool_output_recorded",
+        AgentDurableEvent::NativeInitialPhaseAdvanced { .. } => "native_initial_phase_advanced",
         AgentDurableEvent::PromptManifestCompiled { .. } => "prompt_manifest_compiled",
         AgentDurableEvent::TurnSkillsResolved { .. } => "turn_skills_resolved",
         AgentDurableEvent::TurnCapabilitiesResolved { .. } => "turn_capabilities_resolved",

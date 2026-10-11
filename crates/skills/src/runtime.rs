@@ -394,7 +394,7 @@ impl std::fmt::Display for AgentSkillOverlayError {
 
 impl std::error::Error for AgentSkillOverlayError {}
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum RuntimeToolExcludedReason {
     DynamicToolsDisabled,
     DisabledByConfig,
@@ -405,7 +405,7 @@ pub enum RuntimeToolExcludedReason {
     MaxDynamicToolsPerSkill,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ExcludedRuntimeTool {
     pub skill_id: SkillId,
     pub skill_slug: String,
@@ -413,7 +413,7 @@ pub struct ExcludedRuntimeTool {
     pub reason: RuntimeToolExcludedReason,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SkillRuntimePlan {
     pub tools: Vec<SkillRuntimeDescriptor>,
     pub read_skill_index: HashMap<String, ReadSkillEntry>,

@@ -302,7 +302,7 @@ pub(crate) struct TurnPreflightOrchestratorResult {
     pub plan: TurnPreflightPlan,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct PreflightBudgetUsage {
     pub attempts: u32,
     pub known_tokens: u64,

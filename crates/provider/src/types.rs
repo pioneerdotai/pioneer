@@ -231,7 +231,8 @@ pub struct ProviderInputCapabilities {
     pub video: InputTypeSupport,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProviderTimeoutPolicy {
     pub connect_timeout: Duration,
     pub first_chunk_timeout: Duration,

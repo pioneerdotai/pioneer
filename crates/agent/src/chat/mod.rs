@@ -24,11 +24,10 @@ use crate::hooks::{
     AgentTurnPostTurnSummary, EffectiveTurnPolicySet, EffectiveTurnPromptContextSet,
     EffectiveTurnPromptManifestHookContributionKind, EffectiveTurnPromptManifestHookDiagnosticCode,
     EffectiveTurnPromptManifestHookMetadata, EffectiveTurnPromptManifestHookSource,
-    EffectiveTurnPromptSectionSet, run_agent_turn_policy_hook_phase,
-    run_agent_turn_post_preflight_prompt_context_hook_phase,
+    EffectiveTurnPromptSectionSet, run_agent_turn_notification_hook_phase,
+    run_agent_turn_policy_hook_phase, run_agent_turn_post_preflight_prompt_context_hook_phase,
     run_agent_turn_prompt_compile_hook_phase, run_agent_turn_prompt_context_hook_phase,
-    run_agent_turn_tool_materialization_hook_phase, run_noop_agent_turn_hook_phase,
-    tool_bundle_contributions_from_bundles,
+    run_agent_turn_tool_materialization_hook_phase, tool_bundle_contributions_from_bundles,
 };
 use crate::{
     AgentEventHub, AgentEventHubError, AgentMcpAvailability, AgentMcpMaterialization,
@@ -2296,6 +2295,7 @@ fn preflight_active_recall_prompt_context_input(
     )
 }
 
+#[cfg(test)]
 fn compile_agent_instruction_delivery_plan_with_prompt_root(
     prompt_root: &std::path::Path,
     skills_prompt: Option<String>,
@@ -2309,8 +2309,36 @@ fn compile_agent_instruction_delivery_plan_with_prompt_root(
     thread_id: &str,
     turn_id: &str,
 ) -> Result<CompiledInstructionDeliveryPlan, ChatTurnError> {
-    let now = Local::now();
+    compile_agent_instruction_delivery_plan_with_captured_clock(
+        prompt_root,
+        skills_prompt,
+        retry_instruction,
+        runtime_sections,
+        permission_profile,
+        include_task_orchestration_policy,
+        include_request_tools_catalog,
+        continue_generation_hint,
+        initiating_thread_id,
+        thread_id,
+        turn_id,
+        &Local::now().fixed_offset(),
+    )
+}
 
+fn compile_agent_instruction_delivery_plan_with_captured_clock(
+    prompt_root: &std::path::Path,
+    skills_prompt: Option<String>,
+    retry_instruction: Option<String>,
+    runtime_sections: &[PromptRuntimeSectionInput],
+    permission_profile: &TurnPermissionProfileSnapshot,
+    include_task_orchestration_policy: bool,
+    include_request_tools_catalog: bool,
+    continue_generation_hint: bool,
+    initiating_thread_id: Option<&str>,
+    thread_id: &str,
+    turn_id: &str,
+    now: &chrono::DateTime<chrono::FixedOffset>,
+) -> Result<CompiledInstructionDeliveryPlan, ChatTurnError> {
     let extra_system = format!(
         "## Runtime\n{}\nCurrent date/time: {} ({})\nOS: {}",
         pioneer_promt::render_thread_ids(initiating_thread_id, thread_id),
@@ -2721,6 +2749,8 @@ pub(super) async fn execute_chat_turn_flow(
     disable_tool_calling: bool,
     continue_generation_hint: bool,
     tool_loop_config: ToolLoopConfig,
+    initial_preparation: Option<crate::NativeInitialPreparation>,
+    runtime_generation: u64,
     mcp_tool_provider: Option<Arc<dyn AgentMcpToolProvider>>,
     turn_tool_provider: Option<Arc<dyn TurnToolProvider>>,
     turn_finalization_provider: Option<Arc<dyn TurnFinalizationProvider>>,
@@ -2817,6 +2847,8 @@ pub(super) async fn execute_chat_turn_flow(
                 disable_tool_calling,
                 continue_generation_hint,
                 tool_loop_config,
+                initial_preparation,
+                runtime_generation,
                 mcp_tool_provider,
                 turn_tool_provider,
                 turn_finalization_provider,
@@ -3521,18 +3553,17 @@ fn workdir_from_execution_security_snapshot(
 /// Completed initial outputs are distinct from per-window runtime handles.
 /// Initial phases end at this boundary before provider rounds begin; durable
 /// restoration binds their outputs separately from the ephemeral event receiver.
+#[derive(Clone)]
+pub(crate) struct WarmNativeInitialTools {
+    bundles: Vec<pioneer_tools::ToolExtensionBundle>,
+    skills: Option<Arc<skill_tools::SkillToolMaterialization>>,
+}
+
 struct PreparedNativeInitialTurn {
-    effective_policy_set: EffectiveTurnPolicySet,
-    effective_prompt_context_set: EffectiveTurnPromptContextSet,
-    effective_prompt_section_set: EffectiveTurnPromptSectionSet,
-    initial_instruction_plan: CompiledInstructionDeliveryPlan,
-    capability_diagnostics: Vec<PromptManifestDiagnostic>,
-    skill_runtime_plan: pioneer_skills::SkillRuntimePlan,
+    outputs: crate::native_initial::AcceptedNativeInitialOutputs,
+    extension_bundles: Vec<pioneer_tools::ToolExtensionBundle>,
     skill_tool_materialization: Option<Arc<skill_tools::SkillToolMaterialization>>,
     tools: Option<pioneer_tools::BuiltinTools>,
-    visible_tool_names: Vec<String>,
-    requested_tool_names: Vec<String>,
-    preflight_usage: preflight::PreflightBudgetUsage,
 }
 
 async fn prepare_native_initial_turn(
@@ -3568,6 +3599,7 @@ async fn prepare_native_initial_turn(
     thread_id: &str,
     turn_id: &str,
     event_tx: &Arc<AgentEventHub>,
+    admission_clock: &chrono::DateTime<chrono::FixedOffset>,
 ) -> Result<PreparedNativeInitialTurn, ChatTurnError> {
     let workdir = workdir_from_execution_security_snapshot(execution_security_snapshot)?;
     let filesystem_prompt_snapshot = execution_security_snapshot.cloned();
@@ -3901,7 +3933,7 @@ async fn prepare_native_initial_turn(
             .await?;
         }
 
-        let _effective_tool_bundle_set = run_agent_turn_tool_materialization_hook_phase(
+        let effective_tool_bundle_set = run_agent_turn_tool_materialization_hook_phase(
             hook_runtime,
             hook_context,
             &effective_policy_set,
@@ -3920,6 +3952,12 @@ async fn prepare_native_initial_turn(
             );
             ChatTurnError::Terminal("turn tool materialization hook failed".to_owned())
         })?;
+
+        if !effective_tool_bundle_set.bundles().is_empty() {
+            return Err(ChatTurnError::Blocked(
+                "accepted hook tools require native tool calling".to_owned(),
+            ));
+        }
 
         let turn_preflight = run_agent_turn_preflight_stage(
             event_tx.clone(),
@@ -4006,7 +4044,7 @@ async fn prepare_native_initial_turn(
             filesystem_prompt_snapshot.as_ref(),
         )?;
 
-        let initial_instruction_plan = compile_agent_instruction_delivery_plan_with_prompt_root(
+        let initial_instruction_plan = compile_agent_instruction_delivery_plan_with_captured_clock(
             tool_loop_config.computer_use.runtime_home_dir.as_path(),
             skills_prompt.clone(),
             None,
@@ -4018,16 +4056,18 @@ async fn prepare_native_initial_turn(
             turn_tool_materialization.initiating_thread_id.as_deref(),
             thread_id,
             turn_id,
+            admission_clock,
         )?;
 
-        run_noop_agent_turn_hook_phase(
+        run_agent_turn_notification_hook_phase(
             hook_runtime,
             hook_context,
             HookPhase::TurnPostPromptCompile,
             &effective_policy_set,
             &effective_prompt_context_set,
         )
-        .await;
+        .await
+        .map_err(|_| ChatTurnError::Terminal("required post-prompt hook failed".to_owned()))?;
 
         emit_durable_event(
             event_tx.as_ref(),
@@ -4047,17 +4087,27 @@ async fn prepare_native_initial_turn(
         .await?;
 
         return Ok(PreparedNativeInitialTurn {
-            effective_policy_set,
-            effective_prompt_context_set,
-            effective_prompt_section_set,
-            initial_instruction_plan,
-            capability_diagnostics,
-            skill_runtime_plan: skills_resolution.runtime_plan,
+            outputs: crate::native_initial::AcceptedNativeInitialOutputs {
+                policy: effective_policy_set,
+                prompt_context: effective_prompt_context_set,
+                prompt_sections: effective_prompt_section_set,
+                instructions: initial_instruction_plan,
+                capability_diagnostics,
+                skill_plan: skills_resolution.runtime_plan,
+                tool_metadata: effective_tool_bundle_set.metadata().clone(),
+                extension_specs: Vec::new(),
+                provider_tool_calling,
+                initiating_thread_id: turn_tool_materialization.initiating_thread_id,
+                visible_tools: Vec::new(),
+                core_tools: Vec::new(),
+                selected_optional_tools: Vec::new(),
+                requested_tools: Vec::new(),
+                preflight_usage: turn_preflight.usage,
+                config: tool_loop_config.clone(),
+            },
+            extension_bundles: Vec::new(),
             skill_tool_materialization: None,
             tools: None,
-            visible_tool_names: Vec::new(),
-            requested_tool_names: Vec::new(),
-            preflight_usage: turn_preflight.usage,
         });
     }
 
@@ -4130,6 +4180,13 @@ async fn prepare_native_initial_turn(
         ChatTurnError::Terminal("turn tool materialization hook failed".to_owned())
     })?;
 
+    let extension_specs =
+        crate::native_initial::checked_extension_specs(effective_tool_bundle_set.bundles())
+            .map_err(|_| {
+                ChatTurnError::Blocked(
+                    "accepted initial tool catalog exceeds execution allowance".to_owned(),
+                )
+            })?;
     let extension_bundles = effective_tool_bundle_set.bundles().to_vec();
 
     let permission_context = PermissionEvaluationContext::for_turn(
@@ -4145,7 +4202,7 @@ async fn prepare_native_initial_turn(
         permission_context.clone(),
         tool_loop_config.web.clone(),
         tool_loop_config.computer_use.clone(),
-        extension_bundles,
+        extension_bundles.clone(),
         runtime_environment,
         execution_security_snapshot.cloned(),
     )
@@ -4352,7 +4409,7 @@ async fn prepare_native_initial_turn(
         filesystem_prompt_snapshot.as_ref(),
     )?;
 
-    let initial_instruction_plan = compile_agent_instruction_delivery_plan_with_prompt_root(
+    let initial_instruction_plan = compile_agent_instruction_delivery_plan_with_captured_clock(
         tool_loop_config.computer_use.runtime_home_dir.as_path(),
         skills_prompt.clone(),
         None,
@@ -4364,16 +4421,18 @@ async fn prepare_native_initial_turn(
         turn_tool_materialization.initiating_thread_id.as_deref(),
         thread_id,
         turn_id,
+        admission_clock,
     )?;
 
-    run_noop_agent_turn_hook_phase(
+    run_agent_turn_notification_hook_phase(
         hook_runtime,
         hook_context,
         HookPhase::TurnPostPromptCompile,
         &effective_policy_set,
         &effective_prompt_context_set,
     )
-    .await;
+    .await
+    .map_err(|_| ChatTurnError::Terminal("required post-prompt hook failed".to_owned()))?;
 
     emit_durable_event(
         event_tx.as_ref(),
@@ -4393,17 +4452,92 @@ async fn prepare_native_initial_turn(
     .await?;
 
     Ok(PreparedNativeInitialTurn {
-        effective_policy_set,
-        effective_prompt_context_set,
-        effective_prompt_section_set,
-        initial_instruction_plan,
-        capability_diagnostics,
-        skill_runtime_plan: skills_resolution.runtime_plan,
+        outputs: crate::native_initial::AcceptedNativeInitialOutputs {
+            policy: effective_policy_set,
+            prompt_context: effective_prompt_context_set,
+            prompt_sections: effective_prompt_section_set,
+            instructions: initial_instruction_plan,
+            capability_diagnostics,
+            skill_plan: skills_resolution.runtime_plan,
+            tool_metadata: effective_tool_bundle_set.metadata().clone(),
+            extension_specs,
+            provider_tool_calling,
+            initiating_thread_id: turn_tool_materialization.initiating_thread_id,
+            visible_tools: initial_visibility.visible_tools,
+            core_tools: turn_preflight.local_modules.tools.input.core_tools.clone(),
+            selected_optional_tools: turn_preflight.plan.tools.visible_tools.clone(),
+            requested_tools: requested_tool_names,
+            preflight_usage: turn_preflight.usage,
+            config: tool_loop_config.clone(),
+        },
+        extension_bundles,
         skill_tool_materialization: Some(skill_tool_materialization),
         tools: Some(tools),
-        visible_tool_names: initial_visibility.visible_tools,
-        requested_tool_names,
-        preflight_usage: turn_preflight.usage,
+    })
+}
+
+async fn restore_prepared_native_initial_turn(
+    outputs: &crate::native_initial::AcceptedNativeInitialOutputs,
+    warm: Option<&WarmNativeInitialTools>,
+    runtime_environment: &HashMap<String, String>,
+    permission_profile: &TurnPermissionProfileSnapshot,
+    security_snapshot: Option<&TurnExecutionSecuritySnapshot>,
+    approval_broker: Arc<dyn PermissionApprovalBroker>,
+    native_files: &NativeFileToolCapability,
+    workspace_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+) -> Result<PreparedNativeInitialTurn, ChatTurnError> {
+    if !outputs.provider_tool_calling {
+        return Ok(PreparedNativeInitialTurn {
+            outputs: outputs.clone(),
+            extension_bundles: Vec::new(),
+            skill_tool_materialization: None,
+            tools: None,
+        });
+    }
+    let warm = warm.ok_or_else(|| {
+        ChatTurnError::Blocked(
+            "committed initial tools require their concrete cold restore owners".to_owned(),
+        )
+    })?;
+    let workdir = workdir_from_execution_security_snapshot(security_snapshot)?;
+    let tools = build_tools_with_environment_and_security_snapshot(
+        workdir,
+        turn_id.to_owned(),
+        PermissionEvaluationContext::for_turn(
+            workspace_id,
+            thread_id,
+            turn_id,
+            permission_profile.clone(),
+        ),
+        outputs.config.web.clone(),
+        outputs.config.computer_use.clone(),
+        warm.bundles.clone(),
+        runtime_environment
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect::<BTreeMap<_, _>>(),
+        security_snapshot.cloned(),
+    )
+    .map_err(|_| ChatTurnError::Blocked("accepted tool runtime cannot be restored".to_owned()))?
+    .with_permission_approval_broker(approval_broker);
+    tools
+        .router
+        .set_blocked_tool_names(native_file_tool_blocked_names(native_files));
+    tools
+        .router
+        .set_native_patch_wire_shape(native_files.patch_shape);
+    if let Some(skills) = &warm.skills {
+        skills
+            .bind_function_proxy_runtime(tools.router.clone(), tools.runtime.clone())
+            .await;
+    }
+    Ok(PreparedNativeInitialTurn {
+        outputs: outputs.clone(),
+        extension_bundles: warm.bundles.clone(),
+        skill_tool_materialization: warm.skills.clone(),
+        tools: Some(tools),
     })
 }
 
@@ -4433,6 +4567,8 @@ async fn execute_agent_provider_response(
     disable_tool_calling: bool,
     continue_generation_hint: bool,
     tool_loop_config: ToolLoopConfig,
+    initial_preparation: Option<crate::NativeInitialPreparation>,
+    runtime_generation: u64,
     mcp_tool_provider: Option<Arc<dyn AgentMcpToolProvider>>,
     turn_tool_provider: Option<Arc<dyn TurnToolProvider>>,
     turn_finalization_provider: Option<Arc<dyn TurnFinalizationProvider>>,
@@ -4488,54 +4624,205 @@ async fn execute_agent_provider_response(
     );
     let user_input_text = user_message.text_content_lossy();
 
+    use crate::native_initial::{AcceptedNativeInitialOutputs, InitialPhase};
+    let initial_preparation = initial_preparation.ok_or_else(|| {
+        ChatTurnError::Blocked("native initial preparation owner unavailable".to_owned())
+    })?;
+    let mut initial = initial_preparation.inner.lock().await;
+    let reused_initial = matches!(initial.snapshot.state, InitialPhase::Completed { .. });
+    let prepared = match &initial.snapshot.state {
+        InitialPhase::Preparing => {
+            return Err(ChatTurnError::Blocked(
+                "initial preparation was interrupted before committed outputs; outcome is unknown"
+                    .to_owned(),
+            ));
+        }
+        InitialPhase::Completed { outputs } => {
+            if outputs.provider_tool_calling != provider_tool_calling {
+                return Err(ChatTurnError::Blocked(
+                    "accepted initial tool contract differs".to_owned(),
+                ));
+            }
+            restore_prepared_native_initial_turn(
+                outputs,
+                initial.warm_tools.as_ref(),
+                &runtime_environment,
+                &permission_profile,
+                execution_security_snapshot.as_ref(),
+                permission_approval_broker.clone(),
+                &native_file_tool_capability,
+                workspace_id,
+                thread_id,
+                turn_id,
+            )
+            .await?
+        }
+        InitialPhase::NotStarted => {
+            if execution_window_index != 1 || execution_checkpoint_context.is_some() {
+                return Err(ChatTurnError::Blocked(
+                    "native continuation initial outputs were not committed".to_owned(),
+                ));
+            }
+            let previous_digest = crate::native_initial::digest(&initial.encoded);
+            initial.snapshot.state = InitialPhase::Preparing;
+            let preparing = crate::native_initial::encode(&initial.snapshot, initial.byte_budget)
+                .map_err(|_| {
+                ChatTurnError::Blocked(
+                    "native initial preparation exceeds snapshot allowance".to_owned(),
+                )
+            })?;
+            initial.encoded = preparing.clone();
+            emit_durable_event(
+                event_tx.as_ref(),
+                AgentDurableEvent::NativeInitialPhaseAdvanced {
+                    preparation: pioneer_protocol::NativeInitialPhaseAdvance {
+                        execution_owner_generation: initial_preparation
+                            .execution_owner_generation(),
+                        workspace_id: workspace_id.to_owned(),
+                        thread_id: thread_id.to_owned(),
+                        turn_id: turn_id.to_owned(),
+                        window_index: execution_window_index,
+                        runtime_generation,
+                        expected_sha256: previous_digest,
+                        initial_phase_json: preparing,
+                    },
+                },
+            )
+            .await?;
+            let prepared = prepare_native_initial_turn(
+                provider_registry,
+                provider,
+                model.as_str(),
+                &hook_context,
+                &hook_runtime_context,
+                user_input_text,
+                input,
+                capabilities,
+                workspace_skill_policies,
+                skill_catalog,
+                agent_skill_overlay,
+                runtime_environment.clone(),
+                history.as_slice(),
+                execution_window_index,
+                execution_checkpoint_context.as_ref(),
+                &permission_profile,
+                execution_security_snapshot.as_ref(),
+                continue_generation_hint,
+                &tool_loop_config,
+                provider_tool_calling,
+                native_file_tool_capability.clone(),
+                mcp_tool_provider.as_ref(),
+                turn_tool_provider.as_ref(),
+                task_tool_provider.as_ref(),
+                hook_runtime.as_ref(),
+                tool_bundle_artifacts.as_ref(),
+                permission_approval_broker.clone(),
+                recovery.is_some(),
+                workspace_id,
+                thread_id,
+                turn_id,
+                &event_tx,
+                &initial.snapshot.admission_clock,
+            )
+            .await?;
+
+            let PreparedNativeInitialTurn {
+                outputs,
+                extension_bundles,
+                skill_tool_materialization,
+                tools,
+            } = prepared;
+            let mut completed = initial.snapshot.clone();
+            completed.state = InitialPhase::Completed {
+                outputs: Box::new(outputs),
+            };
+            let encoded =
+                crate::native_initial::encode(&completed, initial.byte_budget).map_err(|_| {
+                    ChatTurnError::Blocked(
+                        "native initial outputs exceed snapshot allowance".to_owned(),
+                    )
+                })?;
+            emit_durable_event(
+                event_tx.as_ref(),
+                AgentDurableEvent::NativeInitialPhaseAdvanced {
+                    preparation: pioneer_protocol::NativeInitialPhaseAdvance {
+                        execution_owner_generation: initial_preparation
+                            .execution_owner_generation(),
+                        workspace_id: workspace_id.to_owned(),
+                        thread_id: thread_id.to_owned(),
+                        turn_id: turn_id.to_owned(),
+                        window_index: execution_window_index,
+                        runtime_generation,
+                        expected_sha256: crate::native_initial::digest(&initial.encoded),
+                        initial_phase_json: encoded.clone(),
+                    },
+                },
+            )
+            .await?;
+            initial.snapshot = completed;
+            initial.encoded = encoded;
+            initial.warm_tools = Some(WarmNativeInitialTools {
+                bundles: extension_bundles.clone(),
+                skills: skill_tool_materialization.clone(),
+            });
+            let InitialPhase::Completed { outputs } = &initial.snapshot.state else {
+                unreachable!()
+            };
+            PreparedNativeInitialTurn {
+                outputs: outputs.as_ref().clone(),
+                extension_bundles,
+                skill_tool_materialization,
+                tools,
+            }
+        }
+    };
+    drop(initial);
     let PreparedNativeInitialTurn {
-        effective_policy_set,
-        effective_prompt_context_set,
-        effective_prompt_section_set,
-        initial_instruction_plan,
-        capability_diagnostics,
-        skill_runtime_plan,
-        skill_tool_materialization,
+        outputs,
         tools,
-        mut visible_tool_names,
-        mut requested_tool_names,
+        skill_tool_materialization,
+        ..
+    } = prepared;
+    let AcceptedNativeInitialOutputs {
+        policy: effective_policy_set,
+        prompt_context: effective_prompt_context_set,
+        prompt_sections: effective_prompt_section_set,
+        instructions: initial_instruction_plan,
+        capability_diagnostics,
+        skill_plan: skill_runtime_plan,
+        visible_tools: mut visible_tool_names,
+        core_tools,
+        selected_optional_tools,
+        requested_tools: mut requested_tool_names,
+        initiating_thread_id,
         preflight_usage,
-    } = prepare_native_initial_turn(
-        provider_registry,
-        provider,
-        model.as_str(),
-        &hook_context,
-        &hook_runtime_context,
-        user_input_text,
-        input,
-        capabilities,
-        workspace_skill_policies,
-        skill_catalog,
-        agent_skill_overlay,
-        runtime_environment,
-        history.as_slice(),
+        config: tool_loop_config,
+        ..
+    } = outputs;
+    // Durable provider-usage receipts already own completed preflight. A new
+    // window must not charge those attempts/tokens again.
+    let preflight_usage = if reused_initial && execution_window_index > 1 {
+        Default::default()
+    } else {
+        preflight_usage
+    };
+    window_stats.record_preflight(preflight_usage);
+    let continuation_sections = runtime_sections_with_execution_continuation_context(
+        &[],
         execution_window_index,
         execution_checkpoint_context.as_ref(),
-        &permission_profile,
-        execution_security_snapshot.as_ref(),
-        continue_generation_hint,
-        &tool_loop_config,
+        prior_visible_assistant_text_for_execution_continuation(&history).as_deref(),
+        initiating_thread_id.as_deref(),
+    );
+    let initial_instruction_plan = pioneer_promt::reproject_native_instruction_plan(
+        &initial_instruction_plan,
+        None,
         provider_tool_calling,
-        native_file_tool_capability.clone(),
-        mcp_tool_provider.as_ref(),
-        turn_tool_provider.as_ref(),
-        task_tool_provider.as_ref(),
-        hook_runtime.as_ref(),
-        tool_bundle_artifacts.as_ref(),
-        permission_approval_broker,
-        recovery.is_some(),
-        workspace_id,
-        thread_id,
-        turn_id,
-        &event_tx,
+        continuation_sections.first(),
     )
-    .await?;
-    window_stats.record_preflight(preflight_usage);
+    .map_err(|_| {
+        ChatTurnError::Blocked("native continuation instruction projection unavailable".to_owned())
+    })?;
 
     if !provider_tool_calling {
         let mut guard = ToolLoopGuard::new_execution_window_with_started_at(
@@ -4641,6 +4928,21 @@ async fn execute_agent_provider_response(
     })?;
     let runtime = tools.runtime.clone();
     let router = tools.router.clone();
+    if reused_initial {
+        requested_tool_names = restored_requested_tool_names(
+            execution_checkpoint_context.as_ref(),
+            workspace_id,
+            thread_id,
+            turn_id,
+        );
+        visible_tool_names = router
+            .compute_final_visible_tools(
+                &core_tools,
+                &selected_optional_tools,
+                &requested_tool_names,
+            )
+            .visible_tools;
+    }
     let runtime_tool_index = Arc::new(
         skill_runtime_plan
             .tools

@@ -5226,6 +5226,71 @@ impl CrudStore {
         Ok(accepted)
     }
 
+    /// The Gateway validates the concrete phase transition on its bounded
+    /// owned row. Here the single SQL write revalidates owner/context/window
+    /// and exact previous bytes, with no JSON work under database capacity.
+    pub async fn advance_native_initial_phase(
+        &self,
+        workspace_id: &str,
+        thread_id: &str,
+        turn_id: &str,
+        window_index: u32,
+        runtime_generation: u64,
+        execution_owner_id: &str,
+        expected_owner_generation: u64,
+        previous_json: &str,
+        next_json: &str,
+    ) -> Result<()> {
+        let owner = self
+            .get_turn_execution(turn_id)
+            .await?
+            .context("initial phase execution owner unavailable")?;
+        anyhow::ensure!(
+            owner.owner_id == execution_owner_id
+                && owner.owner_generation == expected_owner_generation
+                && owner.status.is_active(),
+            "initial phase execution owner changed"
+        );
+        let cancellation = self
+            .native_cancellation_context(turn_id)
+            .await?
+            .context("initial phase cancellation context unavailable")?;
+        anyhow::ensure!(
+            cancellation.preparation.runtime_generation == runtime_generation
+                && cancellation.preparation.workspace_id == workspace_id
+                && cancellation.preparation.thread_id == thread_id
+                && cancellation.accepted_event_id.is_none(),
+            "initial phase runtime generation changed"
+        );
+        let statement = turn_runtime_snapshot::prepare_initial_phase_update(
+            workspace_id,
+            thread_id,
+            turn_id,
+            window_index,
+            execution_owner_id,
+            expected_owner_generation,
+            &cancellation.context_sha256,
+            previous_json,
+            next_json,
+            chrono::Utc::now().fixed_offset(),
+        )?;
+        self.run_serialized_write(|| {
+            let statement = statement.clone();
+            async move {
+                anyhow::ensure!(
+                    self.connection
+                        .execute_raw(statement)
+                        .await?
+                        .rows_affected()
+                        == 1,
+                    "initial phase commit refused by immutable execution fence"
+                );
+                Ok(())
+            }
+        })
+        .await
+    }
+
     pub async fn get_turn_runtime_snapshot(
         &self,
         turn_id: &str,
@@ -41834,6 +41899,7 @@ mod tests {
                     .to_owned(),
             ),
             provider_model_contract_json: None,
+            initial_phase_json: None,
             ordinary_skill_catalog_json: Some(r#"{"schema_version":1,"catalog":{"version":0,"generated_at_unix":0,"skills":[]}}"#.into()),
             hook_runtime_context_json: r#"{"mode":"agent","actor_kind":"agent"}"#.to_owned(),
             workspace_skill_policies_json: "[]".to_owned(),
@@ -42030,6 +42096,7 @@ mod tests {
                     reasoning_effort: None,
                     agent_skill_versions_json: None,
                     provider_model_contract_json: None,
+                    initial_phase_json: None,
                     ordinary_skill_catalog_json: Some(r#"{"schema_version":1,"catalog":{"version":0,"generated_at_unix":0,"skills":[]}}"#.into()),
                     hook_runtime_context_json: r#"{"mode":"agent","actor_kind":"agent"}"#
                         .to_owned(),

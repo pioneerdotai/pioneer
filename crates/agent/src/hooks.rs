@@ -481,7 +481,8 @@ pub(super) fn build_post_turn_phase_request(
     )
 }
 
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct EffectiveTurnPolicySet {
     policies: HookPolicySet,
 }
@@ -500,7 +501,8 @@ impl EffectiveTurnPolicySet {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct EffectiveTurnPromptContextSet {
     contexts: HookPromptContextSet,
     manifest: EffectiveTurnPromptManifestHookMetadata,
@@ -538,7 +540,8 @@ impl EffectiveTurnPromptContextSet {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct EffectiveTurnPromptSectionSet {
     sections: HookPromptSectionSet,
     manifest: EffectiveTurnPromptManifestHookMetadata,
@@ -565,7 +568,8 @@ impl EffectiveTurnPromptSectionSet {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct EffectiveTurnPromptManifestHookMetadata {
     pub(super) sources: Vec<EffectiveTurnPromptManifestHookSourceEntry>,
     pub(super) diagnostics: Vec<EffectiveTurnPromptManifestHookDiagnostic>,
@@ -589,7 +593,8 @@ impl EffectiveTurnPromptManifestHookMetadata {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct EffectiveTurnPromptManifestHookSourceEntry {
     pub(super) source: EffectiveTurnPromptManifestHookSource,
     pub(super) section_id: Option<HookSectionId>,
@@ -601,7 +606,8 @@ pub(super) struct EffectiveTurnPromptManifestHookSourceEntry {
     pub(super) hook_content_chars: Option<usize>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct EffectiveTurnPromptManifestHookSource {
     pub(super) hook_id: HookId,
     pub(super) subscription_id: HookSubscriptionId,
@@ -609,21 +615,22 @@ pub(super) struct EffectiveTurnPromptManifestHookSource {
     pub(super) contribution_hash: Option<HookContributionHash>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(super) enum EffectiveTurnPromptManifestHookContributionKind {
     PromptContext,
     ThreadContext,
     PromptSection,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct EffectiveTurnPromptManifestHookDiagnostic {
     pub(super) code: EffectiveTurnPromptManifestHookDiagnosticCode,
     pub(super) message: String,
     pub(super) source: Option<EffectiveTurnPromptManifestHookSource>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(super) enum EffectiveTurnPromptManifestHookDiagnosticCode {
     HookDiagnostic,
     HookBestEffortFailed,
@@ -712,6 +719,10 @@ impl EffectiveTurnToolBundleSet {
 
     pub(super) fn diagnostics(&self) -> &[HookDiagnostic] {
         &self.metadata.diagnostics
+    }
+
+    pub(super) fn metadata(&self) -> &HookToolBundleSet {
+        &self.metadata
     }
 
     fn require_complete_artifacts(&self) -> Result<(), AgentTurnHookError> {
@@ -1460,36 +1471,29 @@ fn prompt_manifest_hook_diagnostic_code_order(
     }
 }
 
-pub(super) async fn run_noop_agent_turn_hook_phase(
+pub(super) async fn run_agent_turn_notification_hook_phase(
     runtime: Option<&Arc<HookRuntime>>,
     context: &AgentTurnHookContext,
     phase: HookPhase,
     policy_set: &EffectiveTurnPolicySet,
     prompt_context_set: &EffectiveTurnPromptContextSet,
-) {
+) -> Result<(), AgentTurnHookError> {
     let Some(runtime) = runtime else {
-        return;
+        return Ok(());
     };
-
-    let request = match build_phase_request(context, phase, policy_set, prompt_context_set) {
-        Ok(request) => request,
-        Err(error) => {
-            warn!(
-                phase = %phase,
-                error = %error,
-                "skipping agent turn hook phase because context could not be built"
-            );
-            return;
-        }
-    };
-
+    let request = build_phase_request(context, phase, policy_set, prompt_context_set)
+        .map_err(AgentTurnHookError::InvalidContext)?;
     match runtime.run_phase(request).await {
         Ok(response) => {
             for diagnostic in response.diagnostics {
                 warn_hook_diagnostic(phase, &diagnostic);
             }
+            Ok(())
         }
-        Err(error) => warn_hook_runtime_error(phase, &error),
+        Err(error) => {
+            warn_hook_runtime_error(phase, &error);
+            Err(AgentTurnHookError::Runtime(error))
+        }
     }
 }
 

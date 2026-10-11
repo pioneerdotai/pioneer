@@ -19,6 +19,7 @@ pub struct TurnRuntimeSnapshotRecord {
     pub agent_skill_versions_json: Option<String>,
     pub ordinary_skill_catalog_json: Option<String>,
     pub provider_model_contract_json: Option<String>,
+    pub initial_phase_json: Option<String>,
     pub hook_runtime_context_json: String,
     pub workspace_skill_policies_json: String,
     pub input_json: String,
@@ -42,6 +43,7 @@ pub struct NewTurnRuntimeSnapshot {
     pub agent_skill_versions_json: Option<String>,
     pub ordinary_skill_catalog_json: Option<String>,
     pub provider_model_contract_json: Option<String>,
+    pub initial_phase_json: Option<String>,
     pub hook_runtime_context_json: String,
     pub workspace_skill_policies_json: String,
     pub input_json: String,
@@ -79,6 +81,7 @@ impl NewTurnRuntimeSnapshot {
             self.agent_skill_versions_json.as_deref().unwrap_or(""),
             self.ordinary_skill_catalog_json.as_deref().unwrap_or(""),
             self.provider_model_contract_json.as_deref().unwrap_or(""),
+            self.initial_phase_json.as_deref().unwrap_or(""),
             &self.hook_runtime_context_json,
             &self.workspace_skill_policies_json,
             &self.input_json,
@@ -92,6 +95,9 @@ impl NewTurnRuntimeSnapshot {
 
 impl TurnRuntimeSnapshotRecord {
     pub fn validate_storage_size(&self) -> Result<()> {
+        self.remaining_storage_bytes().map(|_| ())
+    }
+    pub fn remaining_storage_bytes(&self) -> Result<usize> {
         validate_snapshot_storage_size(&[
             &self.turn_id,
             &self.thread_id,
@@ -103,6 +109,7 @@ impl TurnRuntimeSnapshotRecord {
             self.agent_skill_versions_json.as_deref().unwrap_or(""),
             self.ordinary_skill_catalog_json.as_deref().unwrap_or(""),
             self.provider_model_contract_json.as_deref().unwrap_or(""),
+            self.initial_phase_json.as_deref().unwrap_or(""),
             &self.hook_runtime_context_json,
             &self.workspace_skill_policies_json,
             &self.input_json,
@@ -111,13 +118,12 @@ impl TurnRuntimeSnapshotRecord {
             &self.runtime_environment_json,
             &self.history_json,
         ])
-        .map(|_| ())
     }
 }
 
 // SQLite byte lengths are checked before a driver materializes TEXT columns.
 // Keep this exact stored-column set aligned with validate_storage_size above.
-const SNAPSHOT_STORAGE_BYTES_SQL: &str = "coalesce(length(cast(turn_id as blob)),0) + coalesce(length(cast(thread_id as blob)),0) + coalesce(length(cast(workspace_id as blob)),0) + coalesce(length(cast(mode_json as blob)),0) + coalesce(length(cast(model as blob)),0) + coalesce(length(cast(provider_name as blob)),0) + coalesce(length(cast(reasoning_effort as blob)),0) + coalesce(length(cast(agent_skill_versions_json as blob)),0) + coalesce(length(cast(hook_runtime_context_json as blob)),0) + coalesce(length(cast(workspace_skill_policies_json as blob)),0) + coalesce(length(cast(input_json as blob)),0) + coalesce(length(cast(capabilities_json as blob)),0) + coalesce(length(cast(resolved_artifacts_json as blob)),0) + coalesce(length(cast(runtime_environment_json as blob)),0) + coalesce(length(cast(history_json as blob)),0) + coalesce(length(cast(ordinary_skill_catalog_json as blob)),0) + coalesce(length(cast(provider_model_contract_json as blob)),0)";
+const SNAPSHOT_STORAGE_BYTES_SQL: &str = "coalesce(length(cast(turn_id as blob)),0) + coalesce(length(cast(thread_id as blob)),0) + coalesce(length(cast(workspace_id as blob)),0) + coalesce(length(cast(mode_json as blob)),0) + coalesce(length(cast(model as blob)),0) + coalesce(length(cast(provider_name as blob)),0) + coalesce(length(cast(reasoning_effort as blob)),0) + coalesce(length(cast(agent_skill_versions_json as blob)),0) + coalesce(length(cast(hook_runtime_context_json as blob)),0) + coalesce(length(cast(workspace_skill_policies_json as blob)),0) + coalesce(length(cast(input_json as blob)),0) + coalesce(length(cast(capabilities_json as blob)),0) + coalesce(length(cast(resolved_artifacts_json as blob)),0) + coalesce(length(cast(runtime_environment_json as blob)),0) + coalesce(length(cast(history_json as blob)),0) + coalesce(length(cast(ordinary_skill_catalog_json as blob)),0) + coalesce(length(cast(provider_model_contract_json as blob)),0) + coalesce(length(cast(initial_phase_json as blob)),0)";
 
 // Encoded values are prepared before opening the admission transaction.
 pub(crate) fn prepare_snapshot_row(
@@ -133,6 +139,7 @@ pub(crate) fn prepare_snapshot_row(
         reasoning_effort: Set(snapshot.reasoning_effort),
         agent_skill_versions_json: Set(snapshot.agent_skill_versions_json),
         provider_model_contract_json: Set(snapshot.provider_model_contract_json),
+        initial_phase_json: Set(snapshot.initial_phase_json),
         ordinary_skill_catalog_json: Set(snapshot.ordinary_skill_catalog_json),
         hook_runtime_context_json: Set(snapshot.hook_runtime_context_json),
         workspace_skill_policies_json: Set(snapshot.workspace_skill_policies_json),
@@ -174,6 +181,7 @@ impl NewTurnRuntimeSnapshot {
             self.agent_skill_versions_json.as_deref(),
             self.ordinary_skill_catalog_json.as_deref(),
             self.provider_model_contract_json.as_deref(),
+            self.initial_phase_json.as_deref(),
             Some(self.hook_runtime_context_json.as_str()),
             Some(self.workspace_skill_policies_json.as_str()),
             Some(self.input_json.as_str()),
@@ -292,6 +300,7 @@ pub async fn upsert_turn_runtime_snapshot<C: ConnectionTrait>(
                     turn_runtime_snapshot::Column::AgentSkillVersionsJson,
                     turn_runtime_snapshot::Column::OrdinarySkillCatalogJson,
                     turn_runtime_snapshot::Column::ProviderModelContractJson,
+                    turn_runtime_snapshot::Column::InitialPhaseJson,
                     turn_runtime_snapshot::Column::HookRuntimeContextJson,
                     turn_runtime_snapshot::Column::WorkspaceSkillPoliciesJson,
                     turn_runtime_snapshot::Column::InputJson,
@@ -411,6 +420,7 @@ fn record_from_model(model: turn_runtime_snapshot::Model) -> TurnRuntimeSnapshot
         reasoning_effort: model.reasoning_effort,
         agent_skill_versions_json: model.agent_skill_versions_json,
         provider_model_contract_json: model.provider_model_contract_json,
+        initial_phase_json: model.initial_phase_json,
         ordinary_skill_catalog_json: model.ordinary_skill_catalog_json,
         hook_runtime_context_json: model.hook_runtime_context_json,
         workspace_skill_policies_json: model.workspace_skill_policies_json,
@@ -422,4 +432,68 @@ fn record_from_model(model: turn_runtime_snapshot::Model) -> TurnRuntimeSnapshot
         created_at: model.created_at,
         updated_at: model.updated_at,
     }
+}
+
+/// All bounds, hashing, JSON validation and owner reads precede this statement.
+/// The compare/execution/context/window predicates close every stale gap in
+/// the single domain write, using only physically bounded SQL scalars.
+pub(crate) fn prepare_initial_phase_update(
+    workspace_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+    window_index: u32,
+    owner_id: &str,
+    owner_generation: u64,
+    cancellation_sha256: &str,
+    previous_json: &str,
+    next_json: &str,
+    now: DateTimeWithTimeZone,
+) -> Result<sea_orm::Statement> {
+    anyhow::ensure!(
+        previous_json.len() <= pioneer_protocol::TURN_EXECUTION_REQUEST_MAX_BYTES
+            && next_json.len() <= pioneer_protocol::TURN_EXECUTION_REQUEST_MAX_BYTES,
+        "initial phase storage exceeds execution byte limit"
+    );
+    let sql = format!(
+        "UPDATE turn_runtime_snapshot SET initial_phase_json=?, updated_at=? \
+        WHERE turn_id=? AND thread_id=? AND workspace_id=? AND initial_phase_json=? \
+        AND ({SNAPSHOT_STORAGE_BYTES_SQL} - coalesce(length(cast(initial_phase_json as blob)),0) + ?) <= ? \
+        AND EXISTS (SELECT 1 FROM \"turn\" t JOIN thread th ON th.id=t.thread_id \
+          JOIN turn_execution e ON e.turn_id=t.id \
+          WHERE t.id=turn_runtime_snapshot.turn_id AND t.thread_id=turn_runtime_snapshot.thread_id \
+          AND th.workspace_id=turn_runtime_snapshot.workspace_id \
+          AND t.status='in_progress' AND t.message_deleted_at IS NULL \
+          AND e.thread_id=t.thread_id AND e.workspace_id=th.workspace_id \
+          AND e.executor_kind IN ('native_agent','api_provider') \
+          AND e.status IN ('queued','starting','running','recovering') \
+          AND e.owner_id=? AND e.owner_generation=?) \
+        AND EXISTS (SELECT 1 FROM native_cancellation_context c \
+          WHERE c.turn_id=turn_runtime_snapshot.turn_id \
+          AND c.thread_id=turn_runtime_snapshot.thread_id AND c.workspace_id=turn_runtime_snapshot.workspace_id \
+          AND c.context_sha256=? AND c.accepted_event_id IS NULL) \
+        AND EXISTS (SELECT 1 FROM turn_execution_window w \
+          WHERE w.turn_id=turn_runtime_snapshot.turn_id AND w.thread_id=turn_runtime_snapshot.thread_id \
+          AND w.workspace_id=turn_runtime_snapshot.workspace_id AND w.window_index=? AND w.status='running' \
+          AND w.window_index=(SELECT max(window_index) FROM turn_execution_window WHERE turn_id=w.turn_id))"
+    );
+    Ok(sea_orm::Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Sqlite,
+        sql,
+        [
+            next_json.to_owned().into(),
+            now.into(),
+            turn_id.to_owned().into(),
+            thread_id.to_owned().into(),
+            workspace_id.to_owned().into(),
+            previous_json.to_owned().into(),
+            (next_json.len() as i64).into(),
+            (pioneer_protocol::TURN_EXECUTION_REQUEST_MAX_BYTES as i64).into(),
+            owner_id.to_owned().into(),
+            i64::try_from(owner_generation)
+                .context("initial phase owner generation invalid")?
+                .into(),
+            cancellation_sha256.to_owned().into(),
+            i64::from(window_index).into(),
+        ],
+    ))
 }

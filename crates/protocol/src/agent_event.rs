@@ -88,6 +88,28 @@ impl NativeFailureMetadata {
     }
 }
 
+#[derive(Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct NativeInitialPhaseAdvance {
+    pub execution_owner_generation: Option<u64>,
+    pub workspace_id: String,
+    pub thread_id: String,
+    pub turn_id: String,
+    pub window_index: u32,
+    pub runtime_generation: u64,
+    pub expected_sha256: String,
+    pub initial_phase_json: String,
+}
+
+impl std::fmt::Debug for NativeInitialPhaseAdvance {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NativeInitialPhaseAdvance")
+            .field("window_index", &self.window_index)
+            .field("runtime_generation", &self.runtime_generation)
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AgentDurableEvent {
@@ -95,6 +117,9 @@ pub enum AgentDurableEvent {
     ToolOutputRecorded {
         id: String,
         notification: ItemDeltaNotification,
+    },
+    NativeInitialPhaseAdvanced {
+        preparation: NativeInitialPhaseAdvance,
     },
     PromptManifestCompiled {
         thread_id: String,
@@ -520,6 +545,9 @@ impl AgentDurableEvent {
             | Self::TurnInterrupted { turn_id, .. } => DurableEventCausalityKey::Turn {
                 turn_id: turn_id.clone(),
             },
+            Self::NativeInitialPhaseAdvanced { preparation } => DurableEventCausalityKey::Turn {
+                turn_id: preparation.turn_id.clone(),
+            },
             Self::NativeCancellationContextPrepared { preparation, .. }
             | Self::NativeTerminalEffectsPrepared { preparation } => {
                 DurableEventCausalityKey::Turn {
@@ -590,7 +618,8 @@ impl AgentDurableEvent {
             | Self::TurnFinalizationPrepared { .. }
             | Self::ItemToolRetryExhausted { .. } => true,
             Self::TaskEvent { event } => event.is_terminal(),
-            Self::PromptManifestCompiled { .. }
+            Self::NativeInitialPhaseAdvanced { .. }
+            | Self::PromptManifestCompiled { .. }
             | Self::TurnSkillsResolved { .. }
             | Self::TurnCapabilitiesResolved { .. }
             | Self::SkillAuditEvents { .. }

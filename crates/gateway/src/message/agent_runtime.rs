@@ -339,6 +339,9 @@ fn durable_event_thread_id(event: &AgentDurableEvent) -> Option<&str> {
         | AgentDurableEvent::TurnFailed { thread_id, .. }
         | AgentDurableEvent::TurnBlocked { thread_id, .. }
         | AgentDurableEvent::TurnInterrupted { thread_id, .. } => Some(thread_id.as_str()),
+        AgentDurableEvent::NativeInitialPhaseAdvanced { preparation } => {
+            Some(preparation.thread_id.as_str())
+        }
         AgentDurableEvent::NativeCancellationContextPrepared { preparation, .. }
         | AgentDurableEvent::NativeTerminalEffectsPrepared { preparation } => {
             Some(preparation.thread_id.as_str())
@@ -402,6 +405,9 @@ fn durable_event_turn_id(event: &AgentDurableEvent) -> Option<&str> {
         | AgentDurableEvent::TurnFailed { turn_id, .. }
         | AgentDurableEvent::TurnBlocked { turn_id, .. }
         | AgentDurableEvent::TurnInterrupted { turn_id, .. } => Some(turn_id.as_str()),
+        AgentDurableEvent::NativeInitialPhaseAdvanced { preparation } => {
+            Some(preparation.turn_id.as_str())
+        }
         AgentDurableEvent::NativeCancellationContextPrepared { preparation, .. }
         | AgentDurableEvent::NativeTerminalEffectsPrepared { preparation } => {
             Some(preparation.turn_id.as_str())
@@ -4441,6 +4447,78 @@ impl MessageProcessor {
                         return false;
                     }
                     true
+                })
+            }
+            AgentDurableEvent::NativeInitialPhaseAdvanced { preparation } => {
+                message_future(async move {
+                    let commit = async {
+                        let current = self
+                            .crud_store
+                            .get_turn_runtime_snapshot(&preparation.turn_id)
+                            .await?
+                            .context("native initial snapshot unavailable")?;
+                        anyhow::ensure!(
+                            current.workspace_id == preparation.workspace_id
+                                && current.thread_id == preparation.thread_id,
+                            "native initial phase scope differs"
+                        );
+                        let previous = current
+                            .initial_phase_json
+                            .as_deref()
+                            .context("native initial phase unavailable")?;
+                        let budget = current
+                            .remaining_storage_bytes()?
+                            .checked_add(previous.len())
+                            .context("native initial phase byte allowance invalid")?;
+                        let _ = pioneer_agent::NativeInitialPreparation::restore(
+                            &preparation.initial_phase_json,
+                            &preparation.workspace_id,
+                            &preparation.thread_id,
+                            &preparation.turn_id,
+                            budget,
+                        )?;
+                        anyhow::ensure!(
+                            preparation.expected_sha256.len() == 64
+                                && preparation
+                                    .expected_sha256
+                                    .bytes()
+                                    .all(|b| b.is_ascii_hexdigit()),
+                            "native initial phase digest invalid"
+                        );
+                        if previous != preparation.initial_phase_json {
+                            use sha2::Digest;
+                            anyhow::ensure!(
+                                hex::encode(sha2::Sha256::digest(previous.as_bytes()))
+                                    == preparation.expected_sha256,
+                                "native initial phase predecessor changed"
+                            );
+                            pioneer_agent::NativeInitialPreparation::validate_transition(
+                                previous,
+                                &preparation.initial_phase_json,
+                                budget,
+                            )?;
+                        }
+                        self.crud_store
+                            .advance_native_initial_phase(
+                                &preparation.workspace_id,
+                                &preparation.thread_id,
+                                &preparation.turn_id,
+                                preparation.window_index,
+                                preparation.runtime_generation,
+                                self.turn_execution_owner_id.as_ref(),
+                                preparation
+                                    .execution_owner_generation
+                                    .context("initial phase producer owner epoch unavailable")?,
+                                previous,
+                                &preparation.initial_phase_json,
+                            )
+                            .await
+                    }
+                    .await;
+                    if commit.is_err() {
+                        warn!("native initial phase commit rejected");
+                    }
+                    commit.is_ok()
                 })
             }
             AgentDurableEvent::NativeCancellationContextPrepared {

@@ -163,7 +163,8 @@ use std::fmt::{Display, Formatter};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WebToolsConfig {
     pub default_timeout_ms: u64,
     pub hard_max_timeout_ms: u64,
@@ -245,7 +246,8 @@ impl WebToolsConfig {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ComputerUseToolsConfig {
     pub runtime_home_dir: PathBuf,
     pub artifacts_subdir: String,

@@ -631,6 +631,7 @@ mod tests {
                     reasoning_effort: None,
                     agent_skill_versions_json: None,
                     provider_model_contract_json: None,
+                    initial_phase_json: None,
                     ordinary_skill_catalog_json: Some(r#"{"schema_version":1,"catalog":{"version":0,"generated_at_unix":0,"skills":[]}}"#.into()),
                     hook_runtime_context_json: r#"{"mode":"agent","actor_kind":"agent"}"#
                         .to_owned(),

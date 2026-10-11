@@ -1,4 +1,5 @@
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ToolLoopBudgetConfig {
     pub max_agent_rounds_per_turn: u32,
     pub max_tool_calls_per_turn: u32,
@@ -22,7 +23,8 @@ impl ToolLoopBudgetConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExecutionWindowBudgetConfig {
     pub max_agent_rounds_per_window: u32,
     pub max_tool_calls_per_window: u32,
@@ -67,7 +69,8 @@ impl From<ToolLoopBudgetConfig> for ExecutionWindowBudgetConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExecutionWindowTotalBudgetConfig {
     pub max_windows_per_turn: Option<u32>,
     pub max_tool_calls_per_turn: Option<u32>,
@@ -102,7 +105,8 @@ impl ExecutionWindowTotalBudgetConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExecutionWindowsConfig {
     pub window: ExecutionWindowBudgetConfig,
     pub total: ExecutionWindowTotalBudgetConfig,

@@ -9,6 +9,8 @@ mod chat;
 pub mod compaction;
 mod hooks;
 mod manager_recovery;
+mod native_initial;
+pub use native_initial::NativeInitialPreparation;
 #[cfg(test)]
 mod manager_tests;
 pub mod post_turn;
@@ -95,7 +97,8 @@ const DEFAULT_CONTROL_OUTCOME_CAPACITY: usize = 512;
 const MAX_CONTROL_ENQUEUE_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_CONTROL_ACK_TIMEOUT: Duration = Duration::from_secs(120);
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ToolLoopConfig {
     pub provider: ProviderTimeoutPolicy,
     pub preflight: PreflightLoopConfig,
@@ -108,7 +111,8 @@ pub struct ToolLoopConfig {
     pub retry: ToolRetryBudgetConfig,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PreflightLoopConfig {
     pub provider_name: Option<String>,
     pub model: Option<String>,
@@ -127,7 +131,8 @@ impl PreflightLoopConfig {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SkillsLoopConfig {
     pub enabled: bool,
     pub max_skills_per_source: usize,
@@ -146,7 +151,8 @@ pub struct SkillsLoopConfig {
     pub runtime: SkillsRuntimeLoopConfig,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SkillsRuntimeLoopConfig {
     pub enable_dynamic_tools: bool,
     pub enable_read_skill: bool,
@@ -158,13 +164,15 @@ pub struct SkillsRuntimeLoopConfig {
     pub allow_function_proxy_tools: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SkillsValidationLoopConfig {
     pub strict_agentskills: bool,
     pub accept_openclaw_profile: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SkillsSecurityLoopConfig {
     pub allow_untrusted_install: bool,
     pub min_trust_for_shell_tools: SkillTrustLevel,
@@ -180,7 +188,8 @@ pub struct SkillsSecurityLoopConfig {
     pub upload_max_chunk_size_bytes: usize,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SkillsDependenciesLoopConfig {
     pub preflight_on_resolve: bool,
     pub runtime_recheck_on_tool_call: bool,
@@ -1314,6 +1323,7 @@ pub struct RestoredRecoveryTurnRequest {
     pub provider_name: String,
     pub azure_connection: Option<pioneer_provider::AzureResolvedConnection>,
     pub provider_model_contract: Option<pioneer_provider::AcceptedProviderModelContract>,
+    pub initial_preparation: Option<NativeInitialPreparation>,
     pub reasoning: Option<ReasoningConfig>,
     pub workspace_skill_policies: HashMap<SkillPolicyKey, WorkspaceSkillPolicy>,
     pub skill_catalog: SkillCatalogSnapshot,
@@ -1360,6 +1370,7 @@ struct ActiveTurnRequest {
     provider_name: String,
     azure_connection: Option<pioneer_provider::AzureResolvedConnection>,
     provider_model_contract: Option<pioneer_provider::AcceptedProviderModelContract>,
+    initial_preparation: Option<NativeInitialPreparation>,
     reasoning: Option<ReasoningConfig>,
     workspace_skill_policies: HashMap<SkillPolicyKey, WorkspaceSkillPolicy>,
     skill_catalog: SkillCatalogSnapshot,
@@ -1894,6 +1905,7 @@ enum AgentCommand {
         provider_name: String,
         azure_connection: Option<pioneer_provider::AzureResolvedConnection>,
         provider_model_contract: Option<pioneer_provider::AcceptedProviderModelContract>,
+        initial_preparation: Option<NativeInitialPreparation>,
         reasoning: Option<ReasoningConfig>,
         workspace_skill_policies: HashMap<SkillPolicyKey, WorkspaceSkillPolicy>,
         skill_catalog: SkillCatalogSnapshot,
@@ -3293,6 +3305,7 @@ impl AgentManager {
             provider_name,
             None,
             None,
+            None,
             workspace_skill_policies,
             skill_catalog,
             agent_skill_overlay,
@@ -3464,6 +3477,7 @@ impl AgentManager {
             provider_name,
             None,
             None,
+            None,
             workspace_skill_policies,
             skill_catalog,
             agent_skill_overlay,
@@ -3552,6 +3566,7 @@ impl AgentManager {
             provider_name,
             None,
             None,
+            None,
             workspace_skill_policies,
             skill_catalog,
             agent_skill_overlay,
@@ -3597,6 +3612,7 @@ impl AgentManager {
             &request.provider_name,
             request.azure_connection,
             request.provider_model_contract,
+            request.initial_preparation,
             request.workspace_skill_policies,
             request.skill_catalog,
             request.agent_skill_overlay,
@@ -3624,6 +3640,7 @@ impl AgentManager {
         provider_name: &str,
         azure_connection: Option<pioneer_provider::AzureResolvedConnection>,
         provider_model_contract: Option<pioneer_provider::AcceptedProviderModelContract>,
+        initial_preparation: Option<NativeInitialPreparation>,
         workspace_skill_policies: HashMap<SkillPolicyKey, WorkspaceSkillPolicy>,
         skill_catalog: SkillCatalogSnapshot,
         agent_skill_overlay: Vec<AgentSkillRuntimeEntry>,
@@ -3670,6 +3687,7 @@ impl AgentManager {
             provider_name: provider_name.to_owned(),
             azure_connection,
             provider_model_contract,
+            initial_preparation,
             reasoning,
             workspace_skill_policies,
             skill_catalog,

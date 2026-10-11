@@ -76,7 +76,7 @@ use tokio::task::yield_now;
 use tokio::time::{Duration, Instant, advance, sleep, timeout};
 use tokio_util::sync::CancellationToken;
 
-fn test_tool_loop_config() -> ToolLoopConfig {
+pub(crate) fn test_tool_loop_config() -> ToolLoopConfig {
     crate::chat::preflight::load_test_catalog();
     ToolLoopConfig {
         provider: pioneer_provider::ProviderTimeoutPolicy::default(),
@@ -4047,6 +4047,7 @@ fn test_agent_event_from_durable(event: AgentDurableEvent) -> Option<AgentEvent>
         | AgentDurableEvent::TurnExecutionWindowBlocked { .. }
         | AgentDurableEvent::TurnProviderHistoryAppended { .. }
         | AgentDurableEvent::TurnPermissionAudit { .. }
+        | AgentDurableEvent::NativeInitialPhaseAdvanced { .. }
         | AgentDurableEvent::NativeCancellationContextPrepared { .. }
         | AgentDurableEvent::NativeTerminalEffectsPrepared { .. } => None,
         AgentDurableEvent::ProviderFailureDetected {
@@ -7732,6 +7733,55 @@ async fn phase_12_post_turn_hook_does_not_create_task_anchor() {
             })
         )
     }));
+}
+
+#[tokio::test]
+async fn required_post_prompt_hook_failure_prevents_main_provider_dispatch() {
+    for failure_policy in [
+        HookFailurePolicy::Required,
+        HookFailurePolicy::FailClosed,
+        HookFailurePolicy::BestEffort,
+    ] {
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = Arc::new(CaptureAgentProvider::default());
+        let registry = Arc::new(ProviderRegistry::with_provider("capture", provider.clone()));
+        let manager = AgentManager::new(registry, test_tool_loop_config());
+        manager
+            .set_hook_runtime(Some(recording_hook_runtime_with_phase_failures(
+                calls.clone(),
+                Vec::new(),
+                failure_policy,
+                vec![HookPhase::TurnPostPromptCompile],
+            )))
+            .await;
+        let observed = start_simple_turn(
+            &manager,
+            "thread_post_prompt",
+            "workspace_post_prompt",
+            "turn_post_prompt",
+            ThreadMode::Agent,
+            "capture",
+            "ordinary answer",
+        )
+        .await;
+        if failure_policy == HookFailurePolicy::BestEffort {
+            assert!(matches!(
+                observed.last(),
+                Some(AgentEvent::TurnCompleted { .. })
+            ));
+            assert!(!visible_test_requests(provider.snapshot_requests()).is_empty());
+        } else {
+            assert_turn_failed(&observed, "required post-prompt hook failed");
+            assert!(visible_test_requests(provider.snapshot_requests()).is_empty());
+        }
+        assert_eq!(
+            snapshot_hook_calls(&calls)
+                .iter()
+                .filter(|call| call.phase == HookPhase::TurnPostPromptCompile)
+                .count(),
+            1
+        );
+    }
 }
 
 #[tokio::test]
@@ -12375,6 +12425,15 @@ async fn execution_window_continuation_restarts_same_turn_and_completes_next_win
     config.retry.max_recoverable_retry_rounds_per_episode = 16;
     config.retry.max_same_tool_error_retries_per_episode = 16;
     let manager = loop_budget_manager(provider.clone(), config);
+    let initial_hook_calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    manager
+        .set_hook_runtime(Some(recording_hook_runtime(
+            initial_hook_calls.clone(),
+            Vec::new(),
+            HookFailurePolicy::FailClosed,
+            false,
+        )))
+        .await;
     let mut events = start_loop_budget_turn(
         &manager,
         "thr_loop_budget_multi_window",
@@ -12383,6 +12442,25 @@ async fn execution_window_continuation_restarts_same_turn_and_completes_next_win
     .await;
 
     let observed_events = recv_events_until_terminal(&mut events).await;
+    for phase in [
+        HookPhase::TurnPrePolicy,
+        HookPhase::TurnPrePromptContext,
+        HookPhase::TurnPreToolMaterialization,
+        HookPhase::TurnPostPreflightPromptContext,
+        HookPhase::TurnPrePromptCompile,
+        HookPhase::TurnPostPromptCompile,
+    ] {
+        assert_eq!(
+            initial_hook_calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|call| call.phase == phase)
+                .count(),
+            1,
+            "completed initial phase must run once across windows: {phase}"
+        );
+    }
     assert!(matches!(
         observed_events.last(),
         Some(AgentEvent::TurnCompleted { turn_id, .. })

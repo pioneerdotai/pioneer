@@ -81,6 +81,7 @@ fn candidate_snapshot(
         reasoning_effort: None,
         agent_skill_versions_json: None,
         provider_model_contract_json: None,
+        initial_phase_json: None,
         ordinary_skill_catalog_json: None,
         hook_runtime_context_json: "{}".into(),
         workspace_skill_policies_json: "[]".into(),
@@ -267,4 +268,226 @@ async fn native_snapshot_has_no_orphan_and_rolls_back_generation_change_at_commi
         .insert_native_turn_runtime_snapshot(snapshot)
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn initial_phase_commit_fences_original_owner_context_window_and_storage_bytes() {
+    let workspace = "ws_initial_phase_fences";
+    let store = test_store_with_workspace(workspace).await;
+    let now = unix_to_datetime(1_700_000_000);
+    let mut snapshot = candidate_snapshot(workspace, now);
+    snapshot.initial_phase_json = Some("{\"phase\":\"not_started\"}".into());
+    seed_native_owner(&store, &snapshot).await;
+    store
+        .insert_native_turn_runtime_snapshot(snapshot.clone())
+        .await
+        .unwrap();
+    store
+        .create_turn_execution_window(
+            crate::NewTurnExecutionWindowRecord {
+                workspace_id: workspace.into(),
+                thread_id: snapshot.thread_id.clone(),
+                turn_id: snapshot.turn_id.clone(),
+                window_index: 1,
+                status: pioneer_protocol::ExecutionWindowStatus::Running,
+                exhaustion_reason: None,
+                agent_round_count: 0,
+                tool_call_count: 0,
+                provider_token_count: 0,
+                metadata_json: serde_json::json!({}),
+                started_at: now,
+            },
+            now,
+            now,
+        )
+        .await
+        .unwrap();
+    store
+        .persist_native_cancellation_context(
+            pioneer_protocol::NativeTerminalEffectPreparation {
+                batch_id: "initial-phase-cancellation".into(),
+                workspace_id: workspace.into(),
+                thread_id: snapshot.thread_id.clone(),
+                turn_id: snapshot.turn_id.clone(),
+                runtime_generation: 7,
+                effects: vec![],
+            },
+            "snapshot-owner",
+            1_700_000_000,
+            true,
+        )
+        .await
+        .unwrap();
+    let previous = snapshot.initial_phase_json.as_deref().unwrap();
+    let next = "{\"phase\":\"preparing\"}";
+    for (owner, epoch, generation, window) in [
+        ("other-owner", 1, 7, 1),
+        ("snapshot-owner", 2, 7, 1),
+        ("snapshot-owner", 1, 8, 1),
+        ("snapshot-owner", 1, 7, 2),
+    ] {
+        assert!(
+            store
+                .advance_native_initial_phase(
+                    workspace,
+                    &snapshot.thread_id,
+                    &snapshot.turn_id,
+                    window,
+                    generation,
+                    owner,
+                    epoch,
+                    previous,
+                    next
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .get_turn_runtime_snapshot(&snapshot.turn_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .initial_phase_json
+                .as_deref(),
+            Some(previous)
+        );
+    }
+    // Actual UTF-8 bytes exceed the shared envelope; failed commits retain the
+    // original phase rather than replacing it with an empty or partial value.
+    let oversized = "é".repeat(pioneer_protocol::TURN_EXECUTION_REQUEST_MAX_BYTES / 2);
+    assert!(
+        store
+            .advance_native_initial_phase(
+                workspace,
+                &snapshot.thread_id,
+                &snapshot.turn_id,
+                1,
+                7,
+                "snapshot-owner",
+                1,
+                previous,
+                &oversized
+            )
+            .await
+            .is_err()
+    );
+    store
+        .advance_native_initial_phase(
+            workspace,
+            &snapshot.thread_id,
+            &snapshot.turn_id,
+            1,
+            7,
+            "snapshot-owner",
+            1,
+            previous,
+            next,
+        )
+        .await
+        .unwrap();
+    // The handler may ACK a duplicate, but the repository requires the exact
+    // accepted predecessor and still checks every execution fence.
+    assert!(
+        store
+            .advance_native_initial_phase(
+                workspace,
+                &snapshot.thread_id,
+                &snapshot.turn_id,
+                1,
+                7,
+                "snapshot-owner",
+                1,
+                previous,
+                next
+            )
+            .await
+            .is_err()
+    );
+    store
+        .advance_native_initial_phase(
+            workspace,
+            &snapshot.thread_id,
+            &snapshot.turn_id,
+            1,
+            7,
+            "snapshot-owner",
+            1,
+            next,
+            next,
+        )
+        .await
+        .unwrap();
+    store
+        .connection
+        .execute_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "UPDATE turn_execution SET owner_generation=owner_generation+1 WHERE turn_id=?",
+            [snapshot.turn_id.clone().into()],
+        ))
+        .await
+        .unwrap();
+    assert!(
+        store
+            .advance_native_initial_phase(
+                workspace,
+                &snapshot.thread_id,
+                &snapshot.turn_id,
+                1,
+                7,
+                "snapshot-owner",
+                1,
+                next,
+                "completed"
+            )
+            .await
+            .is_err()
+    );
+    let context = store
+        .native_cancellation_context(&snapshot.turn_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let prepared = crate::repositories::turn_runtime_snapshot::prepare_initial_phase_update(
+        workspace,
+        &snapshot.thread_id,
+        &snapshot.turn_id,
+        1,
+        "snapshot-owner",
+        2,
+        &context.context_sha256,
+        next,
+        "completed",
+        now,
+    )
+    .unwrap();
+    // A replacement after preparation must also lose at the physical write.
+    store
+        .connection
+        .execute_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "UPDATE turn_execution SET owner_generation=owner_generation+1 WHERE turn_id=?",
+            [snapshot.turn_id.clone().into()],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .connection
+            .execute_raw(prepared)
+            .await
+            .unwrap()
+            .rows_affected(),
+        0
+    );
+    assert_eq!(
+        store
+            .get_turn_runtime_snapshot(&snapshot.turn_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .initial_phase_json
+            .as_deref(),
+        Some(next)
+    );
 }

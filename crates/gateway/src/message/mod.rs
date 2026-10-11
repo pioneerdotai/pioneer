@@ -4230,16 +4230,27 @@ impl MessageProcessor {
         };
         context.require_provider_instance(provider.as_ref(), model)?;
         let profile_byte_budget = snapshot.remaining_storage_bytes()?;
-        let contract =
-            if let Some(accepted) = self.crud_store.get_turn_runtime_snapshot(turn_id).await? {
-                crate::turn_runtime_snapshot::restored_provider_model_contract(&accepted)?
-            } else {
-                provider.capture_model_contract_with_limit(model, profile_byte_budget)?
-            };
+        let accepted = self.crud_store.get_turn_runtime_snapshot(turn_id).await?;
+        let contract = if let Some(accepted) = &accepted {
+            crate::turn_runtime_snapshot::restored_provider_model_contract(accepted)?
+        } else {
+            provider.capture_model_contract_with_limit(model, profile_byte_budget)?
+        };
         contract.validate_identity(provider.name(), model, provider.authority_fingerprint())?;
         let _ = contract.clone().bind(provider)?;
         snapshot.provider_model_contract_json =
             Some(contract.to_json_with_limit(profile_byte_budget)?);
+        snapshot.initial_phase_json = Some(match accepted {
+            Some(accepted) => accepted
+                .initial_phase_json
+                .context("accepted native initial preparation is unavailable")?,
+            None => pioneer_agent::NativeInitialPreparation::new_admission_json(
+                workspace_id,
+                thread_id,
+                turn_id,
+                snapshot.remaining_storage_bytes()?,
+            )?,
+        });
         snapshot.validate_storage_size()?;
         self.crud_store
             .insert_native_turn_runtime_snapshot(snapshot)

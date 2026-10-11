@@ -3,7 +3,8 @@ use crate::output_policy::ToolRecoveryView;
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ToolRetryBudgetConfig {
     pub max_recoverable_retry_rounds_per_episode: u32,
     pub max_same_tool_error_retries_per_episode: u32,

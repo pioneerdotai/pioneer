@@ -132,6 +132,17 @@ pub(crate) fn validate_runtime_snapshot_for_resume(
     snapshot.validate_storage_size()?;
     restored_ordinary_skill_catalog(snapshot)?;
     restored_provider_model_contract(snapshot)?;
+    let initial = snapshot
+        .initial_phase_json
+        .as_deref()
+        .context("native initial preparation unavailable")?;
+    pioneer_agent::NativeInitialPreparation::validate_for_resume(
+        initial,
+        snapshot
+            .remaining_storage_bytes()?
+            .checked_add(initial.len())
+            .context("native initial phase allowance invalid")?,
+    )?;
     let _: ThreadMode = from_snapshot_json(&snapshot.mode_json, "thread mode")?;
     let _: AgentTurnHookRuntimeContext =
         from_snapshot_json(&snapshot.hook_runtime_context_json, "hook runtime context")?;
@@ -300,6 +311,7 @@ pub(crate) fn new_turn_runtime_snapshot(
         agent_skill_versions_json,
         ordinary_skill_catalog_json,
         provider_model_contract_json: None,
+        initial_phase_json: None,
         hook_runtime_context_json: to_snapshot_json_bounded(
             hook_runtime_context,
             "hook runtime context",
@@ -666,6 +678,11 @@ pub(crate) async fn restored_recovery_turn_request_from_snapshot(
     agent_skill_overlay: Vec<AgentSkillRuntimeEntry>,
 ) -> Result<RestoredRecoveryTurnRequest> {
     snapshot.validate_storage_size()?;
+    let execution_owner_generation = store
+        .get_turn_execution(&snapshot.turn_id)
+        .await?
+        .context("native dispatch execution owner unavailable")?
+        .owner_generation;
     let azure_connection = if pioneer_provider::provider_definition(&snapshot.provider_name)
         .is_some_and(|definition| definition.name == "azure-openai")
     {
@@ -794,6 +811,22 @@ pub(crate) async fn restored_recovery_turn_request_from_snapshot(
         provider_name: snapshot.provider_name.clone(),
         azure_connection,
         provider_model_contract: Some(restored_provider_model_contract(snapshot)?),
+        initial_preparation: Some(
+            pioneer_agent::NativeInitialPreparation::restore(
+                snapshot
+                    .initial_phase_json
+                    .as_deref()
+                    .context("native initial preparation unavailable")?,
+                &snapshot.workspace_id,
+                &snapshot.thread_id,
+                &snapshot.turn_id,
+                snapshot
+                    .remaining_storage_bytes()?
+                    .checked_add(snapshot.initial_phase_json.as_ref().map_or(0, String::len))
+                    .context("native initial phase byte budget invalid")?,
+            )?
+            .with_execution_owner_generation(execution_owner_generation),
+        ),
         reasoning: snapshot
             .reasoning_effort
             .as_deref()
@@ -1187,6 +1220,15 @@ mod tests {
             reasoning_effort: None,
             agent_skill_versions_json,
             provider_model_contract_json: Some(model_contract_json("provider", "model")),
+            initial_phase_json: Some(
+                pioneer_agent::NativeInitialPreparation::new_admission_json(
+                    WORKSPACE,
+                    "thread_pinned_snapshot",
+                    "turn_pinned_snapshot",
+                    pioneer_protocol::TURN_EXECUTION_REQUEST_MAX_BYTES,
+                )
+                .unwrap(),
+            ),
             ordinary_skill_catalog_json: Some(
                 r#"{"schema_version":1,"catalog":{"version":0,"generated_at_unix":0,"skills":[]}}"#
                     .into(),

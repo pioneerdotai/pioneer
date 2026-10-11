@@ -93,6 +93,7 @@ mod m20261008_000009_retire_compaction_publication_fences;
 mod m20261009_000001_projection_receipt_cleanup_discovery;
 mod m20261011_000001_native_ordinary_skill_catalog;
 mod m20261011_000002_native_provider_model_contract;
+mod m20261011_000003_native_initial_phase;
 
 #[async_trait::async_trait]
 impl MigratorTrait for Migrator {
@@ -185,6 +186,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261009_000001_projection_receipt_cleanup_discovery::Migration),
             Box::new(m20261011_000001_native_ordinary_skill_catalog::Migration),
             Box::new(m20261011_000002_native_provider_model_contract::Migration),
+            Box::new(m20261011_000003_native_initial_phase::Migration),
         ]
     }
 }
