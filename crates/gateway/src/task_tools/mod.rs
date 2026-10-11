@@ -1271,8 +1271,107 @@ async fn resolve_task_tool_action_scope(
 
 #[derive(Default)]
 struct TaskToolMutationCache {
-    outputs: Mutex<HashMap<String, JsonValue>>,
+    outputs: Mutex<HashMap<String, TaskToolMutationCacheEntry>>,
     locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+}
+
+impl TaskToolMutationCache {
+    async fn cached_mutation_output(
+        &self,
+        invocation: &ToolInvocation,
+        cache_key: &str,
+    ) -> Result<Option<JsonValue>, ToolError> {
+        let arguments_sha256 = invocation_arguments_sha256(invocation)?;
+        let cached = self.outputs.lock().await.get(cache_key).cloned();
+        let Some(cached) = cached else {
+            return Ok(None);
+        };
+        if cached.arguments_sha256 != arguments_sha256 {
+            return Err(ToolError::invalid_arguments(
+                "task mutation idempotency key refers to different arguments",
+            ));
+        }
+        Ok(Some(cached.output.as_ref().clone()))
+    }
+
+    async fn cache_mutation_output(
+        &self,
+        invocation: &ToolInvocation,
+        cache_key: Option<&str>,
+        output: &JsonValue,
+    ) -> Result<(), ToolError> {
+        if let Some(key) = cache_key {
+            let entry = TaskToolMutationCacheEntry {
+                arguments_sha256: invocation_arguments_sha256(invocation)?,
+                output: Arc::new(output.clone()),
+            };
+            self.outputs.lock().await.insert(key.to_owned(), entry);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+struct TaskToolMutationCacheEntry {
+    arguments_sha256: String,
+    output: Arc<JsonValue>,
+}
+
+fn mutation_arguments_sha256(arguments: &JsonValue) -> String {
+    let canonical = pioneer_tools::ToolFailureSignature::from_arguments(
+        "",
+        &arguments.to_string(),
+        pioneer_tools::ToolErrorClass::Unknown,
+    )
+    .arguments_fingerprint;
+    hex::encode(Sha256::digest(canonical.as_bytes()))
+}
+
+fn invocation_arguments_sha256(invocation: &ToolInvocation) -> Result<String, ToolError> {
+    let ToolPayload::Function { arguments } = &invocation.payload else {
+        return Err(ToolError::invalid_arguments(
+            "task mutation requires canonical function arguments",
+        ));
+    };
+    Ok(mutation_arguments_sha256(arguments))
+}
+
+fn cached_task_mutation_receipt<'a>(
+    invocation: &ToolInvocation,
+    output: &'a JsonValue,
+) -> Result<Option<(&'a str, i64, bool)>, ToolError> {
+    let creation = invocation.tool_name == TASK_CREATE_TOOL;
+    if !creation
+        && !matches!(
+            invocation.tool_name.as_str(),
+            TASK_UPDATE_TOOL | TASK_RESCHEDULE_TOOL
+        )
+    {
+        return Ok(None);
+    }
+    let unavailable =
+        || ToolError::execution_failed("previous task mutation postcondition is unavailable");
+    let id = output
+        .get("taskId")
+        .and_then(JsonValue::as_str)
+        .or_else(|| output.pointer("/task/id").and_then(JsonValue::as_str))
+        .filter(|id| id.len() == 21)
+        .ok_or_else(unavailable)?;
+    let revision = output
+        .get("revision")
+        .and_then(JsonValue::as_i64)
+        .or_else(|| output.pointer("/task/revision").and_then(JsonValue::as_i64))
+        .filter(|revision| *revision > 0)
+        .ok_or_else(unavailable)?;
+    if !creation {
+        let ToolPayload::Function { arguments } = &invocation.payload else {
+            return Err(unavailable());
+        };
+        if arguments.get("taskId").and_then(JsonValue::as_str) != Some(id) {
+            return Err(unavailable());
+        }
+    }
+    Ok(Some((id, revision, creation)))
 }
 
 #[async_trait]
@@ -1527,17 +1626,53 @@ impl TaskToolHandler {
         Some(lock.lock_owned().await)
     }
 
-    async fn cached_mutation_output(&self, cache_key: Option<&str>) -> Option<JsonValue> {
-        let key = cache_key?;
-        let mutation_outputs = self.mutation_cache.outputs.lock().await;
-        mutation_outputs.get(key).cloned()
+    async fn cached_mutation_output(
+        &self,
+        invocation: &ToolInvocation,
+        cache_key: &str,
+    ) -> Result<Option<JsonValue>, ToolError> {
+        self.mutation_cache
+            .cached_mutation_output(invocation, cache_key)
+            .await
     }
 
-    async fn cache_mutation_output(&self, cache_key: Option<&str>, output: &JsonValue) {
-        if let Some(key) = cache_key {
-            let mut mutation_outputs = self.mutation_cache.outputs.lock().await;
-            mutation_outputs.insert(key.to_owned(), output.clone());
+    async fn cache_mutation_output(
+        &self,
+        invocation: &ToolInvocation,
+        cache_key: Option<&str>,
+        output: &JsonValue,
+    ) -> Result<(), ToolError> {
+        self.mutation_cache
+            .cache_mutation_output(invocation, cache_key, output)
+            .await
+    }
+
+    async fn validate_cached_task_mutation_receipt(
+        &self,
+        invocation: &ToolInvocation,
+        output: &JsonValue,
+    ) -> Result<(), ToolError> {
+        let Some((task_id, revision, creation)) = cached_task_mutation_receipt(invocation, output)?
+        else {
+            return Ok(());
+        };
+        let current = self
+            .processor
+            .crud_store
+            .task_mutation_receipt_is_current(
+                &self.context.workspace_id,
+                task_id,
+                revision,
+                creation.then_some(self.context.turn_id.as_str()),
+            )
+            .await
+            .map_err(|_| ToolError::internal("task mutation receipt state unavailable"))?;
+        if !current {
+            return Err(ToolError::execution_failed(
+                "previous task mutation postcondition is no longer current",
+            ));
         }
+        Ok(())
     }
 
     async fn cached_or_prior_mutation_output(
@@ -1548,13 +1683,18 @@ impl TaskToolHandler {
         let Some(cache_key) = cache_key else {
             return Ok(None);
         };
-        if let Some(output) = self.cached_mutation_output(Some(cache_key)).await {
+        if let Some(output) = self.cached_mutation_output(invocation, cache_key).await? {
+            self.validate_cached_task_mutation_receipt(invocation, &output)
+                .await?;
             return Ok(Some(output));
         }
         let Some(output) = self.prior_successful_mutation_output(invocation).await? else {
             return Ok(None);
         };
-        self.cache_mutation_output(Some(cache_key), &output).await;
+        self.validate_cached_task_mutation_receipt(invocation, &output)
+            .await?;
+        self.cache_mutation_output(invocation, Some(cache_key), &output)
+            .await?;
         Ok(Some(output))
     }
 
@@ -2010,8 +2150,8 @@ impl TaskToolHandler {
                 })?,
             );
         }
-        self.cache_mutation_output(cache_key.as_deref(), &output)
-            .await;
+        self.cache_mutation_output(&invocation, cache_key.as_deref(), &output)
+            .await?;
         Ok(function_output(output))
     }
 
@@ -2180,8 +2320,8 @@ impl TaskToolHandler {
         let final_answer_allowed = self.final_answer_allowed_after_accept(&response).await;
         let mut output = task_accept_tool_output(&response, final_answer_allowed);
         Self::attach_agent_action_result(&mut output, action_plan.as_ref())?;
-        self.cache_mutation_output(cache_key.as_deref(), &output)
-            .await;
+        self.cache_mutation_output(&invocation, cache_key.as_deref(), &output)
+            .await?;
         Ok(function_output(output))
     }
 
@@ -2268,8 +2408,8 @@ impl TaskToolHandler {
         };
         let mut output = task_revise_tool_output(&response);
         Self::attach_agent_action_result(&mut output, action_plan.as_ref())?;
-        self.cache_mutation_output(cache_key.as_deref(), &output)
-            .await;
+        self.cache_mutation_output(&invocation, cache_key.as_deref(), &output)
+            .await?;
         Ok(function_output(output))
     }
 
@@ -2321,8 +2461,8 @@ impl TaskToolHandler {
             .map_err(task_runtime_tool_error)?;
         let mut output = json!({ "task": task_summary(&response.task) });
         Self::attach_agent_action_result(&mut output, action_plan.as_ref())?;
-        self.cache_mutation_output(cache_key.as_deref(), &output)
-            .await;
+        self.cache_mutation_output(&invocation, cache_key.as_deref(), &output)
+            .await?;
         Ok(function_output(output))
     }
 
@@ -2390,8 +2530,8 @@ impl TaskToolHandler {
             .map_err(task_runtime_tool_error)?;
         let mut output = task_update_tool_output(&response);
         Self::attach_agent_action_result(&mut output, action_plan.as_ref())?;
-        self.cache_mutation_output(cache_key.as_deref(), &output)
-            .await;
+        self.cache_mutation_output(&invocation, cache_key.as_deref(), &output)
+            .await?;
         Ok(function_output(output))
     }
 
@@ -2443,8 +2583,8 @@ impl TaskToolHandler {
             .map_err(task_runtime_tool_error)?;
         let mut output = json!({ "task": task_summary(&response.task) });
         Self::attach_agent_action_result(&mut output, action_plan.as_ref())?;
-        self.cache_mutation_output(cache_key.as_deref(), &output)
-            .await;
+        self.cache_mutation_output(&invocation, cache_key.as_deref(), &output)
+            .await?;
         Ok(function_output(output))
     }
 
@@ -2665,8 +2805,8 @@ impl TaskToolHandler {
             "trigger": task_trigger_model_output(&response.trigger),
         });
         Self::attach_agent_action_result(&mut output, action_plan.as_ref())?;
-        self.cache_mutation_output(cache_key.as_deref(), &output)
-            .await;
+        self.cache_mutation_output(&invocation, cache_key.as_deref(), &output)
+            .await?;
         Ok(function_output(output))
     }
 
@@ -2719,8 +2859,8 @@ impl TaskToolHandler {
             "triggers": task_trigger_details_output(&response.triggers),
         });
         Self::attach_agent_action_result(&mut output, action_plan.as_ref())?;
-        self.cache_mutation_output(cache_key.as_deref(), &output)
-            .await;
+        self.cache_mutation_output(&invocation, cache_key.as_deref(), &output)
+            .await?;
         Ok(function_output(output))
     }
 
@@ -2785,8 +2925,8 @@ impl TaskToolHandler {
             "triggers": task_trigger_details_output(&response.triggers),
         });
         Self::attach_agent_action_result(&mut output, action_plan.as_ref())?;
-        self.cache_mutation_output(cache_key.as_deref(), &output)
-            .await;
+        self.cache_mutation_output(&invocation, cache_key.as_deref(), &output)
+            .await?;
         Ok(function_output(output))
     }
 
@@ -2940,6 +3080,7 @@ impl TaskToolHandler {
                 status,
                 storage,
                 success,
+                outcome,
                 ..
             } = item
             else {
@@ -2957,9 +3098,23 @@ impl TaskToolHandler {
             {
                 continue;
             }
-            if let Some(output) = wait_result_from_storage(&storage) {
-                return Ok(Some(output));
+            if success != Some(true)
+                || !outcome.is_some_and(|outcome| {
+                    outcome.status == pioneer_protocol::ToolOutcomeStatus::Ok
+                })
+            {
+                return Err(ToolError::execution_failed(
+                    "previous task mutation outcome is unavailable",
+                ));
             }
+            if mutation_arguments_sha256(&arguments) != invocation_arguments_sha256(invocation)? {
+                return Err(ToolError::invalid_arguments(
+                    "task mutation idempotency key refers to different arguments",
+                ));
+            }
+            return wait_result_from_storage(&storage).map(Some).ok_or_else(|| {
+                ToolError::execution_failed("previous task mutation receipt is unavailable")
+            });
         }
 
         Ok(None)
@@ -4702,6 +4857,7 @@ fn task_create_tool_output(response: &TaskCreateResponse, anchor: &TaskTurnItem)
 
     json!({
         "taskId": response.task.id,
+        "revision": response.task.revision,
         "runId": response.run.as_ref().map(|run| run.id.clone()),
         "waitable": waitable,
         "waitRecommendation": task_create_wait_recommendation(response, waitable),
@@ -7012,6 +7168,81 @@ mod tests {
             apply_patch_preflight: None,
             cancellation: tokio_util::sync::CancellationToken::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn mutation_cache_rejects_reused_key_with_changed_postcondition() {
+        let cache = TaskToolMutationCache::default();
+        let original = task_tool_invocation(
+            TASK_UPDATE_TOOL,
+            json!({"taskId": "AAAAAAAAAAAAAAAAAAAAA", "title": "accepted"}),
+        );
+        let output = json!({"task": {"id": "AAAAAAAAAAAAAAAAAAAAA", "revision": 3}});
+        cache
+            .cache_mutation_output(&original, Some("task_update:original"), &output)
+            .await
+            .unwrap();
+        assert_eq!(
+            cache
+                .cached_mutation_output(&original, "task_update:original")
+                .await
+                .unwrap(),
+            Some(output)
+        );
+        let changed = task_tool_invocation(
+            TASK_UPDATE_TOOL,
+            json!({"taskId": "AAAAAAAAAAAAAAAAAAAAA", "title": "changed"}),
+        );
+        assert!(
+            cache
+                .cached_mutation_output(&changed, "task_update:original")
+                .await
+                .is_err()
+        );
+        assert!(
+            cache
+                .cached_mutation_output(&changed, "missing")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn cached_mutation_receipts_require_canonical_identity_revision_and_bound_arguments() {
+        let original = json!({"taskId": "AAAAAAAAAAAAAAAAAAAAA", "title": "accepted", "metadata": {"a": 1, "b": 2}});
+        let reordered = json!({"metadata": {"b": 2, "a": 1}, "title": "accepted", "taskId": "AAAAAAAAAAAAAAAAAAAAA"});
+        assert_eq!(
+            mutation_arguments_sha256(&original),
+            mutation_arguments_sha256(&reordered)
+        );
+        let mut changed = original.clone();
+        changed["title"] = json!("different postcondition");
+        assert_ne!(
+            mutation_arguments_sha256(&original),
+            mutation_arguments_sha256(&changed)
+        );
+        let invocation = task_tool_invocation(TASK_UPDATE_TOOL, original);
+        let accepted = json!({"task": {"id": "AAAAAAAAAAAAAAAAAAAAA", "revision": 8}});
+        assert_eq!(
+            cached_task_mutation_receipt(&invocation, &accepted).unwrap(),
+            Some(("AAAAAAAAAAAAAAAAAAAAA", 8, false))
+        );
+        let foreign = json!({"task": {"id": "BBBBBBBBBBBBBBBBBBBBB", "revision": 8}});
+        assert!(cached_task_mutation_receipt(&invocation, &foreign).is_err());
+        let missing_revision = json!({"task": {"id": "AAAAAAAAAAAAAAAAAAAAA"}});
+        assert!(cached_task_mutation_receipt(&invocation, &missing_revision).is_err());
+        let creation = task_tool_invocation(
+            TASK_CREATE_TOOL,
+            json!({"idempotencyKey": "original-creation"}),
+        );
+        let legacy = json!({"taskId": "AAAAAAAAAAAAAAAAAAAAA"});
+        assert!(cached_task_mutation_receipt(&creation, &legacy).is_err());
+        let current = json!({"taskId": "AAAAAAAAAAAAAAAAAAAAA", "revision": 1});
+        assert_eq!(
+            cached_task_mutation_receipt(&creation, &current).unwrap(),
+            Some(("AAAAAAAAAAAAAAAAAAAAA", 1, true))
+        );
     }
 
     #[test]

@@ -137,6 +137,39 @@ pub async fn find_task_by_id<C: ConnectionTrait>(
         .context("failed to query task by id")
 }
 
+/// An existing creation remains proved while the same owned Task exists.
+/// Mutable update/reschedule receipts must match the exact current revision.
+pub(crate) async fn mutation_receipt_is_current<C: ConnectionTrait>(
+    db: &C,
+    workspace_id: &str,
+    task_id: &str,
+    receipt_revision: i64,
+    creator_turn: Option<&str>,
+) -> Result<bool> {
+    if receipt_revision <= 0 {
+        return Ok(false);
+    }
+    let row = db
+        .query_one_raw(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Sqlite,
+            "SELECT EXISTS(SELECT 1 FROM task WHERE id=? AND workspace_id=? \
+         AND (revision=? OR (? IS NOT NULL AND revision>?)) \
+         AND (? IS NULL OR created_by_turn_id=?)) AS current",
+            [
+                task_id.to_owned().into(),
+                workspace_id.to_owned().into(),
+                receipt_revision.into(),
+                creator_turn.map(str::to_owned).into(),
+                receipt_revision.into(),
+                creator_turn.map(str::to_owned).into(),
+                creator_turn.map(str::to_owned).into(),
+            ],
+        ))
+        .await?
+        .context("task receipt proof unavailable")?;
+    Ok(row.try_get::<i64>("", "current")? == 1)
+}
+
 pub async fn list_tasks_by_workspace_status_scoped<C: ConnectionTrait>(
     db: &C,
     workspace_id: &str,

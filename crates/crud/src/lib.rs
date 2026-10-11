@@ -15453,6 +15453,23 @@ impl CrudStore {
             .transpose()
     }
 
+    pub async fn task_mutation_receipt_is_current(
+        &self,
+        workspace_id: &str,
+        task_id: &str,
+        receipt_revision: i64,
+        creator_turn: Option<&str>,
+    ) -> Result<bool> {
+        task_repository::mutation_receipt_is_current(
+            &self.connection,
+            workspace_id,
+            task_id,
+            receipt_revision,
+            creator_turn,
+        )
+        .await
+    }
+
     pub async fn upsert_task_actor_contract(
         &self,
         contract: &pioneer_protocol::TaskActorContract,
@@ -45780,6 +45797,92 @@ mod tests {
             .expect("projection watermark fixture should update")
             .rows_affected;
         assert_eq!(updated, 1, "projection stream fixture must exist");
+    }
+
+    #[tokio::test]
+    async fn task_mutation_receipt_proof_requires_current_scope_revision_and_creation_owner() {
+        let connection = Database::connect("sqlite::memory:").await.unwrap();
+        Migrator::up(&connection, None).await.unwrap();
+        let store = CrudStore::new(connection).with_maintenance_access();
+        let mut task = sample_task(1_700_000_000);
+        task.revision = 2;
+        store
+            .append_task_event(
+                TaskEventPayload::TaskCreated { task: task.clone() },
+                task.created_at,
+            )
+            .await
+            .unwrap();
+        let db = store.database_connection();
+        assert_eq!(
+            db.read_class(),
+            pioneer_sqlite::SqliteReadClass::Maintenance
+        );
+        assert!(
+            store
+                .task_mutation_receipt_is_current(&task.workspace_id, &task.id, 2, None)
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .task_mutation_receipt_is_current(
+                    &task.workspace_id,
+                    &task.id,
+                    2,
+                    Some("turn_task")
+                )
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .task_mutation_receipt_is_current("foreign", &task.id, 2, None)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .task_mutation_receipt_is_current(&task.workspace_id, &task.id, 2, Some("foreign"))
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .task_mutation_receipt_is_current(&task.workspace_id, &task.id, 0, None)
+                .await
+                .unwrap()
+        );
+        db.execute_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "UPDATE task SET revision=3 WHERE id=?",
+            [task.id.clone().into()],
+        ))
+        .await
+        .unwrap();
+        assert!(
+            !store
+                .task_mutation_receipt_is_current(&task.workspace_id, &task.id, 2, None)
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .task_mutation_receipt_is_current(
+                    &task.workspace_id,
+                    &task.id,
+                    2,
+                    Some("turn_task")
+                )
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .task_mutation_receipt_is_current(&task.workspace_id, "missing", 2, None)
+                .await
+                .unwrap()
+        );
     }
 
     fn sample_task(timestamp: i64) -> Task {
