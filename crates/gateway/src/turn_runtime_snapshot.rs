@@ -136,6 +136,16 @@ pub(crate) fn validate_runtime_snapshot_for_resume(
         .initial_phase_json
         .as_deref()
         .context("native initial preparation unavailable")?;
+    let _ = pioneer_agent::NativeInitialPreparation::restore(
+        initial,
+        &snapshot.workspace_id,
+        &snapshot.thread_id,
+        &snapshot.turn_id,
+        snapshot
+            .remaining_storage_bytes()?
+            .checked_add(initial.len())
+            .context("native initial phase allowance invalid")?,
+    )?;
     pioneer_agent::NativeInitialPreparation::validate_for_resume(
         initial,
         snapshot

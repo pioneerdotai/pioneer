@@ -33,7 +33,8 @@ pub struct McpDynamicToolAnnotations {
     pub open_world_hint: Option<bool>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct McpDynamicToolDescriptor {
     pub callable_name: String,
     pub workspace_id: String,

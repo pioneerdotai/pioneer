@@ -135,6 +135,67 @@ impl TaskToolProvider for GatewayTaskToolProvider {
         "pioneer.gateway.attached-task-cleanup.v1"
     }
 
+    async fn restore_task_tools(
+        &self,
+        context: TaskTurnContext,
+        accepted_specs: &[Vec<pioneer_tools::ConfiguredToolSpec>],
+    ) -> Result<TaskToolMaterialization, String> {
+        let processor = self.processor()?;
+        let authorization = resolve_task_tool_authorization_scope(processor.as_ref(), &context)
+            .await
+            .map_err(|_| "accepted Task tool authorization unavailable".to_owned())?;
+        let handler = Arc::new(TaskToolHandler {
+            processor,
+            context,
+            mutation_cache: Arc::new(TaskToolMutationCache::default()),
+        });
+        let catalog = task_tool_specs();
+        let mut bundles = Vec::new();
+        for original in accepted_specs {
+            let mut bundle = ToolExtensionBundle::default();
+            for configured in original {
+                let name = &configured.spec.name;
+                let canonical = catalog
+                    .iter()
+                    .find(|s| &s.spec.name == name)
+                    .ok_or_else(|| "accepted Task tool schema owner unavailable".to_owned())?;
+                let encoded = crate::turn_runtime_snapshot::to_snapshot_json(
+                    configured,
+                    "accepted Task spec",
+                )
+                .map_err(|_| "accepted Task spec unavailable".to_owned())?;
+                let expected =
+                    crate::turn_runtime_snapshot::to_snapshot_json(canonical, "Task spec")
+                        .map_err(|_| "Task spec unavailable".to_owned())?;
+                if encoded != expected
+                    || !authorization.granted_actions.contains(
+                        &task_tool_resource_action(name)
+                            .map_err(|_| "Task action unavailable".to_owned())?,
+                    )
+                {
+                    return Err("accepted Task tool contract unavailable".to_owned());
+                }
+                authorization
+                    .authorize_root_action(
+                        handler.processor.crud_store.as_ref(),
+                        task_tool_resource_action(name)
+                            .map_err(|_| "Task action unavailable".to_owned())?,
+                    )
+                    .await
+                    .map_err(|_| "accepted Task action revoked".to_owned())?;
+                bundle.specs.push(configured.clone());
+                bundle
+                    .handlers
+                    .push((name.clone(), handler.clone() as Arc<dyn ToolHandler>));
+            }
+            bundles.push(bundle);
+        }
+        Ok(TaskToolMaterialization {
+            bundles,
+            diagnostics: Vec::new(),
+        })
+    }
+
     async fn materialize_task_tools(
         &self,
         context: TaskTurnContext,

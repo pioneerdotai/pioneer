@@ -491,3 +491,62 @@ async fn initial_phase_commit_fences_original_owner_context_window_and_storage_b
         Some(next)
     );
 }
+
+#[tokio::test]
+async fn native_initial_mcp_projection_header_cannot_materialize_oversized_legacy_text() {
+    let workspace = "ws_initial_mcp_header_bounds";
+    let store = test_store_with_workspace(workspace)
+        .await
+        .with_maintenance_access();
+    let now = unix_to_datetime(1_700_000_000);
+    let snapshot = candidate_snapshot(workspace, now);
+    seed_native_owner(&store, &snapshot).await;
+    store.connection.execute_raw(Statement::from_sql_and_values(DatabaseBackend::Sqlite,
+        "INSERT INTO turn_mcp_projection(turn_id,workspace_id,projection_version,manifest_hash,resolution_status,tool_count,created_at) VALUES(?,?,1,?,'resolved',0,?)",
+        [snapshot.turn_id.clone().into(), workspace.into(), "original-manifest".into(), now.into()])).await.unwrap();
+    assert_eq!(
+        store
+            .get_turn_mcp_projection(&snapshot.turn_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .manifest_hash,
+        "original-manifest"
+    );
+    store
+        .connection
+        .execute_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "UPDATE turn_mcp_projection SET manifest_hash=? WHERE turn_id=?",
+            [
+                "é".repeat(pioneer_protocol::TURN_EXECUTION_REQUEST_MAX_BYTES / 2)
+                    .into(),
+                snapshot.turn_id.clone().into(),
+            ],
+        ))
+        .await
+        .unwrap();
+    assert!(
+        store
+            .get_turn_mcp_projection(&snapshot.turn_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    store
+        .connection
+        .execute_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "UPDATE turn_mcp_projection SET manifest_hash='original-manifest' WHERE turn_id=?",
+            [snapshot.turn_id.into()],
+        ))
+        .await
+        .unwrap();
+    assert!(
+        store
+            .get_turn_mcp_projection("snapshot_bounds_turn")
+            .await
+            .unwrap()
+            .is_some()
+    );
+}

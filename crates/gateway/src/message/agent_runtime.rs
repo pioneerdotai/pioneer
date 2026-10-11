@@ -8704,6 +8704,13 @@ impl MessageProcessor {
             snapshot.turn_id == turn_id
                 && crate::turn_runtime_snapshot::validate_runtime_snapshot_for_resume(snapshot)
                     .is_ok()
+                && snapshot.initial_phase_json.as_deref().is_some_and(|phase| {
+                    pioneer_agent::NativeInitialPreparation::completed_for_resume(
+                        phase,
+                        pioneer_protocol::TURN_EXECUTION_REQUEST_MAX_BYTES,
+                    )
+                    .unwrap_or(false)
+                })
         });
         let checkpoint_compatible = checkpoint.as_ref().is_some_and(|checkpoint| {
             serde_json::from_value::<pioneer_protocol::ExecutionCheckpointPayload>(

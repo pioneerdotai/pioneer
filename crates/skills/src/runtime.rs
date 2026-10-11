@@ -406,6 +406,7 @@ pub enum RuntimeToolExcludedReason {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExcludedRuntimeTool {
     pub skill_id: SkillId,
     pub skill_slug: String,
@@ -414,6 +415,7 @@ pub struct ExcludedRuntimeTool {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SkillRuntimePlan {
     pub tools: Vec<SkillRuntimeDescriptor>,
     pub read_skill_index: HashMap<String, ReadSkillEntry>,

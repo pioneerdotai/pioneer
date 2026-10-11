@@ -38,23 +38,11 @@ impl GatewayArtifactToolProvider {
     }
 }
 
-impl GatewayArtifactFinalizationProvider {
-    pub(crate) fn new(processor: Weak<MessageProcessor>) -> Self {
-        Self { processor }
-    }
-
-    fn processor(&self) -> Result<Arc<MessageProcessor>, String> {
-        self.processor
-            .upgrade()
-            .ok_or_else(|| "message processor is no longer available".to_owned())
-    }
-}
-
-#[async_trait]
-impl TurnToolProvider for GatewayArtifactToolProvider {
-    async fn materialize_turn_tools(
+impl GatewayArtifactToolProvider {
+    async fn bind_turn_tools(
         &self,
         context: TurnToolContext,
+        restore: Option<(Option<&str>, &[Vec<pioneer_tools::ConfiguredToolSpec>])>,
     ) -> Result<TurnToolMaterialization, String> {
         let processor = self.processor()?;
         let can_read = processor
@@ -126,9 +114,18 @@ impl TurnToolProvider for GatewayArtifactToolProvider {
             bundle.handlers.push((name, artifact_handler.clone()));
         }
 
-        let agent_actions = processor
-            .materialize_agent_action_tools(agent_tool_context)
-            .await?;
+        let agent_actions = if let Some((contract, _)) = restore {
+            super::agent_action_tools::restore_native_agent_action_tools(
+                processor.clone(),
+                agent_tool_context,
+                contract,
+            )
+            .await?
+        } else {
+            processor
+                .materialize_agent_action_tools(agent_tool_context)
+                .await?
+        };
         let mut bundles = (!bundle.specs.is_empty())
             .then_some(bundle)
             .into_iter()
@@ -136,11 +133,67 @@ impl TurnToolProvider for GatewayArtifactToolProvider {
         bundles.extend(agent_actions.bundles);
         bundles.push(processor.thread_result_tools(context_for_results));
 
+        if let Some((_, accepted)) = restore {
+            if bundles.len() != accepted.len() {
+                return Err("accepted Turn tool bundles changed".to_owned());
+            }
+            for (bundle, original) in bundles.iter().zip(accepted) {
+                let actual = crate::turn_runtime_snapshot::to_snapshot_json(
+                    &bundle.specs,
+                    "Turn tool specs",
+                )
+                .map_err(|_| "Turn tool specs cannot be encoded".to_owned())?;
+                let expected = crate::turn_runtime_snapshot::to_snapshot_json(
+                    original,
+                    "accepted Turn tool specs",
+                )
+                .map_err(|_| "accepted Turn tool specs cannot be encoded".to_owned())?;
+                if actual != expected {
+                    return Err("accepted Turn tool specs changed".to_owned());
+                }
+            }
+        }
         Ok(TurnToolMaterialization {
             bundles,
             diagnostics: agent_actions.diagnostics,
             initiating_thread_id: agent_actions.initiating_thread_id,
+            native_agent_action_contract: agent_actions.native_agent_action_contract,
         })
+    }
+}
+
+impl GatewayArtifactFinalizationProvider {
+    pub(crate) fn new(processor: Weak<MessageProcessor>) -> Self {
+        Self { processor }
+    }
+
+    fn processor(&self) -> Result<Arc<MessageProcessor>, String> {
+        self.processor
+            .upgrade()
+            .ok_or_else(|| "message processor is no longer available".to_owned())
+    }
+}
+
+#[async_trait]
+impl TurnToolProvider for GatewayArtifactToolProvider {
+    async fn materialize_turn_tools(
+        &self,
+        context: TurnToolContext,
+    ) -> Result<TurnToolMaterialization, String> {
+        self.bind_turn_tools(context, None).await
+    }
+
+    async fn restore_turn_tools(
+        &self,
+        context: TurnToolContext,
+        native_agent_action_contract: Option<&str>,
+        accepted_specs: &[Vec<pioneer_tools::ConfiguredToolSpec>],
+    ) -> Result<TurnToolMaterialization, String> {
+        self.bind_turn_tools(
+            context,
+            Some((native_agent_action_contract, accepted_specs)),
+        )
+        .await
     }
 
     async fn authorize_skill_continuation(

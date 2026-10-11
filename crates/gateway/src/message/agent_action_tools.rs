@@ -1051,6 +1051,21 @@ async fn restore_persisted_agent_action_binding(
     context: &TurnToolContext,
     execution_id: &AgentExecutionId,
 ) -> anyhow::Result<()> {
+    restore_persisted_agent_action_binding_with_native_contract(
+        processor,
+        context,
+        execution_id,
+        None,
+    )
+    .await
+}
+
+async fn restore_persisted_agent_action_binding_with_native_contract(
+    processor: &Arc<MessageProcessor>,
+    context: &TurnToolContext,
+    execution_id: &AgentExecutionId,
+    native_contract: Option<&str>,
+) -> anyhow::Result<()> {
     let database = processor.crud_store.database_connection();
     let execution = pioneer_crud::load_agent_execution(&database, execution_id.as_str())
         .await?
@@ -1176,12 +1191,18 @@ async fn restore_persisted_agent_action_binding(
             allowed_action_names.as_slice(),
         )
         .map_err(|error| anyhow::anyhow!("failed to restore Agent action binding: {error:?}"))?;
-    let binding = processor
-        .prepare_agent_action_binding(
-            context.turn_id.clone(),
-            AgentActionRuntimeBinding::new(adapter, options, capabilities),
-        )
-        .await?;
+    let mut binding = AgentActionRuntimeBinding::new(adapter, options, capabilities);
+    if let Some(encoded) = native_contract {
+        binding.options = binding
+            .adapter
+            .lock()
+            .await
+            .restore_native_launch_contract(encoded)?;
+    } else {
+        binding = processor
+            .prepare_agent_action_binding(context.turn_id.clone(), binding)
+            .await?;
+    }
     processor
         .register_agent_action_binding(context.turn_id.clone(), binding)
         .await;
@@ -1914,6 +1935,13 @@ pub(crate) async fn materialize(
     ensure_root_agent_action_binding(&processor, &context, None, None)
         .await
         .map_err(|error| format!("failed to bind root Agent execution: {error:#}"))?;
+    project_materialized_agent_action_tools(processor, context).await
+}
+
+async fn project_materialized_agent_action_tools(
+    processor: Arc<MessageProcessor>,
+    context: TurnToolContext,
+) -> Result<pioneer_agent::TurnToolMaterialization, String> {
     let Some(binding) = processor
         .agent_action_binding(context.turn_id.as_str())
         .await
@@ -1933,10 +1961,19 @@ pub(crate) async fn materialize(
             .persistence_facts()
             .home_root_thread_id,
     );
+    let native_agent_action_contract = Some(
+        binding
+            .adapter
+            .lock()
+            .await
+            .capture_native_launch_contract()
+            .map_err(|_| "native Agent launch contract cannot be captured".to_owned())?,
+    );
     let catalog = project_agent_model_tool_catalog(&binding.capabilities, options.as_ref());
     if catalog.is_empty() {
         return Ok(pioneer_agent::TurnToolMaterialization {
             initiating_thread_id,
+            native_agent_action_contract,
             ..Default::default()
         });
     }
@@ -1975,7 +2012,48 @@ pub(crate) async fn materialize(
         bundles: vec![bundle],
         diagnostics: Vec::new(),
         initiating_thread_id,
+        native_agent_action_contract,
     })
+}
+
+pub(crate) async fn restore_native_agent_action_tools(
+    processor: Arc<MessageProcessor>,
+    context: TurnToolContext,
+    contract: Option<&str>,
+) -> Result<pioneer_agent::TurnToolMaterialization, String> {
+    let encoded =
+        contract.ok_or_else(|| "accepted Agent launch contract is unavailable".to_owned())?;
+    // Only an existing durable responding execution is eligible. No root
+    // admission or current launch-catalog refresh is allowed on this path.
+    let database = processor.crud_store.database_connection();
+    let execution_id = if let Some(response) =
+        pioneer_crud::load_agent_turn_response(&database, &context.turn_id)
+            .await
+            .map_err(|_| "accepted Agent execution lookup failed".to_owned())?
+    {
+        AgentExecutionId::new(response.execution_id)
+            .map_err(|_| "accepted Agent execution identity invalid".to_owned())?
+    } else {
+        let (_, turn) = processor
+            .crud_store
+            .get_turn(&context.thread_id, &context.turn_id)
+            .await
+            .map_err(|_| "accepted Agent Turn lookup failed".to_owned())?
+            .ok_or_else(|| "accepted Agent Turn unavailable".to_owned())?;
+        match turn.author.map(|author| author.actor) {
+            Some(PersistedActorRef::AgentExecution(execution_id)) => execution_id,
+            _ => return Err("accepted Agent responding execution unavailable".to_owned()),
+        }
+    };
+    restore_persisted_agent_action_binding_with_native_contract(
+        &processor,
+        &context,
+        &execution_id,
+        Some(encoded),
+    )
+    .await
+    .map_err(|_| "accepted Agent action owner cannot be restored".to_owned())?;
+    project_materialized_agent_action_tools(processor, context).await
 }
 
 fn agent_tool_recovery(tool: AgentModelToolName) -> ToolRecoveryMetadata {

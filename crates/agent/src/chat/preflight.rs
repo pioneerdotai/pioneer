@@ -303,6 +303,7 @@ pub(crate) struct TurnPreflightOrchestratorResult {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct PreflightBudgetUsage {
     pub attempts: u32,
     pub known_tokens: u64,

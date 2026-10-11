@@ -72663,6 +72663,85 @@ async fn memory_methods_fail_when_runtime_disabled() {
 }
 
 #[tokio::test]
+async fn cold_memory_and_task_owners_restore_accepted_subset_and_reject_revocation() {
+    let harness = setup_memory_gateway_harness("cold_initial_owners", true).await;
+    let context = memory_tool_context(&harness, "cold_initial");
+    let initial = materialize_memory_tools_for_context(&harness, context.clone()).await;
+    let memory =
+        crate::memory_tools::GatewayMemoryProvider::new(Arc::downgrade(&harness.processor));
+    let saved_memory = vec![vec![initial.bundles[0].specs[0].clone()]];
+    let restored = memory
+        .restore_memory_tools(context.clone(), &saved_memory)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(&restored.bundles[0].specs).unwrap(),
+        serde_json::to_value(&saved_memory[0]).unwrap()
+    );
+    let task_context = TaskTurnContext {
+        workspace_id: context.workspace_id.clone(),
+        thread_id: context.thread_id.clone(),
+        turn_id: context.turn_id.clone(),
+    };
+    let task = crate::task_tools::GatewayTaskToolProvider::new(Arc::downgrade(&harness.processor));
+    let initial_task = task
+        .materialize_task_tools(task_context.clone())
+        .await
+        .unwrap();
+    assert!(!initial_task.bundles[0].specs.is_empty());
+    let saved_task = vec![vec![initial_task.bundles[0].specs[0].clone()]];
+    let restored_task = task
+        .restore_task_tools(task_context.clone(), &saved_task)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(&restored_task.bundles[0].specs).unwrap(),
+        serde_json::to_value(&saved_task[0]).unwrap()
+    );
+    let mut changed = saved_task.clone();
+    changed[0][0]
+        .spec
+        .description
+        .push_str(" changed schema owner");
+    assert!(
+        task.restore_task_tools(task_context.clone(), &changed)
+            .await
+            .is_err()
+    );
+    let mut changed = saved_memory.clone();
+    changed[0][0].spec.description.push_str(" changed scope");
+    assert!(
+        memory
+            .restore_memory_tools(context.clone(), &changed)
+            .await
+            .is_err()
+    );
+    // Remove the existing authority after admission. Saved tool schemas are
+    // input contracts, never a replacement authorization grant.
+    harness
+        .crud_store
+        .database_connection()
+        .execute_raw(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DbBackend::Sqlite,
+            "UPDATE turn SET execution_authorization_context_json = NULL WHERE id = ?",
+            [context.turn_id.clone().into()],
+        ))
+        .await
+        .unwrap();
+    assert!(
+        memory
+            .restore_memory_tools(context, &saved_memory)
+            .await
+            .is_err()
+    );
+    assert!(
+        task.restore_task_tools(task_context, &saved_task)
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
 async fn memory_provider_materializes_five_memory_tools_when_runtime_enabled() {
     let harness = setup_memory_gateway_harness("tools_materialize", true).await;
     let materialization =

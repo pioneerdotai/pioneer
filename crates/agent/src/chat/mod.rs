@@ -2755,6 +2755,7 @@ pub(super) async fn execute_chat_turn_flow(
     turn_tool_provider: Option<Arc<dyn TurnToolProvider>>,
     turn_finalization_provider: Option<Arc<dyn TurnFinalizationProvider>>,
     task_tool_provider: Option<Arc<dyn TaskToolProvider>>,
+    memory_provider: Option<Arc<dyn crate::AgentMemoryProvider>>,
     hook_runtime: Option<Arc<HookRuntime>>,
     tool_bundle_artifacts: Option<Arc<AgentToolBundleArtifactStore>>,
     permission_approval_broker: Arc<dyn PermissionApprovalBroker>,
@@ -2853,6 +2854,7 @@ pub(super) async fn execute_chat_turn_flow(
                 turn_tool_provider,
                 turn_finalization_provider,
                 task_tool_provider,
+                memory_provider,
                 hook_runtime,
                 tool_bundle_artifacts,
                 permission_approval_broker,
@@ -4088,6 +4090,9 @@ async fn prepare_native_initial_turn(
 
         return Ok(PreparedNativeInitialTurn {
             outputs: crate::native_initial::AcceptedNativeInitialOutputs {
+                native_agent_action_contract: None,
+                mcp_descriptors: Vec::new(),
+                mcp_manifest_hash: None,
                 policy: effective_policy_set,
                 prompt_context: effective_prompt_context_set,
                 prompt_sections: effective_prompt_section_set,
@@ -4103,7 +4108,13 @@ async fn prepare_native_initial_turn(
                 selected_optional_tools: Vec::new(),
                 requested_tools: Vec::new(),
                 preflight_usage: turn_preflight.usage,
-                config: tool_loop_config.clone(),
+                config: crate::native_initial::checked_config_clone(&tool_loop_config).map_err(
+                    |_| {
+                        ChatTurnError::Blocked(
+                            "accepted initial configuration exceeds execution allowance".to_owned(),
+                        )
+                    },
+                )?,
             },
             extension_bundles: Vec::new(),
             skill_tool_materialization: None,
@@ -4453,6 +4464,12 @@ async fn prepare_native_initial_turn(
 
     Ok(PreparedNativeInitialTurn {
         outputs: crate::native_initial::AcceptedNativeInitialOutputs {
+            native_agent_action_contract: turn_tool_materialization.native_agent_action_contract,
+            mcp_manifest_hash: mcp_materialization
+                .persistence
+                .as_ref()
+                .map(|p| p.manifest_hash.clone()),
+            mcp_descriptors: mcp_materialization.descriptors,
             policy: effective_policy_set,
             prompt_context: effective_prompt_context_set,
             prompt_sections: effective_prompt_section_set,
@@ -4468,7 +4485,13 @@ async fn prepare_native_initial_turn(
             selected_optional_tools: turn_preflight.plan.tools.visible_tools.clone(),
             requested_tools: requested_tool_names,
             preflight_usage: turn_preflight.usage,
-            config: tool_loop_config.clone(),
+            config: crate::native_initial::checked_config_clone(&tool_loop_config).map_err(
+                |_| {
+                    ChatTurnError::Blocked(
+                        "accepted initial configuration exceeds execution allowance".to_owned(),
+                    )
+                },
+            )?,
         },
         extension_bundles,
         skill_tool_materialization: Some(skill_tool_materialization),
@@ -4476,9 +4499,178 @@ async fn prepare_native_initial_turn(
     })
 }
 
+/// Fixed concrete owners only. Initial hooks, catalog discovery, preflight
+/// and root admission never execute while restoring an accepted phase.
+async fn restore_native_initial_tool_owners(
+    outputs: &crate::native_initial::AcceptedNativeInitialOutputs,
+    mcp_provider: Option<&Arc<dyn AgentMcpToolProvider>>,
+    turn_provider: Option<&Arc<dyn TurnToolProvider>>,
+    task_provider: Option<&Arc<dyn TaskToolProvider>>,
+    memory_provider: Option<&Arc<dyn crate::AgentMemoryProvider>>,
+    hook_runtime_context: &AgentTurnHookRuntimeContext,
+    original_input_text: &str,
+    workspace_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+) -> Result<WarmNativeInitialTools, ChatTurnError> {
+    let unavailable =
+        || ChatTurnError::Blocked("accepted initial tool owner cannot be restored".to_owned());
+    let mut mcp_specs = Vec::new();
+    let mut memory_specs = Vec::new();
+    let mut turn_specs = Vec::new();
+    let mut task_specs = Vec::new();
+    for (entry, specs) in outputs
+        .tool_metadata
+        .entries
+        .iter()
+        .zip(&outputs.extension_specs)
+    {
+        match (entry.domain.as_str(), entry.bundle_id.as_str()) {
+            ("skill", id) if id.starts_with("skill.runtime.bundle.") => (),
+            ("turn", id) if id.starts_with("turn.runtime.bundle.") => {
+                turn_specs.push(specs.clone())
+            }
+            ("task", id) if id.starts_with("task.runtime.bundle.") => {
+                task_specs.push(specs.clone())
+            }
+            ("memory", id) if id.starts_with("memory.tool_bundle.bundle.") => {
+                memory_specs.push(specs.clone())
+            }
+            ("mcp", id) if id.starts_with("mcp.runtime.bundle.") => mcp_specs.push(specs.clone()),
+            // Unsupported external hook owners never become builtins.
+            _ => return Err(unavailable()),
+        }
+    }
+    let skills = Some(Arc::new(skill_tools::materialize_skill_tooling(
+        &outputs.skill_plan,
+        &outputs.config.skills,
+    )));
+    let turns = if turn_specs.is_empty() {
+        Vec::new()
+    } else {
+        turn_provider
+            .ok_or_else(unavailable)?
+            .restore_turn_tools(
+                TurnToolContext {
+                    workspace_id: workspace_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                },
+                outputs.native_agent_action_contract.as_deref(),
+                &turn_specs,
+            )
+            .await
+            .map_err(|_| unavailable())?
+            .bundles
+    };
+    let tasks = if task_specs.is_empty() {
+        Vec::new()
+    } else {
+        task_provider
+            .ok_or_else(unavailable)?
+            .restore_task_tools(
+                TaskTurnContext {
+                    workspace_id: workspace_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                },
+                &task_specs,
+            )
+            .await
+            .map_err(|_| unavailable())?
+            .bundles
+    };
+    let memory = if memory_specs.is_empty() {
+        Vec::new()
+    } else {
+        memory_provider
+            .ok_or_else(unavailable)?
+            .restore_memory_tools(
+                pioneer_memory::hooks::MemoryTurnContext {
+                    workspace_id: workspace_id.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    mode: ThreadMode::Agent,
+                    conversation_thread_id: hook_runtime_context.conversation_thread_id.clone(),
+                    input_text: original_input_text.to_owned(),
+                    task_id: hook_runtime_context.task_id.clone(),
+                    agent_id: hook_runtime_context.agent_id.clone(),
+                    principal_id: (hook_runtime_context.actor_kind
+                        == pioneer_hooks::HookActorKind::User)
+                        .then(|| hook_runtime_context.actor_id.clone())
+                        .flatten(),
+                },
+                &memory_specs,
+            )
+            .await
+            .map_err(|_| unavailable())?
+            .bundles
+    };
+    let mcp = if mcp_specs.is_empty() {
+        Vec::new()
+    } else {
+        mcp_provider
+            .ok_or_else(unavailable)?
+            .restore_mcp_tools(
+                workspace_id,
+                turn_id,
+                outputs
+                    .mcp_manifest_hash
+                    .as_deref()
+                    .ok_or_else(unavailable)?,
+                &outputs.mcp_descriptors,
+            )
+            .await
+            .map_err(|_| unavailable())?
+    };
+    let mut bundles = Vec::new();
+    for (entry, original) in outputs
+        .tool_metadata
+        .entries
+        .iter()
+        .zip(&outputs.extension_specs)
+    {
+        let (prefix, owned) = match entry.domain.as_str() {
+            "skill" => (
+                "skill.runtime.bundle.",
+                skills.as_ref().ok_or_else(unavailable)?.bundles.as_slice(),
+            ),
+            "turn" => ("turn.runtime.bundle.", turns.as_slice()),
+            "task" => ("task.runtime.bundle.", tasks.as_slice()),
+            "memory" => ("memory.tool_bundle.bundle.", memory.as_slice()),
+            "mcp" => ("mcp.runtime.bundle.", mcp.as_slice()),
+            _ => return Err(unavailable()),
+        };
+        let index: usize = entry
+            .bundle_id
+            .as_str()
+            .strip_prefix(prefix)
+            .and_then(|n| n.parse().ok())
+            .ok_or_else(unavailable)?;
+        let bundle = owned.get(index).ok_or_else(unavailable)?;
+        let actual = crate::native_initial::checked_extension_specs(std::slice::from_ref(bundle))
+            .map_err(|_| unavailable())?;
+        // Objects retain their semantic JSON key order independence; arrays
+        // and every configured policy/binding remain exact.
+        if serde_json::to_value(&actual[0]).map_err(|_| unavailable())?
+            != serde_json::to_value(original).map_err(|_| unavailable())?
+        {
+            return Err(unavailable());
+        }
+        bundles.push(bundle.clone());
+    }
+    Ok(WarmNativeInitialTools { bundles, skills })
+}
+
 async fn restore_prepared_native_initial_turn(
     outputs: &crate::native_initial::AcceptedNativeInitialOutputs,
     warm: Option<&WarmNativeInitialTools>,
+    mcp_provider: Option<&Arc<dyn AgentMcpToolProvider>>,
+    turn_provider: Option<&Arc<dyn TurnToolProvider>>,
+    task_provider: Option<&Arc<dyn TaskToolProvider>>,
+    memory_provider: Option<&Arc<dyn crate::AgentMemoryProvider>>,
+    hook_runtime_context: &AgentTurnHookRuntimeContext,
+    original_input_text: &str,
     runtime_environment: &HashMap<String, String>,
     permission_profile: &TurnPermissionProfileSnapshot,
     security_snapshot: Option<&TurnExecutionSecuritySnapshot>,
@@ -4496,11 +4688,25 @@ async fn restore_prepared_native_initial_turn(
             tools: None,
         });
     }
-    let warm = warm.ok_or_else(|| {
-        ChatTurnError::Blocked(
-            "committed initial tools require their concrete cold restore owners".to_owned(),
+    let cold;
+    let warm = if let Some(warm) = warm {
+        warm
+    } else {
+        cold = restore_native_initial_tool_owners(
+            outputs,
+            mcp_provider,
+            turn_provider,
+            task_provider,
+            memory_provider,
+            hook_runtime_context,
+            original_input_text,
+            workspace_id,
+            thread_id,
+            turn_id,
         )
-    })?;
+        .await?;
+        &cold
+    };
     let workdir = workdir_from_execution_security_snapshot(security_snapshot)?;
     let tools = build_tools_with_environment_and_security_snapshot(
         workdir,
@@ -4573,6 +4779,7 @@ async fn execute_agent_provider_response(
     turn_tool_provider: Option<Arc<dyn TurnToolProvider>>,
     turn_finalization_provider: Option<Arc<dyn TurnFinalizationProvider>>,
     task_tool_provider: Option<Arc<dyn TaskToolProvider>>,
+    memory_provider: Option<Arc<dyn crate::AgentMemoryProvider>>,
     hook_runtime: Option<Arc<HookRuntime>>,
     tool_bundle_artifacts: Option<Arc<AgentToolBundleArtifactStore>>,
     permission_approval_broker: Arc<dyn PermissionApprovalBroker>,
@@ -4646,6 +4853,12 @@ async fn execute_agent_provider_response(
             restore_prepared_native_initial_turn(
                 outputs,
                 initial.warm_tools.as_ref(),
+                mcp_tool_provider.as_ref(),
+                turn_tool_provider.as_ref(),
+                task_tool_provider.as_ref(),
+                memory_provider.as_ref(),
+                &hook_runtime_context,
+                user_input_text.as_str(),
                 &runtime_environment,
                 &permission_profile,
                 execution_security_snapshot.as_ref(),
@@ -4776,6 +4989,12 @@ async fn execute_agent_provider_response(
             }
         }
     };
+    if initial.warm_tools.is_none() {
+        initial.warm_tools = Some(WarmNativeInitialTools {
+            bundles: prepared.extension_bundles.clone(),
+            skills: prepared.skill_tool_materialization.clone(),
+        });
+    }
     drop(initial);
     let PreparedNativeInitialTurn {
         outputs,
@@ -10499,5 +10718,59 @@ mod compaction_result_budget_tests {
         assert!(page.content_parts.is_empty());
         assert!(page.content.contains("fixture-ref"));
         assert!(source.content_parts.len() == 1);
+    }
+}
+
+#[cfg(test)]
+mod cold_initial_owner_tests {
+    #[tokio::test]
+    async fn cold_restore_keeps_skill_bridge_without_initial_hooks_and_rejects_unknown_owner() {
+        let mut outputs = crate::native_initial::tests::outputs();
+        outputs.provider_tool_calling = true;
+        let restored = super::restore_native_initial_tool_owners(
+            &outputs,
+            None,
+            None,
+            None,
+            None,
+            &crate::AgentTurnHookRuntimeContext::default(),
+            "original input",
+            "workspace",
+            "thread",
+            "turn",
+        )
+        .await
+        .unwrap();
+        assert!(restored.skills.is_some());
+        assert!(restored.bundles.is_empty());
+        outputs
+            .tool_metadata
+            .entries
+            .push(pioneer_hooks::HookToolBundleEntry {
+                contribution_id: pioneer_hooks::HookContributionId::new("custom.contribution.0")
+                    .unwrap(),
+                bundle_id: pioneer_hooks::HookToolBundleId::new("custom.bundle.0").unwrap(),
+                domain: pioneer_hooks::HookDomain::new("custom").unwrap(),
+                priority: 1,
+                tool_names: Vec::new(),
+                diagnostics: Vec::new(),
+            });
+        outputs.extension_specs.push(Vec::new());
+        assert!(
+            super::restore_native_initial_tool_owners(
+                &outputs,
+                None,
+                None,
+                None,
+                None,
+                &crate::AgentTurnHookRuntimeContext::default(),
+                "original input",
+                "workspace",
+                "thread",
+                "turn"
+            )
+            .await
+            .is_err()
+        );
     }
 }

@@ -850,10 +850,12 @@ fn explicit_mcp_tool_materialization(
         selection_reason: "explicit_composer_capability".to_owned(),
         capability_id: Some(capability_id.to_owned()),
     };
+    let descriptors = vec![descriptor];
     let materialized =
-        pioneer_tools::materialize_mcp_runtime_tools(&[descriptor], Arc::new(NoopMcpToolExecutor));
+        pioneer_tools::materialize_mcp_runtime_tools(&descriptors, Arc::new(NoopMcpToolExecutor));
 
     AgentMcpMaterialization {
+        descriptors,
         bundles: materialized.bundles,
         available_mcp: vec!["resend".to_owned(), "resend/send".to_owned()],
         blocked_mcp: Vec::new(),

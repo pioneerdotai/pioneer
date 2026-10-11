@@ -13,6 +13,9 @@ use std::sync::Arc;
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct AcceptedNativeInitialOutputs {
+    pub(crate) native_agent_action_contract: Option<String>,
+    pub(crate) mcp_descriptors: Vec<pioneer_tools::McpDynamicToolDescriptor>,
+    pub(crate) mcp_manifest_hash: Option<String>,
     pub(crate) policy: EffectiveTurnPolicySet,
     pub(crate) prompt_context: EffectiveTurnPromptContextSet,
     pub(crate) prompt_sections: EffectiveTurnPromptSectionSet,
@@ -157,6 +160,42 @@ impl NativeInitialPreparation {
         Ok(())
     }
 
+    /// A durable continuation requires completed initial outputs. Admission
+    /// validation alone also permits NotStarted, which cannot prove resume.
+    pub fn completed_for_resume(encoded: &str, byte_budget: usize) -> Result<bool> {
+        let snapshot = decode(encoded, byte_budget)?;
+        let InitialPhase::Completed { outputs } = snapshot.state else {
+            return Ok(false);
+        };
+        for entry in &outputs.tool_metadata.entries {
+            let prefix = match entry.domain.as_str() {
+                "skill" => "skill.runtime.bundle.",
+                "turn" if outputs.native_agent_action_contract.is_some() => "turn.runtime.bundle.",
+                "task" => "task.runtime.bundle.",
+                "memory" => "memory.tool_bundle.bundle.",
+                "mcp"
+                    if outputs.mcp_manifest_hash.is_some()
+                        && !outputs.mcp_descriptors.is_empty() =>
+                {
+                    "mcp.runtime.bundle."
+                }
+                _ => return Ok(false),
+            };
+            let Some(index) = entry
+                .bundle_id
+                .as_str()
+                .strip_prefix(prefix)
+                .and_then(|n| n.parse::<usize>().ok())
+            else {
+                return Ok(false);
+            };
+            if index >= 256 || entry.bundle_id.as_str() != format!("{prefix}{index}") {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     pub fn validate_transition(previous: &str, next: &str, byte_budget: usize) -> Result<()> {
         let previous = decode(previous, byte_budget)?;
         let next = decode(next, byte_budget)?;
@@ -185,6 +224,12 @@ pub(crate) fn digest(encoded: &str) -> String {
 
 pub(crate) fn encode(snapshot: &InitialPhaseSnapshot, byte_budget: usize) -> Result<String> {
     bounded_json(snapshot, byte_budget)
+}
+
+/// Bound the borrowed configuration before retaining its owned turn copy.
+pub(crate) fn checked_config_clone(config: &ToolLoopConfig) -> Result<ToolLoopConfig> {
+    bounded_json(config, pioneer_protocol::TURN_EXECUTION_REQUEST_MAX_BYTES)?;
+    Ok(config.clone())
 }
 
 /// Measure the borrowed catalog before retaining a second owned copy. The
@@ -262,6 +307,17 @@ fn decode(encoded: &str, byte_budget: usize) -> Result<InitialPhaseSnapshot> {
         "initial preparation version unavailable"
     );
     if let InitialPhase::Completed { outputs } = &snapshot.state {
+        ensure!(
+            outputs.mcp_descriptors.len() <= 256,
+            "initial MCP descriptor count exceeds native limit"
+        );
+        ensure!(
+            outputs
+                .mcp_descriptors
+                .iter()
+                .all(|d| d.workspace_id == snapshot.workspace_id),
+            "initial MCP descriptor scope differs"
+        );
         pioneer_promt::validate_native_instruction_plan(&outputs.instructions)
             .map_err(|_| anyhow::anyhow!("initial instruction plan unavailable"))?;
         ensure!(
@@ -398,7 +454,7 @@ fn validate_shape(encoded: &str) -> Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     const LIMIT: usize = pioneer_protocol::TURN_EXECUTION_REQUEST_MAX_BYTES;
 
@@ -411,7 +467,7 @@ mod tests {
         .unwrap()
     }
 
-    fn outputs() -> AcceptedNativeInitialOutputs {
+    pub(crate) fn outputs() -> AcceptedNativeInitialOutputs {
         let root = tempfile::tempdir().unwrap();
         let bundle = pioneer_promt::compile_prompt(pioneer_promt::PromptCompileInput {
             workspace_root: root.path().to_owned(),
@@ -429,6 +485,9 @@ mod tests {
         })
         .unwrap();
         AcceptedNativeInitialOutputs {
+            native_agent_action_contract: None,
+            mcp_descriptors: Vec::new(),
+            mcp_manifest_hash: None,
             policy: Default::default(),
             prompt_context: Default::default(),
             prompt_sections: Default::default(),
@@ -460,6 +519,7 @@ mod tests {
     fn phase_transition_keeps_scope_and_clock_and_rejects_ambiguous_rerun() {
         let snapshot = admitted();
         let original = encode(&snapshot, LIMIT).unwrap();
+        assert!(!NativeInitialPreparation::completed_for_resume(&original, LIMIT).unwrap());
         let mut preparing = snapshot.clone();
         preparing.state = InitialPhase::Preparing;
         let encoded = encode(&preparing, LIMIT).unwrap();
@@ -497,6 +557,7 @@ mod tests {
             outputs: Box::new(owned),
         };
         let encoded = encode(&completed, LIMIT).unwrap();
+        assert!(NativeInitialPreparation::completed_for_resume(&encoded, LIMIT).unwrap());
         NativeInitialPreparation::validate_transition(&previous, &encoded, LIMIT).unwrap();
         let restored =
             NativeInitialPreparation::restore(&encoded, "workspace", "thread", "turn", LIMIT)

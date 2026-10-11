@@ -285,6 +285,7 @@ pub struct AgentMcpAvailability {
 
 #[derive(Clone, Default)]
 pub struct AgentMcpMaterialization {
+    pub descriptors: Vec<pioneer_tools::McpDynamicToolDescriptor>,
     pub bundles: Vec<pioneer_tools::ToolExtensionBundle>,
     pub available_mcp: Vec<String>,
     pub blocked_mcp: Vec<String>,
@@ -412,6 +413,16 @@ pub trait AgentMcpToolProvider: Send + Sync {
         request: AgentMcpMaterializationRequest,
     ) -> Result<AgentMcpMaterialization, AgentMcpMaterializationError>;
 
+    async fn restore_mcp_tools(
+        &self,
+        _workspace_id: &str,
+        _turn_id: &str,
+        _manifest_hash: &str,
+        _descriptors: &[pioneer_tools::McpDynamicToolDescriptor],
+    ) -> Result<Vec<pioneer_tools::ToolExtensionBundle>, String> {
+        Err("accepted MCP tool owner does not support cold restoration".to_owned())
+    }
+
     async fn persist_mcp_projection(
         &self,
         request: AgentMcpProjectionPersistenceRequest,
@@ -493,6 +504,9 @@ pub struct TurnToolContext {
 
 #[derive(Clone, Default)]
 pub struct TurnToolMaterialization {
+    /// Original concrete Agent action launch catalog; no adapter or authority
+    /// lease is serialized. Its owner validates/rebinds it on cold restore.
+    pub native_agent_action_contract: Option<String>,
     pub bundles: Vec<pioneer_tools::ToolExtensionBundle>,
     pub diagnostics: Vec<String>,
     pub initiating_thread_id: Option<String>,
@@ -513,6 +527,15 @@ pub trait TurnToolProvider: Send + Sync {
         &self,
         context: TurnToolContext,
     ) -> Result<TurnToolMaterialization, String>;
+
+    async fn restore_turn_tools(
+        &self,
+        _context: TurnToolContext,
+        _native_agent_action_contract: Option<&str>,
+        _accepted_specs: &[Vec<pioneer_tools::ConfiguredToolSpec>],
+    ) -> Result<TurnToolMaterialization, String> {
+        Err("accepted Turn tool owner does not support cold restoration".to_owned())
+    }
 
     async fn authorize_skill_continuation(
         &self,
@@ -557,6 +580,14 @@ pub trait TaskToolProvider: Send + Sync {
         &self,
         context: TaskTurnContext,
     ) -> Result<TaskToolMaterialization, String>;
+
+    async fn restore_task_tools(
+        &self,
+        _context: TaskTurnContext,
+        _accepted_specs: &[Vec<pioneer_tools::ConfiguredToolSpec>],
+    ) -> Result<TaskToolMaterialization, String> {
+        Err("accepted Task tool owner does not support cold restoration".to_owned())
+    }
 
     /// Read the parent task gate as one logical snapshot.  The default is
     /// retained for lightweight providers and test doubles; the Gateway
@@ -2542,6 +2573,7 @@ pub(crate) struct NativeTurnRuntimeSnapshot {
     pub(crate) mcp_tool_provider: Option<Arc<dyn AgentMcpToolProvider>>,
     pub(crate) turn_tool_provider: Option<Arc<dyn TurnToolProvider>>,
     pub(crate) turn_finalization_provider: Option<Arc<dyn TurnFinalizationProvider>>,
+    pub(crate) memory_provider: Option<Arc<dyn AgentMemoryProvider>>,
     pub(crate) task_tool_provider: Option<Arc<dyn TaskToolProvider>>,
     pub(crate) task_cleanup_runtime_contract: Option<String>,
     pub(crate) hook_runtime: Option<Arc<HookRuntime>>,
@@ -2727,6 +2759,7 @@ impl NativeRuntimeDependencies {
             turn_tool_provider: state.turn_tool_provider.clone(),
             turn_finalization_provider: state.turn_finalization_provider.clone(),
             task_tool_provider: state.task_tool_provider.clone(),
+            memory_provider: state.memory_provider.clone(),
             task_cleanup_runtime_contract: state
                 .task_tool_provider
                 .as_ref()

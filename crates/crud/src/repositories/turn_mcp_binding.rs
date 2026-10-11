@@ -130,6 +130,12 @@ pub async fn find_turn_mcp_projection<C: ConnectionTrait>(
     turn_id: &str,
 ) -> Result<Option<turn_mcp_projection::Model>> {
     turn_mcp_projection::Entity::find_by_id(turn_id.to_owned())
+        // Bound stored TEXT before the driver materializes legacy/corrupt data.
+        // A missing executable header is an explicit unavailable outcome at
+        // both invocation and initial-phase restore consumers.
+        .filter(Expr::cust_with_values(
+            "coalesce(length(cast(turn_id as blob)),0)+coalesce(length(cast(workspace_id as blob)),0)+coalesce(length(cast(manifest_hash as blob)),0)+coalesce(length(cast(resolution_status as blob)),0) <= ?",
+            [pioneer_protocol::TURN_EXECUTION_REQUEST_MAX_BYTES as i64]))
         .one(db)
         .await
         .context("failed to query turn MCP projection header")
