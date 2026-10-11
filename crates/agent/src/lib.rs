@@ -12,6 +12,9 @@ mod manager_recovery;
 mod native_initial;
 pub use native_initial::{NativeInitialPreparation, NativeInitialResumeRequirements};
 
+/// Agent owns this bounded semantic codec; readers must reject other versions.
+pub const NATIVE_SEMANTIC_STATE_SCHEMA_VERSION: u32 = 3;
+
 /// Read-only structural proof; actual restore still revalidates all authority.
 pub fn native_semantic_checkpoint_compatible(
     payload: &pioneer_protocol::ExecutionCheckpointPayload,

@@ -27,9 +27,16 @@ mod markdown;
 mod mcp;
 mod member;
 mod memory;
+mod native_control;
 mod notification;
 mod patch_history;
 mod provider;
+pub use native_control::{
+    NATIVE_CONTROL_MAX_PENDING, NATIVE_CONTROL_RECORD_MAX_BYTES, NATIVE_CONTROL_STORAGE_MAX_BYTES,
+    NativeControlCheckpointState, NativeControlObservation, NativeControlOrigin,
+    NativeControlRecord, NativeControlRef, NativeControlSourceUnavailable, NativeControlTrust,
+    NativeHostControl, NativeHostDirective, encode_native_control,
+};
 mod public_error;
 mod recovery_diagnostic;
 pub use recovery_diagnostic::{

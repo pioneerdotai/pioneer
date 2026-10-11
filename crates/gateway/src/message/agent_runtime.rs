@@ -4459,6 +4459,7 @@ impl MessageProcessor {
                 execution_owner_generation,
                 runtime_generation,
                 checkpoint,
+                control,
             } => message_future(async move {
                 let commit = async {
                     let snapshot = self
@@ -4493,6 +4494,7 @@ impl MessageProcessor {
                     self.crud_store
                         .commit_native_semantic_checkpoint(
                             checkpoint,
+                            control,
                             runtime_generation,
                             self.turn_execution_owner_id.as_ref(),
                             execution_owner_generation
@@ -8840,6 +8842,33 @@ impl MessageProcessor {
                         window.id == checkpoint.window_id
                             && window.status == pioneer_protocol::ExecutionWindowStatus::Running
                     });
+        }
+        if checkpoint_compatible && let Some(checkpoint) = checkpoint.as_ref() {
+            let references: Vec<pioneer_protocol::NativeControlRef> = serde_json::from_value(
+                checkpoint
+                    .payload_json
+                    .get("native_semantic_state")
+                    .and_then(|state| state.get("controls"))
+                    .and_then(|state| state.get("retained"))
+                    .context("compatible native checkpoint control refs unavailable")?
+                    .clone(),
+            )?;
+            match self
+                .crud_store
+                .load_native_controls(
+                    &checkpoint.workspace_id,
+                    &checkpoint.thread_id,
+                    &checkpoint.turn_id,
+                    &references,
+                )
+                .await
+            {
+                Ok(_) => {}
+                Err(error) if error.is::<pioneer_protocol::NativeControlSourceUnavailable>() => {
+                    checkpoint_compatible = false
+                }
+                Err(error) => return Err(error),
+            }
         }
         if snapshot_compatible {
             // Resolve canonical history, propagating repository/read failures.

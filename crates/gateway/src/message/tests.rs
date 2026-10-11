@@ -76426,6 +76426,7 @@ async fn native_foreground_controller_uses_interactive_database_scope() {
         compiled_prompt: None,
     };
     let prepared = pioneer_agent::compaction::controller::NativePreparedRequest {
+        covered_native_control_ids: Vec::new(),
         receipt: pioneer_agent::compaction::controller::NativeInputReceipt::for_request(
             &registration_request,
             &registration_context.provider_instance,
@@ -76753,6 +76754,7 @@ async fn native_history_intent_is_precompleted_idempotent_and_restart_discoverab
         compiled_prompt: None,
     };
     let first_prepared = pioneer_agent::compaction::controller::NativePreparedRequest {
+        covered_native_control_ids: Vec::new(),
         receipt: pioneer_agent::compaction::controller::NativeInputReceipt::for_request(
             &request,
             &context.provider_instance,
@@ -76792,6 +76794,7 @@ async fn native_history_intent_is_precompleted_idempotent_and_restart_discoverab
             "latest compact system metadata",
         ));
     let latest_prepared = pioneer_agent::compaction::controller::NativePreparedRequest {
+        covered_native_control_ids: Vec::new(),
         receipt: pioneer_agent::compaction::controller::NativeInputReceipt::for_request(
             &latest_request,
             &context.provider_instance,
@@ -78812,6 +78815,7 @@ async fn check_completed_history(
             )
             .unwrap();
             let prepared = pioneer_agent::compaction::controller::NativePreparedRequest {
+                covered_native_control_ids: Vec::new(),
                 request,
                 receipt,
                 history_check: pioneer_agent::compaction::controller::NativeHistoryCheckMetadata {

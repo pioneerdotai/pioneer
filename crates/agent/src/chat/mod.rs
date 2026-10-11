@@ -1,3 +1,4 @@
+mod native_control;
 pub(crate) mod preflight;
 mod provider;
 pub(crate) mod semantic_state;
@@ -414,7 +415,6 @@ struct TaskMutationFinalizationGuard {
 #[derive(Debug)]
 struct RenderedTaskObservation {
     task_ids: Vec<String>,
-    message: String,
     details: JsonValue,
 }
 
@@ -422,7 +422,6 @@ struct RenderedTaskObservation {
 struct RenderedReviewRequiredObservation {
     signatures: Vec<String>,
     observations: Vec<ReviewRequiredTaskObservation>,
-    message: String,
     details: JsonValue,
 }
 
@@ -1263,6 +1262,7 @@ async fn persist_native_semantic_checkpoint(
     no_progress: pioneer_protocol::ExecutionCheckpointToolNoProgressState,
     requested_tools: &[String],
     state: serde_json::Value,
+    control: Option<pioneer_protocol::NativeControlRecord>,
     execution_owner_generation: Option<u64>,
     runtime_generation: u64,
 ) -> Result<(), ChatTurnError> {
@@ -1306,6 +1306,7 @@ async fn persist_native_semantic_checkpoint(
             execution_owner_generation,
             runtime_generation,
             checkpoint: payload,
+            control,
         },
     )
     .await
@@ -3373,10 +3374,6 @@ async fn review_required_attached_task_observation(
         .iter()
         .map(review_required_observation_payload)
         .collect::<Vec<_>>();
-    let payload_text = serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "[]".to_owned());
-    let message = format!(
-        "Attached task result candidates require review before this turn can finish:\n{payload_text}\nFor each candidate, call one of its allowedActions (`task_accept`, `task_revise`, or `task_cancel`). Do not provide the final answer until every review-required candidate is accepted, revised, cancelled, or otherwise no longer waiting for review."
-    );
     let details = json!({
         "taskIds": observations.iter().map(|observation| observation.task_id.clone()).collect::<Vec<_>>(),
         "observations": payload,
@@ -3385,7 +3382,6 @@ async fn review_required_attached_task_observation(
     Some(RenderedReviewRequiredObservation {
         signatures,
         observations,
-        message,
         details,
     })
 }
@@ -3497,14 +3493,9 @@ fn render_review_required_snapshot(
         .iter()
         .map(review_required_observation_payload)
         .collect::<Vec<_>>();
-    let payload_text = serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "[]".to_owned());
-    let message = format!(
-        "Attached task result candidates require review before this turn can finish:\n{payload_text}\nFor each candidate, call one of its allowedActions (`task_accept`, `task_revise`, or `task_cancel`). Do not provide the final answer until every review-required candidate is accepted, revised, cancelled, or otherwise no longer waiting for review."
-    );
     Some(RenderedReviewRequiredObservation {
         signatures,
         observations,
-        message,
         details: json!({
             "taskIds": payload.iter().filter_map(|value| value.get("taskId").and_then(JsonValue::as_str)).collect::<Vec<_>>(),
             "observations": payload,
@@ -3512,28 +3503,18 @@ fn render_review_required_snapshot(
     })
 }
 
-fn render_pending_snapshot(pending: &[PendingAttachedTask]) -> Option<String> {
+fn render_pending_snapshot(pending: &[PendingAttachedTask]) -> Option<JsonValue> {
     if pending.is_empty() {
         return None;
     }
-    let task_lines = pending
-        .iter()
-        .map(|task| {
-            let run = task
-                .run_id
-                .as_ref()
-                .map(|run_id| format!(", run {run_id}"))
-                .unwrap_or_default();
-            format!(
-                "- {} ({}, status {}{})",
-                task.title, task.task_id, task.status, run
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    Some(format!(
-        "Attached tasks created by this turn are still active, so the turn cannot finish yet.\n{task_lines}\nCall task_wait for active runs, or task_cancel/task_detach when abandoning or backgrounding the work before giving the final answer."
-    ))
+    Some(json!({
+        "pendingCount": pending.len(),
+        "tasks": pending.iter().take(20).map(|task| json!({
+            "taskId": task.task_id, "runId": task.run_id,
+            "title": bounded_task_text(&task.title, 400), "status": task.status,
+        })).collect::<Vec<_>>(),
+        "additionalTasksRequireAuthoritativeRead": pending.len() > 20,
+    }))
 }
 
 fn render_terminal_snapshot(
@@ -3558,12 +3539,8 @@ fn render_terminal_snapshot(
         .iter()
         .map(task_observation_payload)
         .collect::<Vec<_>>();
-    let payload_text = serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "[]".to_owned());
     Some(RenderedTaskObservation {
         task_ids,
-        message: format!(
-            "Attached task results are available:\n{payload_text}\nUse these TaskRun results/errors in the next response. Full details are available with task_get."
-        ),
         details: json!({
             "taskIds": observations.iter().map(|observation| observation.task_id.clone()).collect::<Vec<_>>(),
             "observations": payload,
@@ -3669,14 +3646,9 @@ async fn terminal_attached_task_observation(
         .iter()
         .map(task_observation_payload)
         .collect::<Vec<_>>();
-    let payload_text = serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "[]".to_owned());
-    let message = format!(
-        "Attached task results are available:\n{payload_text}\nUse these TaskRun results/errors in the next response. Full details are available with task_get."
-    );
 
     Some(RenderedTaskObservation {
         task_ids,
-        message,
         details: json!({
             "taskIds": observations.iter().map(|observation| observation.task_id.clone()).collect::<Vec<_>>(),
             "observations": payload,
@@ -5254,6 +5226,9 @@ async fn execute_agent_provider_response(
         &tool_loop_config.retry,
         !reused_initial,
     )?;
+    let mut native_controls =
+        native_control::NativeControlRuntime::restore(semantic.controls.clone(), context_session)
+            .await?;
     window_stats.record_preflight(preflight_usage);
     let continuation_sections = runtime_sections_with_execution_continuation_context(
         &[],
@@ -5273,6 +5248,11 @@ async fn execute_agent_provider_response(
     })?;
 
     if !provider_tool_calling {
+        if !native_controls.state.retained.is_empty() {
+            return Err(ChatTurnError::Blocked(
+                "non-tool native continuation has incompatible controls".to_owned(),
+            ));
+        }
         let mut guard = ToolLoopGuard::new_execution_window_with_started_at(
             tool_loop_config.execution_windows.window.clone(),
             "",
@@ -5328,6 +5308,7 @@ async fn execute_agent_provider_response(
             Default::default(),
             &requested_tool_names,
             semantic.to_value()?,
+            None,
             initial_preparation.execution_owner_generation(),
             runtime_generation,
         )
@@ -5521,9 +5502,6 @@ async fn execute_agent_provider_response(
         .into_iter()
         .filter(|message| message.role != pioneer_provider::Role::System)
         .collect::<Vec<_>>();
-    let mut active_compiled_prompt = Some(compiled_prompt_payload_from_delivery_plan(
-        &initial_instruction_plan,
-    ));
 
     messages.push(user_message);
     let mut continuation_provider_history = retained_provider_history;
@@ -5585,6 +5563,7 @@ async fn execute_agent_provider_response(
                     semantic_checkpoint_revision,
                     turn_id,
                     &tool_loop_config.retry,
+                    &native_controls.state,
                     &tool_retry_controller,
                     &tool_retry_lifecycle,
                     &pending_retry_instruction,
@@ -5600,6 +5579,32 @@ async fn execute_agent_provider_response(
         };
     }
 
+    macro_rules! persist_control {
+        ($thinking:expr, $directive:expr, $data:expr) => {{
+            let control = native_controls
+                .enqueue($directive, $data)
+                .map_err(|error| (error, $thinking.clone()))?;
+            persist_native_semantic_checkpoint(
+                event_tx.as_ref(),
+                workspace_id,
+                thread_id,
+                turn_id,
+                input,
+                &post_turn_model,
+                &post_turn_model_provider,
+                &window_stats,
+                tool_no_progress_guard.checkpoint_state(),
+                &requested_tool_names,
+                capture_semantic_state!().map_err(|error| (error, $thinking.clone()))?,
+                control,
+                initial_preparation.execution_owner_generation(),
+                runtime_generation,
+            )
+            .await
+            .map_err(|error| (error, $thinking.clone()))?;
+        }};
+    }
+
     let turn_result: Result<AgentProviderLoopOutcome, (ChatTurnError, String)> = async {
         let mut current_thinking_id = initial_thinking_item_id;
         let mut consecutive_rejected_no_tool_rounds = 0usize;
@@ -5611,7 +5616,7 @@ async fn execute_agent_provider_response(
                 &post_turn_model, &post_turn_model_provider, &window_stats,
                 tool_no_progress_guard.checkpoint_state(), &requested_tool_names,
                 capture_semantic_state!().map_err(|e| (e, current_thinking_id.clone()))?,
-                initial_preparation.execution_owner_generation(), runtime_generation,
+                None, initial_preparation.execution_owner_generation(), runtime_generation,
             ).await.map_err(|e| (e, current_thinking_id.clone()))?;
             retain_agent_attachment_messages(&mut messages);
 
@@ -5637,9 +5642,6 @@ async fn execute_agent_provider_response(
                             current_thinking_id.clone(),
                         ));
                     }
-                    let message = format!(
-                        "Attached task state could not be read safely ({task_gate_query_failures}/3); retrying before finalization: {error}"
-                    );
                     send_reasoning_completed(
                         workspace_id,
                         thread_id,
@@ -5650,7 +5652,8 @@ async fn execute_agent_provider_response(
                     )
                     .await
                     .map_err(|error| (error, current_thinking_id.clone()))?;
-                    messages.push(ChatMessage::user(message));
+                    persist_control!(current_thinking_id, pioneer_protocol::NativeHostDirective::RetryTaskStateRead,
+                        Some((pioneer_protocol::NativeControlOrigin::RuntimeDiagnostic, json!({"state": "unavailable", "attempt": task_gate_query_failures}))));
                     current_thinking_id = start_reasoning_item(
                         workspace_id,
                         thread_id,
@@ -5682,27 +5685,8 @@ async fn execute_agent_provider_response(
                         observation.observations.as_slice(),
                         router.as_ref(),
                     );
-                    let event_item_id = generate_id(TURN_ITEM_ID_LEN);
-                    emit_durable_event(
-                        event_tx.as_ref(),
-                        AgentDurableEvent::ItemCompleted {
-                            notification: ItemCompletedNotification {
-                                workspace_id: workspace_id.to_owned(),
-                                thread_id: thread_id.to_owned(),
-                                turn_id: turn_id.to_owned(),
-                                item: TurnItem::SystemEvent {
-                                    id: event_item_id,
-                                    level: pioneer_protocol::SystemEventLevel::Info,
-                                    message: observation.message.clone(),
-                                    code: Some("task.review_required.observed".to_owned()),
-                                    details: Some(observation.details),
-                                },
-                            },
-                        },
-                    )
-                    .await
-                    .map_err(|error| (error, current_thinking_id.clone()))?;
-                    messages.push(ChatMessage::user(observation.message));
+                    persist_control!(current_thinking_id, pioneer_protocol::NativeHostDirective::ReviewTaskResults,
+                        Some((pioneer_protocol::NativeControlOrigin::TaskService, observation.details)));
                 }
             } else {
                 sync_review_action_tools_to_observations(&mut visible_tool_names, &[]);
@@ -5715,27 +5699,8 @@ async fn execute_agent_provider_response(
                 for task_id in &observation.task_ids {
                     observed_terminal_task_ids.insert(task_id.clone());
                 }
-                let event_item_id = generate_id(TURN_ITEM_ID_LEN);
-                emit_durable_event(
-                    event_tx.as_ref(),
-                    AgentDurableEvent::ItemCompleted {
-                        notification: ItemCompletedNotification {
-                            workspace_id: workspace_id.to_owned(),
-                            thread_id: thread_id.to_owned(),
-                            turn_id: turn_id.to_owned(),
-                            item: TurnItem::SystemEvent {
-                                id: event_item_id,
-                                level: pioneer_protocol::SystemEventLevel::Info,
-                                message: observation.message.clone(),
-                                code: Some("task.terminal.observed".to_owned()),
-                                details: Some(observation.details),
-                            },
-                        },
-                    },
-                )
-                .await
-                .map_err(|error| (error, current_thinking_id.clone()))?;
-                messages.push(ChatMessage::user(observation.message));
+                persist_control!(current_thinking_id, pioneer_protocol::NativeHostDirective::ObserveTaskResults,
+                    Some((pioneer_protocol::NativeControlOrigin::TaskService, observation.details)));
             }
 
             let round_plan = tool_loop_guard.begin_provider_round().map_err(|message| {
@@ -5813,37 +5778,6 @@ async fn execute_agent_provider_response(
                     .map_err(|error| (agent_event_error(error), current_thinking_id.clone()))?;
                 }
                 let next_retry_instruction = normalize_optional_prompt(Some(instruction));
-                if next_retry_instruction != applied_retry_instruction {
-                    let refreshed_instruction_plan = reproject_agent_instruction_plan(
-                        &initial_instruction_plan,
-                        next_retry_instruction.as_deref(),
-                        round_plan.tools_enabled,
-                    )
-                    .map_err(|error| (error, current_thinking_id.clone()))?;
-                    active_compiled_prompt = Some(compiled_prompt_payload_from_delivery_plan(
-                        &refreshed_instruction_plan,
-                    ));
-
-                    emit_durable_event(
-                        event_tx.as_ref(),
-                        AgentDurableEvent::PromptManifestCompiled {
-                            thread_id: thread_id.to_owned(),
-                            turn_id: turn_id.to_owned(),
-                            manifest: prompt_manifest_from_bundle(
-                                &refreshed_instruction_plan.bundle,
-                                &EffectiveTurnPromptManifestHookMetadata::combined(
-                                    effective_prompt_context_set.manifest_metadata(),
-                                    effective_prompt_section_set.manifest_metadata(),
-                                ),
-                                capability_diagnostics.as_slice(),
-                            ),
-                        },
-                    )
-                    .await
-                    .map_err(|error| (error, current_thinking_id.clone()))?;
-
-                    applied_retry_instruction = next_retry_instruction.clone();
-                }
                 pending_retry_instruction = next_retry_instruction;
             }
 
@@ -5863,35 +5797,25 @@ async fn execute_agent_provider_response(
                 None
             };
 
-            let round_compiled_prompt = if round_plan.tools_enabled {
-                active_compiled_prompt.clone()
-            } else {
-                let no_tool_instruction_plan = reproject_agent_instruction_plan(
-                        &initial_instruction_plan,
-                        applied_retry_instruction.as_deref(),
-                        false,
-                    )
+            let control_projection = native_controls.projection(workspace_id, thread_id, turn_id)
                 .map_err(|error| (error, current_thinking_id.clone()))?;
-                emit_durable_event(
-                    event_tx.as_ref(),
-                    AgentDurableEvent::PromptManifestCompiled {
-                        thread_id: thread_id.to_owned(),
-                        turn_id: turn_id.to_owned(),
-                        manifest: prompt_manifest_from_bundle(
-                            &no_tool_instruction_plan.bundle,
-                            &EffectiveTurnPromptManifestHookMetadata::combined(
-                                effective_prompt_context_set.manifest_metadata(),
-                                effective_prompt_section_set.manifest_metadata(),
-                            ),
-                            capability_diagnostics.as_slice(),
-                        ),
-                    },
-                )
-                .await
+            control_projection.append_observations(&mut messages)
                 .map_err(|error| (error, current_thinking_id.clone()))?;
-                Some(compiled_prompt_payload_from_delivery_plan(&no_tool_instruction_plan))
-            };
-
+            let round_plan_with_controls = reproject_agent_instruction_plan(
+                &initial_instruction_plan,
+                pending_retry_instruction.as_deref(),
+                round_plan.tools_enabled,
+            ).and_then(|plan| pioneer_promt::reproject_native_control_plan(&plan, &control_projection.instructions)
+                .map_err(|_| ChatTurnError::Blocked("native control instruction projection unavailable".to_owned())))
+                .map_err(|error| (error, current_thinking_id.clone()))?;
+            let round_compiled_prompt = Some(compiled_prompt_payload_from_delivery_plan(&round_plan_with_controls));
+            emit_durable_event(event_tx.as_ref(), AgentDurableEvent::PromptManifestCompiled {
+                thread_id: thread_id.to_owned(), turn_id: turn_id.to_owned(),
+                manifest: prompt_manifest_from_bundle(&round_plan_with_controls.bundle,
+                    &EffectiveTurnPromptManifestHookMetadata::combined(
+                        effective_prompt_context_set.manifest_metadata(), effective_prompt_section_set.manifest_metadata(),
+                    ), capability_diagnostics.as_slice()),
+            }).await.map_err(|error| (error, current_thinking_id.clone()))?;
             let post_turn_assistant_text_before_round = post_turn_assistant_text.clone();
             let request = ChatRequest {
                     model: model.clone(),
@@ -5902,22 +5826,26 @@ async fn execute_agent_provider_response(
                     tool_choice: None,
                     parallel_tool_calls: round_plan.tools_enabled.then_some(true),
                     reasoning,
-                    compiled_prompt: round_compiled_prompt,
+                    compiled_prompt: round_compiled_prompt.clone(),
                             };
-            let (request, receipt) = if let Some(session) = context_session {
+            let (request, receipt, covered_controls) = if let Some(session) = context_session {
                 let prepared = session.prepare(request, false).await.map_err(|e| (
                     ChatTurnError::Blocked(format!("context preparation failed: {e}")),
                     current_thinking_id.clone(),
                 ))?;
-                (prepared.request, Some(prepared.receipt))
-            } else { (request, None) };
+                (prepared.request, Some(prepared.receipt), prepared.covered_native_control_ids)
+            } else { (request, None, Vec::new()) };
+            control_projection.validate_inclusion(&request, &round_compiled_prompt)
+                .map_err(|error| (error, current_thinking_id.clone()))?;
+            native_controls.sync_after_compaction(&covered_controls)
+                .map_err(|error| (error, current_thinking_id.clone()))?;
             messages = request.messages.clone();
             persist_native_semantic_checkpoint(
                 event_tx.as_ref(), workspace_id, thread_id, turn_id, input,
                 &post_turn_model, &post_turn_model_provider, &window_stats,
                 tool_no_progress_guard.checkpoint_state(), &requested_tool_names,
                 capture_semantic_state!().map_err(|e| (e, current_thinking_id.clone()))?,
-                initial_preparation.execution_owner_generation(), runtime_generation,
+                None, initial_preparation.execution_owner_generation(), runtime_generation,
             ).await.map_err(|e| (e, current_thinking_id.clone()))?;
             let tokens_before_round = window_stats.provider_token_count.unwrap_or(0);
             let round = await_context_request(context_session, provider::request_agent_round_accounted(
@@ -5942,6 +5870,15 @@ async fn execute_agent_provider_response(
                 ))?;
             }
 
+            applied_retry_instruction = pending_retry_instruction.clone();
+            native_controls.mark_applied(&control_projection);
+            persist_native_semantic_checkpoint(
+                event_tx.as_ref(), workspace_id, thread_id, turn_id, input,
+                &post_turn_model, &post_turn_model_provider, &window_stats,
+                tool_no_progress_guard.checkpoint_state(), &requested_tool_names,
+                capture_semantic_state!().map_err(|error| (error, current_thinking_id.clone()))?,
+                None, initial_preparation.execution_owner_generation(), runtime_generation,
+            ).await.map_err(|error| (error, current_thinking_id.clone()))?;
             if !round.text.trim().is_empty() {
                 append_text_fragment(&mut post_turn_assistant_text, round.text.as_str());
             }
@@ -5981,9 +5918,8 @@ async fn execute_agent_provider_response(
                         )
                         .await
                         .map_err(|error| (error, current_thinking_id.clone()))?;
-                        messages.push(ChatMessage::user(format!(
-                            "Attached task state could not be read safely ({task_gate_query_failures}/3); retrying before deterministic finalization: {error}"
-                        )));
+                        persist_control!(current_thinking_id, pioneer_protocol::NativeHostDirective::RetryTaskStateRead,
+                            Some((pioneer_protocol::NativeControlOrigin::RuntimeDiagnostic, json!({"state": "unavailable", "attempt": task_gate_query_failures}))));
                         current_thinking_id = start_reasoning_item(
                             workspace_id,
                             thread_id,
@@ -6194,37 +6130,6 @@ async fn execute_agent_provider_response(
 
                     pending_retry_instruction =
                         normalize_optional_prompt(Some(instruction.clone()));
-                    if pending_retry_instruction != applied_retry_instruction {
-                        let refreshed_instruction_plan = reproject_agent_instruction_plan(
-                        &initial_instruction_plan,
-                        pending_retry_instruction.as_deref(),
-                        false,
-                    )
-                        .map_err(|error| (error, current_thinking_id.clone()))?;
-                        active_compiled_prompt = Some(compiled_prompt_payload_from_delivery_plan(
-                            &refreshed_instruction_plan,
-                        ));
-
-                        emit_durable_event(
-                            event_tx.as_ref(),
-                            AgentDurableEvent::PromptManifestCompiled {
-                                thread_id: thread_id.to_owned(),
-                                turn_id: turn_id.to_owned(),
-                                manifest: prompt_manifest_from_bundle(
-                                    &refreshed_instruction_plan.bundle,
-                                    &EffectiveTurnPromptManifestHookMetadata::combined(
-                                        effective_prompt_context_set.manifest_metadata(),
-                                        effective_prompt_section_set.manifest_metadata(),
-                                    ),
-                                    capability_diagnostics.as_slice(),
-                                ),
-                            },
-                        )
-                        .await
-                        .map_err(|error| (error, current_thinking_id.clone()))?;
-
-                        applied_retry_instruction = pending_retry_instruction.clone();
-                    }
 
                     current_thinking_id =
                         start_reasoning_item(workspace_id, thread_id, turn_id, event_tx.as_ref())
@@ -6270,9 +6175,6 @@ async fn execute_agent_provider_response(
                                 current_thinking_id.clone(),
                             ));
                         }
-                        let message = format!(
-                            "Attached task state could not be read safely ({task_gate_query_failures}/3); retrying before finalization: {error}"
-                        );
                         send_reasoning_completed(
                             workspace_id,
                             thread_id,
@@ -6283,7 +6185,8 @@ async fn execute_agent_provider_response(
                         )
                         .await
                         .map_err(|error| (error, current_thinking_id.clone()))?;
-                        messages.push(ChatMessage::user(message));
+                        persist_control!(current_thinking_id, pioneer_protocol::NativeHostDirective::RetryTaskStateRead,
+                        Some((pioneer_protocol::NativeControlOrigin::RuntimeDiagnostic, json!({"state": "unavailable", "attempt": task_gate_query_failures}))));
                         current_thinking_id = start_reasoning_item(
                             workspace_id,
                             thread_id,
@@ -6332,27 +6235,8 @@ async fn execute_agent_provider_response(
                     )
                     .await
                     .map_err(|error| (error, current_thinking_id.clone()))?;
-                    let event_item_id = generate_id(TURN_ITEM_ID_LEN);
-                    emit_durable_event(
-                        event_tx.as_ref(),
-                        AgentDurableEvent::ItemCompleted {
-                            notification: ItemCompletedNotification {
-                                workspace_id: workspace_id.to_owned(),
-                                thread_id: thread_id.to_owned(),
-                                turn_id: turn_id.to_owned(),
-                                item: TurnItem::SystemEvent {
-                                    id: event_item_id,
-                                    level: pioneer_protocol::SystemEventLevel::Info,
-                                    message: observation.message.clone(),
-                                    code: Some("task.review_required.observed".to_owned()),
-                                    details: Some(observation.details),
-                                },
-                            },
-                        },
-                    )
-                    .await
-                    .map_err(|error| (error, current_thinking_id.clone()))?;
-                    messages.push(ChatMessage::user(observation.message));
+                    persist_control!(current_thinking_id, pioneer_protocol::NativeHostDirective::ReviewTaskResults,
+                        Some((pioneer_protocol::NativeControlOrigin::TaskService, observation.details)));
                     current_thinking_id =
                         start_reasoning_item(workspace_id, thread_id, turn_id, event_tx.as_ref())
                             .await
@@ -6375,27 +6259,8 @@ async fn execute_agent_provider_response(
                     )
                     .await
                     .map_err(|error| (error, current_thinking_id.clone()))?;
-                    let event_item_id = generate_id(TURN_ITEM_ID_LEN);
-                    emit_durable_event(
-                        event_tx.as_ref(),
-                        AgentDurableEvent::ItemCompleted {
-                            notification: ItemCompletedNotification {
-                                workspace_id: workspace_id.to_owned(),
-                                thread_id: thread_id.to_owned(),
-                                turn_id: turn_id.to_owned(),
-                                item: TurnItem::SystemEvent {
-                                    id: event_item_id,
-                                    level: pioneer_protocol::SystemEventLevel::Info,
-                                    message: observation.clone(),
-                                    code: Some("task.attached.pending".to_owned()),
-                                    details: None,
-                                },
-                            },
-                        },
-                    )
-                    .await
-                    .map_err(|error| (error, current_thinking_id.clone()))?;
-                    messages.push(ChatMessage::user(observation));
+                    persist_control!(current_thinking_id, pioneer_protocol::NativeHostDirective::AwaitAttachedTasks,
+                        Some((pioneer_protocol::NativeControlOrigin::TaskService, observation)));
                     current_thinking_id =
                         start_reasoning_item(workspace_id, thread_id, turn_id, event_tx.as_ref())
                             .await
@@ -6421,27 +6286,8 @@ async fn execute_agent_provider_response(
                     )
                     .await
                     .map_err(|error| (error, current_thinking_id.clone()))?;
-                    let event_item_id = generate_id(TURN_ITEM_ID_LEN);
-                    emit_durable_event(
-                        event_tx.as_ref(),
-                        AgentDurableEvent::ItemCompleted {
-                            notification: ItemCompletedNotification {
-                                workspace_id: workspace_id.to_owned(),
-                                thread_id: thread_id.to_owned(),
-                                turn_id: turn_id.to_owned(),
-                                item: TurnItem::SystemEvent {
-                                    id: event_item_id,
-                                    level: pioneer_protocol::SystemEventLevel::Info,
-                                    message: observation.message.clone(),
-                                    code: Some("task.terminal.observed".to_owned()),
-                                    details: Some(observation.details),
-                                },
-                            },
-                        },
-                    )
-                    .await
-                    .map_err(|error| (error, current_thinking_id.clone()))?;
-                    messages.push(ChatMessage::user(observation.message));
+                    persist_control!(current_thinking_id, pioneer_protocol::NativeHostDirective::ObserveTaskResults,
+                        Some((pioneer_protocol::NativeControlOrigin::TaskService, observation.details)));
                     current_thinking_id =
                         start_reasoning_item(workspace_id, thread_id, turn_id, event_tx.as_ref())
                             .await
@@ -6545,7 +6391,8 @@ async fn execute_agent_provider_response(
                                 .map_err(|error| (error, current_thinking_id.clone()))?;
                     }
 
-                    messages.push(ChatMessage::user(rejection.recovery_instruction()));
+                    persist_control!(current_thinking_id, pioneer_protocol::NativeHostDirective::RepairFinalAnswer,
+                        Some((pioneer_protocol::NativeControlOrigin::RuntimeDiagnostic, json!({"requirement": rejection.recovery_instruction()}))));
                     continue;
                 }
 
@@ -6584,7 +6431,8 @@ async fn execute_agent_provider_response(
                                 .map_err(|error| (error, current_thinking_id.clone()))?;
                             }
                             consecutive_rejected_no_tool_rounds = 0;
-                            messages.push(ChatMessage::user(instruction));
+                            persist_control!(current_thinking_id, pioneer_protocol::NativeHostDirective::FinalizationRetry,
+                                Some((pioneer_protocol::NativeControlOrigin::ArtifactService, json!({"requirement": instruction}))));
                             continue;
                         }
                         Ok(TurnFinalizationDecision::Fail { message }) => {
@@ -7467,7 +7315,6 @@ async fn execute_agent_provider_response(
                 .map(ExecutedToolResult::retry_observation)
                 .collect::<Vec<_>>();
             let no_progress_feedback = tool_no_progress_guard.observe(&retry_observations);
-            let mut next_round_tools_enabled = true;
             pending_retry_instruction = match tool_retry_controller.decide(&retry_observations) {
                 ToolRetryDecision::None { drafts } => {
                     emit_tool_retry_drafts(
@@ -7493,9 +7340,11 @@ async fn execute_agent_provider_response(
                     )
                     .await
                     .map_err(|error| (agent_event_error(error), current_thinking_id.clone()))?;
+                    persist_control!(current_thinking_id, pioneer_protocol::NativeHostDirective::RetryTools,
+                        Some((pioneer_protocol::NativeControlOrigin::ToolService, json!({"facts": prompt.fact_lines()}))));
                     render_tool_retry_instruction(
                         ToolRetryInstructionKind::Retry,
-                        &prompt.fact_lines(),
+                        &["Inspect the untrusted native tool retry observations.".to_owned()],
                     )
                 }
                 ToolRetryDecision::Exhausted { prompt, drafts, .. } => {
@@ -7509,12 +7358,13 @@ async fn execute_agent_provider_response(
                     )
                     .await
                     .map_err(|error| (agent_event_error(error), current_thinking_id.clone()))?;
+                    persist_control!(current_thinking_id, pioneer_protocol::NativeHostDirective::ExhaustedTools,
+                        Some((pioneer_protocol::NativeControlOrigin::ToolService, json!({"facts": prompt.fact_lines()}))));
                     let exhausted_instruction = render_tool_retry_instruction(
                         ToolRetryInstructionKind::Exhausted,
-                        &prompt.fact_lines(),
+                        &["Inspect the untrusted native tool retry observations.".to_owned()],
                     );
                     if let Some(instruction) = exhausted_instruction.clone() {
-                        next_round_tools_enabled = false;
                         // Explicit retry exhaustion still uses a final no-tools round. Window
                         // budget exhaustion is handled earlier as durable continuation.
                         match tool_loop_guard.request_final_answer_with_instruction(instruction) {
@@ -7533,9 +7383,11 @@ async fn execute_agent_provider_response(
             };
 
             if !no_progress_feedback.is_empty() {
+                persist_control!(current_thinking_id, pioneer_protocol::NativeHostDirective::ChangeToolStrategy,
+                    Some((pioneer_protocol::NativeControlOrigin::ToolService, json!({"facts": no_progress_feedback.fact_lines}))));
                 let guard_instruction = render_tool_retry_instruction(
                     ToolRetryInstructionKind::Retry,
-                    no_progress_feedback.fact_lines.as_slice(),
+                    &["Inspect the untrusted native tool progress observations.".to_owned()],
                 );
                 pending_retry_instruction = match (
                     pending_retry_instruction.take(),
@@ -7548,40 +7400,6 @@ async fn execute_agent_provider_response(
                 };
             }
 
-            let next_retry_instruction =
-                normalize_optional_prompt(pending_retry_instruction.clone());
-
-            if next_retry_instruction != applied_retry_instruction {
-                let refreshed_instruction_plan = reproject_agent_instruction_plan(
-                        &initial_instruction_plan,
-                        next_retry_instruction.as_deref(),
-                        next_round_tools_enabled,
-                    )
-                .map_err(|error| (error, current_thinking_id.clone()))?;
-                active_compiled_prompt = Some(compiled_prompt_payload_from_delivery_plan(
-                    &refreshed_instruction_plan,
-                ));
-
-                emit_durable_event(
-                    event_tx.as_ref(),
-                    AgentDurableEvent::PromptManifestCompiled {
-                        thread_id: thread_id.to_owned(),
-                        turn_id: turn_id.to_owned(),
-                        manifest: prompt_manifest_from_bundle(
-                            &refreshed_instruction_plan.bundle,
-                            &EffectiveTurnPromptManifestHookMetadata::combined(
-                                effective_prompt_context_set.manifest_metadata(),
-                                effective_prompt_section_set.manifest_metadata(),
-                            ),
-                            capability_diagnostics.as_slice(),
-                        ),
-                    },
-                )
-                .await
-                .map_err(|error| (error, current_thinking_id.clone()))?;
-
-                applied_retry_instruction = next_retry_instruction;
-            }
 
             for result in &mut executed_results {
                 result.message.provenance = Some(crate::compaction::history::pending_origin(
@@ -10318,6 +10136,7 @@ mod tests {
                 1,
                 "turn_1",
                 &budget,
+                &super::native_control::NativeControlState::default(),
                 &controller,
                 &lifecycle,
                 &pending,
@@ -10368,7 +10187,7 @@ mod tests {
         );
         context.payload.workspace_id = "workspace_1".to_owned();
         context.payload.native_semantic_state.as_mut().unwrap()["schema_version"] =
-            serde_json::json!(3);
+            serde_json::json!(crate::NATIVE_SEMANTIC_STATE_SCHEMA_VERSION + 1);
         assert!(
             super::semantic_state::NativeSemanticState::restore(
                 Some(&context),
@@ -10412,6 +10231,7 @@ mod tests {
                 1,
                 "turn_1",
                 &budget,
+                &super::native_control::NativeControlState::default(),
                 &controller,
                 &lifecycle,
                 &oversized,

@@ -1176,19 +1176,19 @@ fn liveness_observation_from_payload(
             item_id = Some(payload.item.item_id().to_owned());
             item_type = Some(turn_item_type_to_db(payload.item.item_type()).to_owned());
             !matches!(&payload.item, pioneer_protocol::TurnItem::SystemEvent { code: Some(code), .. }
-                if code == "provider_usage")
+                if code == "provider_usage" || code == "native.control")
         }
         TurnEventPayload::ItemCompleted(payload) => {
             item_id = Some(payload.item.item_id().to_owned());
             item_type = Some(turn_item_type_to_db(payload.item.item_type()).to_owned());
             !matches!(&payload.item, pioneer_protocol::TurnItem::SystemEvent { code: Some(code), .. }
-                if code == "provider_usage")
+                if code == "provider_usage" || code == "native.control")
         }
         TurnEventPayload::ItemUpdated(payload) => {
             item_id = Some(payload.item.item_id().to_owned());
             item_type = Some(turn_item_type_to_db(payload.item.item_type()).to_owned());
             !matches!(&payload.item, pioneer_protocol::TurnItem::SystemEvent { code: Some(code), .. }
-                if code == "provider_usage")
+                if code == "provider_usage" || code == "native.control")
         }
         TurnEventPayload::TurnExecutionWindowStarted(_)
         | TurnEventPayload::TurnExecutionWindowCheckpointed(_)

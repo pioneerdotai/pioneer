@@ -108,6 +108,35 @@ pub fn reproject_native_instruction_plan(
     tools_enabled: bool,
     continuation: Option<&PromptRuntimeSectionInput>,
 ) -> Result<CompiledInstructionDeliveryPlan> {
+    reproject(base, retry_instruction, tools_enabled, continuation, None)
+}
+
+/// The caller supplies only fixed typed host directives; observation bytes stay
+/// in the untrusted native data channel. Initial source sections remain exact.
+pub fn reproject_native_control_plan(
+    base: &CompiledInstructionDeliveryPlan,
+    instructions: &str,
+) -> Result<CompiledInstructionDeliveryPlan> {
+    let retry = base
+        .bundle
+        .sections
+        .iter()
+        .find(|section| section.id == PromptSectionId::RetryRuntimeInstruction)
+        .map(|section| section.content.as_str());
+    reproject(base, retry, true, None, Some(instructions))
+}
+
+fn reproject(
+    base: &CompiledInstructionDeliveryPlan,
+    retry_instruction: Option<&str>,
+    tools_enabled: bool,
+    continuation: Option<&PromptRuntimeSectionInput>,
+    controls: Option<&str>,
+) -> Result<CompiledInstructionDeliveryPlan> {
+    ensure!(
+        controls.is_none_or(|s| s.len() <= 32 * 1024),
+        "native controls byte limit exceeded"
+    );
     validate_native_instruction_plan(base)?;
     let retry = retry_instruction.map(str::trim).filter(|s| !s.is_empty());
     ensure!(
@@ -128,6 +157,7 @@ pub fn reproject_native_instruction_plan(
     }
     let retained = |section: &&PromptSection| {
         section.id != PromptSectionId::RetryRuntimeInstruction
+            && (controls.is_none() || section.id != PromptSectionId::NativeRuntimeControls)
             && (tools_enabled
                 || section.id.manifest_id() != crate::REQUEST_TOOLS_HIDDEN_DOMAIN_SECTION_ID)
             && (continuation.is_none() || section.id != PromptSectionId::ExecutionContinuation)
@@ -151,7 +181,12 @@ pub fn reproject_native_instruction_plan(
                         )
                     }),
             )
-            .chain(retry.map(|s| (crate::content::SECTION_TITLE_RETRY_INSTRUCTION, s))),
+            .chain(retry.map(|s| (crate::content::SECTION_TITLE_RETRY_INSTRUCTION, s)))
+            .chain(
+                controls
+                    .filter(|s| !s.trim().is_empty())
+                    .map(|s| ("Native runtime controls", s)),
+            ),
     )?;
     let mut bundle = base.bundle.clone();
     bundle.sections.retain(|section| retained(&section));
@@ -172,6 +207,15 @@ pub fn reproject_native_instruction_plan(
             id: PromptSectionId::RetryRuntimeInstruction,
             stability: PromptStability::Dynamic,
             title: crate::content::SECTION_TITLE_RETRY_INSTRUCTION.to_owned(),
+            content: content.to_owned(),
+            sources: Vec::new(),
+        });
+    }
+    if let Some(content) = controls.filter(|s| !s.trim().is_empty()) {
+        bundle.sections.push(PromptSection {
+            id: PromptSectionId::NativeRuntimeControls,
+            stability: PromptStability::Dynamic,
+            title: "Native runtime controls".to_owned(),
             content: content.to_owned(),
             sources: Vec::new(),
         });
@@ -264,6 +308,52 @@ mod tests {
             diagnostics: Vec::new(),
         })
         .unwrap()
+    }
+
+    #[test]
+    fn native_runtime_controls_replace_only_the_named_pioneer_instruction_section() {
+        let base = accepted();
+        let retry =
+            reproject_native_instruction_plan(&base, Some("original retry policy"), false, None)
+                .unwrap();
+        let control = reproject_native_control_plan(&retry, "fixed host directive one").unwrap();
+        assert_eq!(
+            control.bundle.stable_system_text,
+            base.bundle.stable_system_text
+        );
+        assert_eq!(control.bundle.source_manifest, base.bundle.source_manifest);
+        assert!(
+            control
+                .provider_instructions
+                .text
+                .contains("original retry policy")
+        );
+        let section = control
+            .sections
+            .iter()
+            .find(|section| section.section_id == "native_runtime_controls");
+        // The typed delivery plan, rather than a chat role or display label, owns authority.
+        let section = section.unwrap();
+        assert_eq!(
+            section.channel,
+            crate::InstructionDeliveryChannel::ProviderInstructions
+        );
+        assert_eq!(section.trust, crate::InstructionTrust::Pioneer);
+        assert!(section.required);
+        let replaced = reproject_native_control_plan(&control, "fixed host directive two").unwrap();
+        assert!(
+            !replaced
+                .provider_instructions
+                .text
+                .contains("fixed host directive one")
+        );
+        assert!(
+            replaced
+                .provider_instructions
+                .text
+                .contains("fixed host directive two")
+        );
+        assert_eq!(reproject_native_control_plan(&control, "").unwrap(), retry);
     }
 
     #[test]

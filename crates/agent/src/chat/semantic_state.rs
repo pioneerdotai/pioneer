@@ -17,6 +17,7 @@ pub(super) const MAX_SUMMARY_TEXT_BYTES: usize = 16 * 1024;
 pub(super) struct NativeSemanticState {
     pub schema_version: u32,
     pub checkpoint_revision: u64,
+    pub controls: super::native_control::NativeControlState,
     pub retry: ToolRetryCheckpoint,
     pub retry_lifecycle: ToolRetryLifecycleCheckpoint,
     pub pending_retry_instruction: Option<String>,
@@ -101,7 +102,8 @@ impl NativeSemanticState {
                 return Err(unavailable());
             }
             return Ok(Self {
-                schema_version: 2,
+                schema_version: crate::NATIVE_SEMANTIC_STATE_SCHEMA_VERSION,
+                controls: Default::default(),
                 checkpoint_revision: 0,
                 retry: ToolRetryController::new(budget.clone())
                     .checkpoint()
@@ -149,7 +151,8 @@ impl NativeSemanticState {
     }
 
     fn validate(&self, turn: &str, budget: &ToolRetryBudgetConfig) -> Result<(), ChatTurnError> {
-        if self.schema_version != 2
+        if self.schema_version != crate::NATIVE_SEMANTIC_STATE_SCHEMA_VERSION
+            || !self.controls.valid()
             || self
                 .pending_retry_instruction
                 .as_ref()
@@ -189,6 +192,7 @@ pub(super) fn capture(
     checkpoint_revision: u64,
     turn: &str,
     budget: &ToolRetryBudgetConfig,
+    controls: &super::native_control::NativeControlState,
     controller: &ToolRetryController,
     lifecycle: &ToolRetryLifecycleTracker,
     pending: &Option<String>,
@@ -204,6 +208,7 @@ pub(super) fn capture(
     struct Borrowed<'a> {
         schema_version: u32,
         checkpoint_revision: u64,
+        controls: &'a super::native_control::NativeControlState,
         retry: ToolRetryCheckpoint,
         retry_lifecycle: ToolRetryLifecycleCheckpoint,
         pending_retry_instruction: &'a Option<String>,
@@ -216,8 +221,9 @@ pub(super) fn capture(
         post_turn_domain_events: &'a [TurnPostTurnDomainEventSummary],
     }
     let encoded = encode(&Borrowed {
-        schema_version: 2,
+        schema_version: crate::NATIVE_SEMANTIC_STATE_SCHEMA_VERSION,
         checkpoint_revision,
+        controls,
         retry: controller.checkpoint().map_err(|_| unavailable())?,
         retry_lifecycle: lifecycle.checkpoint(),
         pending_retry_instruction: pending,

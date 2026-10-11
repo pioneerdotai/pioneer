@@ -4021,6 +4021,24 @@ fn test_agent_event_from_durable(event: AgentDurableEvent) -> Option<AgentEvent>
             },
             output_policy_snapshot,
         }),
+        AgentDurableEvent::NativeSemanticCheckpoint {
+            checkpoint,
+            control: Some(control),
+            ..
+        } => Some(AgentEvent::ItemCompleted(
+            pioneer_protocol::ItemCompletedNotification {
+                workspace_id: checkpoint.workspace_id,
+                thread_id: checkpoint.thread_id,
+                turn_id: checkpoint.turn_id,
+                item: pioneer_protocol::TurnItem::SystemEvent {
+                    id: control.id.clone(),
+                    level: pioneer_protocol::SystemEventLevel::Info,
+                    message: "Native runtime control recorded.".to_owned(),
+                    code: Some("native.control".to_owned()),
+                    details: Some(serde_json::json!({"nativeControl":control})),
+                },
+            },
+        )),
         AgentDurableEvent::ItemStarted { notification } => {
             Some(AgentEvent::ItemStarted(notification))
         }
@@ -4300,6 +4318,34 @@ fn completed_agent_message_text(observed: &[AgentEvent]) -> Option<String> {
         };
         Some(text.clone())
     })
+}
+
+fn completed_native_control_directives(
+    observed: &[AgentEvent],
+) -> Vec<pioneer_protocol::NativeHostDirective> {
+    observed
+        .iter()
+        .filter_map(|event| {
+            let AgentEvent::ItemCompleted(notification) = event else {
+                return None;
+            };
+            let TurnItem::SystemEvent {
+                code,
+                details: Some(details),
+                ..
+            } = &notification.item
+            else {
+                return None;
+            };
+            if code.as_deref() != Some("native.control") {
+                return None;
+            }
+            let record: pioneer_protocol::NativeControlRecord =
+                serde_json::from_value(details.get("nativeControl")?.clone()).ok()?;
+            record.validate().ok()?;
+            Some(record.host.directive)
+        })
+        .collect()
 }
 
 fn completed_system_event_codes(observed: &[AgentEvent]) -> Vec<String> {
@@ -8999,18 +9045,18 @@ async fn phase_11_review_guard_injects_after_final_answer_attempt_and_allows_acc
     );
     assert_eq!(task_provider_for_assert.call_counts(), (1, 0, 0));
 
-    let codes = completed_system_event_codes(&observed);
+    let codes = completed_native_control_directives(&observed);
     assert_eq!(
         codes
             .iter()
-            .filter(|code| code.as_str() == "task.review_required.observed")
+            .filter(|code| **code == pioneer_protocol::NativeHostDirective::ReviewTaskResults)
             .count(),
         1
     );
     assert!(
         !codes
             .iter()
-            .any(|code| code.as_str() == "task.terminal.observed"),
+            .any(|code| *code == pioneer_protocol::NativeHostDirective::ObserveTaskResults),
         "review-required observation must not be recorded as a terminal task observation"
     );
     let requests = provider.snapshot_requests();
@@ -9113,18 +9159,18 @@ async fn phase_11_review_guard_revise_waits_for_revision_candidate_then_accepts(
     );
     assert_eq!(task_provider_for_assert.call_counts(), (1, 1, 1));
 
-    let codes = completed_system_event_codes(&observed);
+    let codes = completed_native_control_directives(&observed);
     assert_eq!(
         codes
             .iter()
-            .filter(|code| code.as_str() == "task.review_required.observed")
+            .filter(|code| **code == pioneer_protocol::NativeHostDirective::ReviewTaskResults)
             .count(),
         2
     );
     assert!(
         !codes
             .iter()
-            .any(|code| code.as_str() == "task.terminal.observed"),
+            .any(|code| *code == pioneer_protocol::NativeHostDirective::ObserveTaskResults),
         "review-required observation must not be recorded as a terminal task observation"
     );
     let requests = provider.snapshot_requests();
@@ -9189,18 +9235,18 @@ async fn phase_11_repeated_review_observation_does_not_spam_or_complete() {
         "Attached task result review is still required. Call task_accept, task_revise, or task_cancel for each pending review candidate before providing the final answer.",
     );
 
-    let codes = completed_system_event_codes(&observed);
+    let codes = completed_native_control_directives(&observed);
     assert_eq!(
         codes
             .iter()
-            .filter(|code| code.as_str() == "task.review_required.observed")
+            .filter(|code| **code == pioneer_protocol::NativeHostDirective::ReviewTaskResults)
             .count(),
         1
     );
     assert!(
         !codes
             .iter()
-            .any(|code| code.as_str() == "task.terminal.observed"),
+            .any(|code| *code == pioneer_protocol::NativeHostDirective::ObserveTaskResults),
         "review-required observation must not be recorded as a terminal task observation"
     );
     assert!(completed_agent_message_text(&observed).is_none());
@@ -16154,6 +16200,7 @@ impl crate::compaction::controller::NativeContextController for RecordingContext
             None,
         )?;
         Ok(crate::compaction::controller::NativePreparedRequest {
+            covered_native_control_ids: Vec::new(),
             request,
             receipt,
             history_check: crate::compaction::controller::NativeHistoryCheckMetadata {

@@ -12,6 +12,7 @@ pub enum PendingOriginKind {
     Assistant,
     ToolResult,
     ToolItem,
+    NativeControl,
 }
 /// A locator is resolved against durable metadata before it can become eligible
 /// work. It contains no guessed revision or copied transcript.
@@ -28,6 +29,7 @@ pub fn pending_origin(
         PendingOriginKind::Assistant => "pending-assistant",
         PendingOriginKind::ToolResult => "pending-tool",
         PendingOriginKind::ToolItem => "pending-item",
+        PendingOriginKind::NativeControl => "pending-control",
     };
     pioneer_provider::MessageProvenance {
         logical_turn_id: None,

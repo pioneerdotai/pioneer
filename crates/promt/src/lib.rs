@@ -35,7 +35,8 @@ pub use instruction_delivery::{
     InstructionScope, InstructionSectionPlan, InstructionTrust, compile_instruction_delivery_plan,
 };
 pub use native_continuation::{
-    reproject_native_instruction_plan, validate_native_instruction_plan,
+    reproject_native_control_plan, reproject_native_instruction_plan,
+    validate_native_instruction_plan,
 };
 pub use profile::PromptProfile;
 pub use render::{

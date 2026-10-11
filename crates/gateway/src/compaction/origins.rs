@@ -111,6 +111,16 @@ pub(super) async fn resolve_message_origin_locators(
                         )
                         .await?
                 }
+                "pending-control" => {
+                    store
+                        .native_control_event_reference(
+                            workspace,
+                            &origin.thread_id,
+                            turn,
+                            &source.id,
+                        )
+                        .await?
+                }
                 "pending-item" => {
                     store
                         .compaction_tool_item_reference(

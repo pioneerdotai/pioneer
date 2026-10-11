@@ -226,7 +226,8 @@ fn cli_instruction_policy(id: &PromptSectionId) -> InstructionPolicy {
         | PromptSectionId::CurrentPermissions
         | PromptSectionId::RecoveryContinuation
         | PromptSectionId::ExecutionContinuation
-        | PromptSectionId::RetryRuntimeInstruction => {
+        | PromptSectionId::RetryRuntimeInstruction
+        | PromptSectionId::NativeRuntimeControls => {
             provider_instructions(InstructionScope::Turn, InstructionTrust::Pioneer)
         }
         PromptSectionId::PioneerCliRuntimeContext => turn_context(InstructionTrust::Pioneer),

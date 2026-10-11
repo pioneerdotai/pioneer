@@ -1,4 +1,5 @@
 use crate::message::{MessageProcessor, now_timestamp_secs};
+use anyhow::Context as _;
 use async_trait::async_trait;
 use pioneer_agent::{
     PendingAttachedTask, ReviewRequiredTaskObservation, TaskFinalizationSnapshot,
@@ -4767,6 +4768,113 @@ async fn observed_terminal_task_ids(
     processor: &Arc<MessageProcessor>,
     context: &TaskTurnContext,
 ) -> anyhow::Result<BTreeSet<String>> {
+    if processor
+        .crud_store
+        .get_turn_execution(&context.turn_id)
+        .await?
+        .is_some_and(|execution| {
+            matches!(
+                execution.executor_kind,
+                pioneer_crud::TurnExecutorKind::NativeAgent
+                    | pioneer_crud::TurnExecutorKind::ApiProvider
+            )
+        })
+    {
+        let Some(checkpoint) = processor
+            .crud_store
+            .native_semantic_checkpoint_for_turn(&context.turn_id)
+            .await?
+        else {
+            // No acknowledged native state proves observation. Returning all
+            // terminal facts as unobserved does not create/reset a semantic Turn.
+            return Ok(BTreeSet::new());
+        };
+        anyhow::ensure!(
+            checkpoint.workspace_id == context.workspace_id
+                && checkpoint.thread_id == context.thread_id,
+            "native task observation checkpoint scope differs"
+        );
+        let semantic = checkpoint
+            .payload_json
+            .get("native_semantic_state")
+            .context("native task observation semantic state missing")?;
+        anyhow::ensure!(
+            semantic.get("schema_version").and_then(JsonValue::as_u64)
+                == Some(u64::from(
+                    pioneer_agent::NATIVE_SEMANTIC_STATE_SCHEMA_VERSION
+                )),
+            "native task observation state incompatible"
+        );
+        anyhow::ensure!(
+            semantic
+                .get("controls")
+                .and_then(|state| state.get("retained"))
+                .and_then(JsonValue::as_array)
+                .is_some_and(|refs| refs.len() <= pioneer_protocol::NATIVE_CONTROL_MAX_PENDING),
+            "native task observation reference bound exceeded"
+        );
+        let controls: pioneer_protocol::NativeControlCheckpointState = serde_json::from_value(
+            semantic
+                .get("controls")
+                .context("native task observation controls missing")?
+                .clone(),
+        )?;
+        anyhow::ensure!(controls.valid(), "native task observation cursor invalid");
+        let markers = semantic
+            .get("observed_terminal_task_ids")
+            .and_then(JsonValue::as_array)
+            .filter(|markers| markers.len() <= 256)
+            .context("native task observation markers invalid")?;
+        let mut observed = BTreeSet::new();
+        for marker in markers {
+            let marker = marker
+                .as_str()
+                .filter(|marker| !marker.is_empty() && marker.len() <= 4096)
+                .context("native task observation identity invalid")?;
+            observed.insert(marker.to_owned());
+        }
+        // A queued directive is durable, but has not yet been observed by the
+        // model. Retain its terminal IDs as outstanding until the applied ACK.
+        let pending = controls
+            .retained
+            .iter()
+            .filter(|reference| reference.sequence > controls.applied_sequence)
+            .cloned()
+            .collect::<Vec<_>>();
+        for record in processor
+            .crud_store
+            .load_native_controls(
+                &context.workspace_id,
+                &context.thread_id,
+                &context.turn_id,
+                &pending,
+            )
+            .await?
+        {
+            if record.host.directive != pioneer_protocol::NativeHostDirective::ObserveTaskResults {
+                continue;
+            }
+            let observation = record
+                .observation
+                .context("native terminal observation missing")?;
+            anyhow::ensure!(
+                observation.origin == pioneer_protocol::NativeControlOrigin::TaskService,
+                "native terminal observation origin differs"
+            );
+            let ids = observation
+                .value
+                .get("taskIds")
+                .and_then(JsonValue::as_array)
+                .context("native terminal observation identities missing")?;
+            for id in ids {
+                observed.remove(
+                    id.as_str()
+                        .context("native terminal observation identity invalid")?,
+                );
+            }
+        }
+        return Ok(observed);
+    }
     let parent_items = processor
         .crud_store
         .list_turn_items_by_type(context.turn_id.as_str(), "system_event")

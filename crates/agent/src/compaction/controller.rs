@@ -121,6 +121,8 @@ pub struct NativeUsageMeasurement {
 pub struct NativePreparedRequest {
     pub request: ChatRequest,
     pub receipt: NativeInputReceipt,
+    /// Exact immutable control sources covered by the acknowledged projection.
+    pub covered_native_control_ids: Vec<String>,
     /// Compact budgeting metadata captured while the provider request is
     /// already materialized. It contains no messages or request payload.
     pub history_check: NativeHistoryCheckMetadata,
@@ -133,6 +135,18 @@ pub struct NativeHistoryCheckMetadata {
 
 #[async_trait]
 pub trait NativeContextController: Send + Sync {
+    /// Resolve immutable control sources through the existing scoped context owner.
+    async fn load_native_controls(
+        &self,
+        _context: &NativeContext,
+        references: &[pioneer_protocol::NativeControlRef],
+    ) -> Result<Vec<pioneer_protocol::NativeControlRecord>> {
+        anyhow::ensure!(
+            references.is_empty(),
+            "native control source owner unavailable"
+        );
+        Ok(Vec::new())
+    }
     /// Persist the service Stop fence before its owned future is cancelled.
     async fn stop(&self, context: &NativeContext) -> Result<()>;
     async fn prepare(
@@ -171,6 +185,27 @@ impl NativeContextSession {
             recovery_pending: std::sync::atomic::AtomicBool::new(recovery),
             recovery_active: std::sync::atomic::AtomicBool::new(recovery),
             recovery_deadline,
+        }
+    }
+    pub async fn load_native_controls(
+        &self,
+        references: &[pioneer_protocol::NativeControlRef],
+    ) -> Result<Vec<pioneer_protocol::NativeControlRecord>> {
+        let load = self
+            .controller
+            .load_native_controls(&self.context, references);
+        let work = async {
+            if let Some(deadline) = self.provider_deadline() {
+                tokio::time::timeout_at(deadline, load)
+                    .await
+                    .map_err(|_| anyhow::anyhow!("native control restore deadline exceeded"))?
+            } else {
+                load.await
+            }
+        };
+        tokio::select! { biased;
+            _ = self.context.cancellation.cancelled() => anyhow::bail!("native control restore cancelled"),
+            result = work => result,
         }
     }
     pub async fn prepare(

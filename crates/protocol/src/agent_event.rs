@@ -127,6 +127,8 @@ pub enum AgentDurableEvent {
         execution_owner_generation: Option<u64>,
         runtime_generation: u64,
         checkpoint: crate::ExecutionCheckpointPayload,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        control: Option<crate::NativeControlRecord>,
     },
     PromptManifestCompiled {
         thread_id: String,

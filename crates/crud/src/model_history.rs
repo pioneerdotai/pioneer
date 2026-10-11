@@ -42,7 +42,7 @@ fn technical_system_event(item: &TurnItem, service_filter: bool) -> bool {
         return false;
     };
     match code.as_deref() {
-        Some("agent_thread_status_changed") => true,
+        Some("agent_thread_status_changed" | "native.control") => true,
         Some(
             "agent_runtime_item_updated"
             | "cli_runtime_turn_steer"

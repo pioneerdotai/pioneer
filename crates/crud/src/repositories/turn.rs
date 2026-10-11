@@ -25,6 +25,55 @@ const DB_ID_LEN: usize = 21;
 pub const TURN_MESSAGE_GUARD_PAGE_ROWS: usize = 128;
 pub const TURN_MESSAGE_GUARD_PAGE_BYTES: usize = 32 * 1024;
 
+pub(crate) async fn native_control_event_reference<C: ConnectionTrait>(
+    db: &C,
+    workspace: &str,
+    thread: &str,
+    turn_id: &str,
+    item: &str,
+) -> Result<Option<pioneer_compaction::SourceRef>> {
+    let row = db.query_one_raw(Statement::from_sql_and_values(DatabaseBackend::Sqlite,
+        "SELECT e.id, r.revision FROM turn_event e JOIN compaction_event_revision r \
+         ON r.source_id=e.id AND r.turn_id=e.turn_id JOIN \"turn\" t ON t.id=e.turn_id \
+         JOIN thread th ON th.id=t.thread_id WHERE e.turn_id=?1 AND e.thread_id=?2 AND th.workspace_id=?3 \
+         AND r.item_id=?4 AND r.present=1 AND r.projection_revision=r.revision AND r.projection_kind='technical' \
+         AND e.event_type='item/completed' AND t.message_deleted_at IS NULL LIMIT 1",
+        [turn_id.into(), thread.into(), workspace.into(), item.into()],
+    )).await?;
+    row.map(|row| {
+        Ok(pioneer_compaction::SourceRef {
+            scope: format!("event:{turn_id}"),
+            id: row.try_get("", "id")?,
+            version: format!("event-revision:{}", row.try_get::<i64>("", "revision")?),
+        })
+    })
+    .transpose()
+}
+
+/// Physically bounded payload; SQL scope is checked before any allocation/decode.
+/// NULL preserves poison identity and causes an explicit read error.
+pub(crate) async fn bounded_native_control_item<C: ConnectionTrait>(
+    db: &C,
+    workspace: &str,
+    thread: &str,
+    turn_id: &str,
+    item: &str,
+) -> Result<Option<String>> {
+    let row = db.query_one_raw(Statement::from_sql_and_values(DatabaseBackend::Sqlite,
+        "SELECT CASE WHEN length(CAST(i.payload AS BLOB))<=?1 THEN i.payload ELSE NULL END AS payload \
+         FROM turn_item i JOIN \"turn\" t ON t.id=i.turn_id JOIN thread th ON th.id=t.thread_id \
+         WHERE i.turn_id=?2 AND i.item_id=?3 AND t.thread_id=?4 AND th.workspace_id=?5 \
+         AND t.message_deleted_at IS NULL AND i.status='completed'",
+        [ (pioneer_protocol::NATIVE_CONTROL_STORAGE_MAX_BYTES as i64).into(),
+          turn_id.into(), item.into(), thread.into(), workspace.into() ],
+    )).await?;
+    row.map(|row| {
+        let payload: Option<String> = row.try_get("", "payload")?;
+        payload.ok_or_else(|| pioneer_protocol::NativeControlSourceUnavailable.into())
+    })
+    .transpose()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, FromQueryResult)]
 pub struct TurnMessageGuard {
     pub id: String,
