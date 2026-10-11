@@ -651,12 +651,12 @@ pub fn compile_prompt(input: PromptCompileInput) -> anyhow::Result<CompiledPromp
     };
 
     Ok(CompiledPromptBundle {
-        compiler_version: env!("CARGO_PKG_VERSION"),
+        compiler_version: env!("CARGO_PKG_VERSION").to_owned(),
         profile,
         full_system_text: full_system_text.clone(),
         stable_system_text: stable_system_text.clone(),
         dynamic_system_text: dynamic_system_text.clone(),
-        boundary_marker: PROMT_CACHE_BOUNDARY,
+        boundary_marker: PROMT_CACHE_BOUNDARY.to_owned(),
         fingerprint_stable: sha256_hex(stable_system_text.as_str()),
         fingerprint_dynamic: sha256_hex(dynamic_system_text.as_str()),
         fingerprint_full: sha256_hex(full_system_text.as_str()),

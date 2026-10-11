@@ -2377,6 +2377,15 @@ fn runtime_sections_with_current_permissions(
     sections
 }
 
+fn reproject_agent_instruction_plan(
+    base: &CompiledInstructionDeliveryPlan,
+    retry: Option<&str>,
+    tools_enabled: bool,
+) -> Result<CompiledInstructionDeliveryPlan, ChatTurnError> {
+    pioneer_promt::reproject_native_instruction_plan(base, retry, tools_enabled, None)
+        .map_err(|_| ChatTurnError::Blocked("accepted prompt reprojection failed".to_owned()))
+}
+
 fn compiled_prompt_payload_from_delivery_plan(
     plan: &CompiledInstructionDeliveryPlan,
 ) -> CompiledPromptPayload {
@@ -4620,11 +4629,6 @@ async fn execute_agent_provider_response(
         Ok::<(), AgentEventHubError>(())
     });
 
-    let include_artifact_reference_policy = history_or_prompt_context_has_artifact_refs(
-        history.as_slice(),
-        &effective_prompt_context_set,
-    );
-
     let mut messages = history
         .into_iter()
         .filter(|message| message.role != pioneer_provider::Role::System)
@@ -4874,18 +4878,10 @@ async fn execute_agent_provider_response(
                 }
                 let next_retry_instruction = normalize_optional_prompt(Some(instruction));
                 if next_retry_instruction != applied_retry_instruction {
-                    let refreshed_instruction_plan = compile_agent_instruction_delivery_plan_with_prompt_root(
-            tool_loop_config.computer_use.runtime_home_dir.as_path(),
-                        skills_prompt.clone(),
-                        next_retry_instruction.clone(),
-                        prompt_runtime_sections.as_slice(),
-                        &permission_profile,
-                        include_task_orchestration_policy,
+                    let refreshed_instruction_plan = reproject_agent_instruction_plan(
+                        &initial_instruction_plan,
+                        next_retry_instruction.as_deref(),
                         round_plan.tools_enabled,
-                        continue_generation_hint,
-                        turn_tool_materialization.initiating_thread_id.as_deref(),
-                        thread_id,
-                        turn_id,
                     )
                     .map_err(|error| (error, current_thinking_id.clone()))?;
                     active_compiled_prompt = Some(compiled_prompt_payload_from_delivery_plan(
@@ -4934,53 +4930,11 @@ async fn execute_agent_provider_response(
             let round_compiled_prompt = if round_plan.tools_enabled {
                 active_compiled_prompt.clone()
             } else {
-                let no_tool_prompt_section_set = run_agent_turn_prompt_compile_hook_phase(
-                    hook_runtime.as_ref(),
-                    &hook_context,
-                    &effective_policy_set,
-                    &effective_prompt_context_set,
-                    Vec::new(),
-                    TurnPrePromptCompileHookInput::from_parts(false, Vec::new()),
-                )
-                .await
-                .map_err(|error| {
-                    (
-                        ChatTurnError::Terminal(format!(
-                            "turn prompt section hook failed before no-tool provider round: {}",
-                            error.kind()
-                        )),
-                        current_thinking_id.clone(),
+                let no_tool_instruction_plan = reproject_agent_instruction_plan(
+                        &initial_instruction_plan,
+                        applied_retry_instruction.as_deref(),
+                        false,
                     )
-                })?;
-                let no_tool_prompt_sections =
-                    prompt_sections_for_compile_from_hook_sections(&no_tool_prompt_section_set)
-                        .map_err(|error| (error, current_thinking_id.clone()))?;
-                let no_tool_runtime_sections =
-                    runtime_sections_with_execution_continuation_context(
-                        no_tool_prompt_sections.runtime_sections.as_slice(),
-                        execution_window_index,
-                        execution_checkpoint_context.as_ref(),
-                        prior_visible_assistant_text.as_deref(),
-                        turn_tool_materialization.initiating_thread_id.as_deref(),
-                    );
-                let no_tool_runtime_sections = runtime_sections_with_artifact_reference_policy(
-                    no_tool_runtime_sections,
-                    include_artifact_reference_policy,
-                )
-                .map_err(|error| (error, current_thinking_id.clone()))?;
-                let no_tool_instruction_plan = compile_agent_instruction_delivery_plan_with_prompt_root(
-            tool_loop_config.computer_use.runtime_home_dir.as_path(),
-                    skills_prompt.clone(),
-                    applied_retry_instruction.clone(),
-                    no_tool_runtime_sections.as_slice(),
-                    &permission_profile,
-                    include_task_orchestration_policy,
-                    false,
-                    continue_generation_hint,
-                    turn_tool_materialization.initiating_thread_id.as_deref(),
-                    thread_id,
-                    turn_id,
-                )
                 .map_err(|error| (error, current_thinking_id.clone()))?;
                 emit_durable_event(
                     event_tx.as_ref(),
@@ -4991,7 +4945,7 @@ async fn execute_agent_provider_response(
                             &no_tool_instruction_plan.bundle,
                             &EffectiveTurnPromptManifestHookMetadata::combined(
                                 effective_prompt_context_set.manifest_metadata(),
-                                no_tool_prompt_section_set.manifest_metadata(),
+                                effective_prompt_section_set.manifest_metadata(),
                             ),
                             capability_diagnostics.as_slice(),
                         ),
@@ -5296,19 +5250,11 @@ async fn execute_agent_provider_response(
                     pending_retry_instruction =
                         normalize_optional_prompt(Some(instruction.clone()));
                     if pending_retry_instruction != applied_retry_instruction {
-                        let refreshed_instruction_plan = compile_agent_instruction_delivery_plan_with_prompt_root(
-            tool_loop_config.computer_use.runtime_home_dir.as_path(),
-                            skills_prompt.clone(),
-                            pending_retry_instruction.clone(),
-                            prompt_runtime_sections.as_slice(),
-                            &permission_profile,
-                            include_task_orchestration_policy,
-                            false,
-                            continue_generation_hint,
-                            turn_tool_materialization.initiating_thread_id.as_deref(),
-                            thread_id,
-                            turn_id,
-                        )
+                        let refreshed_instruction_plan = reproject_agent_instruction_plan(
+                        &initial_instruction_plan,
+                        pending_retry_instruction.as_deref(),
+                        false,
+                    )
                         .map_err(|error| (error, current_thinking_id.clone()))?;
                         active_compiled_prompt = Some(compiled_prompt_payload_from_delivery_plan(
                             &refreshed_instruction_plan,
@@ -6656,19 +6602,11 @@ async fn execute_agent_provider_response(
                 normalize_optional_prompt(pending_retry_instruction.clone());
 
             if next_retry_instruction != applied_retry_instruction {
-                let refreshed_instruction_plan = compile_agent_instruction_delivery_plan_with_prompt_root(
-            tool_loop_config.computer_use.runtime_home_dir.as_path(),
-                    skills_prompt.clone(),
-                    next_retry_instruction.clone(),
-                    prompt_runtime_sections.as_slice(),
-                    &permission_profile,
-                    include_task_orchestration_policy,
-                    next_round_tools_enabled,
-                    continue_generation_hint,
-                    turn_tool_materialization.initiating_thread_id.as_deref(),
-                    thread_id,
-                    turn_id,
-                )
+                let refreshed_instruction_plan = reproject_agent_instruction_plan(
+                        &initial_instruction_plan,
+                        next_retry_instruction.as_deref(),
+                        next_round_tools_enabled,
+                    )
                 .map_err(|error| (error, current_thinking_id.clone()))?;
                 active_compiled_prompt = Some(compiled_prompt_payload_from_delivery_plan(
                     &refreshed_instruction_plan,

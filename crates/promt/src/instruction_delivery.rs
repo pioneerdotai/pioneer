@@ -67,7 +67,8 @@ impl fmt::Debug for CompiledInstructionPayload {
 /// provider instruction payload. CLI profiles split governing instructions
 /// from non-governing turn context before a provider adapter maps the former
 /// to its elevated transport.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CompiledInstructionDeliveryPlan {
     pub bundle: CompiledPromptBundle,
     pub provider_instructions: CompiledInstructionPayload,
@@ -311,7 +312,7 @@ mod tests {
                 .to_owned()
         };
         CompiledPromptBundle {
-            compiler_version: "test",
+            compiler_version: "test".to_owned(),
             profile,
             stable_system_text: String::new(),
             dynamic_system_text: String::new(),
@@ -319,7 +320,7 @@ mod tests {
             fingerprint_dynamic: sha256_hex(""),
             fingerprint_full: sha256_hex(full_system_text.as_str()),
             full_system_text,
-            boundary_marker: "",
+            boundary_marker: "".to_owned(),
             sections,
             source_manifest: Vec::new(),
             diagnostics: Vec::new(),
