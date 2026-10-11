@@ -4,6 +4,9 @@ mod cli_runtime_active_bindings;
 #[path = "tests/recovered_turn_stop.rs"]
 mod recovered_turn_stop;
 
+#[path = "tests/recovered_native_turn_stop.rs"]
+mod recovered_native_turn_stop;
+
 #[path = "tests/agent_action_outbox.rs"]
 mod agent_action_outbox;
 

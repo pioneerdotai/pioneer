@@ -5750,7 +5750,7 @@ impl MessageProcessor {
                     .get_turn(&turn_binding.thread_id, &turn_binding.turn_id)
                     .await?
                     .context("native terminal Turn is missing")?;
-                self.ensure_cli_runtime_turn_loaded_for_lifecycle(
+                self.ensure_runtime_turn_loaded_for_lifecycle(
                     &workspace_id,
                     &turn_binding.thread_id,
                     &turn,
@@ -6770,7 +6770,7 @@ impl MessageProcessor {
                     }
                 };
                 if let Err(error) = self
-                    .ensure_cli_runtime_turn_loaded_for_lifecycle(
+                    .ensure_runtime_turn_loaded_for_lifecycle(
                         binding.workspace_id.as_str(),
                         binding.thread_id.as_str(),
                         &turn,
@@ -7706,7 +7706,7 @@ impl MessageProcessor {
                     return Ok(CLIRuntimeAuthoritativeTurnState::Unavailable);
                 }
             };
-            self.ensure_cli_runtime_turn_loaded_for_lifecycle(
+            self.ensure_runtime_turn_loaded_for_lifecycle(
                 workspace_id,
                 binding.thread_id.as_str(),
                 turn,
@@ -7826,7 +7826,7 @@ impl MessageProcessor {
         if !self.finalize_codex_history(binding).await {
             return Ok(CLIRuntimeAuthoritativeTurnState::Unavailable);
         }
-        self.ensure_cli_runtime_turn_loaded_for_lifecycle(
+        self.ensure_runtime_turn_loaded_for_lifecycle(
             workspace_id,
             binding.thread_id.as_str(),
             turn,
@@ -7959,7 +7959,7 @@ impl MessageProcessor {
         Ok(CLIRuntimeAuthoritativeTurnState::Terminal)
     }
 
-    pub(super) async fn ensure_cli_runtime_turn_loaded_for_lifecycle(
+    pub(super) async fn ensure_runtime_turn_loaded_for_lifecycle(
         &self,
         workspace_id: &str,
         thread_id: &str,

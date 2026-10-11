@@ -7831,7 +7831,7 @@ impl MessageProcessor {
         // The caller holds the CLI session transition gate shared with
         // cancellation and terminal delivery. Existing subscribers need
         // a domain snapshot; execution-window/native events cannot restore it.
-        self.ensure_cli_runtime_turn_loaded_for_lifecycle(
+        self.ensure_runtime_turn_loaded_for_lifecycle(
             binding.workspace_id.as_str(),
             binding.thread_id.as_str(),
             &turn,
