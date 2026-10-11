@@ -5530,6 +5530,13 @@ async fn execute_agent_provider_response(
             .map_err(|_| {
                 ChatTurnError::Blocked("native retry checkpoint is incompatible".to_owned())
             })?;
+    if tool_retry_controller.is_exhausted() {
+        tool_loop_guard
+            .request_final_answer_with_instruction(
+                pioneer_protocol::NativeHostDirective::ExhaustedTools.instruction(),
+            )
+            .map_err(ChatTurnError::Blocked)?;
+    }
     let restored_no_progress_state = execution_checkpoint_context
         .as_ref()
         .map(|context| context.payload.tool_no_progress.clone())
@@ -10113,6 +10120,63 @@ mod tests {
             r#"{"task":{"id":"AAAAAAAAAAAAAAAAAAAAA"},"revision":9}"#.to_owned();
         restored.observe(&unrelated).unwrap();
         assert!(restored.deterministic_failure_message().is_none());
+    }
+
+    #[test]
+    fn restored_retry_exhaustion_keeps_native_next_round_without_tools() {
+        let budget = pioneer_tools::ToolRetryBudgetConfig {
+            max_recoverable_retry_rounds_per_episode: 1,
+            max_same_tool_error_retries_per_episode: 1,
+            max_retries_per_tool_name_per_episode: 1,
+        };
+        let mut controller = pioneer_tools::ToolRetryController::new(budget.clone());
+        let failure = pioneer_tools::ToolRetryObservation::from_tool_outcome(
+            "item",
+            "command_execution",
+            1,
+            "exec_command",
+            "{}",
+            false,
+            pioneer_tools::ToolOutcome::recoverable(
+                pioneer_tools::ToolErrorClass::NotFound,
+                "correct the call",
+                false,
+                None,
+            ),
+        );
+        assert!(matches!(
+            controller.decide(&[failure.clone()]),
+            pioneer_tools::ToolRetryDecision::Retry { .. }
+        ));
+        assert!(matches!(
+            controller.decide(&[failure]),
+            pioneer_tools::ToolRetryDecision::Exhausted { .. }
+        ));
+        let restored = pioneer_tools::ToolRetryController::from_checkpoint(
+            budget,
+            controller.checkpoint().unwrap(),
+        )
+        .unwrap();
+        let mut guard = pioneer_tools::ToolLoopGuard::new_execution_window(
+            Default::default(),
+            "ordinary finalization",
+        );
+        if restored.is_exhausted() {
+            guard
+                .request_final_answer_with_instruction(
+                    pioneer_protocol::NativeHostDirective::ExhaustedTools.instruction(),
+                )
+                .unwrap();
+        }
+        let round = guard.begin_provider_round().unwrap();
+        assert!(
+            !round.tools_enabled,
+            "window/restart must not renew an exhausted tool allowance"
+        );
+        assert_eq!(
+            round.final_instruction.as_deref(),
+            Some(pioneer_protocol::NativeHostDirective::ExhaustedTools.instruction())
+        );
     }
 
     #[test]
