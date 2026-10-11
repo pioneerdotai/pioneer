@@ -3619,15 +3619,15 @@ async fn frozen_capture_rejects_foreign_scope_before_legacy_registration() {
         "UPDATE compaction_frozen_message_data SET reference_json=?,bytes=? WHERE manifest_id=? AND ordinal=0",
         [reference_json.clone().into(), (reference_json.len() as i64).into(), storage_manifest.into()],
     )).await.unwrap();
-    let held_writer = store.database_connection().begin().await.unwrap();
+    // Acquiring a read hold legitimately serializes with expiry. Scope rejection
+    // must precede legacy source registration, after that short acquisition.
     let restore_error = tokio::time::timeout(
         Duration::from_secs(1),
         super::frozen::restore(&store, "ws", &allowed, &descriptor),
     )
     .await
-    .expect("foreign restore waited for the serialized writer")
+    .expect("foreign restore must reject the scoped reference promptly")
     .unwrap_err();
-    held_writer.rollback().await.unwrap();
     assert!(
         restore_error
             .to_string()
@@ -3718,6 +3718,7 @@ async fn benchmark_frozen_capture_restore_and_compressed_runner() {
         "INSERT INTO compaction_manifest(operation_id,ordinal,unit_ordinal,reference_only,source_thread,source_scope,source_id,source_version) VALUES('operation',1,0,1,'thread',?,?,?)",
         [reference_only.scope.into(), reference_only.id.into(), reference_only.version.into()],
     )).await.unwrap();
+    seed_active_manifest_entries(&f.store, &[]).await;
     let config = serde_json::json!({
         "table":"turn_llm_context", "column":"payload", "compression_level":3,
         "dict_chooser":"'[nodict]'"
@@ -3873,9 +3874,9 @@ async fn fixture_with_canonical_payloads(
         plan: CompactionPlan {
             mode: CompactionMode::Normal,
             coverage_domain: pioneer_compaction::CoverageDomain::OwnContribution,
-            compact: vec![],
+            compact: vec![0],
             retain: vec![],
-            coverage: vec![],
+            coverage: sources.clone(),
             fingerprint: "fixture-fingerprint".into(),
         },
     };
@@ -3950,6 +3951,43 @@ async fn fixture_with_canonical_payloads(
 // activates its operation. Seed the already-active snapshot directly: the
 // production append API intentionally rejects changes after activation.
 async fn seed_active_manifest_entries(store: &CrudStore, entries: &[ManifestEntry]) {
+    // Model the original raw admission along with its replaced fixture
+    // manifest. An empty admission denotes frozen mode, not a legacy raw plan.
+    let record = store
+        .compaction_operation("operation")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(record.next_portion, 0);
+    let mut admitted_entries = store
+        .compaction_manifest_page("operation", false, 0, 0)
+        .await
+        .unwrap();
+    assert!(admitted_entries.len() < pioneer_crud::compaction::SOURCE_PAGE_ROWS as usize);
+    admitted_entries.extend_from_slice(entries);
+    let mut snapshot: OperationSnapshot = serde_json::from_str(&record.snapshot).unwrap();
+    snapshot.plan.coverage = admitted_entries
+        .iter()
+        .filter(|entry| !entry.reference_only)
+        .map(|entry| entry.source.clone())
+        .collect();
+    snapshot.plan.compact = admitted_entries
+        .iter()
+        .filter(|entry| !entry.reference_only)
+        .map(|entry| entry.unit as usize)
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let updated = store
+        .database_connection()
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE compaction_operation SET snapshot=? WHERE id='operation' AND next_portion=0",
+            [serde_json::to_string(&snapshot).unwrap().into()],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(updated.rows_affected(), 1);
     for entry in entries {
         store
             .database_connection()
@@ -10854,6 +10892,19 @@ async fn published_checkpoint_suppresses_saved_tool_replay_alias_after_item_dele
         )
         .await
         .unwrap();
+    f.store
+        .compaction_activate_runner(
+            &operation.id,
+            &RunnerState::new(
+                operation.admission.deadline_ms,
+                &ModelBudget::new(None, None, None),
+                500,
+                None,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
     let checkpoint = Checkpoint {
         id: "tool-alias-checkpoint".into(),
         operation_id: operation.id.clone(),
@@ -12131,12 +12182,6 @@ async fn frozen_fork_uses_compatible_ancestor_without_importing_future_work() {
         .await
         .unwrap()
         .unwrap();
-    let first_checkpoint = f
-        .store
-        .compaction_checkpoint(&first)
-        .await
-        .unwrap()
-        .unwrap();
     f.store
         .database_connection()
         .execute_raw(Statement::from_sql_and_values(
@@ -12163,61 +12208,33 @@ async fn frozen_fork_uses_compatible_ancestor_without_importing_future_work() {
         ))
         .await
         .unwrap();
-    f.store
-        .database_connection()
-        .execute_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "DELETE FROM compaction_checkpoint WHERE id=?",
-            [first.clone().into()],
-        ))
-        .await
-        .unwrap();
     assert!(
-        prepared_graph
-            .resolve(&f.store, "ws", Some(&allowed), &head_source)
+        f.store
+            .database_connection()
+            .execute_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "DELETE FROM compaction_checkpoint WHERE id=?",
+                [first.clone().into()],
+            ))
             .await
-            .unwrap()
-            .is_some(),
-        "deleting an ancestor invalidated the already prepared published head"
+            .is_err(),
+        "a sealed historical ancestor must remain durable"
     );
-    f.store
-        .database_connection()
-        .execute_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "UPDATE compaction_operation SET status='running' WHERE id=?",
-            [first_checkpoint.operation_id.clone().into()],
-        ))
-        .await
-        .unwrap();
-    f.store
-        .compaction_save_candidate(&first_checkpoint, 0)
-        .await
-        .unwrap();
-    f.store
-        .database_connection()
-        .execute_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "UPDATE compaction_checkpoint SET status='retained' WHERE id=?",
-            [first.clone().into()],
-        ))
-        .await
-        .unwrap();
-    f.store
-        .database_connection()
-        .execute_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "UPDATE compaction_operation SET status='completed' WHERE id=?",
-            [first_checkpoint.operation_id.clone().into()],
-        ))
-        .await
-        .unwrap();
     assert!(
         prepared_graph
             .resolve(&f.store, "ws", Some(&allowed), &head_source)
             .await
             .unwrap()
             .is_some(),
-        "restoring historical metadata affected the published head"
+        "rejected ancestor deletion must preserve the prepared graph"
+    );
+    assert!(
+        super::coverage::CheckpointGraphResolver::default()
+            .resolve(&f.store, "ws", Some(&allowed), &head_source)
+            .await
+            .unwrap()
+            .is_some(),
+        "the full graph must also remain readable without the prepared cache"
     );
     let accepted_fence = at_sixty.unwrap();
     let raw =
@@ -14742,6 +14759,7 @@ async fn publish_projection_checkpoint(
     id: &str,
     inputs: &[(String, SourceRef)],
     coverage_domain: pioneer_compaction::CoverageDomain,
+    projection: Option<&pioneer_compaction::frozen::FrozenHistoryRef>,
 ) -> Checkpoint {
     let owner = super::native::native_owner("ws", source_thread);
     let projection_version = f
@@ -14769,12 +14787,28 @@ async fn publish_projection_checkpoint(
     operation.projection_version = projection_version;
     operation.source_epochs = source_epochs;
     operation.plan.coverage_domain = coverage_domain;
+    operation.plan.compact = (0..inputs.len()).collect();
     operation.plan.coverage = inputs.iter().map(|(_, source)| source.clone()).collect();
     operation.plan.fingerprint = format!("{id}-plan");
-    f.store
-        .compaction_admit("ws", source_thread, &operation)
-        .await
-        .unwrap();
+    if let Some(projection) = projection {
+        let (_, execution_turn) = inputs[0].1.scope.split_once(':').unwrap();
+        let mut admitted = operation.clone();
+        admitted.plan.compact.clear();
+        admitted.plan.coverage.clear();
+        f.store
+            .compaction_admit_for_turn("ws", source_thread, &admitted, Some(execution_turn))
+            .await
+            .unwrap();
+        f.store
+            .compaction_bind_source_projection(&operation.id, projection)
+            .await
+            .unwrap();
+    } else {
+        f.store
+            .compaction_admit("ws", source_thread, &operation)
+            .await
+            .unwrap();
+    }
     f.store
         .compaction_prepare_runner(
             &operation.id,
@@ -14801,6 +14835,21 @@ async fn publish_projection_checkpoint(
         )
         .await
         .unwrap();
+    if projection.is_some() {
+        f.store
+            .compaction_activate_runner(
+                &operation.id,
+                &RunnerState::new(
+                    operation.admission.deadline_ms,
+                    &ModelBudget::new(None, None, None),
+                    500,
+                    None,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+    }
     let checkpoint = Checkpoint {
         id: id.into(),
         operation_id: operation.id.clone(),
@@ -14937,6 +14986,7 @@ async fn contained_checkpoint_fixture(
         &format!("summary-a-{b_thread}"),
         &[("thread".into(), source_a.clone())],
         coverage_domain,
+        None,
     )
     .await;
     let a_source = f
@@ -14954,6 +15004,7 @@ async fn contained_checkpoint_fixture(
             (b_thread.into(), source_b.clone()),
         ],
         coverage_domain,
+        None,
     )
     .await;
     let inherited = coverage_domain == pioneer_compaction::CoverageDomain::WorkingContext;
@@ -15246,6 +15297,7 @@ async fn accepted_frozen_restore_prefers_contained_working_checkpoint_with_equal
             &format!("equal-a-{child}"),
             &[("thread".into(), a_leaf)],
             pioneer_compaction::CoverageDomain::WorkingContext,
+            None,
         )
         .await;
         let a_source = f
@@ -15280,6 +15332,7 @@ async fn accepted_frozen_restore_prefers_contained_working_checkpoint_with_equal
             &format!("equal-b-{child}"),
             &[("thread".into(), a_source.clone())],
             pioneer_compaction::CoverageDomain::WorkingContext,
+            None,
         )
         .await;
         let b_source = f
@@ -15386,6 +15439,7 @@ async fn accepted_frozen_restore_applies_working_checkpoint_containing_inherited
             ("thread".into(), a_input.clone()),
         ],
         pioneer_compaction::CoverageDomain::OwnContribution,
+        None,
     )
     .await;
     let a_source = f
@@ -15473,6 +15527,7 @@ async fn accepted_frozen_restore_applies_working_checkpoint_containing_inherited
         "cross-domain-working-b",
         &[("thread".into(), a_source.clone())],
         pioneer_compaction::CoverageDomain::WorkingContext,
+        None,
     )
     .await;
     let b_source = f
@@ -15527,6 +15582,7 @@ async fn accepted_frozen_restore_applies_working_checkpoint_containing_inherited
             ("nested-copy".into(), copy_input),
         ],
         pioneer_compaction::CoverageDomain::WorkingContext,
+        None,
     )
     .await;
     let bounded = super::frozen::restore_accepted_history_for_execution(
@@ -15583,6 +15639,7 @@ async fn accepted_checkpoint_projection_keeps_partial_and_independent_summaries(
             (partial_thread.into(), partial_source.clone()),
         ],
         pioneer_compaction::CoverageDomain::OwnContribution,
+        None,
     )
     .await;
     let independent = publish_projection_checkpoint(
@@ -15591,6 +15648,7 @@ async fn accepted_checkpoint_projection_keeps_partial_and_independent_summaries(
         "summary-independent",
         &[(independent_thread.into(), independent_source.clone())],
         pioneer_compaction::CoverageDomain::OwnContribution,
+        None,
     )
     .await;
     let raw = |thread: &str, unit: &str, source: &SourceRef| {
@@ -15692,6 +15750,7 @@ async fn absorbed_checkpoint_still_requires_its_exact_saved_revision() {
         "summary-outside-frozen-boundary",
         &[("thread".into(), a_source), ("child".into(), outside)],
         pioneer_compaction::CoverageDomain::OwnContribution,
+        None,
     )
     .await;
     let before_boundary_check = projected.clone();
@@ -17079,6 +17138,19 @@ async fn covered_input_rows_keep_their_mixed_ui_copy_suppressed_across_frozen_ro
         )
         .await
         .unwrap();
+    f.store
+        .compaction_activate_runner(
+            &operation.id,
+            &RunnerState::new(
+                operation.admission.deadline_ms,
+                &ModelBudget::new(None, None, None),
+                500,
+                None,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
     let checkpoint = Checkpoint {
         id: "covered-input-row-checkpoint".into(),
         operation_id: operation.id.clone(),
@@ -17668,6 +17740,19 @@ async fn covered_event_input_still_suppresses_its_uncovered_mixed_ui_copy() {
                 thread_id: "thread".into(),
                 source: source.clone(),
             }],
+        )
+        .await
+        .unwrap();
+    f.store
+        .compaction_activate_runner(
+            &operation.id,
+            &RunnerState::new(
+                operation.admission.deadline_ms,
+                &ModelBudget::new(None, None, None),
+                500,
+                None,
+            )
+            .unwrap(),
         )
         .await
         .unwrap();
@@ -19001,10 +19086,14 @@ struct StaleCommitTarget(CrudStore);
 #[async_trait]
 impl CompactionTarget for StaleCommitTarget {
     async fn fits(&self, _: &str) -> Result<bool> {
-        // Provider succeeded; invalidate only the selected revision before commit.
-        self.0.database_connection().execute_unprepared(
-            "UPDATE compaction_manifest SET source_version='stale' WHERE operation_id='operation'"
-        ).await?;
+        // Historical ownership is already closed. A competing control change
+        // still invalidates publication without rewriting the saved evidence.
+        self.0
+            .database_connection()
+            .execute_unprepared(
+                "UPDATE compaction_operation SET expected_head='stale-head' WHERE id='operation'",
+            )
+            .await?;
         Ok(true)
     }
 }
@@ -25422,6 +25511,7 @@ async fn runner_projects_provider_reasoning_for_compact_and_reference_only_witho
         "INSERT INTO compaction_manifest(operation_id,ordinal,unit_ordinal,reference_only,source_thread,source_scope,source_id,source_version) VALUES('operation',1,1,1,'thread',?,?,?)",
         [reference_source.scope.into(), reference_source.id.into(), reference_source.version.into()],
     )).await.unwrap();
+    seed_active_manifest_entries(&f.store, &[]).await;
 
     assert!(matches!(
         f.runner.run(CancellationToken::new()).await.unwrap(),
@@ -26426,6 +26516,7 @@ async fn published_checkpoint_keeps_coverage_of_newly_hidden_service_event() {
         "service-covered-checkpoint",
         &covered,
         pioneer_compaction::CoverageDomain::OwnContribution,
+        None,
     )
     .await;
     assert_eq!(checkpoint.coverage.len(), 2);

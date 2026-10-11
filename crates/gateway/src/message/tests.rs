@@ -11799,18 +11799,37 @@ async fn assert_concurrent_collaborative_tasks_receive_independent_frozen_comman
         );
     }
 
-    crud_store
-        .database_connection()
-        .execute_raw(sea_orm::Statement::from_sql_and_values(
-            sea_orm::DbBackend::Sqlite,
-            "UPDATE compaction_frozen_history SET imports_sha256=? WHERE id=?",
-            [
-                "0".repeat(64).into(),
-                assembled_descriptor.manifest_id.clone().into(),
-            ],
-        ))
-        .await
-        .unwrap();
+    assert!(
+        crud_store
+            .database_connection()
+            .execute_raw(sea_orm::Statement::from_sql_and_values(
+                sea_orm::DbBackend::Sqlite,
+                "UPDATE compaction_frozen_history SET imports_sha256=? WHERE id=?",
+                [
+                    "0".repeat(64).into(),
+                    assembled_descriptor.manifest_id.clone().into()
+                ],
+            ))
+            .await
+            .is_err(),
+        "a completed import digest must be immutable"
+    );
+    // Corrupt the actual backing row, including a shared import range. The
+    // unchanged header digest must detect damage to its retained proof bytes.
+    let import_row = crud_store.database_connection().query_one_raw(sea_orm::Statement::from_sql_and_values(
+        sea_orm::DbBackend::Sqlite,
+        "SELECT d.manifest_id,d.ordinal,d.proof_json,d.bytes FROM compaction_frozen_import_data d WHERE (d.manifest_id=?1 AND d.ordinal=0 AND NOT EXISTS (SELECT 1 FROM compaction_frozen_span s WHERE s.manifest_id=?1 AND s.kind=1 AND s.start<=0 AND s.end>0)) OR EXISTS (SELECT 1 FROM compaction_frozen_span s WHERE s.manifest_id=?1 AND s.kind=1 AND s.start<=0 AND s.end>0 AND d.manifest_id=s.source_manifest AND d.ordinal=s.source_start-s.start) LIMIT 1",
+        [assembled_descriptor.manifest_id.clone().into()],
+    )).await.unwrap().unwrap();
+    let backing: String = import_row.try_get("", "manifest_id").unwrap();
+    let ordinal: i64 = import_row.try_get("", "ordinal").unwrap();
+    let original_proof: String = import_row.try_get("", "proof_json").unwrap();
+    let original_bytes: i64 = import_row.try_get("", "bytes").unwrap();
+    crud_store.database_connection().execute_raw(sea_orm::Statement::from_sql_and_values(
+        sea_orm::DbBackend::Sqlite,
+        "UPDATE compaction_frozen_import_data SET proof_json='{}',bytes=2 WHERE manifest_id=? AND ordinal=?",
+        [backing.clone().into(), ordinal.into()],
+    )).await.unwrap();
     assert!(
         crate::turn_runtime_snapshot::restore_history_json(
             crud_store.as_ref(),
@@ -11822,18 +11841,23 @@ async fn assert_concurrent_collaborative_tasks_receive_independent_frozen_comman
         .is_err(),
         "own-import metadata corruption cannot silently change context ownership"
     );
-    crud_store
-        .database_connection()
-        .execute_raw(sea_orm::Statement::from_sql_and_values(
-            sea_orm::DbBackend::Sqlite,
-            "UPDATE compaction_frozen_history SET imports_sha256=? WHERE id=?",
-            [
-                import_digest.into(),
-                assembled_descriptor.manifest_id.clone().into(),
-            ],
-        ))
-        .await
-        .unwrap();
+    crud_store.database_connection().execute_raw(sea_orm::Statement::from_sql_and_values(
+        sea_orm::DbBackend::Sqlite,
+        "UPDATE compaction_frozen_import_data SET proof_json=?,bytes=? WHERE manifest_id=? AND ordinal=?",
+        [original_proof.into(), original_bytes.into(), backing.into(), ordinal.into()],
+    )).await.unwrap();
+    assert_eq!(
+        crud_store
+            .compaction_frozen_import_state(
+                &workspace_id,
+                parent_thread_id,
+                &assembled_descriptor.manifest_id,
+            )
+            .await
+            .unwrap()
+            .unwrap(),
+        (import_count, import_digest)
+    );
     for outcome in ["A complete", "B complete"] {
         assert_eq!(
             assembled
@@ -12137,15 +12161,33 @@ async fn assert_concurrent_collaborative_tasks_receive_independent_frozen_comman
     // produced result must remain independent of that expensive input path.
     let accepted_c_descriptor: pioneer_compaction::frozen::FrozenHistoryRef =
         serde_json::from_str(&accepted_c_basis.history_json).unwrap();
-    crud_store
+    let accepted_c_owner = crud_store
+        .compaction_frozen_history_owner(&workspace_id, &accepted_c_descriptor)
+        .await
+        .unwrap()
+        .unwrap();
+    let unavailable = crud_store
         .database_connection()
         .execute_raw(sea_orm::Statement::from_sql_and_values(
             sea_orm::DbBackend::Sqlite,
-            "UPDATE compaction_frozen_history SET ready=0 WHERE id=?",
+            "UPDATE compaction_frozen_layout SET failed=1 WHERE manifest_id=? AND kind=0",
             [accepted_c_descriptor.manifest_id.clone().into()],
         ))
         .await
         .unwrap();
+    assert_eq!(unavailable.rows_affected(), 1);
+    assert!(
+        crud_store
+            .compaction_frozen_history_page(
+                &workspace_id,
+                &accepted_c_owner,
+                &accepted_c_descriptor.manifest_id,
+                0,
+            )
+            .await
+            .is_err(),
+        "C's input layout must actually reject reads during output delivery"
+    );
     provider.release_third.notify_one();
     assert_eq!(
         wait_for_task_status(crud_store.clone(), &c_task.id, TaskStatus::Completed).await,
@@ -12244,7 +12286,7 @@ async fn assert_concurrent_collaborative_tasks_receive_independent_frozen_comman
         .database_connection()
         .execute_raw(sea_orm::Statement::from_sql_and_values(
             sea_orm::DbBackend::Sqlite,
-            "UPDATE compaction_frozen_history SET ready=1 WHERE id=?",
+            "UPDATE compaction_frozen_layout SET failed=0 WHERE manifest_id=? AND kind=0",
             [accepted_c_descriptor.manifest_id.into()],
         ))
         .await
