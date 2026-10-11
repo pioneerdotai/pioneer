@@ -1,5 +1,5 @@
 use super::agent_runtime::TurnFailureRecoveryKind;
-use super::turn_handlers::CliRuntimeLaunchSpecRestore;
+use super::turn_handlers::{CliRuntimeLaunchSpecRestore, CliRuntimeRecoveryStartFailure};
 use super::*;
 use crate::authorization::{
     AuthorizationExternalError, AuthorizationResolver, AuthorizationService, ProofResolution,
@@ -6528,6 +6528,23 @@ impl MessageProcessor {
         };
 
         if observation.status == CLIAgentRuntimeObservedTurnStatus::InProgress {
+            // The production handler holds `transition` and revalidates the
+            // recovery source before entering reconciliation. Active native
+            // execution still needs the original Pioneer Turn restored, just
+            // like a restart attempt, before recovery can be marked successful.
+            if let Err(error) = self
+                .restore_cli_runtime_recovery_turn_snapshot(binding)
+                .await
+            {
+                return match error {
+                    CliRuntimeRecoveryStartFailure::Unavailable { diagnostic } => {
+                        CLIRuntimeObservationGapReconciliation::Unavailable { diagnostic }
+                    }
+                    CliRuntimeRecoveryStartFailure::InvalidBinding { diagnostic } => {
+                        CLIRuntimeObservationGapReconciliation::InvalidBinding { diagnostic }
+                    }
+                };
+            }
             let now_unix = now_timestamp_secs();
             if let Err(error) = self
                 .timeout_supervisor
@@ -7942,7 +7959,7 @@ impl MessageProcessor {
         Ok(CLIRuntimeAuthoritativeTurnState::Terminal)
     }
 
-    async fn ensure_cli_runtime_turn_loaded_for_lifecycle(
+    pub(super) async fn ensure_cli_runtime_turn_loaded_for_lifecycle(
         &self,
         workspace_id: &str,
         thread_id: &str,

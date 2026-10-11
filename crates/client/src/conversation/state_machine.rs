@@ -350,6 +350,11 @@ impl TurnStateMachine {
         if turn.turn_kind != TurnKind::Conversation || turn.mode == ThreadMode::Message {
             return;
         }
+        if turn.status == TurnStatus::InProgress
+            && matches!(&self.state, TurnFlowState::Cancelling { turn_id } if turn_id == &turn.id)
+        {
+            return;
+        }
         self.state = match turn.status {
             TurnStatus::InProgress => TurnFlowState::Running {
                 turn_id: turn.id.clone(),

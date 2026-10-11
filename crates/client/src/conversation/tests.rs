@@ -96,6 +96,95 @@ fn apply_in_progress_turn(conversation: &mut Conversation) {
 }
 
 #[test]
+fn recovered_turn_snapshot_applies_current_terminal_before_another_running_turn() {
+    let mut conversation = Conversation::new(THREAD_ID);
+    let mut current = turn_snapshot(TURN_ID, TurnStatus::InProgress, None);
+    current.mode = ThreadMode::Agent;
+    conversation.sync_thread_snapshot(&thread_snapshot_with_turn(current.clone()));
+    current.status = TurnStatus::Completed;
+    current.permission_profile =
+        pioneer_protocol::system_turn_permission_profile_snapshot(TurnPermissionMode::FullAccess);
+    let mut another = turn_snapshot("another", TurnStatus::InProgress, None);
+    another.mode = ThreadMode::Agent;
+    let mut snapshot = thread_snapshot_with_turn(current.clone());
+    snapshot.turns.push(another);
+
+    for _ in 0..2 {
+        conversation.sync_thread_snapshot(&snapshot);
+        assert_eq!(conversation.in_flight_turn_id(), Some("another"));
+        assert_eq!(conversation.status_label(), "running");
+        let completed = conversation
+            .projection()
+            .turns
+            .iter()
+            .find(|turn| turn.id == TURN_ID)
+            .unwrap();
+        assert_eq!(completed.phase, TurnPhase::Completed);
+        assert_eq!(
+            completed.permission_profile.as_ref(),
+            Some(&current.permission_profile)
+        );
+    }
+}
+
+#[test]
+fn recovered_turn_snapshot_current_terminal_ignores_running_message_and_task_marker() {
+    let mut conversation = Conversation::new(THREAD_ID);
+    let mut current = turn_snapshot(TURN_ID, TurnStatus::InProgress, None);
+    current.mode = ThreadMode::Agent;
+    conversation.sync_thread_snapshot(&thread_snapshot_with_turn(current.clone()));
+    current.status = TurnStatus::Completed;
+    let mut snapshot = thread_snapshot_with_turn(current);
+    let mut message = turn_snapshot("message", TurnStatus::InProgress, None);
+    message.mode = ThreadMode::Message;
+    let mut marker = turn_snapshot("task-marker", TurnStatus::InProgress, None);
+    marker.turn_kind = TurnKind::TaskRun;
+    marker.origin = TurnOrigin::DetachedTask;
+    snapshot.turns.extend([message, marker]);
+    conversation.sync_thread_snapshot(&snapshot);
+    assert_eq!(conversation.in_flight_turn_id(), None);
+    assert_eq!(conversation.status_label(), "completed");
+    assert!(conversation.can_submit_message());
+    assert_eq!(
+        conversation
+            .projection()
+            .turns
+            .iter()
+            .find(|turn| turn.id == TURN_ID)
+            .unwrap()
+            .phase,
+        TurnPhase::Completed
+    );
+}
+
+#[test]
+fn recovered_turn_snapshot_keeps_current_running_or_cancelling_turn() {
+    for cancelling in [false, true] {
+        let mut conversation = Conversation::new(THREAD_ID);
+        let mut current = turn_snapshot(TURN_ID, TurnStatus::InProgress, None);
+        current.mode = ThreadMode::Agent;
+        let mut snapshot = thread_snapshot_with_turn(current);
+        conversation.sync_thread_snapshot(&snapshot);
+        if cancelling {
+            conversation.apply(ConversationEvent::LocalTurnCancelRequested {
+                thread_id: THREAD_ID.to_owned(),
+                turn_id: TURN_ID.to_owned(),
+            });
+        }
+        let mut another = turn_snapshot("another", TurnStatus::InProgress, None);
+        another.mode = ThreadMode::Agent;
+        snapshot.turns.push(another);
+        conversation.sync_thread_snapshot(&snapshot);
+        assert_eq!(conversation.in_flight_turn_id(), Some(TURN_ID));
+        assert_eq!(conversation.is_cancelling_turn(), cancelling);
+        assert_eq!(
+            conversation.projection().in_flight_turn_id.as_deref(),
+            Some(TURN_ID)
+        );
+    }
+}
+
+#[test]
 fn thread_snapshot_hydration_locks_composer_for_running_turn() {
     let mut conversation = Conversation::new(THREAD_ID);
 
