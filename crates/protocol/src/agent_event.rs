@@ -121,6 +121,13 @@ pub enum AgentDurableEvent {
     NativeInitialPhaseAdvanced {
         preparation: NativeInitialPhaseAdvance,
     },
+    /// A bounded mutable projection, acknowledged before the next provider use.
+    /// The checkpoint owns the state; canonical events remain authoritative.
+    NativeSemanticCheckpoint {
+        execution_owner_generation: Option<u64>,
+        runtime_generation: u64,
+        checkpoint: crate::ExecutionCheckpointPayload,
+    },
     PromptManifestCompiled {
         thread_id: String,
         turn_id: String,
@@ -548,6 +555,9 @@ impl AgentDurableEvent {
             Self::NativeInitialPhaseAdvanced { preparation } => DurableEventCausalityKey::Turn {
                 turn_id: preparation.turn_id.clone(),
             },
+            Self::NativeSemanticCheckpoint { checkpoint, .. } => DurableEventCausalityKey::Turn {
+                turn_id: checkpoint.turn_id.clone(),
+            },
             Self::NativeCancellationContextPrepared { preparation, .. }
             | Self::NativeTerminalEffectsPrepared { preparation } => {
                 DurableEventCausalityKey::Turn {
@@ -619,6 +629,7 @@ impl AgentDurableEvent {
             | Self::ItemToolRetryExhausted { .. } => true,
             Self::TaskEvent { event } => event.is_terminal(),
             Self::NativeInitialPhaseAdvanced { .. }
+            | Self::NativeSemanticCheckpoint { .. }
             | Self::PromptManifestCompiled { .. }
             | Self::TurnSkillsResolved { .. }
             | Self::TurnCapabilitiesResolved { .. }

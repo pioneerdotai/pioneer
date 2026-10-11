@@ -2504,8 +2504,19 @@ pub struct ExecutionCheckpointPayload {
     /// a native continuation with fresh retry allowances or empty obligations.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_semantic_state: Option<serde_json::Value>,
+    /// Exact committed sources consumed by an in-window semantic projection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_event_frontier: Option<ExecutionCheckpointNativeFrontier>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub strict_obligations: Vec<ExecutionCheckpointStrictObligation>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionCheckpointNativeFrontier {
+    pub schema_version: u32,
+    pub event_sequence: i64,
+    pub context_sequence: i64,
 }
 
 /// Language-neutral state used to prevent a model from repeatedly spending time on a tool
@@ -2802,6 +2813,7 @@ pub fn build_execution_checkpoint_payload(
         tool_no_progress: ExecutionCheckpointToolNoProgressState::default(),
         requested_tool_names: Vec::new(),
         native_semantic_state: None,
+        native_event_frontier: None,
         strict_obligations: obligations,
     }
 }

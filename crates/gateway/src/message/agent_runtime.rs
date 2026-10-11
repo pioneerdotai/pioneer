@@ -342,6 +342,9 @@ fn durable_event_thread_id(event: &AgentDurableEvent) -> Option<&str> {
         AgentDurableEvent::NativeInitialPhaseAdvanced { preparation } => {
             Some(preparation.thread_id.as_str())
         }
+        AgentDurableEvent::NativeSemanticCheckpoint { checkpoint, .. } => {
+            Some(checkpoint.thread_id.as_str())
+        }
         AgentDurableEvent::NativeCancellationContextPrepared { preparation, .. }
         | AgentDurableEvent::NativeTerminalEffectsPrepared { preparation } => {
             Some(preparation.thread_id.as_str())
@@ -407,6 +410,9 @@ fn durable_event_turn_id(event: &AgentDurableEvent) -> Option<&str> {
         | AgentDurableEvent::TurnInterrupted { turn_id, .. } => Some(turn_id.as_str()),
         AgentDurableEvent::NativeInitialPhaseAdvanced { preparation } => {
             Some(preparation.turn_id.as_str())
+        }
+        AgentDurableEvent::NativeSemanticCheckpoint { checkpoint, .. } => {
+            Some(checkpoint.turn_id.as_str())
         }
         AgentDurableEvent::NativeCancellationContextPrepared { preparation, .. }
         | AgentDurableEvent::NativeTerminalEffectsPrepared { preparation } => {
@@ -4449,6 +4455,57 @@ impl MessageProcessor {
                     true
                 })
             }
+            AgentDurableEvent::NativeSemanticCheckpoint {
+                execution_owner_generation,
+                runtime_generation,
+                checkpoint,
+            } => message_future(async move {
+                let commit = async {
+                    let snapshot = self
+                        .crud_store
+                        .get_turn_runtime_snapshot(&checkpoint.turn_id)
+                        .await?
+                        .context("semantic checkpoint startup unavailable")?;
+                    let phase = snapshot
+                        .initial_phase_json
+                        .as_deref()
+                        .context("semantic checkpoint phase unavailable")?;
+                    anyhow::ensure!(
+                        snapshot.workspace_id == checkpoint.workspace_id
+                            && snapshot.thread_id == checkpoint.thread_id,
+                        "semantic checkpoint scope differs"
+                    );
+                    let requirements =
+                        pioneer_agent::NativeInitialPreparation::completed_resume_requirements(
+                            phase,
+                            snapshot
+                                .remaining_storage_bytes()?
+                                .saturating_add(phase.len()),
+                        )?
+                        .context("semantic checkpoint initial preparation is not completed")?;
+                    anyhow::ensure!(
+                        pioneer_agent::native_semantic_checkpoint_compatible(
+                            &checkpoint,
+                            &requirements.tool_retry_budget
+                        ),
+                        "semantic checkpoint is incompatible"
+                    );
+                    self.crud_store
+                        .commit_native_semantic_checkpoint(
+                            checkpoint,
+                            runtime_generation,
+                            self.turn_execution_owner_id.as_ref(),
+                            execution_owner_generation
+                                .context("semantic checkpoint owner epoch unavailable")?,
+                        )
+                        .await
+                }
+                .await;
+                if commit.is_err() {
+                    warn!("native semantic checkpoint commit rejected");
+                }
+                commit.is_ok()
+            }),
             AgentDurableEvent::NativeInitialPhaseAdvanced { preparation } => {
                 message_future(async move {
                     let commit = async {
@@ -8750,7 +8807,7 @@ impl MessageProcessor {
                     });
             }
         }
-        let checkpoint_compatible = checkpoint.as_ref().is_some_and(|checkpoint| {
+        let mut checkpoint_compatible = checkpoint.as_ref().is_some_and(|checkpoint| {
             serde_json::from_value::<pioneer_protocol::ExecutionCheckpointPayload>(
                 checkpoint.payload_json.clone(),
             )
@@ -8765,6 +8822,25 @@ impl MessageProcessor {
                     })
             })
         });
+        if checkpoint_compatible
+            && let Some(checkpoint) = checkpoint.as_ref()
+            && checkpoint.checkpoint_kind
+                == pioneer_crud::TurnExecutionCheckpointKind::SemanticState
+        {
+            let payload = serde_json::from_value(checkpoint.payload_json.clone())?;
+            checkpoint_compatible = self
+                .crud_store
+                .native_semantic_checkpoint_frontier_is_current(&payload)
+                .await?
+                && self
+                    .crud_store
+                    .latest_turn_execution_window(turn_id)
+                    .await?
+                    .is_some_and(|window| {
+                        window.id == checkpoint.window_id
+                            && window.status == pioneer_protocol::ExecutionWindowStatus::Running
+                    });
+        }
         if snapshot_compatible {
             // Resolve canonical history, propagating repository/read failures.
             // A row's mere existence is not proof its referenced state exists.

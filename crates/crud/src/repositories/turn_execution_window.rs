@@ -18,9 +18,151 @@ use crate::convention::{
 
 pub const TURN_EXECUTION_CHECKPOINT_PAYLOAD_MAX_BYTES: usize = 128 * 1024;
 
+pub(crate) fn semantic_checkpoint_id(turn_id: &str) -> String {
+    use sha2::Digest;
+    hex::encode(sha2::Sha256::digest(
+        format!("native-semantic-v1:{turn_id}").as_bytes(),
+    ))[..DB_ID_LEN]
+        .to_owned()
+}
+
+pub(crate) async fn native_event_frontier<C: ConnectionTrait>(
+    db: &C,
+    turn_id: &str,
+) -> Result<pioneer_protocol::ExecutionCheckpointNativeFrontier> {
+    let row = db
+        .query_one_raw(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Sqlite,
+            "SELECT coalesce((SELECT max(sequence) FROM turn_event WHERE turn_id=?1),0) AS events, \
+         coalesce((SELECT max(sequence) FROM turn_llm_context WHERE turn_id=?1),-1) AS contexts",
+            [turn_id.to_owned().into()],
+        ))
+        .await?
+        .context("native event frontier unavailable")?;
+    Ok(pioneer_protocol::ExecutionCheckpointNativeFrontier {
+        schema_version: 1,
+        event_sequence: row.try_get("", "events")?,
+        context_sequence: row.try_get("", "contexts")?,
+    })
+}
+
+/// Only this bounded checkpoint row is replaced. All preparation reads are
+/// revalidated by scalar predicates and exact predecessor bytes in this write.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prepare_semantic_checkpoint_commit(
+    payload: &pioneer_protocol::ExecutionCheckpointPayload,
+    next_json: String,
+    previous_json: Option<String>,
+    owner_id: &str,
+    owner_generation: u64,
+    context_sha256: &str,
+    frontier: &pioneer_protocol::ExecutionCheckpointNativeFrontier,
+    now: DateTimeWithTimeZone,
+) -> Result<sea_orm::Statement> {
+    anyhow::ensure!(
+        next_json.len() <= TURN_EXECUTION_CHECKPOINT_PAYLOAD_MAX_BYTES,
+        "native semantic checkpoint exceeds byte limit"
+    );
+    Ok(sea_orm::Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Sqlite,
+        "INSERT INTO turn_execution_checkpoint \
+        (id,window_id,workspace_id,thread_id,turn_id,checkpoint_kind,payload_json,created_at) \
+        SELECT ?1,w.id,?2,?3,?4,'semantic_state',?5,?6 FROM turn_execution_window w \
+        JOIN \"turn\" t ON t.id=w.turn_id JOIN thread th ON th.id=t.thread_id \
+        JOIN turn_execution e ON e.turn_id=t.id JOIN native_cancellation_context c ON c.turn_id=t.id \
+        WHERE w.turn_id=?4 AND w.workspace_id=?2 AND w.thread_id=?3 AND w.window_index=?7 \
+        AND w.status='running' AND w.window_index=(SELECT max(window_index) FROM turn_execution_window WHERE turn_id=?4) \
+        AND t.thread_id=?3 AND th.workspace_id=?2 AND t.status='in_progress' AND t.message_deleted_at IS NULL \
+        AND e.workspace_id=?2 AND e.thread_id=?3 AND e.owner_id=?8 AND e.owner_generation=?9 \
+        AND e.executor_kind IN ('native_agent','api_provider') AND e.status IN ('queued','starting','running','recovering') \
+        AND c.workspace_id=?2 AND c.thread_id=?3 AND c.context_sha256=?10 AND c.accepted_event_id IS NULL \
+        AND coalesce((SELECT max(sequence) FROM turn_event WHERE turn_id=?4),0)=?11 \
+        AND coalesce((SELECT max(sequence) FROM turn_llm_context WHERE turn_id=?4),-1)=?12 \
+        AND ((?13 IS NULL AND NOT EXISTS(SELECT 1 FROM turn_execution_checkpoint WHERE id=?1)) \
+          OR EXISTS(SELECT 1 FROM turn_execution_checkpoint WHERE id=?1 AND turn_id=?4 AND workspace_id=?2 AND thread_id=?3 AND payload_json=?13)) \
+        ON CONFLICT(id) DO UPDATE SET window_id=excluded.window_id,payload_json=excluded.payload_json,created_at=excluded.created_at \
+        WHERE turn_execution_checkpoint.payload_json=?13 AND turn_execution_checkpoint.checkpoint_kind='semantic_state'",
+        [
+            semantic_checkpoint_id(&payload.turn_id).into(),
+            payload.workspace_id.clone().into(),
+            payload.thread_id.clone().into(),
+            payload.turn_id.clone().into(),
+            next_json.into(),
+            now.into(),
+            i64::from(payload.window.window_index).into(),
+            owner_id.to_owned().into(),
+            i64::try_from(owner_generation)?.into(),
+            context_sha256.to_owned().into(),
+            frontier.event_sequence.into(),
+            frontier.context_sequence.into(),
+            previous_json.into(),
+        ],
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prepare_semantic_recovery_close(
+    window: &TurnExecutionWindowRecord,
+    previous_json: String,
+    stats: &TurnExecutionWindowStatsRecord,
+    reason: ExecutionWindowExhaustionReason,
+    owner_id: &str,
+    owner_generation: u64,
+    context_sha256: &str,
+    frontier: &pioneer_protocol::ExecutionCheckpointNativeFrontier,
+) -> Result<sea_orm::Statement> {
+    let metadata = serde_json::to_string(&stats.metadata_json)?;
+    anyhow::ensure!(
+        metadata.len() <= TURN_EXECUTION_CHECKPOINT_PAYLOAD_MAX_BYTES,
+        "window metadata byte limit"
+    );
+    Ok(sea_orm::Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Sqlite,
+        "UPDATE turn_execution_window SET status='checkpointed',exhaustion_reason=?1, \
+        agent_round_count=max(agent_round_count,?2),tool_call_count=max(tool_call_count,?3), \
+        provider_token_count=max(provider_token_count,?4),metadata_json=?5,completed_at=?6,updated_at=?7 \
+        WHERE id=?8 AND turn_id=?9 AND workspace_id=?10 AND thread_id=?11 AND status='running' \
+        AND window_index=(SELECT max(window_index) FROM turn_execution_window WHERE turn_id=?9) \
+        AND metadata_json=?12 \
+        AND EXISTS(SELECT 1 FROM \"turn\" t JOIN thread th ON th.id=t.thread_id \
+          JOIN turn_execution e ON e.turn_id=t.id JOIN native_cancellation_context c ON c.turn_id=t.id \
+          WHERE t.id=?9 AND t.thread_id=?11 AND th.workspace_id=?10 AND t.status='in_progress' \
+          AND t.message_deleted_at IS NULL AND e.workspace_id=?10 AND e.thread_id=?11 \
+          AND e.owner_id=?13 AND e.owner_generation=?14 AND e.status IN ('queued','starting','running','recovering') \
+          AND e.executor_kind IN ('native_agent','api_provider') AND c.workspace_id=?10 AND c.thread_id=?11 \
+          AND c.context_sha256=?15 AND c.accepted_event_id IS NULL) \
+        AND EXISTS(SELECT 1 FROM turn_execution_checkpoint WHERE id=?16 AND window_id=?8 \
+          AND workspace_id=?10 AND thread_id=?11 AND turn_id=?9 AND checkpoint_kind='semantic_state' AND payload_json=?17) \
+        AND coalesce((SELECT max(sequence) FROM turn_event WHERE turn_id=?9),0)=?18 \
+        AND coalesce((SELECT max(sequence) FROM turn_llm_context WHERE turn_id=?9),-1)=?19",
+        [
+            execution_window_exhaustion_reason_to_db(reason).into(),
+            i64::from(stats.agent_round_count).into(),
+            i64::from(stats.tool_call_count).into(),
+            i64::try_from(stats.provider_token_count)?.into(),
+            metadata.into(),
+            stats.completed_at.into(),
+            stats.updated_at.into(),
+            window.id.clone().into(),
+            window.turn_id.clone().into(),
+            window.workspace_id.clone().into(),
+            window.thread_id.clone().into(),
+            serde_json::to_string(&window.metadata_json)?.into(),
+            owner_id.to_owned().into(),
+            i64::try_from(owner_generation)?.into(),
+            context_sha256.to_owned().into(),
+            semantic_checkpoint_id(&window.turn_id).into(),
+            previous_json.into(),
+            frontier.event_sequence.into(),
+            frontier.context_sequence.into(),
+        ],
+    ))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TurnExecutionCheckpointKind {
+    SemanticState,
     WindowExhausted,
     TurnBlocked,
     StartupRecovery,
@@ -1033,7 +1175,16 @@ pub async fn list_turn_execution_checkpoints_for_window<C: ConnectionTrait>(
 ) -> Result<Vec<TurnExecutionCheckpointRecord>> {
     bounded_checkpoint_query()
         .filter(turn_execution_checkpoint::Column::WindowId.eq(window_id.to_owned()))
+        // The completed-window checkpoint supersedes the replaceable Running
+        // projection even when recovery uses a coarser/backdated timestamp.
+        .order_by(
+            sea_orm::sea_query::Expr::cust(
+                "CASE WHEN checkpoint_kind='semantic_state' THEN 0 ELSE 1 END",
+            ),
+            sea_orm::Order::Asc,
+        )
         .order_by_asc(turn_execution_checkpoint::Column::CreatedAt)
+        .order_by_asc(turn_execution_checkpoint::Column::Id)
         .all(db)
         .await
         .context("failed to list turn_execution_checkpoint rows for window")?
@@ -1048,7 +1199,16 @@ pub async fn latest_turn_execution_checkpoint_for_turn<C: ConnectionTrait>(
 ) -> Result<Option<TurnExecutionCheckpointRecord>> {
     bounded_checkpoint_query()
         .filter(turn_execution_checkpoint::Column::TurnId.eq(turn_id.to_owned()))
+        .order_by(
+            sea_orm::sea_query::Expr::cust("(SELECT window_index FROM turn_execution_window WHERE id=turn_execution_checkpoint.window_id)"),
+            sea_orm::Order::Desc,
+        )
+        .order_by(
+            sea_orm::sea_query::Expr::cust("CASE WHEN checkpoint_kind='semantic_state' THEN 0 ELSE 1 END"),
+            sea_orm::Order::Desc,
+        )
         .order_by_desc(turn_execution_checkpoint::Column::CreatedAt)
+        .order_by_desc(turn_execution_checkpoint::Column::Id)
         .one(db)
         .await
         .context("failed to query latest turn_execution_checkpoint row for turn")?

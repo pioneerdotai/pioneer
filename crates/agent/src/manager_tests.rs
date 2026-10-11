@@ -4050,6 +4050,7 @@ fn test_agent_event_from_durable(event: AgentDurableEvent) -> Option<AgentEvent>
         | AgentDurableEvent::TurnProviderHistoryAppended { .. }
         | AgentDurableEvent::TurnPermissionAudit { .. }
         | AgentDurableEvent::NativeInitialPhaseAdvanced { .. }
+        | AgentDurableEvent::NativeSemanticCheckpoint { .. }
         | AgentDurableEvent::NativeCancellationContextPrepared { .. }
         | AgentDurableEvent::NativeTerminalEffectsPrepared { .. } => None,
         AgentDurableEvent::ProviderFailureDetected {

@@ -676,6 +676,18 @@ enum RestoredRecoveryTurnUnavailable {
     },
 }
 
+/// Source incompatibility is separate from a transient repository/read error.
+#[derive(Debug)]
+struct NativeSemanticCheckpointUnavailable;
+
+impl std::fmt::Display for NativeSemanticCheckpointUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("native semantic checkpoint is unavailable or has unconsumed sources")
+    }
+}
+
+impl std::error::Error for NativeSemanticCheckpointUnavailable {}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ExecutionWindowContinuationAdmission {
     Open {
@@ -2517,14 +2529,29 @@ impl RecoveryCoordinator {
                     .await;
             }
         };
-        let execution_checkpoint_context = self
+        let execution_checkpoint_context = match self
             .prepare_execution_checkpoint_for_recovery(
                 workspace_id.as_str(),
                 thread_id.as_str(),
                 &job,
                 now_unix,
             )
-            .await?;
+            .await
+        {
+            Ok(context) => context,
+            Err(error) if error.is::<NativeSemanticCheckpointUnavailable>() => {
+                return self
+                    .block_active_recovery(
+                        job,
+                        active_attempt_id,
+                        NativeSemanticCheckpointUnavailable.to_string(),
+                        None,
+                        now_unix,
+                    )
+                    .await;
+            }
+            Err(error) => return Err(error),
+        };
         if let Some(context) = execution_checkpoint_context.as_ref()
             && let ExecutionWindowContinuationAdmission::Block {
                 reason,
@@ -3218,20 +3245,31 @@ impl RecoveryCoordinator {
         // Ordinary skills are the exact catalog accepted in the runtime snapshot.
         // Current authorization is revalidated by the existing continuation/tool
         // owners; it cannot replace accepted content with the latest catalog.
-        self.checkpoint_running_execution_window(
-            workspace_id.as_str(),
-            thread_id,
-            request.turn_id.as_str(),
-            request.input.as_slice(),
-            request.model.as_str(),
-            request.provider_name.as_str(),
-            now_unix,
-            ExecutionWindowExhaustionReason::RuntimeShutdownContinuation,
-            TurnExecutionCheckpointKind::StartupRecovery,
-            "startup_recovery",
-            "agent loop was restored after process loss",
-        )
-        .await?;
+        if let Err(error) = self
+            .checkpoint_running_execution_window(
+                workspace_id.as_str(),
+                thread_id,
+                request.turn_id.as_str(),
+                request.input.as_slice(),
+                request.model.as_str(),
+                request.provider_name.as_str(),
+                now_unix,
+                ExecutionWindowExhaustionReason::RuntimeShutdownContinuation,
+                TurnExecutionCheckpointKind::StartupRecovery,
+                "startup_recovery",
+                "agent loop was restored after process loss",
+            )
+            .await
+        {
+            if error.is::<NativeSemanticCheckpointUnavailable>() {
+                return Ok(RestoredRecoveryTurnRequestLookup::Unavailable(
+                    RestoredRecoveryTurnUnavailable::SnapshotInvalid {
+                        error: NativeSemanticCheckpointUnavailable.to_string(),
+                    },
+                ));
+            }
+            return Err(error);
+        }
         match self
             .execution_window_continuation_admission_for_turn(
                 request.turn_id.as_str(),
@@ -3383,6 +3421,28 @@ impl RecoveryCoordinator {
         let completed_at = chrono::DateTime::<chrono::Utc>::from_timestamp(now_unix, 0)
             .map(|timestamp| timestamp.fixed_offset())
             .unwrap_or_else(|| chrono::Utc::now().fixed_offset());
+        let execution = self.crud_store.get_turn_execution(turn_id).await?;
+        let requires_semantic = match execution.as_ref().map(|execution| execution.executor_kind) {
+            Some(
+                pioneer_crud::TurnExecutorKind::NativeAgent
+                | pioneer_crud::TurnExecutorKind::ApiProvider,
+            ) => true,
+            Some(
+                pioneer_crud::TurnExecutorKind::CliRuntime
+                | pioneer_crud::TurnExecutorKind::AcpRuntime,
+            ) => false,
+            None => {
+                if self
+                    .crud_store
+                    .get_cli_runtime_turn_binding(turn_id)
+                    .await?
+                    .is_none()
+                {
+                    return Err(NativeSemanticCheckpointUnavailable.into());
+                }
+                false
+            }
+        };
         let window = match self
             .crud_store
             .latest_turn_execution_window(turn_id)
@@ -3390,6 +3450,9 @@ impl RecoveryCoordinator {
         {
             Some(window) => window,
             None => {
+                if requires_semantic {
+                    return Err(NativeSemanticCheckpointUnavailable.into());
+                }
                 self.crud_store
                     .create_turn_execution_window(
                         NewTurnExecutionWindowRecord {
@@ -3418,6 +3481,38 @@ impl RecoveryCoordinator {
         if window.status != ExecutionWindowStatus::Running {
             return Ok(());
         }
+
+        let semantic_checkpoint = if requires_semantic {
+            Some(
+                self.crud_store
+                    .native_semantic_checkpoint_for_turn(turn_id)
+                    .await?
+                    .ok_or(NativeSemanticCheckpointUnavailable)?,
+            )
+        } else {
+            None
+        };
+        let semantic_payload = if let Some(checkpoint) = &semantic_checkpoint {
+            let payload: ExecutionCheckpointPayload =
+                serde_json::from_value(checkpoint.payload_json.clone())
+                    .map_err(|_| NativeSemanticCheckpointUnavailable)?;
+            if !(checkpoint.window_id == window.id
+                && payload.workspace_id == workspace_id
+                && payload.thread_id == thread_id
+                && payload.turn_id == turn_id
+                && payload.window.window_index == window.window_index
+                && payload.native_semantic_state.is_some()
+                && self
+                    .crud_store
+                    .native_semantic_checkpoint_frontier_is_current(&payload)
+                    .await?)
+            {
+                return Err(NativeSemanticCheckpointUnavailable.into());
+            }
+            Some(payload)
+        } else {
+            None
+        };
 
         let window_items = self
             .crud_store
@@ -3452,7 +3547,7 @@ impl RecoveryCoordinator {
             .and_then(serde_json::Value::as_str)
             .map(str::to_owned)
             .unwrap_or_else(|| format!("{turn_id}:window:{}", window.window_index));
-        let payload = build_execution_checkpoint_payload(
+        let mut payload = build_execution_checkpoint_payload(
             workspace_id,
             thread_id,
             turn_id,
@@ -3482,6 +3577,15 @@ impl RecoveryCoordinator {
             tool_summary,
             Vec::new(),
         );
+        if let Some(semantic_payload) = semantic_payload {
+            payload.original_request = semantic_payload.original_request;
+            payload.native_semantic_state = semantic_payload.native_semantic_state;
+            payload.tool_no_progress = semantic_payload.tool_no_progress;
+            payload.requested_tool_names = semantic_payload.requested_tool_names;
+            payload.strict_obligations = semantic_payload.strict_obligations;
+            payload.provider_budget.provider_usage_available &=
+                semantic_payload.provider_budget.provider_usage_available;
+        }
         let mut metadata_json = window.metadata_json.clone();
         match metadata_json.as_object_mut() {
             Some(metadata) => {
@@ -3500,6 +3604,40 @@ impl RecoveryCoordinator {
                     "terminalReason": terminal_reason,
                 });
             }
+        }
+
+        if let Some(semantic_checkpoint) = semantic_checkpoint {
+            let execution = execution
+                .as_ref()
+                .context("native recovery owner unavailable")?;
+            return self
+                .crud_store
+                .checkpoint_native_running_window_for_recovery(
+                    &window,
+                    &semantic_checkpoint,
+                    NewTurnExecutionCheckpointRecord {
+                        id: None,
+                        window_id: window.id.clone(),
+                        workspace_id: workspace_id.to_owned(),
+                        thread_id: thread_id.to_owned(),
+                        turn_id: turn_id.to_owned(),
+                        checkpoint_kind,
+                        payload_json: serde_json::to_value(payload)?,
+                        created_at: completed_at,
+                    },
+                    pioneer_crud::TurnExecutionWindowStatsRecord {
+                        agent_round_count,
+                        tool_call_count,
+                        provider_token_count: window.provider_token_count,
+                        metadata_json,
+                        completed_at,
+                        updated_at: completed_at,
+                    },
+                    reason,
+                    self.turn_execution_owner_id.as_ref(),
+                    execution.owner_generation,
+                )
+                .await;
         }
 
         let checkpoint_exists = self

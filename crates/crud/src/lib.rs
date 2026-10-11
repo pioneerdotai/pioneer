@@ -8004,6 +8004,7 @@ impl CrudStore {
                                 );
                             }
                             let expected_kind = match checkpoint.checkpoint_kind {
+                                TurnExecutionCheckpointKind::SemanticState => "semantic_state",
                                 TurnExecutionCheckpointKind::WindowExhausted => "window_exhausted",
                                 TurnExecutionCheckpointKind::TurnBlocked => "turn_blocked",
                                 TurnExecutionCheckpointKind::StartupRecovery => "startup_recovery",
@@ -8679,6 +8680,235 @@ impl CrudStore {
         record: NewTurnExecutionCheckpointRecord,
     ) -> Result<TurnExecutionCheckpointRecord> {
         turn_execution_window::save_turn_execution_checkpoint(&self.connection, record).await
+    }
+
+    /// Persist an acknowledged projection without occupying SQL capacity during
+    /// decode/serialization. The single write closes every preparation gap.
+    pub async fn commit_native_semantic_checkpoint(
+        &self,
+        mut payload: pioneer_protocol::ExecutionCheckpointPayload,
+        runtime_generation: u64,
+        owner_id: &str,
+        owner_generation: u64,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            payload.native_event_frontier.is_none(),
+            "producer cannot supply durable frontier"
+        );
+        let revision = payload
+            .native_semantic_state
+            .as_ref()
+            .and_then(|state| state.get("checkpoint_revision"))
+            .and_then(serde_json::Value::as_u64)
+            .filter(|revision| *revision > 0)
+            .context("native semantic revision unavailable")?;
+        let owner = self
+            .get_turn_execution(&payload.turn_id)
+            .await?
+            .context("semantic owner unavailable")?;
+        anyhow::ensure!(
+            owner.owner_id == owner_id
+                && owner.owner_generation == owner_generation
+                && owner.status.is_active(),
+            "native semantic owner changed"
+        );
+        let cancellation = self
+            .native_cancellation_context(&payload.turn_id)
+            .await?
+            .context("semantic cancellation context unavailable")?;
+        anyhow::ensure!(
+            cancellation.preparation.runtime_generation == runtime_generation
+                && cancellation.preparation.workspace_id == payload.workspace_id
+                && cancellation.preparation.thread_id == payload.thread_id
+                && cancellation.accepted_event_id.is_none(),
+            "native semantic generation changed"
+        );
+        let previous = turn_execution_window::get_turn_execution_checkpoint_model(
+            &self.connection,
+            &turn_execution_window::semantic_checkpoint_id(&payload.turn_id),
+        )
+        .await?;
+        let frontier =
+            turn_execution_window::native_event_frontier(&self.connection, &payload.turn_id)
+                .await?;
+        if let Some(previous) = &previous {
+            let mut previous_payload: pioneer_protocol::ExecutionCheckpointPayload =
+                serde_json::from_str(&previous.payload_json)?;
+            let previous_revision = previous_payload
+                .native_semantic_state
+                .as_ref()
+                .and_then(|state| state.get("checkpoint_revision"))
+                .and_then(serde_json::Value::as_u64)
+                .context("previous native semantic revision unavailable")?;
+            if revision == previous_revision {
+                anyhow::ensure!(
+                    previous_payload.native_event_frontier.as_ref() == Some(&frontier),
+                    "duplicate native semantic checkpoint has an unconsumed source gap"
+                );
+            }
+            previous_payload.native_event_frontier = None;
+            anyhow::ensure!(
+                revision > previous_revision
+                    || (revision == previous_revision && previous_payload == payload),
+                "native semantic revision is stale"
+            );
+        }
+        payload.native_event_frontier = Some(frontier.clone());
+        let encoded =
+            turn_execution_window::serialize_checkpoint_payload(&serde_json::to_value(&payload)?)?;
+        let statement = turn_execution_window::prepare_semantic_checkpoint_commit(
+            &payload,
+            encoded,
+            previous.map(|row| row.payload_json),
+            owner_id,
+            owner_generation,
+            &cancellation.context_sha256,
+            &frontier,
+            chrono::Utc::now().fixed_offset(),
+        )?;
+        self.run_serialized_write(|| async {
+            anyhow::ensure!(
+                self.connection
+                    .execute_raw(statement.clone())
+                    .await?
+                    .rows_affected()
+                    == 1,
+                "native semantic checkpoint refused by execution/source fence"
+            );
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn native_semantic_checkpoint_frontier_is_current(
+        &self,
+        payload: &pioneer_protocol::ExecutionCheckpointPayload,
+    ) -> Result<bool> {
+        let Some(frontier) = payload.native_event_frontier.as_ref() else {
+            return Ok(false);
+        };
+        Ok(frontier.schema_version == 1
+            && *frontier
+                == turn_execution_window::native_event_frontier(&self.connection, &payload.turn_id)
+                    .await?)
+    }
+
+    pub async fn native_semantic_checkpoint_for_turn(
+        &self,
+        turn_id: &str,
+    ) -> Result<Option<TurnExecutionCheckpointRecord>> {
+        let record = turn_execution_window::get_turn_execution_checkpoint(
+            &self.connection,
+            &turn_execution_window::semantic_checkpoint_id(turn_id),
+        )
+        .await?;
+        anyhow::ensure!(
+            record
+                .as_ref()
+                .is_none_or(|record| record.turn_id == turn_id
+                    && record.checkpoint_kind == TurnExecutionCheckpointKind::SemanticState),
+            "native semantic checkpoint identity differs"
+        );
+        Ok(record)
+    }
+
+    /// Recovery closes the window and retains semantic state in one transaction.
+    /// Only immediate scalar fencing and two prepared writes occupy the writer.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn checkpoint_native_running_window_for_recovery(
+        &self,
+        window: &TurnExecutionWindowRecord,
+        semantic: &TurnExecutionCheckpointRecord,
+        checkpoint: NewTurnExecutionCheckpointRecord,
+        stats: TurnExecutionWindowStatsRecord,
+        reason: pioneer_protocol::ExecutionWindowExhaustionReason,
+        owner_id: &str,
+        owner_generation: u64,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            window.turn_id == semantic.turn_id
+                && window.id == semantic.window_id
+                && checkpoint.window_id == window.id
+                && checkpoint.turn_id == window.turn_id
+                && checkpoint.workspace_id == window.workspace_id
+                && checkpoint.thread_id == window.thread_id
+                && checkpoint.checkpoint_kind != TurnExecutionCheckpointKind::SemanticState,
+            "native recovery checkpoint scope differs"
+        );
+        let previous = turn_execution_window::get_turn_execution_checkpoint_model(
+            &self.connection,
+            &semantic.id,
+        )
+        .await?
+        .context("native recovery semantic predecessor unavailable")?;
+        let payload: pioneer_protocol::ExecutionCheckpointPayload =
+            serde_json::from_str(&previous.payload_json)?;
+        let next_payload: pioneer_protocol::ExecutionCheckpointPayload =
+            serde_json::from_value(checkpoint.payload_json.clone())?;
+        anyhow::ensure!(
+            payload.schema_version == pioneer_protocol::EXECUTION_CHECKPOINT_PAYLOAD_SCHEMA_VERSION
+                && next_payload.schema_version == payload.schema_version
+                && next_payload.workspace_id == payload.workspace_id
+                && next_payload.thread_id == payload.thread_id
+                && next_payload.turn_id == payload.turn_id
+                && next_payload.window.window_index == window.window_index
+                && next_payload.native_semantic_state == payload.native_semantic_state
+                && next_payload.tool_no_progress == payload.tool_no_progress
+                && next_payload.requested_tool_names == payload.requested_tool_names
+                && next_payload.strict_obligations == payload.strict_obligations,
+            "native recovery cannot discard accepted semantic state"
+        );
+        anyhow::ensure!(
+            serde_json::from_str::<serde_json::Value>(&previous.payload_json)?
+                == semantic.payload_json,
+            "native recovery semantic predecessor changed"
+        );
+        let frontier = payload
+            .native_event_frontier
+            .as_ref()
+            .filter(|frontier| frontier.schema_version == 1)
+            .context("native recovery frontier unavailable")?;
+        let owner = self
+            .get_turn_execution(&window.turn_id)
+            .await?
+            .context("native recovery execution unavailable")?;
+        anyhow::ensure!(
+            owner.owner_id == owner_id
+                && owner.owner_generation == owner_generation
+                && owner.status.is_active(),
+            "native recovery execution owner changed"
+        );
+        let cancellation = self
+            .native_cancellation_context(&window.turn_id)
+            .await?
+            .context("native recovery cancellation unavailable")?;
+        let statement = turn_execution_window::prepare_semantic_recovery_close(
+            window,
+            previous.payload_json,
+            &stats,
+            reason,
+            owner_id,
+            owner_generation,
+            &cancellation.context_sha256,
+            frontier,
+        )?;
+        let prepared = turn_execution_window::prepare_turn_execution_checkpoint_insert(checkpoint)?;
+        self.run_serialized_write(|| {
+            let statement = statement.clone();
+            let prepared = prepared.clone();
+            async move {
+                let tx = self.connection.begin().await?;
+                anyhow::ensure!(
+                    tx.execute_raw(statement).await?.rows_affected() == 1,
+                    "native recovery checkpoint refused by execution/source fence"
+                );
+                turn_execution_window::insert_prepared_turn_execution_checkpoint(&tx, prepared)
+                    .await?;
+                tx.commit().await?;
+                Ok(())
+            }
+        })
+        .await
     }
 
     pub async fn get_turn_execution_checkpoint(
@@ -36549,6 +36779,287 @@ mod tests {
                 max_attempts: 3,
             }],
         }
+    }
+
+    #[tokio::test]
+    async fn native_semantic_storage_fences_sources_and_closes_recovery_atomically() {
+        let (store, _, _) =
+            test_store_with_started_turn("ws_semantic", "thr_semantic", "turn_semantic").await;
+        let store = store.with_maintenance_access();
+        let timestamp = unix_to_datetime(1_700_000_000);
+        crate::repositories::turn_execution::insert_immutable(
+            &store.connection,
+            crate::NewTurnExecution {
+                turn_id: "turn_semantic".to_owned(),
+                thread_id: "thr_semantic".to_owned(),
+                workspace_id: "ws_semantic".to_owned(),
+                executor_kind: crate::TurnExecutorKind::NativeAgent,
+                executor_key: Some("openai".to_owned()),
+                status: crate::TurnExecutionStatus::Running,
+                owner_id: "semantic-owner".to_owned(),
+                lease_until: unix_to_datetime(1_700_000_100),
+                created_at: timestamp,
+            },
+        )
+        .await
+        .unwrap();
+        store
+            .persist_native_cancellation_context(
+                cleanup_effect_preparation(
+                    "ws_semantic",
+                    "thr_semantic",
+                    "turn_semantic",
+                    "semantic",
+                ),
+                "semantic-owner",
+                1_700_000_000,
+                true,
+            )
+            .await
+            .unwrap();
+        let window = store
+            .create_turn_execution_window(
+                NewTurnExecutionWindowRecord {
+                    workspace_id: "ws_semantic".to_owned(),
+                    thread_id: "thr_semantic".to_owned(),
+                    turn_id: "turn_semantic".to_owned(),
+                    window_index: 1,
+                    status: ExecutionWindowStatus::Running,
+                    exhaustion_reason: None,
+                    agent_round_count: 0,
+                    tool_call_count: 0,
+                    provider_token_count: 0,
+                    metadata_json: serde_json::json!({"runtimeWindowId":"semantic-runtime-1"}),
+                    started_at: timestamp,
+                },
+                timestamp,
+                timestamp,
+            )
+            .await
+            .unwrap();
+        let mut payload = pioneer_protocol::build_execution_checkpoint_payload(
+            "ws_semantic",
+            "thr_semantic",
+            "turn_semantic",
+            pioneer_protocol::build_execution_checkpoint_original_request_summary(&[]),
+            pioneer_protocol::ExecutionCheckpointWindowSummary {
+                window_id: Some("semantic-runtime-1".to_owned()),
+                window_index: 1,
+                started_at_unix_ms: Some(timestamp.timestamp_millis()),
+                completed_at_unix_ms: None,
+                agent_round_count: 0,
+                tool_call_count: 0,
+                provider_token_count: None,
+                exhaustion_reason: None,
+            },
+            pioneer_protocol::build_execution_checkpoint_provider_budget_summary(
+                pioneer_protocol::ExecutionCheckpointProviderBudgetInput {
+                    model: Some("accepted-model".to_owned()),
+                    model_provider: Some("openai".to_owned()),
+                    agent_round_count: 0,
+                    tool_call_count: 0,
+                    provider_token_count: None,
+                    exhaustion_reason: None,
+                    exhausted_limit: None,
+                    exhausted_observed: None,
+                },
+            ),
+            pioneer_protocol::build_execution_checkpoint_tool_summary(&[], 32),
+            vec![],
+        );
+        // This storage-layer fixture treats the Agent-validated state as opaque;
+        // its schema/semantic restore is covered in the Agent capture fixtures.
+        payload.native_semantic_state =
+            Some(serde_json::json!({"checkpoint_revision":1,"obligation":"original"}));
+        assert_eq!(
+            store.connection.read_class(),
+            pioneer_sqlite::SqliteReadClass::Maintenance
+        );
+        store
+            .commit_native_semantic_checkpoint(payload.clone(), 1, "semantic-owner", 1)
+            .await
+            .unwrap();
+        store
+            .commit_native_semantic_checkpoint(payload.clone(), 1, "semantic-owner", 1)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .commit_native_semantic_checkpoint(payload.clone(), 2, "semantic-owner", 1)
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .commit_native_semantic_checkpoint(payload.clone(), 1, "foreign-owner", 1)
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .commit_native_semantic_checkpoint(payload.clone(), 1, "semantic-owner", 2)
+                .await
+                .is_err()
+        );
+        let first = store
+            .native_semantic_checkpoint_for_turn("turn_semantic")
+            .await
+            .unwrap()
+            .unwrap();
+        let first_payload = serde_json::from_value(first.payload_json.clone()).unwrap();
+        assert!(
+            store
+                .native_semantic_checkpoint_frontier_is_current(&first_payload)
+                .await
+                .unwrap()
+        );
+        store
+            .materialize_item_completed(
+                ItemCompletedNotification {
+                    workspace_id: "ws_semantic".to_owned(),
+                    thread_id: "thr_semantic".to_owned(),
+                    turn_id: "turn_semantic".to_owned(),
+                    item: TurnItem::SystemEvent {
+                        id: "semantic_source_event".to_owned(),
+                        level: pioneer_protocol::SystemEventLevel::Info,
+                        message: "Committed source after checkpoint".to_owned(),
+                        code: Some("test.semantic.source".to_owned()),
+                        details: None,
+                    },
+                },
+                1_700_000_001,
+            )
+            .await
+            .unwrap();
+        assert!(
+            !store
+                .native_semantic_checkpoint_frontier_is_current(&first_payload)
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .commit_native_semantic_checkpoint(payload.clone(), 1, "semantic-owner", 1)
+                .await
+                .is_err(),
+            "duplicate ACK cannot move an old projection past a new source"
+        );
+        let old = payload.clone();
+        payload.native_semantic_state.as_mut().unwrap()["checkpoint_revision"] =
+            serde_json::json!(2);
+        store
+            .commit_native_semantic_checkpoint(payload.clone(), 1, "semantic-owner", 1)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .commit_native_semantic_checkpoint(old, 1, "semantic-owner", 1)
+                .await
+                .is_err()
+        );
+        let semantic = store
+            .native_semantic_checkpoint_for_turn("turn_semantic")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            semantic.id, first.id,
+            "one replaceable row owns active semantic state"
+        );
+        let stats = TurnExecutionWindowStatsRecord {
+            agent_round_count: 0,
+            tool_call_count: 0,
+            provider_token_count: 0,
+            metadata_json: window.metadata_json.clone(),
+            completed_at: unix_to_datetime(1_700_000_002),
+            updated_at: unix_to_datetime(1_700_000_002),
+        };
+        let checkpoint = NewTurnExecutionCheckpointRecord {
+            id: Some(semantic.id.clone()),
+            window_id: window.id.clone(),
+            workspace_id: window.workspace_id.clone(),
+            thread_id: window.thread_id.clone(),
+            turn_id: window.turn_id.clone(),
+            checkpoint_kind: TurnExecutionCheckpointKind::StartupRecovery,
+            payload_json: serde_json::to_value(&payload).unwrap(),
+            created_at: stats.completed_at,
+        };
+        assert!(
+            store
+                .checkpoint_native_running_window_for_recovery(
+                    &window,
+                    &semantic,
+                    checkpoint.clone(),
+                    stats.clone(),
+                    pioneer_protocol::ExecutionWindowExhaustionReason::RuntimeShutdownContinuation,
+                    "semantic-owner",
+                    1
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .get_turn_execution_window(&window.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            ExecutionWindowStatus::Running,
+            "failed checkpoint insertion rolls back window transition"
+        );
+        let mut valid = checkpoint;
+        valid.id = Some(pioneer_protocol::generate_id(21));
+        store
+            .checkpoint_native_running_window_for_recovery(
+                &window,
+                &semantic,
+                valid,
+                stats,
+                pioneer_protocol::ExecutionWindowExhaustionReason::RuntimeShutdownContinuation,
+                "semantic-owner",
+                1,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .get_turn_execution_window(&window.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            ExecutionWindowStatus::Checkpointed
+        );
+        let records = store
+            .list_turn_execution_checkpoints_for_window(&window.id)
+            .await
+            .unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(
+            store
+                .latest_turn_execution_checkpoint_for_turn("turn_semantic")
+                .await
+                .unwrap()
+                .unwrap()
+                .checkpoint_kind,
+            TurnExecutionCheckpointKind::StartupRecovery,
+            "completed checkpoint supersedes Running snapshot despite backdated timestamp"
+        );
+        assert_eq!(
+            records.last().unwrap().checkpoint_kind,
+            TurnExecutionCheckpointKind::StartupRecovery
+        );
+        assert_eq!(
+            records
+                .iter()
+                .find(
+                    |record| record.checkpoint_kind == TurnExecutionCheckpointKind::StartupRecovery
+                )
+                .unwrap()
+                .payload_json["native_semantic_state"]["obligation"],
+            "original"
+        );
     }
 
     #[tokio::test]

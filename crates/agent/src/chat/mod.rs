@@ -1250,6 +1250,67 @@ async fn emit_durable_event(
         .map_err(agent_event_error)
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn persist_native_semantic_checkpoint(
+    event_tx: &AgentEventHub,
+    workspace_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+    input: &[UserInput],
+    model: &str,
+    model_provider: &str,
+    stats: &ChatExecutionWindowStats,
+    no_progress: pioneer_protocol::ExecutionCheckpointToolNoProgressState,
+    requested_tools: &[String],
+    state: serde_json::Value,
+    execution_owner_generation: Option<u64>,
+    runtime_generation: u64,
+) -> Result<(), ChatTurnError> {
+    let mut payload = pioneer_protocol::build_execution_checkpoint_payload(
+        workspace_id,
+        thread_id,
+        turn_id,
+        build_execution_checkpoint_original_request_summary(input),
+        ExecutionCheckpointWindowSummary {
+            window_id: Some(execution_window_runtime_id(turn_id, stats.window_index)),
+            window_index: stats.window_index,
+            started_at_unix_ms: Some(stats.started_at_unix_ms),
+            completed_at_unix_ms: None,
+            agent_round_count: stats.agent_round_count,
+            tool_call_count: stats.requested_tool_call_count,
+            provider_token_count: stats.provider_token_count,
+            exhaustion_reason: None,
+        },
+        build_execution_checkpoint_provider_budget_summary(
+            ExecutionCheckpointProviderBudgetInput {
+                model: Some(model.to_owned()),
+                model_provider: Some(model_provider.to_owned()),
+                agent_round_count: stats.agent_round_count,
+                tool_call_count: stats.requested_tool_call_count,
+                provider_token_count: stats.provider_token_count,
+                exhaustion_reason: None,
+                exhausted_limit: None,
+                exhausted_observed: None,
+            },
+        ),
+        stats.checkpoint_tool_summary(),
+        Vec::new(),
+    );
+    payload.provider_budget.provider_usage_available &= !stats.provider_token_usage_unknown;
+    payload.tool_no_progress = no_progress;
+    payload.requested_tool_names = requested_tools.to_vec();
+    payload.native_semantic_state = Some(state);
+    emit_durable_event(
+        event_tx,
+        AgentDurableEvent::NativeSemanticCheckpoint {
+            execution_owner_generation,
+            runtime_generation,
+            checkpoint: payload,
+        },
+    )
+    .await
+}
+
 async fn persist_provider_history_message(
     event_tx: &AgentEventHub,
     thread_id: &str,
@@ -5184,7 +5245,7 @@ async fn execute_agent_provider_response(
     } else {
         preflight_usage
     };
-    let semantic = semantic_state::NativeSemanticState::restore(
+    let mut semantic = semantic_state::NativeSemanticState::restore(
         execution_checkpoint_context.as_ref(),
         workspace_id,
         thread_id,
@@ -5251,6 +5312,26 @@ async fn execute_agent_provider_response(
             return Ok(ChatTurnOutcome::NeedsContinuation(continuation));
         }
 
+        semantic.checkpoint_revision = semantic
+            .checkpoint_revision
+            .checked_add(1)
+            .ok_or_else(|| ChatTurnError::Blocked("semantic revision exhausted".to_owned()))?;
+        persist_native_semantic_checkpoint(
+            event_tx.as_ref(),
+            workspace_id,
+            thread_id,
+            turn_id,
+            input,
+            &post_turn_model,
+            &post_turn_model_provider,
+            &window_stats,
+            Default::default(),
+            &requested_tool_names,
+            semantic.to_value()?,
+            initial_preparation.execution_owner_generation(),
+            runtime_generation,
+        )
+        .await?;
         let result = execute_standard_provider_response(
             context_session,
             provider,
@@ -5450,6 +5531,7 @@ async fn execute_agent_provider_response(
         next_retained_provider_history_sequence(&continuation_provider_history);
     append_recovered_provider_history(&mut messages, continuation_provider_history.clone());
 
+    let mut semantic_checkpoint_revision = semantic.checkpoint_revision;
     let mut pending_retry_instruction = semantic.pending_retry_instruction;
     let mut applied_retry_instruction = semantic.applied_retry_instruction;
     let mut observed_review_required_signatures = semantic.observed_review_required_signatures;
@@ -5494,20 +5576,27 @@ async fn execute_agent_provider_response(
 
     macro_rules! capture_semantic_state {
         () => {
-            semantic_state::capture(
-                turn_id,
-                &tool_loop_config.retry,
-                &tool_retry_controller,
-                &tool_retry_lifecycle,
-                &pending_retry_instruction,
-                &applied_retry_instruction,
-                &observed_review_required_signatures,
-                &observed_terminal_task_ids,
-                &task_mutation_finalization_guard,
-                &post_turn_assistant_text,
-                &post_turn_tool_events,
-                &post_turn_domain_events,
-            )
+            (|| -> Result<serde_json::Value, ChatTurnError> {
+                semantic_checkpoint_revision =
+                    semantic_checkpoint_revision.checked_add(1).ok_or_else(|| {
+                        ChatTurnError::Blocked("semantic revision exhausted".to_owned())
+                    })?;
+                semantic_state::capture(
+                    semantic_checkpoint_revision,
+                    turn_id,
+                    &tool_loop_config.retry,
+                    &tool_retry_controller,
+                    &tool_retry_lifecycle,
+                    &pending_retry_instruction,
+                    &applied_retry_instruction,
+                    &observed_review_required_signatures,
+                    &observed_terminal_task_ids,
+                    &task_mutation_finalization_guard,
+                    &post_turn_assistant_text,
+                    &post_turn_tool_events,
+                    &post_turn_domain_events,
+                )
+            })()
         };
     }
 
@@ -5517,6 +5606,13 @@ async fn execute_agent_provider_response(
         let mut task_gate_query_failures = 0usize;
 
         loop {
+            persist_native_semantic_checkpoint(
+                event_tx.as_ref(), workspace_id, thread_id, turn_id, input,
+                &post_turn_model, &post_turn_model_provider, &window_stats,
+                tool_no_progress_guard.checkpoint_state(), &requested_tool_names,
+                capture_semantic_state!().map_err(|e| (e, current_thinking_id.clone()))?,
+                initial_preparation.execution_owner_generation(), runtime_generation,
+            ).await.map_err(|e| (e, current_thinking_id.clone()))?;
             retain_agent_attachment_messages(&mut messages);
 
             let task_gate_snapshot = match attached_task_finalization_snapshot(
@@ -5816,6 +5912,13 @@ async fn execute_agent_provider_response(
                 (prepared.request, Some(prepared.receipt))
             } else { (request, None) };
             messages = request.messages.clone();
+            persist_native_semantic_checkpoint(
+                event_tx.as_ref(), workspace_id, thread_id, turn_id, input,
+                &post_turn_model, &post_turn_model_provider, &window_stats,
+                tool_no_progress_guard.checkpoint_state(), &requested_tool_names,
+                capture_semantic_state!().map_err(|e| (e, current_thinking_id.clone()))?,
+                initial_preparation.execution_owner_generation(), runtime_generation,
+            ).await.map_err(|e| (e, current_thinking_id.clone()))?;
             let tokens_before_round = window_stats.provider_token_count.unwrap_or(0);
             let round = await_context_request(context_session, provider::request_agent_round_accounted(
                 provider,
@@ -8415,6 +8518,7 @@ mod tests {
                 tool_no_progress: Default::default(),
                 requested_tool_names: Vec::new(),
                 native_semantic_state: None,
+                native_event_frontier: None,
                 strict_obligations: Vec::new(),
             },
         }
@@ -10211,6 +10315,7 @@ mod tests {
         context.window_index = context.payload.window.window_index;
         context.payload.native_semantic_state = Some(
             super::semantic_state::capture(
+                1,
                 "turn_1",
                 &budget,
                 &controller,
@@ -10236,6 +10341,7 @@ mod tests {
             false,
         )
         .unwrap();
+        assert_eq!(state.checkpoint_revision, 1);
         assert_eq!(state.pending_retry_instruction, pending);
         assert_eq!(state.applied_retry_instruction, applied);
         assert_eq!(state.observed_review_required_signatures, reviews);
@@ -10262,7 +10368,7 @@ mod tests {
         );
         context.payload.workspace_id = "workspace_1".to_owned();
         context.payload.native_semantic_state.as_mut().unwrap()["schema_version"] =
-            serde_json::json!(2);
+            serde_json::json!(3);
         assert!(
             super::semantic_state::NativeSemanticState::restore(
                 Some(&context),
@@ -10303,6 +10409,7 @@ mod tests {
         let oversized = Some("界".repeat(32 * 1024));
         assert!(
             super::semantic_state::capture(
+                1,
                 "turn_1",
                 &budget,
                 &controller,

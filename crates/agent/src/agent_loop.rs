@@ -2104,6 +2104,7 @@ enum LoopDurableCommitOutcome {
 fn loop_durable_event_kind(event: &AgentDurableEvent) -> &'static str {
     match event {
         AgentDurableEvent::ToolOutputRecorded { .. } => "tool_output_recorded",
+        AgentDurableEvent::NativeSemanticCheckpoint { .. } => "native_semantic_checkpoint",
         AgentDurableEvent::NativeInitialPhaseAdvanced { .. } => "native_initial_phase_advanced",
         AgentDurableEvent::PromptManifestCompiled { .. } => "prompt_manifest_compiled",
         AgentDurableEvent::TurnSkillsResolved { .. } => "turn_skills_resolved",

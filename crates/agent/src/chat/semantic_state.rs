@@ -16,6 +16,7 @@ pub(super) const MAX_SUMMARY_TEXT_BYTES: usize = 16 * 1024;
 #[serde(deny_unknown_fields)]
 pub(super) struct NativeSemanticState {
     pub schema_version: u32,
+    pub checkpoint_revision: u64,
     pub retry: ToolRetryCheckpoint,
     pub retry_lifecycle: ToolRetryLifecycleCheckpoint,
     pub pending_retry_instruction: Option<String>,
@@ -65,6 +66,17 @@ pub(crate) fn checkpoint_compatible(
     if payload.schema_version != pioneer_protocol::EXECUTION_CHECKPOINT_PAYLOAD_SCHEMA_VERSION {
         return false;
     }
+    if payload
+        .native_event_frontier
+        .as_ref()
+        .is_some_and(|frontier| {
+            frontier.schema_version != 1
+                || frontier.event_sequence < 0
+                || frontier.context_sequence < -1
+        })
+    {
+        return false;
+    }
     let Some(value) = payload.native_semantic_state.as_ref() else {
         return false;
     };
@@ -89,7 +101,8 @@ impl NativeSemanticState {
                 return Err(unavailable());
             }
             return Ok(Self {
-                schema_version: 1,
+                schema_version: 2,
+                checkpoint_revision: 0,
                 retry: ToolRetryController::new(budget.clone())
                     .checkpoint()
                     .map_err(|_| unavailable())?,
@@ -111,6 +124,14 @@ impl NativeSemanticState {
             || payload.turn_id != turn
             || context.window_index != payload.window.window_index
             || payload.window.window_index > window_index
+            || payload
+                .native_event_frontier
+                .as_ref()
+                .is_some_and(|frontier| {
+                    frontier.schema_version != 1
+                        || frontier.event_sequence < 0
+                        || frontier.context_sequence < -1
+                })
         {
             return Err(unavailable());
         }
@@ -128,7 +149,7 @@ impl NativeSemanticState {
     }
 
     fn validate(&self, turn: &str, budget: &ToolRetryBudgetConfig) -> Result<(), ChatTurnError> {
-        if self.schema_version != 1
+        if self.schema_version != 2
             || self
                 .pending_retry_instruction
                 .as_ref()
@@ -165,6 +186,7 @@ impl NativeSemanticState {
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn capture(
+    checkpoint_revision: u64,
     turn: &str,
     budget: &ToolRetryBudgetConfig,
     controller: &ToolRetryController,
@@ -181,6 +203,7 @@ pub(super) fn capture(
     #[derive(Serialize)]
     struct Borrowed<'a> {
         schema_version: u32,
+        checkpoint_revision: u64,
         retry: ToolRetryCheckpoint,
         retry_lifecycle: ToolRetryLifecycleCheckpoint,
         pending_retry_instruction: &'a Option<String>,
@@ -193,7 +216,8 @@ pub(super) fn capture(
         post_turn_domain_events: &'a [TurnPostTurnDomainEventSummary],
     }
     let encoded = encode(&Borrowed {
-        schema_version: 1,
+        schema_version: 2,
+        checkpoint_revision,
         retry: controller.checkpoint().map_err(|_| unavailable())?,
         retry_lifecycle: lifecycle.checkpoint(),
         pending_retry_instruction: pending,

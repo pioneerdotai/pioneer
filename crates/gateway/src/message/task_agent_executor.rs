@@ -8673,20 +8673,31 @@ async fn load_execution_checkpoint_context_for_turn(
     processor: &Arc<MessageProcessor>,
     turn_id: &str,
 ) -> Result<Option<ExecutionCheckpointContext>> {
-    let Some(checkpoint) = processor
-        .crud_store
-        .latest_turn_execution_checkpoint_for_turn(turn_id)
-        .await?
-    else {
-        return Ok(None);
-    };
     let Some(window) = processor
         .crud_store
-        .get_turn_execution_window(checkpoint.window_id.as_str())
+        .latest_turn_execution_window(turn_id)
         .await?
     else {
         return Ok(None);
     };
+    let checkpoint = if window.status == pioneer_protocol::ExecutionWindowStatus::Running {
+        processor
+            .crud_store
+            .native_semantic_checkpoint_for_turn(turn_id)
+            .await?
+    } else {
+        processor
+            .crud_store
+            .latest_turn_execution_checkpoint_for_turn(turn_id)
+            .await?
+    };
+    let Some(mut checkpoint) = checkpoint else {
+        return Ok(None);
+    };
+    anyhow::ensure!(
+        checkpoint.window_id == window.id,
+        "Task checkpoint does not belong to current window"
+    );
     if window.turn_id != turn_id {
         warn!(
             turn_id,
@@ -8696,7 +8707,7 @@ async fn load_execution_checkpoint_context_for_turn(
         );
         return Ok(None);
     }
-    let payload =
+    let mut payload =
         match serde_json::from_value::<ExecutionCheckpointPayload>(checkpoint.payload_json.clone())
         {
             Ok(payload) => payload,
@@ -8714,6 +8725,63 @@ async fn load_execution_checkpoint_context_for_turn(
     // identity used by continuation events, not the database row primary key
     // stored in `checkpoint.window_id`.  The transition validator compares it
     // with the immutable runtimeWindowId written by the Started event.
+    if checkpoint.checkpoint_kind == pioneer_crud::TurnExecutionCheckpointKind::SemanticState {
+        anyhow::ensure!(
+            window.status == pioneer_protocol::ExecutionWindowStatus::Running
+                && processor
+                    .crud_store
+                    .native_semantic_checkpoint_frontier_is_current(&payload)
+                    .await?,
+            "Task native semantic checkpoint has an unconsumed source frontier"
+        );
+        let owner = processor
+            .crud_store
+            .get_turn_execution(turn_id)
+            .await?
+            .context("Task native recovery owner unavailable")?;
+        let completed_at = utc_now();
+        let recovery_checkpoint_id = pioneer_protocol::generate_id(21);
+        let mut recovered = payload.clone();
+        recovered.native_event_frontier = None;
+        recovered.window.completed_at_unix_ms = Some(completed_at.timestamp_millis());
+        recovered.window.exhaustion_reason =
+            Some(pioneer_protocol::ExecutionWindowExhaustionReason::RuntimeShutdownContinuation);
+        processor
+            .crud_store
+            .checkpoint_native_running_window_for_recovery(
+                &window,
+                &checkpoint,
+                pioneer_crud::NewTurnExecutionCheckpointRecord {
+                    id: Some(recovery_checkpoint_id.clone()),
+                    window_id: window.id.clone(),
+                    workspace_id: window.workspace_id.clone(),
+                    thread_id: window.thread_id.clone(),
+                    turn_id: turn_id.to_owned(),
+                    checkpoint_kind: pioneer_crud::TurnExecutionCheckpointKind::StartupRecovery,
+                    payload_json: serde_json::to_value(&recovered)?,
+                    created_at: completed_at,
+                },
+                pioneer_crud::TurnExecutionWindowStatsRecord {
+                    agent_round_count: window
+                        .agent_round_count
+                        .max(payload.window.agent_round_count),
+                    tool_call_count: window.tool_call_count.max(payload.window.tool_call_count),
+                    provider_token_count: window
+                        .provider_token_count
+                        .max(payload.window.provider_token_count.unwrap_or(0)),
+                    metadata_json: window.metadata_json.clone(),
+                    completed_at,
+                    updated_at: completed_at,
+                },
+                pioneer_protocol::ExecutionWindowExhaustionReason::RuntimeShutdownContinuation,
+                processor.turn_execution_owner_id.as_ref(),
+                owner.owner_generation,
+            )
+            .await?;
+        checkpoint.id = recovery_checkpoint_id;
+        checkpoint.checkpoint_kind = pioneer_crud::TurnExecutionCheckpointKind::StartupRecovery;
+        payload = recovered;
+    }
     let runtime_window_id = window
         .metadata_json
         .get("runtimeWindowId")
@@ -8744,6 +8812,7 @@ async fn load_execution_checkpoint_context_for_turn(
 
 fn task_execution_checkpoint_kind_label(kind: pioneer_crud::TurnExecutionCheckpointKind) -> String {
     match kind {
+        pioneer_crud::TurnExecutionCheckpointKind::SemanticState => "semantic_state",
         pioneer_crud::TurnExecutionCheckpointKind::WindowExhausted => "window_exhausted",
         pioneer_crud::TurnExecutionCheckpointKind::TurnBlocked => "turn_blocked",
         pioneer_crud::TurnExecutionCheckpointKind::StartupRecovery => "startup_recovery",
