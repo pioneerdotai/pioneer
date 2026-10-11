@@ -1952,7 +1952,7 @@ impl TaskAgentExecutor {
                 frozen_parent_history,
             )
             .await?;
-            materialize_child_task_input(prompt, agent_spec)
+            materialize_child_task_input(prompt, agent_spec, cli_runtime_backend.is_none())?
         };
         let selected_capabilities = normalized_selected_capabilities
             .as_ref()
@@ -3121,7 +3121,8 @@ impl TaskAgentExecutor {
             )
             .await?,
             agent_spec,
-        );
+            turn_settings.cli_runtime.is_none(),
+        )?;
         if let Some((runtime_id, runtime_kind)) = turn_settings.cli_runtime.clone() {
             let child_security_snapshot = resolve_task_child_cli_execution_security_snapshot(
                 processor,
@@ -9885,13 +9886,20 @@ async fn materialize_child_task_prompt(
     }))
 }
 
-fn materialize_child_task_input(prompt: String, agent_spec: &TaskAgentSpec) -> Vec<UserInput> {
+fn materialize_child_task_input(
+    prompt: String,
+    agent_spec: &TaskAgentSpec,
+    native_media: bool,
+) -> Result<Vec<UserInput>> {
     let mut input = vec![UserInput::Text {
         text: prompt,
         text_elements: Vec::new(),
     }];
-    input.extend(task_artifacts::task_agent_artifact_user_inputs(agent_spec));
-    input
+    input.extend(task_artifacts::task_agent_artifact_user_inputs(
+        agent_spec,
+        native_media,
+    )?);
+    Ok(input)
 }
 
 fn materialize_reviewer_prompt(
@@ -11800,7 +11808,7 @@ mod tests {
 
     #[test]
     fn task_artifact_input_attachments_are_materialized_as_user_inputs() {
-        let agent_spec = TaskAgentSpec {
+        let mut agent_spec = TaskAgentSpec {
             id: "spec".to_owned(),
             task_id: "task".to_owned(),
             run_id: None,
@@ -11846,7 +11854,7 @@ mod tests {
             updated_at: 1,
         };
 
-        let inputs = materialize_child_task_input("prompt".to_owned(), &agent_spec);
+        let inputs = materialize_child_task_input("prompt".to_owned(), &agent_spec, true).unwrap();
 
         assert!(matches!(inputs[0], UserInput::Text { .. }));
         assert!(inputs.iter().any(|input| matches!(
@@ -11857,6 +11865,70 @@ mod tests {
             input,
             UserInput::Artifact { artifact_id, .. } if artifact_id == "art_ref"
         )));
+        let original_count = inputs.len();
+        let attachment = |kind, path, url| pioneer_protocol::TaskAgentInputAttachment {
+            kind,
+            name: None,
+            path,
+            url,
+            artifact_id: None,
+            version_id: None,
+            mime_type: None,
+        };
+        let source = agent_spec.prompt.input.as_mut().unwrap();
+        source.attachments.push(attachment(
+            TaskAgentInputAttachmentKind::File,
+            Some("/authorized/original.pdf".into()),
+            None,
+        ));
+        source.attachments.push(attachment(
+            TaskAgentInputAttachmentKind::Url,
+            None,
+            Some("https://example.org/original.pdf".into()),
+        ));
+        let native = materialize_child_task_input("prompt".into(), &agent_spec, true).unwrap();
+        assert_eq!(native.len(), original_count + 2);
+        assert!(native.contains(&UserInput::LocalFile {
+            path: "/authorized/original.pdf".into()
+        }));
+        assert!(native.contains(&UserInput::File {
+            url: "https://example.org/original.pdf".into()
+        }));
+        assert_eq!(
+            materialize_child_task_input("prompt".into(), &agent_spec, false).unwrap(),
+            inputs
+        );
+        agent_spec.context_policy = Some(pioneer_protocol::TaskAgentContextPolicy {
+            mode: pioneer_protocol::TaskAgentContextMode::Custom,
+            max_turns: None,
+            include_parent_summary: false,
+            include_artifacts: true,
+            custom_context: Some(pioneer_protocol::TaskAgentContext {
+                text: None,
+                variables: Vec::new(),
+                attachments: vec![attachment(
+                    TaskAgentInputAttachmentKind::File,
+                    Some("/authorized/context.pdf".into()),
+                    None,
+                )],
+                references: Vec::new(),
+            }),
+        });
+        let native = materialize_child_task_input("prompt".into(), &agent_spec, true).unwrap();
+        assert!(native.contains(&UserInput::LocalFile {
+            path: "/authorized/context.pdf".into()
+        }));
+        agent_spec
+            .prompt
+            .input
+            .as_mut()
+            .unwrap()
+            .attachments
+            .last_mut()
+            .unwrap()
+            .url = None;
+        let error = materialize_child_task_input("prompt".into(), &agent_spec, true).unwrap_err();
+        assert!(!format!("{error:#}").contains("/authorized"));
     }
 
     #[test]

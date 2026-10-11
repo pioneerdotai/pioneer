@@ -73,60 +73,107 @@ impl TaskResultArtifactAuthorization {
 
 pub(super) fn task_agent_artifact_user_inputs(
     agent_spec: &pioneer_protocol::TaskAgentSpec,
-) -> Vec<UserInput> {
+    native_media: bool,
+) -> Result<Vec<UserInput>> {
     let mut artifacts = Vec::new();
-    collect_task_agent_input_artifacts(agent_spec.prompt.input.as_ref(), &mut artifacts);
+    collect_task_agent_input_artifacts(
+        agent_spec.prompt.input.as_ref(),
+        &mut artifacts,
+        native_media,
+    )?;
     if let Some(context) = agent_spec
         .context_policy
         .as_ref()
         .and_then(|policy| policy.custom_context.as_ref())
     {
-        collect_task_agent_context_artifacts(context, &mut artifacts);
+        collect_task_agent_context_artifacts(context, &mut artifacts, native_media)?;
     }
-    artifacts
+    Ok(artifacts)
 }
 
 fn collect_task_agent_context_artifacts(
     context: &TaskAgentContext,
     artifacts: &mut Vec<UserInput>,
-) {
+    native_media: bool,
+) -> Result<()> {
     let input = TaskAgentInput {
         text: None,
         variables: Vec::new(),
         attachments: context.attachments.clone(),
         references: context.references.clone(),
     };
-    collect_task_agent_input_artifacts(Some(&input), artifacts);
+    collect_task_agent_input_artifacts(Some(&input), artifacts, native_media)
 }
 
 fn collect_task_agent_input_artifacts(
     input: Option<&TaskAgentInput>,
     artifacts: &mut Vec<UserInput>,
-) {
+    native_media: bool,
+) -> Result<()> {
     let Some(input) = input else {
-        return;
+        return Ok(());
     };
     for attachment in &input.attachments {
-        if attachment.kind == TaskAgentInputAttachmentKind::Artifact
-            && let Some(artifact_id) = attachment.artifact_id.as_deref()
-            && !artifact_id.trim().is_empty()
-        {
-            artifacts.push(UserInput::Artifact {
-                artifact_id: artifact_id.to_owned(),
-                version_id: attachment.version_id.clone(),
-            });
+        if !native_media && attachment.kind != TaskAgentInputAttachmentKind::Artifact {
+            continue;
         }
+        if !native_media
+            && !attachment
+                .artifact_id
+                .as_ref()
+                .is_some_and(|id| !id.trim().is_empty())
+        {
+            continue;
+        }
+        anyhow::ensure!(
+            !native_media
+                || artifacts.len()
+                    < pioneer_provider::default_attachment_pipeline_config()
+                        .max_attachments_per_request,
+            "Task input attachment count exceeds native media limit"
+        );
+        let locator = |value: Option<&String>| -> Result<String> {
+            value
+                .filter(|value| !value.trim().is_empty())
+                .cloned()
+                .context("Task input attachment locator is unavailable")
+        };
+        artifacts.push(match attachment.kind {
+            TaskAgentInputAttachmentKind::File => UserInput::LocalFile {
+                path: locator(attachment.path.as_ref())?,
+            },
+            TaskAgentInputAttachmentKind::Url => UserInput::File {
+                url: locator(attachment.url.as_ref())?,
+            },
+            TaskAgentInputAttachmentKind::Artifact => UserInput::Artifact {
+                artifact_id: locator(attachment.artifact_id.as_ref())?,
+                version_id: attachment.version_id.clone(),
+            },
+        });
     }
     for reference in &input.references {
-        if reference.kind == TaskAgentInputReferenceKind::Artifact
-            && !reference.id.trim().is_empty()
-        {
+        if reference.kind == TaskAgentInputReferenceKind::Artifact {
+            if !native_media && reference.id.trim().is_empty() {
+                continue;
+            }
+            anyhow::ensure!(
+                !reference.id.trim().is_empty(),
+                "Task artifact reference is unavailable"
+            );
+            anyhow::ensure!(
+                !native_media
+                    || artifacts.len()
+                        < pioneer_provider::default_attachment_pipeline_config()
+                            .max_attachments_per_request,
+                "Task input attachment count exceeds native media limit"
+            );
             artifacts.push(UserInput::Artifact {
                 artifact_id: reference.id.clone(),
                 version_id: reference.version_id.clone(),
             });
         }
     }
+    Ok(())
 }
 
 pub(super) async fn render_parent_artifact_refs(
