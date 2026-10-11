@@ -1072,6 +1072,11 @@ async fn restore_persisted_agent_action_binding_with_native_contract(
         .ok_or_else(|| anyhow::anyhow!("persisted AgentExecution is missing"))?;
     if execution.workspace_id != context.workspace_id
         || execution.parent_thread_id.as_deref() != Some(context.thread_id.as_str())
+        || (native_contract.is_some()
+            && !matches!(
+                execution.status.as_str(),
+                "created" | "queued" | "running" | "recovering"
+            ))
         || execution.finished_at.is_some()
         || matches!(
             execution.status.as_str(),

@@ -280,6 +280,66 @@ impl BoundAgentActionAdapter {
         )
     }
 
+    pub(crate) async fn native_launch_contract_can_restore(
+        store: &pioneer_crud::CrudStore,
+        workspace: &str,
+        thread: &str,
+        turn: &str,
+        encoded: &str,
+    ) -> anyhow::Result<bool> {
+        if encoded.len() > pioneer_protocol::TURN_EXECUTION_REQUEST_MAX_BYTES {
+            return Ok(false);
+        }
+        let Ok(accepted) = serde_json::from_str::<NativeAgentActionLaunchContract>(encoded) else {
+            return Ok(false);
+        };
+        if accepted.schema_version != 1
+            || accepted.identity_fingerprint.is_empty()
+            || accepted.profile_fingerprint.is_empty()
+            || accepted
+                .same_capsule_targets
+                .iter()
+                .any(|(id, _)| id.trim().is_empty())
+            || accepted.routes.iter().any(|route| {
+                route.source_identity_id.is_none()
+                    || (route.kind == pioneer_protocol::AgentRouteKind::ExecutionBound
+                        && route.source_execution_id != accepted.execution_id.as_str())
+            })
+            || accepted.start_options.agents.len()
+                > pioneer_protocol::ChildAgentLaunchGrantSet::MAX_IDENTITIES
+            || accepted.start_options.profiles.len()
+                > pioneer_protocol::ChildAgentLaunchGrantSet::MAX_PROFILES
+            || accepted.routes.len() > 256
+            || accepted.same_capsule_targets.len() > 256
+            || accepted
+                .routes
+                .iter()
+                .map(|r| &r.route_id)
+                .collect::<BTreeSet<_>>()
+                .len()
+                != accepted.routes.len()
+            || accepted
+                .same_capsule_targets
+                .iter()
+                .map(|(id, _)| id)
+                .collect::<BTreeSet<_>>()
+                .len()
+                != accepted.same_capsule_targets.len()
+        {
+            return Ok(false);
+        }
+        pioneer_crud::native_initial_agent_owner_exists(
+            &store.database_connection(),
+            accepted.execution_id.as_str(),
+            workspace,
+            thread,
+            turn,
+            &accepted.identity_fingerprint,
+            &accepted.profile_fingerprint,
+        )
+        .await
+    }
+
     fn validate_native_launch_catalog_bounds(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
             self.start_options.agents.len()
@@ -2076,6 +2136,50 @@ mod tests {
                     &"x".repeat(pioneer_protocol::TURN_EXECUTION_REQUEST_MAX_BYTES + 1)
                 )
                 .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_owner_check_rejects_missing_original_execution_and_future_contract() {
+        use migration::MigratorTrait;
+        let db = sea_orm::Database::connect("sqlite::memory:").await.unwrap();
+        migration::Migrator::up(&db, None).await.unwrap();
+        let store = pioneer_crud::CrudStore::new(db);
+        let encoded = test_adapter().capture_native_launch_contract().unwrap();
+        assert!(
+            !BoundAgentActionAdapter::native_launch_contract_can_restore(
+                &store,
+                "workspace",
+                "thread",
+                "turn",
+                &encoded,
+            )
+            .await
+            .unwrap()
+        );
+        let mut future: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        future["schema_version"] = serde_json::json!(2);
+        assert!(
+            !BoundAgentActionAdapter::native_launch_contract_can_restore(
+                &store,
+                "workspace",
+                "thread",
+                "turn",
+                &future.to_string(),
+            )
+            .await
+            .unwrap()
+        );
+        assert!(
+            !BoundAgentActionAdapter::native_launch_contract_can_restore(
+                &store,
+                "workspace",
+                "thread",
+                "turn",
+                "PRIVATE incompatible",
+            )
+            .await
+            .unwrap()
         );
     }
 

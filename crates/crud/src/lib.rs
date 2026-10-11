@@ -103,9 +103,10 @@ pub use repositories::agent_domain::{
     load_agent_work_graph_projection_target, load_current_agent_authors_for_executions,
     load_current_agent_presentation_snapshot, load_native_agent_config,
     load_native_agent_config_by_system_key, mark_agent_action_outbox_delivered,
-    mark_agent_action_outbox_failed, promote_queued_agent_executions,
-    record_agent_execution_progress, reopen_agent_execution_for_retry,
-    revoke_agent_delegation_route, upgrade_agent_execution_grant_model_to_current, utc_now,
+    mark_agent_action_outbox_failed, native_initial_agent_owner_exists,
+    promote_queued_agent_executions, record_agent_execution_progress,
+    reopen_agent_execution_for_retry, revoke_agent_delegation_route,
+    upgrade_agent_execution_grant_model_to_current, utc_now,
     wake_agent_action_outbox_for_execution,
 };
 pub use repositories::agent_identity_catalog::{

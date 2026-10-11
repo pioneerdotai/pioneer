@@ -2736,7 +2736,9 @@ impl AgentMcpToolProvider for McpService {
         descriptors: &[pioneer_tools::McpDynamicToolDescriptor],
     ) -> Result<Vec<pioneer_tools::ToolExtensionBundle>, String> {
         let unavailable = || "accepted MCP projection cannot be restored".to_owned();
-        if descriptors.len() > 256 || descriptors.iter().any(|d| d.workspace_id != workspace_id) {
+        if descriptors.len() > McpProjectionLimits::default().max_tools
+            || descriptors.iter().any(|d| d.workspace_id != workspace_id)
+        {
             return Err(unavailable());
         }
         let projection = self
@@ -2751,7 +2753,10 @@ impl AgentMcpToolProvider for McpService {
             || projection.projection_version != MCP_TURN_PROJECTION_VERSION as i32
             || projection.manifest_hash != manifest_hash
             || projection.tool_count != descriptors.len() as i32
-            || !projection.resolution_status.starts_with("resolved")
+            || !matches!(
+                projection.resolution_status.as_str(),
+                "resolved" | "resolved_degraded"
+            )
         {
             return Err(unavailable());
         }
@@ -5038,6 +5043,23 @@ mod tests {
                     &fixture.turn_id,
                     "changed-manifest",
                     &materialized.descriptors
+                )
+                .await
+                .is_err()
+        );
+        fixture.crud_store.database_connection().execute_raw(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DbBackend::Sqlite,
+            "UPDATE turn_mcp_projection SET resolution_status='resolved_future_unknown' WHERE turn_id=?",
+            [fixture.turn_id.clone().into()],
+        )).await.unwrap();
+        assert!(
+            fixture
+                .service
+                .restore_mcp_tools(
+                    &fixture.workspace_id,
+                    &fixture.turn_id,
+                    &fixture.manifest_hash,
+                    &materialized.descriptors,
                 )
                 .await
                 .is_err()

@@ -10,7 +10,7 @@ pub mod compaction;
 mod hooks;
 mod manager_recovery;
 mod native_initial;
-pub use native_initial::NativeInitialPreparation;
+pub use native_initial::{NativeInitialPreparation, NativeInitialResumeRequirements};
 #[cfg(test)]
 mod manager_tests;
 pub mod post_turn;

@@ -34,6 +34,13 @@ pub(crate) struct AcceptedNativeInitialOutputs {
     pub(crate) config: ToolLoopConfig,
 }
 
+/// Concrete references needed by the Gateway's read-only resume eligibility
+/// check. This projection is ephemeral; the existing phase remains its owner.
+pub struct NativeInitialResumeRequirements {
+    pub native_agent_action_contract: Option<String>,
+    pub mcp_projection: Option<(String, usize)>,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "phase", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum InitialPhase {
@@ -163,9 +170,16 @@ impl NativeInitialPreparation {
     /// A durable continuation requires completed initial outputs. Admission
     /// validation alone also permits NotStarted, which cannot prove resume.
     pub fn completed_for_resume(encoded: &str, byte_budget: usize) -> Result<bool> {
+        Ok(Self::completed_resume_requirements(encoded, byte_budget)?.is_some())
+    }
+
+    pub fn completed_resume_requirements(
+        encoded: &str,
+        byte_budget: usize,
+    ) -> Result<Option<NativeInitialResumeRequirements>> {
         let snapshot = decode(encoded, byte_budget)?;
         let InitialPhase::Completed { outputs } = snapshot.state else {
-            return Ok(false);
+            return Ok(None);
         };
         for entry in &outputs.tool_metadata.entries {
             let prefix = match entry.domain.as_str() {
@@ -179,7 +193,7 @@ impl NativeInitialPreparation {
                 {
                     "mcp.runtime.bundle."
                 }
-                _ => return Ok(false),
+                _ => return Ok(None),
             };
             let Some(index) = entry
                 .bundle_id
@@ -187,13 +201,34 @@ impl NativeInitialPreparation {
                 .strip_prefix(prefix)
                 .and_then(|n| n.parse::<usize>().ok())
             else {
-                return Ok(false);
+                return Ok(None);
             };
             if index >= 256 || entry.bundle_id.as_str() != format!("{prefix}{index}") {
-                return Ok(false);
+                return Ok(None);
             }
         }
-        Ok(true)
+        let has_turn_owner = outputs
+            .tool_metadata
+            .entries
+            .iter()
+            .any(|e| e.domain.as_str() == "turn");
+        let has_mcp_owner = outputs
+            .tool_metadata
+            .entries
+            .iter()
+            .any(|e| e.domain.as_str() == "mcp");
+        Ok(Some(NativeInitialResumeRequirements {
+            native_agent_action_contract: has_turn_owner
+                .then_some(outputs.native_agent_action_contract)
+                .flatten(),
+            mcp_projection: has_mcp_owner
+                .then_some(
+                    outputs
+                        .mcp_manifest_hash
+                        .map(|hash| (hash, outputs.mcp_descriptors.len())),
+                )
+                .flatten(),
+        }))
     }
 
     pub fn validate_transition(previous: &str, next: &str, byte_budget: usize) -> Result<()> {

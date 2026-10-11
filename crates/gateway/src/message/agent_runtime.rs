@@ -8700,7 +8700,7 @@ impl MessageProcessor {
         let latest_checkpoint_id = checkpoint.as_ref().map(|checkpoint| checkpoint.id.clone());
         let recovery_job = self.crud_store.get_recovery_job(recovery_job_id).await?;
         let snapshot = self.crud_store.get_turn_runtime_snapshot(turn_id).await?;
-        let snapshot_compatible = snapshot.as_ref().is_some_and(|snapshot| {
+        let mut snapshot_compatible = snapshot.as_ref().is_some_and(|snapshot| {
             snapshot.turn_id == turn_id
                 && crate::turn_runtime_snapshot::validate_runtime_snapshot_for_resume(snapshot)
                     .is_ok()
@@ -8712,6 +8712,42 @@ impl MessageProcessor {
                     .unwrap_or(false)
                 })
         });
+        if snapshot_compatible {
+            let snapshot = snapshot.as_ref().expect("validated snapshot");
+            let requirements =
+                pioneer_agent::NativeInitialPreparation::completed_resume_requirements(
+                    snapshot
+                        .initial_phase_json
+                        .as_deref()
+                        .expect("validated initial phase"),
+                    pioneer_protocol::TURN_EXECUTION_REQUEST_MAX_BYTES,
+                )?
+                .expect("validated completed phase");
+            if let Some(contract) = requirements.native_agent_action_contract {
+                snapshot_compatible = crate::authorization::BoundAgentActionAdapter::native_launch_contract_can_restore(
+                    &self.crud_store, &snapshot.workspace_id, &snapshot.thread_id, turn_id, &contract,
+                ).await?;
+            }
+            if let Some((hash, count)) = requirements.mcp_projection {
+                snapshot_compatible &=
+                    count <= crate::turn_mcp::McpProjectionLimits::default().max_tools;
+                snapshot_compatible &= self
+                    .crud_store
+                    .get_turn_mcp_projection(turn_id)
+                    .await?
+                    .is_some_and(|projection| {
+                        projection.workspace_id == snapshot.workspace_id
+                            && projection.projection_version
+                                == crate::turn_mcp::MCP_TURN_PROJECTION_VERSION as i32
+                            && projection.manifest_hash == hash
+                            && projection.tool_count == count as i32
+                            && matches!(
+                                projection.resolution_status.as_str(),
+                                "resolved" | "resolved_degraded"
+                            )
+                    });
+            }
+        }
         let checkpoint_compatible = checkpoint.as_ref().is_some_and(|checkpoint| {
             serde_json::from_value::<pioneer_protocol::ExecutionCheckpointPayload>(
                 checkpoint.payload_json.clone(),

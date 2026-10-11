@@ -365,7 +365,10 @@ impl GatewayTurnMcpInvoker {
             ));
         }
         if projection.projection_version <= 0
-            || !projection.resolution_status.starts_with("resolved")
+            || !matches!(
+                projection.resolution_status.as_str(),
+                "resolved" | "resolved_degraded"
+            )
         {
             return Err(invocation_error(
                 TurnMcpInvocationErrorCode::ProjectionUnavailable,
