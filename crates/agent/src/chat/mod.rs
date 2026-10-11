@@ -3518,96 +3518,65 @@ fn workdir_from_execution_security_snapshot(
         })
 }
 
-async fn execute_agent_provider_response(
-    context_session: Option<&crate::compaction::controller::NativeContextSession>,
+/// Completed initial outputs are distinct from per-window runtime handles.
+/// Initial phases end at this boundary before provider rounds begin; durable
+/// restoration binds their outputs separately from the ephemeral event receiver.
+struct PreparedNativeInitialTurn {
+    effective_policy_set: EffectiveTurnPolicySet,
+    effective_prompt_context_set: EffectiveTurnPromptContextSet,
+    effective_prompt_section_set: EffectiveTurnPromptSectionSet,
+    initial_instruction_plan: CompiledInstructionDeliveryPlan,
+    capability_diagnostics: Vec<PromptManifestDiagnostic>,
+    skill_runtime_plan: pioneer_skills::SkillRuntimePlan,
+    skill_tool_materialization: Option<Arc<skill_tools::SkillToolMaterialization>>,
+    tools: Option<pioneer_tools::BuiltinTools>,
+    visible_tool_names: Vec<String>,
+    requested_tool_names: Vec<String>,
+    preflight_usage: preflight::PreflightBudgetUsage,
+}
+
+async fn prepare_native_initial_turn(
     provider_registry: Arc<ProviderRegistry>,
     provider: &Arc<dyn Provider>,
-    model: String,
-    hook_runtime_context: AgentTurnHookRuntimeContext,
-    reasoning: Option<ReasoningConfig>,
-    history: Vec<ChatMessage>,
-    user_message: ChatMessage,
+    model: &str,
+    hook_context: &AgentTurnHookContext,
+    hook_runtime_context: &AgentTurnHookRuntimeContext,
+    user_input_text: String,
     input: &[UserInput],
     capabilities: &[TurnCapability],
     workspace_skill_policies: &HashMap<SkillPolicyKey, crate::WorkspaceSkillPolicy>,
     skill_catalog: &pioneer_skills::SkillCatalogSnapshot,
     agent_skill_overlay: &[pioneer_skills::AgentSkillRuntimeEntry],
     runtime_environment: HashMap<String, String>,
-    retained_provider_history: Vec<RetainedProviderHistoryMessage>,
+    history: &[ChatMessage],
     execution_window_index: u32,
-    preparation_started: Instant,
-    preparation_started_at_unix_ms: i64,
-    execution_checkpoint_context: Option<ExecutionCheckpointContext>,
-    permission_profile: TurnPermissionProfileSnapshot,
-    execution_security_snapshot: Option<TurnExecutionSecuritySnapshot>,
-    force_non_stream: bool,
-    disable_tool_calling: bool,
+    execution_checkpoint_context: Option<&ExecutionCheckpointContext>,
+    permission_profile: &TurnPermissionProfileSnapshot,
+    execution_security_snapshot: Option<&TurnExecutionSecuritySnapshot>,
     continue_generation_hint: bool,
-    tool_loop_config: ToolLoopConfig,
-    mcp_tool_provider: Option<Arc<dyn AgentMcpToolProvider>>,
-    turn_tool_provider: Option<Arc<dyn TurnToolProvider>>,
-    turn_finalization_provider: Option<Arc<dyn TurnFinalizationProvider>>,
-    task_tool_provider: Option<Arc<dyn TaskToolProvider>>,
-    hook_runtime: Option<Arc<HookRuntime>>,
-    tool_bundle_artifacts: Option<Arc<AgentToolBundleArtifactStore>>,
+    tool_loop_config: &ToolLoopConfig,
+    provider_tool_calling: bool,
+    native_file_tool_capability: NativeFileToolCapability,
+    mcp_tool_provider: Option<&Arc<dyn AgentMcpToolProvider>>,
+    turn_tool_provider: Option<&Arc<dyn TurnToolProvider>>,
+    task_tool_provider: Option<&Arc<dyn TaskToolProvider>>,
+    hook_runtime: Option<&Arc<HookRuntime>>,
+    tool_bundle_artifacts: Option<&Arc<AgentToolBundleArtifactStore>>,
     permission_approval_broker: Arc<dyn PermissionApprovalBroker>,
-    turn_control: TurnExecutionControl,
-    mut recovery: Option<RecoveryAttemptContext>,
+    recovering: bool,
     workspace_id: &str,
     thread_id: &str,
     turn_id: &str,
-    initial_thinking_item_id: String,
-    message_item_id: &str,
-    event_tx: Arc<AgentEventHub>,
-) -> Result<ChatTurnOutcome, ChatTurnError> {
-    let mut window_stats = ChatExecutionWindowStats::new(execution_window_index);
-    window_stats.started_at_unix_ms = preparation_started_at_unix_ms;
-    emit_execution_window_started(
-        workspace_id,
-        thread_id,
-        turn_id,
-        &window_stats,
-        event_tx.as_ref(),
-    )
-    .await?;
-    let workdir = workdir_from_execution_security_snapshot(execution_security_snapshot.as_ref())?;
-    let filesystem_prompt_snapshot = execution_security_snapshot.clone();
-
-    let tool_loop_config = tool_loop_config.normalized();
-    let model_tool_support = provider.model_tool_support(model.as_str());
-    if !disable_tool_calling && model_tool_support == pioneer_provider::ModelToolSupport::Unknown {
-        return Err(ChatTurnError::Blocked(
-            "native Agent requires verified model tool support; capability evidence is unknown"
-                .to_owned(),
-        ));
-    }
-    let provider_tool_calling = model_tool_support == pioneer_provider::ModelToolSupport::Supported
-        && !disable_tool_calling;
-    let native_file_tool_capability = if provider_tool_calling {
-        provider.native_file_tool_capability(model.as_str())
-    } else {
-        NativeFileToolCapability::unavailable(
-            provider.name(),
-            model.as_str(),
-            "provider tool calling is disabled for this turn",
-        )
-    };
-    let post_turn_model = model.clone();
-    let post_turn_model_provider = provider.name().to_owned();
-    let hook_context = AgentTurnHookContext::with_runtime_context(
-        workspace_id,
-        thread_id,
-        turn_id,
-        hook_runtime_context.clone(),
-    );
-    let user_input_text = user_message.text_content_lossy();
-
+    event_tx: &Arc<AgentEventHub>,
+) -> Result<PreparedNativeInitialTurn, ChatTurnError> {
+    let workdir = workdir_from_execution_security_snapshot(execution_security_snapshot)?;
+    let filesystem_prompt_snapshot = execution_security_snapshot.cloned();
     let effective_policy_set = run_agent_turn_policy_hook_phase(
-        hook_runtime.as_ref(),
-        &hook_context,
+        hook_runtime,
+        hook_context,
         TurnPrePolicyHookInput::from_parts(
             user_input_text.clone(),
-            Some(model.clone()),
+            Some(model.to_owned()),
             Some(provider.name().to_owned()),
         ),
     )
@@ -3623,12 +3592,12 @@ async fn execute_agent_provider_response(
     })?;
 
     let mut effective_prompt_context_set = run_agent_turn_prompt_context_hook_phase(
-        hook_runtime.as_ref(),
-        &hook_context,
+        hook_runtime,
+        hook_context,
         &effective_policy_set,
         TurnPrePromptContextHookInput::from_parts(
             user_input_text.clone(),
-            Some(model.clone()),
+            Some(model.to_owned()),
             Some(provider.name().to_owned()),
         ),
     )
@@ -3641,7 +3610,7 @@ async fn execute_agent_provider_response(
 
     let mcp_materialization = if provider_tool_calling {
         match materialize_mcp_tooling(
-            mcp_tool_provider.as_ref(),
+            mcp_tool_provider,
             workspace_id,
             turn_id,
             normalized_capabilities.mcp_server_refs.as_slice(),
@@ -3817,7 +3786,7 @@ async fn execute_agent_provider_response(
     }
 
     if let Some(persistence_request) = mcp_materialization.persistence.clone() {
-        let Some(mcp_tool_provider) = mcp_tool_provider.as_ref() else {
+        let Some(mcp_tool_provider) = mcp_tool_provider else {
             return Err(ChatTurnError::Blocked(
                 "resolved MCP projection has no persistence owner".to_owned(),
             ));
@@ -3874,16 +3843,11 @@ async fn execute_agent_provider_response(
     let mut skills_prompt = normalize_optional_prompt(Some(skills_resolution.prompt.clone()));
 
     let task_materialization = if provider_tool_calling {
-        materialize_task_tooling(
-            task_tool_provider.as_ref(),
-            workspace_id,
-            thread_id,
-            turn_id,
-        )
-        .await
-        .map_err(|_| {
-            ChatTurnError::Blocked("required task tooling could not be materialized".to_owned())
-        })?
+        materialize_task_tooling(task_tool_provider, workspace_id, thread_id, turn_id)
+            .await
+            .map_err(|_| {
+                ChatTurnError::Blocked("required task tooling could not be materialized".to_owned())
+            })?
     } else {
         TaskToolMaterialization::default()
     };
@@ -3902,18 +3866,14 @@ async fn execute_agent_provider_response(
     // provider materializes the durable responding execution here even for a
     // model/backend that cannot receive tools, and any admission failure must
     // stop before the first external provider request.
-    let turn_tool_materialization = materialize_turn_tooling(
-        turn_tool_provider.as_ref(),
-        workspace_id,
-        thread_id,
-        turn_id,
-    )
-    .await
-    .map_err(|error| {
-        ChatTurnError::Terminal(format!(
-            "failed to admit durable Agent execution before provider start: {error}"
-        ))
-    })?;
+    let turn_tool_materialization =
+        materialize_turn_tooling(turn_tool_provider, workspace_id, thread_id, turn_id)
+            .await
+            .map_err(|error| {
+                ChatTurnError::Terminal(format!(
+                    "failed to admit durable Agent execution before provider start: {error}"
+                ))
+            })?;
     for diagnostic in &turn_tool_materialization.diagnostics {
         warn!(
             thread_id,
@@ -3925,7 +3885,7 @@ async fn execute_agent_provider_response(
 
     if !provider_tool_calling {
         if !agent_skill_overlay.is_empty() {
-            if recovery.is_some() {
+            if recovering {
                 return Err(ChatTurnError::Terminal(
                     "pinned Agent skills cannot be recovered without native tool calling"
                         .to_owned(),
@@ -3942,12 +3902,12 @@ async fn execute_agent_provider_response(
         }
 
         let _effective_tool_bundle_set = run_agent_turn_tool_materialization_hook_phase(
-            hook_runtime.as_ref(),
-            &hook_context,
+            hook_runtime,
+            hook_context,
             &effective_policy_set,
             &effective_prompt_context_set,
             Vec::new(),
-            tool_bundle_artifacts.as_ref(),
+            tool_bundle_artifacts,
             provider_tool_calling,
         )
         .await
@@ -3965,7 +3925,7 @@ async fn execute_agent_provider_response(
             event_tx.clone(),
             provider_registry.clone(),
             provider.clone(),
-            model.as_str(),
+            model,
             provider_tool_calling,
             &tool_loop_config,
             &effective_policy_set,
@@ -3978,24 +3938,23 @@ async fn execute_agent_provider_response(
             thread_id,
             turn_id,
             execution_window_index,
-            &hook_runtime_context,
+            hook_runtime_context,
             user_input_text.as_str(),
         )
         .await;
 
-        window_stats.record_preflight(turn_preflight.usage);
         ensure_preflight_usage_committed(turn_preflight.publication_failure)?;
         trace_agent_turn_preflight(thread_id, turn_id, &turn_preflight, &[]);
 
         if let Some(active_recall_input) = preflight_active_recall_prompt_context_input(
             user_input_text.as_str(),
-            model.as_str(),
+            model,
             provider.name(),
             &turn_preflight,
         ) {
             effective_prompt_context_set = run_agent_turn_post_preflight_prompt_context_hook_phase(
-                hook_runtime.as_ref(),
-                &hook_context,
+                hook_runtime,
+                hook_context,
                 &effective_policy_set,
                 &effective_prompt_context_set,
                 active_recall_input,
@@ -4009,8 +3968,8 @@ async fn execute_agent_provider_response(
         }
 
         let effective_prompt_section_set = run_agent_turn_prompt_compile_hook_phase(
-            hook_runtime.as_ref(),
-            &hook_context,
+            hook_runtime,
+            hook_context,
             &effective_policy_set,
             &effective_prompt_context_set,
             Vec::new(),
@@ -4029,20 +3988,17 @@ async fn execute_agent_provider_response(
         let prompt_sections =
             prompt_sections_for_compile_from_hook_sections(&effective_prompt_section_set)?;
         let prior_visible_assistant_text =
-            prior_visible_assistant_text_for_execution_continuation(history.as_slice());
+            prior_visible_assistant_text_for_execution_continuation(history);
         let prompt_runtime_sections = runtime_sections_with_execution_continuation_context(
             prompt_sections.runtime_sections.as_slice(),
             execution_window_index,
-            execution_checkpoint_context.as_ref(),
+            execution_checkpoint_context,
             prior_visible_assistant_text.as_deref(),
             turn_tool_materialization.initiating_thread_id.as_deref(),
         );
         let prompt_runtime_sections = runtime_sections_with_artifact_reference_policy(
             prompt_runtime_sections,
-            history_or_prompt_context_has_artifact_refs(
-                history.as_slice(),
-                &effective_prompt_context_set,
-            ),
+            history_or_prompt_context_has_artifact_refs(history, &effective_prompt_context_set),
         )?;
         let prompt_runtime_sections = append_native_filesystem_capability_section(
             prompt_runtime_sections,
@@ -4055,7 +4011,7 @@ async fn execute_agent_provider_response(
             skills_prompt.clone(),
             None,
             prompt_runtime_sections.as_slice(),
-            &permission_profile,
+            permission_profile,
             include_task_orchestration_policy,
             false,
             continue_generation_hint,
@@ -4065,8 +4021,8 @@ async fn execute_agent_provider_response(
         )?;
 
         run_noop_agent_turn_hook_phase(
-            hook_runtime.as_ref(),
-            &hook_context,
+            hook_runtime,
+            hook_context,
             HookPhase::TurnPostPromptCompile,
             &effective_policy_set,
             &effective_prompt_context_set,
@@ -4090,15 +4046,507 @@ async fn execute_agent_provider_response(
         )
         .await?;
 
+        return Ok(PreparedNativeInitialTurn {
+            effective_policy_set,
+            effective_prompt_context_set,
+            effective_prompt_section_set,
+            initial_instruction_plan,
+            capability_diagnostics,
+            skill_runtime_plan: skills_resolution.runtime_plan,
+            skill_tool_materialization: None,
+            tools: None,
+            visible_tool_names: Vec::new(),
+            requested_tool_names: Vec::new(),
+            preflight_usage: turn_preflight.usage,
+        });
+    }
+
+    let skill_tool_materialization = Arc::new(skill_tools::materialize_skill_tooling(
+        &skills_resolution.runtime_plan,
+        &tool_loop_config.skills,
+    ));
+
+    for excluded in &skill_tool_materialization.excluded_tools {
+        warn!(
+            thread_id,
+            turn_id,
+            tool_name = excluded.canonical_tool_name.as_str(),
+            reason = excluded.reason.as_str(),
+            "excluded invalid skill runtime tool; continuing turn"
+        );
+    }
+    for diagnostic in &skill_tool_materialization.policy_diagnostics {
+        warn!(
+            thread_id,
+            turn_id,
+            tool_name = diagnostic.canonical_tool_name.as_str(),
+            diagnostics = ?diagnostic.diagnostics,
+            "dynamic skill tool output policy was narrowed"
+        );
+    }
+
+    let mut tool_bundle_contributions = Vec::new();
+    tool_bundle_contributions.extend(tool_bundle_contributions_from_bundles(
+        "skill",
+        "skill.runtime",
+        SKILL_TOOL_BUNDLE_PRIORITY,
+        skill_tool_materialization.bundles.clone(),
+    ));
+    tool_bundle_contributions.extend(tool_bundle_contributions_from_bundles(
+        "mcp",
+        "mcp.runtime",
+        MCP_TOOL_BUNDLE_PRIORITY,
+        mcp_materialization.bundles.clone(),
+    ));
+    tool_bundle_contributions.extend(tool_bundle_contributions_from_bundles(
+        "turn",
+        "turn.runtime",
+        TURN_TOOL_BUNDLE_PRIORITY,
+        turn_tool_materialization.bundles.clone(),
+    ));
+    tool_bundle_contributions.extend(tool_bundle_contributions_from_bundles(
+        "task",
+        "task.runtime",
+        TASK_TOOL_BUNDLE_PRIORITY,
+        task_materialization.bundles.clone(),
+    ));
+    let effective_tool_bundle_set = run_agent_turn_tool_materialization_hook_phase(
+        hook_runtime,
+        hook_context,
+        &effective_policy_set,
+        &effective_prompt_context_set,
+        tool_bundle_contributions,
+        tool_bundle_artifacts,
+        provider_tool_calling,
+    )
+    .await
+    .map_err(|error| {
+        warn!(
+            thread_id,
+            turn_id,
+            error_kind = error.kind(),
+            "turn tool materialization hook failed before tool runtime construction"
+        );
+        ChatTurnError::Terminal("turn tool materialization hook failed".to_owned())
+    })?;
+
+    let extension_bundles = effective_tool_bundle_set.bundles().to_vec();
+
+    let permission_context = PermissionEvaluationContext::for_turn(
+        workspace_id,
+        thread_id,
+        turn_id,
+        permission_profile.clone(),
+    );
+    let runtime_environment = runtime_environment.into_iter().collect::<BTreeMap<_, _>>();
+    let tools = build_tools_with_environment_and_security_snapshot(
+        workdir.clone(),
+        turn_id.to_owned(),
+        permission_context.clone(),
+        tool_loop_config.web.clone(),
+        tool_loop_config.computer_use.clone(),
+        extension_bundles,
+        runtime_environment,
+        execution_security_snapshot.cloned(),
+    )
+    .map_err(|_| {
+        ChatTurnError::Blocked("required tool runtime could not be constructed".to_owned())
+    })?
+    .with_permission_approval_broker(permission_approval_broker);
+
+    emit_capability_resolution_events(
+        event_tx.as_ref(),
+        workspace_id,
+        thread_id,
+        turn_id,
+        accepted_capabilities.as_slice(),
+        rejected_capabilities.as_slice(),
+        mcp_materialization.mcp_bindings.as_slice(),
+    )
+    .await?;
+    emit_mcp_resolution_diagnostics(
+        event_tx.as_ref(),
+        workspace_id,
+        thread_id,
+        turn_id,
+        mcp_materialization.diagnostics.as_slice(),
+    )
+    .await?;
+
+    // One trusted provider capability decision owns native filesystem-tool
+    // visibility for this turn.  Apply it before preflight so the core index,
+    // request_tools catalog and final provider schema cannot diverge.
+    tools
+        .router
+        .set_blocked_tool_names(native_file_tool_blocked_names(&native_file_tool_capability));
+    tools
+        .router
+        .set_native_patch_wire_shape(native_file_tool_capability.patch_shape);
+
+    skill_tool_materialization
+        .bind_function_proxy_runtime(tools.router.clone(), tools.runtime.clone())
+        .await;
+
+    let router = tools.router.clone();
+
+    let turn_preflight = run_agent_turn_preflight_stage(
+        event_tx.clone(),
+        provider_registry,
+        provider.clone(),
+        model,
+        provider_tool_calling,
+        &tool_loop_config,
+        &effective_policy_set,
+        &effective_prompt_context_set,
+        router.preflight_tool_index(),
+        workspace_id,
+        thread_id,
+        turn_id,
+        execution_window_index,
+        hook_runtime_context,
+        user_input_text.as_str(),
+    )
+    .await;
+
+    ensure_preflight_usage_committed(turn_preflight.publication_failure)?;
+    let mut requested_tool_names = restored_requested_tool_names(
+        execution_checkpoint_context,
+        workspace_id,
+        thread_id,
+        turn_id,
+    );
+    let initial_visibility = compute_agent_turn_final_visible_tools(
+        router.as_ref(),
+        &turn_preflight,
+        &requested_tool_names,
+    );
+    requested_tool_names.retain(|name| initial_visibility.visible_tools.contains(name));
+
+    warn_final_visible_tool_diagnostics(
+        thread_id,
+        turn_id,
+        initial_visibility.diagnostics.as_slice(),
+    );
+
+    let read_skill_is_visible = initial_visibility
+        .visible_tools
+        .iter()
+        .any(|tool_name| tool_name == "read_skill");
+    let exposed_agent_overlay = if skills_resolution.agent_overlay_error.is_none()
+        && agent_skill_cards_have_read_path(agent_skill_overlay, read_skill_is_visible)
+    {
+        readable_agent_skill_overlay(agent_skill_overlay, provider_tool_calling)
+    } else {
+        if skills_resolution.agent_overlay_error.is_none() && !agent_skill_overlay.is_empty() {
+            let base_resolution = skills::resolve_turn_skills_with_explicit_refs(
+                input,
+                normalized_capabilities.skill_refs.as_slice(),
+                skill_catalog,
+                &[],
+                &tool_loop_config.skills,
+                workspace_skill_policies,
+                &projected_mcp_availability,
+            )
+            .map_err(|error| {
+                ChatTurnError::Terminal(format!(
+                    "failed to rebuild ordinary skills after Agent read_skill was unavailable: \
+                     {error:#}"
+                ))
+            })?;
+            skills_prompt = normalize_optional_prompt(Some(base_resolution.prompt));
+            warn!(
+                workspace_id,
+                thread_id,
+                turn_id,
+                "read_skill was absent from the final native tool plan; Agent cards were removed"
+            );
+        }
+        &[]
+    };
+
+    if recovering && !agent_skill_overlay.is_empty() && exposed_agent_overlay.is_empty() {
+        return Err(ChatTurnError::Terminal(
+            "pinned Agent skills are unavailable in the recovered turn's final tool plan"
+                .to_owned(),
+        ));
+    }
+
+    emit_turn_skills_resolved_event(
+        event_tx.as_ref(),
+        thread_id,
+        turn_id,
+        skills::to_turn_skill_bindings(
+            skills_resolution.result.active.as_slice(),
+            exposed_agent_overlay,
+        ),
+        !agent_skill_overlay.is_empty(),
+    )
+    .await?;
+
+    trace_agent_turn_preflight(
+        thread_id,
+        turn_id,
+        &turn_preflight,
+        initial_visibility.visible_tools.as_slice(),
+    );
+
+    if let Some(active_recall_input) = preflight_active_recall_prompt_context_input(
+        user_input_text.as_str(),
+        model,
+        provider.name(),
+        &turn_preflight,
+    ) {
+        effective_prompt_context_set = run_agent_turn_post_preflight_prompt_context_hook_phase(
+            hook_runtime,
+            hook_context,
+            &effective_policy_set,
+            &effective_prompt_context_set,
+            active_recall_input,
+        )
+        .await
+        .map_err(|_| {
+            ChatTurnError::Terminal("required post-preflight context preparation failed".to_owned())
+        })?;
+    }
+
+    let effective_prompt_section_set = run_agent_turn_prompt_compile_hook_phase(
+        hook_runtime,
+        hook_context,
+        &effective_policy_set,
+        &effective_prompt_context_set,
+        Vec::new(),
+        TurnPrePromptCompileHookInput::from_parts(
+            provider_tool_calling,
+            hook_tool_names_from_strings(initial_visibility.visible_tools.as_slice()),
+        ),
+    )
+    .await
+    .map_err(|error| {
+        warn!(
+            thread_id,
+            turn_id,
+            error_kind = error.kind(),
+            "turn prompt section hook failed before prompt construction"
+        );
+        ChatTurnError::Terminal("turn prompt section hook failed".to_owned())
+    })?;
+
+    let prompt_sections =
+        prompt_sections_for_compile_from_hook_sections(&effective_prompt_section_set)?;
+    let prior_visible_assistant_text =
+        prior_visible_assistant_text_for_execution_continuation(history);
+    let prompt_runtime_sections = runtime_sections_with_execution_continuation_context(
+        prompt_sections.runtime_sections.as_slice(),
+        execution_window_index,
+        execution_checkpoint_context,
+        prior_visible_assistant_text.as_deref(),
+        turn_tool_materialization.initiating_thread_id.as_deref(),
+    );
+    let prompt_runtime_sections = runtime_sections_with_artifact_reference_policy(
+        prompt_runtime_sections,
+        history_or_prompt_context_has_artifact_refs(history, &effective_prompt_context_set),
+    )?;
+    let prompt_runtime_sections = append_native_filesystem_capability_section(
+        prompt_runtime_sections,
+        &native_file_tool_capability,
+        filesystem_prompt_snapshot.as_ref(),
+    )?;
+
+    let initial_instruction_plan = compile_agent_instruction_delivery_plan_with_prompt_root(
+        tool_loop_config.computer_use.runtime_home_dir.as_path(),
+        skills_prompt.clone(),
+        None,
+        prompt_runtime_sections.as_slice(),
+        permission_profile,
+        include_task_orchestration_policy,
+        true,
+        continue_generation_hint,
+        turn_tool_materialization.initiating_thread_id.as_deref(),
+        thread_id,
+        turn_id,
+    )?;
+
+    run_noop_agent_turn_hook_phase(
+        hook_runtime,
+        hook_context,
+        HookPhase::TurnPostPromptCompile,
+        &effective_policy_set,
+        &effective_prompt_context_set,
+    )
+    .await;
+
+    emit_durable_event(
+        event_tx.as_ref(),
+        AgentDurableEvent::PromptManifestCompiled {
+            thread_id: thread_id.to_owned(),
+            turn_id: turn_id.to_owned(),
+            manifest: prompt_manifest_from_bundle(
+                &initial_instruction_plan.bundle,
+                &EffectiveTurnPromptManifestHookMetadata::combined(
+                    effective_prompt_context_set.manifest_metadata(),
+                    effective_prompt_section_set.manifest_metadata(),
+                ),
+                capability_diagnostics.as_slice(),
+            ),
+        },
+    )
+    .await?;
+
+    Ok(PreparedNativeInitialTurn {
+        effective_policy_set,
+        effective_prompt_context_set,
+        effective_prompt_section_set,
+        initial_instruction_plan,
+        capability_diagnostics,
+        skill_runtime_plan: skills_resolution.runtime_plan,
+        skill_tool_materialization: Some(skill_tool_materialization),
+        tools: Some(tools),
+        visible_tool_names: initial_visibility.visible_tools,
+        requested_tool_names,
+        preflight_usage: turn_preflight.usage,
+    })
+}
+
+async fn execute_agent_provider_response(
+    context_session: Option<&crate::compaction::controller::NativeContextSession>,
+    provider_registry: Arc<ProviderRegistry>,
+    provider: &Arc<dyn Provider>,
+    model: String,
+    hook_runtime_context: AgentTurnHookRuntimeContext,
+    reasoning: Option<ReasoningConfig>,
+    history: Vec<ChatMessage>,
+    user_message: ChatMessage,
+    input: &[UserInput],
+    capabilities: &[TurnCapability],
+    workspace_skill_policies: &HashMap<SkillPolicyKey, crate::WorkspaceSkillPolicy>,
+    skill_catalog: &pioneer_skills::SkillCatalogSnapshot,
+    agent_skill_overlay: &[pioneer_skills::AgentSkillRuntimeEntry],
+    runtime_environment: HashMap<String, String>,
+    retained_provider_history: Vec<RetainedProviderHistoryMessage>,
+    execution_window_index: u32,
+    preparation_started: Instant,
+    preparation_started_at_unix_ms: i64,
+    execution_checkpoint_context: Option<ExecutionCheckpointContext>,
+    permission_profile: TurnPermissionProfileSnapshot,
+    execution_security_snapshot: Option<TurnExecutionSecuritySnapshot>,
+    force_non_stream: bool,
+    disable_tool_calling: bool,
+    continue_generation_hint: bool,
+    tool_loop_config: ToolLoopConfig,
+    mcp_tool_provider: Option<Arc<dyn AgentMcpToolProvider>>,
+    turn_tool_provider: Option<Arc<dyn TurnToolProvider>>,
+    turn_finalization_provider: Option<Arc<dyn TurnFinalizationProvider>>,
+    task_tool_provider: Option<Arc<dyn TaskToolProvider>>,
+    hook_runtime: Option<Arc<HookRuntime>>,
+    tool_bundle_artifacts: Option<Arc<AgentToolBundleArtifactStore>>,
+    permission_approval_broker: Arc<dyn PermissionApprovalBroker>,
+    turn_control: TurnExecutionControl,
+    mut recovery: Option<RecoveryAttemptContext>,
+    workspace_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+    initial_thinking_item_id: String,
+    message_item_id: &str,
+    event_tx: Arc<AgentEventHub>,
+) -> Result<ChatTurnOutcome, ChatTurnError> {
+    let mut window_stats = ChatExecutionWindowStats::new(execution_window_index);
+    window_stats.started_at_unix_ms = preparation_started_at_unix_ms;
+    emit_execution_window_started(
+        workspace_id,
+        thread_id,
+        turn_id,
+        &window_stats,
+        event_tx.as_ref(),
+    )
+    .await?;
+    let tool_loop_config = tool_loop_config.normalized();
+    let model_tool_support = provider.model_tool_support(model.as_str());
+    if !disable_tool_calling && model_tool_support == pioneer_provider::ModelToolSupport::Unknown {
+        return Err(ChatTurnError::Blocked(
+            "native Agent requires verified model tool support; capability evidence is unknown"
+                .to_owned(),
+        ));
+    }
+    let provider_tool_calling = model_tool_support == pioneer_provider::ModelToolSupport::Supported
+        && !disable_tool_calling;
+    let native_file_tool_capability = if provider_tool_calling {
+        provider.native_file_tool_capability(model.as_str())
+    } else {
+        NativeFileToolCapability::unavailable(
+            provider.name(),
+            model.as_str(),
+            "provider tool calling is disabled for this turn",
+        )
+    };
+    let post_turn_model = model.clone();
+    let post_turn_model_provider = provider.name().to_owned();
+    let hook_context = AgentTurnHookContext::with_runtime_context(
+        workspace_id,
+        thread_id,
+        turn_id,
+        hook_runtime_context.clone(),
+    );
+    let user_input_text = user_message.text_content_lossy();
+
+    let PreparedNativeInitialTurn {
+        effective_policy_set,
+        effective_prompt_context_set,
+        effective_prompt_section_set,
+        initial_instruction_plan,
+        capability_diagnostics,
+        skill_runtime_plan,
+        skill_tool_materialization,
+        tools,
+        mut visible_tool_names,
+        mut requested_tool_names,
+        preflight_usage,
+    } = prepare_native_initial_turn(
+        provider_registry,
+        provider,
+        model.as_str(),
+        &hook_context,
+        &hook_runtime_context,
+        user_input_text,
+        input,
+        capabilities,
+        workspace_skill_policies,
+        skill_catalog,
+        agent_skill_overlay,
+        runtime_environment,
+        history.as_slice(),
+        execution_window_index,
+        execution_checkpoint_context.as_ref(),
+        &permission_profile,
+        execution_security_snapshot.as_ref(),
+        continue_generation_hint,
+        &tool_loop_config,
+        provider_tool_calling,
+        native_file_tool_capability.clone(),
+        mcp_tool_provider.as_ref(),
+        turn_tool_provider.as_ref(),
+        task_tool_provider.as_ref(),
+        hook_runtime.as_ref(),
+        tool_bundle_artifacts.as_ref(),
+        permission_approval_broker,
+        recovery.is_some(),
+        workspace_id,
+        thread_id,
+        turn_id,
+        &event_tx,
+    )
+    .await?;
+    window_stats.record_preflight(preflight_usage);
+
+    if !provider_tool_calling {
         let mut guard = ToolLoopGuard::new_execution_window_with_started_at(
             tool_loop_config.execution_windows.window.clone(),
             "",
             preparation_started,
         );
         guard.record_preflight_provider_usage(
-            turn_preflight.usage.attempts,
-            turn_preflight.usage.known_tokens,
-            turn_preflight.usage.unknown,
+            preflight_usage.attempts,
+            preflight_usage.known_tokens,
+            preflight_usage.unknown,
         );
         let round_plan = guard
             .begin_provider_round()
@@ -4185,138 +4633,16 @@ async fn execute_agent_provider_response(
         }
     }
 
-    let skill_tool_materialization = skill_tools::materialize_skill_tooling(
-        &skills_resolution.runtime_plan,
-        &tool_loop_config.skills,
-    );
-
-    for excluded in &skill_tool_materialization.excluded_tools {
-        warn!(
-            thread_id,
-            turn_id,
-            tool_name = excluded.canonical_tool_name.as_str(),
-            reason = excluded.reason.as_str(),
-            "excluded invalid skill runtime tool; continuing turn"
-        );
-    }
-    for diagnostic in &skill_tool_materialization.policy_diagnostics {
-        warn!(
-            thread_id,
-            turn_id,
-            tool_name = diagnostic.canonical_tool_name.as_str(),
-            diagnostics = ?diagnostic.diagnostics,
-            "dynamic skill tool output policy was narrowed"
-        );
-    }
-
-    let mut tool_bundle_contributions = Vec::new();
-    tool_bundle_contributions.extend(tool_bundle_contributions_from_bundles(
-        "skill",
-        "skill.runtime",
-        SKILL_TOOL_BUNDLE_PRIORITY,
-        skill_tool_materialization.bundles.clone(),
-    ));
-    tool_bundle_contributions.extend(tool_bundle_contributions_from_bundles(
-        "mcp",
-        "mcp.runtime",
-        MCP_TOOL_BUNDLE_PRIORITY,
-        mcp_materialization.bundles.clone(),
-    ));
-    tool_bundle_contributions.extend(tool_bundle_contributions_from_bundles(
-        "turn",
-        "turn.runtime",
-        TURN_TOOL_BUNDLE_PRIORITY,
-        turn_tool_materialization.bundles.clone(),
-    ));
-    tool_bundle_contributions.extend(tool_bundle_contributions_from_bundles(
-        "task",
-        "task.runtime",
-        TASK_TOOL_BUNDLE_PRIORITY,
-        task_materialization.bundles.clone(),
-    ));
-    let effective_tool_bundle_set = run_agent_turn_tool_materialization_hook_phase(
-        hook_runtime.as_ref(),
-        &hook_context,
-        &effective_policy_set,
-        &effective_prompt_context_set,
-        tool_bundle_contributions,
-        tool_bundle_artifacts.as_ref(),
-        provider_tool_calling,
-    )
-    .await
-    .map_err(|error| {
-        warn!(
-            thread_id,
-            turn_id,
-            error_kind = error.kind(),
-            "turn tool materialization hook failed before tool runtime construction"
-        );
-        ChatTurnError::Terminal("turn tool materialization hook failed".to_owned())
+    let tools = tools.ok_or_else(|| {
+        ChatTurnError::Blocked("prepared native tool runtime is unavailable".to_owned())
     })?;
-
-    let extension_bundles = effective_tool_bundle_set.bundles().to_vec();
-
-    let permission_context = PermissionEvaluationContext::for_turn(
-        workspace_id,
-        thread_id,
-        turn_id,
-        permission_profile.clone(),
-    );
-    let runtime_environment = runtime_environment.into_iter().collect::<BTreeMap<_, _>>();
-    let tools = build_tools_with_environment_and_security_snapshot(
-        workdir.clone(),
-        turn_id.to_owned(),
-        permission_context.clone(),
-        tool_loop_config.web.clone(),
-        tool_loop_config.computer_use.clone(),
-        extension_bundles,
-        runtime_environment,
-        execution_security_snapshot.clone(),
-    )
-    .map_err(|_| {
-        ChatTurnError::Blocked("required tool runtime could not be constructed".to_owned())
-    })?
-    .with_permission_approval_broker(permission_approval_broker);
-
-    emit_capability_resolution_events(
-        event_tx.as_ref(),
-        workspace_id,
-        thread_id,
-        turn_id,
-        accepted_capabilities.as_slice(),
-        rejected_capabilities.as_slice(),
-        mcp_materialization.mcp_bindings.as_slice(),
-    )
-    .await?;
-    emit_mcp_resolution_diagnostics(
-        event_tx.as_ref(),
-        workspace_id,
-        thread_id,
-        turn_id,
-        mcp_materialization.diagnostics.as_slice(),
-    )
-    .await?;
-
-    // One trusted provider capability decision owns native filesystem-tool
-    // visibility for this turn.  Apply it before preflight so the core index,
-    // request_tools catalog and final provider schema cannot diverge.
-    tools
-        .router
-        .set_blocked_tool_names(native_file_tool_blocked_names(&native_file_tool_capability));
-    tools
-        .router
-        .set_native_patch_wire_shape(native_file_tool_capability.patch_shape);
-
-    skill_tool_materialization
-        .bind_function_proxy_runtime(tools.router.clone(), tools.runtime.clone())
-        .await;
-
+    let skill_tool_materialization = skill_tool_materialization.ok_or_else(|| {
+        ChatTurnError::Blocked("prepared skill runtime is unavailable".to_owned())
+    })?;
     let runtime = tools.runtime.clone();
     let router = tools.router.clone();
-
     let runtime_tool_index = Arc::new(
-        skills_resolution
-            .runtime_plan
+        skill_runtime_plan
             .tools
             .iter()
             .map(|descriptor| (descriptor.canonical_tool_name.clone(), descriptor.clone()))
@@ -4349,215 +4675,6 @@ async fn execute_agent_provider_response(
             max_install_file_bytes: tool_loop_config.skills.security.max_install_file_bytes,
         },
     };
-
-    let turn_preflight = run_agent_turn_preflight_stage(
-        event_tx.clone(),
-        provider_registry,
-        provider.clone(),
-        model.as_str(),
-        provider_tool_calling,
-        &tool_loop_config,
-        &effective_policy_set,
-        &effective_prompt_context_set,
-        router.preflight_tool_index(),
-        workspace_id,
-        thread_id,
-        turn_id,
-        execution_window_index,
-        &hook_runtime_context,
-        user_input_text.as_str(),
-    )
-    .await;
-
-    window_stats.record_preflight(turn_preflight.usage);
-    ensure_preflight_usage_committed(turn_preflight.publication_failure)?;
-    let mut requested_tool_names = restored_requested_tool_names(
-        execution_checkpoint_context.as_ref(),
-        workspace_id,
-        thread_id,
-        turn_id,
-    );
-    let initial_visibility = compute_agent_turn_final_visible_tools(
-        router.as_ref(),
-        &turn_preflight,
-        &requested_tool_names,
-    );
-    requested_tool_names.retain(|name| initial_visibility.visible_tools.contains(name));
-
-    warn_final_visible_tool_diagnostics(
-        thread_id,
-        turn_id,
-        initial_visibility.diagnostics.as_slice(),
-    );
-
-    let read_skill_is_visible = initial_visibility
-        .visible_tools
-        .iter()
-        .any(|tool_name| tool_name == "read_skill");
-    let exposed_agent_overlay = if skills_resolution.agent_overlay_error.is_none()
-        && agent_skill_cards_have_read_path(agent_skill_overlay, read_skill_is_visible)
-    {
-        readable_agent_skill_overlay(agent_skill_overlay, provider_tool_calling)
-    } else {
-        if skills_resolution.agent_overlay_error.is_none() && !agent_skill_overlay.is_empty() {
-            let base_resolution = skills::resolve_turn_skills_with_explicit_refs(
-                input,
-                normalized_capabilities.skill_refs.as_slice(),
-                skill_catalog,
-                &[],
-                &tool_loop_config.skills,
-                workspace_skill_policies,
-                &projected_mcp_availability,
-            )
-            .map_err(|error| {
-                ChatTurnError::Terminal(format!(
-                    "failed to rebuild ordinary skills after Agent read_skill was unavailable: \
-                     {error:#}"
-                ))
-            })?;
-            skills_prompt = normalize_optional_prompt(Some(base_resolution.prompt));
-            warn!(
-                workspace_id,
-                thread_id,
-                turn_id,
-                "read_skill was absent from the final native tool plan; Agent cards were removed"
-            );
-        }
-        &[]
-    };
-
-    if recovery.is_some() && !agent_skill_overlay.is_empty() && exposed_agent_overlay.is_empty() {
-        return Err(ChatTurnError::Terminal(
-            "pinned Agent skills are unavailable in the recovered turn's final tool plan"
-                .to_owned(),
-        ));
-    }
-
-    emit_turn_skills_resolved_event(
-        event_tx.as_ref(),
-        thread_id,
-        turn_id,
-        skills::to_turn_skill_bindings(
-            skills_resolution.result.active.as_slice(),
-            exposed_agent_overlay,
-        ),
-        !agent_skill_overlay.is_empty(),
-    )
-    .await?;
-
-    trace_agent_turn_preflight(
-        thread_id,
-        turn_id,
-        &turn_preflight,
-        initial_visibility.visible_tools.as_slice(),
-    );
-
-    if let Some(active_recall_input) = preflight_active_recall_prompt_context_input(
-        user_input_text.as_str(),
-        model.as_str(),
-        provider.name(),
-        &turn_preflight,
-    ) {
-        effective_prompt_context_set = run_agent_turn_post_preflight_prompt_context_hook_phase(
-            hook_runtime.as_ref(),
-            &hook_context,
-            &effective_policy_set,
-            &effective_prompt_context_set,
-            active_recall_input,
-        )
-        .await
-        .map_err(|_| {
-            ChatTurnError::Terminal("required post-preflight context preparation failed".to_owned())
-        })?;
-    }
-
-    let effective_prompt_section_set = run_agent_turn_prompt_compile_hook_phase(
-        hook_runtime.as_ref(),
-        &hook_context,
-        &effective_policy_set,
-        &effective_prompt_context_set,
-        Vec::new(),
-        TurnPrePromptCompileHookInput::from_parts(
-            provider_tool_calling,
-            hook_tool_names_from_strings(initial_visibility.visible_tools.as_slice()),
-        ),
-    )
-    .await
-    .map_err(|error| {
-        warn!(
-            thread_id,
-            turn_id,
-            error_kind = error.kind(),
-            "turn prompt section hook failed before prompt construction"
-        );
-        ChatTurnError::Terminal("turn prompt section hook failed".to_owned())
-    })?;
-
-    let prompt_sections =
-        prompt_sections_for_compile_from_hook_sections(&effective_prompt_section_set)?;
-    let prior_visible_assistant_text =
-        prior_visible_assistant_text_for_execution_continuation(history.as_slice());
-    let prompt_runtime_sections = runtime_sections_with_execution_continuation_context(
-        prompt_sections.runtime_sections.as_slice(),
-        execution_window_index,
-        execution_checkpoint_context.as_ref(),
-        prior_visible_assistant_text.as_deref(),
-        turn_tool_materialization.initiating_thread_id.as_deref(),
-    );
-    let prompt_runtime_sections = runtime_sections_with_artifact_reference_policy(
-        prompt_runtime_sections,
-        history_or_prompt_context_has_artifact_refs(
-            history.as_slice(),
-            &effective_prompt_context_set,
-        ),
-    )?;
-    let prompt_runtime_sections = append_native_filesystem_capability_section(
-        prompt_runtime_sections,
-        &native_file_tool_capability,
-        filesystem_prompt_snapshot.as_ref(),
-    )?;
-
-    let initial_instruction_plan = compile_agent_instruction_delivery_plan_with_prompt_root(
-        tool_loop_config.computer_use.runtime_home_dir.as_path(),
-        skills_prompt.clone(),
-        None,
-        prompt_runtime_sections.as_slice(),
-        &permission_profile,
-        include_task_orchestration_policy,
-        true,
-        continue_generation_hint,
-        turn_tool_materialization.initiating_thread_id.as_deref(),
-        thread_id,
-        turn_id,
-    )?;
-
-    run_noop_agent_turn_hook_phase(
-        hook_runtime.as_ref(),
-        &hook_context,
-        HookPhase::TurnPostPromptCompile,
-        &effective_policy_set,
-        &effective_prompt_context_set,
-    )
-    .await;
-
-    emit_durable_event(
-        event_tx.as_ref(),
-        AgentDurableEvent::PromptManifestCompiled {
-            thread_id: thread_id.to_owned(),
-            turn_id: turn_id.to_owned(),
-            manifest: prompt_manifest_from_bundle(
-                &initial_instruction_plan.bundle,
-                &EffectiveTurnPromptManifestHookMetadata::combined(
-                    effective_prompt_context_set.manifest_metadata(),
-                    effective_prompt_section_set.manifest_metadata(),
-                ),
-                capability_diagnostics.as_slice(),
-            ),
-        },
-    )
-    .await?;
-
-    let mut visible_tool_names = initial_visibility.visible_tools;
 
     let pending_tool_ui = Arc::new(Mutex::new(HashMap::<String, PendingToolUiState>::new()));
 
@@ -4654,9 +4771,9 @@ async fn execute_agent_provider_response(
         preparation_started,
     );
     tool_loop_guard.record_preflight_provider_usage(
-        turn_preflight.usage.attempts,
-        turn_preflight.usage.known_tokens,
-        turn_preflight.usage.unknown,
+        preflight_usage.attempts,
+        preflight_usage.known_tokens,
+        preflight_usage.unknown,
     );
     let mut tool_retry_controller = ToolRetryController::new(tool_loop_config.retry.clone());
     let restored_no_progress_state = execution_checkpoint_context

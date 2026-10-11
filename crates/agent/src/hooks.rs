@@ -714,6 +714,28 @@ impl EffectiveTurnToolBundleSet {
         &self.metadata.diagnostics
     }
 
+    fn require_complete_artifacts(&self) -> Result<(), AgentTurnHookError> {
+        if self.metadata.entries.len() != self.bundles.len() {
+            return Err(AgentTurnHookError::ToolBundleUnavailable);
+        }
+        for (entry, bundle) in self.metadata.entries.iter().zip(&self.bundles) {
+            let advertised = entry
+                .tool_names
+                .iter()
+                .map(|name| name.as_str())
+                .collect::<std::collections::BTreeSet<_>>();
+            let actual = bundle
+                .specs
+                .iter()
+                .map(|spec| spec.spec.name.as_str())
+                .collect::<std::collections::BTreeSet<_>>();
+            if advertised != actual {
+                return Err(AgentTurnHookError::ToolBundleUnavailable);
+            }
+        }
+        Ok(())
+    }
+
     fn from_local(local_contributions: Vec<AgentTurnToolBundleContribution>) -> Self {
         Self::from_local_and_hook_contributions(local_contributions, Vec::new(), None, "")
     }
@@ -759,6 +781,7 @@ impl EffectiveTurnToolBundleSet {
 pub(super) enum AgentTurnHookError {
     InvalidContext(HookIdError),
     Runtime(HookRuntimeError),
+    ToolBundleUnavailable,
 }
 
 impl AgentTurnHookError {
@@ -772,6 +795,7 @@ impl AgentTurnHookError {
                 let _ = error;
                 "runtime"
             }
+            Self::ToolBundleUnavailable => "tool_bundle_unavailable",
         }
     }
 
@@ -1008,7 +1032,9 @@ pub(super) async fn run_agent_turn_tool_materialization_hook_phase(
         pioneer_observability::turn_startup::Stage::HookTools,
     );
     let Some(runtime) = runtime else {
-        return Ok(EffectiveTurnToolBundleSet::from_local(local_contributions));
+        let set = EffectiveTurnToolBundleSet::from_local(local_contributions);
+        set.require_complete_artifacts()?;
+        return Ok(set);
     };
 
     let input = TurnPreToolMaterializationHookInput::from_parts(
@@ -1040,6 +1066,7 @@ pub(super) async fn run_agent_turn_tool_materialization_hook_phase(
             if let Some(store) = artifact_store {
                 store.clear_turn(context.turn_id.as_str());
             }
+            set.require_complete_artifacts()?;
             set.metadata.diagnostics.extend(phase_diagnostics);
             for diagnostic in set.diagnostics() {
                 warn_hook_diagnostic(HookPhase::TurnPreToolMaterialization, diagnostic);
@@ -2403,6 +2430,150 @@ mod tests {
         HookSubscription, HookSubscriptionRegistry,
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn accepted_test_tool_contribution() -> ToolBundleContribution {
+        ToolBundleContribution {
+            contribution_id: HookContributionId::new("test.accepted.tools").unwrap(),
+            bundle_id: HookToolBundleId::new("test.accepted.bundle").unwrap(),
+            domain: pioneer_hooks::HookDomain::new("test").unwrap(),
+            priority: 100,
+            tool_names: vec![HookToolName::new("test.accepted_tool").unwrap()],
+            diagnostics: Vec::new(),
+        }
+    }
+
+    struct AcceptedToolHook;
+
+    #[async_trait::async_trait]
+    impl HookHandler for AcceptedToolHook {
+        fn id(&self) -> HookId {
+            HookId::new("test.accepted_tool_hook").unwrap()
+        }
+
+        fn kind(&self) -> HookKind {
+            HookKind::new("test").unwrap()
+        }
+
+        fn supported_phases(&self) -> Vec<HookPhase> {
+            vec![HookPhase::TurnPreToolMaterialization]
+        }
+
+        fn capabilities(&self) -> HookCapabilities {
+            HookCapabilities::new([
+                pioneer_hooks::HookCapability::new("contribute_tool_bundle").unwrap()
+            ])
+        }
+
+        async fn execute(&self, _: HookHandlerRequest) -> HookResult<HookHandlerResponse> {
+            Ok(HookHandlerResponse {
+                contributions: vec![HookContribution::ToolBundle(
+                    accepted_test_tool_contribution(),
+                )],
+                ..Default::default()
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn accepted_tool_hook_requires_its_exact_owned_artifact() {
+        let handlers = Arc::new(HookRegistry::new());
+        let subscriptions = Arc::new(HookSubscriptionRegistry::new());
+        handlers
+            .register_handler(Arc::new(AcceptedToolHook))
+            .unwrap();
+        subscriptions
+            .register_subscription(
+                &handlers,
+                HookSubscription::new(
+                    HookSubscriptionId::new("test.accepted_tool_subscription").unwrap(),
+                    HookId::new("test.accepted_tool_hook").unwrap(),
+                    HookPhase::TurnPreToolMaterialization,
+                ),
+            )
+            .unwrap();
+        let runtime = Arc::new(HookRuntime::new(handlers, subscriptions));
+        let context = AgentTurnHookContext::new("workspace", "thread", "turn");
+        let store = Arc::new(AgentToolBundleArtifactStore::new());
+        // A valid artifact for another Turn cannot satisfy this accepted bundle.
+        store.insert(
+            "other-turn",
+            accepted_test_tool_contribution().bundle_id,
+            ToolExtensionBundle::default(),
+        );
+        let result = run_agent_turn_tool_materialization_hook_phase(
+            Some(&runtime),
+            &context,
+            &EffectiveTurnPolicySet::empty(),
+            &EffectiveTurnPromptContextSet::empty(),
+            Vec::new(),
+            Some(&store),
+            true,
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(AgentTurnHookError::ToolBundleUnavailable)
+        ));
+        assert!(
+            store
+                .get("other-turn", &accepted_test_tool_contribution().bundle_id)
+                .is_some()
+        );
+
+        // An artifact with the accepted ID but different advertised tools is also unsafe.
+        store.insert(
+            "turn",
+            accepted_test_tool_contribution().bundle_id,
+            ToolExtensionBundle::default(),
+        );
+        let result = run_agent_turn_tool_materialization_hook_phase(
+            Some(&runtime),
+            &context,
+            &EffectiveTurnPolicySet::empty(),
+            &EffectiveTurnPromptContextSet::empty(),
+            Vec::new(),
+            Some(&store),
+            true,
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(AgentTurnHookError::ToolBundleUnavailable)
+        ));
+
+        // The same accepted contribution with its exact spec is retained.
+        let spec = pioneer_tools::ConfiguredToolSpec::new(
+            pioneer_tools::ToolSpec::new(
+                "test.accepted_tool",
+                "Test tool",
+                serde_json::json!({"type":"object"}),
+                pioneer_tools::PayloadKind::Function,
+            ),
+            pioneer_tools::ExecutionClass::Shared,
+            pioneer_tools::dynamic_unknown_output_policy(),
+        );
+        store.insert(
+            "turn",
+            accepted_test_tool_contribution().bundle_id,
+            ToolExtensionBundle {
+                specs: vec![spec],
+                handlers: Vec::new(),
+            },
+        );
+        let result = run_agent_turn_tool_materialization_hook_phase(
+            Some(&runtime),
+            &context,
+            &EffectiveTurnPolicySet::empty(),
+            &EffectiveTurnPromptContextSet::empty(),
+            Vec::new(),
+            Some(&store),
+            true,
+        )
+        .await;
+        let set = result.unwrap();
+        assert_eq!(set.bundles().len(), 1);
+        assert_eq!(set.bundles()[0].specs[0].spec.name, "test.accepted_tool");
+    }
 
     #[test]
     fn thread_context_prompt_contribution_has_distinct_manifest_kind() {
