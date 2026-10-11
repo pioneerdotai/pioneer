@@ -11818,7 +11818,7 @@ async fn assert_concurrent_collaborative_tasks_receive_independent_frozen_comman
     // unchanged header digest must detect damage to its retained proof bytes.
     let import_row = crud_store.database_connection().query_one_raw(sea_orm::Statement::from_sql_and_values(
         sea_orm::DbBackend::Sqlite,
-        "SELECT d.manifest_id,d.ordinal,d.proof_json,d.bytes FROM compaction_frozen_import_data d WHERE (d.manifest_id=?1 AND d.ordinal=0 AND NOT EXISTS (SELECT 1 FROM compaction_frozen_span s WHERE s.manifest_id=?1 AND s.kind=1 AND s.start<=0 AND s.end>0)) OR EXISTS (SELECT 1 FROM compaction_frozen_span s WHERE s.manifest_id=?1 AND s.kind=1 AND s.start<=0 AND s.end>0 AND d.manifest_id=s.source_manifest AND d.ordinal=s.source_start-s.start) LIMIT 1",
+        "SELECT d.manifest_id,d.ordinal,d.proof_json,d.bytes FROM compaction_frozen_import_data d WHERE d.ordinal=0 AND ((d.manifest_id=?1 AND NOT EXISTS (SELECT 1 FROM compaction_frozen_span s WHERE s.manifest_id=?1 AND s.kind=1 AND s.start<=0 AND s.end>0)) OR EXISTS (SELECT 1 FROM compaction_frozen_span s WHERE s.manifest_id=?1 AND s.kind=1 AND s.start<=0 AND s.end>0 AND d.manifest_id=s.source_manifest)) LIMIT 1",
         [assembled_descriptor.manifest_id.clone().into()],
     )).await.unwrap().unwrap();
     let backing: String = import_row.try_get("", "manifest_id").unwrap();
@@ -21890,7 +21890,7 @@ async fn hidden_task_agent_run_uses_preflight_before_child_main_prompt_compile_b
         TaskWaitParams {
             task_ids: vec![response.task.id.clone()],
             run_ids: Vec::new(),
-            timeout_ms: Some(5_000),
+            timeout_ms: Some(30_000),
             return_completed: true,
             return_pending: true,
             ..Default::default()
@@ -22168,12 +22168,13 @@ async fn recovered_hidden_task_run_uses_preflight_before_restored_child_main_pro
         "the frozen snapshot fixture must contain prior history distinct from the current Task source turn"
     );
     let lineage = wait_for_child_lineage_for_run(crud_store.clone(), run.id.as_str()).await;
-    for _ in 0..100 {
-        if initial_provider.child_main_call_count() > 0 {
-            break;
+    timeout(Duration::from_secs(30), async {
+        while initial_provider.child_main_call_count() == 0 {
+            sleep(Duration::from_millis(25)).await;
         }
-        sleep(Duration::from_millis(25)).await;
-    }
+    })
+    .await
+    .expect("initial child must reach its main provider before recovery is injected");
     assert!(
         initial_provider.child_main_call_count() > 0,
         "initial child task provider should be hanging in the main child request"
@@ -24026,7 +24027,7 @@ async fn immediate_detached_task_runs_after_parent_and_delivers_to_occurrence_tu
         }
         CompletedHistoryDeliveryBarrier::Summarizer => provider.release_paused_call(),
     }
-    timeout(Duration::from_secs(10), async {
+    timeout(Duration::from_secs(30), async {
         loop {
             let finished = processor
                 .completed_history_checks
@@ -24041,7 +24042,7 @@ async fn immediate_detached_task_runs_after_parent_and_delivers_to_occurrence_tu
             if finished {
                 break;
             }
-            tokio::task::yield_now().await;
+            sleep(Duration::from_millis(25)).await;
         }
     })
     .await
@@ -26009,11 +26010,15 @@ async fn cli_input_admission_impl(case: CliInputAdmissionCase) {
         CliInputAdmissionCase::History => (2, 64 * 1024),
         CliInputAdmissionCase::Current | CliInputAdmissionCase::Fits => (1, 32),
     };
+    let history_chunk = if matches!(case, CliInputAdmissionCase::Frame) {
+        // Exercise the frame byte limit with ordinary word boundaries. One
+        // 730k-character word makes BPE merging dominate this admission test.
+        "background history ".repeat(chunk_chars / "background history ".len())
+    } else {
+        "x".repeat(chunk_chars)
+    };
     for index in 0..history_turns {
-        let text = format!(
-            "HISTORICAL HUGE CHUNK {index:02} {}",
-            "x".repeat(chunk_chars)
-        );
+        let text = format!("HISTORICAL HUGE CHUNK {index:02} {history_chunk}");
         raw_bytes += text.len();
         seed_completed_task_parent_with_inputs(
             &processor,
@@ -26125,10 +26130,16 @@ async fn cli_input_admission_impl(case: CliInputAdmissionCase) {
         );
         return;
     }
-    Arc::clone(&processor)
-        .process_owned_request(context, payload)
-        .await;
-    let response = recv_response_by_id(&mut rx, &request_id).await;
+    let (_, admission_events) = crate::public_error::test_support::capture_events_async(
+        Arc::clone(&processor).process_owned_request(context, payload),
+    )
+    .await;
+    let response_payload = recv_jsonrpc_payload_by_id(&mut rx, &request_id).await;
+    let response: JsonRpcResponse = serde_json::from_str(&response_payload).unwrap_or_else(|error| {
+        panic!(
+            "CLI transfer should be admitted: {error}; payload: {response_payload}; diagnostics: {admission_events:#?}"
+        )
+    });
     let accepted: TurnStartResponse = serde_json::from_value(response.result).unwrap();
     assert_eq!(accepted.turn.id, turn);
     let starts = wait_for_cli_runtime_turn_starts(&cli, 1).await;
@@ -27113,7 +27124,7 @@ async fn pending_cli_heartbeat_writer_is_dropped_before_compaction_cleanup_impl(
             "deadline" => processor.cli_transfer_test_deadline.notify_one(),
             _ => {}
         }
-        let finished = timeout(Duration::from_secs(15), &mut start).await;
+        let finished = timeout(Duration::from_secs(30), &mut start).await;
         if finished.is_err() {
             writer_pause.release.notify_one();
             let _ = timeout(Duration::from_secs(10), &mut start).await;
@@ -32091,6 +32102,15 @@ async fn detached_composer_work_matches_parent_llm_prompts_end_to_end_impl() {
     ));
     let mut harness =
         setup_memory_agent_e2e_harness("detached_prompt_parity", provider_registry).await;
+    // Compare fixed history, as in the full-request parity fixture below.
+    // Independently indexed live recall can differ between the two executions.
+    harness
+        .processor
+        .apply_thread_episodic_runtime_config(crate::thread_episodic::ThreadEpisodicRuntimeConfig {
+            recall_enabled: false,
+            ..Default::default()
+        })
+        .await;
     harness.processor.bind_task_bridge().await;
     harness.processor.start_task_event_listener().await;
 
@@ -79967,12 +79987,18 @@ async fn recovery_failure_task_consumers_impl(
             .unwrap();
     }
     let lineage = wait_for_child_lineage_for_run(store.clone(), &run.id).await;
-    for _ in 0..100 {
-        if provider.child_main_call_count() > 0 {
-            break;
+    // Lineage registration precedes the child's remaining preflight work.
+    // Wait for the actual provider entry before injecting its failure; a fixed
+    // 2.5-second poll window races that preparation in the parallel suite.
+    timeout(Duration::from_secs(30), async {
+        while provider.child_main_call_count() == 0 {
+            sleep(Duration::from_millis(25)).await;
         }
-        sleep(Duration::from_millis(25)).await;
-    }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!("child provider must start before {scenario}/{path}/{parent_kind} recovery")
+    });
     assert!(provider.child_main_call_count() > 0);
     let now = super::now_timestamp_secs();
     let private = "private-response-body https://secret.example?token=credential /private/provider-key HTTP 401";

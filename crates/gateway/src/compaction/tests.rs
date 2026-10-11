@@ -83,7 +83,14 @@ async fn source_creation_order_keeps_child_tool_work_before_later_parent_input()
                     }
                 ),
                 id: source.into(),
-                version: "revision:1".into(),
+                version: if source == "child-new" {
+                    "item-revision:1"
+                } else if thread == "child" {
+                    "revision:1"
+                } else {
+                    "input-revision:1"
+                }
+                .into(),
             }],
             source_aliases: vec![],
             ambiguous_input_aliases: vec![],
@@ -217,6 +224,7 @@ async fn source_creation_order_keeps_child_tool_work_before_later_parent_input()
     for reference_only in [false, true] {
         let mut plan = f.runner.snapshot.plan.clone();
         if reference_only {
+            plan.compact.clear();
             plan.retain = (0..layout.units.len()).collect();
         } else {
             plan.compact = (1..layout.units.len()).collect();
@@ -4962,6 +4970,15 @@ async fn admission_resumes_exact_plan_without_resetting_deadline() {
     )
     .await
     .unwrap();
+    assert!(first.plan.compact.is_empty());
+    assert!(first.plan.coverage.is_empty());
+    assert_eq!(
+        f.store
+            .compaction_bound_source_projection(&first.id)
+            .await
+            .unwrap(),
+        Some(projection.clone())
+    );
     let recaptured = super::frozen::capture(&f.store, "ws", "thread", &allowed, &[])
         .await
         .unwrap();
@@ -8991,6 +9008,33 @@ async fn native_preparation_applies_real_runner_and_reuses_checkpoint_without_ge
         .await
         .unwrap()
         .unwrap();
+    let published = f
+        .store
+        .compaction_checkpoint(&checkpoint_ref.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let admitted = f
+        .store
+        .compaction_operation(&published.operation_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let original: OperationSnapshot = serde_json::from_str(&admitted.snapshot).unwrap();
+    assert!(!original.plan.compact.is_empty());
+    assert!(
+        published
+            .coverage
+            .iter()
+            .all(|source| original.plan.coverage.contains(source))
+    );
+    assert!(
+        f.store
+            .compaction_bound_source_projection(&published.operation_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
     let preparation_work = super::coverage::observe_preparation_work(&f.store, "ws");
     let allowed = std::collections::BTreeSet::from(["thread".to_owned()]);
     let mut resolver = super::coverage::CheckpointGraphResolver::default();
@@ -9426,22 +9470,39 @@ async fn native_preparation_applies_real_runner_and_reuses_checkpoint_without_ge
         "historical revision changes affected the published summary"
     );
     assert_eq!(f.provider.calls.lock().unwrap().len(), count);
-    f.store
+    let deletion = f
+        .store
         .database_connection()
         .execute_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
             "DELETE FROM compaction_checkpoint WHERE id=?",
             [checkpoint_ref.id.clone().into()],
         ))
-        .await
-        .unwrap();
+        .await;
+    assert!(
+        deletion
+            .unwrap_err()
+            .to_string()
+            .contains("sealed checkpoint retained"),
+        "published checkpoint identity must survive frozen input cleanup"
+    );
     assert!(
         resolver
             .resolve(&f.store, "ws", Some(&allowed), &checkpoint_ref)
             .await
             .unwrap()
+            .is_some(),
+        "rejected deletion invalidated the retained published root"
+    );
+    let mut missing_checkpoint = checkpoint_ref.clone();
+    missing_checkpoint.id = "missing-root-checkpoint".into();
+    assert!(
+        resolver
+            .resolve(&f.store, "ws", Some(&allowed), &missing_checkpoint)
+            .await
+            .unwrap()
             .is_none(),
-        "a cached graph invented a deleted root checkpoint"
+        "a cached graph invented a missing root checkpoint"
     );
 }
 
@@ -15832,6 +15893,7 @@ async fn compaction_checkpoint_projects_accepted_foreign_own_dag_without_coverin
     let mut snapshot = f.runner.snapshot.clone();
     snapshot.id = "c-operation".into();
     snapshot.owner = "c-owner".into();
+    snapshot.plan.coverage = vec![a_source.clone()];
     snapshot.plan.fingerprint = "c-plan".into();
     f.store
         .compaction_admit("ws", "c", &snapshot)
@@ -16155,6 +16217,11 @@ async fn compaction_reuses_completed_child_head_after_immutable_raw_output_captu
     mixed_snapshot.expected_checkpoint = Some(checkpoint.id.clone());
     mixed_snapshot.plan.coverage_domain = pioneer_compaction::CoverageDomain::WorkingContext;
     mixed_snapshot.plan.fingerprint = mixed_snapshot.id.clone();
+    mixed_snapshot.plan.coverage = vec![SourceRef {
+        scope: "event:turn".into(),
+        id: "accepted-h".into(),
+        version: "event-revision:1".into(),
+    }];
     f.store
         .compaction_admit("ws", "thread", &mixed_snapshot)
         .await
@@ -16251,12 +16318,33 @@ async fn compaction_reuses_completed_child_head_after_immutable_raw_output_captu
         version: "event-revision:1".into(),
     }];
     later.summary = "work beyond the accepted boundary".into();
+    // Later work needs its own original admission, rather than expanding the
+    // already sealed child's assertion plan.
+    let mut later_snapshot = snapshot.clone();
+    later_snapshot.id = "later-child-operation".into();
+    later_snapshot.expected_checkpoint = Some(checkpoint.id.clone());
+    later_snapshot.plan.fingerprint = later_snapshot.id.clone();
+    later_snapshot.plan.coverage = later.coverage.clone();
+    later.operation_id = later_snapshot.id.clone();
+    f.store
+        .compaction_admit("ws", "thread", &later_snapshot)
+        .await
+        .unwrap();
+    f.store
+        .compaction_prepare_runner(
+            &later.operation_id,
+            &ModelBudget::new(None, None, None),
+            1,
+            0,
+        )
+        .await
+        .unwrap();
     f.store
         .compaction_append_manifest(
             &later.operation_id,
             &[ManifestEntry {
-                ordinal: 1,
-                unit: 1,
+                ordinal: 0,
+                unit: 0,
                 reference_only: false,
                 thread_id: "thread".into(),
                 source: later.coverage[0].clone(),
@@ -16264,7 +16352,7 @@ async fn compaction_reuses_completed_child_head_after_immutable_raw_output_captu
         )
         .await
         .unwrap();
-    f.store.compaction_save_candidate(&later, 1).await.unwrap();
+    f.store.compaction_save_candidate(&later, 0).await.unwrap();
     db.execute_unprepared(
         "UPDATE compaction_checkpoint SET status='applied' WHERE id='later-child-summary'",
     )
