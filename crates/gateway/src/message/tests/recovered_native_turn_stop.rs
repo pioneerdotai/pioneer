@@ -398,11 +398,11 @@ async fn exercise(kind: TurnExecutorKind, scenario: Scenario, delivery_before_ro
         owner_id: Set(old_owner.into()),
         owner_generation: Set(1),
         lease_until: Set(now - chrono::Duration::seconds(1)),
-        heartbeat_at: Set(now),
-        started_at: Set(Some(now)),
+        heartbeat_at: Set(now - chrono::Duration::seconds(2)),
+        started_at: Set(Some(now - chrono::Duration::seconds(2))),
         completed_at: Set(None),
-        created_at: Set(now),
-        updated_at: Set(now),
+        created_at: Set(now - chrono::Duration::seconds(2)),
+        updated_at: Set(now - chrono::Duration::seconds(2)),
     }
     .insert(&db)
     .await
@@ -902,6 +902,26 @@ async fn exercise(kind: TurnExecutorKind, scenario: Scenario, delivery_before_ro
         assert!(!store.native_cancellation_was_accepted(turn).await.unwrap());
         assert_no_interruption_fanout(&mut rx, turn);
         if !projected_before_ack {
+            // Live delivery can precede aggregate projection. Keep its real
+            // obligation until it can synchronize the rolled-back control state.
+            delivery_processor
+                .process_due_native_turn_event_deliveries(now_timestamp_secs(), 64)
+                .await
+                .unwrap();
+            let delivery = completion_live_delivery(&store, turn).await;
+            assert_eq!(delivery.status, "failed");
+            assert!(delivery.delivered_at.is_none());
+            assert_eq!(
+                processor
+                    .thread_manager
+                    .turn_get(thread, turn)
+                    .await
+                    .unwrap()
+                    .1,
+                saved
+            );
+            assert_no_interruption_fanout(&mut rx, turn);
+            assert!(!saw_snapshot);
             let replay = store
                 .with_maintenance_access()
                 .replay_due_turn_event_projections(now_timestamp_secs(), 64)

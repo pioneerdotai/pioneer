@@ -3605,15 +3605,16 @@ impl MessageProcessor {
     /// Synchronize loaded control state only from the projected durable Turn.
     /// A conflicting provisional terminal remains untouched: live delivery must
     /// retain its existing outbox obligation until the local transition resolves.
+    /// Returns false while the authoritative terminal projection is unavailable.
     async fn synchronize_projected_native_terminal_turn(
         &self,
         workspace_id: &str,
         thread_id: &str,
         turn_id: &str,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let Some((workspace, terminal)) = self.crud_store.get_turn(thread_id, turn_id).await?
         else {
-            return Ok(());
+            return Ok(false);
         };
         anyhow::ensure!(workspace == workspace_id, "terminal Turn workspace changed");
         anyhow::ensure!(
@@ -3622,25 +3623,25 @@ impl MessageProcessor {
         );
         if terminal.status == TurnStatus::InProgress {
             // Acceptance alone fences execution, but cannot confirm memory state.
-            return Ok(());
+            return Ok(false);
         }
         let Some((workspace, current)) = self.thread_manager.turn_get(thread_id, turn_id).await
         else {
-            return Ok(());
+            return Ok(true);
         };
         anyhow::ensure!(
             workspace == workspace_id,
             "loaded terminal Turn workspace changed"
         );
         if current == terminal {
-            return Ok(());
+            return Ok(true);
         }
         if !self
             .thread_manager
             .commit_terminal_turn(thread_id, &terminal)
             .await?
         {
-            return Ok(());
+            return Ok(true);
         }
         if let Some(thread) = self.thread_manager.thread_get(thread_id).await {
             anyhow::ensure!(
@@ -3658,7 +3659,7 @@ impl MessageProcessor {
             )
             .await;
         }
-        Ok(())
+        Ok(true)
     }
 
     async fn deliver_native_turn_event_live(
@@ -3668,14 +3669,33 @@ impl MessageProcessor {
         use pioneer_crud::CanonicalTurnEventPayload as Event;
 
         let terminal = match payload {
-            Event::TurnCompleted(n) => Some((&n.workspace_id, &n.thread_id, &n.turn.id)),
-            Event::TurnFailed(n) => Some((&n.workspace_id, &n.thread_id, &n.turn.id)),
-            Event::TurnBlocked(n) => Some((&n.workspace_id, &n.thread_id, &n.turn.id)),
+            Event::TurnCompleted(n) => Some((&n.workspace_id, &n.thread_id, &n.turn)),
+            Event::TurnFailed(n) => Some((&n.workspace_id, &n.thread_id, &n.turn)),
+            // Blocked has an explicit resume lifecycle. Optional delivery must
+            // not introduce a memory transition into that admission path.
+            Event::TurnBlocked(_) => None,
             _ => None,
         };
-        if let Some((workspace_id, thread_id, turn_id)) = terminal {
-            self.synchronize_projected_native_terminal_turn(workspace_id, thread_id, turn_id)
-                .await?;
+        if let Some((workspace_id, thread_id, turn)) = terminal {
+            // The outbox claim already proves canonical acceptance.
+            // A matching local result is confirmed by that exact event, even if
+            // aggregate hydration adds author or prompt metadata to the DB Turn.
+            let matches_canonical = self
+                .thread_manager
+                .turn_get(thread_id, &turn.id)
+                .await
+                .is_some_and(|(workspace, current)| workspace == *workspace_id && current == *turn);
+            if !matches_canonical {
+                anyhow::ensure!(
+                    self.synchronize_projected_native_terminal_turn(
+                        workspace_id,
+                        thread_id,
+                        &turn.id,
+                    )
+                    .await?,
+                    "canonical terminal projection is pending before control synchronization"
+                );
+            }
         }
         match payload {
             Event::ItemStarted(notification) => {
