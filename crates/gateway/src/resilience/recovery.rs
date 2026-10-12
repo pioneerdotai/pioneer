@@ -8090,7 +8090,7 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            let recovered: ExecutionCheckpointPayload =
+            let recovered: pioneer_protocol::ExecutionCheckpointPayload =
                 serde_json::from_value(checkpoint.payload_json).unwrap();
             assert_eq!(recovered.window.agent_round_count, 2);
             assert_eq!(recovered.window.provider_token_count, Some(known));
