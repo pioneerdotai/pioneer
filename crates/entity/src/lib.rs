@@ -199,3 +199,7 @@ pub mod turn_work_projection;
 pub mod user_notification_outbox;
 pub mod workspace;
 pub mod workspace_membership;
+
+pub mod compaction_checkpoint_event_input;
+pub mod compaction_checkpoint_import;
+pub mod compaction_checkpoint_replay_alias;

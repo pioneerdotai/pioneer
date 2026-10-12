@@ -35,6 +35,7 @@ fn fixture(id: String, status: &str) -> binding::ActiveModel {
         native_thread_id: Set("native_thread".into()),
         status: Set(status.into()),
         input_mapping_json: Set("{}".into()),
+        frozen_manifest_id: Set(None),
         created_at: Set(timestamp),
         updated_at: Set(timestamp),
         ..Default::default()

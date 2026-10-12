@@ -1,3 +1,5 @@
+mod frozen_lifetime;
+pub use frozen_lifetime::FrozenReadHold;
 mod tool_output;
 pub use repositories::compaction;
 mod compaction_store;
@@ -2959,6 +2961,7 @@ pub struct CrudStore {
     #[cfg(any(test, feature = "test-support"))]
     episodic_claim_discoveries: std::sync::Arc<std::sync::atomic::AtomicU64>,
     episodic_work: std::sync::Arc<tokio::sync::Notify>,
+    frozen_readers: frozen_lifetime::ReaderCounts,
     connection: SqliteDatabase,
     projector: TurnProjector,
     task_projector: TaskProjector,
@@ -4543,6 +4546,7 @@ impl CrudStore {
         Self {
             connection: connection.into(),
             episodic_work: std::sync::Arc::new(tokio::sync::Notify::new()),
+            frozen_readers: Default::default(),
             #[cfg(any(test, feature = "test-support"))]
             episodic_claim_fault: Default::default(),
             #[cfg(any(test, feature = "test-support"))]
@@ -5181,9 +5185,20 @@ impl CrudStore {
         &self,
         snapshot: NewTurnRuntimeSnapshot,
     ) -> Result<TurnRuntimeSnapshotRecord> {
+        let root = frozen_lifetime::PreparedFrozenRoot::history(&snapshot.history_json)?;
         self.run_serialized_write(|| async {
-            turn_runtime_snapshot::upsert_turn_runtime_snapshot(&self.connection, snapshot.clone())
+            let transaction = self.connection.begin().await?;
+            let result = async {
+                turn_runtime_snapshot::upsert_turn_runtime_snapshot(
+                    &transaction,
+                    snapshot.clone(),
+                    &root,
+                )
                 .await
+            }
+            .await?;
+            transaction.commit().await?;
+            Ok(result)
         })
         .await
     }
@@ -5268,8 +5283,16 @@ impl CrudStore {
         &self,
         binding: NewCliRuntimeThreadBinding,
     ) -> Result<CliRuntimeThreadBindingRecord> {
+        let root = frozen_lifetime::PreparedFrozenRoot::cli(&binding.resume_cursor_json, true)?;
         self.run_serialized_write(|| async {
-            cli_runtime_binding::upsert_thread_binding(&self.connection, binding.clone()).await
+            let transaction = self.connection.begin().await?;
+            let result = async {
+                cli_runtime_binding::upsert_thread_binding(&transaction, binding.clone(), &root)
+                    .await
+            }
+            .await?;
+            transaction.commit().await?;
+            Ok(result)
         })
         .await
     }
@@ -5278,9 +5301,20 @@ impl CrudStore {
         &self,
         pending: NewCliRuntimeThreadBinding,
     ) -> Result<bool> {
+        let root = frozen_lifetime::PreparedFrozenRoot::cli(&pending.resume_cursor_json, true)?;
         self.run_serialized_write(|| async {
-            cli_runtime_binding::insert_fork_intent_if_absent(&self.connection, pending.clone())
+            let transaction = self.connection.begin().await?;
+            let result = async {
+                cli_runtime_binding::insert_fork_intent_if_absent(
+                    &transaction,
+                    pending.clone(),
+                    &root,
+                )
                 .await
+            }
+            .await?;
+            transaction.commit().await?;
+            Ok(result)
         })
         .await
     }
@@ -5322,17 +5356,25 @@ impl CrudStore {
         resume_cursor_json: String,
         updated_at: sea_orm::entity::prelude::DateTimeWithTimeZone,
     ) -> Result<CliRuntimeThreadBindingRecord> {
+        let root = frozen_lifetime::PreparedFrozenRoot::cli(&resume_cursor_json, true)?;
         self.run_serialized_write(|| async {
-            cli_runtime_binding::confirm_marked_fork_intent(
-                &self.connection,
-                pending,
-                fork_native_thread_id,
-                native_cwd.clone(),
-                native_model.clone(),
-                resume_cursor_json.clone(),
-                updated_at,
-            )
-            .await
+            let transaction = self.connection.begin().await?;
+            let result = async {
+                cli_runtime_binding::confirm_marked_fork_intent(
+                    &transaction,
+                    pending,
+                    fork_native_thread_id,
+                    native_cwd.clone(),
+                    native_model.clone(),
+                    resume_cursor_json.clone(),
+                    updated_at,
+                    &root,
+                )
+                .await
+            }
+            .await?;
+            transaction.commit().await?;
+            Ok(result)
         })
         .await
     }
@@ -5348,16 +5390,24 @@ impl CrudStore {
         let thread_id = thread_id.to_owned();
         let expected_native_thread_id = expected_native_thread_id.to_owned();
         let expected_cursor_json = expected_cursor_json.to_owned();
+        let root = frozen_lifetime::PreparedFrozenRoot::cli(&resume_cursor_json, true)?;
         self.run_serialized_write(|| async {
-            cli_runtime_binding::update_thread_resume_cursor(
-                &self.connection,
-                thread_id.as_str(),
-                expected_native_thread_id.as_str(),
-                expected_cursor_json.as_str(),
-                resume_cursor_json.clone(),
-                updated_at,
-            )
-            .await
+            let transaction = self.connection.begin().await?;
+            let result = async {
+                cli_runtime_binding::update_thread_resume_cursor(
+                    &transaction,
+                    thread_id.as_str(),
+                    expected_native_thread_id.as_str(),
+                    expected_cursor_json.as_str(),
+                    resume_cursor_json.clone(),
+                    updated_at,
+                    &root,
+                )
+                .await
+            }
+            .await?;
+            transaction.commit().await?;
+            Ok(result)
         })
         .await
     }
@@ -5366,12 +5416,23 @@ impl CrudStore {
         &self,
         request: PrepareClaudeProviderSessionBinding,
     ) -> Result<PreparedClaudeProviderSessionBinding> {
+        let root = frozen_lifetime::PreparedFrozenRoot::cli(
+            &request.thread_binding.resume_cursor_json,
+            true,
+        )?;
         self.run_serialized_write(|| async {
-            cli_runtime_binding::prepare_claude_provider_session_binding(
-                &self.connection,
-                request.clone(),
-            )
-            .await
+            let transaction = self.connection.begin().await?;
+            let result = async {
+                cli_runtime_binding::prepare_claude_provider_session_binding(
+                    &transaction,
+                    request.clone(),
+                    &root,
+                )
+                .await
+            }
+            .await?;
+            transaction.commit().await?;
+            Ok(result)
         })
         .await
     }
@@ -5450,10 +5511,18 @@ impl CrudStore {
         &self,
         binding: NewCliRuntimeTurnBinding,
     ) -> Result<CliRuntimeTurnBindingRecord> {
+        let root = frozen_lifetime::PreparedFrozenRoot::cli(&binding.input_mapping_json, false)?;
         self.run_serialized_write(|| async {
-            let stored =
-                cli_runtime_binding::upsert_turn_binding(&self.connection, binding.clone()).await?;
-            Ok(stored)
+            let transaction = self.connection.begin().await?;
+            let result = async {
+                let stored =
+                    cli_runtime_binding::upsert_turn_binding(&transaction, binding.clone(), &root)
+                        .await?;
+                Ok::<_, anyhow::Error>(stored)
+            }
+            .await?;
+            transaction.commit().await?;
+            Ok(result)
         })
         .await
     }
@@ -5956,6 +6025,7 @@ impl CrudStore {
         attempt_id: String,
         execution_window_index: u32,
     ) -> Result<(CliRuntimeTurnBindingRecord, CliRuntimeTurnAttemptRecord)> {
+        let root = frozen_lifetime::PreparedFrozenRoot::cli(&binding.input_mapping_json, false)?;
         self.run_serialized_write(|| async {
             let transaction = self
                 .connection
@@ -6016,9 +6086,12 @@ impl CrudStore {
                             binding.turn_id
                         );
                     }
-                    let stored_binding =
-                        cli_runtime_binding::upsert_turn_binding(&transaction, binding.clone())
-                            .await?;
+                    let stored_binding = cli_runtime_binding::upsert_turn_binding(
+                        &transaction,
+                        binding.clone(),
+                        &root,
+                    )
+                    .await?;
                     cli_runtime_binding::create_turn_attempt(
                         &transaction,
                         NewCliRuntimeTurnAttempt {
@@ -6231,7 +6304,7 @@ impl CrudStore {
             binding.native_turn_id = None;
             binding.status = "starting".to_owned();
             binding.updated_at = prepared_at;
-            let stored_binding = cli_runtime_binding::upsert_turn_binding(
+            let stored_binding = cli_runtime_binding::update_turn_control(
                 &transaction,
                 NewCliRuntimeTurnBinding {
                     turn_id: binding.turn_id,
@@ -6434,7 +6507,7 @@ impl CrudStore {
                 transaction.rollback().await.ok();
                 bail!("CLI runtime turn attempt `{attempt_id}` is no longer starting");
             }
-            let stored_binding = cli_runtime_binding::upsert_turn_binding(
+            let stored_binding = cli_runtime_binding::update_turn_control(
                 &transaction,
                 NewCliRuntimeTurnBinding {
                     turn_id: binding.turn_id,
@@ -7003,7 +7076,7 @@ impl CrudStore {
                     attempt.id
                 );
             }
-            let stored_binding = cli_runtime_binding::upsert_turn_binding(
+            let stored_binding = cli_runtime_binding::update_turn_control(
                 &transaction,
                 NewCliRuntimeTurnBinding {
                     turn_id: binding.turn_id,
@@ -14849,7 +14922,12 @@ impl CrudStore {
         &self,
         input: TaskCreationCommitInput,
     ) -> Result<Vec<AppendedTaskEvent>> {
-        self.run_serialized_write(|| self.commit_task_creation_once(input.clone()))
+        let root = input
+            .conversation_snapshot
+            .as_ref()
+            .map(|s| frozen_lifetime::PreparedFrozenRoot::history(&s.history_json))
+            .transpose()?;
+        self.run_serialized_write(|| self.commit_task_creation_once(input.clone(), root.clone()))
             .await
     }
 
@@ -15204,8 +15282,20 @@ impl CrudStore {
         &self,
         snapshot: NewTaskRunConversationSnapshot,
     ) -> Result<TaskRunConversationSnapshotRecord> {
-        self.run_serialized_write(|| {
-            task_run_conversation_snapshot::insert_if_absent(&self.connection, snapshot.clone())
+        let root = frozen_lifetime::PreparedFrozenRoot::history(&snapshot.history_json)?;
+        self.run_serialized_write(|| async {
+            let transaction = self.connection.begin().await?;
+            let result = async {
+                task_run_conversation_snapshot::insert_if_absent(
+                    &transaction,
+                    snapshot.clone(),
+                    &root,
+                )
+                .await
+            }
+            .await?;
+            transaction.commit().await?;
+            Ok(result)
         })
         .await
     }
@@ -31385,6 +31475,7 @@ impl CrudStore {
     async fn commit_task_creation_once(
         &self,
         input: TaskCreationCommitInput,
+        root: Option<frozen_lifetime::PreparedFrozenRoot>,
     ) -> Result<Vec<AppendedTaskEvent>> {
         let prepared_events = self
             .prepare_task_events_for_write(input.events.clone())
@@ -31405,9 +31496,12 @@ impl CrudStore {
 
             if let Some(snapshot) = input.conversation_snapshot {
                 let expected = snapshot.clone();
-                let persisted =
-                    task_run_conversation_snapshot::insert_if_absent(&transaction, snapshot)
-                        .await?;
+                let persisted = task_run_conversation_snapshot::insert_if_absent(
+                    &transaction,
+                    snapshot,
+                    root.as_ref().context("missing prepared Task root")?,
+                )
+                .await?;
                 if persisted.run_id != expected.run_id
                     || persisted.task_id != expected.task_id
                     || persisted.workspace_id != expected.workspace_id
@@ -34364,6 +34458,9 @@ mod tests {
 
     #[path = "native_terminal_effect_gates.rs"]
     mod terminal_effect_gates;
+
+    #[path = "episodic_delivery_tests.rs"]
+    mod episodic_delivery_tests;
 
     async fn test_store_with_started_turn(
         workspace_id: &str,
@@ -41407,7 +41504,7 @@ mod tests {
             capabilities_json: "[]".to_owned(),
             resolved_artifacts_json: "[]".to_owned(),
             runtime_environment_json: r#"{"PIONEER_ARTIFACT_OUTPUT_DIR":"/tmp/a"}"#.to_owned(),
-            history_json: r#"[{"role":"User","content":"hello"}]"#.to_owned(),
+            history_json: r#"[{"role":"user","content":"hello"}]"#.to_owned(),
             created_at,
             updated_at: created_at,
         };
@@ -58331,3 +58428,6 @@ mod tests {
         );
     }
 }
+
+/// Private per-worker lifetime reconciliation state; constructing it does not activate cleanup.
+pub use repositories::frozen_storage_lifetime::FrozenStorageLifetimeProgress;

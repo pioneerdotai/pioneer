@@ -96,6 +96,7 @@ pub struct ThreadTimelineController {
     pub(crate) pending: HashMap<PageKey, PageAction>,
     requests: HashMap<PageKey, (u64, PageAction)>,
     failures: HashMap<PageKey, (u8, u64)>,
+    failed_refreshes: HashMap<String, PageAction>,
     demands: HashMap<(String, String), TimelineDemand>,
     retired: HashMap<(String, String), u64>,
     demand_pages: HashMap<(String, String), HashSet<PageKey>>,
@@ -108,6 +109,10 @@ pub struct ThreadTimelineController {
 }
 
 impl ThreadTimelineController {
+    pub(crate) fn has_failed_refresh(&self, thread_id: &str) -> bool {
+        self.failed_refreshes.contains_key(thread_id)
+    }
+
     pub(crate) fn retain_domain_request(&mut self, key: &PageKey) {
         self.durable_pages.insert(key.clone());
     }
@@ -180,7 +185,23 @@ impl ThreadTimelineController {
         succeeded: bool,
         now_ms: u64,
     ) -> Option<PageAction> {
-        self.requests.remove(key)?;
+        let (_, action) = self.requests.remove(key)?;
+        if let PageAction::ThreadTimelinePage {
+            key: PageKey::ThreadNewest { thread_id },
+            params,
+        } = &action
+        {
+            if params.anchor == pioneer_protocol::TimelinePageAnchor::Newest {
+                if succeeded {
+                    self.failed_refreshes.remove(thread_id);
+                } else {
+                    self.failed_refreshes
+                        .insert(thread_id.clone(), action.clone());
+                    // A failed walk is retried explicitly, not by a queued notification.
+                    self.pending.remove(key);
+                }
+            }
+        }
         if succeeded {
             self.failures.remove(key);
         } else {
@@ -484,6 +505,8 @@ impl ThreadTimelineController {
         self.cancel_unowned();
         self.failures
             .retain(|key, _| thread.is_some_and(|id| request_thread_id(key) != id));
+        self.failed_refreshes
+            .retain(|id, _| thread.is_some_and(|thread| id != thread));
         keys
     }
 }
@@ -569,6 +592,29 @@ mod tests {
         let next = policy.update(reentered, vec![page()], 0);
         assert!(next.pages[0].generation > first.pages[0].generation);
     }
+    #[test]
+    fn failed_refresh_retry_preserves_the_consumers_anchor_and_scroll_generation() {
+        let mut policy = ThreadTimelineController::default();
+        let mut input = demand("desktop");
+        input.row_ids = vec!["stable-parent-row".into()];
+        input.scroll_generation = 17;
+        policy.update(input.clone(), vec![], 0);
+        let action = page();
+        let key = semantic::semantic_timeline_request_key(&action).clone();
+        policy.retain_domain_request(&key);
+        policy.begin(action.clone()).unwrap();
+        let generation = policy.request_generation(&key);
+        policy.begin(action); // one coalesced notification, not another owner
+        assert_eq!(policy.request_generation(&key), generation);
+        assert!(policy.finish(&key, false, 0).is_none());
+        assert!(!policy.accepts(&key, generation));
+        assert!(policy.has_failed_refresh("a"));
+        let retry = policy.retry("a", "desktop", 1).unwrap();
+        assert_eq!(retry.row_ids, input.row_ids);
+        assert_eq!(retry.scroll_generation, input.scroll_generation);
+        assert_eq!(retry.generation, input.generation);
+    }
+
     #[test]
     fn persistent_read_failure_stops_at_three_attempts_until_explicit_retry() {
         let mut policy = ThreadTimelineController::default();
@@ -737,6 +783,7 @@ impl crate::core::ClientCore {
         if self.is_stopped() {
             return TimelineEffectPlan::default();
         }
+        let mut retry_refresh = None;
         let mut demand = match intent {
             TimelineIntent::ConsumeScroll {
                 thread_id,
@@ -769,15 +816,17 @@ impl crate::core::ClientCore {
                 consumer_id,
                 generation,
             } => {
-                let Some(demand) = self
+                let mut registry = self
                     .thread_registry
                     .lock()
-                    .expect("thread registry poisoned")
+                    .expect("thread registry poisoned");
+                let Some(demand) = registry
                     .timeline
                     .retry(&thread_id, &consumer_id, generation)
                 else {
                     return TimelineEffectPlan::default();
                 };
+                retry_refresh = registry.timeline.failed_refreshes.get(&thread_id).cloned();
                 demand
             }
         };
@@ -819,7 +868,18 @@ impl crate::core::ClientCore {
                 .map(|row| row.id().as_str().to_owned())
                 .collect(),
         );
-        registry.timeline.update(demand, actions, now_ms)
+        let mut plan = registry.timeline.update(demand, actions, now_ms);
+        if let Some(action) = retry_refresh {
+            let key = semantic::semantic_timeline_request_key(&action).clone();
+            registry.timeline.retain_domain_request(&key);
+            if let Some(action) = registry.timeline.begin(action) {
+                plan.pages.push(TimelinePageRequest {
+                    action,
+                    generation: registry.timeline.request_generation(&key),
+                });
+            }
+        }
+        plan
     }
 
     pub(crate) fn next_timeline_read_delay(&self) -> Option<std::time::Duration> {
