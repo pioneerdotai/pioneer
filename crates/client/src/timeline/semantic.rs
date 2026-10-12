@@ -356,6 +356,11 @@ impl TopLevelTimelineCache {
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct TurnWorkRangeCache {
+    #[serde(default)]
+    pub has_loaded_page: bool,
+    // Owned by initial history requests, independently of item reads/invalidation.
+    #[serde(default)]
+    pub initial_request_status: TimelineRequestStatus,
     pub thread_id: ThreadId,
     pub turn_id: TurnId,
     pub work: Option<TurnWorkBlock>,
@@ -638,6 +643,8 @@ pub fn turn_work_range_from_page(page: TurnWorkPageResponse) -> TurnWorkRangeCac
         items_by_id.insert(item.work_item_id.clone(), item);
     }
     let mut range = TurnWorkRangeCache {
+        has_loaded_page: true,
+        initial_request_status: TimelineRequestStatus::Ready,
         thread_id: page.thread_id,
         turn_id: page.turn_id,
         work: page.work,
@@ -2179,7 +2186,7 @@ pub fn apply_work_range_page(
     merge_mode: WorkPageMergeMode,
 ) -> bool {
     let before = range.clone();
-    let was_empty = range.ordered_item_ids.is_empty();
+    let initialize_loaded_range = !range.has_loaded_page || range.ordered_item_ids.is_empty();
     let incoming_projection_revision = (
         page.source_high_watermark,
         page.projection_updated_at_unix_micros,
@@ -2212,11 +2219,22 @@ pub fn apply_work_range_page(
             range.stale_work_item_ids.clear();
             range.source_high_watermark = page.source_high_watermark;
             range.projection_updated_at_unix_micros = page.projection_updated_at_unix_micros;
+            range.has_loaded_page = true;
+            range.initial_request_status = TimelineRequestStatus::Ready;
             range.request_status = TimelineRequestStatus::Ready;
             return before != *range;
         };
         if let Some(existing_work) = range.work.as_ref() {
             preserve_newer_agent_work_graph(existing_work, &mut incoming_work);
+            // A page requested before live completion must not reopen the work group.
+            if is_terminal_turn_work_state(existing_work.state)
+                && !is_terminal_turn_work_state(incoming_work.state)
+            {
+                incoming_work.state = existing_work.state;
+                incoming_work.presentation = existing_work.presentation;
+                incoming_work.completed_at_unix_ms = existing_work.completed_at_unix_ms;
+                incoming_work.elapsed_ms = existing_work.elapsed_ms;
+            }
         }
         range.work = Some(incoming_work);
         range.source_high_watermark = page.source_high_watermark;
@@ -2231,9 +2249,11 @@ pub fn apply_work_range_page(
         range,
         &page.page,
         merge_mode,
-        was_empty,
+        initialize_loaded_range,
         page_can_advance_newest_boundary,
     );
+    range.has_loaded_page = true;
+    range.initial_request_status = TimelineRequestStatus::Ready;
     range.request_status = TimelineRequestStatus::Ready;
 
     before != *range
@@ -2305,9 +2325,7 @@ pub fn apply_work_items_get_response(
 }
 
 fn merge_turn_work_item(range: &mut TurnWorkRangeCache, item: TurnWorkItem) -> bool {
-    if let Some(existing) = range.items_by_id.get(item.work_item_id.as_str())
-        && !incoming_work_item_is_newer(existing, &item)
-    {
+    if !should_merge_turn_work_item(range, &item) {
         return range.stale_work_item_ids.remove(item.work_item_id.as_str());
     }
 
@@ -2322,6 +2340,14 @@ fn merge_turn_work_item(range: &mut TurnWorkRangeCache, item: TurnWorkItem) -> b
         changed = true;
     }
     changed
+}
+
+// Shared by the cache merge and initial-response admission.
+pub(crate) fn should_merge_turn_work_item(range: &TurnWorkRangeCache, item: &TurnWorkItem) -> bool {
+    range
+        .items_by_id
+        .get(item.work_item_id.as_str())
+        .is_none_or(|existing| incoming_work_item_is_newer(existing, item))
 }
 
 fn incoming_work_item_is_newer(existing: &TurnWorkItem, incoming: &TurnWorkItem) -> bool {
@@ -3657,13 +3683,15 @@ fn push_turn_work_rows_and_hints(
     rows: &mut Vec<SemanticTimelineRow>,
     request_hints: &mut Vec<SemanticTimelineRequestHint>,
 ) {
+    if work_range.is_none_or(|range| !range.has_loaded_page)
+        && (work.visible_work_count > 0 || work.has_more_before || work.has_more_after)
+    {
+        request_hints.push(SemanticTimelineRequestHint::TurnWorkInitial {
+            thread_id: thread_id.to_owned(),
+            turn_id: work.turn_id.clone(),
+        });
+    }
     let Some(work_range) = work_range else {
-        if work.visible_work_count > 0 || work.has_more_before || work.has_more_after {
-            request_hints.push(SemanticTimelineRequestHint::TurnWorkInitial {
-                thread_id: thread_id.to_owned(),
-                turn_id: work.turn_id.clone(),
-            });
-        }
         return;
     };
 
@@ -4839,6 +4867,295 @@ mod tests {
             vec!["item_prior", "old_live", "item_newer"],
             "canonical reconciliation must preserve the order already shown live",
         );
+    }
+
+    #[test]
+    fn live_fragment_still_requests_initial_page_and_accepts_empty_or_canonical_history() {
+        for empty in [false, true] {
+            let mut state = SemanticTimelineState::default();
+            apply_thread_timeline_page(
+                &mut state,
+                thread_page(vec![turn_work_block("thread_a", "turn:turn_a:work", "001")]),
+                TopLevelPageMergeMode::Reset,
+            );
+            apply_conversation_event_to_semantic_timeline(
+                &mut state,
+                "workspace_a",
+                &ConversationEvent::ItemDelta {
+                    thread_id: "thread_a".into(),
+                    turn_id: "turn_a".into(),
+                    item_id: "comment".into(),
+                    delta: "fragment".into(),
+                    stream: Some(ItemDeltaStream::AgentMessage),
+                    payload: None,
+                    markdown: None,
+                    markdown_version: None,
+                },
+                10_000,
+            );
+            let thread = state.thread("thread_a").unwrap();
+            let range = thread.work_range("turn_a").unwrap();
+            assert!(!range.has_loaded_page);
+            let mut canonical = range.ordered_items().next().unwrap().clone();
+            canonical.source_sequence = 2;
+            canonical.source_updated_at_unix_micros = 2;
+            canonical.metadata = None;
+            if let TurnItem::AgentMessage { text, .. } = &mut canonical.item {
+                *text = "canonical complete text".into();
+            }
+            let flattened = flatten_thread_semantic_timeline(thread);
+            assert_eq!(flattened.rows.len(), 2, "live fragment stays visible");
+            let visible = SemanticTimelineVisibleRow {
+                row_id: flattened.rows[0].id.clone(),
+                top_offset_px: 0,
+            };
+            let input = SemanticTimelineRequestPlannerInput {
+                visible_rows: vec![visible],
+                ..Default::default()
+            };
+            let plan = plan_semantic_timeline_requests(thread, &input);
+            assert!(matches!(plan.actions.as_slice(),
+                [SemanticTimelineRequestAction::TurnWorkPage { key: SemanticTimelineRequestKey::TurnWorkInitial { .. }, params }]
+                if params.anchor == TimelinePageAnchor::Newest));
+            assert!(
+                plan_semantic_timeline_requests(thread, &Default::default())
+                    .actions
+                    .is_empty()
+            );
+
+            collapse_turn_work(&mut state, "thread_a", "turn_a");
+            assert!(
+                flatten_semantic_timeline(&state, "thread_a")
+                    .unwrap()
+                    .request_hints
+                    .is_empty()
+            );
+            expand_turn_work(&mut state, "thread_a", "turn_a");
+
+            let mut page = work_page(if empty {
+                vec![]
+            } else {
+                vec![canonical.clone()]
+            });
+            page.page.has_more_before = !empty;
+            page.page.has_more_after = !empty;
+            page.source_high_watermark = 2;
+            page.projection_updated_at_unix_micros = 2;
+            let expected_range = TimelineLoadedRange::from(&page.page);
+            assert!(apply_turn_work_page(
+                &mut state,
+                page,
+                WorkPageMergeMode::MergeAfter
+            ));
+            let thread = state.thread("thread_a").unwrap();
+            let range = thread.work_range("turn_a").unwrap();
+            assert!(range.has_loaded_page);
+            assert_eq!(range.loaded_range, expected_range);
+            assert_eq!(range.ordered_item_ids.len(), 1);
+            if !empty {
+                assert_eq!(range.ordered_items().next(), Some(&canonical));
+            }
+            let flattened = flatten_thread_semantic_timeline(thread);
+            assert!(
+                flattened.request_hints.iter().all(|hint| !matches!(
+                    hint,
+                    SemanticTimelineRequestHint::TurnWorkInitial { .. }
+                ))
+            );
+            assert_eq!(flattened.request_hints.len(), if empty { 0 } else { 2 });
+            if empty {
+                assert!(
+                    plan_semantic_timeline_requests(thread, &input)
+                        .actions
+                        .is_empty()
+                );
+            } else {
+                let plan = plan_semantic_timeline_requests(thread, &input);
+                assert!(plan.actions.iter().any(|action| matches!(action,
+                    SemanticTimelineRequestAction::TurnWorkPage { params, .. }
+                    if matches!(&params.anchor, TimelinePageAnchor::Before { cursor }
+                        if cursor.value == "work-before")
+                )));
+            }
+        }
+    }
+
+    #[test]
+    fn work_state_and_targeted_items_do_not_count_as_a_loaded_page() {
+        let mut state = SemanticTimelineState::default();
+        apply_turn_work_state_changed(
+            &mut state,
+            TurnWorkStateChangedNotification {
+                workspace_id: "workspace_a".into(),
+                thread_id: "thread_a".into(),
+                turn_id: "turn_a".into(),
+                source_high_watermark: 20,
+                projection_updated_at_unix_micros: 20,
+                work: work_block("turn_a"),
+                reason: pioneer_protocol::TimelineChangeReason::LiveEvent,
+            },
+        );
+        let mut newer = work_item("shared", "002");
+        newer.source_sequence = 20;
+        newer.source_updated_at_unix_micros = 20;
+        apply_turn_work_items_get_response(
+            &mut state,
+            work_items_response("thread_a", "turn_a", 20, vec![newer.clone()]),
+        );
+        assert!(
+            !state
+                .thread("thread_a")
+                .unwrap()
+                .work_range("turn_a")
+                .unwrap()
+                .has_loaded_page
+        );
+        let mut page = work_page(vec![work_item("older", "001"), work_item("shared", "002")]);
+        page.page.has_more_after = true;
+        let expected_range = TimelineLoadedRange::from(&page.page);
+        apply_turn_work_page(&mut state, page, WorkPageMergeMode::MergeAfter);
+        let range = state
+            .thread("thread_a")
+            .unwrap()
+            .work_range("turn_a")
+            .unwrap();
+        assert!(
+            range.has_loaded_page,
+            "an older but accepted history window is still a page"
+        );
+        assert_eq!(range.loaded_range, expected_range);
+        assert_eq!(range.source_high_watermark, 20);
+        assert_eq!(range.item("shared"), Some(&newer));
+        assert_eq!(range.ordered_item_ids.len(), 2);
+    }
+
+    #[test]
+    fn initial_page_merges_live_arrivals_and_preserves_terminal_items_and_work() {
+        let mut state = SemanticTimelineState::default();
+        let item = TurnItem::AgentMessage {
+            id: "comment".into(),
+            text: "initial".into(),
+            phase: AgentMessagePhase::Commentary,
+            markdown: None,
+            markdown_version: None,
+        };
+        apply_conversation_event_to_semantic_timeline(
+            &mut state,
+            "workspace_a",
+            &ConversationEvent::ItemStarted {
+                thread_id: "thread_a".into(),
+                turn_id: "turn_a".into(),
+                item: item.clone(),
+            },
+            10,
+        );
+        let mut stale = state
+            .thread("thread_a")
+            .unwrap()
+            .work_range("turn_a")
+            .unwrap()
+            .ordered_items()
+            .next()
+            .unwrap()
+            .clone();
+        stale.source_sequence = 10;
+        let page = work_page(vec![stale]);
+        let range = state.thread_mut("thread_a").work_range_mut("turn_a");
+        range.request_status = TimelineRequestStatus::Loading {
+            request_key: "initial".into(),
+        };
+        let mut completed = item;
+        if let TurnItem::AgentMessage { text, .. } = &mut completed {
+            *text = "live complete text".into();
+        }
+        apply_conversation_event_to_semantic_timeline(
+            &mut state,
+            "workspace_a",
+            &ConversationEvent::ItemCompleted {
+                thread_id: "thread_a".into(),
+                turn_id: "turn_a".into(),
+                item: completed.clone(),
+            },
+            11,
+        );
+        apply_conversation_event_to_semantic_timeline(
+            &mut state,
+            "workspace_a",
+            &ConversationEvent::ItemStarted {
+                thread_id: "thread_a".into(),
+                turn_id: "turn_a".into(),
+                item: TurnItem::AgentMessage {
+                    id: "new-live".into(),
+                    text: "new live item".into(),
+                    phase: AgentMessagePhase::Commentary,
+                    markdown: None,
+                    markdown_version: None,
+                },
+            },
+            12,
+        );
+        let mut turn = detached_task_turn("turn_a");
+        turn.status = TurnStatus::Completed;
+        turn.turn_kind = TurnKind::Conversation;
+        turn.origin = TurnOrigin::User;
+        apply_conversation_event_to_semantic_timeline(
+            &mut state,
+            "workspace_a",
+            &ConversationEvent::TurnCompleted {
+                thread_id: "thread_a".into(),
+                turn,
+            },
+            13,
+        );
+        let before = state
+            .thread("thread_a")
+            .unwrap()
+            .work_range("turn_a")
+            .unwrap()
+            .clone();
+        assert!(!before.has_loaded_page);
+        assert!(apply_turn_work_page(
+            &mut state,
+            page,
+            WorkPageMergeMode::MergeAfter
+        ));
+        let range = state
+            .thread("thread_a")
+            .unwrap()
+            .work_range("turn_a")
+            .unwrap();
+        assert!(range.has_loaded_page);
+        assert_eq!(range.ordered_item_ids.len(), 2);
+        assert_eq!(range.items_by_id.len(), 2);
+        let item = range.item("turn:turn_a:work:comment").unwrap();
+        assert_eq!(item.status, TurnWorkItemStatus::Completed);
+        assert_eq!(item.item, completed);
+        assert_eq!(
+            range.item("turn:turn_a:work:new-live"),
+            before.item("turn:turn_a:work:new-live")
+        );
+        let work = range.work.as_ref().unwrap();
+        let terminal = before.work.as_ref().unwrap();
+        assert_eq!(work.state, TurnWorkState::Completed);
+        assert_eq!(work.presentation, terminal.presentation);
+        assert_eq!(work.completed_at_unix_ms, terminal.completed_at_unix_ms);
+        assert_eq!(work.elapsed_ms, terminal.elapsed_ms);
+    }
+
+    #[test]
+    fn work_range_loaded_flag_defaults_for_legacy_serialized_cache() {
+        let range = turn_work_range_from_page(work_page(vec![]));
+        assert!(range.has_loaded_page);
+        assert_eq!(range.initial_request_status, TimelineRequestStatus::Ready);
+        let mut legacy = serde_json::to_value(range).unwrap();
+        legacy.as_object_mut().unwrap().remove("has_loaded_page");
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("initial_request_status");
+        let decoded: TurnWorkRangeCache = serde_json::from_value(legacy).unwrap();
+        assert!(!decoded.has_loaded_page);
+        assert_eq!(decoded.initial_request_status, TimelineRequestStatus::Idle);
     }
 
     #[test]
