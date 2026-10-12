@@ -111,7 +111,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::Mutex;
-use tokio::task::JoinHandle;
 use tokio::time::{Duration, sleep};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, warn};
@@ -166,9 +165,9 @@ fn agent_skill_cards_have_read_path(
 }
 
 async fn finish_tool_event_forwarder(
-    forwarder: JoinHandle<Result<(), AgentEventHubError>>,
+    forwarder: AbortOnDropJoinHandle<Result<(), AgentEventHubError>>,
 ) -> Result<(), ChatTurnError> {
-    match forwarder.await {
+    match forwarder.join().await {
         Ok(Ok(())) => Ok(()),
         Ok(Err(error)) => Err(agent_event_error(error)),
         Err(error) => Err(ChatTurnError::Terminal(format!(
@@ -309,6 +308,12 @@ impl<T> AbortOnDropJoinHandle<T> {
         Self {
             handle: Some(handle),
         }
+    }
+
+    fn is_finished(&self) -> bool {
+        self.handle
+            .as_ref()
+            .is_none_or(tokio::task::JoinHandle::is_finished)
     }
 
     async fn join(mut self) -> Result<T, tokio::task::JoinError> {
@@ -6266,7 +6271,7 @@ async fn execute_agent_provider_response(
     let thread_id_for_tools = thread_id.to_owned();
     let turn_id_for_tools = turn_id.to_owned();
 
-    let tool_event_forwarder = tokio::spawn(async move {
+    let tool_event_forwarder = AbortOnDropJoinHandle::new(tokio::spawn(async move {
         let mut durable_open = true;
         while durable_open {
             tokio::select! {
@@ -6319,7 +6324,7 @@ async fn execute_agent_provider_response(
             }
         }
         Ok::<(), AgentEventHubError>(())
-    });
+    }));
 
     let mut provider_history_roots = semantic.provider_history_roots;
     let restored_roots = if provider_history_roots.is_empty() {
@@ -9244,6 +9249,45 @@ mod tests {
         assert!(!lowered.contains("wire shape"));
         assert!(!lowered.contains("proposal"));
         assert!(!lowered.contains("if-match"));
+    }
+
+    #[tokio::test]
+    async fn tool_forwarder_stays_owned_on_early_exit_and_cancelled_drain() {
+        struct Dropped(Option<tokio::sync::oneshot::Sender<()>>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                if let Some(sender) = self.0.take() {
+                    let _ = sender.send(());
+                }
+            }
+        }
+        for cancel_drain in [false, true] {
+            let (started, start) = tokio::sync::oneshot::channel();
+            let (dropped, drop_observed) = tokio::sync::oneshot::channel();
+            let owned = super::AbortOnDropJoinHandle::new(tokio::spawn(async move {
+                let _witness = Dropped(Some(dropped));
+                let _ = started.send(());
+                std::future::pending::<Result<(), super::AgentEventHubError>>().await
+            }));
+            start.await.unwrap();
+            if cancel_drain {
+                assert!(
+                    tokio::time::timeout(
+                        std::time::Duration::ZERO,
+                        super::finish_tool_event_forwarder(owned)
+                    )
+                    .await
+                    .is_err()
+                );
+            } else {
+                // A restore failure returns before reaching the drain helper.
+                drop(owned);
+            }
+            tokio::time::timeout(std::time::Duration::from_secs(1), drop_observed)
+                .await
+                .unwrap()
+                .unwrap();
+        }
     }
 
     pub(super) fn execution_checkpoint_context_fixture() -> ExecutionCheckpointContext {
