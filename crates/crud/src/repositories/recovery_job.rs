@@ -298,6 +298,35 @@ pub(crate) async fn prepare_progress<C: ConnectionTrait>(
                 )),
             RecoveryProgressUnavailable
         );
+        let wait = native
+            .get("attached_task_wait")
+            .ok_or(RecoveryProgressUnavailable)?;
+        if !wait.is_null() {
+            anyhow::ensure!(
+                wait.as_object().is_some_and(|fields| fields.len() == 6)
+                    && wait["baseline"]
+                        .as_array()
+                        .is_some_and(|bytes| bytes.len() == 32
+                            && bytes
+                                .iter()
+                                .all(|byte| byte.as_u64().is_some_and(|value| value <= 255)))
+                    && wait["item_id"]
+                        .as_str()
+                        .is_some_and(|id| !id.is_empty() && id.len() <= 21)
+                    && wait["checkpoint_id"]
+                        .as_str()
+                        .is_some_and(|id| id.len() == 21),
+                RecoveryProgressUnavailable
+            );
+            let wait: pioneer_protocol::NativeAttachedTaskWait =
+                serde_json::from_value(wait.clone()).map_err(|_| RecoveryProgressUnavailable)?;
+            anyhow::ensure!(
+                wait.valid()
+                    && wait.checkpoint_id
+                        == pioneer_protocol::native_semantic_checkpoint_id(&turn_id),
+                RecoveryProgressUnavailable
+            );
+        }
         let semantic = &native["progress_frontier"];
         anyhow::ensure!(
             semantic["schema_version"].as_u64() == Some(1),
@@ -1738,7 +1767,7 @@ mod progress_tests {
                 "provider_budget":{"agent_round_count":0,"tool_call_count":0,"provider_usage_available":false},
                 "tools":{"requested_count":0,"executed_count":0,"unexecuted_count":0,"total_count":0,"succeeded_count":0,"failed_count":0,"in_progress_count":0,"detail_limit":1,"details_truncated":false},
                 "window":{"window_index":1,"agent_round_count":0,"tool_call_count":0,"progress":pioneer_protocol::ExecutionProgressSummary { schema_version: 1, baseline: [0;3], frontier: counts }},
-                "native_semantic_state":{"schema_version":pioneer_protocol::NATIVE_SEMANTIC_STATE_SCHEMA_VERSION,"progress_frontier":{
+                "native_semantic_state":{"schema_version":pioneer_protocol::NATIVE_SEMANTIC_STATE_SCHEMA_VERSION,"attached_task_wait":null,"progress_frontier":{
                     "schema_version":1,"advanced_observations":counts[0], "unchanged_observations":counts[1], "unknown_observations":counts[2]}}
             })
         };
@@ -1780,6 +1809,54 @@ mod progress_tests {
                 .unwrap()
                 .is_none()
         );
+        // Codec8 requires explicit null or a supported host wait; incomplete new
+        // state must not grant recovery progress authority on cold restore.
+        for wait in [None, Some(serde_json::json!({"schema_version":2}))] {
+            let mut malformed = checkpoint_payload([1, 0, 0]);
+            if let Some(wait) = wait {
+                malformed["native_semantic_state"]["attached_task_wait"] = wait;
+            } else {
+                malformed["native_semantic_state"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("attached_task_wait");
+            }
+            let malformed = malformed.to_string();
+            store
+                .run_serialized_write(|| async {
+                    store
+                        .connection
+                        .execute_raw(sea_orm::Statement::from_sql_and_values(
+                            sea_orm::DatabaseBackend::Sqlite,
+                            "UPDATE turn_execution_checkpoint SET payload_json=? WHERE id=?",
+                            [malformed.clone().into(), checkpoint_id.clone().into()],
+                        ))
+                        .await
+                        .map_err(Into::into)
+                })
+                .await
+                .unwrap();
+            let error = store
+                .prepare_recovery_progress_outcome(&job.id, "attempt_cas")
+                .await
+                .unwrap_err();
+            assert!(error.is::<RecoveryProgressUnavailable>());
+        }
+        let supported = checkpoint_payload([1, 0, 0]).to_string();
+        store
+            .run_serialized_write(|| async {
+                store
+                    .connection
+                    .execute_raw(sea_orm::Statement::from_sql_and_values(
+                        sea_orm::DatabaseBackend::Sqlite,
+                        "UPDATE turn_execution_checkpoint SET payload_json=? WHERE id=?",
+                        [supported.clone().into(), checkpoint_id.clone().into()],
+                    ))
+                    .await
+                    .map_err(Into::into)
+            })
+            .await
+            .unwrap();
         let prior = store
             .prepare_recovery_progress_outcome(&job.id, "attempt_cas")
             .await

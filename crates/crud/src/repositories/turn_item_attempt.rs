@@ -21,6 +21,24 @@ use crate::convention::{
 };
 use crate::turn_item_terminal::{TurnItemTerminalState, terminalize_turn_item_payload};
 
+// Only the atomic native checkpoint writer admits this existing class/type
+// pairing. Read the accepted operation class in the actual deadline statement;
+// no checkpoint JSON parsing or stale pre-read is needed under DB capacity.
+pub(crate) fn native_attached_wait_predicate() -> &'static str {
+    "turn_item_attempt.execution_class='durable_wait' AND turn_item_attempt.item_type='reasoning'"
+}
+
+fn wait_aware_deadline(value: Option<DateTimeWithTimeZone>) -> sea_orm::sea_query::SimpleExpr {
+    Expr::cust_with_values(
+        format!(
+            "CASE WHEN {} THEN NULL ELSE ? END",
+            native_attached_wait_predicate()
+        ),
+        [value],
+    )
+    .into()
+}
+
 const MAX_TERMINAL_TURN_RUNNING_ATTEMPTS: u64 = 64;
 
 #[derive(Debug, Clone)]
@@ -199,13 +217,13 @@ pub async fn heartbeat_running_attempt<C: ConnectionTrait>(
     if let Some(idle) = next_idle_deadline_at {
         update = update.col_expr(
             turn_item_attempt::Column::IdleDeadlineAt,
-            Expr::value(Some(idle)),
+            wait_aware_deadline(Some(idle)),
         );
     }
     if let Some(hard_deadline_at) = next_hard_deadline_at {
         update = update.col_expr(
             turn_item_attempt::Column::HardDeadlineAt,
-            Expr::value(Some(hard_deadline_at)),
+            wait_aware_deadline(Some(hard_deadline_at)),
         );
     }
     let affected = update
@@ -272,11 +290,11 @@ pub async fn configure_running_attempt_deadlines<C: ConnectionTrait>(
         )
         .col_expr(
             turn_item_attempt::Column::IdleDeadlineAt,
-            Expr::value(idle_deadline_at),
+            wait_aware_deadline(idle_deadline_at),
         )
         .col_expr(
             turn_item_attempt::Column::HardDeadlineAt,
-            Expr::value(hard_deadline_at),
+            wait_aware_deadline(hard_deadline_at),
         )
         .col_expr(
             turn_item_attempt::Column::UpdatedAt,

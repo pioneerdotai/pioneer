@@ -17,6 +17,8 @@ pub(super) const MAX_SUMMARY_TEXT_BYTES: usize = 16 * 1024;
 pub(super) struct NativeSemanticState {
     pub schema_version: u32,
     pub checkpoint_revision: u64,
+    #[serde(deserialize_with = "required_wait")]
+    pub attached_task_wait: Option<pioneer_protocol::NativeAttachedTaskWait>,
     pub controls: super::native_control::NativeControlState,
     pub provider_history_roots: Vec<pioneer_compaction::SourceRef>,
     pub no_progress_mode: pioneer_tools::ToolNoProgressMode,
@@ -31,6 +33,12 @@ pub(super) struct NativeSemanticState {
     pub post_turn_assistant_text: String,
     pub post_turn_tool_events: Vec<TurnPostTurnToolEventSummary>,
     pub post_turn_domain_events: Vec<TurnPostTurnDomainEventSummary>,
+}
+
+fn required_wait<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<pioneer_protocol::NativeAttachedTaskWait>, D::Error> {
+    Option::<pioneer_protocol::NativeAttachedTaskWait>::deserialize(deserializer)
 }
 
 /// Serialize borrowed state with a physical byte ceiling before cloning any
@@ -174,6 +182,7 @@ impl NativeSemanticState {
                 no_progress_mode: mode,
                 progress_frontier: Default::default(),
                 checkpoint_revision: 0,
+                attached_task_wait: None,
                 retry: ToolRetryController::new(budget.clone())
                     .checkpoint()
                     .map_err(|_| unavailable())?,
@@ -233,6 +242,10 @@ impl NativeSemanticState {
 
     fn validate(&self, turn: &str, budget: &ToolRetryBudgetConfig) -> Result<(), ChatTurnError> {
         if self.schema_version != crate::NATIVE_SEMANTIC_STATE_SCHEMA_VERSION
+            || self.attached_task_wait.as_ref().is_some_and(|wait| {
+                !wait.valid()
+                    || wait.checkpoint_id != pioneer_protocol::native_semantic_checkpoint_id(turn)
+            })
             || !self.progress_frontier.valid()
             || !self.controls.valid()
             || !history_roots_valid(&self.provider_history_roots)
@@ -273,6 +286,7 @@ impl NativeSemanticState {
 #[allow(clippy::too_many_arguments)]
 pub(super) fn capture(
     checkpoint_revision: u64,
+    attached_task_wait: &Option<pioneer_protocol::NativeAttachedTaskWait>,
     turn: &str,
     budget: &ToolRetryBudgetConfig,
     controls: &super::native_control::NativeControlState,
@@ -294,6 +308,7 @@ pub(super) fn capture(
     struct Borrowed<'a> {
         schema_version: u32,
         checkpoint_revision: u64,
+        attached_task_wait: &'a Option<pioneer_protocol::NativeAttachedTaskWait>,
         controls: &'a super::native_control::NativeControlState,
         provider_history_roots: &'a [pioneer_compaction::SourceRef],
         no_progress_mode: pioneer_tools::ToolNoProgressMode,
@@ -312,6 +327,7 @@ pub(super) fn capture(
     let encoded = encode(&Borrowed {
         schema_version: crate::NATIVE_SEMANTIC_STATE_SCHEMA_VERSION,
         checkpoint_revision,
+        attached_task_wait,
         controls,
         provider_history_roots: history_roots,
         no_progress_mode: mode,

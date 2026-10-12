@@ -5486,6 +5486,52 @@ fn wait_mode_label(mode: pioneer_protocol::TaskWaitMode) -> &'static str {
     }
 }
 
+fn candidate_review_revision(candidate: &pioneer_protocol::TaskResultCandidate) -> Option<String> {
+    use sha2::Digest;
+    struct DigestWriter {
+        hash: sha2::Sha256,
+        bytes: usize,
+    }
+    impl std::io::Write for DigestWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.bytes = self
+                .bytes
+                .checked_add(bytes.len())
+                .filter(|count| *count <= 16 * 1024 * 1024)
+                .ok_or_else(|| std::io::Error::other("candidate revision input unavailable"))?;
+            self.hash.update(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut writer = DigestWriter {
+        hash: sha2::Sha256::new(),
+        bytes: 0,
+    };
+    serde_json::to_writer(
+        &mut writer,
+        &(
+            &candidate.id,
+            &candidate.task_id,
+            &candidate.run_id,
+            &candidate.task_run_turn_id,
+            &candidate.thread_id,
+            &candidate.turn_id,
+            candidate.round,
+            candidate.status,
+            &candidate.result,
+            &candidate.extraction_error,
+            &candidate.summary,
+            &candidate.diagnostics,
+            &candidate.final_review_event_id,
+        ),
+    )
+    .ok()?;
+    Some(hex::encode(writer.hash.finalize()))
+}
+
 fn review_required_task_observation(
     item: &pioneer_protocol::TaskWaitReviewItem,
 ) -> ReviewRequiredTaskObservation {
@@ -5503,6 +5549,7 @@ fn review_required_task_observation(
             .map(|run| run.id.clone())
             .unwrap_or_else(|| candidate.run_id.clone()),
         candidate_id: candidate.id.clone(),
+        candidate_revision: candidate_review_revision(candidate).unwrap_or_default(),
         title: bounded_preview(item.item.task.title.as_str(), 160),
         status: wait_item_status(&item.item.task, run),
         candidate_status: candidate_status_label(candidate.status),
@@ -6731,6 +6778,44 @@ mod tests {
             non_waitable_count: 0,
             mode: TaskWaitMode::AllTerminalOrReviewRequired,
         }
+    }
+
+    #[test]
+    fn review_projection_revision_covers_hidden_result_changes_and_excludes_liveness() {
+        let mut response = sample_review_wait_response(
+            vec![pioneer_protocol::TaskWaitReviewAction::TaskAccept],
+            1,
+            None,
+            TaskResultCandidateStatus::PendingReview,
+        );
+        let item = &mut response.review_required[0];
+        let first = review_required_task_observation(item);
+        assert_eq!(first.candidate_revision.len(), 64);
+        item.candidate.result.as_mut().unwrap().data = Some(pioneer_protocol::TaskValue::String(
+            "different hidden result suffix".into(),
+        ));
+        let changed = review_required_task_observation(item);
+        assert_eq!(first.result_preview, changed.result_preview);
+        assert_eq!(first.candidate_id, changed.candidate_id);
+        assert_ne!(first.candidate_revision, changed.candidate_revision);
+        item.item.task.updated_at += 1;
+        item.item.run.as_mut().unwrap().heartbeat_at = Some(999);
+        item.item.run.as_mut().unwrap().lock_expires_at = Some(9999);
+        item.candidate.updated_at += 1;
+        assert_eq!(
+            changed.candidate_revision,
+            review_required_task_observation(item).candidate_revision
+        );
+        item.candidate.result.as_mut().unwrap().data = Some(pioneer_protocol::TaskValue::String(
+            "x".repeat(17 * 1024 * 1024),
+        ));
+        assert!(candidate_review_revision(&item.candidate).is_none());
+        assert!(
+            review_required_task_observation(item)
+                .candidate_revision
+                .is_empty(),
+            "no partial digest may authorize delivery"
+        );
     }
 
     fn sample_task_response(

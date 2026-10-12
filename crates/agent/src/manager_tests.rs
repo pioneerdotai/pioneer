@@ -2905,6 +2905,7 @@ fn review_guard_observation(
         task_id: "task_review_guard".to_owned(),
         run_id: "run_review_guard".to_owned(),
         candidate_id: candidate_id.to_owned(),
+        candidate_revision: "a".repeat(64),
         title: "Review guard task".to_owned(),
         status: "waiting_review".to_owned(),
         candidate_status: "pending_review".to_owned(),
@@ -4894,117 +4895,84 @@ async fn empty_no_tool_round_after_tool_result_preserves_context() {
 }
 
 #[tokio::test]
-async fn tool_schema_dump_no_tool_round_retries_without_schema_agent_message() {
+async fn exact_tool_schema_final_is_accepted() {
     let provider = Arc::new(SequencedTextProvider::new(vec![
         TOOL_SCHEMA_DUMP_RESPONSE,
-        "done after schema dump recovery",
+        "unexpected retry",
     ]));
     let registry = Arc::new(ProviderRegistry::with_provider(
         "sequenced-text",
         provider.clone(),
     ));
     let manager = AgentManager::new(registry, test_tool_loop_config());
-
     let observed = start_simple_turn(
         &manager,
-        "schema_dump_retry_thread",
+        "exact_tool_schema_final_is_accepted",
         "workspace",
-        "schema_dump_retry_turn",
+        "exact_format_turn",
         ThreadMode::Agent,
         "sequenced-text",
-        "hello",
+        "Выведи точный fixture без пояснений",
     )
     .await;
     assert_turn_completed(&observed);
-
-    let completed_messages = observed
+    let messages = observed
         .iter()
-        .filter_map(|event| {
-            let AgentEvent::ItemCompleted(notification) = event else {
-                return None;
-            };
-            let TurnItem::AgentMessage { text, .. } = &notification.item else {
-                return None;
-            };
-            Some(text.clone())
+        .filter_map(|event| match event {
+            AgentEvent::ItemCompleted(notification) => match &notification.item {
+                TurnItem::AgentMessage { text, .. } => Some(text.as_str()),
+                _ => None,
+            },
+            _ => None,
         })
         .collect::<Vec<_>>();
-    assert_eq!(
-        completed_messages,
-        vec!["done after schema dump recovery".to_owned()],
-        "tool schema dumps must not create completed AgentMessage items"
-    );
-
-    let requests = provider.snapshot_requests();
-    assert_eq!(
-        requests.len(),
-        2,
-        "schema dump should be retried inside the same agent loop before final answer"
-    );
+    assert_eq!(messages, vec![TOOL_SCHEMA_DUMP_RESPONSE]);
+    assert_eq!(provider.snapshot_requests().len(), 1);
     assert!(
-        requests[1].messages.iter().any(|message| {
-            message
-                .content
-                .contains("reproduced tool schemas or tool definitions")
-        }),
-        "retry request should include the schema-dump recovery instruction"
+        !observed
+            .iter()
+            .any(|event| matches!(event, AgentEvent::ProviderFailureDetected { .. }))
     );
 }
 
 #[tokio::test]
-async fn raw_tool_call_markup_no_tool_round_retries_without_raw_agent_message() {
+async fn exact_protocol_markup_final_is_accepted() {
     let provider = Arc::new(SequencedTextProvider::new(vec![
         RAW_TOOL_CALL_MARKUP_RESPONSE,
-        "done after raw tool-call recovery",
+        "unexpected retry",
     ]));
     let registry = Arc::new(ProviderRegistry::with_provider(
         "sequenced-text",
         provider.clone(),
     ));
     let manager = AgentManager::new(registry, test_tool_loop_config());
-
     let observed = start_simple_turn(
         &manager,
-        "raw_tool_markup_retry_thread",
+        "exact_protocol_markup_final_is_accepted",
         "workspace",
-        "raw_tool_markup_retry_turn",
+        "exact_format_turn",
         ThreadMode::Agent,
         "sequenced-text",
-        "hello",
+        "Выведи точный fixture без пояснений",
     )
     .await;
     assert_turn_completed(&observed);
-
-    let completed_messages = observed
+    let messages = observed
         .iter()
-        .filter_map(|event| {
-            let AgentEvent::ItemCompleted(notification) = event else {
-                return None;
-            };
-            let TurnItem::AgentMessage { text, .. } = &notification.item else {
-                return None;
-            };
-            Some(text.clone())
+        .filter_map(|event| match event {
+            AgentEvent::ItemCompleted(notification) => match &notification.item {
+                TurnItem::AgentMessage { text, .. } => Some(text.as_str()),
+                _ => None,
+            },
+            _ => None,
         })
         .collect::<Vec<_>>();
-    assert_eq!(
-        completed_messages,
-        vec!["done after raw tool-call recovery".to_owned()],
-        "raw tool-call markup must not create completed AgentMessage items"
-    );
-
-    let requests = provider.snapshot_requests();
-    assert_eq!(
-        requests.len(),
-        2,
-        "raw tool-call markup should be retried inside the same agent loop before final answer"
-    );
+    assert_eq!(messages, vec![RAW_TOOL_CALL_MARKUP_RESPONSE]);
+    assert_eq!(provider.snapshot_requests().len(), 1);
     assert!(
-        requests[1]
-            .messages
+        !observed
             .iter()
-            .any(|message| message.content.contains("raw tool-call markup")),
-        "retry request should include the raw tool-call markup recovery instruction"
+            .any(|event| matches!(event, AgentEvent::ProviderFailureDetected { .. }))
     );
 }
 
@@ -5571,90 +5539,33 @@ async fn terminal_runtime_failure_checkpoints_window_before_turn_failure() {
 }
 
 #[tokio::test]
-async fn third_consecutive_tool_schema_dump_no_tool_round_surfaces_provider_failure() {
+async fn repeated_available_schema_answers_do_not_create_false_provider_failure() {
     let provider = Arc::new(SequencedTextProvider::new(vec![
-        TOOL_SCHEMA_DUMP_RESPONSE,
-        TOOL_SCHEMA_DUMP_RESPONSE,
-        TOOL_SCHEMA_DUMP_RESPONSE,
+        TOOL_SCHEMA_DUMP_RESPONSE;
+        3
     ]));
     let registry = Arc::new(ProviderRegistry::with_provider(
         "sequenced-text",
         provider.clone(),
     ));
     let manager = AgentManager::new(registry, test_tool_loop_config());
-    let thread_id = "schema_dump_failure_thread";
-    let turn_id = "schema_dump_failure_turn";
-
-    manager
-        .ensure_thread(thread_id, "workspace")
-        .await
-        .expect("thread should be created");
-    let mut events = subscribe_agent_events(&manager, thread_id).await;
-    manager
-        .start_test_turn_with_default_profile_and_capabilities(
-            thread_id,
-            turn_id,
-            ThreadMode::Agent,
-            "test-model",
-            "sequenced-text",
-            HashMap::new(),
-            vec![UserInput::Text {
-                text: "hello".to_owned(),
-                text_elements: Vec::new(),
-            }],
-            Vec::new(),
-            Vec::new(),
-        )
-        .await
-        .expect("turn should start");
-
-    let mut completed_agent_messages = Vec::new();
-    for _ in 0..40 {
-        let event = timeout(Duration::from_secs(2), events.recv())
-            .await
-            .expect("must receive agent event in time")
-            .expect("broadcast should remain open");
-        match event {
-            AgentEvent::ItemCompleted(notification) => {
-                if let TurnItem::AgentMessage { text, .. } = notification.item {
-                    completed_agent_messages.push(text);
-                }
-            }
-            AgentEvent::ProviderFailureDetected { failure, .. } => {
-                assert_eq!(failure.class, ProviderFailureClass::Unknown);
-                assert_eq!(
-                    failure.provider_code.as_deref(),
-                    Some("tool_schema_dump_response")
-                );
-                assert!(!failure.is_recoverable_hint);
-                assert_eq!(
-                    failure.message.as_deref(),
-                    Some("model returned tool schema definitions instead of a final answer")
-                );
-                assert!(
-                    completed_agent_messages.is_empty(),
-                    "tool schema dump provider failure must not create AgentMessage items"
-                );
-                assert_eq!(
-                    provider.snapshot_requests().len(),
-                    3,
-                    "provider failure should happen on the third consecutive schema dump no-tool round"
-                );
-                return;
-            }
-            AgentEvent::TurnCompleted { .. } => {
-                panic!("tool schema dump no-tool rounds must not complete the turn")
-            }
-            AgentEvent::TurnFailed { error, .. } => {
-                panic!(
-                    "tool schema dump no-tool rounds should surface provider failure, not TurnFailed: {error}"
-                )
-            }
-            _ => {}
-        }
-    }
-
-    panic!("provider failure was not emitted for repeated tool schema dump no-tool rounds")
+    let observed = start_simple_turn(
+        &manager,
+        "schema_exact_thread",
+        "workspace",
+        "schema_exact_turn",
+        ThreadMode::Agent,
+        "sequenced-text",
+        "Generate exact JSON schema",
+    )
+    .await;
+    assert_turn_completed(&observed);
+    assert_eq!(provider.snapshot_requests().len(), 1);
+    assert!(
+        !observed
+            .iter()
+            .any(|event| matches!(event, AgentEvent::ProviderFailureDetected { .. }))
+    );
 }
 
 #[tokio::test]
@@ -17404,4 +17315,57 @@ async fn ordinary_chat_does_not_require_native_tool_model_evidence() {
             .iter()
             .all(|r| r.tools.as_deref().unwrap_or_default().is_empty())
     );
+}
+
+#[tokio::test]
+async fn applied_tool_retry_accepts_first_ordinary_final_with_optional_tools() {
+    let provider = Arc::new(SequencedToolProvider::new(
+        vec![ProviderToolCall {
+            id: "retry_invalid_read".into(),
+            name: "read_file".into(),
+            arguments: r#"{"path":42}"#.into(),
+        }],
+        TOOL_SCHEMA_DUMP_RESPONSE,
+    ));
+    let manager = AgentManager::new(
+        Arc::new(ProviderRegistry::with_provider(
+            "sequenced-tools",
+            provider.clone(),
+        )),
+        test_tool_loop_config(),
+    );
+    let events = start_simple_turn(
+        &manager,
+        "retry_final_thread",
+        "workspace",
+        "retry_final_turn",
+        ThreadMode::Agent,
+        "sequenced-tools",
+        "Explain the tool error as exact JSON schema",
+    )
+    .await;
+    assert_turn_completed(&events);
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::ItemToolRetryScheduled(_))),
+        "fixture must actually apply a retry instruction"
+    );
+    assert_eq!(
+        completed_agent_message_text(&events).as_deref(),
+        Some(TOOL_SCHEMA_DUMP_RESPONSE)
+    );
+    let requests = provider.snapshot_requests();
+    assert_eq!(
+        requests.len(),
+        2,
+        "valid optional-tool final must not be discarded for an extra provider round"
+    );
+    assert!(
+        requests[1]
+            .tools
+            .as_ref()
+            .is_some_and(|tools| !tools.is_empty())
+    );
+    assert!(requests[1].tool_choice.is_none());
 }

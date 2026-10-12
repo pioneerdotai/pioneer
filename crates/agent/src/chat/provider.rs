@@ -157,7 +157,7 @@ pub(super) async fn persist_completed_response(
 /// This acknowledged observation precedes failure/recovery and never becomes an
 /// executable assistant/tool round. Cancellation still drops this owned future.
 #[allow(clippy::too_many_arguments)]
-async fn persist_failed_provider_observation(
+pub(super) async fn persist_failed_provider_observation(
     events: &AgentEventHub,
     thread: &str,
     turn: &str,
@@ -320,6 +320,15 @@ async fn request_agent_round_observed(
 
                 if !chunk.delta.is_empty() {
                     full_text.push_str(chunk.delta.as_str());
+                    // Buffered provider text is physical attempt activity even
+                    // when no provisional final message is published yet.
+                    event_tx.publish_confirmed_activity(
+                        workspace_id.into(),
+                        thread_id.into(),
+                        turn_id.into(),
+                        thinking_item_id.into(),
+                        TurnItemType::Reasoning,
+                    );
                 }
 
                 validate_provider_tool_calls(
@@ -468,14 +477,31 @@ async fn request_agent_round_observed(
         .await?;
     }
 
-    let termination = require_round_termination(
+    let termination = match require_round_termination(
         Some(response.termination),
         response.tool_calls.as_slice(),
         FailureTarget::new(thinking_item_id, TurnItemType::Reasoning),
         provider.name(),
         model_name.as_str(),
         ProviderTransportKind::NonStream,
-    )?;
+    ) {
+        Ok(termination) => termination,
+        Err(error) => {
+            persist_failed_provider_observation(
+                event_tx,
+                thread_id,
+                turn_id,
+                thinking_item_id,
+                &response.text,
+                &reasoning,
+                &response.tool_calls,
+                response.provider_replay_state.as_ref(),
+                &error,
+            )
+            .await?;
+            return Err(error);
+        }
+    };
     lifecycle_metric.finish(pioneer_observability::NativeLifecycleOutcome::Succeeded);
     Ok(AgentRoundResponse {
         text: response.text,
@@ -499,6 +525,7 @@ async fn stream_provider_response_observed(
     provider_timeout_policy: ProviderTimeoutPolicy,
     event_tx: &AgentEventHub,
     observation: &ProviderAttemptObservation<'_>,
+    finalization: Option<&super::StandardFinalization<'_>>,
 ) -> Result<(String, Option<pioneer_provider::TokenUsage>), ChatTurnError> {
     pioneer_observability::turn_startup::dispatched(turn_id);
     let mut lifecycle_metric = NativeProviderRoundMetric::start();
@@ -746,63 +773,45 @@ async fn stream_provider_response_observed(
         .await?;
         return Err(error);
     }
-    if stream_tool_calls.is_empty() {
-        persist_completed_response(
+    if let Err(error) = require_standard_final_answer(
+        &full_text,
+        &stream_tool_calls,
+        FailureTarget::new(thinking_item_id, TurnItemType::Reasoning),
+        &provider_name,
+        &model_name,
+        ProviderTransportKind::Stream,
+    ) {
+        persist_failed_provider_observation(
             event_tx,
             thread_id,
             turn_id,
-            message_item_id,
             thinking_item_id,
             &full_text,
             &reasoning_parts,
+            &stream_tool_calls,
             provider_replay_state.as_ref(),
+            &error,
         )
         .await?;
+        return Err(error);
     }
-    for tool_call in stream_tool_calls {
-        super::emit_durable_event(
-            event_tx,
-            AgentDurableEvent::ItemStarted {
-                notification: ItemStartedNotification {
-                    workspace_id: workspace_id.to_owned(),
-                    thread_id: thread_id.to_owned(),
-                    turn_id: turn_id.to_owned(),
-                    item: super::tooling::build_started_tool_turn_item(
-                        tool_call.id.clone(),
-                        tool_call.name.clone(),
-                        tool_call.arguments.clone(),
-                        None,
-                        pioneer_protocol::TurnItemExecutionClass::Standard,
-                        None,
-                        None,
-                    ),
-                },
-            },
-        )
-        .await?;
-
-        super::emit_durable_event(
-            event_tx,
-            AgentDurableEvent::ItemCompleted {
-                notification: ItemCompletedNotification {
-                    workspace_id: workspace_id.to_owned(),
-                    thread_id: thread_id.to_owned(),
-                    turn_id: turn_id.to_owned(),
-                    item: super::tooling::build_completed_tool_turn_item(
-                        tool_call.id,
-                        tool_call.name,
-                        tool_call.arguments,
-                        None,
-                        pioneer_protocol::TurnItemExecutionClass::Standard,
-                        None,
-                        None,
-                    ),
-                },
-            },
-        )
-        .await?;
-    }
-
+    let task_revision = if let Some(gate) = finalization {
+        gate.check(workspace_id, thread_id, turn_id, &full_text, usage.as_ref())
+            .await?
+    } else {
+        None
+    };
+    persist_completed_response(
+        event_tx,
+        thread_id,
+        turn_id,
+        message_item_id,
+        thinking_item_id,
+        &full_text,
+        &reasoning_parts,
+        provider_replay_state.as_ref(),
+    )
+    .await?;
     if !message_started {
         let reasoning_text = reasoning_parts;
 
@@ -865,7 +874,7 @@ async fn stream_provider_response_observed(
                 },
             },
             generation: super::TURN_FINALIZATION_GENERATION,
-            task_finalization_revision: None,
+            task_finalization_revision: task_revision,
         },
     )
     .await?;
@@ -884,6 +893,7 @@ async fn non_stream_provider_response_observed(
     message_item_id: &str,
     event_tx: &AgentEventHub,
     observation: &ProviderAttemptObservation<'_>,
+    finalization: Option<&super::StandardFinalization<'_>>,
 ) -> Result<(String, Option<pioneer_provider::TokenUsage>), ChatTurnError> {
     pioneer_observability::turn_startup::dispatched(turn_id);
     let mut lifecycle_metric = NativeProviderRoundMetric::start();
@@ -938,27 +948,73 @@ async fn non_stream_provider_response_observed(
         ));
     }
 
-    require_round_termination(
+    if let Err(error) = require_round_termination(
         Some(response.termination.clone()),
         response.tool_calls.as_slice(),
         FailureTarget::new(thinking_item_id, TurnItemType::Reasoning),
         provider.name(),
         model_name.as_str(),
         ProviderTransportKind::NonStream,
-    )?;
-    if response.tool_calls.is_empty() {
-        persist_completed_response(
+    ) {
+        persist_failed_provider_observation(
             event_tx,
             thread_id,
             turn_id,
-            message_item_id,
             thinking_item_id,
             &response.text,
             response.reasoning_content.as_deref().unwrap_or_default(),
+            &response.tool_calls,
             response.provider_replay_state.as_ref(),
+            &error,
         )
         .await?;
+        return Err(error);
     }
+    if let Err(error) = require_standard_final_answer(
+        &response.text,
+        &response.tool_calls,
+        FailureTarget::new(thinking_item_id, TurnItemType::Reasoning),
+        provider.name(),
+        &model_name,
+        ProviderTransportKind::NonStream,
+    ) {
+        persist_failed_provider_observation(
+            event_tx,
+            thread_id,
+            turn_id,
+            thinking_item_id,
+            &response.text,
+            response.reasoning_content.as_deref().unwrap_or_default(),
+            &response.tool_calls,
+            response.provider_replay_state.as_ref(),
+            &error,
+        )
+        .await?;
+        return Err(error);
+    }
+    let task_revision = if let Some(gate) = finalization {
+        gate.check(
+            workspace_id,
+            thread_id,
+            turn_id,
+            &response.text,
+            response.usage.as_ref(),
+        )
+        .await?
+    } else {
+        None
+    };
+    persist_completed_response(
+        event_tx,
+        thread_id,
+        turn_id,
+        message_item_id,
+        thinking_item_id,
+        &response.text,
+        response.reasoning_content.as_deref().unwrap_or_default(),
+        response.provider_replay_state.as_ref(),
+    )
+    .await?;
     let reasoning_content = match &response.reasoning_content {
         Some(rc) if !rc.is_empty() => vec![rc.clone()],
         _ => Vec::new(),
@@ -1038,7 +1094,7 @@ async fn non_stream_provider_response_observed(
                 },
             },
             generation: super::TURN_FINALIZATION_GENERATION,
-            task_finalization_revision: None,
+            task_finalization_revision: task_revision,
         },
     )
     .await?;
@@ -1136,6 +1192,60 @@ fn validate_stream_append_limits(
     {
         return Err(provider_response_limit_error(
             target, provider, model, transport, error,
+        ));
+    }
+    Ok(())
+}
+
+pub(super) fn validate_standard_final_answer(
+    text: &str,
+    calls: &[ProviderToolCall],
+    item: &str,
+    provider: &str,
+    model: &str,
+    transport: ProviderTransportKind,
+) -> Result<(), ChatTurnError> {
+    require_standard_final_answer(
+        text,
+        calls,
+        FailureTarget::new(item, TurnItemType::Reasoning),
+        provider,
+        model,
+        transport,
+    )
+}
+
+fn require_standard_final_answer(
+    text: &str,
+    calls: &[ProviderToolCall],
+    target: FailureTarget<'_>,
+    provider: &str,
+    model: &str,
+    transport: ProviderTransportKind,
+) -> Result<(), ChatTurnError> {
+    let failure = if !calls.is_empty() {
+        Some((
+            ProviderFailureClass::MalformedProviderRequest,
+            "provider returned tool calls in a response path without tool execution",
+        ))
+    } else {
+        super::validator::no_tool_final_answer_rejection(text).map(|rejection| {
+            (
+                rejection.provider_failure_class(),
+                rejection.provider_message(),
+            )
+        })
+    };
+    if let Some((class, message)) = failure {
+        return Err(provider_failure_error_with_classification(
+            target.item_id,
+            target.item_type,
+            provider,
+            model,
+            transport,
+            ProviderFailureStage::Finalize,
+            message.into(),
+            Some(ProviderFailureClassification::new(class)),
         ));
     }
     Ok(())
@@ -3672,6 +3782,7 @@ pub(super) async fn stream_provider_response(
         provider_timeout_policy,
         event_tx,
         None,
+        None,
     )
     .await
 }
@@ -3687,6 +3798,7 @@ pub(super) async fn stream_provider_response_accounted(
     provider_timeout_policy: ProviderTimeoutPolicy,
     event_tx: &AgentEventHub,
     mut accounting: Option<&mut super::ChatExecutionWindowStats>,
+    finalization: Option<&super::StandardFinalization<'_>>,
 ) -> Result<(String, Option<pioneer_provider::TokenUsage>), ChatTurnError> {
     let context = pioneer_provider::ProviderAttemptContext::from_started(
         provider_timeout_policy,
@@ -3721,6 +3833,7 @@ pub(super) async fn stream_provider_response_accounted(
                 provider_timeout_policy,
                 event_tx,
                 &observation,
+                finalization,
             )
             .await
         })
@@ -3759,6 +3872,7 @@ pub(super) async fn non_stream_provider_response_with_policy(
     provider_timeout_policy: ProviderTimeoutPolicy,
     event_tx: &AgentEventHub,
     mut accounting: Option<&mut super::ChatExecutionWindowStats>,
+    finalization: Option<&super::StandardFinalization<'_>>,
 ) -> Result<(String, Option<TokenUsage>), ChatTurnError> {
     let context = pioneer_provider::ProviderAttemptContext::from_started(
         provider_timeout_policy,
@@ -3792,6 +3906,7 @@ pub(super) async fn non_stream_provider_response_with_policy(
                 message_item_id,
                 event_tx,
                 &observation,
+                finalization,
             )
             .await
         })
@@ -4020,6 +4135,7 @@ mod terminal_boundary_tests {
                 policy,
                 &hub,
                 Some(&mut stats),
+                None,
             ),
             acknowledge_round_events(&hub)
         );
@@ -4558,5 +4674,335 @@ mod native_decoder_gate_tests {
             )
             + &event(serde_json::json!({"type":"message_stop"}));
         check_gate(body, false, true).await;
+    }
+}
+
+#[cfg(test)]
+mod standard_final_gate_tests {
+    use super::*;
+    struct ResponseProvider(pioneer_provider::ChatResponse);
+    #[async_trait::async_trait]
+    impl Provider for ResponseProvider {
+        fn name(&self) -> &str {
+            "standard-final-fixture"
+        }
+        fn capabilities(&self) -> pioneer_provider::ProviderCapabilities {
+            pioneer_provider::ProviderCapabilities {
+                streaming: true,
+                ..Default::default()
+            }
+        }
+        async fn chat(&self, _: ChatRequest) -> anyhow::Result<pioneer_provider::ChatResponse> {
+            Ok(self.0.clone())
+        }
+        async fn stream_chat(
+            &self,
+            _: ChatRequest,
+        ) -> anyhow::Result<futures_util::stream::BoxStream<'static, anyhow::Result<StreamChunk>>>
+        {
+            Ok(futures_util::stream::iter(vec![
+                Ok(StreamChunk::delta(&self.0.text)),
+                Ok(StreamChunk::tool_calls(self.0.tool_calls.clone())),
+                Ok(StreamChunk::provider_replay_state(
+                    self.0.provider_replay_state.clone().unwrap(),
+                )),
+                Ok(StreamChunk::final_chunk_with(self.0.termination.clone())),
+            ])
+            .boxed())
+        }
+    }
+    struct UnresolvedTasks;
+    #[async_trait::async_trait]
+    impl crate::TaskToolProvider for UnresolvedTasks {
+        fn terminal_cleanup_runtime_contract(&self) -> &'static str {
+            "test.unresolved.v1"
+        }
+        async fn materialize_task_tools(
+            &self,
+            _: crate::TaskTurnContext,
+        ) -> Result<crate::TaskToolMaterialization, String> {
+            Ok(Default::default())
+        }
+        async fn pending_attached_tasks(
+            &self,
+            _: crate::TaskTurnContext,
+        ) -> Result<Vec<crate::PendingAttachedTask>, String> {
+            Ok(vec![crate::PendingAttachedTask {
+                task_id: "child".into(),
+                run_id: Some("run".into()),
+                title: "Child".into(),
+                status: "running".into(),
+            }])
+        }
+        async fn review_required_attached_task_observations(
+            &self,
+            _: crate::TaskTurnContext,
+        ) -> Result<Vec<crate::ReviewRequiredTaskObservation>, String> {
+            Ok(vec![])
+        }
+        async fn terminal_attached_task_observations(
+            &self,
+            _: crate::TaskTurnContext,
+        ) -> Result<Vec<crate::TerminalTaskObservation>, String> {
+            Ok(vec![])
+        }
+        async fn cleanup_attached_tasks(
+            &self,
+            _: crate::TaskTurnContext,
+            _: String,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+        async fn cleanup_attached_tasks_idempotent(
+            &self,
+            _: &str,
+            _: crate::TaskTurnContext,
+            _: String,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+    }
+    struct UnregisteredArtifact;
+    #[async_trait::async_trait]
+    impl crate::TurnFinalizationProvider for UnregisteredArtifact {
+        async fn check_turn_finalization(
+            &self,
+            _: crate::TurnFinalizationContext,
+        ) -> Result<crate::TurnFinalizationDecision, String> {
+            Ok(crate::TurnFinalizationDecision::Retry {
+                instruction: "register original artifact".into(),
+            })
+        }
+    }
+    #[tokio::test]
+    async fn both_standard_transports_gate_unresolved_tasks_and_artifacts_before_durable_final() {
+        for stream in [false, true] {
+            for task_obligation in [false, true] {
+                let provider: Arc<dyn Provider> =
+                    Arc::new(ResponseProvider(pioneer_provider::ChatResponse {
+                        text: "candidate final".into(),
+                        termination: ProviderTermination::Complete,
+                        tool_calls: vec![],
+                        usage: None,
+                        reasoning_content: None,
+                        provider_replay_state: Some(pioneer_provider::ProviderReplayState::new(
+                            "fixture",
+                            serde_json::json!({"opaque":"unchanged"}),
+                        )),
+                    }));
+                let task: Arc<dyn crate::TaskToolProvider> = Arc::new(UnresolvedTasks);
+                let artifact: Arc<dyn crate::TurnFinalizationProvider> =
+                    Arc::new(UnregisteredArtifact);
+                let gate = super::super::StandardFinalization {
+                    task: task_obligation.then_some(&task),
+                    finalization: (!task_obligation).then_some(&artifact),
+                    context: None,
+                };
+                let hub = AgentEventHub::new();
+                let mut receiver = hub.take_durable_receiver().await.unwrap();
+                let receive = async {
+                    let mut events = vec![];
+                    loop {
+                        let event = receiver.recv().await.unwrap();
+                        let done = matches!(&event, AgentDurableEvent::ItemCompleted { notification } if matches!(&notification.item,
+                            TurnItem::SystemEvent { code: Some(code), details: Some(details), .. } if code == "provider_usage" && matches!(details.get("status").and_then(serde_json::Value::as_str), Some("completed" | "failed"))));
+                        receiver.acknowledge_last(Ok(()));
+                        events.push(event);
+                        if done {
+                            break events;
+                        }
+                    }
+                };
+                let work = async {
+                    if stream {
+                        stream_provider_response_accounted(
+                            &provider,
+                            request(),
+                            "ws",
+                            "thread",
+                            "turn",
+                            "reasoning",
+                            "final",
+                            ProviderTimeoutPolicy::default(),
+                            &hub,
+                            None,
+                            Some(&gate),
+                        )
+                        .await
+                    } else {
+                        non_stream_provider_response_with_policy(
+                            &provider,
+                            request(),
+                            "ws",
+                            "thread",
+                            "turn",
+                            "reasoning",
+                            "final",
+                            ProviderTimeoutPolicy::default(),
+                            &hub,
+                            None,
+                            Some(&gate),
+                        )
+                        .await
+                    }
+                };
+                let (result, events) =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                        tokio::join!(work, receive)
+                    })
+                    .await
+                    .unwrap();
+                assert!(matches!(result, Err(ChatTurnError::Blocked(_))));
+                assert!(!events.iter().any(|event| matches!(
+                    event,
+                    AgentDurableEvent::TurnFinalizationPrepared { .. }
+                )));
+            }
+        }
+    }
+    fn request() -> ChatRequest {
+        ChatRequest {
+            model: "fixture".into(),
+            messages: vec![pioneer_provider::ChatMessage::user("Exact output")],
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            temperature: None,
+            max_tokens: None,
+            reasoning: None,
+            compiled_prompt: None,
+        }
+    }
+    #[tokio::test]
+    async fn both_transports_accept_exact_text_and_reject_empty_truncated_and_unexpected_calls_before_success()
+     {
+        for stream in [false, true] {
+            for (text, termination, calls, failure_class) in [
+                (
+                    "<tool_call><invoke name=\"read_file\"><arguments>{}</arguments></invoke></tool_call>",
+                    ProviderTermination::Complete,
+                    vec![],
+                    None,
+                ),
+                (
+                    r#"{"name":"read_file","description":"Read","parameters":{"type":"object","properties":{}}}"#,
+                    ProviderTermination::Complete,
+                    vec![],
+                    None,
+                ),
+                (
+                    "  \n",
+                    ProviderTermination::Complete,
+                    vec![],
+                    Some(ProviderFailureClass::EmptyResponse),
+                ),
+                (
+                    "partial",
+                    ProviderTermination::Length,
+                    vec![],
+                    Some(ProviderFailureClass::MaxOutputTokens),
+                ),
+                (
+                    "",
+                    ProviderTermination::ToolCalls,
+                    vec![ProviderToolCall {
+                        id: "unexecuted".into(),
+                        name: "write_file".into(),
+                        arguments: "{}".into(),
+                    }],
+                    Some(ProviderFailureClass::MalformedProviderRequest),
+                ),
+            ] {
+                let provider: Arc<dyn Provider> =
+                    Arc::new(ResponseProvider(pioneer_provider::ChatResponse {
+                        text: text.into(),
+                        termination,
+                        tool_calls: calls,
+                        usage: None,
+                        reasoning_content: None,
+                        provider_replay_state: Some(pioneer_provider::ProviderReplayState::new(
+                            "fixture",
+                            serde_json::json!({"opaque":"unchanged signature"}),
+                        )),
+                    }));
+                let hub = AgentEventHub::new();
+                let mut receiver = hub.take_durable_receiver().await.unwrap();
+                let receive = async {
+                    let mut events = vec![];
+                    loop {
+                        let event = receiver.recv().await.unwrap();
+                        let completed = matches!(&event, AgentDurableEvent::ItemCompleted { notification } if matches!(&notification.item,
+                            TurnItem::SystemEvent { code: Some(code), details: Some(details), .. } if code == "provider_usage" && matches!(details.get("status").and_then(serde_json::Value::as_str), Some("completed" | "failed"))));
+                        receiver.acknowledge_last(Ok(()));
+                        events.push(event);
+                        if completed {
+                            break events;
+                        }
+                    }
+                };
+                let work = async {
+                    if stream {
+                        stream_provider_response(
+                            &provider,
+                            request(),
+                            "ws",
+                            "thread",
+                            "turn",
+                            "reasoning",
+                            "final",
+                            ProviderTimeoutPolicy::default(),
+                            &hub,
+                        )
+                        .await
+                    } else {
+                        non_stream_provider_response_with_policy(
+                            &provider,
+                            request(),
+                            "ws",
+                            "thread",
+                            "turn",
+                            "reasoning",
+                            "final",
+                            ProviderTimeoutPolicy::default(),
+                            &hub,
+                            None,
+                            None,
+                        )
+                        .await
+                    }
+                };
+                let (result, events) =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                        tokio::join!(work, receive)
+                    })
+                    .await
+                    .unwrap();
+                let finals = events
+                    .iter()
+                    .filter_map(|event| match event {
+                        AgentDurableEvent::TurnFinalizationPrepared { notification, .. } => {
+                            match &notification.item {
+                                TurnItem::AgentMessage { text, .. } => Some(text.as_str()),
+                                _ => None,
+                            }
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                match failure_class {
+                    None => {
+                        assert_eq!(result.unwrap().0, text);
+                        assert_eq!(finals, vec![text]);
+                    }
+                    Some(class) => {
+                        assert!(
+                            matches!(result, Err(ChatTurnError::ProviderFailure { failure, .. }) if failure.class == class)
+                        );
+                        assert!(finals.is_empty());
+                    }
+                }
+                assert!(!events.iter().any(|event| matches!(event, AgentDurableEvent::ItemCompleted { notification } if matches!(notification.item, TurnItem::DynamicToolCall { .. } | TurnItem::FileChange { .. } | TurnItem::CommandExecution { .. }))), "no decorative tool success without execution");
+            }
+        }
     }
 }

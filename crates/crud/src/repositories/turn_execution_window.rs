@@ -19,11 +19,7 @@ use crate::convention::{
 pub const TURN_EXECUTION_CHECKPOINT_PAYLOAD_MAX_BYTES: usize = 128 * 1024;
 
 pub(crate) fn semantic_checkpoint_id(turn_id: &str) -> String {
-    use sha2::Digest;
-    hex::encode(sha2::Sha256::digest(
-        format!("native-semantic-v1:{turn_id}").as_bytes(),
-    ))[..DB_ID_LEN]
-        .to_owned()
+    pioneer_protocol::native_semantic_checkpoint_id(turn_id)
 }
 
 pub(crate) async fn native_event_frontier<C: ConnectionTrait>(

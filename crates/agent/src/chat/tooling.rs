@@ -984,42 +984,6 @@ pub(super) fn build_failed_tool_turn_item(
     ))
 }
 
-pub(super) fn build_completed_tool_turn_item(
-    id: String,
-    tool_name: String,
-    arguments: String,
-    recovery_policy: Option<ToolRecoveryPolicySnapshot>,
-    turn_item_execution_class: TurnItemExecutionClass,
-    output_policy: Option<ToolOutputPolicySnapshot>,
-    observation: Option<ToolObservation>,
-) -> TurnItem {
-    let output_policy = output_policy
-        .unwrap_or_else(|| ToolOutputPolicySnapshot::for_tool_name(tool_name.as_str()));
-    let summary = summary_payload(
-        format!("{tool_name} completed"),
-        Vec::new(),
-        ToolMetadata::from_json(serde_json::json!({ "state": "completed" })),
-        false,
-    );
-    let display = display_for_policy(&output_policy, summary.clone());
-    let storage = storage_for_policy(&output_policy, summary);
-    build_tool_turn_item(ProjectedToolItemInput {
-        id,
-        tool_name,
-        arguments: parse_arguments_json(arguments.as_str()),
-        status: ToolCallStatus::Completed,
-        success: Some(true),
-        outcome: None,
-        output_policy,
-        recovery_policy,
-        turn_item_execution_class,
-        display,
-        storage,
-        recovery: None,
-        observation,
-    })
-}
-
 fn display_for_policy(
     output_policy: &ToolOutputPolicySnapshot,
     summary: ToolOutputSummary,

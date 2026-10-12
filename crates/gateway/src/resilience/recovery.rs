@@ -9544,7 +9544,7 @@ mod tests {
                 "tools":{"requested_count":0,"executed_count":0,"unexecuted_count":0,"total_count":0,"succeeded_count":0,"failed_count":0,"in_progress_count":0,"detail_limit":1,"details_truncated":false},
                 "window":{"window_index":1,"agent_round_count":0,"tool_call_count":0,"progress":pioneer_protocol::ExecutionProgressSummary {
                         schema_version:1,baseline:[0;3],frontier:counts }},
-                    "native_semantic_state":{"schema_version":pioneer_protocol::NATIVE_SEMANTIC_STATE_SCHEMA_VERSION,"progress_frontier":{"schema_version":1,
+                    "native_semantic_state":{"schema_version":pioneer_protocol::NATIVE_SEMANTIC_STATE_SCHEMA_VERSION,"attached_task_wait":null,"progress_frontier":{"schema_version":1,
                         "advanced_observations":counts[0],"unchanged_observations":counts[1],"unknown_observations":counts[2]}}
                 })
             };

@@ -3322,6 +3322,11 @@ pub(super) async fn execute_chat_turn_flow(
                 tool_loop_config.provider,
                 None,
                 event_tx.clone(),
+                StandardFinalization {
+                    task: task_tool_provider.as_ref(),
+                    finalization: turn_finalization_provider.as_ref(),
+                    context: None,
+                },
             )
             .await;
 
@@ -3380,6 +3385,153 @@ async fn await_context_request<T>(
     }
 }
 
+pub(super) struct StandardFinalization<'a> {
+    task: Option<&'a Arc<dyn TaskToolProvider>>,
+    finalization: Option<&'a Arc<dyn TurnFinalizationProvider>>,
+    context: Option<(
+        &'a crate::compaction::controller::NativeContextSession,
+        crate::compaction::controller::NativeInputReceipt,
+    )>,
+}
+
+impl StandardFinalization<'_> {
+    async fn check(
+        &self,
+        workspace: &str,
+        thread: &str,
+        turn: &str,
+        text: &str,
+        usage: Option<&pioneer_provider::TokenUsage>,
+    ) -> Result<Option<String>, ChatTurnError> {
+        if let Some((session, receipt)) = &self.context {
+            session
+                .record_usage(receipt.clone(), usage)
+                .map_err(|error| {
+                    ChatTurnError::Blocked(format!("context usage unavailable: {error}"))
+                })?;
+        }
+        let mut revision = None;
+        if let Some(snapshot) =
+            attached_task_finalization_snapshot(self.task, workspace, thread, turn)
+                .await
+                .map_err(|error| {
+                    ChatTurnError::Blocked(format!("task finalization unavailable: {error}"))
+                })?
+        {
+            revision = Some(snapshot.revision.clone());
+            if !snapshot.pending.is_empty() || !snapshot.review_required.is_empty() {
+                return Err(ChatTurnError::Blocked(
+                    "attached task obligations remain unresolved".into(),
+                ));
+            }
+        }
+        if let Some(provider) = self.finalization {
+            match provider
+                .check_turn_finalization(TurnFinalizationContext {
+                    workspace_id: workspace.into(),
+                    thread_id: thread.into(),
+                    turn_id: turn.into(),
+                    final_text: text.into(),
+                })
+                .await
+                .map_err(|error| {
+                    ChatTurnError::Blocked(format!("turn finalization unavailable: {error}"))
+                })? {
+                TurnFinalizationDecision::Allow => {}
+                TurnFinalizationDecision::Retry { .. } => {
+                    return Err(ChatTurnError::Blocked(
+                        "finalization requires work unavailable in the tool-less response path"
+                            .into(),
+                    ));
+                }
+                TurnFinalizationDecision::Fail { message } => {
+                    return Err(ChatTurnError::Terminal(message));
+                }
+            }
+        }
+        Ok(revision)
+    }
+}
+
+async fn publish_standard_final_response(
+    hub: &AgentEventHub,
+    workspace: &str,
+    thread: &str,
+    turn: &str,
+    thinking: &str,
+    message: &str,
+    round: &AgentRoundResponse,
+    revision: Option<String>,
+) -> Result<(), ChatTurnError> {
+    provider::persist_completed_response(
+        hub,
+        thread,
+        turn,
+        message,
+        thinking,
+        &round.text,
+        &round.reasoning,
+        round.provider_replay_state.as_ref(),
+    )
+    .await?;
+    send_reasoning_completed(workspace, thread, turn, thinking, &round.reasoning, hub).await?;
+    emit_durable_event(
+        hub,
+        AgentDurableEvent::ItemStarted {
+            notification: ItemStartedNotification {
+                workspace_id: workspace.into(),
+                thread_id: thread.into(),
+                turn_id: turn.into(),
+                item: TurnItem::AgentMessage {
+                    id: message.into(),
+                    text: String::new(),
+                    phase: Default::default(),
+                    markdown: None,
+                    markdown_version: None,
+                },
+            },
+        },
+    )
+    .await?;
+    emit_progress_event(
+        hub,
+        AgentProgressEvent::ItemDelta {
+            notification: ItemDeltaNotification {
+                workspace_id: workspace.into(),
+                thread_id: thread.into(),
+                turn_id: turn.into(),
+                item_id: message.into(),
+                delta: round.text.clone(),
+                stream: Some(pioneer_protocol::ItemDeltaStream::AgentMessage),
+                payload: None,
+                markdown: None,
+                markdown_version: None,
+            },
+        },
+    )
+    .await?;
+    emit_durable_event(
+        hub,
+        AgentDurableEvent::TurnFinalizationPrepared {
+            notification: ItemCompletedNotification {
+                workspace_id: workspace.into(),
+                thread_id: thread.into(),
+                turn_id: turn.into(),
+                item: TurnItem::AgentMessage {
+                    id: message.into(),
+                    text: round.text.clone(),
+                    phase: Default::default(),
+                    markdown: None,
+                    markdown_version: None,
+                },
+            },
+            generation: TURN_FINALIZATION_GENERATION,
+            task_finalization_revision: revision,
+        },
+    )
+    .await
+}
+
 async fn execute_standard_provider_response(
     context_session: Option<&crate::compaction::controller::NativeContextSession>,
     provider: &Arc<dyn Provider>,
@@ -3398,6 +3550,7 @@ async fn execute_standard_provider_response(
     provider_timeout_policy: ProviderTimeoutPolicy,
     accounting: Option<&mut ChatExecutionWindowStats>,
     event_tx: Arc<AgentEventHub>,
+    finalization: StandardFinalization<'_>,
 ) -> Result<String, ChatTurnError> {
     let mut messages = history;
 
@@ -3428,6 +3581,10 @@ async fn execute_standard_provider_response(
     } else {
         (request, None)
     };
+    let finalization = StandardFinalization {
+        context: context_session.zip(receipt),
+        ..finalization
+    };
     let work = async {
         if provider.capabilities().streaming && !force_non_stream {
             provider::stream_provider_response_accounted(
@@ -3441,6 +3598,7 @@ async fn execute_standard_provider_response(
                 provider_timeout_policy,
                 event_tx.as_ref(),
                 accounting,
+                Some(&finalization),
             )
             .await
         } else {
@@ -3455,16 +3613,12 @@ async fn execute_standard_provider_response(
                 provider_timeout_policy,
                 event_tx.as_ref(),
                 accounting,
+                Some(&finalization),
             )
             .await
         }
     };
-    let (text, usage) = await_context_request(context_session, work).await?;
-    if let (Some(session), Some(receipt)) = (context_session, receipt) {
-        session
-            .record_usage(receipt, usage.as_ref())
-            .map_err(|e| ChatTurnError::Blocked(format!("context usage unavailable: {e}")))?;
-    }
+    let (text, _) = await_context_request(context_session, work).await?;
     Ok(text)
 }
 
@@ -3565,41 +3719,59 @@ async fn review_required_attached_task_observation(
         }
     };
 
-    let mut observations = observations
-        .into_iter()
-        .take(MAX_REVIEW_REQUIRED_TASK_OBSERVATIONS)
-        .collect::<Vec<_>>();
-    if observations.is_empty() {
-        return None;
-    }
-    observations.sort_by(|left, right| {
-        left.task_id
-            .cmp(&right.task_id)
-            .then_with(|| left.run_id.cmp(&right.run_id))
-            .then_with(|| left.candidate_id.cmp(&right.candidate_id))
-    });
-
-    let signatures = observations
-        .iter()
-        .map(review_required_observation_signature)
-        .collect::<Vec<_>>();
-    let payload = observations
-        .iter()
-        .map(review_required_observation_payload)
-        .collect::<Vec<_>>();
-    let details = json!({
-        "taskIds": observations.iter().map(|observation| observation.task_id.clone()).collect::<Vec<_>>(),
-        "observations": payload,
-    });
-
-    Some(RenderedReviewRequiredObservation {
-        signatures,
-        observations,
-        details,
-    })
+    render_review_required_snapshot(&observations, &BTreeSet::new())
 }
 
 fn review_required_observation_signature(observation: &ReviewRequiredTaskObservation) -> String {
+    use sha2::Digest;
+    // Exact bytes presented in the control, including candidate identity/revision.
+    hex::encode(sha2::Sha256::digest(
+        review_required_observation_payload(observation)
+            .to_string()
+            .as_bytes(),
+    ))
+}
+
+fn retain_current_review_delivery(
+    observations: &[ReviewRequiredTaskObservation],
+    delivered: &mut BTreeSet<String>,
+) -> Result<(), ChatTurnError> {
+    if observations.iter().any(|record| {
+        record.candidate_revision.len() != 64
+            || !record
+                .candidate_revision
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+    }) {
+        return Err(ChatTurnError::Blocked(
+            "authoritative review candidate revision unavailable".into(),
+        ));
+    }
+    let current = observations
+        .iter()
+        .map(review_required_observation_signature)
+        .collect::<BTreeSet<_>>();
+    if current.len() > 256 {
+        return Err(ChatTurnError::Blocked(
+            "active review delivery cursor exceeds its accepted bound".into(),
+        ));
+    }
+    let retained = observations
+        .iter()
+        .filter_map(|record| {
+            let signature = review_required_observation_signature(record);
+            (delivered.contains(&signature)
+                || delivered.contains(&legacy_review_required_observation_signature(record)))
+            .then_some(signature)
+        })
+        .collect();
+    *delivered = retained;
+    Ok(())
+}
+
+fn legacy_review_required_observation_signature(
+    observation: &ReviewRequiredTaskObservation,
+) -> String {
     format!(
         "{}:{}:{}:{}:{}:{}:{}:{}",
         observation.task_id,
@@ -3618,6 +3790,7 @@ fn review_required_observation_payload(observation: &ReviewRequiredTaskObservati
         "taskId": observation.task_id,
         "runId": observation.run_id,
         "candidateId": observation.candidate_id,
+        "candidateRevision": observation.candidate_revision,
         "title": observation.title,
         "status": observation.status,
         "candidateStatus": observation.candidate_status,
@@ -3684,11 +3857,131 @@ async fn wait_for_attached_task_finalization_snapshot(
         .map(Some)
 }
 
+fn attached_wait_owner(generation: Option<u64>) -> Result<u64, ChatTurnError> {
+    generation.filter(|value| *value > 0).ok_or_else(|| {
+        ChatTurnError::Blocked("durable attached task wait owner unavailable".into())
+    })
+}
+
+fn attached_task_semantic_revision(
+    snapshot: &TaskFinalizationSnapshot,
+) -> Result<[u8; 32], ChatTurnError> {
+    use sha2::Digest;
+    if snapshot
+        .pending
+        .len()
+        .saturating_add(snapshot.review_required.len())
+        .saturating_add(snapshot.terminal.len())
+        > 256
+    {
+        return Err(ChatTurnError::Blocked(
+            "attached task waiting snapshot exceeds bounded checkpoint contract".into(),
+        ));
+    }
+    let mut records = snapshot
+        .pending
+        .iter()
+        .map(|task| {
+            (
+                "pending",
+                task.task_id.as_str(),
+                task.run_id.as_deref().unwrap_or(""),
+                task.status.as_str(),
+            )
+        })
+        .chain(snapshot.terminal.iter().map(|task| {
+            (
+                "terminal",
+                task.task_id.as_str(),
+                task.run_id.as_deref().unwrap_or(""),
+                task.status.as_str(),
+            )
+        }))
+        .collect::<Vec<_>>();
+    records.sort_unstable();
+    let mut hash = sha2::Sha256::new();
+    for record in records {
+        for field in [record.0, record.1, record.2, record.3] {
+            hash.update((field.len() as u64).to_le_bytes());
+            hash.update(field.as_bytes());
+        }
+    }
+    let reviews = snapshot
+        .review_required
+        .iter()
+        .map(review_required_observation_signature)
+        .collect::<BTreeSet<_>>();
+    for review in reviews {
+        hash.update(review.as_bytes());
+    }
+    Ok(hash.finalize().into())
+}
+
+async fn await_attached_task_change(
+    provider: Option<&Arc<dyn TaskToolProvider>>,
+    wait: &pioneer_protocol::NativeAttachedTaskWait,
+    workspace: &str,
+    thread: &str,
+    turn: &str,
+    control: &TurnExecutionControl,
+    hub: &AgentEventHub,
+) -> Result<TaskFinalizationSnapshot, ChatTurnError> {
+    let provider = provider
+        .ok_or_else(|| ChatTurnError::Blocked("attached task wait owner unavailable".into()))?;
+    let context = TaskTurnContext {
+        workspace_id: workspace.into(),
+        thread_id: thread.into(),
+        turn_id: turn.into(),
+    };
+    let cancellation = control.cancellation_token();
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(5));
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut failures = 0u8;
+    loop {
+        let observation = provider.wait_for_attached_task_finalization_snapshot(
+            context.clone(),
+            ATTACHED_TASK_FINALIZATION_WAIT_MS,
+        );
+        tokio::pin!(observation);
+        let result = loop {
+            tokio::select! { biased;
+                _ = cancellation.cancelled() => return Err(ChatTurnError::Blocked("attached task wait cancelled".into())),
+                _ = heartbeat.tick() => hub.publish_heartbeat(workspace.into(), thread.into(), turn.into(), wait.item_id.clone(), TurnItemType::Reasoning),
+                result = &mut observation => break result,
+            }
+        };
+        let snapshot = match result {
+            Ok(snapshot) => {
+                failures = 0;
+                snapshot
+            }
+            Err(error) => {
+                failures += 1;
+                if failures >= 3 {
+                    return Err(ChatTurnError::Blocked(format!(
+                        "attached task wait unavailable: {error}"
+                    )));
+                }
+                tokio::select! { biased; _ = cancellation.cancelled() => return Err(ChatTurnError::Blocked("attached task wait cancelled".into())), _ = tokio::time::sleep(Duration::from_millis(100)) => {} }
+                continue;
+            }
+        };
+        if attached_task_semantic_revision(&snapshot)? != wait.baseline {
+            return Ok(snapshot);
+        }
+        // A no-change bounded timeout stays in this owned host wait, without a provider round.
+    }
+}
+
 fn render_review_required_snapshot(
     observations: &[ReviewRequiredTaskObservation],
+    delivered: &BTreeSet<String>,
 ) -> Option<RenderedReviewRequiredObservation> {
-    let mut observations = observations.to_vec();
-    observations.truncate(MAX_REVIEW_REQUIRED_TASK_OBSERVATIONS);
+    let mut observations = observations
+        .iter()
+        .filter(|record| !delivered.contains(&review_required_observation_signature(record)))
+        .cloned()
+        .collect::<Vec<_>>();
     if observations.is_empty() {
         return None;
     }
@@ -3698,6 +3991,7 @@ fn render_review_required_snapshot(
             .then_with(|| left.run_id.cmp(&right.run_id))
             .then_with(|| left.candidate_id.cmp(&right.candidate_id))
     });
+    observations.truncate(MAX_REVIEW_REQUIRED_TASK_OBSERVATIONS);
     let signatures = observations
         .iter()
         .map(review_required_observation_signature)
@@ -5518,6 +5812,13 @@ async fn execute_agent_provider_response(
             return Ok(ChatTurnOutcome::NeedsContinuation(continuation));
         }
 
+        let mut standard_thinking_id = initial_thinking_item_id.clone();
+        if let Some(wait) = semantic.attached_task_wait.as_mut() {
+            wait.item_id = standard_thinking_id.clone();
+            wait.owner_generation =
+                attached_wait_owner(initial_preparation.execution_owner_generation())?;
+            wait.runtime_generation = runtime_generation;
+        }
         semantic.checkpoint_revision = semantic
             .checkpoint_revision
             .checked_add(1)
@@ -5539,27 +5840,301 @@ async fn execute_agent_provider_response(
             runtime_generation,
         )
         .await?;
-        let result = execute_standard_provider_response(
-            context_session,
-            provider,
-            model,
-            history,
-            user_message.clone(),
-            reasoning,
-            Some(compiled_prompt_payload_from_delivery_plan(
-                &initial_instruction_plan,
-            )),
-            false,
-            force_non_stream,
-            workspace_id,
-            thread_id,
-            turn_id,
-            initial_thinking_item_id.as_str(),
-            message_item_id,
-            tool_loop_config.provider,
-            Some(&mut window_stats),
-            event_tx.clone(),
-        )
+        let result: Result<String, ChatTurnError> = async {
+            if let Some(wait) = &semantic.attached_task_wait {
+                await_attached_task_change(
+                    task_tool_provider.as_ref(),
+                    wait,
+                    workspace_id,
+                    thread_id,
+                    turn_id,
+                    &turn_control,
+                    event_tx.as_ref(),
+                )
+                .await?;
+                send_reasoning_completed(
+                    workspace_id,
+                    thread_id,
+                    turn_id,
+                    &standard_thinking_id,
+                    "",
+                    event_tx.as_ref(),
+                )
+                .await?;
+                standard_thinking_id =
+                    start_reasoning_item(workspace_id, thread_id, turn_id, event_tx.as_ref())
+                        .await?;
+                semantic.attached_task_wait = None;
+                semantic.checkpoint_revision = semantic
+                    .checkpoint_revision
+                    .checked_add(1)
+                    .ok_or_else(|| ChatTurnError::Blocked("semantic revision exhausted".into()))?;
+                persist_native_semantic_checkpoint(
+                    event_tx.as_ref(),
+                    workspace_id,
+                    thread_id,
+                    turn_id,
+                    input,
+                    &post_turn_model,
+                    &post_turn_model_provider,
+                    &window_stats,
+                    Default::default(),
+                    &requested_tool_names,
+                    semantic.to_value()?,
+                    None,
+                    initial_preparation.execution_owner_generation(),
+                    runtime_generation,
+                )
+                .await?;
+            }
+            let restored_roots = if semantic.provider_history_roots.is_empty() {
+                Vec::new()
+            } else {
+                let session = context_session.ok_or_else(|| {
+                    ChatTurnError::Blocked("native history root owner unavailable".into())
+                })?;
+                session
+                    .load_native_history_roots(&semantic.provider_history_roots)
+                    .await
+                    .map_err(|_| {
+                        ChatTurnError::Blocked("native history roots unavailable".into())
+                    })?
+            };
+            let mut messages = history;
+            messages.push(user_message.clone());
+            let mut continuation_provider_history = retained_provider_history;
+            if !restored_roots.is_empty() {
+                continuation_provider_history.retain(|entry| {
+                    !entry.message.provenance.as_ref().is_some_and(|origin| {
+                        origin
+                            .sources
+                            .iter()
+                            .any(|source| source.scope.starts_with("checkpoint:"))
+                    })
+                });
+                continuation_provider_history.extend(restored_roots.into_iter().enumerate().map(
+                    |(index, message)| RetainedProviderHistoryMessage {
+                        sequence: i64::MIN + index as i64,
+                        message,
+                    },
+                ));
+            }
+            append_recovered_provider_history(&mut messages, continuation_provider_history);
+            let request = ChatRequest {
+                model: model.clone(),
+                messages,
+                temperature: Some(0.7),
+                max_tokens: None,
+                tools: None,
+                tool_choice: None,
+                parallel_tool_calls: None,
+                reasoning,
+                compiled_prompt: Some(compiled_prompt_payload_from_delivery_plan(
+                    &initial_instruction_plan,
+                )),
+            };
+            let (request, receipt) = if let Some(session) = context_session {
+                let prepared = session.prepare(request, false).await.map_err(|error| {
+                    ChatTurnError::Blocked(format!("context preparation failed: {error}"))
+                })?;
+                semantic.provider_history_roots =
+                    semantic_state::history_roots_from_request(&prepared.request.messages)?;
+                (prepared.request, Some(prepared.receipt))
+            } else {
+                (request, None)
+            };
+            semantic.checkpoint_revision = semantic
+                .checkpoint_revision
+                .checked_add(1)
+                .ok_or_else(|| ChatTurnError::Blocked("semantic revision exhausted".into()))?;
+            persist_native_semantic_checkpoint(
+                event_tx.as_ref(),
+                workspace_id,
+                thread_id,
+                turn_id,
+                input,
+                &post_turn_model,
+                &post_turn_model_provider,
+                &window_stats,
+                Default::default(),
+                &requested_tool_names,
+                semantic.to_value()?,
+                None,
+                initial_preparation.execution_owner_generation(),
+                runtime_generation,
+            )
+            .await?;
+            let round = await_context_request(
+                context_session,
+                provider::request_agent_round_accounted(
+                    provider,
+                    request,
+                    workspace_id,
+                    thread_id,
+                    turn_id,
+                    &standard_thinking_id,
+                    force_non_stream,
+                    tool_loop_config.provider,
+                    event_tx.as_ref(),
+                    Some(&mut window_stats),
+                ),
+            )
+            .await?;
+            if let (Some(session), Some(receipt)) = (context_session, receipt) {
+                session
+                    .record_usage(receipt, round.usage.as_ref())
+                    .map_err(|error| {
+                        ChatTurnError::Blocked(format!("context usage unavailable: {error}"))
+                    })?;
+            }
+            if let Err(error) = provider::validate_standard_final_answer(
+                &round.text,
+                &round.tool_calls,
+                &standard_thinking_id,
+                provider.name(),
+                &model,
+                if provider.capabilities().streaming && !force_non_stream {
+                    ProviderTransportKind::Stream
+                } else {
+                    ProviderTransportKind::NonStream
+                },
+            ) {
+                provider::persist_failed_provider_observation(
+                    event_tx.as_ref(),
+                    thread_id,
+                    turn_id,
+                    &standard_thinking_id,
+                    &round.text,
+                    &round.reasoning,
+                    &round.tool_calls,
+                    round.provider_replay_state.as_ref(),
+                    &error,
+                )
+                .await?;
+                return Err(error);
+            }
+            loop {
+                let snapshot = attached_task_finalization_snapshot(
+                    task_tool_provider.as_ref(),
+                    workspace_id,
+                    thread_id,
+                    turn_id,
+                )
+                .await
+                .map_err(|error| {
+                    ChatTurnError::Blocked(format!("task finalization unavailable: {error}"))
+                })?;
+                let Some(snapshot) = snapshot.filter(|snapshot| !snapshot.pending.is_empty())
+                else {
+                    break;
+                };
+                if !snapshot.review_required.is_empty() {
+                    return Err(ChatTurnError::Blocked(
+                        review_required_final_answer_block_message(),
+                    ));
+                }
+                semantic.attached_task_wait = Some(pioneer_protocol::NativeAttachedTaskWait {
+                    schema_version: 1,
+                    baseline: attached_task_semantic_revision(&snapshot)?,
+                    item_id: standard_thinking_id.clone(),
+                    checkpoint_id: pioneer_protocol::native_semantic_checkpoint_id(turn_id),
+                    owner_generation: attached_wait_owner(
+                        initial_preparation.execution_owner_generation(),
+                    )?,
+                    runtime_generation,
+                });
+                semantic.checkpoint_revision = semantic
+                    .checkpoint_revision
+                    .checked_add(1)
+                    .ok_or_else(|| ChatTurnError::Blocked("semantic revision exhausted".into()))?;
+                persist_native_semantic_checkpoint(
+                    event_tx.as_ref(),
+                    workspace_id,
+                    thread_id,
+                    turn_id,
+                    input,
+                    &post_turn_model,
+                    &post_turn_model_provider,
+                    &window_stats,
+                    Default::default(),
+                    &requested_tool_names,
+                    semantic.to_value()?,
+                    None,
+                    initial_preparation.execution_owner_generation(),
+                    runtime_generation,
+                )
+                .await?;
+                await_attached_task_change(
+                    task_tool_provider.as_ref(),
+                    semantic.attached_task_wait.as_ref().unwrap(),
+                    workspace_id,
+                    thread_id,
+                    turn_id,
+                    &turn_control,
+                    event_tx.as_ref(),
+                )
+                .await?;
+                send_reasoning_completed(
+                    workspace_id,
+                    thread_id,
+                    turn_id,
+                    &standard_thinking_id,
+                    &round.reasoning,
+                    event_tx.as_ref(),
+                )
+                .await?;
+                standard_thinking_id =
+                    start_reasoning_item(workspace_id, thread_id, turn_id, event_tx.as_ref())
+                        .await?;
+                semantic.attached_task_wait = None;
+                semantic.checkpoint_revision = semantic
+                    .checkpoint_revision
+                    .checked_add(1)
+                    .ok_or_else(|| ChatTurnError::Blocked("semantic revision exhausted".into()))?;
+                persist_native_semantic_checkpoint(
+                    event_tx.as_ref(),
+                    workspace_id,
+                    thread_id,
+                    turn_id,
+                    input,
+                    &post_turn_model,
+                    &post_turn_model_provider,
+                    &window_stats,
+                    Default::default(),
+                    &requested_tool_names,
+                    semantic.to_value()?,
+                    None,
+                    initial_preparation.execution_owner_generation(),
+                    runtime_generation,
+                )
+                .await?;
+            }
+            let revision = StandardFinalization {
+                task: task_tool_provider.as_ref(),
+                finalization: turn_finalization_provider.as_ref(),
+                context: None,
+            }
+            .check(
+                workspace_id,
+                thread_id,
+                turn_id,
+                &round.text,
+                round.usage.as_ref(),
+            )
+            .await?;
+            publish_standard_final_response(
+                event_tx.as_ref(),
+                workspace_id,
+                thread_id,
+                turn_id,
+                &standard_thinking_id,
+                message_item_id,
+                &round,
+                revision,
+            )
+            .await?;
+            Ok(round.text)
+        }
         .await;
 
         match result {
@@ -5766,6 +6341,7 @@ async fn execute_agent_provider_response(
     append_recovered_provider_history(&mut messages, continuation_provider_history.clone());
 
     let mut semantic_checkpoint_revision = semantic.checkpoint_revision;
+    let mut attached_task_wait = semantic.attached_task_wait;
     let mut pending_retry_instruction = semantic.pending_retry_instruction;
     let mut applied_retry_instruction = semantic.applied_retry_instruction;
     let mut observed_review_required_signatures = semantic.observed_review_required_signatures;
@@ -5828,6 +6404,7 @@ async fn execute_agent_provider_response(
                     })?;
                 semantic_state::capture(
                     semantic_checkpoint_revision,
+                    &attached_task_wait,
                     turn_id,
                     &tool_loop_config.retry,
                     &native_controls.state,
@@ -5881,6 +6458,11 @@ async fn execute_agent_provider_response(
         let mut task_gate_query_failures = 0usize;
 
         loop {
+            if let Some(wait) = attached_task_wait.as_mut() {
+                wait.item_id = current_thinking_id.clone();
+                wait.owner_generation = attached_wait_owner(initial_preparation.execution_owner_generation()).map_err(|error| (error, current_thinking_id.clone()))?;
+                wait.runtime_generation = runtime_generation;
+            }
             persist_native_semantic_checkpoint(
                 event_tx.as_ref(), workspace_id, thread_id, turn_id, input,
                 &post_turn_model, &post_turn_model_provider, &window_stats,
@@ -5890,6 +6472,20 @@ async fn execute_agent_provider_response(
             ).await.map_err(|e| (e, current_thinking_id.clone()))?;
             retain_agent_attachment_messages(&mut messages);
 
+            if let Some(wait) = &attached_task_wait {
+                await_attached_task_change(task_tool_provider.as_ref(), wait, workspace_id, thread_id, turn_id, &turn_control, event_tx.as_ref())
+                    .await.map_err(|error| (error, current_thinking_id.clone()))?;
+                send_reasoning_completed(workspace_id, thread_id, turn_id, &current_thinking_id, "", event_tx.as_ref())
+                    .await.map_err(|error| (error, current_thinking_id.clone()))?;
+                current_thinking_id = start_reasoning_item(workspace_id, thread_id, turn_id, event_tx.as_ref())
+                    .await.map_err(|error| (error, current_thinking_id.clone()))?;
+                attached_task_wait = None;
+                persist_native_semantic_checkpoint(event_tx.as_ref(), workspace_id, thread_id, turn_id, input,
+                    &post_turn_model, &post_turn_model_provider, &window_stats, tool_no_progress_guard.checkpoint_state(),
+                    &requested_tool_names, capture_semantic_state!().map_err(|error| (error, current_thinking_id.clone()))?,
+                    None, initial_preparation.execution_owner_generation(), runtime_generation)
+                    .await.map_err(|error| (error, current_thinking_id.clone()))?;
+            }
             let task_gate_snapshot = match attached_task_finalization_snapshot(
                 task_tool_provider.as_ref(),
                 workspace_id,
@@ -5936,14 +6532,15 @@ async fn execute_agent_provider_response(
                 }
             };
 
+            if let Some(snapshot) = &task_gate_snapshot {
+                retain_current_review_delivery(&snapshot.review_required, &mut observed_review_required_signatures)
+                    .map_err(|error| (error, current_thinking_id.clone()))?;
+                sync_review_action_tools_to_observations(&mut visible_tool_names, &snapshot.review_required);
+            }
             let review_observation = task_gate_snapshot
                 .as_ref()
-                .and_then(|snapshot| render_review_required_snapshot(snapshot.review_required.as_slice()));
+                .and_then(|snapshot| render_review_required_snapshot(snapshot.review_required.as_slice(), &observed_review_required_signatures));
             if let Some(observation) = review_observation {
-                sync_review_action_tools_to_observations(
-                    &mut visible_tool_names,
-                    observation.observations.as_slice(),
-                );
                 let has_new_signature = observation
                     .signatures
                     .iter()
@@ -5958,8 +6555,6 @@ async fn execute_agent_provider_response(
                     persist_control!(current_thinking_id, pioneer_protocol::NativeHostDirective::ReviewTaskResults,
                         Some((pioneer_protocol::NativeControlOrigin::TaskService, observation.details)));
                 }
-            } else {
-                sync_review_action_tools_to_observations(&mut visible_tool_names, &[]);
             }
 
             if let Some(observation) = task_gate_snapshot.as_ref().and_then(|snapshot| {
@@ -6149,7 +6744,7 @@ async fn execute_agent_provider_response(
                 ))?;
             }
 
-            applied_retry_instruction = pending_retry_instruction.clone();
+            applied_retry_instruction = pending_retry_instruction.take();
             native_controls.mark_applied(&control_projection);
             persist_native_semantic_checkpoint(
                 event_tx.as_ref(), workspace_id, thread_id, turn_id, input,
@@ -6422,11 +7017,6 @@ async fn execute_agent_provider_response(
             }
 
             if round.tool_calls.is_empty() {
-                if round_plan.tools_enabled && pending_retry_instruction.take().is_some() {
-                    consecutive_rejected_no_tool_rounds = 0;
-                    continue;
-                }
-
                 // The snapshot used to render observations at the start of
                 // the round is not sufficient as a terminal gate: a child
                 // can transition while the provider is generating its final
@@ -6480,9 +7070,13 @@ async fn execute_agent_provider_response(
                     }
                 };
 
+                if let Some(snapshot) = &final_task_gate_snapshot {
+                    retain_current_review_delivery(&snapshot.review_required, &mut observed_review_required_signatures)
+                        .map_err(|error| (error, current_thinking_id.clone()))?;
+                }
                 if let Some(observation) = final_task_gate_snapshot
                     .as_ref()
-                    .and_then(|snapshot| render_review_required_snapshot(snapshot.review_required.as_slice()))
+                    .and_then(|snapshot| render_review_required_snapshot(snapshot.review_required.as_slice(), &observed_review_required_signatures))
                 {
                     let has_new_signature = observation
                         .signatures
@@ -6498,7 +7092,7 @@ async fn execute_agent_provider_response(
                     observed_review_required_signatures.extend(observation.signatures.clone());
                     sync_review_action_tools_to_observations(
                         &mut visible_tool_names,
-                        observation.observations.as_slice(),
+                        &final_task_gate_snapshot.as_ref().unwrap().review_required,
                     );
                     apply_review_required_tools_to_visible_tools(
                         &mut visible_tool_names,
@@ -6525,26 +7119,17 @@ async fn execute_agent_provider_response(
                     continue;
                 }
 
-                if let Some(observation) = final_task_gate_snapshot
-                    .as_ref()
-                    .and_then(|snapshot| render_pending_snapshot(snapshot.pending.as_slice()))
-                {
-                    send_reasoning_completed(
-                        workspace_id,
-                        thread_id,
-                        turn_id,
-                        current_thinking_id.as_str(),
-                        round.reasoning.as_str(),
-                        event_tx.as_ref(),
-                    )
-                    .await
-                    .map_err(|error| (error, current_thinking_id.clone()))?;
+                if final_task_gate_snapshot.as_ref().is_some_and(|snapshot| !snapshot.review_required.is_empty()) {
+                    return Err((ChatTurnError::Blocked(review_required_final_answer_block_message()), current_thinking_id.clone()));
+                }
+
+                if let Some(snapshot) = final_task_gate_snapshot.as_ref().filter(|snapshot| !snapshot.pending.is_empty()) {
+                    attached_task_wait = Some(pioneer_protocol::NativeAttachedTaskWait {
+                        schema_version: 1, checkpoint_id: pioneer_protocol::native_semantic_checkpoint_id(turn_id), baseline: attached_task_semantic_revision(snapshot).map_err(|error| (error, current_thinking_id.clone()))?,
+                        item_id: current_thinking_id.clone(), owner_generation: attached_wait_owner(initial_preparation.execution_owner_generation()).map_err(|error| (error, current_thinking_id.clone()))?, runtime_generation,
+                    });
                     persist_control!(current_thinking_id, pioneer_protocol::NativeHostDirective::AwaitAttachedTasks,
-                        Some((pioneer_protocol::NativeControlOrigin::TaskService, observation)));
-                    current_thinking_id =
-                        start_reasoning_item(workspace_id, thread_id, turn_id, event_tx.as_ref())
-                            .await
-                            .map_err(|error| (error, current_thinking_id.clone()))?;
+                        Some((pioneer_protocol::NativeControlOrigin::TaskService, render_pending_snapshot(&snapshot.pending).unwrap())));
                     consecutive_rejected_no_tool_rounds = 0;
                     continue;
                 }
@@ -8020,6 +8605,9 @@ fn retain_chat_mode_attachment_messages(messages: &mut [ChatMessage]) {
 }
 
 #[cfg(test)]
+mod final_acceptance_tests;
+
+#[cfg(test)]
 mod tests {
     use super::{
         ChatExecutionWindowStats, ExecutedToolResult, TURN_ITEM_ID_LEN,
@@ -8636,7 +9224,7 @@ mod tests {
         assert!(!lowered.contains("if-match"));
     }
 
-    fn execution_checkpoint_context_fixture() -> ExecutionCheckpointContext {
+    pub(super) fn execution_checkpoint_context_fixture() -> ExecutionCheckpointContext {
         ExecutionCheckpointContext {
             window_id: "turn_1:window:1".to_owned(),
             window_index: 1,
@@ -8833,6 +9421,7 @@ mod tests {
             task_id: "task_review_payload".to_owned(),
             run_id: "run_review_payload".to_owned(),
             candidate_id: "candidate_review_payload".to_owned(),
+            candidate_revision: "a".repeat(64),
             title: "Review payload".to_owned(),
             status: "waiting_review".to_owned(),
             candidate_status: "pending_review".to_owned(),
@@ -8895,10 +9484,17 @@ mod tests {
         );
 
         let signature = review_required_observation_signature(&observation);
-        assert!(signature.contains("task_review_payload"));
-        assert!(signature.contains("candidate_review_payload"));
-        assert!(signature.contains("task_accept,task_cancel"));
-        assert!(signature.contains("max_revision_rounds_reached"));
+        assert_eq!(signature.len(), 64);
+        assert_eq!(
+            signature,
+            review_required_observation_signature(&observation)
+        );
+        let mut revised = observation.clone();
+        revised.candidate_id = "different_candidate".into();
+        assert_ne!(signature, review_required_observation_signature(&revised));
+        revised = observation.clone();
+        revised.allowed_actions.push("task_revise".into());
+        assert_ne!(signature, review_required_observation_signature(&revised));
     }
 
     fn test_skill_id(seed: &str) -> pioneer_protocol::SkillId {
@@ -9629,6 +10225,7 @@ mod tests {
             task_id: "task_review_visibility".to_owned(),
             run_id: "run_review_visibility".to_owned(),
             candidate_id: "candidate_review_visibility".to_owned(),
+            candidate_revision: "a".repeat(64),
             title: "Review visibility".to_owned(),
             status: "waiting_review".to_owned(),
             candidate_status: "pending_review".to_owned(),
@@ -10570,6 +11167,7 @@ mod tests {
         context.payload.native_semantic_state = Some(
             super::semantic_state::capture(
                 1,
+                &None,
                 "turn_1",
                 &budget,
                 &super::native_control::NativeControlState::default(),
@@ -10813,6 +11411,7 @@ mod tests {
         assert!(
             super::semantic_state::capture(
                 1,
+                &None,
                 "turn_1",
                 &budget,
                 &super::native_control::NativeControlState::default(),

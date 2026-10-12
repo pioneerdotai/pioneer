@@ -472,6 +472,8 @@ pub struct ReviewRequiredTaskObservation {
     pub task_id: String,
     pub run_id: String,
     pub candidate_id: String,
+    /// Full authoritative candidate projection revision; empty means unavailable.
+    pub candidate_revision: String,
     pub title: String,
     pub status: String,
     pub candidate_status: String,

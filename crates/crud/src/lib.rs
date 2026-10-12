@@ -8901,6 +8901,33 @@ impl CrudStore {
                 "native checkpoint cannot invent control sources"
             );
         }
+        let prepared_wait = payload
+            .native_semantic_state
+            .as_ref()
+            .and_then(|state| state.get("attached_task_wait"))
+            .filter(|value| !value.is_null())
+            .map(|value| {
+                serde_json::from_value::<pioneer_protocol::NativeAttachedTaskWait>(value.clone())
+            })
+            .transpose()?;
+        if let Some(wait) = &prepared_wait {
+            anyhow::ensure!(
+                payload
+                    .native_semantic_state
+                    .as_ref()
+                    .and_then(|state| state.get("schema_version"))
+                    .and_then(serde_json::Value::as_u64)
+                    == Some(u64::from(
+                        pioneer_protocol::NATIVE_SEMANTIC_STATE_SCHEMA_VERSION
+                    ))
+                    && wait.valid()
+                    && wait.checkpoint_id
+                        == turn_execution_window::semantic_checkpoint_id(&payload.turn_id)
+                    && wait.owner_generation == owner_generation
+                    && wait.runtime_generation == runtime_generation,
+                "native attached-task wait proof unavailable"
+            );
+        }
         // Prepare the existing immutable event/read-model projection outside SQL.
         let now = chrono::Utc::now().fixed_offset();
         let prepared_control = if let Some(control) = control {
@@ -8964,6 +8991,11 @@ impl CrudStore {
         payload.native_event_frontier = Some(committed_frontier.clone());
         let encoded =
             turn_execution_window::serialize_checkpoint_payload(&serde_json::to_value(&payload)?)?;
+        let wait_deadlines = prepared_wait.as_ref().map(|wait| sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Sqlite,
+            "UPDATE turn_item_attempt SET execution_class='durable_wait', idle_deadline_at=NULL, hard_deadline_at=NULL WHERE turn_id=?1 AND item_id=?2 AND item_type='reasoning' AND status='running' AND lease_expires_at IS NOT NULL AND EXISTS (SELECT 1 FROM turn_execution_checkpoint cp WHERE cp.id=?3 AND cp.turn_id=?1 AND cp.payload_json=?4)",
+            [payload.turn_id.clone().into(), wait.item_id.clone().into(), wait.checkpoint_id.clone().into(), encoded.clone().into()],
+        ));
         let statement = turn_execution_window::prepare_semantic_checkpoint_commit(
             &payload,
             encoded,
@@ -8978,6 +9010,7 @@ impl CrudStore {
             self.run_serialized_write(|| {
                 let prepared = prepared.clone();
                 let statement = statement.clone();
+                let wait_deadlines = wait_deadlines.clone();
                 async move {
                     let transaction = self.connection.begin().await?;
                     self.append_and_project_turn_event_in_transaction(
@@ -8994,6 +9027,16 @@ impl CrudStore {
                         transaction.execute_raw(statement).await?.rows_affected() == 1,
                         "native control/checkpoint refused by execution/source fence"
                     );
+                    if let Some(wait_deadlines) = wait_deadlines {
+                        anyhow::ensure!(
+                            transaction
+                                .execute_raw(wait_deadlines)
+                                .await?
+                                .rows_affected()
+                                == 1,
+                            "native wait item changed"
+                        );
+                    }
                     transaction.commit().await?;
                     Ok(())
                 }
@@ -9001,6 +9044,27 @@ impl CrudStore {
             .await
         } else {
             self.run_serialized_write(|| async {
+                if let Some(wait_deadlines) = &wait_deadlines {
+                    let transaction = self.connection.begin().await?;
+                    anyhow::ensure!(
+                        transaction
+                            .execute_raw(statement.clone())
+                            .await?
+                            .rows_affected()
+                            == 1,
+                        "native wait checkpoint refused"
+                    );
+                    anyhow::ensure!(
+                        transaction
+                            .execute_raw(wait_deadlines.clone())
+                            .await?
+                            .rows_affected()
+                            == 1,
+                        "native wait item changed"
+                    );
+                    transaction.commit().await?;
+                    return Ok(());
+                }
                 anyhow::ensure!(
                     self.connection
                         .execute_raw(statement.clone())
@@ -25031,6 +25095,10 @@ impl CrudStore {
                     .add(pioneer_entity::turn_item_attempt::Column::IdleDeadlineAt.is_null())
                     .add(pioneer_entity::turn_item_attempt::Column::HardDeadlineAt.is_null()),
             )
+            .filter(Expr::cust(format!(
+                "NOT ({}) OR turn_item_attempt.lease_expires_at IS NULL",
+                turn_item_attempt::native_attached_wait_predicate()
+            )))
             .limit(limit)
             .all(&self.connection)
             .await
@@ -38110,6 +38178,281 @@ mod tests {
         payload.native_semantic_state =
             Some(serde_json::json!({"checkpoint_revision":1,"obligation":"original"}));
         (store, window, payload)
+    }
+
+    #[tokio::test]
+    async fn attached_task_wait_checkpoint_and_deadlines_are_atomic_and_owner_fenced() {
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+        let (store, _, mut payload) = native_semantic_store_fixture().await;
+        let item = "task_wait_reasoning";
+        store
+            .materialize_item_started(
+                ItemStartedNotification {
+                    workspace_id: "ws_semantic".into(),
+                    thread_id: "thr_semantic".into(),
+                    turn_id: "turn_semantic".into(),
+                    item: TurnItem::Reasoning {
+                        id: item.into(),
+                        summary: vec![],
+                        content: vec![],
+                    },
+                },
+                1_700_000_010,
+            )
+            .await
+            .unwrap();
+        store
+            .configure_turn_item_attempt_deadlines(
+                "turn_semantic",
+                item,
+                1_700_000_010,
+                Some(1_700_000_300),
+                Some(1_700_000_020),
+                Some(1_700_000_030),
+            )
+            .await
+            .unwrap();
+        let wait = pioneer_protocol::NativeAttachedTaskWait {
+            schema_version: 1,
+            baseline: [1; 32],
+            item_id: item.into(),
+            checkpoint_id: pioneer_protocol::native_semantic_checkpoint_id("turn_semantic"),
+            owner_generation: 1,
+            runtime_generation: 1,
+        };
+        payload.native_semantic_state = Some(serde_json::json!({
+            "schema_version": pioneer_protocol::NATIVE_SEMANTIC_STATE_SCHEMA_VERSION,
+            "checkpoint_revision": 1, "attached_task_wait": wait,
+        }));
+        store
+            .commit_native_semantic_checkpoint(payload.clone(), None, 1, "semantic-owner", 1)
+            .await
+            .unwrap();
+        let attempt = || {
+            pioneer_entity::turn_item_attempt::Entity::find()
+                .filter(pioneer_entity::turn_item_attempt::Column::TurnId.eq("turn_semantic"))
+                .filter(pioneer_entity::turn_item_attempt::Column::ItemId.eq(item))
+        };
+        let row = attempt().one(&store.connection).await.unwrap().unwrap();
+        assert!(row.idle_deadline_at.is_none() && row.hard_deadline_at.is_none());
+        assert!(row.lease_expires_at.is_some());
+        // A repair prepared before entering wait may arrive after the checkpoint.
+        store
+            .configure_turn_item_attempt_deadlines(
+                "turn_semantic",
+                item,
+                1_700_000_040,
+                Some(1_700_000_400),
+                Some(1_700_000_050),
+                Some(1_700_000_060),
+            )
+            .await
+            .unwrap();
+        store
+            .heartbeat_turn_item_attempt_with_activity_kind(
+                "turn_semantic",
+                item,
+                TurnItemType::Reasoning,
+                1_700_000_070,
+                Some(1_700_000_500),
+                Some(1_700_000_080),
+                Some(1_700_000_090),
+                "external_activity",
+            )
+            .await
+            .unwrap();
+        let row = attempt().one(&store.connection).await.unwrap().unwrap();
+        assert!(row.idle_deadline_at.is_none() && row.hard_deadline_at.is_none());
+        assert_eq!(row.lease_expires_at.unwrap().timestamp(), 1_700_000_500);
+        assert!(
+            store
+                .list_running_attempts_missing_deadlines(64)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .list_timeout_candidates(1_700_000_100, 64)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            !store
+                .list_timeout_candidates(1_700_000_501, 64)
+                .await
+                .unwrap()
+                .is_empty(),
+            "dead owner still loses its lease"
+        );
+        // Legacy/corrupt missing lease stays visible to repair, but repaired
+        // work horizons cannot turn the accepted host wait into provider work.
+        store.run_serialized_write(|| async {
+            store.connection.execute_raw(sea_orm::Statement::from_string(
+                sea_orm::DatabaseBackend::Sqlite,
+                "UPDATE turn_item_attempt SET lease_expires_at=NULL WHERE turn_id='turn_semantic' AND item_id='task_wait_reasoning'",
+            )).await.map_err(Into::into)
+        }).await.unwrap();
+        assert_eq!(
+            store
+                .list_running_attempts_missing_deadlines(64)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        store
+            .configure_turn_item_attempt_deadlines(
+                "turn_semantic",
+                item,
+                1_700_000_090,
+                Some(1_700_000_500),
+                Some(1_700_000_120),
+                Some(1_700_000_150),
+            )
+            .await
+            .unwrap();
+        let repaired = attempt().one(&store.connection).await.unwrap().unwrap();
+        assert!(repaired.lease_expires_at.is_some());
+        assert!(repaired.idle_deadline_at.is_none() && repaired.hard_deadline_at.is_none());
+        let before = store
+            .native_semantic_checkpoint_for_turn("turn_semantic")
+            .await
+            .unwrap()
+            .unwrap();
+        let state = payload.native_semantic_state.as_mut().unwrap();
+        state["checkpoint_revision"] = 2.into();
+        state["attached_task_wait"]["item_id"] = "missing_reasoning".into();
+        assert!(
+            store
+                .commit_native_semantic_checkpoint(payload.clone(), None, 1, "semantic-owner", 1)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .native_semantic_checkpoint_for_turn("turn_semantic")
+                .await
+                .unwrap()
+                .unwrap()
+                .payload_json,
+            before.payload_json,
+            "missing running item rolls back the checkpoint, not only the deadline write"
+        );
+        let execution = store
+            .get_turn_execution("turn_semantic")
+            .await
+            .unwrap()
+            .unwrap();
+        let claimed = store
+            .claim_expired_turn_execution(
+                &execution,
+                "replacement-owner",
+                1_700_000_600,
+                1_700_000_700,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed.owner_generation, 2);
+        // The old accepted wait remains a wait attempt with an expired finite
+        // lease. A replacement does not invent provider work for that item.
+        assert!(
+            store
+                .list_running_attempts_missing_deadlines(64)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        store
+            .materialize_item_completed(
+                ItemCompletedNotification {
+                    workspace_id: "ws_semantic".into(),
+                    thread_id: "thr_semantic".into(),
+                    turn_id: "turn_semantic".into(),
+                    item: TurnItem::Reasoning {
+                        id: item.into(),
+                        summary: vec![],
+                        content: vec![],
+                    },
+                },
+                1_700_000_600,
+            )
+            .await
+            .unwrap();
+        let replacement_item = "replacement_reasoning";
+        store
+            .materialize_item_started(
+                ItemStartedNotification {
+                    workspace_id: "ws_semantic".into(),
+                    thread_id: "thr_semantic".into(),
+                    turn_id: "turn_semantic".into(),
+                    item: TurnItem::Reasoning {
+                        id: replacement_item.into(),
+                        summary: vec![],
+                        content: vec![],
+                    },
+                },
+                1_700_000_600,
+            )
+            .await
+            .unwrap();
+        store
+            .configure_turn_item_attempt_deadlines(
+                "turn_semantic",
+                replacement_item,
+                1_700_000_600,
+                Some(1_700_000_700),
+                Some(1_700_000_650),
+                Some(1_700_000_680),
+            )
+            .await
+            .unwrap();
+        let replacement = || {
+            pioneer_entity::turn_item_attempt::Entity::find()
+                .filter(pioneer_entity::turn_item_attempt::Column::TurnId.eq("turn_semantic"))
+                .filter(pioneer_entity::turn_item_attempt::Column::ItemId.eq(replacement_item))
+        };
+        assert!(
+            replacement()
+                .one(&store.connection)
+                .await
+                .unwrap()
+                .unwrap()
+                .hard_deadline_at
+                .is_some()
+        );
+        payload.native_semantic_state.as_mut().unwrap()["attached_task_wait"]["item_id"] =
+            replacement_item.into();
+        payload.native_semantic_state.as_mut().unwrap()["attached_task_wait"]["owner_generation"] =
+            2.into();
+        store
+            .commit_native_semantic_checkpoint(payload.clone(), None, 1, "replacement-owner", 2)
+            .await
+            .unwrap();
+        let restored = replacement().one(&store.connection).await.unwrap().unwrap();
+        assert!(restored.hard_deadline_at.is_none());
+        assert_eq!(restored.execution_class.as_deref(), Some("durable_wait"));
+        assert!(
+            store
+                .commit_native_semantic_checkpoint(payload.clone(), None, 1, "semantic-owner", 1)
+                .await
+                .is_err()
+        );
+        payload.native_semantic_state.as_mut().unwrap()["checkpoint_revision"] = 3.into();
+        payload.native_semantic_state.as_mut().unwrap()["attached_task_wait"]["schema_version"] =
+            2.into();
+        assert!(
+            store
+                .commit_native_semantic_checkpoint(payload, None, 1, "replacement-owner", 2)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            store.connection.read_class(),
+            pioneer_sqlite::SqliteReadClass::Maintenance
+        );
     }
 
     #[tokio::test]

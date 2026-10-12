@@ -578,4 +578,39 @@ pub use model_selection::{GatewayModelSelection, ModelSelectionTransport};
 
 /// Agent-owned semantic checkpoint codec shared with persistence readers.
 /// Agent remains the serializer and full restore authority.
-pub const NATIVE_SEMANTIC_STATE_SCHEMA_VERSION: u32 = 7;
+pub const NATIVE_SEMANTIC_STATE_SCHEMA_VERSION: u32 = 8;
+
+/// Agent-owned host wait in the existing semantic checkpoint; never work progress.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeAttachedTaskWait {
+    pub schema_version: u32,
+    pub baseline: [u8; 32],
+    pub item_id: String,
+    pub checkpoint_id: String,
+    pub owner_generation: u64,
+    pub runtime_generation: u64,
+}
+impl NativeAttachedTaskWait {
+    pub fn valid(&self) -> bool {
+        self.schema_version == 1
+            && !self.item_id.is_empty()
+            && self.item_id.len() <= 21
+            && self.checkpoint_id.len() == 21
+            && self
+                .checkpoint_id
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+            && self.owner_generation > 0
+            && self.runtime_generation > 0
+    }
+}
+
+/// Existing durable semantic checkpoint identity; shared by its producer and readers.
+pub fn native_semantic_checkpoint_id(turn: &str) -> String {
+    use sha2::Digest;
+    hex::encode(sha2::Sha256::digest(
+        format!("native-semantic-v1:{turn}").as_bytes(),
+    ))[..21]
+        .to_owned()
+}
