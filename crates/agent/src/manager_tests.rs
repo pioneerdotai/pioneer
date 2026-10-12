@@ -1882,6 +1882,61 @@ struct BatchJournalHandler {
     slow_release: Arc<tokio::sync::Semaphore>,
 }
 
+#[derive(Default)]
+struct OrderedBatchState {
+    active_reads: AtomicUsize,
+    max_reads: AtomicUsize,
+    revision: AtomicUsize,
+    completed_before: AtomicUsize,
+    completed_after: AtomicUsize,
+}
+
+struct OrderedBatchHandler {
+    state: Arc<OrderedBatchState>,
+    before_barrier: Arc<tokio::sync::Barrier>,
+    mutation: bool,
+    after: bool,
+}
+
+#[async_trait::async_trait]
+impl ToolHandler for OrderedBatchHandler {
+    fn supports_parallel_reads(&self) -> bool {
+        !self.mutation
+    }
+
+    async fn handle(
+        &self,
+        _invocation: ToolInvocation,
+        _trace: ToolEventTrace,
+    ) -> Result<Box<dyn pioneer_tools::ToolOutput>, pioneer_tools::ToolError> {
+        if self.mutation {
+            assert_eq!(self.state.active_reads.load(Ordering::SeqCst), 0);
+            assert_eq!(self.state.completed_before.load(Ordering::SeqCst), 8);
+            assert_eq!(self.state.completed_after.load(Ordering::SeqCst), 0);
+            self.state.revision.store(1, Ordering::SeqCst);
+        } else {
+            let active = self.state.active_reads.fetch_add(1, Ordering::SeqCst) + 1;
+            self.state.max_reads.fetch_max(active, Ordering::SeqCst);
+            if !self.after {
+                // Each native read segment must start four real handlers.
+                self.before_barrier.wait().await;
+            }
+            assert_eq!(
+                self.state.revision.load(Ordering::SeqCst),
+                usize::from(self.after)
+            );
+            tokio::task::yield_now().await;
+            self.state.active_reads.fetch_sub(1, Ordering::SeqCst);
+            if self.after {
+                self.state.completed_after.fetch_add(1, Ordering::SeqCst);
+            } else {
+                self.state.completed_before.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        Ok(Box::new(FunctionToolOutput::new("observed", true)))
+    }
+}
+
 struct ReviewGuardProvider {
     requests: std::sync::Mutex<Vec<ChatRequest>>,
     steps: std::sync::Mutex<VecDeque<ReviewGuardProviderStep>>,
@@ -2736,6 +2791,11 @@ impl ToolHandler for RetainingTraceHandler {
 
 #[async_trait::async_trait]
 impl ToolHandler for BatchJournalHandler {
+    fn supports_parallel_reads(&self) -> bool {
+        // This fixture only waits and returns a fixed value.
+        true
+    }
+
     async fn handle(
         &self,
         invocation: ToolInvocation,
@@ -12251,6 +12311,95 @@ async fn request_tools_selection_survives_execution_window_and_not_next_turn() {
     assert!(!has_memory_write(
         provider.snapshot_requests().last().unwrap()
     ));
+}
+
+#[tokio::test]
+async fn native_batch_drains_bounded_read_segments_around_an_unknown_shared_mutation() {
+    let state = Arc::new(OrderedBatchState::default());
+    let barrier = Arc::new(tokio::sync::Barrier::new(4));
+    let names = (0..8)
+        .map(|i| format!("batch_read_{i}"))
+        .chain([
+            "batch_unknown_mutation".to_owned(),
+            "batch_read_after".to_owned(),
+        ])
+        .collect::<Vec<_>>();
+    let bundle = ToolExtensionBundle {
+        specs: names.iter().map(|name| fake_task_tool_spec(name)).collect(),
+        handlers: names
+            .iter()
+            .map(|name| {
+                let handler: Arc<dyn ToolHandler> = Arc::new(OrderedBatchHandler {
+                    state: state.clone(),
+                    before_barrier: barrier.clone(),
+                    mutation: name == "batch_unknown_mutation",
+                    after: name == "batch_read_after",
+                });
+                (name.clone(), handler)
+            })
+            .collect(),
+    };
+    let provider = Arc::new(SequencedToolProvider::new(
+        names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| ProviderToolCall {
+                id: format!("ordered_{i}"),
+                name: name.clone(),
+                arguments: "{}".to_owned(),
+            })
+            .collect(),
+        "ordered complete",
+    ));
+    let manager = AgentManager::new(
+        Arc::new(ProviderRegistry::with_provider(
+            "sequenced-tools",
+            provider.clone(),
+        )),
+        test_tool_loop_config(),
+    );
+    manager
+        .set_turn_tool_provider(Some(Arc::new(StaticTurnToolProvider { bundle })))
+        .await;
+    manager
+        .ensure_thread("ordered_thread", "ordered_workspace")
+        .await
+        .unwrap();
+    let mut events = subscribe_agent_events(&manager, "ordered_thread").await;
+    manager
+        .start_test_turn_with_default_profile_and_capabilities(
+            "ordered_thread",
+            "ordered_turn",
+            ThreadMode::Agent,
+            "test-model",
+            "sequenced-tools",
+            HashMap::new(),
+            vec![UserInput::Text {
+                text: "observe, mutate, observe".to_owned(),
+                text_elements: Vec::new(),
+            }],
+            Vec::new(),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    let observed = recv_events_until_terminal(&mut events).await;
+    assert_turn_completed(&observed);
+    assert_eq!(state.completed_before.load(Ordering::SeqCst), 8);
+    assert_eq!(state.completed_after.load(Ordering::SeqCst), 1);
+    assert_eq!(state.max_reads.load(Ordering::SeqCst), 4);
+    let requests = provider.snapshot_requests();
+    let results = requests
+        .last()
+        .unwrap()
+        .messages
+        .iter()
+        .filter_map(|message| message.tool_call_id.as_deref())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        results,
+        (0..10).map(|i| format!("ordered_{i}")).collect::<Vec<_>>()
+    );
 }
 
 #[tokio::test]

@@ -71,6 +71,18 @@ pub struct ToolRouter {
 }
 
 impl ToolRouter {
+    pub fn supports_parallel_reads(&self, tool_name: &str) -> bool {
+        self.registry.supports_parallel_reads(tool_name)
+            && self
+                .specs
+                .get(tool_name)
+                .is_some_and(|spec| matches!(spec.execution_class, ExecutionClass::Shared))
+    }
+
+    pub(crate) fn delegates_runtime_locks(&self, tool_name: &str) -> bool {
+        self.registry.delegates_runtime_locks(tool_name)
+    }
+
     pub fn new(
         specs: Vec<ConfiguredToolSpec>,
         registry: ToolRegistry,

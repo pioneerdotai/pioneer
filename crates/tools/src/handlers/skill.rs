@@ -678,6 +678,10 @@ struct SkillShellToolHandler {
 
 #[async_trait]
 impl ToolHandler for SkillShellToolHandler {
+    fn delegates_runtime_locks(&self) -> bool {
+        true
+    }
+
     async fn handle(
         &self,
         invocation: ToolInvocation,
@@ -803,6 +807,10 @@ struct SkillFunctionProxyHandler {
 
 #[async_trait]
 impl ToolHandler for SkillFunctionProxyHandler {
+    fn delegates_runtime_locks(&self) -> bool {
+        true
+    }
+
     async fn handle(
         &self,
         invocation: ToolInvocation,

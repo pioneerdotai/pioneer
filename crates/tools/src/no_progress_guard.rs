@@ -121,6 +121,10 @@ impl Default for ToolNoProgressGuard {
 }
 
 impl ToolNoProgressGuard {
+    pub fn exact_strategy_identity(tool_name: &str, arguments: &str) -> String {
+        StrategyFingerprint::new(tool_name, arguments, 1).exact
+    }
+
     pub fn new(config: ToolNoProgressGuardConfig) -> Self {
         Self::new_with_mode(config, ToolNoProgressMode::Enforce)
     }

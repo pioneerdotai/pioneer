@@ -247,6 +247,28 @@ struct SpawnedToolTask {
     handle: AbortOnDropJoinHandle<Result<ExecutedToolResult, ChatTurnError>>,
 }
 
+const NATIVE_PARALLEL_READ_LIMIT: usize = 4;
+
+fn native_tool_batch_segment_len<'a>(
+    calls: impl Iterator<Item = (&'a str, &'a str)>,
+    supports_parallel_reads: impl Fn(&str) -> bool,
+) -> usize {
+    let mut identities = HashSet::new();
+    let mut count = 0;
+    for (name, arguments) in calls.take(NATIVE_PARALLEL_READ_LIMIT) {
+        if !supports_parallel_reads(name) {
+            return count.max(1);
+        }
+        if !identities.insert(ToolNoProgressGuard::exact_strategy_identity(
+            name, arguments,
+        )) {
+            break;
+        }
+        count += 1;
+    }
+    count
+}
+
 fn unknown_tool_task_result(
     item_id: String,
     provider_call_id: String,
@@ -6816,8 +6838,20 @@ async fn execute_agent_provider_response(
             ).map_err(|error| (error, current_thinking_id.clone()))?;
             messages.push(assistant_round);
 
-            let guarded_tool_calls = resolved_tool_calls
-                .into_iter()
+            let mut pending_tool_calls = std::collections::VecDeque::from(resolved_tool_calls);
+            let mut executed_results = Vec::new();
+            let mut no_progress_feedback = pioneer_tools::ToolNoProgressFeedback::default();
+            while !pending_tool_calls.is_empty() {
+                let segment_len = native_tool_batch_segment_len(
+                    pending_tool_calls.iter().map(|(call, _, _)| {
+                        (call.name.as_str(), call.arguments.as_str())
+                    }),
+                    |name| router.supports_parallel_reads(name),
+                );
+                // Admission is computed by the parent after the preceding
+                // segment has completed and updated the exact guard state.
+                let guarded_tool_calls = pending_tool_calls
+                .drain(..segment_len)
                 .map(|(model_tool_call, item_id, ordinal)| {
                     let decision = tool_no_progress_guard.preflight(
                         model_tool_call.name.as_str(),
@@ -7366,7 +7400,7 @@ async fn execute_agent_provider_response(
                 .collect::<Vec<_>>();
 
             let parallel_tool_calls = tool_tasks.len().max(1);
-            let mut executed_results = stream::iter(tool_tasks)
+            let segment_results = stream::iter(tool_tasks)
                 .map(|task| {
                     let event_tx = event_tx.clone();
                     let workspace_id = workspace_id.to_owned();
@@ -7463,6 +7497,14 @@ async fn execute_agent_provider_response(
                 .into_iter()
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|error| (error, current_thinking_id.clone()))?;
+                let observations = segment_results.iter()
+                    .map(ExecutedToolResult::retry_observation).collect::<Vec<_>>();
+                no_progress_feedback.fact_lines.extend(
+                    tool_no_progress_guard.observe(&observations).fact_lines,
+                );
+                no_progress_feedback.fact_lines.truncate(semantic_state::MAX_SUMMARY_EVENTS);
+                executed_results.extend(segment_results);
+            }
             executed_results.sort_by_key(|result| result.ordinal);
             if tool_event_forwarder.is_finished() {
                 return Err((
@@ -7518,7 +7560,6 @@ async fn execute_agent_provider_response(
                 .iter()
                 .map(ExecutedToolResult::retry_observation)
                 .collect::<Vec<_>>();
-            let no_progress_feedback = tool_no_progress_guard.observe(&retry_observations);
             pending_retry_instruction = match tool_retry_controller.decide(&retry_observations) {
                 ToolRetryDecision::None { drafts } => {
                     emit_tool_retry_drafts(
@@ -8300,6 +8341,51 @@ mod tests {
 
     #[derive(Default)]
     struct NoopToolHandler;
+
+    #[test]
+    fn native_batch_segments_bound_reads_and_separate_unknown_mutations_and_exact_duplicates() {
+        let calls = [
+            ("read", r#"{"path":"a"}"#),
+            ("read", r#"{"path":"b"}"#),
+            ("mutation", "{}"),
+            ("read", r#"{"path":"c"}"#),
+        ];
+        let reads = |name: &str| name == "read";
+        assert_eq!(
+            super::native_tool_batch_segment_len(calls.iter().copied(), reads),
+            2
+        );
+        assert_eq!(
+            super::native_tool_batch_segment_len(calls[2..].iter().copied(), reads),
+            1
+        );
+        assert_eq!(
+            super::native_tool_batch_segment_len(calls[3..].iter().copied(), reads),
+            1
+        );
+        assert_eq!(
+            super::native_tool_batch_segment_len(calls.iter().copied(), |_| false),
+            1
+        );
+        let duplicate = [
+            ("read", r#"{"path":"a","start_line":1}"#),
+            ("read", r#"{"start_line":1,"path":"a"}"#),
+        ];
+        assert_eq!(
+            super::native_tool_batch_segment_len(duplicate.into_iter(), reads),
+            1
+        );
+        let distinct = (0..9)
+            .map(|index| ("read", format!(r#"{{"path":"{index}"}}"#)))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            super::native_tool_batch_segment_len(
+                distinct.iter().map(|(name, args)| (*name, args.as_str())),
+                reads
+            ),
+            4
+        );
+    }
 
     #[async_trait::async_trait]
     impl ToolHandler for NoopToolHandler {

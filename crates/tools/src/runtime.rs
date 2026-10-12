@@ -160,178 +160,186 @@ impl ToolCallRuntime {
             )
             .await?;
 
-        let result = match call.execution_class {
-            ExecutionClass::Shared => {
-                trace.emit_stage(
-                    1,
-                    "runtime.lock_wait.started",
-                    None,
-                    Some(serde_json::json!({
-                        "execution_class": "shared",
-                    })),
-                );
-                let wait_started = std::time::Instant::now();
-                let read_guard = tokio::select! {
-                    _ = cancellation.cancelled() => {
-                        let error = ToolError::cancelled("cancelled before shared lock acquisition");
-                        trace.emit_stage(1, "runtime.lock_wait.failed", Some(error.to_string()), None);
-                        Err(error)
-                    }
-                    guard = self.global_lock.read() => {
-                        trace.emit_stage(
-                            1,
-                            "runtime.lock_wait.completed",
-                            None,
-                            Some(serde_json::json!({
-                                "wait_ms": wait_started.elapsed().as_millis() as u64,
-                                "execution_class": "shared",
-                            })),
-                        );
-                        Ok(guard)
-                    },
-                }?;
-
-                let output = self
-                    .dispatch_call(call.clone(), &cancellation, &trace, source, &workdir)
-                    .await;
-                drop(read_guard);
-                output
-            }
-            ExecutionClass::MutationScoped => {
-                trace.emit_stage(
-                    1,
-                    "runtime.lock_wait.started",
-                    None,
-                    Some(serde_json::json!({
-                        "execution_class": "mutation_scoped",
-                    })),
-                );
-                let wait_started = std::time::Instant::now();
-                // Mutation-scoped calls share the global barrier with ordinary
-                // reads, but do not take the exclusive write guard.  The
-                // patch engine's canonical target locks serialize only
-                // overlapping paths and allow disjoint patches to proceed.
-                let read_guard = tokio::select! {
-                    _ = cancellation.cancelled() => {
-                        let error = ToolError::cancelled("cancelled before mutation-scoped lock acquisition");
-                        trace.emit_stage(1, "runtime.lock_wait.failed", Some(error.to_string()), None);
-                        Err(error)
-                    }
-                    guard = self.global_lock.read() => {
-                        trace.emit_stage(
-                            1,
-                            "runtime.lock_wait.completed",
-                            None,
-                            Some(serde_json::json!({
-                                "wait_ms": wait_started.elapsed().as_millis() as u64,
-                                "execution_class": "mutation_scoped",
-                            })),
-                        );
-                        Ok(guard)
-                    },
-                }?;
-
-                let output = self
-                    .dispatch_call(call.clone(), &cancellation, &trace, source, &workdir)
-                    .await;
-                drop(read_guard);
-                output
-            }
-            ExecutionClass::Exclusive => {
-                trace.emit_stage(
-                    1,
-                    "runtime.lock_wait.started",
-                    None,
-                    Some(serde_json::json!({
-                        "execution_class": "exclusive",
-                    })),
-                );
-                let wait_started = std::time::Instant::now();
-                let write_guard = tokio::select! {
-                    _ = cancellation.cancelled() => {
-                        let error = ToolError::cancelled("cancelled before exclusive lock acquisition");
-                        trace.emit_stage(1, "runtime.lock_wait.failed", Some(error.to_string()), None);
-                        Err(error)
-                    }
-                    guard = self.global_lock.write() => {
-                        trace.emit_stage(
-                            1,
-                            "runtime.lock_wait.completed",
-                            None,
-                            Some(serde_json::json!({
-                                "wait_ms": wait_started.elapsed().as_millis() as u64,
-                                "execution_class": "exclusive",
-                            })),
-                        );
-                        Ok(guard)
-                    },
-                }?;
-
-                let output = self
-                    .dispatch_call(call.clone(), &cancellation, &trace, source, &workdir)
-                    .await;
-                drop(write_guard);
-                output
-            }
-            ExecutionClass::SessionScoped => {
-                trace.emit_stage(
-                    1,
-                    "runtime.lock_wait.started",
-                    None,
-                    Some(serde_json::json!({
-                        "execution_class": "session_scoped",
-                    })),
-                );
-                let wait_started = std::time::Instant::now();
-                let read_guard = tokio::select! {
-                    _ = cancellation.cancelled() => {
-                        let error = ToolError::cancelled("cancelled before session lock acquisition");
-                        trace.emit_stage(1, "runtime.lock_wait.failed", Some(error.to_string()), None);
-                        Err(error)
-                    }
-                    guard = self.global_lock.read() => Ok(guard),
-                }?;
-
-                let key = call
-                    .session_scope_key()
-                    .unwrap_or_else(|| format!("call:{}", call.call_id));
-
-                let session_lock = {
-                    let mut map = tokio::select! {
+        let result = if self.router.delegates_runtime_locks(&call.tool_name) {
+            // The registered composition handler re-enters this same runtime.
+            // Holding any outer read/write barrier can deadlock the child;
+            // each real child still takes its normal locks and fresh authority.
+            self.dispatch_call(call.clone(), &cancellation, &trace, source, &workdir)
+                .await
+        } else {
+            match call.execution_class {
+                ExecutionClass::Shared => {
+                    trace.emit_stage(
+                        1,
+                        "runtime.lock_wait.started",
+                        None,
+                        Some(serde_json::json!({
+                            "execution_class": "shared",
+                        })),
+                    );
+                    let wait_started = std::time::Instant::now();
+                    let read_guard = tokio::select! {
                         _ = cancellation.cancelled() => {
-                            Err(ToolError::cancelled("cancelled before session map acquisition"))
+                            let error = ToolError::cancelled("cancelled before shared lock acquisition");
+                            trace.emit_stage(1, "runtime.lock_wait.failed", Some(error.to_string()), None);
+                            Err(error)
                         }
-                        map = self.session_locks.lock() => Ok(map),
+                        guard = self.global_lock.read() => {
+                            trace.emit_stage(
+                                1,
+                                "runtime.lock_wait.completed",
+                                None,
+                                Some(serde_json::json!({
+                                    "wait_ms": wait_started.elapsed().as_millis() as u64,
+                                    "execution_class": "shared",
+                                })),
+                            );
+                            Ok(guard)
+                        },
                     }?;
-                    map.entry(key.clone())
-                        .or_insert_with(|| Arc::new(Mutex::new(())))
-                        .clone()
-                };
-                let session_guard = tokio::select! {
-                    _ = cancellation.cancelled() => {
-                        let error = ToolError::cancelled("cancelled before session-scoped execution");
-                        trace.emit_stage(1, "runtime.lock_wait.failed", Some(error.to_string()), None);
-                        Err(error)
-                    }
-                    guard = session_lock.lock() => Ok(guard),
-                }?;
-                trace.emit_stage(
-                    1,
-                    "runtime.lock_wait.completed",
-                    None,
-                    Some(serde_json::json!({
-                        "wait_ms": wait_started.elapsed().as_millis() as u64,
-                        "execution_class": "session_scoped",
-                        "session_key": key,
-                    })),
-                );
 
-                let output = self
-                    .dispatch_call(call.clone(), &cancellation, &trace, source, &workdir)
-                    .await;
-                drop(session_guard);
-                drop(read_guard);
-                output
+                    let output = self
+                        .dispatch_call(call.clone(), &cancellation, &trace, source, &workdir)
+                        .await;
+                    drop(read_guard);
+                    output
+                }
+                ExecutionClass::MutationScoped => {
+                    trace.emit_stage(
+                        1,
+                        "runtime.lock_wait.started",
+                        None,
+                        Some(serde_json::json!({
+                            "execution_class": "mutation_scoped",
+                        })),
+                    );
+                    let wait_started = std::time::Instant::now();
+                    // Mutation-scoped calls share the global barrier with ordinary
+                    // reads, but do not take the exclusive write guard.  The
+                    // patch engine's canonical target locks serialize only
+                    // overlapping paths and allow disjoint patches to proceed.
+                    let read_guard = tokio::select! {
+                        _ = cancellation.cancelled() => {
+                            let error = ToolError::cancelled("cancelled before mutation-scoped lock acquisition");
+                            trace.emit_stage(1, "runtime.lock_wait.failed", Some(error.to_string()), None);
+                            Err(error)
+                        }
+                        guard = self.global_lock.read() => {
+                            trace.emit_stage(
+                                1,
+                                "runtime.lock_wait.completed",
+                                None,
+                                Some(serde_json::json!({
+                                    "wait_ms": wait_started.elapsed().as_millis() as u64,
+                                    "execution_class": "mutation_scoped",
+                                })),
+                            );
+                            Ok(guard)
+                        },
+                    }?;
+
+                    let output = self
+                        .dispatch_call(call.clone(), &cancellation, &trace, source, &workdir)
+                        .await;
+                    drop(read_guard);
+                    output
+                }
+                ExecutionClass::Exclusive => {
+                    trace.emit_stage(
+                        1,
+                        "runtime.lock_wait.started",
+                        None,
+                        Some(serde_json::json!({
+                            "execution_class": "exclusive",
+                        })),
+                    );
+                    let wait_started = std::time::Instant::now();
+                    let write_guard = tokio::select! {
+                        _ = cancellation.cancelled() => {
+                            let error = ToolError::cancelled("cancelled before exclusive lock acquisition");
+                            trace.emit_stage(1, "runtime.lock_wait.failed", Some(error.to_string()), None);
+                            Err(error)
+                        }
+                        guard = self.global_lock.write() => {
+                            trace.emit_stage(
+                                1,
+                                "runtime.lock_wait.completed",
+                                None,
+                                Some(serde_json::json!({
+                                    "wait_ms": wait_started.elapsed().as_millis() as u64,
+                                    "execution_class": "exclusive",
+                                })),
+                            );
+                            Ok(guard)
+                        },
+                    }?;
+
+                    let output = self
+                        .dispatch_call(call.clone(), &cancellation, &trace, source, &workdir)
+                        .await;
+                    drop(write_guard);
+                    output
+                }
+                ExecutionClass::SessionScoped => {
+                    trace.emit_stage(
+                        1,
+                        "runtime.lock_wait.started",
+                        None,
+                        Some(serde_json::json!({
+                            "execution_class": "session_scoped",
+                        })),
+                    );
+                    let wait_started = std::time::Instant::now();
+                    let read_guard = tokio::select! {
+                        _ = cancellation.cancelled() => {
+                            let error = ToolError::cancelled("cancelled before session lock acquisition");
+                            trace.emit_stage(1, "runtime.lock_wait.failed", Some(error.to_string()), None);
+                            Err(error)
+                        }
+                        guard = self.global_lock.read() => Ok(guard),
+                    }?;
+
+                    let key = call
+                        .session_scope_key()
+                        .unwrap_or_else(|| format!("call:{}", call.call_id));
+
+                    let session_lock = {
+                        let mut map = tokio::select! {
+                            _ = cancellation.cancelled() => {
+                                Err(ToolError::cancelled("cancelled before session map acquisition"))
+                            }
+                            map = self.session_locks.lock() => Ok(map),
+                        }?;
+                        map.entry(key.clone())
+                            .or_insert_with(|| Arc::new(Mutex::new(())))
+                            .clone()
+                    };
+                    let session_guard = tokio::select! {
+                        _ = cancellation.cancelled() => {
+                            let error = ToolError::cancelled("cancelled before session-scoped execution");
+                            trace.emit_stage(1, "runtime.lock_wait.failed", Some(error.to_string()), None);
+                            Err(error)
+                        }
+                        guard = session_lock.lock() => Ok(guard),
+                    }?;
+                    trace.emit_stage(
+                        1,
+                        "runtime.lock_wait.completed",
+                        None,
+                        Some(serde_json::json!({
+                            "wait_ms": wait_started.elapsed().as_millis() as u64,
+                            "execution_class": "session_scoped",
+                            "session_key": key,
+                        })),
+                    );
+
+                    let output = self
+                        .dispatch_call(call.clone(), &cancellation, &trace, source, &workdir)
+                        .await;
+                    drop(session_guard);
+                    drop(read_guard);
+                    output
+                }
             }
         };
 
@@ -603,6 +611,117 @@ mod tests {
     }
 
     struct FailingHandler;
+
+    struct NestedExclusiveHandler {
+        runtime: Arc<tokio::sync::Mutex<Option<ToolCallRuntime>>>,
+    }
+
+    #[async_trait]
+    impl ToolHandler for NestedExclusiveHandler {
+        fn delegates_runtime_locks(&self) -> bool {
+            true
+        }
+
+        async fn handle(
+            &self,
+            invocation: ToolInvocation,
+            _trace: crate::events::ToolEventTrace,
+        ) -> Result<Box<dyn ToolOutput>, ToolError> {
+            let runtime = self.runtime.lock().await.clone().unwrap();
+            let child = runtime
+                .execute_nested_tool_call_with_cancellation(
+                    function_call("nested_leaf", "nested_call", ExecutionClass::Exclusive),
+                    invocation.workdir,
+                    invocation.cancellation,
+                )
+                .await?;
+            Ok(child.output)
+        }
+    }
+
+    #[tokio::test]
+    async fn composition_wrapper_leaves_exclusive_lock_to_its_real_child() {
+        for outer_class in [ExecutionClass::Shared, ExecutionClass::Exclusive] {
+            let bridge = Arc::new(tokio::sync::Mutex::new(None));
+            let wrapper = Arc::new(NestedExclusiveHandler {
+                runtime: bridge.clone(),
+            });
+            let leaf = Arc::new(SleepHandler {
+                sleep_ms: 0,
+                active: Arc::new(AtomicUsize::new(0)),
+                max_active: Arc::new(AtomicUsize::new(0)),
+            });
+            let mut builder = ToolRegistryBuilder::new();
+            for (name, class) in [
+                ("nested_wrapper", outer_class),
+                ("nested_leaf", ExecutionClass::Exclusive),
+            ] {
+                builder.push_configured_spec(ConfiguredToolSpec::with_output_projection(
+                    ToolSpec::new(
+                        name,
+                        "fixture",
+                        serde_json::json!({"type":"object"}),
+                        PayloadKind::Function,
+                    ),
+                    class,
+                    dynamic_unknown_output_policy(),
+                    ToolOutputProjectionKind::DynamicGeneric,
+                ));
+            }
+            builder.register_dyn_handler("nested_wrapper", wrapper);
+            builder.register_dyn_handler("nested_leaf", leaf);
+            let (specs, registry) = builder.build();
+            let event_bus = ToolEventBus::default();
+            let visibility =
+                ToolVisibilitySnapshot::new(specs.iter().map(|spec| spec.spec.clone()).collect());
+            let router = Arc::new(ToolRouter::new(
+                specs,
+                registry,
+                visibility,
+                event_bus.clone(),
+                "turn_test",
+            ));
+            assert!(!router.supports_parallel_reads("nested_wrapper"));
+            assert!(!router.supports_parallel_reads("nested_leaf"));
+            let runtime = ToolCallRuntime::new(
+                router,
+                Arc::new(ToolOrchestrator::default()),
+                event_bus,
+                "turn_test",
+                crate::PermissionEvaluationContext::for_turn(
+                    "workspace_test",
+                    "thread_test",
+                    "turn_test",
+                    pioneer_protocol::default_turn_permission_profile_snapshot(),
+                ),
+                PathBuf::from("."),
+            )
+            .with_execution_security_snapshot(Some(test_full_access_snapshot()));
+            *bridge.lock().await = Some(runtime.clone());
+            let result = tokio::time::timeout(
+                Duration::from_secs(2),
+                runtime.execute_tool_call(function_call(
+                    "nested_wrapper",
+                    "outer_call",
+                    outer_class,
+                )),
+            )
+            .await
+            .expect("nested exclusive child must acquire its own lock")
+            .unwrap();
+            assert!(result.success());
+            let cancelled = CancellationToken::new();
+            cancelled.cancel();
+            let result = runtime
+                .execute_tool_call_with_cancellation(
+                    function_call("nested_wrapper", "cancelled_outer", outer_class),
+                    cancelled,
+                )
+                .await;
+            assert!(result.is_err());
+            *bridge.lock().await = None;
+        }
+    }
 
     #[test]
     fn shell_fallback_is_attributed_once_to_the_preceding_failed_patch() {

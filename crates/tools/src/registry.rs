@@ -8,6 +8,18 @@ use std::sync::Arc;
 
 #[async_trait]
 pub trait ToolHandler: Send + Sync {
+    /// The concrete handler performs only reads. Class names and remote hints
+    /// are not sufficient proof for native batch concurrency.
+    fn supports_parallel_reads(&self) -> bool {
+        false
+    }
+
+    /// A composition handler delegates all effects to this runtime's nested
+    /// dispatch. The children, rather than their wrapper, own runtime locks.
+    fn delegates_runtime_locks(&self) -> bool {
+        false
+    }
+
     /// One execution attempt, after authorization. Concrete handlers may use
     /// their frozen workload policy instead of the native default.
     fn attempt_work_budget(
@@ -35,6 +47,18 @@ impl ToolRegistry {
 
     pub fn has_handler(&self, tool_name: &str) -> bool {
         self.handlers.contains_key(tool_name)
+    }
+
+    pub(crate) fn supports_parallel_reads(&self, tool_name: &str) -> bool {
+        self.handlers.get(tool_name).is_some_and(|handler| {
+            handler.supports_parallel_reads() && !handler.delegates_runtime_locks()
+        })
+    }
+
+    pub(crate) fn delegates_runtime_locks(&self, tool_name: &str) -> bool {
+        self.handlers
+            .get(tool_name)
+            .is_some_and(|handler| handler.delegates_runtime_locks())
     }
 
     pub(crate) fn attempt_work_budget(

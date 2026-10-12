@@ -127,6 +127,10 @@ struct DirEntryView {
 
 #[async_trait]
 impl ToolHandler for ReadFileHandler {
+    fn supports_parallel_reads(&self) -> bool {
+        true
+    }
+
     async fn handle(
         &self,
         invocation: ToolInvocation,
@@ -294,6 +298,10 @@ fn map_read_error(path: &Path, error: ReadError) -> ToolError {
 
 #[async_trait]
 impl ToolHandler for ListDirHandler {
+    fn supports_parallel_reads(&self) -> bool {
+        true
+    }
+
     async fn handle(
         &self,
         invocation: ToolInvocation,
