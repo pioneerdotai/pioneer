@@ -575,3 +575,7 @@ pub use schema::{protocol_schema_documents, write_protocol_schemas};
 
 mod model_selection;
 pub use model_selection::{GatewayModelSelection, ModelSelectionTransport};
+
+/// Agent-owned semantic checkpoint codec shared with persistence readers.
+/// Agent remains the serializer and full restore authority.
+pub const NATIVE_SEMANTIC_STATE_SCHEMA_VERSION: u32 = 7;

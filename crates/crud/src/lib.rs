@@ -1,5 +1,9 @@
 mod tool_output;
 pub use repositories::compaction;
+pub use repositories::recovery_job::{
+    PreparedRecoveryProgress, RecoveryProgressLoad, RecoveryProgressState,
+    RecoveryProgressUnavailable,
+};
 mod compaction_store;
 mod convention;
 mod events;
@@ -2208,6 +2212,7 @@ impl RepairSummary {
 
 #[derive(Debug, Clone)]
 pub struct RecoveryJobRecord {
+    pub progress: RecoveryProgressLoad,
     pub last_failure_attempt_id: Option<String>,
     pub diagnostic: Option<pioneer_protocol::RecoveryDiagnostic>,
     pub id: String,
@@ -26599,73 +26604,76 @@ impl CrudStore {
         now_unix: i64,
     ) -> Result<AtomicRecoveryJobEnqueueOutcome> {
         let diagnostic_json = diagnostic.as_ref().map(serde_json::to_string).transpose()?;
-        self.run_serialized_write(|| async {
-            let tx = self
-                .connection
-                .begin()
-                .await
-                .context("failed to begin atomic recovery enqueue transaction")?;
-            let result = async {
-                if let Some(existing) =
-                    recovery_job::find_unresolved_job_by_turn(&tx, turn_id.as_str()).await?
-                {
-                    return Ok(AtomicRecoveryJobEnqueueOutcome::Reused(
-                        recovery_job_record_from_model(existing),
-                    ));
-                }
+        let policy_json = serde_json::to_string(&policy_json)
+            .context("failed to serialize recovery policy json")?;
+        let policy_snapshot_json = serde_json::to_string(&policy_snapshot)
+            .context("failed to serialize recovery policy snapshot json")?;
+        let (created, row) = self
+            .run_serialized_write(|| async {
+                let tx = self
+                    .connection
+                    .begin()
+                    .await
+                    .context("failed to begin atomic recovery enqueue transaction")?;
+                let result = async {
+                    if let Some(existing) =
+                        recovery_job::find_unresolved_job_by_turn(&tx, turn_id.as_str()).await?
+                    {
+                        return Ok((false, existing));
+                    }
 
-                let now = unix_to_datetime(now_unix);
-                let retry_delay_secs = retry_after_ms
-                    .map(|retry_after_ms| retry_after_ms.max(0).saturating_add(999) / 1_000)
-                    .unwrap_or(0);
-                let scheduled_at = unix_to_datetime(now_unix.saturating_add(retry_delay_secs));
-                let policy_json = serde_json::to_string(&policy_json)
-                    .context("failed to serialize recovery policy json")?;
-                let policy_snapshot_json = serde_json::to_string(&policy_snapshot)
-                    .context("failed to serialize recovery policy snapshot json")?;
-                let row = recovery_job::enqueue_recovery_job(
-                    &tx,
-                    recovery_job::NewRecoveryJob {
-                        diagnostic_json: diagnostic_json.clone(),
-                        turn_id: turn_id.clone(),
-                        item_id: item_id.clone(),
-                        item_type,
-                        source_attempt_id: source_attempt_id.clone(),
-                        trigger,
-                        action,
-                        reason: reason.clone(),
-                        policy_json,
-                        error_class,
-                        transport_stage,
-                        retry_after_ms,
-                        provider_attempt_number,
-                        policy_snapshot_json,
-                        max_attempts,
-                        created_at: now,
-                        scheduled_at,
-                        next_run_at: scheduled_at,
-                    },
-                )
-                .await?;
-                Ok(AtomicRecoveryJobEnqueueOutcome::Created(
-                    recovery_job_record_from_model(row),
-                ))
-            }
-            .await;
-            match result {
-                Ok(outcome) => {
-                    tx.commit()
-                        .await
-                        .context("failed to commit atomic recovery enqueue transaction")?;
-                    Ok(outcome)
+                    let now = unix_to_datetime(now_unix);
+                    let retry_delay_secs = retry_after_ms
+                        .map(|retry_after_ms| retry_after_ms.max(0).saturating_add(999) / 1_000)
+                        .unwrap_or(0);
+                    let scheduled_at = unix_to_datetime(now_unix.saturating_add(retry_delay_secs));
+                    let row = recovery_job::enqueue_recovery_job(
+                        &tx,
+                        recovery_job::NewRecoveryJob {
+                            diagnostic_json: diagnostic_json.clone(),
+                            turn_id: turn_id.clone(),
+                            item_id: item_id.clone(),
+                            item_type,
+                            source_attempt_id: source_attempt_id.clone(),
+                            trigger,
+                            action,
+                            reason: reason.clone(),
+                            policy_json: policy_json.clone(),
+                            error_class,
+                            transport_stage,
+                            retry_after_ms,
+                            provider_attempt_number,
+                            policy_snapshot_json: policy_snapshot_json.clone(),
+                            max_attempts,
+                            created_at: now,
+                            scheduled_at,
+                            next_run_at: scheduled_at,
+                        },
+                    )
+                    .await?;
+                    Ok((true, row))
                 }
-                Err(error) => {
-                    let _ = tx.rollback().await;
-                    Err(error)
+                .await;
+                match result {
+                    Ok(outcome) => {
+                        tx.commit()
+                            .await
+                            .context("failed to commit atomic recovery enqueue transaction")?;
+                        Ok(outcome)
+                    }
+                    Err(error) => {
+                        let _ = tx.rollback().await;
+                        Err(error)
+                    }
                 }
-            }
+            })
+            .await?;
+        let record = recovery_job_record_from_model(row);
+        Ok(if created {
+            AtomicRecoveryJobEnqueueOutcome::Created(record)
+        } else {
+            AtomicRecoveryJobEnqueueOutcome::Reused(record)
         })
-        .await
     }
 
     pub async fn mark_attempt_recovery_action(
@@ -26741,7 +26749,7 @@ impl CrudStore {
             .connection
             .query_one_raw(Statement::from_sql_and_values(
                 DatabaseBackend::Sqlite,
-                "SELECT j.diagnostic, t.error FROM recovery_job j JOIN turn t ON t.id = j.turn_id \
+                "SELECT CASE WHEN length(CAST(j.diagnostic AS BLOB)) <= 4096 THEN j.diagnostic ELSE NULL END AS diagnostic, t.error FROM recovery_job j JOIN turn t ON t.id = j.turn_id \
              WHERE j.turn_id = ? AND t.status = 'failed' AND j.status IN ('failed', 'exhausted') \
              ORDER BY j.updated_at DESC, j.id DESC LIMIT 1",
                 [turn_id.into()],
@@ -26752,9 +26760,9 @@ impl CrudStore {
         };
         let diagnostic: Option<String> = row.try_get("", "diagnostic")?;
         let error: Option<String> = row.try_get("", "error")?;
-        let diagnostic = diagnostic.as_deref().and_then(|value| {
-            serde_json::from_str::<pioneer_protocol::RecoveryDiagnostic>(value).ok()
-        });
+        let diagnostic = diagnostic
+            .as_deref()
+            .and_then(|value| recovery_job::decode_public_diagnostic(value).ok());
         Ok(diagnostic.filter(|value| {
             value.stop_reason.is_some() && error.as_deref() == Some(value.public_message().as_str())
         }))
@@ -26768,7 +26776,7 @@ impl CrudStore {
     ) -> Result<Option<pioneer_protocol::RecoveryDiagnostic>> {
         let row = self.connection.query_one_raw(Statement::from_sql_and_values(
             DatabaseBackend::Sqlite,
-            "SELECT e.payload, t.error, j.diagnostic FROM turn t \
+            "SELECT e.payload, t.error, CASE WHEN length(CAST(j.diagnostic AS BLOB)) <= 4096 THEN j.diagnostic ELSE NULL END AS diagnostic FROM turn t \
              JOIN turn_event e ON e.turn_id = t.id AND e.sequence = \
                (SELECT MAX(sequence) FROM turn_event WHERE turn_id = t.id \
                 AND event_type IN ('turn/started', 'turn/blocked', 'turn/failed', 'turn/completed')) \
@@ -26797,9 +26805,9 @@ impl CrudStore {
         else {
             return Ok(None);
         };
-        let diagnostic = diagnostic.as_deref().and_then(|value| {
-            serde_json::from_str::<pioneer_protocol::RecoveryDiagnostic>(value).ok()
-        });
+        let diagnostic = diagnostic
+            .as_deref()
+            .and_then(|value| recovery_job::decode_public_diagnostic(value).ok());
         Ok(diagnostic.filter(|value| {
             value.stop_reason == Some(pioneer_protocol::RecoveryStopReason::NoProgress)
                 && value.last_failure.is_some()
@@ -26818,6 +26826,18 @@ impl CrudStore {
                 .map(recovery_job_record_from_model))
         })
         .await
+    }
+
+    pub async fn prepare_recovery_progress_outcome(
+        &self,
+        job_id: &str,
+        active_attempt_id: &str,
+    ) -> Result<Option<PreparedRecoveryProgress>> {
+        let prepared = recovery_job::prepare_progress(&self.connection, job_id, true).await?;
+        Ok(prepared.filter(|source| {
+            source.status == "active"
+                && source.active_attempt_id.as_deref() == Some(active_attempt_id)
+        }))
     }
 
     async fn prepare_cli_runtime_recovery_outcome_source(
@@ -26870,13 +26890,59 @@ impl CrudStore {
         now_unix: i64,
         accepted_cli_outcome: Option<&pioneer_protocol::CliRuntimeBlockedTurnGuard>,
     ) -> Result<bool> {
-        let diagnostic_json = diagnostic.as_ref().map(serde_json::to_string).transpose()?;
+        self.mark_recovery_job_retrying_with_diagnostic_and_progress(
+            job_id,
+            active_attempt_id,
+            next_run_at_unix,
+            budget_origin_after_cooldown_unix,
+            last_error,
+            diagnostic,
+            now_unix,
+            accepted_cli_outcome,
+            None,
+        )
+        .await
+    }
+
+    pub async fn mark_recovery_job_retrying_with_diagnostic_and_progress(
+        &self,
+        job_id: &str,
+        active_attempt_id: &str,
+        next_run_at_unix: i64,
+        budget_origin_after_cooldown_unix: Option<i64>,
+        last_error: Option<String>,
+        diagnostic: Option<pioneer_protocol::RecoveryDiagnostic>,
+        now_unix: i64,
+        accepted_cli_outcome: Option<&pioneer_protocol::CliRuntimeBlockedTurnGuard>,
+        prepared_progress: Option<&PreparedRecoveryProgress>,
+    ) -> Result<bool> {
+        let progress = match prepared_progress {
+            Some(source) => Some(source.clone()),
+            None => {
+                self.prepare_recovery_progress_outcome(job_id, active_attempt_id)
+                    .await?
+            }
+        };
+        let Some(progress) = progress.filter(|source| {
+            source.job_id == job_id
+                && source.status == "active"
+                && source.active_attempt_id.as_deref() == Some(active_attempt_id)
+        }) else {
+            return Ok(false);
+        };
+        let mut safe_diagnostic = diagnostic.unwrap_or_else(|| progress.diagnostic.clone());
+        safe_diagnostic.stop_reason = None;
+        let diagnostic_json = Some(progress.encoded_diagnostic(Some(&safe_diagnostic))?);
         let last_error_value = last_error.clone();
         let cli_source = self
             .prepare_cli_runtime_recovery_outcome_source(job_id)
             .await?;
         self.run_serialized_write(|| async {
             let tx = self.connection.begin().await?;
+            if !progress.current(&tx).await? {
+                tx.rollback().await?;
+                return Ok(false);
+            }
             if !cli_runtime_recovery_transition_allowed(
                 &tx,
                 job_id,
@@ -26951,17 +27017,45 @@ impl CrudStore {
         last_error: Option<String>,
         now_unix: i64,
     ) -> Result<bool> {
+        let Some(mut progress) =
+            recovery_job::prepare_progress(&self.connection, job_id, false).await?
+        else {
+            return Ok(false);
+        };
+        if progress.status != "pending"
+            || progress.claim_token.as_deref() != Some(claim_token)
+            || progress.active_attempt_id.is_some()
+        {
+            return Ok(false);
+        }
+        // This admission failed before an accepted execution baseline/work.
+        // Count an actual retry outcome as Unknown, never replay old advancement.
+        progress.state.start(None);
+        progress.state.observe_outcome(None);
+        let mut diagnostic = progress.diagnostic.clone();
+        diagnostic.stop_reason = None;
+        let diagnostic_json = progress.encoded_diagnostic(Some(&diagnostic))?;
         let last_error_value = last_error.clone();
         self.run_serialized_write(|| async {
-            recovery_job::mark_claimed_job_retrying(
-                &self.connection,
+            let tx = self.connection.begin().await?;
+            if !progress.current(&tx).await? {
+                tx.rollback().await?;
+                return Ok(false);
+            }
+            let affected = recovery_job::mark_claimed_job_retrying(
+                &tx,
                 job_id,
                 claim_token,
                 unix_to_datetime(next_run_at_unix),
                 last_error_value.clone(),
                 unix_to_datetime(now_unix),
             )
-            .await
+            .await?;
+            if affected {
+                recovery_job::set_diagnostic(&tx, job_id, diagnostic_json.clone()).await?;
+            }
+            tx.commit().await?;
+            Ok(affected)
         })
         .await
     }
@@ -26973,15 +27067,33 @@ impl CrudStore {
         active_attempt_id: &str,
         now_unix: i64,
     ) -> Result<ClaimedRecoveryActivation> {
+        let Some(progress) =
+            recovery_job::prepare_progress(&self.connection, job_id, false).await?
+        else {
+            return Ok(ClaimedRecoveryActivation::ClaimNotFound);
+        };
+        if progress.status != "pending" || progress.claim_token.as_deref() != Some(claim_token) {
+            return Ok(ClaimedRecoveryActivation::ClaimNotFound);
+        }
+        let diagnostic_json = progress.encoded_diagnostic(None)?;
         self.run_serialized_write(|| async {
+            let tx = self.connection.begin().await?;
+            if !progress.current(&tx).await? {
+                tx.rollback().await?;
+                return Ok(ClaimedRecoveryActivation::ClaimNotFound);
+            }
             let outcome = recovery_job::mark_claimed_job_active(
-                &self.connection,
+                &tx,
                 job_id,
                 claim_token,
                 active_attempt_id,
                 unix_to_datetime(now_unix),
             )
             .await?;
+            if outcome == recovery_job::ClaimedJobActivation::Activated {
+                recovery_job::set_diagnostic(&tx, job_id, diagnostic_json.clone()).await?;
+            }
+            tx.commit().await?;
             Ok(match outcome {
                 recovery_job::ClaimedJobActivation::Activated => {
                     ClaimedRecoveryActivation::Activated
@@ -27328,7 +27440,77 @@ impl CrudStore {
         now_unix: i64,
         accepted_cli_outcome: Option<&pioneer_protocol::CliRuntimeBlockedTurnGuard>,
     ) -> Result<bool> {
-        let diagnostic_json = diagnostic.as_ref().map(serde_json::to_string).transpose()?;
+        self.mark_recovery_job_terminal_after_attempt_with_diagnostic_and_progress(
+            job_id,
+            active_attempt_id,
+            status,
+            last_error,
+            diagnostic,
+            now_unix,
+            accepted_cli_outcome,
+            None,
+        )
+        .await
+    }
+
+    pub async fn mark_recovery_job_terminal_after_attempt_with_diagnostic_and_progress(
+        &self,
+        job_id: &str,
+        active_attempt_id: &str,
+        status: RecoveryJobStatus,
+        last_error: Option<String>,
+        diagnostic: Option<pioneer_protocol::RecoveryDiagnostic>,
+        now_unix: i64,
+        accepted_cli_outcome: Option<&pioneer_protocol::CliRuntimeBlockedTurnGuard>,
+        prepared_progress: Option<&PreparedRecoveryProgress>,
+    ) -> Result<bool> {
+        let loaded = match prepared_progress {
+            Some(source) => Ok(Some(source.clone())),
+            None => {
+                self.prepare_recovery_progress_outcome(job_id, active_attempt_id)
+                    .await
+            }
+        };
+        let (progress, unavailable) = match loaded {
+            Ok(source) => (source, false),
+            Err(error)
+                if error.is::<RecoveryProgressUnavailable>()
+                    && (status == RecoveryJobStatus::Blocked
+                        || (status == RecoveryJobStatus::Failed
+                            && diagnostic.as_ref().is_some_and(|diagnostic| {
+                                diagnostic.stop_reason
+                                    == Some(pioneer_protocol::RecoveryStopReason::PolicyRejected)
+                                    && diagnostic.last_failure.is_some()
+                            }))) =>
+            {
+                (None, true)
+            }
+            Err(error) => return Err(error),
+        };
+        let progress = progress.filter(|source| {
+            source.job_id == job_id
+                && source.status == "active"
+                && source.active_attempt_id.as_deref() == Some(active_attempt_id)
+        });
+        if progress.is_none() && !unavailable {
+            return Ok(false);
+        }
+        let diagnostic_json = if let Some(progress) = progress.as_ref() {
+            let clear_stale_stop = diagnostic.is_none()
+                && matches!(
+                    status,
+                    RecoveryJobStatus::Blocked | RecoveryJobStatus::Succeeded
+                );
+            let mut safe_diagnostic = diagnostic.unwrap_or_else(|| progress.diagnostic.clone());
+            if clear_stale_stop {
+                safe_diagnostic.stop_reason = None;
+            }
+            Some(progress.encoded_diagnostic(Some(&safe_diagnostic))?)
+        } else {
+            // Incompatible state can only become Blocked or a typed permanent
+            // provider failure. Charge the real attempt without resetting state.
+            diagnostic.as_ref().map(serde_json::to_string).transpose()?
+        };
         let last_error_value = last_error.clone();
         let cli_source = self
             .prepare_cli_runtime_recovery_outcome_source(job_id)
@@ -27339,6 +27521,12 @@ impl CrudStore {
                 .begin()
                 .await
                 .context("failed to begin recovery-after-attempt terminal transaction")?;
+            if let Some(progress) = progress.as_ref()
+                && !progress.current(&tx).await?
+            {
+                tx.rollback().await?;
+                return Ok(false);
+            }
             if matches!(
                 status,
                 RecoveryJobStatus::Failed
@@ -28885,9 +29073,7 @@ impl CrudStore {
         let blocked_diagnostic = job
             .diagnostic
             .as_deref()
-            .and_then(|value| {
-                serde_json::from_str::<pioneer_protocol::RecoveryDiagnostic>(value).ok()
-            })
+            .and_then(|value| recovery_job::decode_public_diagnostic(value).ok())
             .filter(|value| {
                 value.stop_reason == Some(pioneer_protocol::RecoveryStopReason::NoProgress)
             });
@@ -28916,9 +29102,7 @@ impl CrudStore {
         } else {
             job.diagnostic
                 .as_deref()
-                .and_then(|value| {
-                    serde_json::from_str::<pioneer_protocol::RecoveryDiagnostic>(value).ok()
-                })
+                .and_then(|value| recovery_job::decode_public_diagnostic(value).ok())
                 .filter(|value| value.stop_reason.is_some())
                 .unwrap_or_default()
                 .public_message()
@@ -34720,12 +34904,19 @@ fn infer_timeout_reason(
 }
 
 fn recovery_job_record_from_model(model: pioneer_entity::recovery_job::Model) -> RecoveryJobRecord {
+    let decoded = recovery_job::decode_stored_diagnostic(model.diagnostic.as_deref());
+    let progress = match &decoded {
+        Ok((_, Some(state))) => RecoveryProgressLoad::Available(state.clone()),
+        Ok((_, None)) => RecoveryProgressLoad::LegacyUnknown,
+        Err(_) => RecoveryProgressLoad::Unavailable,
+    };
     RecoveryJobRecord {
+        progress,
         last_failure_attempt_id: model.last_failure_attempt_id,
         diagnostic: model
             .diagnostic
             .as_deref()
-            .and_then(|value| serde_json::from_str(value).ok()),
+            .and_then(|wire| recovery_job::decode_public_diagnostic(wire).ok()),
         id: model.id,
         turn_id: model.turn_id,
         item_id: model.item_id,

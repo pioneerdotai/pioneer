@@ -1213,17 +1213,63 @@ impl RecoveryCoordinator {
     ) -> Result<Vec<RecoveryCoordinatorEvent>> {
         let policy = self.policy_for_recovery_job(&job).await?;
         let attempt_number = attempt_number_for_job(&job);
+        let progress = match self
+            .crud_store
+            .prepare_recovery_progress_outcome(&job.id, active_attempt_id)
+            .await
+        {
+            Ok(Some(progress)) => progress,
+            Ok(None) => return Ok(Vec::new()),
+            Err(error) if error.is::<pioneer_crud::RecoveryProgressUnavailable>() => {
+                return self
+                    .block_active_recovery_with_source(
+                        job,
+                        active_attempt_id.to_owned(),
+                        error.to_string(),
+                        None,
+                        now_unix,
+                        diagnostic.clone(),
+                        accepted_cli_outcome,
+                    )
+                    .await;
+            }
+            Err(error) => return Err(error),
+        };
+        let mode = match self.accepted_execution_window_policy(&job.turn_id).await {
+            Ok((_, mode)) => mode,
+            Err(error) if error.is::<NativeSemanticCheckpointUnavailable>() => {
+                return self
+                    .block_active_recovery_with_source(
+                        job,
+                        active_attempt_id.to_owned(),
+                        error.to_string(),
+                        None,
+                        now_unix,
+                        diagnostic.clone(),
+                        accepted_cli_outcome,
+                    )
+                    .await;
+            }
+            Err(error) => return Err(error),
+        };
         let consumed_run_count = job.run_count.saturating_add(1);
         let wall_clock_exceeded = i64::try_from(policy.max_wall_clock_secs)
             .ok()
             .is_some_and(|limit| now_unix.saturating_sub(job.scheduled_at_unix) > limit);
-        let no_progress_exceeded =
-            policy.no_progress_limit >= 0 && consumed_run_count >= policy.no_progress_limit;
+        let no_progress_exceeded = mode == pioneer_tools::ToolNoProgressMode::Enforce
+            && policy.no_progress_limit >= 0
+            && progress.state().consecutive_no_progress > 0
+            && i64::from(progress.state().consecutive_no_progress) >= policy.no_progress_limit;
+        let unconfirmed_exceeded = progress.state().consecutive_unconfirmed >= 128;
         let attempts_exhausted =
             policy.max_attempts >= 0 && consumed_run_count >= policy.max_attempts;
 
-        if wall_clock_exceeded || no_progress_exceeded || attempts_exhausted {
-            let stop_reason = budget_stop_reason(wall_clock_exceeded, attempts_exhausted);
+        if wall_clock_exceeded || no_progress_exceeded || attempts_exhausted || unconfirmed_exceeded
+        {
+            let stop_reason = budget_stop_reason(
+                wall_clock_exceeded,
+                attempts_exhausted || unconfirmed_exceeded,
+            );
             let mut diagnostic = diagnostic
                 .or_else(|| job.diagnostic.clone())
                 .unwrap_or_default();
@@ -1237,7 +1283,7 @@ impl RecoveryCoordinator {
 
             if self
                 .crud_store
-                .mark_recovery_job_terminal_after_attempt_with_diagnostic(
+                .mark_recovery_job_terminal_after_attempt_with_diagnostic_and_progress(
                     job.id.as_str(),
                     active_attempt_id,
                     RecoveryJobStatus::Exhausted,
@@ -1245,6 +1291,7 @@ impl RecoveryCoordinator {
                     Some(diagnostic),
                     now_unix,
                     accepted_cli_outcome,
+                    Some(&progress),
                 )
                 .await?
             {
@@ -1284,7 +1331,7 @@ impl RecoveryCoordinator {
         let reason = failure_message;
         if self
             .crud_store
-            .mark_recovery_job_retrying_with_diagnostic(
+            .mark_recovery_job_retrying_with_diagnostic_and_progress(
                 job.id.as_str(),
                 active_attempt_id,
                 next_run_at_unix,
@@ -1293,6 +1340,7 @@ impl RecoveryCoordinator {
                 diagnostic,
                 now_unix,
                 accepted_cli_outcome,
+                Some(&progress),
             )
             .await?
         {
@@ -2183,15 +2231,56 @@ impl RecoveryCoordinator {
             .ok()
             .is_some_and(|limit| now_unix.saturating_sub(job.scheduled_at_unix) > limit);
 
-        let no_progress_exceeded =
-            policy.no_progress_limit >= 0 && run_index > policy.no_progress_limit;
+        if job.progress == pioneer_crud::RecoveryProgressLoad::Unavailable {
+            return self
+                .block_claimed_recovery_for_unavailable_progress(
+                    job,
+                    &claim_token,
+                    pioneer_crud::RecoveryProgressUnavailable.to_string(),
+                    now_unix,
+                )
+                .await;
+        }
+        let mode = match self.accepted_execution_window_policy(&job.turn_id).await {
+            Ok((_, mode)) => mode,
+            Err(error) if error.is::<NativeSemanticCheckpointUnavailable>() => {
+                return self
+                    .block_claimed_recovery_for_unavailable_progress(
+                        job,
+                        &claim_token,
+                        error.to_string(),
+                        now_unix,
+                    )
+                    .await;
+            }
+            Err(error) => return Err(error),
+        };
+        let progress = match &job.progress {
+            pioneer_crud::RecoveryProgressLoad::Available(state) => Some(state),
+            pioneer_crud::RecoveryProgressLoad::LegacyUnknown => None,
+            pioneer_crud::RecoveryProgressLoad::Unavailable => {
+                unreachable!("unavailable progress blocked before policy");
+            }
+        };
+        let no_progress_exceeded = mode == pioneer_tools::ToolNoProgressMode::Enforce
+            && policy.no_progress_limit >= 0
+            && progress.is_some_and(|state| {
+                state.consecutive_no_progress > 0
+                    && i64::from(state.consecutive_no_progress) >= policy.no_progress_limit
+            });
+        let unconfirmed_exceeded =
+            progress.is_some_and(|state| state.consecutive_unconfirmed >= 128);
 
         let attempts_exhausted = policy.max_attempts >= 0 && run_index > policy.max_attempts;
 
-        if wall_clock_exceeded || no_progress_exceeded || attempts_exhausted {
+        if wall_clock_exceeded || no_progress_exceeded || attempts_exhausted || unconfirmed_exceeded
+        {
             let diagnostic = terminal_diagnostic(
                 &job,
-                budget_stop_reason(wall_clock_exceeded, attempts_exhausted),
+                budget_stop_reason(
+                    wall_clock_exceeded,
+                    attempts_exhausted || unconfirmed_exceeded,
+                ),
             );
             let message = diagnostic.public_message();
 
@@ -2242,7 +2331,7 @@ impl RecoveryCoordinator {
                 None,
             );
             let reason = Some("turn location missing".to_owned());
-            if self
+            if match self
                 .crud_store
                 .mark_claimed_recovery_job_retrying(
                     job.id.as_str(),
@@ -2251,8 +2340,21 @@ impl RecoveryCoordinator {
                     reason.clone(),
                     now_unix,
                 )
-                .await?
+                .await
             {
+                Ok(scheduled) => scheduled,
+                Err(error) if error.is::<pioneer_crud::RecoveryProgressUnavailable>() => {
+                    return self
+                        .block_claimed_recovery_for_unavailable_progress(
+                            job,
+                            &claim_token,
+                            error.to_string(),
+                            now_unix,
+                        )
+                        .await;
+                }
+                Err(error) => return Err(error),
+            } {
                 events.push(RecoveryCoordinatorEvent::RetryScheduled {
                     job_id: job.id,
                     turn_id: job.turn_id,
@@ -2344,10 +2446,10 @@ impl RecoveryCoordinator {
                     active_attempt_id.as_str(),
                     now_unix,
                 )
-                .await?
+                .await
             {
-                ClaimedRecoveryActivation::Activated => {}
-                ClaimedRecoveryActivation::BlockedByActiveRecovery => {
+                Ok(ClaimedRecoveryActivation::Activated) => {}
+                Ok(ClaimedRecoveryActivation::BlockedByActiveRecovery) => {
                     let _ = self
                         .crud_store
                         .release_claimed_recovery_job(
@@ -2360,7 +2462,18 @@ impl RecoveryCoordinator {
                         .await?;
                     return Ok(events);
                 }
-                ClaimedRecoveryActivation::ClaimNotFound => return Ok(events),
+                Ok(ClaimedRecoveryActivation::ClaimNotFound) => return Ok(events),
+                Err(error) if error.is::<pioneer_crud::RecoveryProgressUnavailable>() => {
+                    return self
+                        .block_claimed_recovery_for_unavailable_progress(
+                            job,
+                            &claim_token,
+                            error.to_string(),
+                            now_unix,
+                        )
+                        .await;
+                }
+                Err(error) => return Err(error),
             }
             events.push(
                 RecoveryCoordinatorEvent::CliRuntimeTerminalReconciliationRequested(Box::new(
@@ -2430,10 +2543,10 @@ impl RecoveryCoordinator {
                 active_attempt_id.as_str(),
                 now_unix,
             )
-            .await?
+            .await
         {
-            ClaimedRecoveryActivation::Activated => {}
-            ClaimedRecoveryActivation::BlockedByActiveRecovery => {
+            Ok(ClaimedRecoveryActivation::Activated) => {}
+            Ok(ClaimedRecoveryActivation::BlockedByActiveRecovery) => {
                 let _ = self
                     .crud_store
                     .release_claimed_recovery_job(
@@ -2446,7 +2559,18 @@ impl RecoveryCoordinator {
                     .await?;
                 return Ok(events);
             }
-            ClaimedRecoveryActivation::ClaimNotFound => return Ok(events),
+            Ok(ClaimedRecoveryActivation::ClaimNotFound) => return Ok(events),
+            Err(error) if error.is::<pioneer_crud::RecoveryProgressUnavailable>() => {
+                return self
+                    .block_claimed_recovery_for_unavailable_progress(
+                        job,
+                        &claim_token,
+                        error.to_string(),
+                        now_unix,
+                    )
+                    .await;
+            }
+            Err(error) => return Err(error),
         }
 
         if let Some(binding) = cli_runtime_binding {
@@ -2816,6 +2940,37 @@ impl RecoveryCoordinator {
         Ok(())
     }
 
+    async fn block_claimed_recovery_for_unavailable_progress(
+        &self,
+        job: RecoveryJobRecord,
+        claim_token: &str,
+        reason: String,
+        now_unix: i64,
+    ) -> Result<Vec<RecoveryCoordinatorEvent>> {
+        if self
+            .crud_store
+            .mark_claimed_recovery_job_terminal_with_diagnostic(
+                &job.id,
+                claim_token,
+                RecoveryJobStatus::Blocked,
+                Some(reason.clone()),
+                None,
+                now_unix,
+            )
+            .await?
+        {
+            self.cancel_other_open_jobs_after_terminal_recovery(&job.turn_id, &job.id, now_unix)
+                .await?;
+            Ok(vec![RecoveryCoordinatorEvent::RecoveryBlocked {
+                job_id: job.id,
+                turn_id: job.turn_id,
+                reason,
+            }])
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
     async fn block_active_recovery(
         &self,
         job: RecoveryJobRecord,
@@ -2824,7 +2979,30 @@ impl RecoveryCoordinator {
         stop_reason: Option<pioneer_protocol::RecoveryStopReason>,
         now_unix: i64,
     ) -> Result<Vec<RecoveryCoordinatorEvent>> {
-        let diagnostic = stop_reason.map(|stop_reason| terminal_diagnostic(&job, stop_reason));
+        self.block_active_recovery_with_source(
+            job,
+            active_attempt_id,
+            reason,
+            stop_reason,
+            now_unix,
+            None,
+            None,
+        )
+        .await
+    }
+
+    async fn block_active_recovery_with_source(
+        &self,
+        job: RecoveryJobRecord,
+        active_attempt_id: String,
+        reason: String,
+        stop_reason: Option<pioneer_protocol::RecoveryStopReason>,
+        now_unix: i64,
+        source_diagnostic: Option<pioneer_protocol::RecoveryDiagnostic>,
+        accepted_cli_outcome: Option<&pioneer_protocol::CliRuntimeBlockedTurnGuard>,
+    ) -> Result<Vec<RecoveryCoordinatorEvent>> {
+        let diagnostic = source_diagnostic
+            .or_else(|| stop_reason.map(|stop_reason| terminal_diagnostic(&job, stop_reason)));
         // Keep the last provider failure separate from the reason retries stopped.
         let last_error = if diagnostic.is_some() {
             job.last_error.clone().or_else(|| job.reason.clone())
@@ -2841,7 +3019,7 @@ impl RecoveryCoordinator {
                 last_error,
                 diagnostic,
                 now_unix,
-                None,
+                accepted_cli_outcome,
             )
             .await?
         {
@@ -6790,6 +6968,7 @@ mod tests {
 
     fn provider_plan_job(class: ProviderFailureClass, transport: &str) -> RecoveryJobRecord {
         RecoveryJobRecord {
+            progress: pioneer_crud::RecoveryProgressLoad::LegacyUnknown,
             last_failure_attempt_id: None,
             diagnostic: None,
             id: format!("job_plan_{}", super::provider_failure_class_name(class)),
@@ -9311,14 +9490,393 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn time_and_no_progress_stops_preserve_last_provider_fact() {
-        for (max_wall_clock_secs, no_progress_limit, stop_reason) in [
+    async fn recovery_progress_policy_uses_committed_domain_outcomes_in_all_modes() {
+        use sha2::Digest;
+        for mode in [
+            pioneer_tools::ToolNoProgressMode::Disabled,
+            pioneer_tools::ToolNoProgressMode::Observe,
+            pioneer_tools::ToolNoProgressMode::Enforce,
+        ] {
+            let mut config = test_tool_loop_config();
+            config.no_progress_mode = mode;
+            let (store, _agent, coordinator) =
+                setup_coordinator_with_tool_loop_config(config).await;
+            let (workspace, thread, turn) = (
+                "ws_episode_progress",
+                "thread_episode_progress",
+                "turn_episode_progress",
+            );
+            materialize_turn_with_tool_item(&store, workspace, thread, turn, "item_episode", None)
+                .await;
+            let now = chrono::DateTime::from_timestamp(1_700_000_000, 0)
+                .unwrap()
+                .fixed_offset();
+            let window = store
+                .create_turn_execution_window(
+                    NewTurnExecutionWindowRecord {
+                        workspace_id: workspace.into(),
+                        thread_id: thread.into(),
+                        turn_id: turn.into(),
+                        window_index: 1,
+                        status: ExecutionWindowStatus::Running,
+                        exhaustion_reason: None,
+                        agent_round_count: 0,
+                        tool_call_count: 0,
+                        provider_token_count: 0,
+                        metadata_json: serde_json::json!({}),
+                        started_at: now,
+                    },
+                    now,
+                    now,
+                )
+                .await
+                .unwrap();
+            let checkpoint_id = hex::encode(sha2::Sha256::digest(
+                format!("native-semantic-v1:{turn}").as_bytes(),
+            ))[..21]
+                .to_owned();
+            let payload = |counts: [u64; 3]| {
+                serde_json::json!({
+                    "schema_version":pioneer_protocol::EXECUTION_CHECKPOINT_PAYLOAD_SCHEMA_VERSION,
+                    "workspace_id":workspace,"thread_id":thread,"turn_id":turn,
+                    "original_request":{"input_count":0,"text_truncated":false,"attachment_count":0},
+                "provider_budget":{"agent_round_count":0,"tool_call_count":0,"provider_usage_available":false},
+                "tools":{"requested_count":0,"executed_count":0,"unexecuted_count":0,"total_count":0,"succeeded_count":0,"failed_count":0,"in_progress_count":0,"detail_limit":1,"details_truncated":false},
+                "window":{"window_index":1,"agent_round_count":0,"tool_call_count":0,"progress":pioneer_protocol::ExecutionProgressSummary {
+                        schema_version:1,baseline:[0;3],frontier:counts }},
+                    "native_semantic_state":{"schema_version":pioneer_protocol::NATIVE_SEMANTIC_STATE_SCHEMA_VERSION,"progress_frontier":{"schema_version":1,
+                        "advanced_observations":counts[0],"unchanged_observations":counts[1],"unknown_observations":counts[2]}}
+                })
+            };
+            store
+                .save_turn_execution_checkpoint(pioneer_crud::NewTurnExecutionCheckpointRecord {
+                    id: Some(checkpoint_id.clone()),
+                    window_id: window.id,
+                    workspace_id: workspace.into(),
+                    thread_id: thread.into(),
+                    turn_id: turn.into(),
+                    checkpoint_kind: TurnExecutionCheckpointKind::SemanticState,
+                    payload_json: payload([1, 0, 0]),
+                    created_at: now,
+                })
+                .await
+                .unwrap();
+            let job = coordinator
+                .enqueue_runtime_failure_job(
+                    &RuntimeFailureCandidate {
+                        turn_id: turn.into(),
+                        item_id: "reasoning_episode".into(),
+                        item_type: TurnItemType::Reasoning,
+                        trigger: RecoveryTrigger::RuntimeFailure,
+                        action: RecoveryAction::RestartTurn,
+                        reason: "fixture runtime failure".into(),
+                        base_backoff_secs: 1,
+                        max_attempts: 10,
+                        max_wall_clock_secs: 900,
+                        no_progress_limit: 2,
+                        metadata: Default::default(),
+                    },
+                    now.timestamp(),
+                )
+                .await
+                .unwrap()
+                .into_job();
+            for (ordinal, counts, stalls) in [
+                (1, [2, 0, 0], 0),
+                (2, [2, 1, 0], 1),
+                (3, [3, 1, 0], 0),
+                (4, [3, 2, 0], 1),
+                (5, [3, 3, 0], 2),
+            ] {
+                let current = store.get_recovery_job(&job.id).await.unwrap().unwrap();
+                let timestamp = current.next_run_at_unix.max(now.timestamp() + 1);
+                let claim = store
+                    .claim_due_recovery_jobs(timestamp, 45, 1)
+                    .await
+                    .unwrap()
+                    .remove(0);
+                let attempt = format!("episode_attempt_{ordinal}");
+                assert_eq!(
+                    store
+                        .mark_claimed_recovery_job_active(
+                            &job.id,
+                            claim.claim_token.as_deref().unwrap(),
+                            &attempt,
+                            timestamp
+                        )
+                        .await
+                        .unwrap(),
+                    ClaimedRecoveryActivation::Activated
+                );
+                let wire = payload(counts).to_string();
+                store
+                    .database_connection()
+                    .execute_raw(sea_orm::Statement::from_sql_and_values(
+                        sea_orm::DatabaseBackend::Sqlite,
+                        "UPDATE turn_execution_checkpoint SET payload_json=? WHERE id=?",
+                        [wire.into(), checkpoint_id.clone().into()],
+                    ))
+                    .await
+                    .unwrap();
+                let failure =
+                    provider_failure(ProviderFailureClass::StreamTruncated, "fixture transient");
+                let events = coordinator
+                    .record_recovery_provider_failure(
+                        &job.id,
+                        &attempt,
+                        failure.clone(),
+                        timestamp,
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                if ordinal == 5 && mode == pioneer_tools::ToolNoProgressMode::Enforce {
+                    assert!(matches!(
+                        events.as_slice(),
+                        [RecoveryCoordinatorEvent::RecoveryExhausted(_)]
+                    ));
+                } else {
+                    assert!(matches!(
+                        events.as_slice(),
+                        [RecoveryCoordinatorEvent::RetryScheduled { .. }]
+                    ));
+                }
+                let restored = store.get_recovery_job(&job.id).await.unwrap().unwrap();
+                assert_eq!(restored.run_count, ordinal);
+                let pioneer_crud::RecoveryProgressLoad::Available(progress) = restored.progress
+                else {
+                    panic!("progress");
+                };
+                assert_eq!(progress.consecutive_no_progress, stalls);
+                if ordinal == 5 && mode == pioneer_tools::ToolNoProgressMode::Enforce {
+                    assert_eq!(
+                        restored.diagnostic.unwrap().stop_reason,
+                        Some(pioneer_protocol::RecoveryStopReason::NoProgress)
+                    );
+                }
+                assert!(
+                    coordinator
+                        .record_recovery_provider_failure(
+                            &job.id, &attempt, failure, timestamp, None
+                        )
+                        .await
+                        .unwrap()
+                        .is_empty(),
+                    "duplicate outcome must not charge again"
+                );
+                assert_eq!(
+                    store
+                        .get_recovery_job(&job.id)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .run_count,
+                    ordinal
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn incompatible_checkpoint_at_activation_blocks_before_starting_attempt() {
+        use sha2::Digest;
+        let (store, coordinator) = setup_coordinator().await;
+        let (workspace, thread, turn) = (
+            "ws_bad_progress_cp",
+            "thread_bad_progress_cp",
+            "turn_bad_progress_cp",
+        );
+        materialize_turn_with_tool_item(
+            &store,
+            workspace,
+            thread,
+            turn,
+            "item_bad_progress_cp",
+            None,
+        )
+        .await;
+        let now = chrono::DateTime::from_timestamp(1_700_000_000, 0)
+            .unwrap()
+            .fixed_offset();
+        let window = store
+            .create_turn_execution_window(
+                NewTurnExecutionWindowRecord {
+                    workspace_id: workspace.into(),
+                    thread_id: thread.into(),
+                    turn_id: turn.into(),
+                    window_index: 1,
+                    status: ExecutionWindowStatus::Running,
+                    exhaustion_reason: None,
+                    agent_round_count: 0,
+                    tool_call_count: 0,
+                    provider_token_count: 0,
+                    metadata_json: serde_json::json!({}),
+                    started_at: now,
+                },
+                now,
+                now,
+            )
+            .await
+            .unwrap();
+        let id = hex::encode(sha2::Sha256::digest(
+            format!("native-semantic-v1:{turn}").as_bytes(),
+        ))[..21]
+            .to_owned();
+        store.save_turn_execution_checkpoint(pioneer_crud::NewTurnExecutionCheckpointRecord {
+            id:Some(id),window_id:window.id,workspace_id:workspace.into(),thread_id:thread.into(),turn_id:turn.into(),
+            checkpoint_kind:TurnExecutionCheckpointKind::SemanticState,
+            payload_json:serde_json::json!({"schema_version":99,"workspace_id":workspace,"thread_id":thread,"turn_id":turn}),
+            created_at:now,
+        }).await.unwrap();
+        let job = coordinator
+            .enqueue_runtime_failure_job(
+                &RuntimeFailureCandidate {
+                    turn_id: turn.into(),
+                    item_id: "reasoning_bad_progress_cp".into(),
+                    item_type: TurnItemType::Reasoning,
+                    trigger: RecoveryTrigger::RuntimeFailure,
+                    action: RecoveryAction::RestartTurn,
+                    reason: "fixture".into(),
+                    base_backoff_secs: 1,
+                    max_attempts: 10,
+                    max_wall_clock_secs: 900,
+                    no_progress_limit: 2,
+                    metadata: Default::default(),
+                },
+                now.timestamp(),
+            )
+            .await
+            .unwrap()
+            .into_job();
+        let claimed = store
+            .claim_due_recovery_jobs(now.timestamp() + 1, 45, 1)
+            .await
+            .unwrap()
+            .remove(0);
+        let events = coordinator
+            .run_claimed_recovery_job_for_test(claimed, now.timestamp() + 1)
+            .await
+            .unwrap();
+        assert!(matches!(
+            events.as_slice(),
+            [RecoveryCoordinatorEvent::RecoveryBlocked { .. }]
+        ));
+        let saved = store.get_recovery_job(&job.id).await.unwrap().unwrap();
+        assert_eq!(saved.status, RecoveryJobStatus::Blocked);
+        assert_eq!(
+            saved.run_count, 0,
+            "unprovable admission cannot charge unstarted work"
+        );
+        assert!(saved.active_attempt_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn incompatible_progress_has_safe_terminal_outcome_with_current_provider_facts() {
+        for permanent in [false, true] {
+            let (store, coordinator) = setup_coordinator().await;
+            let job = coordinator
+                .enqueue_runtime_failure_job(
+                    &RuntimeFailureCandidate {
+                        turn_id: "turn_future_progress".into(),
+                        item_id: "reasoning_future_progress".into(),
+                        item_type: TurnItemType::Reasoning,
+                        trigger: RecoveryTrigger::RuntimeFailure,
+                        action: RecoveryAction::RestartTurn,
+                        reason: "fixture".into(),
+                        base_backoff_secs: 1,
+                        max_attempts: 10,
+                        max_wall_clock_secs: 900,
+                        no_progress_limit: 2,
+                        metadata: Default::default(),
+                    },
+                    1_700_000_000,
+                )
+                .await
+                .unwrap()
+                .into_job();
+            let attempt = claim_and_activate(&store, &job.id).await;
+            store.database_connection().execute_raw(sea_orm::Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Sqlite,
+                "UPDATE recovery_job SET diagnostic=json_set(diagnostic,'$.semanticProgress.schema_version',99) WHERE id=?",
+                [job.id.clone().into()])).await.unwrap();
+            let mut failure = provider_failure(
+                if permanent {
+                    ProviderFailureClass::AuthOrPermission
+                } else {
+                    ProviderFailureClass::StreamTruncated
+                },
+                "private fixture response",
+            );
+            failure.is_recoverable_hint = !permanent;
+            let events = coordinator
+                .record_recovery_provider_failure(
+                    &job.id,
+                    &attempt,
+                    failure.clone(),
+                    1_700_000_002,
+                    None,
+                )
+                .await
+                .unwrap();
+            assert!(!events.is_empty());
+            let saved = store.get_recovery_job(&job.id).await.unwrap().unwrap();
+            assert_eq!(
+                saved.status,
+                if permanent {
+                    RecoveryJobStatus::Failed
+                } else {
+                    RecoveryJobStatus::Blocked
+                }
+            );
+            assert_eq!(saved.run_count, 1);
+            assert_eq!(
+                saved.progress,
+                pioneer_crud::RecoveryProgressLoad::Unavailable
+            );
+            let diagnostic = saved.diagnostic.unwrap();
+            assert_eq!(
+                diagnostic.last_failure,
+                Some(pioneer_protocol::RecoveryProviderFailure::from(&failure))
+            );
+            assert_eq!(
+                diagnostic.stop_reason,
+                if permanent {
+                    Some(pioneer_protocol::RecoveryStopReason::PolicyRejected)
+                } else {
+                    None
+                }
+            );
+            assert!(
+                coordinator
+                    .record_recovery_provider_failure(
+                        &job.id,
+                        &attempt,
+                        failure,
+                        1_700_000_002,
+                        None
+                    )
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn time_and_total_attempt_stops_preserve_last_provider_fact() {
+        for (max_wall_clock_secs, no_progress_limit, max_attempts, stop_reason) in [
             (
                 0,
                 9,
+                10,
                 pioneer_protocol::RecoveryStopReason::WallClockExhausted,
             ),
-            (900, 1, pioneer_protocol::RecoveryStopReason::NoProgress),
+            (
+                900,
+                1,
+                1,
+                pioneer_protocol::RecoveryStopReason::AttemptsExhausted,
+            ),
         ] {
             let (store, coordinator) = setup_coordinator().await;
             let job = coordinator
@@ -9331,7 +9889,7 @@ mod tests {
                         action: RecoveryAction::RestartTurn,
                         reason: "raw initial runtime failure".to_owned(),
                         base_backoff_secs: 1,
-                        max_attempts: 10,
+                        max_attempts,
                         max_wall_clock_secs,
                         no_progress_limit,
                         metadata: pioneer_protocol::ToolMetadata::default(),
@@ -9342,9 +9900,8 @@ mod tests {
                 .unwrap()
                 .into_job();
             let attempt = claim_and_activate(&store, &job.id).await;
-            let mut failure =
-                provider_failure(ProviderFailureClass::AuthOrPermission, "raw last failure");
-            failure.http_status = Some(403);
+            let mut failure = provider_failure(ProviderFailureClass::RateLimit, "raw last failure");
+            failure.http_status = Some(429);
             let events = coordinator
                 .record_recovery_provider_failure(
                     &job.id,
