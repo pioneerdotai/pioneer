@@ -1506,6 +1506,7 @@ mod tests {
                     "https://retired.invalid".into(),
                     "old-gateway".into(),
                     "old-session".into(),
+                    1,
                 ));
             }
             let before = core.composer_snapshot("thread").unwrap();
