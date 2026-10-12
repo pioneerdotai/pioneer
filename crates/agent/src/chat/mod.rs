@@ -2665,16 +2665,170 @@ fn next_retained_provider_history_sequence(
         .map_or(0, |sequence| sequence.saturating_add(1))
 }
 
+const MAX_RETAINED_PROVIDER_MESSAGES: usize = 8192;
+const MAX_RETAINED_PROVIDER_BYTES: usize = 256 * 1024 * 1024;
+
+struct RetainedProviderByteCounter(usize);
+impl std::io::Write for RetainedProviderByteCounter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 = self
+            .0
+            .checked_add(bytes.len())
+            .filter(|value| *value <= MAX_RETAINED_PROVIDER_BYTES)
+            .ok_or_else(|| std::io::Error::other("retained native history byte limit"))?;
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Count actual message and provenance wire bytes without another transcript allocation.
+fn retained_provider_message_bytes(message: &ChatMessage) -> Result<usize, ChatTurnError> {
+    let mut counter = RetainedProviderByteCounter(0);
+    serde_json::to_writer(&mut counter, &(message, &message.provenance)).map_err(|_| {
+        ChatTurnError::Blocked("retained native history exceeds its byte bound".into())
+    })?;
+    Ok(counter.0)
+}
+
+/// Called only after successful context preparation. The exact acknowledged
+/// checkpoint roots replace their old prefix; current native tool units stay whole.
+fn synchronize_retained_provider_history(
+    retained: &mut Vec<RetainedProviderHistoryMessage>,
+    next_sequence: &mut i64,
+    workspace: &str,
+    thread: &str,
+    turn: &str,
+    accepted: &[ChatMessage],
+) -> Result<usize, ChatTurnError> {
+    let unavailable =
+        || ChatTurnError::Blocked("retained native history projection unavailable".into());
+    let mut units = std::collections::BTreeMap::new();
+    let mut selected = Vec::new();
+    let mut bytes = 0usize;
+    for message in accepted {
+        let Some(origin) = &message.provenance else {
+            if matches!(
+                message.role,
+                pioneer_provider::Role::Assistant | pioneer_provider::Role::Tool
+            ) {
+                return Err(unavailable());
+            }
+            continue;
+        };
+        let root = origin
+            .sources
+            .iter()
+            .any(|source| source.scope.starts_with("checkpoint:"));
+        let current = origin.thread_id == thread
+            && origin.sources.iter().any(|source| {
+                source.scope.split_once(':').is_some_and(|(kind, owner)| {
+                    owner == turn
+                        && matches!(
+                            kind,
+                            "context"
+                                | "event"
+                                | "item"
+                                | "pending-assistant"
+                                | "pending-tool"
+                                | "pending-item"
+                        )
+                })
+            });
+        let keep = root
+            || (current
+                && matches!(
+                    message.role,
+                    pioneer_provider::Role::Assistant | pioneer_provider::Role::Tool
+                ));
+        let key = (origin.thread_id.as_str(), origin.unit_id.as_str());
+        if units
+            .insert(key, keep)
+            .is_some_and(|previous| previous != keep)
+        {
+            return Err(unavailable());
+        }
+        if !keep {
+            continue;
+        }
+        if origin.workspace_id != workspace || origin.sources.is_empty() {
+            return Err(unavailable());
+        }
+        if current
+            && !root
+            && !origin.sources.iter().all(|source| {
+                source.scope.split_once(':').is_some_and(|(kind, owner)| {
+                    owner == turn
+                        && matches!(
+                            kind,
+                            "context"
+                                | "event"
+                                | "item"
+                                | "pending-assistant"
+                                | "pending-tool"
+                                | "pending-item"
+                        )
+                })
+            })
+        {
+            return Err(unavailable());
+        }
+        if selected.len() >= MAX_RETAINED_PROVIDER_MESSAGES {
+            return Err(unavailable());
+        }
+        bytes = bytes
+            .checked_add(retained_provider_message_bytes(message)?)
+            .filter(|value| *value <= MAX_RETAINED_PROVIDER_BYTES)
+            .ok_or_else(unavailable)?;
+        selected.push(message);
+    }
+    // All validation precedes replacement. A failed preparation or bound leaves
+    // the old agreed projection intact, including opaque native replay state.
+    let next = selected
+        .into_iter()
+        .enumerate()
+        .map(|(sequence, message)| RetainedProviderHistoryMessage {
+            sequence: sequence as i64,
+            message: message.clone(),
+        })
+        .collect::<Vec<_>>();
+    *next_sequence = next.len() as i64;
+    *retained = next;
+    Ok(bytes)
+}
+
 fn retain_provider_history_message(
     retained_context: &mut Vec<RetainedProviderHistoryMessage>,
     next_sequence: &mut i64,
+    retained_bytes: &mut Option<usize>,
     message: &ChatMessage,
-) {
+) -> Result<(), ChatTurnError> {
+    let unavailable = || ChatTurnError::Blocked("retained native history capacity exceeded".into());
+    if retained_context.len() >= MAX_RETAINED_PROVIDER_MESSAGES {
+        return Err(unavailable());
+    }
+    let previous_bytes = match *retained_bytes {
+        Some(bytes) => bytes,
+        None => retained_context.iter().try_fold(0usize, |bytes, entry| {
+            bytes
+                .checked_add(retained_provider_message_bytes(&entry.message)?)
+                .filter(|bytes| *bytes <= MAX_RETAINED_PROVIDER_BYTES)
+                .ok_or_else(unavailable)
+        })?,
+    };
+    let bytes = previous_bytes
+        .checked_add(retained_provider_message_bytes(message)?)
+        .filter(|bytes| *bytes <= MAX_RETAINED_PROVIDER_BYTES)
+        .ok_or_else(unavailable)?;
+    let following_sequence = next_sequence.checked_add(1).ok_or_else(unavailable)?;
     retained_context.push(RetainedProviderHistoryMessage {
         sequence: *next_sequence,
         message: message.clone(),
     });
-    *next_sequence = next_sequence.saturating_add(1);
+    *next_sequence = following_sequence;
+    *retained_bytes = Some(bytes);
+    Ok(())
 }
 
 fn prompt_manifest_profile(profile: PromptProfile) -> PromptManifestProfile {
@@ -5505,6 +5659,7 @@ async fn execute_agent_provider_response(
 
     messages.push(user_message);
     let mut continuation_provider_history = retained_provider_history;
+    let mut continuation_provider_history_bytes = None;
     let mut next_provider_history_sequence =
         next_retained_provider_history_sequence(&continuation_provider_history);
     append_recovered_provider_history(&mut messages, continuation_provider_history.clone());
@@ -5846,6 +6001,12 @@ async fn execute_agent_provider_response(
                 .map_err(|error| (error, current_thinking_id.clone()))?;
             native_controls.sync_after_compaction(&covered_controls)
                 .map_err(|error| (error, current_thinking_id.clone()))?;
+            if context_session.is_some() {
+                continuation_provider_history_bytes = Some(synchronize_retained_provider_history(
+                    &mut continuation_provider_history, &mut next_provider_history_sequence,
+                    workspace_id, thread_id, turn_id, &request.messages,
+                ).map_err(|error| (error, current_thinking_id.clone()))?);
+            }
             messages = request.messages.clone();
             persist_native_semantic_checkpoint(
                 event_tx.as_ref(), workspace_id, thread_id, turn_id, input,
@@ -6615,8 +6776,9 @@ async fn execute_agent_provider_response(
             retain_provider_history_message(
                 &mut continuation_provider_history,
                 &mut next_provider_history_sequence,
+                &mut continuation_provider_history_bytes,
                 &assistant_round,
-            );
+            ).map_err(|error| (error, current_thinking_id.clone()))?;
             messages.push(assistant_round);
 
             let guarded_tool_calls = resolved_tool_calls
@@ -7417,8 +7579,9 @@ async fn execute_agent_provider_response(
                 retain_provider_history_message(
                     &mut continuation_provider_history,
                     &mut next_provider_history_sequence,
+                    &mut continuation_provider_history_bytes,
                     &result.message,
-                );
+                ).map_err(|error| (error, current_thinking_id.clone()))?;
             }
             messages.extend(executed_results.into_iter().map(|result| result.message));
 
@@ -7734,6 +7897,11 @@ mod tests {
         review_required_observation_signature, runtime_sections_with_artifact_reference_policy,
         runtime_sections_with_execution_continuation_context,
         sync_review_action_tools_to_observations, workdir_from_execution_security_snapshot,
+    };
+    use super::{
+        MAX_RETAINED_PROVIDER_BYTES, MAX_RETAINED_PROVIDER_MESSAGES, RetainedProviderByteCounter,
+        retain_provider_history_message, retained_provider_message_bytes,
+        synchronize_retained_provider_history,
     };
     use crate::{
         AgentMcpAvailability, AgentMcpMaterialization, AgentMcpMaterializationError,
@@ -10599,6 +10767,199 @@ mod tests {
                 .dynamic_system_text
                 .contains("Some tool domains and their tools are hidden until requested")
         );
+    }
+
+    #[test]
+    fn retained_history_replaces_compacted_prefix_and_preserves_signed_atomic_tool_group() {
+        use crate::compaction::history::{PendingOriginKind, pending_origin};
+        let mut assistant = ChatMessage::assistant_tool_calls_with_provider_state(
+            Some("working"),
+            Some("opaque reasoning"),
+            vec![ProviderToolCall {
+                id: "native-call".into(),
+                name: "read_file".into(),
+                arguments: "{\"path\":\"/original\"}".into(),
+            }],
+            Some(pioneer_provider::ProviderReplayState::new(
+                "test",
+                serde_json::json!({"signature":"SIGNED_SENTINEL"}),
+            )),
+        );
+        assistant.provenance = Some(pending_origin(
+            "workspace",
+            "thread",
+            "turn",
+            "round",
+            PendingOriginKind::Assistant,
+            "round",
+        ));
+        let mut result = ChatMessage::tool_result("native-call", "read_file", "result");
+        result.provenance = Some(pending_origin(
+            "workspace",
+            "thread",
+            "turn",
+            "round",
+            PendingOriginKind::ToolResult,
+            "item",
+        ));
+        result.tool_outcome = Some(pioneer_provider::ToolResultOutcome::new(
+            pioneer_provider::ToolResultStatus::Ok,
+        ));
+        // Pending metadata must remain pending, rather than becoming a reason
+        // to discard native state or to declare a domain success.
+        assistant.provenance.as_mut().unwrap().complete = false;
+        result.provenance.as_mut().unwrap().complete = false;
+        let mut retained = vec![];
+        let mut sequence = 0;
+        for generation in 0..256 {
+            let mut root = ChatMessage::user(format!("acknowledged summary {generation}"));
+            let mut origin = pending_origin(
+                "workspace",
+                "thread",
+                "turn",
+                "summary",
+                PendingOriginKind::Assistant,
+                "summary",
+            );
+            origin.unit_id = format!("checkpoint:owner:root-{generation}");
+            origin.sources[0].scope = "checkpoint:owner".into();
+            origin.sources[0].id = format!("root-{generation}");
+            origin.sources[0].version = "exact-version".into();
+            root.provenance = Some(origin);
+            let accepted = vec![
+                ChatMessage::system("instructions"),
+                ChatMessage::user("original input"),
+                root.clone(),
+                assistant.clone(),
+                result.clone(),
+            ];
+            let bytes = synchronize_retained_provider_history(
+                &mut retained,
+                &mut sequence,
+                "workspace",
+                "thread",
+                "turn",
+                &accepted,
+            )
+            .unwrap();
+            assert!(bytes < 4096);
+            assert_eq!(retained.len(), 3);
+            assert_eq!(sequence, 3);
+            assert_eq!(retained[0].message, root);
+            assert_eq!(retained[1].message, assistant);
+            assert_eq!(retained[2].message, result);
+            let mut replay = vec![];
+            append_recovered_provider_history(&mut replay, retained.clone());
+            assert_eq!(
+                replay,
+                accepted[2..],
+                "next window uses the accepted root and exact native suffix"
+            );
+        }
+    }
+
+    #[test]
+    fn retained_history_rejects_split_units_missing_proof_and_capacity_without_replacement() {
+        use crate::compaction::history::{PendingOriginKind, pending_origin};
+        let mut assistant = ChatMessage::assistant("unchanged");
+        assistant.provenance = Some(pending_origin(
+            "workspace",
+            "thread",
+            "turn",
+            "round",
+            PendingOriginKind::Assistant,
+            "round",
+        ));
+        let mut retained = vec![RetainedProviderHistoryMessage {
+            sequence: 7,
+            message: assistant.clone(),
+        }];
+        let original = retained.clone();
+        let mut sequence = 8;
+        let mut unrelated = ChatMessage::user("belongs to same indivisible unit");
+        unrelated.provenance = assistant.provenance.clone();
+        assert!(
+            synchronize_retained_provider_history(
+                &mut retained,
+                &mut sequence,
+                "workspace",
+                "thread",
+                "turn",
+                &[assistant.clone(), unrelated]
+            )
+            .is_err()
+        );
+        assert_eq!(retained, original);
+        assert_eq!(sequence, 8);
+        assert!(
+            synchronize_retained_provider_history(
+                &mut retained,
+                &mut sequence,
+                "workspace",
+                "thread",
+                "turn",
+                &[ChatMessage::assistant("unproven")]
+            )
+            .is_err()
+        );
+        assert_eq!(retained, original);
+        let mut bytes = Some(MAX_RETAINED_PROVIDER_BYTES);
+        assert!(
+            retain_provider_history_message(&mut retained, &mut sequence, &mut bytes, &assistant)
+                .is_err()
+        );
+        assert_eq!(retained, original);
+        assert_eq!(sequence, 8);
+        let mut bytes = None;
+        sequence = i64::MAX;
+        assert!(
+            retain_provider_history_message(&mut retained, &mut sequence, &mut bytes, &assistant)
+                .is_err()
+        );
+        assert_eq!(retained, original);
+        let mut crowded = vec![assistant; MAX_RETAINED_PROVIDER_MESSAGES + 1];
+        for (index, message) in crowded.iter_mut().enumerate() {
+            message.provenance.as_mut().unwrap().unit_id = format!("turn:round-{index}");
+        }
+        assert!(
+            synchronize_retained_provider_history(
+                &mut retained,
+                &mut sequence,
+                "workspace",
+                "thread",
+                "turn",
+                &crowded
+            )
+            .is_err()
+        );
+        assert_eq!(retained, original);
+    }
+
+    #[test]
+    fn retained_history_counts_physical_wire_and_provenance_bytes_with_a_real_ceiling() {
+        use std::io::Write;
+        let mut message = ChatMessage::assistant("界\n\"immutable");
+        message.provenance = Some(crate::compaction::history::pending_origin(
+            "workspace",
+            "thread",
+            "turn",
+            "round",
+            crate::compaction::history::PendingOriginKind::Assistant,
+            "round",
+        ));
+        assert_eq!(
+            retained_provider_message_bytes(&message).unwrap(),
+            serde_json::to_vec(&(&message, &message.provenance))
+                .unwrap()
+                .len()
+        );
+        let mut counter = RetainedProviderByteCounter(0);
+        for _ in 0..MAX_RETAINED_PROVIDER_BYTES / 8192 {
+            counter.write_all(&[b'a'; 8192]).unwrap();
+        }
+        assert_eq!(counter.0, MAX_RETAINED_PROVIDER_BYTES);
+        assert!(counter.write_all(b"x").is_err());
+        assert_eq!(counter.0, MAX_RETAINED_PROVIDER_BYTES);
     }
 
     #[test]
