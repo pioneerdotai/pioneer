@@ -34549,6 +34549,9 @@ mod tests {
     #[path = "native_terminal_effect_gates.rs"]
     mod terminal_effect_gates;
 
+    #[path = "episodic_delivery_tests.rs"]
+    mod episodic_delivery_tests;
+
     async fn test_store_with_started_turn(
         workspace_id: &str,
         thread_id: &str,

@@ -22,10 +22,22 @@ async fn db_fixture(legacy: bool) -> sea_orm::DatabaseConnection {
         .try_get("", "foreign_keys")
         .unwrap();
     assert_eq!(pragma, 0, "production single writer uses FK OFF");
-    let last = Migrator::migrations().len() - 1;
-    Migrator::up(&db, if legacy { Some(last as u32) } else { None })
-        .await
-        .unwrap();
+    // Legacy fixtures need the schema before frozen lifetime, regardless of
+    // how many migrations have been appended since that cutover.
+    let before_frozen_lifetime = Migrator::migrations()
+        .iter()
+        .position(|migration| migration.name() == "m20261010_000001_frozen_lifetime")
+        .expect("frozen lifetime migration must remain registered");
+    Migrator::up(
+        &db,
+        if legacy {
+            Some(before_frozen_lifetime as u32)
+        } else {
+            None
+        },
+    )
+    .await
+    .unwrap();
     db.execute_unprepared("INSERT INTO workspace(id,name,is_active,is_current) VALUES('ws','fixture',1,1),('other','other',1,0)").await.unwrap();
     db.execute_unprepared("INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES('thread','ws','','agent','m','p','active','user','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP),('other-thread','other','','agent','m','p','active','user','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)").await.unwrap();
     db

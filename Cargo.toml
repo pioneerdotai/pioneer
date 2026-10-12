@@ -45,7 +45,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.58.0"
+version = "0.58.1"
 edition = "2024"
 license = "MIT"
 authors = ["Pioneer Contributors"]
@@ -132,8 +132,8 @@ opentelemetry_sdk = { version = "0.32", default-features = false, features = ["i
 opentelemetry-otlp = { version = "0.32", default-features = false, features = ["internal-logs", "metrics", "trace", "http-proto", "reqwest-blocking-client", "experimental-http-retry"] }
 
 # UI
-gpui-kit = { git = "https://github.com/longbridge/gpui-kit", rev = "1e7ffaa6d1c0c230cb84099584e6c057531d5a5d", default-features = false, features = ["gpui-fast"] }
-gpui-webview = { git = "https://github.com/longbridge/gpui-kit", rev = "1e7ffaa6d1c0c230cb84099584e6c057531d5a5d" }
+gpui-kit = { git = "https://github.com/longbridge/gpui-kit", rev = "369f7a8f5a6602da980f008cf726467588ad517f", default-features = false, features = ["gpui-fast"] }
+gpui-webview = { git = "https://github.com/longbridge/gpui-kit", rev = "369f7a8f5a6602da980f008cf726467588ad517f" }
 wry = { version = "0.53.3", package = "lb-wry" }
 terminal = { path = "crates/terminal" }
 markdown = "1"
