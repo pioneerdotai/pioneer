@@ -349,7 +349,10 @@ impl TurnStateMachine {
             | ConversationEvent::TurnToolLoopBudgetExceeded { turn_id, .. }
             | ConversationEvent::ItemCompleted { turn_id, .. }
             | ConversationEvent::ItemUpdated { turn_id, .. } => {
+                // Admission items confirm message delivery, not execution ownership.
+                // Keep the exact pending request until its admission is acknowledged.
                 if self.matches_turn(turn_id.as_str())
+                    && !self.is_local_admission(turn_id)
                     && matches!(self.state, TurnFlowState::Starting { .. })
                 {
                     self.state = TurnFlowState::Running {

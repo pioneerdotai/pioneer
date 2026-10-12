@@ -4747,6 +4747,12 @@ mod tests {
                 workspace_id: "ws".into(),
                 thread_id: "a".into(),
                 turn_id: "admission".into(),
+                item: item.clone(),
+            }),
+            GatewayNotification::ItemUpdated(ItemUpdatedNotification {
+                workspace_id: "ws".into(),
+                thread_id: "a".into(),
+                turn_id: "admission".into(),
                 item,
             }),
         ];
@@ -4788,6 +4794,50 @@ mod tests {
             turn: composer_admission(),
         }));
         assert_successful_admission(&core);
+    }
+
+    #[test]
+    fn foreground_user_item_delivery_still_claims_running_flow() {
+        use crate::conversation::{reducer::TurnPhase, state_machine::TurnFlowState};
+        for origin in [ThreadOriginKind::User, ThreadOriginKind::DirectMessage] {
+            let core = core();
+            let mut snapshot = thread("a", "ws");
+            snapshot.origin_kind = origin;
+            core.upsert_thread(snapshot);
+            request_admission(&core, "foreground", "request");
+            core.apply_thread_notification(GatewayNotification::ItemStarted(
+                ItemStartedNotification {
+                    workspace_id: "ws".into(),
+                    thread_id: "a".into(),
+                    turn_id: "foreground".into(),
+                    item: TurnItem::UserMessage {
+                        id: "user-foreground".into(),
+                        text: "Send through Composer".into(),
+                        attachments: vec![],
+                    },
+                },
+            ));
+            let source = core.thread_snapshot("a").unwrap();
+            let conversation = &source.coordinator.conversation;
+            assert_eq!(
+                conversation.turn_flow_state(),
+                &TurnFlowState::Running {
+                    turn_id: "foreground".into()
+                }
+            );
+            assert_eq!(conversation.pending_request_id(), None);
+            assert_eq!(conversation.in_flight_turn_id(), Some("foreground"));
+            assert!(conversation.projection().composer_locked);
+            let rendered = rendered_thread(&core);
+            let view = rendered
+                .projection
+                .turns
+                .iter()
+                .find(|turn| turn.id == "foreground")
+                .unwrap();
+            assert_eq!(view.phase, TurnPhase::Running);
+            assert_eq!(rendered.projection.pending_request_id, None);
+        }
     }
 
     #[test]
