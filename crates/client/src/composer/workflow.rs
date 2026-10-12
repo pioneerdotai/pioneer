@@ -1112,7 +1112,9 @@ mod tests {
         }
     }
     fn fixture() -> (Arc<ClientCore>, ComposerOperationIdentity) {
-        let core = Arc::new(ClientCore::new());
+        fixture_using(Arc::new(ClientCore::new()))
+    }
+    fn fixture_using(core: Arc<ClientCore>) -> (Arc<ClientCore>, ComposerOperationIdentity) {
         core.composer_intent(ComposerIntent::Open {
             thread_id: "a".into(),
             defaults: ComposerDomainState::default(),
@@ -1352,6 +1354,70 @@ mod tests {
         for task in tasks {
             task.join().unwrap();
         }
+    }
+
+    #[test]
+    fn bounded_catalog_connection_transition_keeps_the_send_identity_and_dispatches_once() {
+        let (core, identity) = fixture_using(crate::catalog_test_support::client());
+        let reduction = ready_send(&core, &identity);
+        let mut event = 0;
+        let result = core.read_provider_runtimes_with_events_for_test("workspace", || {
+            event += 1;
+            if event == 1 {
+                let scope = crate::core::ClientScope::Administration { workspace_id: None };
+                let previous = core.snapshot(&scope).unwrap();
+                let mut epoch = (*previous.snapshot().payload::<crate::gateway::identity_authorization::IdentityAuthorizationPublication>().unwrap()).clone();
+                epoch.connection_id = Some(2);
+                core.publish(&crate::core::ClientMutationAuthority::for_test(), scope,
+                    crate::threads::registry::revisions(previous.revisions().scoped().get() + 1), Arc::new(epoch), vec![]);
+            } else {
+                let request = core.provider_runtime_request_for_test("workspace").unwrap();
+                core.complete_provider_runtime_for_test(request, Ok(pioneer_protocol::CLIRuntimeListResponse { revision: 1, runtimes: vec![] }));
+            }
+        });
+        assert!(result.is_ok());
+        assert_eq!(event, 2);
+        assert_eq!(
+            core.composer_snapshot("a")
+                .unwrap()
+                .operation()
+                .unwrap()
+                .identity,
+            identity
+        );
+        let (started, receive) = std::sync::mpsc::sync_channel(2);
+        let (reply, finish) = std::sync::mpsc::sync_channel(1);
+        core.send_prepared_composer_turn_using(
+            identity.clone(),
+            "workspace".into(),
+            reduction.clone(),
+            "send failed".into(),
+            SendTransport {
+                started: started.clone(),
+                reply: finish,
+            },
+        )
+        .unwrap();
+        receive
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        let (_, never) = std::sync::mpsc::sync_channel(1);
+        assert!(
+            core.send_prepared_composer_turn_using(
+                identity.clone(),
+                "workspace".into(),
+                reduction,
+                "send failed".into(),
+                SendTransport {
+                    started,
+                    reply: never
+                }
+            )
+            .is_err()
+        );
+        reply.send(true).unwrap();
+        join_sends(&core);
+        assert!(receive.try_recv().is_err());
     }
 
     #[test]

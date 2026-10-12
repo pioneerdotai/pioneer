@@ -43,7 +43,7 @@ pub struct ComposerVoiceCancelRequest {
 pub(super) struct VoiceSessionCleanup {
     session_id: Option<String>,
     identity: ComposerOperationIdentity,
-    authority: Option<(String, String, String)>,
+    authority: Option<(String, String, String, u64)>,
     cleanup_requested: bool,
 }
 const VOICE_SESSION_CLEANUP_LIMIT: usize = 64;
@@ -85,6 +85,7 @@ impl ClientCore {
     ) -> anyhow::Result<super::store::ComposerOperationPlan> {
         self.prepare_composer_voice_capture_with(identity.clone(), |workspace_id| {
             self.wait_composer_session_refresh(&identity)?;
+            let authority = self.voice_session_authority();
             let sender = self.transport_runtime().ws_command_sender();
             let access = sender
                 .current_gateway_http_access()
@@ -95,6 +96,7 @@ impl ClientCore {
                     workspace_id: Some(workspace_id.into()),
                 },
             )
+            .map(|response| (authority, response))
         })
     }
 
@@ -105,20 +107,26 @@ impl ClientCore {
         sender: &impl JsonRpcRequestTransport,
     ) -> anyhow::Result<super::store::ComposerOperationPlan> {
         self.prepare_composer_voice_capture_with(identity, |workspace_id| {
+            let authority = self.voice_session_authority();
             command_sender::voice_status(
                 sender,
                 pioneer_protocol::VoiceStatusParams {
                     workspace_id: Some(workspace_id.into()),
                 },
             )
+            .map(|response| (authority, response))
         })
     }
     fn prepare_composer_voice_capture_with(
         &self,
         identity: ComposerOperationIdentity,
-        request: impl FnOnce(&str) -> anyhow::Result<pioneer_protocol::VoiceStatusResponse>,
+        request: impl FnOnce(
+            &str,
+        ) -> anyhow::Result<(
+            Option<(String, String, String, u64)>,
+            pioneer_protocol::VoiceStatusResponse,
+        )>,
     ) -> anyhow::Result<super::store::ComposerOperationPlan> {
-        let authority = self.voice_session_authority();
         let plan = self
             .composer_operation_plan(&identity)
             .filter(|plan| plan.kind == ComposerOperationKind::Voice)
@@ -152,7 +160,8 @@ impl ClientCore {
             self.publish_composer_model_display(&mut store, next);
         }
         let response = request(&context.workspace_id);
-        let result = response.and_then(|response| {
+        // The request port captures authority after any planned refresh, before its RPC.
+        let result = response.and_then(|(authority, response)| {
             anyhow::ensure!(
                 self.voice_session_authority() == authority
                     && self.composer_operation_plan(&identity).is_some(),
@@ -216,21 +225,36 @@ impl ClientCore {
     ) -> anyhow::Result<VoiceSessionStartResponse> {
         self.prepare_composer_voice_capture(request.operation.clone())?;
         let sender = self.transport_runtime().ws_command_sender();
-        let access = sender
-            .current_gateway_http_access()
-            .map_err(|_| anyhow::anyhow!("Voice session authority unavailable"))?;
+        let authority = self
+            .voice_session_authority()
+            .ok_or_else(|| anyhow::anyhow!("Voice session authority unavailable"))?;
         // The claimed start owns its failure. A duplicate start must not fail
         // a capture that is already using this operation.
-        self.start_composer_voice_session_using(
+        self.start_composer_voice_session_with_authority(
             request,
-            &sender.requests_for_connection(access.generation),
+            &sender.requests_for_connection(authority.3),
+            Some(authority),
         )
     }
 
+    #[cfg(test)]
     fn start_composer_voice_session_using(
         &self,
         request: ComposerVoiceStartRequest,
         sender: &impl JsonRpcRequestTransport,
+    ) -> anyhow::Result<VoiceSessionStartResponse> {
+        self.start_composer_voice_session_with_authority(
+            request,
+            sender,
+            self.voice_session_authority(),
+        )
+    }
+
+    fn start_composer_voice_session_with_authority(
+        &self,
+        request: ComposerVoiceStartRequest,
+        sender: &impl JsonRpcRequestTransport,
+        authority: Option<(String, String, String, u64)>,
     ) -> anyhow::Result<VoiceSessionStartResponse> {
         let identity = request.operation;
         let plan = self
@@ -248,8 +272,11 @@ impl ClientCore {
                 == ClientTransitionOutcome::Changed,
             "Voice session already starting"
         );
-        let authority = self.voice_session_authority();
         let result = (|| {
+            anyhow::ensure!(
+                self.voice_session_authority() == authority,
+                "Voice session authority retired"
+            );
             {
                 let mut store = self.composer_store.lock().expect("composer store poisoned");
                 anyhow::ensure!(
@@ -268,7 +295,8 @@ impl ClientCore {
             }
             self.refresh_thread_subscription(sender, &context.thread_id, &context.workspace_id)?;
             anyhow::ensure!(
-                self.composer_operation_plan(&identity).is_some(),
+                self.composer_operation_plan(&identity).is_some()
+                    && self.voice_session_authority() == authority,
                 "Voice operation cancelled"
             );
             let response = command_sender::voice_session_start(
@@ -286,6 +314,9 @@ impl ClientCore {
                 let session = store
                     .voice_sessions
                     .get_mut(&identity.generation)
+                    .filter(|session| {
+                        session.identity == identity && session.authority == authority
+                    })
                     .ok_or_else(|| anyhow::anyhow!("Voice session owner retired"))?;
                 session.session_id = Some(response.session_id.clone());
             }
@@ -373,15 +404,13 @@ impl ClientCore {
         pcm_chunk: Vec<u8>,
     ) -> anyhow::Result<()> {
         let sender = self.transport_runtime().ws_command_sender();
-        let access = sender
-            .current_gateway_http_access()
-            .map_err(|_| anyhow::anyhow!("Voice session authority unavailable"))?;
+        let connection = self.composer_voice_connection(identity)?;
         anyhow::ensure!(
             self.composer_voice_session_matches(identity, &session_id),
             "Voice operation cancelled"
         );
         let result = sender.send_voice_audio_chunk_for_connection(
-            access.generation,
+            connection,
             session_id,
             sequence,
             audio_format,
@@ -405,12 +434,10 @@ impl ClientCore {
         request: ComposerVoiceFinalizeRequest,
     ) -> anyhow::Result<VoiceSessionFinalizeResponse> {
         let sender = self.transport_runtime().ws_command_sender();
-        let access = sender
-            .current_gateway_http_access()
-            .map_err(|_| anyhow::anyhow!("Voice session authority unavailable"))?;
+        let connection = self.composer_voice_connection(&request.operation)?;
         self.finalize_composer_voice_session_using(
             request,
-            &sender.requests_for_connection(access.generation),
+            &sender.requests_for_connection(connection),
         )
     }
 
@@ -439,6 +466,7 @@ impl ClientCore {
             .voice_session_id
             .clone()
             .ok_or_else(|| anyhow::anyhow!("Voice session is not started"))?;
+        let authority = self.voice_session_authority();
         anyhow::ensure!(
             self.composer_voice_session_matches(&identity, &session_id),
             "Voice session authority retired"
@@ -462,6 +490,30 @@ impl ClientCore {
                 context,
             },
         );
+        let result = result.and_then(|response| {
+            let terminal = self
+                .composer_snapshot(&identity.thread_id)
+                .is_some_and(|publication| {
+                    publication.operation().is_some_and(|operation| {
+                        operation.identity == identity
+                            && operation.kind == ComposerOperationKind::Voice
+                            && operation.voice_session_id.as_deref() == Some(session_id.as_str())
+                            && !operation.pending()
+                            && (operation.status == ComposerOperationStatus::Completed
+                                || operation
+                                    .voice_result
+                                    .as_ref()
+                                    .is_some_and(|result| result.session_id == session_id))
+                    })
+                });
+            anyhow::ensure!(
+                !self.is_stopped()
+                    && self.voice_session_authority() == authority
+                    && (self.composer_voice_session_matches(&identity, &session_id) || terminal),
+                "Voice session authority retired"
+            );
+            Ok(response)
+        });
         if let Ok(response) = &result {
             self.composer_intent(ComposerIntent::VoiceFinalized {
                 identity: identity.clone(),
@@ -487,7 +539,7 @@ impl ClientCore {
         result
     }
 
-    fn voice_session_authority(&self) -> Option<(String, String, String)> {
+    fn voice_session_authority(&self) -> Option<(String, String, String, u64)> {
         self.transport_runtime()
             .ws_command_sender()
             .current_gateway_http_access()
@@ -497,20 +549,79 @@ impl ClientCore {
                     access.gateway_base_url.as_str().to_owned(),
                     access.gateway_id.to_string(),
                     access.session_id.to_string(),
+                    access.generation,
                 )
             })
+    }
+    fn composer_voice_connection(
+        &self,
+        identity: &ComposerOperationIdentity,
+    ) -> anyhow::Result<u64> {
+        self.retire_disconnected_composer_voice(None);
+        self.composer_store
+            .lock()
+            .expect("composer store poisoned")
+            .voice_sessions
+            .get(&identity.generation)
+            .filter(|session| session.identity == *identity)
+            .and_then(|session| session.authority.as_ref().map(|authority| authority.3))
+            .ok_or_else(|| anyhow::anyhow!("Voice session authority retired"))
+    }
+
+    pub(crate) fn retire_disconnected_composer_voice(&self, closed: Option<u64>) {
+        let authority = self.voice_session_authority();
+        let retired = {
+            let mut store = self.composer_store.lock().expect("composer store poisoned");
+            let identities: Vec<_> = store
+                .voice_sessions
+                .values()
+                .filter(|session| {
+                    session.authority != authority
+                        || closed.is_some_and(|connection| {
+                            session
+                                .authority
+                                .as_ref()
+                                .is_some_and(|a| a.3 == connection)
+                        })
+                })
+                .map(|session| session.identity.clone())
+                .collect();
+            for identity in &identities {
+                store.voice_sessions.remove(&identity.generation);
+            }
+            identities
+        };
+        for identity in retired {
+            self.complete_composer_operation(
+                identity,
+                ComposerOperationCompletion::Failed {
+                    message: "Voice recording connection closed".into(),
+                },
+            );
+        }
     }
     pub fn cancel_composer_voice_session(
         &self,
         request: ComposerVoiceCancelRequest,
     ) -> anyhow::Result<VoiceSessionCancelResponse> {
         let sender = self.transport_runtime().ws_command_sender();
-        let Ok(access) = sender.current_gateway_http_access() else {
+        let connection = self
+            .composer_store
+            .lock()
+            .expect("composer store poisoned")
+            .voice_sessions
+            .get(&request.operation.generation)
+            .filter(|session| {
+                session.identity == request.operation
+                    && session.session_id.as_deref() == Some(request.session_id.as_str())
+            })
+            .and_then(|session| session.authority.as_ref().map(|authority| authority.3));
+        let Some(connection) = connection else {
             return Ok(VoiceSessionCancelResponse { cancelled: false });
         };
         self.cancel_composer_voice_session_using(
             request,
-            &sender.requests_for_connection(access.generation),
+            &sender.requests_for_connection(connection),
         )
     }
     fn cancel_composer_voice_session_using(
@@ -537,6 +648,12 @@ impl ClientCore {
                 .unwrap()
         };
         if claimed.authority != self.voice_session_authority() {
+            self.complete_composer_operation(
+                request.operation,
+                ComposerOperationCompletion::Failed {
+                    message: "Voice recording connection closed".into(),
+                },
+            );
             return Ok(VoiceSessionCancelResponse { cancelled: false });
         }
         self.complete_composer_operation(request.operation, ComposerOperationCompletion::Cancelled);
@@ -745,6 +862,413 @@ mod tests {
                 .map_err(|error| error.to_string())
         }
     }
+    fn connection(core: &ClientCore, generation: u64) {
+        core.transport_runtime()
+            .ws_command_sender()
+            .set_http_session_access_for_test(Some(crate::transport::http::GatewayHttpAccess {
+                gateway_base_url: GatewayBaseUrl::parse_presentation("https://example.test")
+                    .unwrap(),
+                gateway_id: GatewayId::new("GAAAAAAAAAAAAAAAAAAAA").unwrap(),
+                session_id: AuthSessionId::new("SAAAAAAAAAAAAAAAAAAAA").unwrap(),
+                generation,
+                access_expires_at_unix: 1000,
+                access_token: AuthSecretString::new("synthetic-token"),
+            }));
+    }
+
+    #[test]
+    fn readiness_uses_the_connection_after_planned_refresh_and_rejects_rotation_during_rpc() {
+        for during_rpc in [false, true] {
+            let (core, identity, _) = fixture();
+            connection(&core, 7);
+            let epoch = core.authorization_operation_epoch();
+            let refresh = core.schedule_gateway_refresh().unwrap();
+            assert!(core.start_gateway_refresh(refresh));
+            let transport = ReadinessTransport {
+                status: VoiceStatus::Ready,
+                calls: Default::default(),
+                during: Box::new(|| {
+                    assert!(!core.gateway_refresh_in_flight());
+                    assert_eq!(core.voice_session_authority().unwrap().3, 8);
+                    if during_rpc {
+                        connection(&core, 9);
+                    }
+                }),
+            };
+            let result = core.prepare_composer_voice_capture_with(identity.clone(), |workspace| {
+                // Complete the existing refresh controller before the readiness RPC.
+                assert!(core.gateway_refresh_in_flight());
+                connection(&core, 8);
+                assert!(core.finish_gateway_refresh(refresh));
+                core.wait_composer_session_refresh(&identity)?;
+                let authority = core.voice_session_authority();
+                command_sender::voice_status(
+                    &transport,
+                    VoiceStatusParams {
+                        workspace_id: Some(workspace.into()),
+                    },
+                )
+                .map(|response| (authority, response))
+            });
+            assert_eq!(core.authorization_operation_epoch(), epoch);
+            assert_eq!(transport.calls.get(), 1);
+            let publication = core.composer_snapshot(&identity.thread_id).unwrap();
+            let operation = publication.operation().unwrap();
+            if during_rpc {
+                assert!(result.is_err());
+                assert!(matches!(
+                    operation.status,
+                    ComposerOperationStatus::Failed { .. }
+                ));
+            } else {
+                assert_eq!(result.unwrap().identity, identity);
+                assert_eq!(
+                    operation.voice_capture_preflight,
+                    Some(ComposerVoiceCapturePreflightState::Ready)
+                );
+                assert!(operation.pending());
+            }
+        }
+    }
+
+    struct FinalizeTransport<'a> {
+        inner: Transport<'a>,
+        during_finalize: Box<dyn Fn() + 'a>,
+    }
+    impl JsonRpcRequestTransport for FinalizeTransport<'_> {
+        fn send_json_rpc_request(
+            &self,
+            request_id: String,
+            payload: String,
+            response: crate::rpc::JsonRpcResponseSender,
+        ) -> Result<(), String> {
+            let request: serde_json::Value = serde_json::from_str(&payload).unwrap();
+            if request["method"] == "voice/session/finalize" {
+                (self.during_finalize)();
+            }
+            self.inner
+                .send_json_rpc_request(request_id, payload, response)
+        }
+    }
+
+    fn turn_started(context: &VoiceTurnContext) -> GatewayNotification {
+        GatewayNotification::TurnStarted(TurnStartedNotification {
+            workspace_id: context.workspace_id.clone(),
+            thread_id: context.thread_id.clone(),
+            turn: Turn {
+                id: context.turn_id.clone(),
+                status: TurnStatus::InProgress,
+                turn_kind: TurnKind::Conversation,
+                origin: TurnOrigin::User,
+                mode: ThreadMode::Message,
+                author: None,
+                reply_to_turn_id: None,
+                mentions: vec![],
+                message_revision: 0,
+                message_deleted: false,
+                error: None,
+                prompt_manifest: None,
+                permission_profile: default_turn_permission_profile_snapshot(),
+            },
+        })
+    }
+
+    #[test]
+    fn terminal_notification_before_finalize_response_preserves_the_confirmed_outcome() {
+        for outcome in [
+            Some(VoiceSessionOutcome::TurnStarted),
+            Some(VoiceSessionOutcome::NoSpeech),
+            None,
+        ] {
+            let (core, identity, thread) = fixture();
+            connection(&core, 7);
+            let inner = Transport {
+                thread,
+                calls: Default::default(),
+                on_start: Box::new(|| {}),
+                fail_finalize: false,
+            };
+            core.start_composer_voice_session_using(start_request(identity.clone()), &inner)
+                .unwrap();
+            let context = prepare(&core, &identity);
+            let confirmed = RefCell::new(None);
+            let transport = FinalizeTransport {
+                inner,
+                during_finalize: Box::new(|| {
+                    assert_eq!(
+                        core.composer_snapshot("thread")
+                            .unwrap()
+                            .operation()
+                            .unwrap()
+                            .status,
+                        ComposerOperationStatus::Sending
+                    );
+                    let notification = match outcome {
+                        Some(outcome) => GatewayNotification::VoiceSessionResult(
+                            VoiceSessionResultNotification {
+                                session_id: "session".into(),
+                                turn_id: Some(context.turn_id.clone()),
+                                outcome,
+                                error: None,
+                            },
+                        ),
+                        None => turn_started(&context),
+                    };
+                    core.observe_composer_voice_notification(&notification);
+                    assert!(
+                        core.composer_store
+                            .lock()
+                            .unwrap()
+                            .voice_sessions
+                            .get(&identity.generation)
+                            .is_none()
+                    );
+                    *confirmed.borrow_mut() = core.composer_snapshot("thread");
+                }),
+            };
+            let response = core
+                .finalize_composer_voice_session_using(
+                    ComposerVoiceFinalizeRequest {
+                        operation: identity.clone(),
+                    },
+                    &transport,
+                )
+                .unwrap();
+            assert_eq!(response.status, VoiceStatus::Transcribing);
+            let current = core.composer_snapshot("thread").unwrap();
+            assert!(Arc::ptr_eq(confirmed.borrow().as_ref().unwrap(), &current));
+            assert!(!current.operation().unwrap().pending());
+            assert!(current.operation().unwrap().voice_finalize.is_none());
+            if outcome == Some(VoiceSessionOutcome::NoSpeech) {
+                assert_eq!(
+                    current
+                        .operation()
+                        .unwrap()
+                        .voice_result
+                        .as_ref()
+                        .unwrap()
+                        .action,
+                    crate::voice::VoiceFinalizeUiAction::ShowNoSpeechError
+                );
+                assert_eq!(current.draft().text, "preserved draft");
+            } else {
+                assert_eq!(
+                    current.operation().unwrap().status,
+                    ComposerOperationStatus::Completed
+                );
+                assert!(current.draft().text.is_empty());
+            }
+            assert_eq!(transport.inner.calls.borrow().len(), 3);
+        }
+    }
+
+    #[test]
+    fn late_finalize_response_cannot_cross_a_new_operation_or_connection() {
+        for new_operation in [false, true] {
+            let (core, identity, thread) = fixture();
+            connection(&core, 7);
+            let inner = Transport {
+                thread,
+                calls: Default::default(),
+                on_start: Box::new(|| {}),
+                fail_finalize: false,
+            };
+            core.start_composer_voice_session_using(start_request(identity.clone()), &inner)
+                .unwrap();
+            let context = prepare(&core, &identity);
+            let replacement = RefCell::new(None);
+            let transport = FinalizeTransport {
+                inner,
+                during_finalize: Box::new(|| {
+                    core.observe_composer_voice_notification(
+                        &GatewayNotification::VoiceSessionResult(VoiceSessionResultNotification {
+                            session_id: "session".into(),
+                            turn_id: Some(context.turn_id.clone()),
+                            outcome: VoiceSessionOutcome::NoSpeech,
+                            error: None,
+                        }),
+                    );
+                    if new_operation {
+                        let draft = core.composer_snapshot("thread").unwrap();
+                        assert_eq!(
+                            core.composer_intent(ComposerIntent::BeginOperation {
+                                thread_id: "thread".into(),
+                                draft_id: draft.draft_id(),
+                                operation: ComposerOperationKind::Voice,
+                            })
+                            .outcome(),
+                            ClientTransitionOutcome::Changed
+                        );
+                    } else {
+                        connection(&core, 8);
+                    }
+                    *replacement.borrow_mut() = core.composer_snapshot("thread");
+                }),
+            };
+            assert!(
+                core.finalize_composer_voice_session_using(
+                    ComposerVoiceFinalizeRequest {
+                        operation: identity
+                    },
+                    &transport
+                )
+                .is_err()
+            );
+            assert!(Arc::ptr_eq(
+                replacement.borrow().as_ref().unwrap(),
+                &core.composer_snapshot("thread").unwrap()
+            ));
+            assert_eq!(transport.inner.calls.borrow().len(), 3);
+        }
+    }
+
+    #[test]
+    fn old_voice_owner_cannot_send_chunks_finalize_or_cleanup_on_a_replacement_connection() {
+        for command in ["chunk", "finalize", "cancel"] {
+            let (core, identity, thread) = fixture();
+            connection(&core, 7);
+            let transport = Transport {
+                thread,
+                calls: Default::default(),
+                on_start: Box::new(|| {}),
+                fail_finalize: false,
+            };
+            core.start_composer_voice_session_using(start_request(identity.clone()), &transport)
+                .unwrap();
+            core.composer_intent(ComposerIntent::CommitVoiceCapture {
+                identity: identity.clone(),
+            });
+            prepare(&core, &identity);
+            let calls = transport.calls.borrow().len();
+            connection(&core, 8);
+            match command {
+                "chunk" => assert!(
+                    core.send_composer_voice_audio_chunk(
+                        &identity,
+                        "session".into(),
+                        0,
+                        start_request(identity.clone()).audio_format,
+                        None,
+                        None,
+                        vec![0, 0]
+                    )
+                    .is_err()
+                ),
+                "finalize" => assert!(
+                    core.finalize_composer_voice_session(ComposerVoiceFinalizeRequest {
+                        operation: identity.clone()
+                    })
+                    .is_err()
+                ),
+                _ => {
+                    assert!(
+                        !core
+                            .cancel_composer_voice_session_using(
+                                ComposerVoiceCancelRequest {
+                                    operation: identity.clone(),
+                                    session_id: "session".into(),
+                                    reason: None
+                                },
+                                &transport
+                            )
+                            .unwrap()
+                            .cancelled
+                    );
+                    core.retire_disconnected_composer_voice(Some(7));
+                }
+            }
+            assert_eq!(transport.calls.borrow().len(), calls);
+            assert!(!core.composer_voice_session_matches(&identity, "session"));
+            assert!(
+                !core
+                    .composer_snapshot("thread")
+                    .unwrap()
+                    .operation()
+                    .unwrap()
+                    .pending()
+            );
+            let draft = core.composer_snapshot("thread").unwrap();
+            assert_eq!(
+                core.composer_intent(ComposerIntent::BeginOperation {
+                    thread_id: "thread".into(),
+                    draft_id: draft.draft_id(),
+                    operation: ComposerOperationKind::Voice
+                })
+                .outcome(),
+                ClientTransitionOutcome::Changed
+            );
+            let replacement = core.composer_snapshot("thread").unwrap();
+            let next = replacement.operation().unwrap().identity.clone();
+            core.start_composer_voice_session_using(start_request(next.clone()), &transport)
+                .unwrap();
+            let before = core.composer_snapshot("thread").unwrap();
+            assert!(!core.complete_composer_operation(
+                identity.clone(),
+                ComposerOperationCompletion::Failed {
+                    message: "late".into()
+                }
+            ));
+            assert!(Arc::ptr_eq(
+                &before,
+                &core.composer_snapshot("thread").unwrap()
+            ));
+            assert!(core.composer_voice_session_matches(&next, "session"));
+        }
+    }
+
+    #[test]
+    fn connection_replaced_during_voice_start_rejects_the_old_result_and_allows_manual_retry() {
+        let (core, identity, thread) = fixture();
+        connection(&core, 7);
+        let transport = Transport {
+            thread: thread.clone(),
+            calls: Default::default(),
+            on_start: Box::new(|| connection(&core, 8)),
+            fail_finalize: false,
+        };
+        assert!(
+            core.start_composer_voice_session_using(start_request(identity.clone()), &transport)
+                .is_err()
+        );
+        let input = core.composer_snapshot("thread").unwrap();
+        assert!(matches!(
+            input.operation().unwrap().status,
+            ComposerOperationStatus::Failed { .. }
+        ));
+        assert!(
+            core.composer_store
+                .lock()
+                .unwrap()
+                .voice_sessions
+                .is_empty()
+        );
+        assert_eq!(
+            core.composer_intent(ComposerIntent::BeginOperation {
+                thread_id: "thread".into(),
+                draft_id: input.draft_id(),
+                operation: ComposerOperationKind::Voice
+            })
+            .outcome(),
+            ClientTransitionOutcome::Changed
+        );
+        let next = core
+            .composer_snapshot("thread")
+            .unwrap()
+            .operation()
+            .unwrap()
+            .identity
+            .clone();
+        let transport = Transport {
+            thread,
+            calls: Default::default(),
+            on_start: Box::new(|| {}),
+            fail_finalize: false,
+        };
+        core.start_composer_voice_session_using(start_request(next.clone()), &transport)
+            .unwrap();
+        assert!(core.composer_voice_session_matches(&next, "session"));
+    }
+
     #[test]
     fn capture_preflight_is_claimed_once_and_reuses_only_the_matching_ready_plan() {
         let (core, identity, _) = fixture();

@@ -207,8 +207,19 @@ impl ClientCore {
                         .map(|r| r.capabilities.supports_steer)
                 });
         }
-        let target = composer_capability_target_for_provider(provider.as_deref(), &runtimes);
-        self.apply_composer_runtime_target(&mut next, target);
+        let snapshot = store
+            .runtimes
+            .get(thread)
+            .and_then(|state| state.snapshot.as_ref());
+        // Loading/failed reads carry no evidence of a capability change. A real
+        // authorization invalidation still applies the existing restrictions.
+        if snapshot.is_some_and(|snapshot| {
+            self.provider_runtime_data_valid(snapshot.workspace_id())
+                || *snapshot.request() == ProviderRuntimeRequestState::Cancelled
+        }) {
+            let target = composer_capability_target_for_provider(provider.as_deref(), &runtimes);
+            self.apply_composer_runtime_target(&mut next, target);
+        }
         if next != *current {
             self.publish_composer_model_display(store, next);
         }
@@ -383,6 +394,181 @@ mod tests {
             },
         ));
     }
+    fn replace_connection(core: &ClientCore, connection: u64) {
+        let scope = ClientScope::Administration { workspace_id: None };
+        let previous = core.snapshot(&scope).unwrap();
+        let mut identity = (*previous
+            .snapshot()
+            .payload::<crate::gateway::identity_authorization::IdentityAuthorizationPublication>()
+            .unwrap())
+        .clone();
+        identity.connection_id = Some(connection);
+        core.publish(
+            &ClientMutationAuthority { _private: () },
+            scope,
+            crate::threads::registry::revisions(previous.revisions().scoped().get() + 1),
+            Arc::new(identity),
+            vec![],
+        );
+    }
+
+    #[test]
+    fn loading_and_failed_rotation_preserve_voice_and_send_without_execution_selections() {
+        use crate::composer::store::{ComposerOperationKind, ComposerOperationStatus};
+        for kind in [ComposerOperationKind::Voice, ComposerOperationKind::Send] {
+            let core = fixture();
+            let initial = core.provider_runtime_request_for_test("ws").unwrap();
+            core.complete_provider_runtime_for_test(initial, Ok(response(10, true)));
+            let draft = core.composer_snapshot("a").unwrap();
+            assert!(draft.domain().skill_selections.is_empty());
+            assert!(draft.domain().capabilities.is_empty());
+            core.composer_intent(ComposerIntent::EditText {
+                thread_id: "a".into(),
+                draft_id: draft.draft_id(),
+                text: "message".into(),
+            });
+            core.composer_intent(ComposerIntent::BeginOperation {
+                thread_id: "a".into(),
+                draft_id: draft.draft_id(),
+                operation: kind,
+            });
+            let operation = core
+                .composer_snapshot("a")
+                .unwrap()
+                .operation()
+                .unwrap()
+                .clone();
+            assert!(operation.pending());
+            core.provider_runtime_intent(ProviderRuntimeIntent::Refresh {
+                workspace_id: "ws".into(),
+            });
+            let old = core.provider_runtime_request_for_test("ws").unwrap();
+            replace_connection(&core, 2);
+            core.provider_runtime_intent(ProviderRuntimeIntent::Refresh {
+                workspace_id: "ws".into(),
+            });
+            let current = core.provider_runtime_request_for_test("ws").unwrap();
+            let loading = core.composer_snapshot("a").unwrap();
+            assert_eq!(loading.operation().unwrap(), &operation);
+            assert!(loading.selected_provider_ready());
+            assert_eq!(
+                loading.domain().capability_target,
+                draft.domain().capability_target
+            );
+            core.complete_provider_runtime_for_test(
+                old,
+                Ok(CLIRuntimeListResponse {
+                    revision: 100,
+                    runtimes: vec![],
+                }),
+            );
+            assert_eq!(
+                core.composer_snapshot("a").unwrap().operation().unwrap(),
+                &operation
+            );
+            // The replacement stream may restart its revision numbering.
+            core.complete_provider_runtime_for_test(current, Ok(response(1, true)));
+            assert_eq!(
+                core.provider_runtime_snapshot("ws").unwrap().request(),
+                &ProviderRuntimeRequestState::Ready
+            );
+            assert_eq!(
+                core.composer_snapshot("a").unwrap().operation().unwrap(),
+                &operation
+            );
+            core.provider_runtime_intent(ProviderRuntimeIntent::Refresh {
+                workspace_id: "ws".into(),
+            });
+            // Exhaust the existing bounded retry sequence; failure keeps accepted data.
+            let mut failed = core.provider_runtime_request_for_test("ws").unwrap();
+            for _ in 0..4 {
+                core.complete_provider_runtime_for_test(failed.clone(), Err(()));
+                if let Some(retry) = core.provider_runtime_request_for_test("ws") {
+                    failed = retry;
+                }
+            }
+            assert_eq!(
+                core.composer_snapshot("a").unwrap().operation().unwrap(),
+                &operation
+            );
+            core.provider_runtime_intent(ProviderRuntimeIntent::Refresh {
+                workspace_id: "ws".into(),
+            });
+            let current = core.provider_runtime_request_for_test("ws").unwrap();
+            core.complete_provider_runtime_for_test(
+                current,
+                Ok(CLIRuntimeListResponse {
+                    revision: 2,
+                    runtimes: vec![],
+                }),
+            );
+            let removed = core.composer_snapshot("a").unwrap();
+            assert_eq!(
+                removed.operation().unwrap().status,
+                ComposerOperationStatus::Cancelled
+            );
+            assert!(!removed.selected_provider_ready());
+        }
+    }
+
+    #[test]
+    fn actual_session_or_rights_loss_retires_an_active_send_and_accepted_runtime_information() {
+        use crate::composer::store::{ComposerOperationKind, ComposerOperationStatus};
+        for session_loss in [true, false] {
+            let core = fixture();
+            let initial = core.provider_runtime_request_for_test("ws").unwrap();
+            core.complete_provider_runtime_for_test(initial, Ok(response(1, true)));
+            let draft = core.composer_snapshot("a").unwrap();
+            core.composer_intent(ComposerIntent::EditText {
+                thread_id: "a".into(),
+                draft_id: draft.draft_id(),
+                text: "message".into(),
+            });
+            core.composer_intent(ComposerIntent::BeginOperation {
+                thread_id: "a".into(),
+                draft_id: draft.draft_id(),
+                operation: ComposerOperationKind::Send,
+            });
+            assert!(
+                core.composer_snapshot("a")
+                    .unwrap()
+                    .operation()
+                    .unwrap()
+                    .pending()
+            );
+            if session_loss {
+                core.clear_authorization_projections();
+            } else {
+                let mut revoked = core
+                    .thread_capability_snapshot("a")
+                    .unwrap()
+                    .snapshot
+                    .clone()
+                    .unwrap();
+                revoked.authorization_revision += 1;
+                let workspace = revoked.workspace.as_mut().unwrap();
+                workspace.capabilities.can_use_cli_runtimes = false;
+                workspace.operational_resources.cli_runtimes = Default::default();
+                workspace.execution_draft_policy.resources.cli_runtimes = Default::default();
+                workspace.execution_draft_policy.fingerprint = "revoked-policy".into();
+                let ticket = core.current_auth_ticket();
+                assert_eq!(
+                    core.accept_authorization_projection(ticket.0, ticket.1, revoked),
+                    crate::authorization::AuthorizationProjectionAcceptance::Accepted
+                );
+            }
+            assert!(!core.provider_runtime_data_valid("ws"));
+            assert_eq!(
+                core.composer_snapshot("a")
+                    .unwrap()
+                    .operation()
+                    .unwrap()
+                    .status,
+                ComposerOperationStatus::Cancelled
+            );
+        }
+    }
+
     #[test]
     fn selected_runtime_readiness_and_capability_target_have_one_publication_owner() {
         let core = fixture();

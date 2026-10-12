@@ -259,6 +259,11 @@ impl GatewayWsCommandSender {
             .ok_or(GatewayHttpAuthorityError::TemporarilyUnavailable)
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_http_session_access_for_test(&self, access: Option<GatewayHttpAccess>) {
+        self.replace_http_session_access(access).unwrap();
+    }
+
     pub(super) fn replace_http_session_access(
         &self,
         access: Option<GatewayHttpAccess>,
