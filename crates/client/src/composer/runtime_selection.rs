@@ -513,7 +513,9 @@ mod tests {
 
     #[test]
     fn actual_session_or_rights_loss_retires_an_active_send_and_accepted_runtime_information() {
-        use crate::composer::store::{ComposerOperationKind, ComposerOperationStatus};
+        use crate::composer::store::{
+            ComposerOperationCompletion, ComposerOperationKind, ComposerOperationStatus,
+        };
         for session_loss in [true, false] {
             let core = fixture();
             let initial = core.provider_runtime_request_for_test("ws").unwrap();
@@ -529,13 +531,13 @@ mod tests {
                 draft_id: draft.draft_id(),
                 operation: ComposerOperationKind::Send,
             });
-            assert!(
-                core.composer_snapshot("a")
-                    .unwrap()
-                    .operation()
-                    .unwrap()
-                    .pending()
-            );
+            let operation = core
+                .composer_snapshot("a")
+                .unwrap()
+                .operation()
+                .unwrap()
+                .clone();
+            assert!(operation.pending());
             if session_loss {
                 core.clear_authorization_projections();
             } else {
@@ -558,14 +560,31 @@ mod tests {
                 );
             }
             assert!(!core.provider_runtime_data_valid("ws"));
-            assert_eq!(
-                core.composer_snapshot("a")
-                    .unwrap()
-                    .operation()
-                    .unwrap()
-                    .status,
-                ComposerOperationStatus::Cancelled
-            );
+            let retired = core.composer_snapshot("a");
+            if session_loss {
+                // Losing the session evicts the protected draft entirely.
+                assert!(retired.is_none());
+            } else {
+                let retired = retired.as_ref().unwrap();
+                assert_eq!(retired.draft_id(), draft.draft_id());
+                assert_eq!(retired.operation().unwrap().identity, operation.identity);
+                assert_eq!(
+                    retired.operation().unwrap().status,
+                    ComposerOperationStatus::Cancelled
+                );
+                assert!(!retired.selected_provider_ready());
+            }
+            assert!(core.composer_operation_plan(&operation.identity).is_none());
+            assert!(!core.complete_composer_operation(
+                operation.identity,
+                ComposerOperationCompletion::Sent
+            ));
+            match retired {
+                Some(retired) => {
+                    assert!(Arc::ptr_eq(&retired, &core.composer_snapshot("a").unwrap()))
+                }
+                None => assert!(core.composer_snapshot("a").is_none()),
+            }
         }
     }
 
