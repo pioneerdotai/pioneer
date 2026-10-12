@@ -20,6 +20,7 @@ pub(super) struct NativeSemanticState {
     pub controls: super::native_control::NativeControlState,
     pub provider_history_roots: Vec<pioneer_compaction::SourceRef>,
     pub no_progress_mode: pioneer_tools::ToolNoProgressMode,
+    pub progress_frontier: pioneer_tools::ToolProgressFrontier,
     pub retry: ToolRetryCheckpoint,
     pub retry_lifecycle: ToolRetryLifecycleCheckpoint,
     pub pending_retry_instruction: Option<String>,
@@ -88,7 +89,12 @@ pub(crate) fn checkpoint_compatible(
         .ok()
         .and_then(|bytes| serde_json::from_slice::<NativeSemanticState>(&bytes).ok())
         .is_some_and(|state| {
-            state.no_progress_mode == mode && state.validate(&payload.turn_id, budget).is_ok()
+            state.no_progress_mode == mode
+                && state.validate(&payload.turn_id, budget).is_ok()
+                && pioneer_tools::ToolNoProgressGuard::checkpoint_progress_compatible(
+                    &payload.tool_no_progress,
+                    &state.progress_frontier,
+                )
         })
 }
 
@@ -162,6 +168,7 @@ impl NativeSemanticState {
                 controls: Default::default(),
                 provider_history_roots: Vec::new(),
                 no_progress_mode: mode,
+                progress_frontier: Default::default(),
                 checkpoint_revision: 0,
                 retry: ToolRetryController::new(budget.clone())
                     .checkpoint()
@@ -201,7 +208,12 @@ impl NativeSemanticState {
             .ok_or_else(unavailable)?;
         let state: Self = serde_json::from_slice(&encode(value)?).map_err(|_| unavailable())?;
         state.validate(turn, budget)?;
-        if state.no_progress_mode != mode {
+        if state.no_progress_mode != mode
+            || !pioneer_tools::ToolNoProgressGuard::checkpoint_progress_compatible(
+                &payload.tool_no_progress,
+                &state.progress_frontier,
+            )
+        {
             return Err(unavailable());
         }
         Ok(state)
@@ -213,6 +225,7 @@ impl NativeSemanticState {
 
     fn validate(&self, turn: &str, budget: &ToolRetryBudgetConfig) -> Result<(), ChatTurnError> {
         if self.schema_version != crate::NATIVE_SEMANTIC_STATE_SCHEMA_VERSION
+            || !self.progress_frontier.valid()
             || !self.controls.valid()
             || !history_roots_valid(&self.provider_history_roots)
             || self
@@ -257,6 +270,7 @@ pub(super) fn capture(
     controls: &super::native_control::NativeControlState,
     history_roots: &[pioneer_compaction::SourceRef],
     mode: pioneer_tools::ToolNoProgressMode,
+    progress_frontier: &pioneer_tools::ToolProgressFrontier,
     controller: &ToolRetryController,
     lifecycle: &ToolRetryLifecycleTracker,
     pending: &Option<String>,
@@ -275,6 +289,7 @@ pub(super) fn capture(
         controls: &'a super::native_control::NativeControlState,
         provider_history_roots: &'a [pioneer_compaction::SourceRef],
         no_progress_mode: pioneer_tools::ToolNoProgressMode,
+        progress_frontier: &'a pioneer_tools::ToolProgressFrontier,
         retry: ToolRetryCheckpoint,
         retry_lifecycle: ToolRetryLifecycleCheckpoint,
         pending_retry_instruction: &'a Option<String>,
@@ -292,6 +307,7 @@ pub(super) fn capture(
         controls,
         provider_history_roots: history_roots,
         no_progress_mode: mode,
+        progress_frontier,
         retry: controller.checkpoint().map_err(|_| unavailable())?,
         retry_lifecycle: lifecycle.checkpoint(),
         pending_retry_instruction: pending,

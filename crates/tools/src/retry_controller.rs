@@ -98,6 +98,7 @@ pub fn default_tool_retry_class_budgets() -> Vec<ToolRetryClassBudget> {
 
 #[derive(Debug, Clone)]
 pub struct ToolRetryObservation {
+    pub progress: crate::ToolProgressEvidence,
     pub item_id: String,
     pub item_type: String,
     pub attempt_number: u32,
@@ -121,6 +122,7 @@ impl ToolRetryObservation {
     ) -> Self {
         Self {
             item_id: item_id.into(),
+            progress: Default::default(),
             item_type: item_type.into(),
             attempt_number,
             tool_name: tool_name.into(),
@@ -134,6 +136,11 @@ impl ToolRetryObservation {
 
     pub fn with_recovery_view(mut self, recovery_view: Option<ToolRecoveryView>) -> Self {
         self.recovery_view = recovery_view;
+        self
+    }
+
+    pub fn with_progress(mut self, progress: crate::ToolProgressEvidence) -> Self {
+        self.progress = progress;
         self
     }
 

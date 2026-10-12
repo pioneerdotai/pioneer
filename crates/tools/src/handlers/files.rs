@@ -10,6 +10,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
+use sha2::Digest;
 use std::collections::{BTreeSet, VecDeque};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, OnceLock};
@@ -163,6 +164,7 @@ impl ToolHandler for ReadFileHandler {
             (None, None) => (0, None, args.cursor),
         };
         let requested_path = file_path.clone();
+        let progress_resource = sha2::Sha256::digest(target.identity().as_bytes()).into();
         let page = tokio::task::spawn_blocking(move || {
             let _filesystem_slot = filesystem_slot;
             let file = capability
@@ -212,6 +214,17 @@ impl ToolHandler for ReadFileHandler {
         if rendered.ends_with("---\n") {
             rendered.push_str("<empty selection>\n");
         }
+        let progress = crate::ToolProgressEvidence::resource_state(
+            progress_resource,
+            sha2::Sha256::digest(
+                [
+                    page.token.digest().as_slice(),
+                    &page.token.byte_len().to_le_bytes(),
+                ]
+                .concat(),
+            )
+            .into(),
+        );
         let version_token = page.token.to_string();
         let full_byte_count = page.token.byte_len();
         let selected_line_count = split_lines_inclusive(page.content.as_str()).len();
@@ -241,9 +254,9 @@ impl ToolHandler for ReadFileHandler {
             "output": rendered.clone(),
             "line_endings": page.line_endings,
         });
-        Ok(Box::new(FunctionToolOutput::with_payload(
-            rendered, true, payload,
-        )))
+        Ok(Box::new(
+            FunctionToolOutput::with_payload(rendered, true, payload).with_progress(progress),
+        ))
     }
 }
 
@@ -1371,6 +1384,24 @@ mod tests {
             .await
             .expect("start_byte should take precedence over cursor");
         assert_eq!(by_byte.raw_json()["text"], "gamma\n");
+        assert_eq!(
+            by_line.progress_evidence(),
+            by_byte.progress_evidence(),
+            "different selected pages must retain the same full snapshot revision"
+        );
+        let expected = crate::apply_patch::file_mutation::FileVersionToken::from_bytes(
+            b"alpha\nbeta\ngamma\n",
+        );
+        let expected_revision: [u8; 32] = sha2::Sha256::digest(
+            [
+                expected.digest().as_slice(),
+                &expected.byte_len().to_le_bytes(),
+            ]
+            .concat(),
+        )
+        .into();
+        assert!(matches!(by_line.progress_evidence().semantic,
+            crate::ToolSemanticEvidence::ResourceState { revision, .. } if revision == expected_revision));
 
         let first_page = ReadFileHandler
             .handle(

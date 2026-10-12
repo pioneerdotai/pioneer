@@ -1898,6 +1898,35 @@ struct OrderedBatchHandler {
     after: bool,
 }
 
+struct ConfirmedStalledReadHandler(Arc<AtomicUsize>);
+
+#[async_trait::async_trait]
+impl ToolHandler for ConfirmedStalledReadHandler {
+    fn supports_parallel_reads(&self) -> bool {
+        true
+    }
+
+    async fn handle(
+        &self,
+        _invocation: ToolInvocation,
+        _trace: ToolEventTrace,
+    ) -> Result<Box<dyn pioneer_tools::ToolOutput>, pioneer_tools::ToolError> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        let mut progress = pioneer_tools::ToolProgressEvidence::resource_state([7; 32], [1; 32]);
+        progress.completion = pioneer_tools::ToolCompletionEvidence::TimedOut;
+        Ok(Box::new(
+            FunctionToolOutput::new("same observed job revision", false)
+                .with_progress(progress)
+                .with_authoritative_outcome(pioneer_tools::ToolOutcome::recoverable(
+                    pioneer_tools::ToolErrorClass::Timeout,
+                    "observation timed out",
+                    false,
+                    None,
+                )),
+        ))
+    }
+}
+
 #[async_trait::async_trait]
 impl ToolHandler for OrderedBatchHandler {
     fn supports_parallel_reads(&self) -> bool {
@@ -12311,6 +12340,89 @@ async fn request_tools_selection_survives_execution_window_and_not_next_turn() {
     assert!(!has_memory_write(
         provider.snapshot_requests().last().unwrap()
     ));
+}
+
+#[tokio::test]
+async fn native_identical_read_batch_observes_exact_allowance_before_the_next_spawn() {
+    for mode in [
+        pioneer_tools::ToolNoProgressMode::Enforce,
+        pioneer_tools::ToolNoProgressMode::Observe,
+        pioneer_tools::ToolNoProgressMode::Disabled,
+    ] {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let handler: Arc<dyn ToolHandler> = Arc::new(ConfirmedStalledReadHandler(calls.clone()));
+        let provider = Arc::new(SequencedToolProvider::new(
+            (0..5)
+                .map(|i| ProviderToolCall {
+                    id: format!("same_read_{i}"),
+                    name: "batch_wait".to_owned(),
+                    arguments: "{}".to_owned(),
+                })
+                .collect(),
+            "all observed results reported",
+        ));
+        let mut config = test_tool_loop_config();
+        config.no_progress_mode = mode;
+        let manager = AgentManager::new(
+            Arc::new(ProviderRegistry::with_provider(
+                "sequenced-tools",
+                provider.clone(),
+            )),
+            config,
+        );
+        manager
+            .set_turn_tool_provider(Some(Arc::new(StaticTurnToolProvider {
+                bundle: fake_task_tool_bundle_for_names(&["batch_wait"], handler),
+            })))
+            .await;
+        manager
+            .ensure_thread("duplicate_thread", "duplicate_workspace")
+            .await
+            .unwrap();
+        let mut events = subscribe_agent_events(&manager, "duplicate_thread").await;
+        manager
+            .start_test_turn_with_default_profile_and_capabilities(
+                "duplicate_thread",
+                "duplicate_turn",
+                ThreadMode::Agent,
+                "test-model",
+                "sequenced-tools",
+                HashMap::new(),
+                vec![UserInput::Text {
+                    text: "observe the same job revision".to_owned(),
+                    text_elements: Vec::new(),
+                }],
+                Vec::new(),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        let _terminal = recv_events_until_terminal(&mut events).await;
+        // The first result establishes the authoritative baseline; only the
+        // next two timeouts prove unchanged state. Later identical calls must
+        // see that updated parent state before they can execute.
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            if mode == pioneer_tools::ToolNoProgressMode::Enforce {
+                3
+            } else {
+                5
+            }
+        );
+        let requests = provider.snapshot_requests();
+        let replay = requests
+            .get(1)
+            .expect("the complete batch reaches provider replay");
+        let ids = replay
+            .messages
+            .iter()
+            .filter_map(|message| message.tool_call_id.as_deref())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ids,
+            (0..5).map(|i| format!("same_read_{i}")).collect::<Vec<_>>()
+        );
+    }
 }
 
 #[tokio::test]

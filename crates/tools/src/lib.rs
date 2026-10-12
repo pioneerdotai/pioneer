@@ -17,6 +17,7 @@ mod output_policy;
 mod output_projection;
 mod permissions;
 mod process_policy;
+mod progress;
 mod registry;
 mod retry_controller;
 mod router;
@@ -108,6 +109,10 @@ pub use permissions::{
     StaticPermissionApprovalBroker, ToolPermissionEvaluator, extract_permission_intent,
 };
 pub use process_policy::{ProcessSpawnPlan, build_process_spawn_plan, resolve_process_cwd};
+pub use progress::{
+    ToolCompletionEvidence, ToolProgressDisposition, ToolProgressEvidence, ToolProgressFrontier,
+    ToolSemanticEvidence, ToolStreamActivity,
+};
 pub use registry::{ToolHandler, ToolRegistry, ToolRegistryBuilder};
 pub use retry_controller::{
     ToolFailureSignature, ToolRetryBudgetConfig, ToolRetryBudgetKind, ToolRetryBudgetSnapshot,

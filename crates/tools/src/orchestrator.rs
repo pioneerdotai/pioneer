@@ -156,9 +156,10 @@ impl PostExecutionPolicy {
 
     fn apply(&self, invocation: &ToolInvocation, result: &mut AnyToolResult) {
         let raw_output_json = result.raw_output_json();
-        let outcome =
+        let outcome = result.output.authoritative_outcome().unwrap_or_else(|| {
             self.classifier
-                .classify_result(invocation, &raw_output_json, result.success());
+                .classify_result(invocation, &raw_output_json, result.success())
+        });
         result.set_outcome(outcome);
     }
 
@@ -4673,6 +4674,50 @@ mod tests {
             Some(crate::context::ToolErrorClass::CommandNotFound)
         );
         assert!(outcome.should_retry);
+    }
+
+    #[test]
+    fn dynamic_wrapper_retains_actual_nested_timeout_before_model_projection() {
+        let invocation = invocation_for_tool(
+            "skill.dynamic.proxy",
+            ToolPayload::Function {
+                arguments: serde_json::json!({}),
+            },
+        );
+        let child_outcome = ToolOutcome::recoverable(
+            crate::ToolErrorClass::Timeout,
+            "actual child timeout",
+            false,
+            None,
+        );
+        let mut result = AnyToolResult {
+            call_id: invocation.call_id.clone(),
+            tool_name: invocation.tool_name.clone(),
+            payload: invocation.payload.clone(),
+            output: Box::new(
+                FunctionToolOutput::with_payload(
+                    "obscured",
+                    false,
+                    serde_json::json!({"stdout":"", "timed_out":true}),
+                )
+                .with_authoritative_outcome(child_outcome),
+            ),
+            outcome: ToolOutcome::ok(),
+            projection: None,
+        };
+        PostExecutionPolicy::default().apply(&invocation, &mut result);
+        assert_eq!(
+            result.outcome.error_class,
+            Some(crate::ToolErrorClass::Timeout)
+        );
+        assert_eq!(
+            result.outcome.status,
+            crate::ToolOutcomeStatus::RecoverableError
+        );
+        assert_eq!(
+            result.outcome.provider_outcome().status,
+            pioneer_provider::ToolResultStatus::RecoverableError
+        );
     }
 }
 

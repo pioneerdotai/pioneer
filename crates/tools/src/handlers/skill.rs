@@ -785,11 +785,11 @@ impl ToolHandler for SkillShellToolHandler {
             "truncated": truncated
         });
 
-        Ok(Box::new(FunctionToolOutput::with_payload(
-            merged,
-            nested.success(),
-            payload,
-        )))
+        Ok(Box::new(
+            FunctionToolOutput::with_payload(merged, nested.success(), payload)
+                .with_progress(nested.progress_evidence())
+                .with_authoritative_outcome(nested.outcome.clone()),
+        ))
     }
 }
 
@@ -844,11 +844,11 @@ impl ToolHandler for SkillFunctionProxyHandler {
         .await?;
 
         let payload = nested.raw_output_json();
-        Ok(Box::new(FunctionToolOutput::with_payload(
-            nested.raw_output_text(),
-            nested.success(),
-            payload,
-        )))
+        Ok(Box::new(
+            FunctionToolOutput::with_payload(nested.raw_output_text(), nested.success(), payload)
+                .with_progress(nested.progress_evidence())
+                .with_authoritative_outcome(nested.outcome.clone()),
+        ))
     }
 }
 

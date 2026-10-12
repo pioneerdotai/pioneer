@@ -220,6 +220,7 @@ struct AgentRoundResponse {
 
 #[derive(Debug)]
 struct ExecutedToolResult {
+    progress: pioneer_tools::ToolProgressEvidence,
     item_id: String,
     provider_call_id: String,
     ordinal: u32,
@@ -279,6 +280,7 @@ fn unknown_tool_task_result(
 ) -> ExecutedToolResult {
     let outcome = ToolOutcome::fatal(ToolErrorClass::Internal, Some(message.clone()));
     ExecutedToolResult {
+        progress: Default::default(),
         item_id,
         provider_call_id: provider_call_id.clone(),
         ordinal,
@@ -460,6 +462,7 @@ impl ExecutedToolResult {
         )
         .with_recovery_view(self.recovery_view.clone())
         .with_model_visible_text(self.model_visible_text.clone())
+        .with_progress(self.progress)
     }
 }
 
@@ -5753,6 +5756,9 @@ async fn execute_agent_provider_response(
         restored_no_progress_state,
         semantic.no_progress_mode,
     );
+    tool_no_progress_guard
+        .restore_progress_frontier(semantic.progress_frontier)
+        .map_err(|message| ChatTurnError::Blocked(message.to_owned()))?;
     let mut tool_retry_lifecycle = ToolRetryLifecycleTracker::from_checkpoint(
         turn_id,
         semantic.retry_lifecycle,
@@ -5781,6 +5787,7 @@ async fn execute_agent_provider_response(
                     &native_controls.state,
                     &provider_history_roots,
                     tool_loop_config.no_progress_mode,
+                    tool_no_progress_guard.progress_frontier(),
                     &tool_retry_controller,
                     &tool_retry_lifecycle,
                     &pending_retry_instruction,
@@ -6976,6 +6983,7 @@ async fn execute_agent_provider_response(
                             )
                             .await?;
                             return Ok(ExecutedToolResult {
+                                progress: Default::default(),
                                 item_id: item_id.clone(),
                                 provider_call_id: provider_call_id.clone(),
                                 ordinal,
@@ -7137,6 +7145,7 @@ async fn execute_agent_provider_response(
                                 .await?;
 
                                 return Ok(ExecutedToolResult {
+                                    progress: Default::default(),
                                     item_id: item_id.clone(),
                                     provider_call_id: provider_call_id.clone(),
                                     ordinal,
@@ -7226,6 +7235,7 @@ async fn execute_agent_provider_response(
                                     .await?;
                                 }
                                 return Ok(ExecutedToolResult {
+                                    progress: Default::default(),
                                     item_id: item_id.clone(),
                                     provider_call_id: provider_call_id.clone(),
                                     ordinal,
@@ -7296,6 +7306,7 @@ async fn execute_agent_provider_response(
                             .complete_attempt(turn_id.as_str(), item_id.as_str())
                             .await;
 
+                        let progress = dispatch_result.as_ref().ok().map(|result| result.progress_evidence()).unwrap_or_default();
                         let full_source_in_item = dispatch_result.as_ref().ok().and_then(|r| r.projection()).is_some_and(|p| matches!(p.storage, pioneer_protocol::ToolStoragePayload::Shell { .. }) && matches!(p.output_policy.storage, pioneer_protocol::StorageOutputPolicy::Full { .. }));
                         let full_message = dispatch_result.as_ref().ok().map(|result| {
                             let mut message = result.to_history_message();
@@ -7369,6 +7380,7 @@ async fn execute_agent_provider_response(
                         );
 
                         Ok(ExecutedToolResult {
+                            progress,
                             item_id: item_id.clone(),
                             provider_call_id,
                             ordinal,
@@ -9163,6 +9175,7 @@ mod tests {
 
     fn task_result(tool_name: &str, success: bool, text: &str) -> ExecutedToolResult {
         ExecutedToolResult {
+            progress: Default::default(),
             item_id: "item_1234567890123456".to_owned(),
             provider_call_id: "provider_call_1".to_owned(),
             ordinal: 0,
@@ -10487,6 +10500,19 @@ mod tests {
             id: "acknowledged-root".into(),
             version: "exact-version".into(),
         }];
+        let mut progress_guard = super::ToolNoProgressGuard::default();
+        progress_guard.observe(&[pioneer_tools::ToolRetryObservation::from_tool_outcome(
+            "snapshot",
+            "dynamic_tool_call",
+            1,
+            "read_file",
+            "{}",
+            true,
+            pioneer_tools::ToolOutcome::ok(),
+        )
+        .with_progress(pioneer_tools::ToolProgressEvidence::resource_state(
+            [1; 32], [2; 32],
+        ))]);
         let mut context = execution_checkpoint_context_fixture();
         context.window_index = context.payload.window.window_index;
         context.payload.native_semantic_state = Some(
@@ -10497,6 +10523,7 @@ mod tests {
                 &super::native_control::NativeControlState::default(),
                 &roots,
                 pioneer_tools::ToolNoProgressMode::Enforce,
+                progress_guard.progress_frontier(),
                 &controller,
                 &lifecycle,
                 &pending,
@@ -10544,6 +10571,61 @@ mod tests {
             )
             .is_err()
         );
+        assert_eq!(state.progress_frontier.advanced_observations, 1);
+        let mut cold_progress = super::ToolNoProgressGuard::default();
+        cold_progress
+            .restore_progress_frontier(state.progress_frontier.clone())
+            .unwrap();
+        cold_progress.observe(&[pioneer_tools::ToolRetryObservation::from_tool_outcome(
+            "same-snapshot",
+            "dynamic_tool_call",
+            1,
+            "read_file",
+            "{}",
+            true,
+            pioneer_tools::ToolOutcome::ok(),
+        )
+        .with_progress(pioneer_tools::ToolProgressEvidence::resource_state(
+            [1; 32], [2; 32],
+        ))]);
+        assert_eq!(cold_progress.progress_frontier().advanced_observations, 1);
+        assert_eq!(cold_progress.progress_frontier().unchanged_observations, 1);
+        let mut legacy_progress = context.clone();
+        legacy_progress
+            .payload
+            .native_semantic_state
+            .as_mut()
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .remove("progress_frontier");
+        assert!(!crate::native_semantic_checkpoint_compatible(
+            &legacy_progress.payload,
+            &budget,
+            pioneer_tools::ToolNoProgressMode::Enforce
+        ));
+        let mut future_progress = context.clone();
+        future_progress
+            .payload
+            .native_semantic_state
+            .as_mut()
+            .unwrap()["progress_frontier"]["schema_version"] = serde_json::json!(99);
+        assert!(!crate::native_semantic_checkpoint_compatible(
+            &future_progress.payload,
+            &budget,
+            pioneer_tools::ToolNoProgressMode::Enforce
+        ));
+        let mut inconsistent_progress = context.clone();
+        inconsistent_progress
+            .payload
+            .native_semantic_state
+            .as_mut()
+            .unwrap()["progress_frontier"]["advanced_observations"] = serde_json::json!(0);
+        assert!(!crate::native_semantic_checkpoint_compatible(
+            &inconsistent_progress.payload,
+            &budget,
+            pioneer_tools::ToolNoProgressMode::Enforce,
+        ));
         let mut legacy_mode = context.clone();
         legacy_mode
             .payload
@@ -10659,6 +10741,7 @@ mod tests {
                 &super::native_control::NativeControlState::default(),
                 &[],
                 pioneer_tools::ToolNoProgressMode::Enforce,
+                &pioneer_tools::ToolProgressFrontier::default(),
                 &controller,
                 &lifecycle,
                 &oversized,
