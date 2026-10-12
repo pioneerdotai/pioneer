@@ -185,6 +185,7 @@ mod tests {
                 attachment_kinds: Vec::new(),
             },
             ExecutionCheckpointWindowSummary {
+                progress: None,
                 window_id: Some("window_4".to_owned()),
                 window_index: 4,
                 started_at_unix_ms: Some(1),
@@ -260,6 +261,7 @@ mod tests {
                 total_wall_clock_ms: 0,
                 total_provider_tokens: 0,
                 provider_token_usage_unknown: false,
+                consecutive_unconfirmed_progress_windows: 0,
                 consecutive_no_progress_windows: 0,
             }
         );

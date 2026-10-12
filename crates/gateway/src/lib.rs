@@ -1372,6 +1372,9 @@ fn execution_windows_config_from_gateway_execution_windows_config(
             max_wall_clock_ms_per_turn: config.total.max_wall_clock_ms_per_turn,
             max_provider_tokens_per_turn: config.total.max_provider_tokens_per_turn,
             max_consecutive_no_progress_windows: config.total.max_consecutive_no_progress_windows,
+            max_consecutive_unconfirmed_progress_windows: config
+                .total
+                .max_consecutive_unconfirmed_progress_windows,
         },
     }
     .normalized()
@@ -1859,6 +1862,7 @@ mod runtime_tests {
                     max_wall_clock_ms_per_turn: Some(3_000),
                     max_provider_tokens_per_turn: Some(4_000),
                     max_consecutive_no_progress_windows: 2,
+                    max_consecutive_unconfirmed_progress_windows: 128,
                 },
             }),
             retry: GatewayToolRetryBudgetConfig::default(),

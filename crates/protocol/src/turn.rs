@@ -2572,8 +2572,76 @@ pub struct ExecutionCheckpointOriginalRequestSummary {
     pub attachment_kinds: Vec<String>,
 }
 
+/// Fixed domain-observation counts owned by one original execution window.
+/// Activity, completion and display text never populate these counts.
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionProgressSummary {
+    pub schema_version: u32,
+    /// Advanced, unchanged and unknown cumulative observations at window start.
+    pub baseline: [u64; 3],
+    pub frontier: [u64; 3],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionProgressKind {
+    Advanced,
+    Unchanged,
+    Unknown,
+}
+
+impl ExecutionProgressSummary {
+    /// Bound legacy/malformed metadata before cloning or decoding it.
+    pub fn from_value(value: &serde_json::Value) -> Option<Self> {
+        struct Limit(Vec<u8>);
+        impl std::io::Write for Limit {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if self
+                    .0
+                    .len()
+                    .checked_add(bytes.len())
+                    .is_none_or(|size| size > 256)
+                {
+                    return Err(std::io::Error::other("progress summary byte limit"));
+                }
+                self.0.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut wire = Limit(Vec::new());
+        serde_json::to_writer(&mut wire, value).ok()?;
+        let summary: Self = serde_json::from_slice(&wire.0).ok()?;
+        summary.valid().then_some(summary)
+    }
+    pub fn valid(&self) -> bool {
+        self.schema_version == 1
+            && self
+                .frontier
+                .iter()
+                .zip(self.baseline)
+                .all(|(current, previous)| *current >= previous)
+    }
+    pub fn kind(&self) -> ExecutionProgressKind {
+        if !self.valid() || self.frontier.contains(&u64::MAX) {
+            return ExecutionProgressKind::Unknown;
+        }
+        if self.frontier[0] > self.baseline[0] {
+            ExecutionProgressKind::Advanced
+        } else if self.frontier[2] == self.baseline[2] && self.frontier[1] > self.baseline[1] {
+            ExecutionProgressKind::Unchanged
+        } else {
+            ExecutionProgressKind::Unknown
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
 pub struct ExecutionCheckpointWindowSummary {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress: Option<ExecutionProgressSummary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub window_id: Option<String>,
     pub window_index: u32,
@@ -6466,6 +6534,7 @@ mod tests {
             "turn_1",
             original_request,
             ExecutionCheckpointWindowSummary {
+                progress: None,
                 window_id: Some("win_1".to_owned()),
                 window_index: 1,
                 started_at_unix_ms: Some(1000),
@@ -8924,5 +8993,39 @@ mod tests {
                 observation: None,
             },
         ]
+    }
+}
+
+#[cfg(test)]
+mod execution_progress_tests {
+    use super::{ExecutionProgressKind as Kind, ExecutionProgressSummary as Summary};
+    #[test]
+    fn domain_counts_preserve_unknown_and_have_a_fixed_wire_bound() {
+        for (baseline, frontier, expected) in [
+            ([1, 0, 0], [1, 1, 0], Kind::Unchanged),
+            ([1, 0, 0], [1, 1, 1], Kind::Unknown),
+            ([1, 1, 1], [2, 1, 2], Kind::Advanced),
+            ([1, 1, 1], [1, 1, 1], Kind::Unknown),
+            ([2, 1, 1], [1, 1, 1], Kind::Unknown),
+            ([0; 3], [u64::MAX; 3], Kind::Unknown),
+        ] {
+            let summary = Summary {
+                schema_version: 1,
+                baseline,
+                frontier,
+            };
+            assert_eq!(summary.kind(), expected);
+            let wire = serde_json::to_vec(&summary).unwrap();
+            assert!(wire.len() <= 256);
+            let value = serde_json::to_value(summary).unwrap();
+            assert_eq!(Summary::from_value(&value).is_some(), summary.valid());
+        }
+        assert!(
+            Summary::from_value(
+                &serde_json::json!({"schema_version":99,"baseline":[0,0,0],"frontier":[1,0,0]})
+            )
+            .is_none()
+        );
+        assert!(Summary::from_value(&serde_json::json!({"schema_version":1,"baseline":[0,0,0],"frontier":[1,0,0],"padding":"x".repeat(256)})).is_none());
     }
 }

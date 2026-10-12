@@ -22459,6 +22459,7 @@ async fn recovered_hidden_task_run_uses_preflight_before_restored_child_main_pro
             attachment_kinds: Vec::new(),
         },
         pioneer_protocol::ExecutionCheckpointWindowSummary {
+            progress: None,
             window_id: Some(runtime_window_id.clone()),
             window_index: runtime_window_index,
             started_at_unix_ms: Some(1_000),
@@ -39612,6 +39613,7 @@ async fn direct_durable_execution_window_lifecycle_updates_rows() {
             attachment_kinds: Vec::new(),
         },
         pioneer_protocol::ExecutionCheckpointWindowSummary {
+            progress: None,
             window_id: Some("runtime_win_1".to_owned()),
             window_index: 1,
             started_at_unix_ms: Some(1_000),

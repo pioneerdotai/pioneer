@@ -41,6 +41,7 @@ fn continuation_checkpoint_payload() -> ExecutionCheckpointPayload {
             attachment_kinds: Vec::new(),
         },
         window: ExecutionCheckpointWindowSummary {
+            progress: None,
             window_id: Some("turn_snapshot:window:1".to_owned()),
             window_index: 1,
             started_at_unix_ms: Some(1_000),

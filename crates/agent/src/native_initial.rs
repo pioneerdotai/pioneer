@@ -41,6 +41,7 @@ pub struct NativeInitialResumeRequirements {
     pub mcp_projection: Option<(String, usize)>,
     pub tool_retry_budget: pioneer_tools::ToolRetryBudgetConfig,
     pub no_progress_mode: pioneer_tools::ToolNoProgressMode,
+    pub execution_windows: pioneer_tools::ExecutionWindowsConfig,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -106,7 +107,7 @@ impl NativeInitialPreparation {
         );
         encode(
             &InitialPhaseSnapshot {
-                schema_version: 1,
+                schema_version: 2,
                 workspace_id: workspace_id.to_owned(),
                 thread_id: thread_id.to_owned(),
                 turn_id: turn_id.to_owned(),
@@ -222,6 +223,7 @@ impl NativeInitialPreparation {
         Ok(Some(NativeInitialResumeRequirements {
             tool_retry_budget: outputs.config.retry.clone(),
             no_progress_mode: outputs.config.no_progress_mode,
+            execution_windows: outputs.config.execution_windows.clone(),
             native_agent_action_contract: has_turn_owner
                 .then_some(outputs.native_agent_action_contract)
                 .flatten(),
@@ -342,7 +344,7 @@ fn decode(encoded: &str, byte_budget: usize) -> Result<InitialPhaseSnapshot> {
     let snapshot: InitialPhaseSnapshot = serde_json::from_str(encoded)
         .map_err(|_| anyhow::anyhow!("initial preparation is incompatible"))?;
     ensure!(
-        snapshot.schema_version == 1,
+        snapshot.schema_version == 2,
         "initial preparation version unavailable"
     );
     if let InitialPhase::Completed { outputs } = &snapshot.state {
@@ -590,6 +592,11 @@ pub(crate) mod tests {
         owned
             .config
             .execution_windows
+            .total
+            .max_consecutive_unconfirmed_progress_windows = 11;
+        owned
+            .config
+            .execution_windows
             .window
             .max_agent_rounds_per_window = 7;
         let expected_plan = serde_json::to_value(&owned.instructions).unwrap();
@@ -598,6 +605,27 @@ pub(crate) mod tests {
         };
         let encoded = encode(&completed, LIMIT).unwrap();
         assert!(NativeInitialPreparation::completed_for_resume(&encoded, LIMIT).unwrap());
+        let requirements = NativeInitialPreparation::completed_resume_requirements(&encoded, LIMIT)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            requirements.no_progress_mode,
+            pioneer_tools::ToolNoProgressMode::Observe
+        );
+        assert_eq!(
+            requirements
+                .execution_windows
+                .total
+                .max_consecutive_unconfirmed_progress_windows,
+            11
+        );
+        let mut legacy = completed.clone();
+        legacy.schema_version = 1;
+        assert!(
+            NativeInitialPreparation::completed_for_resume(&encode(&legacy, LIMIT).unwrap(), LIMIT)
+                .is_err()
+        );
+
         NativeInitialPreparation::validate_transition(&previous, &encoded, LIMIT).unwrap();
         let restored =
             NativeInitialPreparation::restore(&encoded, "workspace", "thread", "turn", LIMIT)
@@ -649,9 +677,9 @@ pub(crate) mod tests {
         value["state"]["outputs"]["config"]["unknown_contract"] = "PRIVATE_SENTINEL".into();
         let error = decode(&value.to_string(), LIMIT).err().unwrap();
         assert!(!format!("{error:#}").contains("PRIVATE_SENTINEL"));
-        completed.schema_version = 2;
+        completed.schema_version = 99;
         assert!(decode(&encode(&completed, LIMIT).unwrap(), LIMIT).is_err());
-        completed.schema_version = 1;
+        completed.schema_version = 2;
         if let InitialPhase::Completed { outputs } = &mut completed.state {
             outputs
                 .instructions

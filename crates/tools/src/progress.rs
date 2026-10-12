@@ -141,6 +141,13 @@ impl Default for ToolProgressFrontier {
 }
 
 impl ToolProgressFrontier {
+    pub fn observation_counts(&self) -> [u64; 3] {
+        [
+            self.advanced_observations,
+            self.unchanged_observations,
+            self.unknown_observations,
+        ]
+    }
     pub fn valid(&self) -> bool {
         self.schema_version == VERSION
             && self.resources.len() <= MAX_RESOURCES

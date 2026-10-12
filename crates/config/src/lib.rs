@@ -1578,6 +1578,8 @@ pub struct GatewayExecutionWindowTotalBudgetConfig {
         alias = "max_consecutive_failed_windows"
     )]
     pub max_consecutive_no_progress_windows: u32,
+    #[serde(default = "default_execution_window_total_max_unconfirmed_progress_windows")]
+    pub max_consecutive_unconfirmed_progress_windows: u32,
 }
 
 impl Default for GatewayExecutionWindowTotalBudgetConfig {
@@ -1589,6 +1591,8 @@ impl Default for GatewayExecutionWindowTotalBudgetConfig {
             max_provider_tokens_per_turn: None,
             max_consecutive_no_progress_windows:
                 default_execution_window_total_max_consecutive_no_progress_windows(),
+            max_consecutive_unconfirmed_progress_windows:
+                default_execution_window_total_max_unconfirmed_progress_windows(),
         }
     }
 }
@@ -2022,6 +2026,10 @@ const fn default_execution_window_max_tool_calls_per_window() -> u32 {
 
 const fn default_execution_window_max_wall_clock_ms_per_window() -> Option<u64> {
     Some(1_800_000)
+}
+
+const fn default_execution_window_total_max_unconfirmed_progress_windows() -> u32 {
+    128
 }
 
 const fn default_execution_window_total_max_consecutive_no_progress_windows() -> u32 {
@@ -4793,6 +4801,7 @@ max_tool_calls_per_turn = 11
                 max_wall_clock_ms_per_turn: Some(3_000),
                 max_provider_tokens_per_turn: Some(4_000),
                 max_consecutive_no_progress_windows: 2,
+                max_consecutive_unconfirmed_progress_windows: 128,
             },
         };
 

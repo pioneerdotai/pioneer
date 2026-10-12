@@ -13250,7 +13250,7 @@ async fn total_tool_call_cap_blocks_continuation_without_turn_failed() {
 }
 
 #[tokio::test]
-async fn failed_tool_results_with_durable_progress_do_not_trip_no_progress_breaker() {
+async fn unknown_tool_results_preserve_general_window_cap_without_fabricating_progress() {
     let provider = Arc::new(LoopBudgetProvider::new(
         LoopBudgetProviderMode::ToolWhileAvailableThenFinal,
         1,
@@ -13277,11 +13277,11 @@ async fn failed_tool_results_with_durable_progress_do_not_trip_no_progress_break
     };
     assert!(
         reason.contains("max execution windows per turn reached"),
-        "failed tool results are durable progress, so only the explicit administrative cap may block: {reason}"
+        "unknown results cannot prove semantic stall or advancement; the explicit administrative cap still applies: {reason}"
     );
     assert!(
         !reason.contains("max_consecutive_no_progress_windows"),
-        "durable progress must reset the recovery circuit breaker: {reason}"
+        "Unknown must not be reported as confirmed no-progress: {reason}"
     );
 }
 

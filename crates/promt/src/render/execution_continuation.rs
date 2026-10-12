@@ -295,6 +295,7 @@ mod tests {
                 attachment_kinds: Vec::new(),
             },
             pioneer_protocol::ExecutionCheckpointWindowSummary {
+                progress: None,
                 window_id: Some("window_1".to_owned()),
                 window_index: 1,
                 started_at_unix_ms: Some(1),
@@ -386,6 +387,7 @@ mod tests {
                 attachment_kinds: Vec::new(),
             },
             pioneer_protocol::ExecutionCheckpointWindowSummary {
+                progress: None,
                 window_id: Some("window_1".to_owned()),
                 window_index: 1,
                 started_at_unix_ms: None,
@@ -455,6 +457,7 @@ mod tests {
                 attachment_kinds: vec!["local_file".to_owned()],
             },
             pioneer_protocol::ExecutionCheckpointWindowSummary {
+                progress: None,
                 window_id: Some("window_snapshot_1".to_owned()),
                 window_index: 2,
                 started_at_unix_ms: Some(100),

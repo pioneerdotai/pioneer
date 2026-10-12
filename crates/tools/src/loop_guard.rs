@@ -77,6 +77,7 @@ pub struct ExecutionWindowTotalBudgetConfig {
     pub max_wall_clock_ms_per_turn: Option<u64>,
     pub max_provider_tokens_per_turn: Option<u64>,
     pub max_consecutive_no_progress_windows: u32,
+    pub max_consecutive_unconfirmed_progress_windows: u32,
 }
 
 impl Default for ExecutionWindowTotalBudgetConfig {
@@ -87,6 +88,7 @@ impl Default for ExecutionWindowTotalBudgetConfig {
             max_wall_clock_ms_per_turn: None,
             max_provider_tokens_per_turn: None,
             max_consecutive_no_progress_windows: 3,
+            max_consecutive_unconfirmed_progress_windows: 128,
         }
     }
 }
@@ -101,6 +103,9 @@ impl ExecutionWindowTotalBudgetConfig {
                 .max_provider_tokens_per_turn
                 .map(|value| value.max(1)),
             max_consecutive_no_progress_windows: self.max_consecutive_no_progress_windows.max(1),
+            max_consecutive_unconfirmed_progress_windows: self
+                .max_consecutive_unconfirmed_progress_windows
+                .clamp(1, 4096),
         }
     }
 }

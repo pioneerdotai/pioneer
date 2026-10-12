@@ -90,6 +90,10 @@ pub(crate) fn checkpoint_compatible(
         .and_then(|bytes| serde_json::from_slice::<NativeSemanticState>(&bytes).ok())
         .is_some_and(|state| {
             state.no_progress_mode == mode
+                && payload.window.progress.is_some_and(|progress| {
+                    progress.valid()
+                        && progress.frontier == state.progress_frontier.observation_counts()
+                })
                 && state.validate(&payload.turn_id, budget).is_ok()
                 && pioneer_tools::ToolNoProgressGuard::checkpoint_progress_compatible(
                     &payload.tool_no_progress,
@@ -209,6 +213,10 @@ impl NativeSemanticState {
         let state: Self = serde_json::from_slice(&encode(value)?).map_err(|_| unavailable())?;
         state.validate(turn, budget)?;
         if state.no_progress_mode != mode
+            || !payload.window.progress.is_some_and(|progress| {
+                progress.valid()
+                    && progress.frontier == state.progress_frontier.observation_counts()
+            })
             || !pioneer_tools::ToolNoProgressGuard::checkpoint_progress_compatible(
                 &payload.tool_no_progress,
                 &state.progress_frontier,

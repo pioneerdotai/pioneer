@@ -732,7 +732,7 @@ fn execution_window_limit_reason(total_windows: u32, max_windows_per_turn: u32) 
 
 fn execution_window_no_progress_reason(limit: u32, observed: u32) -> String {
     format!(
-        "max_consecutive_no_progress_windows reached: limit={limit}, observed={observed}; automatic recovery stopped because consecutive execution windows produced no durable agent round or tool result"
+        "max_consecutive_no_progress_windows reached: limit={limit}, observed={observed}; automatic recovery stopped after confirmed unchanged domain observations"
     )
 }
 
@@ -3553,6 +3553,7 @@ impl RecoveryCoordinator {
             turn_id,
             build_execution_checkpoint_original_request_summary(input),
             ExecutionCheckpointWindowSummary {
+                progress: None,
                 window_id: Some(runtime_window_id),
                 window_index: window.window_index,
                 started_at_unix_ms: Some(window.started_at.timestamp_millis()),
@@ -3578,6 +3579,7 @@ impl RecoveryCoordinator {
             Vec::new(),
         );
         if let Some(semantic_payload) = semantic_payload {
+            payload.window.progress = semantic_payload.window.progress;
             payload.original_request = semantic_payload.original_request;
             payload.native_semantic_state = semantic_payload.native_semantic_state;
             payload.tool_no_progress = semantic_payload.tool_no_progress;
@@ -3606,6 +3608,7 @@ impl RecoveryCoordinator {
             }
         }
 
+        metadata_json["semanticProgress"] = serde_json::to_value(payload.window.progress)?;
         if let Some(semantic_checkpoint) = semantic_checkpoint {
             let execution = execution
                 .as_ref()
@@ -3681,6 +3684,62 @@ impl RecoveryCoordinator {
         Ok(())
     }
 
+    async fn accepted_execution_window_policy(
+        &self,
+        turn_id: &str,
+    ) -> Result<(
+        pioneer_tools::ExecutionWindowsConfig,
+        pioneer_tools::ToolNoProgressMode,
+    )> {
+        let execution = self.crud_store.get_turn_execution(turn_id).await?;
+        if let Some(execution) = execution.as_ref().filter(|execution| {
+            matches!(
+                execution.executor_kind,
+                TurnExecutorKind::NativeAgent | TurnExecutorKind::ApiProvider
+            )
+        }) {
+            let snapshot = self
+                .crud_store
+                .get_turn_runtime_snapshot(turn_id)
+                .await?
+                .ok_or(NativeSemanticCheckpointUnavailable)?;
+            if snapshot.workspace_id != execution.workspace_id
+                || snapshot.thread_id != execution.thread_id
+            {
+                return Err(NativeSemanticCheckpointUnavailable.into());
+            }
+            let phase = snapshot
+                .initial_phase_json
+                .as_deref()
+                .ok_or(NativeSemanticCheckpointUnavailable)?;
+            // Reuse the original scoped restore proof. No handlers/services or
+            // database resources are held while decoding this bounded phase.
+            pioneer_agent::NativeInitialPreparation::restore(
+                phase,
+                &execution.workspace_id,
+                &execution.thread_id,
+                turn_id,
+                pioneer_protocol::TURN_EXECUTION_REQUEST_MAX_BYTES,
+            )
+            .map_err(|_| NativeSemanticCheckpointUnavailable)?;
+            let requirements =
+                pioneer_agent::NativeInitialPreparation::completed_resume_requirements(
+                    phase,
+                    pioneer_protocol::TURN_EXECUTION_REQUEST_MAX_BYTES,
+                )
+                .map_err(|_| NativeSemanticCheckpointUnavailable)?
+                .ok_or(NativeSemanticCheckpointUnavailable)?;
+            return Ok((
+                requirements.execution_windows.normalized(),
+                requirements.no_progress_mode,
+            ));
+        }
+        Ok((
+            self.tool_loop_config.execution_windows.normalized(),
+            self.tool_loop_config.no_progress_mode,
+        ))
+    }
+
     async fn execution_window_admission_for_turn(
         &self,
         turn_id: &str,
@@ -3717,12 +3776,10 @@ impl RecoveryCoordinator {
         .filter(|index| *index > 0)
         .max();
 
+        let (windows, _) = self.accepted_execution_window_policy(turn_id).await?;
         Ok(decide_execution_window_admission(
             latest_window_index,
-            self.tool_loop_config
-                .execution_windows
-                .total
-                .max_windows_per_turn,
+            windows.total.max_windows_per_turn,
         ))
     }
 
@@ -3741,7 +3798,9 @@ impl RecoveryCoordinator {
                     turn_id,
                 )
                 .await?;
-                let total_budget = &self.tool_loop_config.execution_windows.total;
+                let (accepted_windows, mode) =
+                    self.accepted_execution_window_policy(turn_id).await?;
+                let total_budget = &accepted_windows.total;
                 if let Some(limit) = total_budget.max_tool_calls_per_turn
                     && usage.total_tool_calls >= u64::from(limit)
                 {
@@ -3779,19 +3838,29 @@ impl RecoveryCoordinator {
                         ),
                     });
                 }
-                let limit = self
-                    .tool_loop_config
-                    .execution_windows
-                    .total
-                    .max_consecutive_no_progress_windows
-                    .max(1);
-                if usage.consecutive_no_progress_windows >= limit {
+                let limit = total_budget.max_consecutive_no_progress_windows.max(1);
+                if mode == pioneer_tools::ToolNoProgressMode::Enforce
+                    && usage.consecutive_no_progress_windows >= limit
+                {
                     return Ok(ExecutionWindowContinuationAdmission::Block {
                         stop_reason: Some(pioneer_protocol::RecoveryStopReason::NoProgress),
                         total_windows: usage.total_windows,
                         reason: execution_window_no_progress_reason(
                             limit,
                             usage.consecutive_no_progress_windows,
+                        ),
+                    });
+                }
+                let limit = total_budget
+                    .max_consecutive_unconfirmed_progress_windows
+                    .clamp(1, 4096);
+                if usage.consecutive_unconfirmed_progress_windows >= limit {
+                    return Ok(ExecutionWindowContinuationAdmission::Block {
+                        stop_reason: Some(pioneer_protocol::RecoveryStopReason::AttemptsExhausted),
+                        total_windows: usage.total_windows,
+                        reason: format!(
+                            "max_consecutive_unconfirmed_progress_windows reached: limit={limit}, observed={}; domain progress remains unconfirmed",
+                            usage.consecutive_unconfirmed_progress_windows
                         ),
                     });
                 }
@@ -7644,7 +7713,11 @@ mod tests {
             .expect("window usage should aggregate");
         assert_eq!(usage.total_agent_rounds, 5);
         assert_eq!(usage.total_tool_calls, 7);
-        assert_eq!(usage.consecutive_no_progress_windows, 1);
+        assert_eq!(
+            usage.consecutive_no_progress_windows, 0,
+            "legacy/missing evidence must remain Unknown"
+        );
+        assert_eq!(usage.consecutive_unconfirmed_progress_windows, 2);
     }
 
     #[tokio::test]
@@ -7673,6 +7746,10 @@ mod tests {
                         provider_token_count: 10,
                         metadata_json: serde_json::json!({
                             "runtimeWindowId": format!("{turn_id}:window:{window_index}"),
+                            "semanticProgress": pioneer_protocol::ExecutionProgressSummary {
+                                schema_version: 1, baseline: [u64::from(window_index - 1),0,0],
+                                frontier: [u64::from(window_index),0,0],
+                            },
                         }),
                         started_at: window_started_at,
                     },
@@ -7707,6 +7784,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn original_native_policy_missing_phase_is_typed_unavailable_without_global_fallback() {
+        let (store, coordinator) = setup_coordinator().await;
+        let (ws, thread, turn) = (
+            "ws_native_window_policy",
+            "thread_native_window_policy",
+            "turn_native_window_policy",
+        );
+        materialize_turn_with_tool_item(
+            store.as_ref(),
+            ws,
+            thread,
+            turn,
+            "tool_native_policy",
+            None,
+        )
+        .await;
+        insert_test_turn_execution(
+            &store,
+            ws,
+            thread,
+            turn,
+            "original_owner",
+            TurnExecutorKind::NativeAgent,
+            1_700_000_120,
+        )
+        .await;
+        let error = coordinator
+            .accepted_execution_window_policy(turn)
+            .await
+            .unwrap_err();
+        assert!(error.is::<super::NativeSemanticCheckpointUnavailable>());
+        persist_test_runtime_snapshot(&store, ws, thread, turn).await;
+        let error = coordinator
+            .accepted_execution_window_policy(turn)
+            .await
+            .unwrap_err();
+        assert!(error.is::<super::NativeSemanticCheckpointUnavailable>());
+    }
+
+    #[tokio::test]
+    async fn unknown_automatic_window_budget_is_separate_from_all_heuristic_modes() {
+        for mode in [
+            pioneer_tools::ToolNoProgressMode::Disabled,
+            pioneer_tools::ToolNoProgressMode::Observe,
+            pioneer_tools::ToolNoProgressMode::Enforce,
+        ] {
+            let mut config = test_tool_loop_config();
+            config.no_progress_mode = mode;
+            config
+                .execution_windows
+                .total
+                .max_consecutive_no_progress_windows = 1;
+            config
+                .execution_windows
+                .total
+                .max_consecutive_unconfirmed_progress_windows = 2;
+            let (store, _, coordinator) = setup_coordinator_with_tool_loop_config(config).await;
+            let now = chrono::Utc::now().fixed_offset();
+            for index in 1..=2 {
+                store
+                    .create_turn_execution_window(
+                        NewTurnExecutionWindowRecord {
+                            workspace_id: "ws_unknown_window".into(),
+                            thread_id: "thread_unknown_window".into(),
+                            turn_id: "turn_unknown_window".into(),
+                            window_index: index,
+                            status: ExecutionWindowStatus::Checkpointed,
+                            exhaustion_reason: None,
+                            agent_round_count: 20,
+                            tool_call_count: 40,
+                            provider_token_count: 30,
+                            metadata_json: serde_json::json!({}),
+                            started_at: now,
+                        },
+                        now,
+                        now,
+                    )
+                    .await
+                    .unwrap();
+            }
+            let admission = coordinator
+                .execution_window_continuation_admission_for_turn("turn_unknown_window", None)
+                .await
+                .unwrap();
+            assert!(
+                matches!(admission, super::ExecutionWindowContinuationAdmission::Block {
+                stop_reason: Some(pioneer_protocol::RecoveryStopReason::AttemptsExhausted), reason, ..
+            } if reason.contains("max_consecutive_unconfirmed_progress_windows") && !reason.contains("max_consecutive_no_progress_windows"))
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn persisted_no_progress_windows_trip_recovery_circuit_breaker_after_coordinator_restart()
     {
         let (crud_store, agent_manager, coordinator) = setup_coordinator_with_agent().await;
@@ -7724,12 +7894,16 @@ mod tests {
                         exhaustion_reason: Some(
                             ExecutionWindowExhaustionReason::RuntimeShutdownContinuation,
                         ),
-                        agent_round_count: 0,
-                        tool_call_count: 0,
+                        agent_round_count: 10,
+                        tool_call_count: 20,
                         provider_token_count: 0,
                         metadata_json: serde_json::json!({
                             "interruptedBy": "cli_runtime_recovery",
-                            "terminalReason": "native runtime exited before producing output",
+                            "terminalReason": "repeated known observations without domain revision",
+                            "semanticProgress": pioneer_protocol::ExecutionProgressSummary {
+                                schema_version: 1, baseline: [1,u64::from(window_index - 1),0],
+                                frontier: [1,u64::from(window_index),0],
+                            },
                         }),
                         started_at: timestamp,
                     },
@@ -7786,7 +7960,10 @@ mod tests {
                         agent_round_count: 0,
                         tool_call_count: 0,
                         provider_token_count: 0,
-                        metadata_json: serde_json::json!({}),
+                        metadata_json: serde_json::json!({"semanticProgress": pioneer_protocol::ExecutionProgressSummary {
+                            schema_version: 1, baseline: [1,u64::from(window_index - 1),0],
+                            frontier: [1,u64::from(window_index),0],
+                        }}),
                         started_at: timestamp,
                     },
                     timestamp,
@@ -7809,7 +7986,9 @@ mod tests {
                     agent_round_count: 1,
                     tool_call_count: 0,
                     provider_token_count: 10,
-                    metadata_json: serde_json::json!({}),
+                    metadata_json: serde_json::json!({"semanticProgress": pioneer_protocol::ExecutionProgressSummary {
+                        schema_version: 1, baseline: [1,2,0], frontier: [2,2,0],
+                    }}),
                     started_at: timestamp,
                 },
                 timestamp,
@@ -8816,6 +8995,7 @@ mod tests {
                 attachment_kinds: Vec::new(),
             },
             pioneer_protocol::ExecutionCheckpointWindowSummary {
+                progress: None,
                 window_id: Some("runtime_window_1".to_owned()),
                 window_index: 1,
                 started_at_unix_ms: Some(1_000),
@@ -9006,6 +9186,7 @@ mod tests {
                 attachment_kinds: Vec::new(),
             },
             pioneer_protocol::ExecutionCheckpointWindowSummary {
+                progress: None,
                 window_id: Some("restore_window_1".to_owned()),
                 window_index: 1,
                 started_at_unix_ms: Some(1),

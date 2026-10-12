@@ -779,6 +779,7 @@ impl Default for ChatTurnOutcome {
 
 #[derive(Debug, Clone)]
 struct ChatExecutionWindowStats {
+    progress_baseline: [u64; 3],
     window_index: u32,
     started_at_unix_ms: i64,
     agent_round_count: u32,
@@ -793,6 +794,7 @@ impl ChatExecutionWindowStats {
     fn new(window_index: u32) -> Self {
         Self {
             window_index,
+            progress_baseline: [0; 3],
             started_at_unix_ms: Local::now().timestamp_millis(),
             agent_round_count: 0,
             requested_tool_call_count: 0,
@@ -856,6 +858,7 @@ impl ChatExecutionWindowStats {
         reason: ExecutionWindowExhaustionReason,
     ) -> ExecutionCheckpointWindowSummary {
         ExecutionCheckpointWindowSummary {
+            progress: None,
             window_id: None,
             window_index: self.window_index,
             started_at_unix_ms: Some(self.started_at_unix_ms),
@@ -1274,6 +1277,36 @@ async fn emit_durable_event(
         .map_err(agent_event_error)
 }
 
+fn attach_native_semantic_state(
+    payload: &mut pioneer_protocol::ExecutionCheckpointPayload,
+    state: serde_json::Value,
+    baseline: [u64; 3],
+) -> Result<(), ChatTurnError> {
+    let frontier = &state["progress_frontier"];
+    let read = |field: &str| {
+        frontier[field]
+            .as_u64()
+            .ok_or_else(|| ChatTurnError::Blocked("native progress source unavailable".to_owned()))
+    };
+    let progress = pioneer_protocol::ExecutionProgressSummary {
+        schema_version: 1,
+        baseline,
+        frontier: [
+            read("advanced_observations")?,
+            read("unchanged_observations")?,
+            read("unknown_observations")?,
+        ],
+    };
+    if !progress.valid() {
+        return Err(ChatTurnError::Blocked(
+            "native progress baseline is incompatible".to_owned(),
+        ));
+    }
+    payload.window.progress = Some(progress);
+    payload.native_semantic_state = Some(state);
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn persist_native_semantic_checkpoint(
     event_tx: &AgentEventHub,
@@ -1297,6 +1330,7 @@ async fn persist_native_semantic_checkpoint(
         turn_id,
         build_execution_checkpoint_original_request_summary(input),
         ExecutionCheckpointWindowSummary {
+            progress: None,
             window_id: Some(execution_window_runtime_id(turn_id, stats.window_index)),
             window_index: stats.window_index,
             started_at_unix_ms: Some(stats.started_at_unix_ms),
@@ -1324,7 +1358,7 @@ async fn persist_native_semantic_checkpoint(
     payload.provider_budget.provider_usage_available &= !stats.provider_token_usage_unknown;
     payload.tool_no_progress = no_progress;
     payload.requested_tool_names = requested_tools.to_vec();
-    payload.native_semantic_state = Some(state);
+    attach_native_semantic_state(&mut payload, state, stats.progress_baseline)?;
     emit_durable_event(
         event_tx,
         AgentDurableEvent::NativeSemanticCheckpoint {
@@ -5406,6 +5440,14 @@ async fn execute_agent_provider_response(
         !reused_initial,
         tool_loop_config.no_progress_mode,
     )?;
+    window_stats.progress_baseline = execution_checkpoint_context
+        .as_ref()
+        .filter(|context| context.payload.window.window_index == execution_window_index)
+        .and_then(|context| context.payload.window.progress)
+        .map_or_else(
+            || semantic.progress_frontier.observation_counts(),
+            |progress| progress.baseline,
+        );
     let mut native_controls =
         native_control::NativeControlRuntime::restore(semantic.controls.clone(), context_session)
             .await?;
@@ -5459,7 +5501,11 @@ async fn execute_agent_provider_response(
                 Default::default(),
                 &[],
             );
-            continuation.checkpoint_payload.native_semantic_state = Some(semantic.to_value()?);
+            attach_native_semantic_state(
+                &mut continuation.checkpoint_payload,
+                semantic.to_value()?,
+                window_stats.progress_baseline,
+            )?;
             emit_execution_window_exhausted_and_checkpointed(
                 workspace_id,
                 thread_id,
@@ -5974,8 +6020,9 @@ async fn execute_agent_provider_response(
                     tool_no_progress_guard.checkpoint_state(),
                     &requested_tool_names,
                 );
-                continuation.checkpoint_payload.native_semantic_state = Some(capture_semantic_state!()
-                    .map_err(|error| (error, current_thinking_id.clone()))?);
+                attach_native_semantic_state(&mut continuation.checkpoint_payload, capture_semantic_state!()
+                    .map_err(|error| (error, current_thinking_id.clone()))?, window_stats.progress_baseline)
+                    .map_err(|error| (error, current_thinking_id.clone()))?;
                 emit_execution_window_exhausted_and_checkpointed(
                     workspace_id,
                     thread_id,
@@ -6322,8 +6369,9 @@ async fn execute_agent_provider_response(
                         tool_no_progress_guard.checkpoint_state(),
                         &requested_tool_names,
                     );
-                    continuation.checkpoint_payload.native_semantic_state = Some(capture_semantic_state!()
-                    .map_err(|error| (error, current_thinking_id.clone()))?);
+                    attach_native_semantic_state(&mut continuation.checkpoint_payload, capture_semantic_state!()
+                    .map_err(|error| (error, current_thinking_id.clone()))?, window_stats.progress_baseline)
+                    .map_err(|error| (error, current_thinking_id.clone()))?;
                 emit_execution_window_exhausted_and_checkpointed(
                         workspace_id,
                         thread_id,
@@ -7757,8 +7805,11 @@ async fn execute_agent_provider_response(
                 tool_no_progress_guard.checkpoint_state(),
                 &requested_tool_names,
             ) {
-                continuation.checkpoint_payload.native_semantic_state =
-                    Some(capture_semantic_state!()?);
+                attach_native_semantic_state(
+                    &mut continuation.checkpoint_payload,
+                    capture_semantic_state!()?,
+                    window_stats.progress_baseline,
+                )?;
                 emit_execution_window_exhausted_and_checkpointed(
                     workspace_id,
                     thread_id,
@@ -8605,6 +8656,7 @@ mod tests {
                     attachment_kinds: Vec::new(),
                 },
                 window: ExecutionCheckpointWindowSummary {
+                    progress: None,
                     window_id: Some("turn_1:window:1".to_owned()),
                     window_index: 1,
                     started_at_unix_ms: Some(1_000),
@@ -10537,6 +10589,31 @@ mod tests {
             )
             .unwrap(),
         );
+        context.payload.window.progress = Some(pioneer_protocol::ExecutionProgressSummary {
+            schema_version: 1,
+            baseline: [0; 3],
+            frontier: progress_guard.progress_frontier().observation_counts(),
+        });
+        let mut missing_window_progress = context.clone();
+        missing_window_progress.payload.window.progress = None;
+        assert!(!super::semantic_state::checkpoint_compatible(
+            &missing_window_progress.payload,
+            &budget,
+            pioneer_tools::ToolNoProgressMode::Enforce
+        ));
+        let mut inconsistent_window_progress = context.clone();
+        inconsistent_window_progress
+            .payload
+            .window
+            .progress
+            .as_mut()
+            .unwrap()
+            .frontier[0] += 1;
+        assert!(!super::semantic_state::checkpoint_compatible(
+            &inconsistent_window_progress.payload,
+            &budget,
+            pioneer_tools::ToolNoProgressMode::Enforce
+        ));
         let state = super::semantic_state::NativeSemanticState::restore(
             Some(&context),
             "workspace_1",

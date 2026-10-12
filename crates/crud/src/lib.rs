@@ -7699,6 +7699,18 @@ impl CrudStore {
             ),
             _ => None,
         };
+        let checkpoint_progress_json = match &transition {
+            NativeExecutionWindowTransition::Checkpointed { checkpoint, .. } => {
+                let value = &checkpoint.payload_json["window"]["progress"];
+                let progress = pioneer_protocol::ExecutionProgressSummary::from_value(value);
+                anyhow::ensure!(
+                    value.is_null() || progress.is_some(),
+                    "invalid checkpoint progress summary"
+                );
+                Some(serde_json::to_string(&progress)?)
+            }
+            _ => None,
+        };
         let checkpoint_payload_bytes = prepared_checkpoint
             .as_ref()
             .map(|checkpoint| checkpoint.payload_bytes());
@@ -7803,6 +7815,7 @@ impl CrudStore {
             let prepared_blocked_stats = prepared_blocked_stats.clone();
             let prepared_checkpoint_status = prepared_checkpoint_status.clone();
             let prepared_continued_status = prepared_continued_status.clone();
+            let checkpoint_progress_json = checkpoint_progress_json.clone();
             async move {
                 let transaction = self
                     .connection
@@ -8074,6 +8087,7 @@ impl CrudStore {
                             turn_execution_window::commit_checkpoint_usage_availability(
                                 &transaction, window.id.as_str(),
                                 checkpoint_usage_available.context("missing checkpoint usage availability")?,
+                                checkpoint_progress_json.as_deref().context("missing checkpoint progress preparation")?,
                             ).await?;
                         }
                         NativeExecutionWindowTransition::Continued {
@@ -8424,14 +8438,19 @@ impl CrudStore {
             aggregate.wall_clock_window_count = aggregate
                 .wall_clock_window_count
                 .saturating_add(next.wall_clock_window_count);
-            aggregate.consecutive_no_progress_windows =
-                if next.consecutive_no_progress_windows == next.total_windows {
-                    aggregate
-                        .consecutive_no_progress_windows
-                        .saturating_add(next.consecutive_no_progress_windows)
-                } else {
-                    next.consecutive_no_progress_windows
-                };
+            if next.semantic_progress_advanced {
+                aggregate.semantic_progress_advanced = true;
+                aggregate.consecutive_no_progress_windows = next.consecutive_no_progress_windows;
+                aggregate.consecutive_unconfirmed_progress_windows =
+                    next.consecutive_unconfirmed_progress_windows;
+            } else {
+                aggregate.consecutive_no_progress_windows = aggregate
+                    .consecutive_no_progress_windows
+                    .saturating_add(next.consecutive_no_progress_windows);
+                aggregate.consecutive_unconfirmed_progress_windows = aggregate
+                    .consecutive_unconfirmed_progress_windows
+                    .saturating_add(next.consecutive_unconfirmed_progress_windows);
+            }
             tokio::task::yield_now().await;
         }
         Ok(aggregate)
@@ -9063,6 +9082,7 @@ impl CrudStore {
                 && next_payload.thread_id == payload.thread_id
                 && next_payload.turn_id == payload.turn_id
                 && next_payload.window.window_index == window.window_index
+                && next_payload.window.progress == payload.window.progress
                 && next_payload.native_semantic_state == payload.native_semantic_state
                 && next_payload.tool_no_progress == payload.tool_no_progress
                 && next_payload.requested_tool_names == payload.requested_tool_names
@@ -37869,6 +37889,7 @@ mod tests {
             "turn_semantic",
             pioneer_protocol::build_execution_checkpoint_original_request_summary(&[]),
             pioneer_protocol::ExecutionCheckpointWindowSummary {
+                progress: None,
                 window_id: Some("semantic-runtime-1".to_owned()),
                 window_index: 1,
                 started_at_unix_ms: Some(timestamp.timestamp_millis()),
@@ -42373,7 +42394,12 @@ mod tests {
             "failed checkpoint transaction must not advance authoritative status"
         );
 
-        let payload = serde_json::json!({"window": 1, "state": "durable"});
+        let progress = pioneer_protocol::ExecutionProgressSummary {
+            schema_version: 1,
+            baseline: [1, 0, 0],
+            frontier: [1, 1, 0],
+        };
+        let payload = serde_json::json!({"window": {"progress": progress}, "state": "durable"});
         let mut valid_checkpoint_notification = checkpoint_notification;
         valid_checkpoint_notification.payload_bytes = u64::try_from(
             serde_json::to_vec(&payload)
@@ -42413,6 +42439,19 @@ mod tests {
             checkpointed_window.metadata_json["providerUsageAvailable"], false,
             "legacy checkpoint cannot claim complete usage"
         );
+
+        assert_eq!(
+            pioneer_protocol::ExecutionProgressSummary::from_value(
+                &checkpointed_window.metadata_json["semanticProgress"]
+            ),
+            Some(progress)
+        );
+        let progress_usage = store
+            .aggregate_turn_execution_window_usage("turn_native_window")
+            .await
+            .unwrap();
+        assert_eq!(progress_usage.consecutive_no_progress_windows, 1);
+        assert_eq!(progress_usage.consecutive_unconfirmed_progress_windows, 1);
 
         let same_identity_conflicting_payload =
             serde_json::json!({"window": 1, "state": "same-id-conflict"});
@@ -53791,6 +53830,8 @@ mod tests {
                 // availability marker can assert complete accounting.
                 provider_token_usage_unknown: true,
                 consecutive_no_progress_windows: 0,
+                consecutive_unconfirmed_progress_windows: 2,
+                semantic_progress_advanced: false,
             }
         );
 
@@ -53830,6 +53871,8 @@ mod tests {
                 total_provider_tokens: 0,
                 provider_token_usage_unknown: true,
                 consecutive_no_progress_windows: 0,
+                consecutive_unconfirmed_progress_windows: 1,
+                semantic_progress_advanced: false,
             }
         );
 

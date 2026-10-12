@@ -223,6 +223,9 @@ pub struct TurnExecutionWindowUsageAggregateRecord {
     pub total_provider_tokens: u64,
     pub provider_token_usage_unknown: bool,
     pub consecutive_no_progress_windows: u32,
+    pub consecutive_unconfirmed_progress_windows: u32,
+    /// A bounded page contains an authoritative reset; prefixes otherwise carry.
+    pub semantic_progress_advanced: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -693,20 +696,30 @@ pub fn aggregate_turn_execution_window_records(
             aggregate.provider_token_usage_unknown = true;
         }
 
-        let no_progress_recovery = window.agent_round_count == 0
-            && window.tool_call_count == 0
-            && matches!(
-                window.exhaustion_reason,
-                Some(
-                    ExecutionWindowExhaustionReason::ProviderFailureContinuation
-                        | ExecutionWindowExhaustionReason::RuntimeShutdownContinuation
-                )
-            );
-        if no_progress_recovery {
-            aggregate.consecutive_no_progress_windows =
-                aggregate.consecutive_no_progress_windows.saturating_add(1);
-        } else {
-            aggregate.consecutive_no_progress_windows = 0;
+        match pioneer_protocol::ExecutionProgressSummary::from_value(
+            &window.metadata_json["semanticProgress"],
+        )
+        .map_or(
+            pioneer_protocol::ExecutionProgressKind::Unknown,
+            |progress| progress.kind(),
+        ) {
+            pioneer_protocol::ExecutionProgressKind::Advanced => {
+                aggregate.semantic_progress_advanced = true;
+                aggregate.consecutive_no_progress_windows = 0;
+                aggregate.consecutive_unconfirmed_progress_windows = 0;
+            }
+            pioneer_protocol::ExecutionProgressKind::Unchanged => {
+                aggregate.consecutive_no_progress_windows =
+                    aggregate.consecutive_no_progress_windows.saturating_add(1);
+                aggregate.consecutive_unconfirmed_progress_windows = aggregate
+                    .consecutive_unconfirmed_progress_windows
+                    .saturating_add(1);
+            }
+            pioneer_protocol::ExecutionProgressKind::Unknown => {
+                aggregate.consecutive_unconfirmed_progress_windows = aggregate
+                    .consecutive_unconfirmed_progress_windows
+                    .saturating_add(1);
+            }
         }
 
         if let Some(completed_at) = window.completed_at.as_ref() {
@@ -1007,12 +1020,13 @@ pub(crate) async fn commit_checkpoint_usage_availability<C: ConnectionTrait>(
     db: &C,
     window_id: &str,
     available: bool,
+    progress_json: &str,
 ) -> Result<()> {
     let result = turn_execution_window::Entity::update_many()
         .col_expr(turn_execution_window::Column::MetadataJson,
             sea_orm::sea_query::Expr::cust_with_values(
-                "json_set(metadata_json, '$.accountingSchemaVersion', 1, '$.providerUsageAvailable', json(?))",
-                [if available { "true" } else { "false" }],
+                "json_set(metadata_json, '$.accountingSchemaVersion', 1, '$.providerUsageAvailable', json(?), '$.semanticProgress', json(?))",
+                [if available { "true" } else { "false" }, progress_json],
             ))
         .filter(turn_execution_window::Column::Id.eq(window_id.to_owned()))
         .filter(turn_execution_window::Column::Status.eq(execution_window_status_to_db(ExecutionWindowStatus::Checkpointed)))
@@ -1416,6 +1430,83 @@ fn active_model_id(value: &ActiveValue<String>) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn progress_aggregate_carries_unknown_and_stall_across_bounded_pages_after_restart() {
+        use migration::{Migrator, MigratorTrait};
+        let connection = sea_orm::Database::connect("sqlite::memory:").await.unwrap();
+        Migrator::up(&connection, None).await.unwrap();
+        let store = crate::CrudStore::new(connection).with_maintenance_access();
+        let now = chrono::Utc::now().fixed_offset();
+        // More than the actual128-row query quantum, with a reset in its suffix.
+        for index in 1..=260_u32 {
+            let (baseline, frontier) = match index {
+                1 => ([0, 0, 0], [1, 0, 0]),
+                2..=130 => ([1, u64::from(index - 2), 0], [1, u64::from(index - 1), 0]),
+                131 => ([1, 129, 0], [2, 129, 0]),
+                _ => (
+                    [2, 129, u64::from(index - 132)],
+                    [2, 129, u64::from(index - 131)],
+                ),
+            };
+            store.create_turn_execution_window(NewTurnExecutionWindowRecord {
+                workspace_id: "ws_progress".into(), thread_id: "thread_progress".into(), turn_id: "turn_progress".into(),
+                window_index: index, status: ExecutionWindowStatus::Checkpointed,
+                exhaustion_reason: Some(ExecutionWindowExhaustionReason::ProviderFailureContinuation),
+                agent_round_count: 5, tool_call_count: 7, provider_token_count: 20,
+                metadata_json: serde_json::json!({"semanticProgress":pioneer_protocol::ExecutionProgressSummary {
+                    schema_version: 1, baseline, frontier }}), started_at: now,
+            }, now, now).await.unwrap();
+        }
+        for index in 1..=260_u32 {
+            let (baseline, frontier) = if index <= 130 {
+                ([1, u64::from(index - 1), 0], [1, u64::from(index), 0])
+            } else {
+                (
+                    [1, 130, u64::from(index - 131)],
+                    [1, 130, u64::from(index - 130)],
+                )
+            };
+            store.create_turn_execution_window(NewTurnExecutionWindowRecord {
+                workspace_id: "ws_progress".into(), thread_id: "thread_progress".into(), turn_id: "turn_stall".into(),
+                window_index: index, status: ExecutionWindowStatus::Checkpointed, exhaustion_reason: None,
+                agent_round_count: 10, tool_call_count: 10, provider_token_count: 20,
+                metadata_json: serde_json::json!({"semanticProgress": pioneer_protocol::ExecutionProgressSummary {
+                    schema_version: 1, baseline, frontier }}), started_at: now,
+            }, now, now).await.unwrap();
+        }
+        let stalled = store
+            .aggregate_turn_execution_window_usage("turn_stall")
+            .await
+            .unwrap();
+        assert_eq!(stalled.consecutive_no_progress_windows, 130);
+        assert_eq!(stalled.consecutive_unconfirmed_progress_windows, 260);
+        assert!(
+            !stalled.semantic_progress_advanced,
+            "rounds/unknown suffix cannot clear an earlier confirmed stall"
+        );
+        let usage = store
+            .aggregate_turn_execution_window_usage("turn_progress")
+            .await
+            .unwrap();
+        assert_eq!(usage.total_windows, 260);
+        assert_eq!(usage.total_tool_calls, 260 * 7);
+        assert_eq!(usage.consecutive_no_progress_windows, 0);
+        assert_eq!(usage.consecutive_unconfirmed_progress_windows, 129);
+        assert!(usage.semantic_progress_advanced);
+        let restored = crate::CrudStore::new(store.connection.clone()).with_maintenance_access();
+        assert_eq!(
+            restored
+                .aggregate_turn_execution_window_usage("turn_progress")
+                .await
+                .unwrap(),
+            usage
+        );
+        assert_eq!(
+            restored.database_connection().read_class(),
+            pioneer_sqlite::SqliteReadClass::Maintenance
+        );
+    }
 
     #[tokio::test]
     async fn legacy_oversized_newest_checkpoint_is_unavailable_without_stale_fallback() {

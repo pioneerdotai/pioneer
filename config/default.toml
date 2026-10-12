@@ -159,6 +159,7 @@ max_wall_clock_ms_per_window = 1800000
 
 [gateway.tools.execution_windows.total]
 max_consecutive_no_progress_windows = 3
+max_consecutive_unconfirmed_progress_windows = 128
 
 [gateway.tools.retry]
 max_recoverable_retry_rounds_per_episode = 32

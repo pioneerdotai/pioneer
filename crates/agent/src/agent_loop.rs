@@ -45,6 +45,7 @@ enum ExecutionWindowTotalBudgetBlockKind {
     MaxWallClockMs,
     MaxProviderTokens,
     MaxConsecutiveNoProgressWindows,
+    MaxUnconfirmedProgressWindows,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,6 +65,7 @@ enum ExecutionWindowTotalBudgetDecision {
 fn decide_execution_window_total_budget(
     usage: &TurnExecutionUsageCounters,
     total_budget: &pioneer_tools::ExecutionWindowTotalBudgetConfig,
+    mode: pioneer_tools::ToolNoProgressMode,
 ) -> ExecutionWindowTotalBudgetDecision {
     let next_window_index = match decide_execution_window_admission(
         Some(usage.total_windows.max(1)),
@@ -131,7 +133,9 @@ fn decide_execution_window_total_budget(
 
     let max_consecutive_no_progress_windows =
         total_budget.max_consecutive_no_progress_windows.max(1);
-    if usage.consecutive_no_progress_windows >= max_consecutive_no_progress_windows {
+    if mode == pioneer_tools::ToolNoProgressMode::Enforce
+        && usage.consecutive_no_progress_windows >= max_consecutive_no_progress_windows
+    {
         return ExecutionWindowTotalBudgetDecision::Block(ExecutionWindowTotalBudgetBlock {
             kind: ExecutionWindowTotalBudgetBlockKind::MaxConsecutiveNoProgressWindows,
             total_windows: usage.total_windows,
@@ -143,6 +147,20 @@ fn decide_execution_window_total_budget(
         });
     }
 
+    let limit = total_budget
+        .max_consecutive_unconfirmed_progress_windows
+        .clamp(1, 4096);
+    if usage.consecutive_unconfirmed_progress_windows >= limit {
+        return ExecutionWindowTotalBudgetDecision::Block(ExecutionWindowTotalBudgetBlock {
+            kind: ExecutionWindowTotalBudgetBlockKind::MaxUnconfirmedProgressWindows,
+            total_windows: usage.total_windows,
+            total_tool_calls: saturating_u32_from_u64(usage.total_tool_calls),
+            reason: format!(
+                "max_consecutive_unconfirmed_progress_windows reached: limit={limit}, observed={}; domain progress remains unconfirmed",
+                usage.consecutive_unconfirmed_progress_windows
+            ),
+        });
+    }
     ExecutionWindowTotalBudgetDecision::Continue { next_window_index }
 }
 
@@ -161,7 +179,8 @@ fn total_budget_block_exhaustion_reason(
         ExecutionWindowTotalBudgetBlockKind::MaxProviderTokens => {
             pioneer_protocol::ExecutionWindowExhaustionReason::MaxProviderTokensPerWindow
         }
-        ExecutionWindowTotalBudgetBlockKind::MaxConsecutiveNoProgressWindows => fallback,
+        ExecutionWindowTotalBudgetBlockKind::MaxConsecutiveNoProgressWindows
+        | ExecutionWindowTotalBudgetBlockKind::MaxUnconfirmedProgressWindows => fallback,
     }
 }
 
@@ -177,13 +196,20 @@ fn recovery_execution_window_admission_error(
     match decide_execution_window_total_budget(
         &turn_request.execution_usage,
         &tool_loop_config.execution_windows.total.normalized(),
+        tool_loop_config.no_progress_mode,
     ) {
         ExecutionWindowTotalBudgetDecision::Continue { .. } => None,
         ExecutionWindowTotalBudgetDecision::Block(block) => Some(
             super::AgentControlError::ExecutionWindowContinuationBlocked {
-                stop_reason: (block.kind
-                    == ExecutionWindowTotalBudgetBlockKind::MaxConsecutiveNoProgressWindows)
-                    .then_some(pioneer_protocol::RecoveryStopReason::NoProgress),
+                stop_reason: match block.kind {
+                    ExecutionWindowTotalBudgetBlockKind::MaxConsecutiveNoProgressWindows => {
+                        Some(pioneer_protocol::RecoveryStopReason::NoProgress)
+                    }
+                    ExecutionWindowTotalBudgetBlockKind::MaxUnconfirmedProgressWindows => {
+                        Some(pioneer_protocol::RecoveryStopReason::AttemptsExhausted)
+                    }
+                    _ => None,
+                },
                 reason: block.reason,
             },
         ),
@@ -712,6 +738,9 @@ pub(super) async fn run_agent_loop(
                         let next_window_index = match decide_execution_window_total_budget(
                             &next_turn_request.execution_usage,
                             &total_budget,
+                            runtime_snapshot_for_continuation
+                                .tool_loop_config
+                                .no_progress_mode,
                         ) {
                             ExecutionWindowTotalBudgetDecision::Continue { next_window_index } => {
                                 next_window_index
@@ -2663,6 +2692,7 @@ mod tests {
             max_wall_clock_ms_per_turn,
             max_provider_tokens_per_turn,
             max_consecutive_no_progress_windows: 3,
+            max_consecutive_unconfirmed_progress_windows: 128,
         }
     }
 
@@ -2686,6 +2716,7 @@ mod tests {
                 attachment_kinds: Vec::new(),
             },
             pioneer_protocol::ExecutionCheckpointWindowSummary {
+                progress: None,
                 window_id: Some(format!("window_{window_index}")),
                 window_index,
                 started_at_unix_ms: Some(i64::from(window_index) * 1_000),
@@ -2731,10 +2762,14 @@ mod tests {
             total_provider_tokens: 0,
             provider_token_usage_unknown: false,
             consecutive_no_progress_windows: 0,
+            consecutive_unconfirmed_progress_windows: 0,
         };
 
-        let decision =
-            decide_execution_window_total_budget(&usage, &total_budget(3, 12, Some(10_000), None));
+        let decision = decide_execution_window_total_budget(
+            &usage,
+            &total_budget(3, 12, Some(10_000), None),
+            pioneer_tools::ToolNoProgressMode::Enforce,
+        );
 
         let ExecutionWindowTotalBudgetDecision::Block(block) = decision else {
             panic!("total window budget should block continuation");
@@ -2753,10 +2788,14 @@ mod tests {
             total_provider_tokens: 0,
             provider_token_usage_unknown: false,
             consecutive_no_progress_windows: 0,
+            consecutive_unconfirmed_progress_windows: 0,
         };
 
-        let decision =
-            decide_execution_window_total_budget(&usage, &total_budget(4, 12, Some(10_000), None));
+        let decision = decide_execution_window_total_budget(
+            &usage,
+            &total_budget(4, 12, Some(10_000), None),
+            pioneer_tools::ToolNoProgressMode::Enforce,
+        );
 
         let ExecutionWindowTotalBudgetDecision::Block(block) = decision else {
             panic!("total tool-call budget should block continuation");
@@ -2779,10 +2818,14 @@ mod tests {
             total_provider_tokens: 0,
             provider_token_usage_unknown: false,
             consecutive_no_progress_windows: 0,
+            consecutive_unconfirmed_progress_windows: 0,
         };
 
-        let decision =
-            decide_execution_window_total_budget(&usage, &total_budget(4, 100, Some(5_000), None));
+        let decision = decide_execution_window_total_budget(
+            &usage,
+            &total_budget(4, 100, Some(5_000), None),
+            pioneer_tools::ToolNoProgressMode::Enforce,
+        );
 
         let ExecutionWindowTotalBudgetDecision::Block(block) = decision else {
             panic!("total wall-clock budget should block continuation");
@@ -2805,11 +2848,13 @@ mod tests {
             total_provider_tokens: 10_000,
             provider_token_usage_unknown: false,
             consecutive_no_progress_windows: 0,
+            consecutive_unconfirmed_progress_windows: 0,
         };
 
         let decision = decide_execution_window_total_budget(
             &usage,
             &total_budget(4, 100, Some(50_000), Some(10_000)),
+            pioneer_tools::ToolNoProgressMode::Enforce,
         );
 
         let ExecutionWindowTotalBudgetDecision::Block(block) = decision else {
@@ -2833,12 +2878,14 @@ mod tests {
             total_provider_tokens: 10_000,
             provider_token_usage_unknown: true,
             consecutive_no_progress_windows: 0,
+            consecutive_unconfirmed_progress_windows: 0,
         };
 
         assert_eq!(
             decide_execution_window_total_budget(
                 &usage,
-                &total_budget(4, 100, Some(50_000), Some(10))
+                &total_budget(4, 100, Some(50_000), Some(10)),
+                pioneer_tools::ToolNoProgressMode::Enforce
             ),
             ExecutionWindowTotalBudgetDecision::Continue {
                 next_window_index: 2
@@ -2855,12 +2902,14 @@ mod tests {
             total_provider_tokens: 2_000_000,
             provider_token_usage_unknown: false,
             consecutive_no_progress_windows: 0,
+            consecutive_unconfirmed_progress_windows: 0,
         };
 
         assert_eq!(
             decide_execution_window_total_budget(
                 &usage,
-                &pioneer_tools::ExecutionWindowTotalBudgetConfig::default()
+                &pioneer_tools::ExecutionWindowTotalBudgetConfig::default(),
+                pioneer_tools::ToolNoProgressMode::Enforce
             ),
             ExecutionWindowTotalBudgetDecision::Continue {
                 next_window_index: 97
@@ -2869,42 +2918,89 @@ mod tests {
     }
 
     #[test]
-    fn no_progress_accounting_increments_only_for_empty_recovery_windows() {
+    fn unknown_windows_do_not_invent_or_reset_confirmed_semantic_stall() {
+        use pioneer_protocol::{
+            ExecutionProgressSummary, ExecutionWindowExhaustionReason as Reason,
+        };
         let mut usage = TurnExecutionUsageCounters::default();
-
-        usage.observe_checkpoint_payload(&checkpoint_payload(
-            1,
-            0,
-            0,
-            0,
-            pioneer_protocol::ExecutionWindowExhaustionReason::RuntimeShutdownContinuation,
-        ));
-
-        assert_eq!(usage.total_windows, 1);
+        let mut first = checkpoint_payload(1, 100, 20, 0, Reason::ProviderFailureContinuation);
+        first.window.progress = Some(ExecutionProgressSummary {
+            schema_version: 1,
+            baseline: [1, 0, 0],
+            frontier: [1, 1, 0],
+        });
+        usage.observe_checkpoint_payload(&first);
         assert_eq!(usage.consecutive_no_progress_windows, 1);
+        assert_eq!(usage.consecutive_unconfirmed_progress_windows, 1);
+        let mut noisy = checkpoint_payload(2, 40, 0, 3, Reason::RuntimeShutdownContinuation);
+        noisy.window.progress = Some(ExecutionProgressSummary {
+            schema_version: 1,
+            baseline: [1, 1, 0],
+            frontier: [1, 1, 3],
+        });
+        usage.observe_checkpoint_payload(&noisy);
+        assert_eq!(usage.consecutive_no_progress_windows, 1);
+        assert_eq!(usage.consecutive_unconfirmed_progress_windows, 2);
+        usage.observe_checkpoint_payload(&noisy);
+        assert_eq!(
+            usage.consecutive_unconfirmed_progress_windows, 2,
+            "duplicate window cannot spend twice"
+        );
+        let mut advanced = checkpoint_payload(3, 1, 0, 1, Reason::ProviderFailureContinuation);
+        advanced.window.progress = Some(ExecutionProgressSummary {
+            schema_version: 1,
+            baseline: [1, 1, 3],
+            frontier: [2, 1, 4],
+        });
+        usage.observe_checkpoint_payload(&advanced);
+        assert_eq!(usage.consecutive_no_progress_windows, 0);
+        assert_eq!(usage.consecutive_unconfirmed_progress_windows, 0);
+        assert_eq!(usage.total_windows, 3);
+        let restored = TurnExecutionUsageCounters::from_snapshot(usage.snapshot());
+        assert_eq!(restored, usage);
+        let mut unknown = checkpoint_payload(4, 0, 0, 0, Reason::RuntimeShutdownContinuation);
+        unknown.window.progress = None;
+        usage.observe_checkpoint_payload(&unknown);
+        assert_eq!(usage.consecutive_no_progress_windows, 0);
+        assert_eq!(usage.consecutive_unconfirmed_progress_windows, 1);
     }
 
     #[test]
-    fn durable_progress_resets_no_progress_accounting_even_when_tools_fail() {
-        let mut usage = TurnExecutionUsageCounters::default();
-
-        usage.observe_checkpoint_payload(&checkpoint_payload(
-            1,
-            0,
-            0,
-            0,
-            pioneer_protocol::ExecutionWindowExhaustionReason::ProviderFailureContinuation,
-        ));
-        usage.observe_checkpoint_payload(&checkpoint_payload(
-            2,
-            1,
-            0,
-            3,
-            pioneer_protocol::ExecutionWindowExhaustionReason::RuntimeShutdownContinuation,
-        ));
-
-        assert_eq!(usage.total_windows, 2);
-        assert_eq!(usage.consecutive_no_progress_windows, 0);
+    fn progress_safety_budget_remains_finite_in_all_heuristic_modes() {
+        let mut budget = pioneer_tools::ExecutionWindowTotalBudgetConfig::default();
+        budget.max_consecutive_no_progress_windows = 1;
+        budget.max_consecutive_unconfirmed_progress_windows = 2;
+        let mut usage = TurnExecutionUsageCounters {
+            total_windows: 1,
+            consecutive_no_progress_windows: 1,
+            consecutive_unconfirmed_progress_windows: 1,
+            ..Default::default()
+        };
+        for mode in [
+            pioneer_tools::ToolNoProgressMode::Disabled,
+            pioneer_tools::ToolNoProgressMode::Observe,
+        ] {
+            assert!(matches!(
+                decide_execution_window_total_budget(&usage, &budget, mode),
+                ExecutionWindowTotalBudgetDecision::Continue { .. }
+            ));
+        }
+        assert!(
+            matches!(decide_execution_window_total_budget(&usage, &budget, pioneer_tools::ToolNoProgressMode::Enforce),
+            ExecutionWindowTotalBudgetDecision::Block(block) if block.kind == ExecutionWindowTotalBudgetBlockKind::MaxConsecutiveNoProgressWindows)
+        );
+        usage.consecutive_no_progress_windows = 0;
+        usage.consecutive_unconfirmed_progress_windows = 2;
+        for mode in [
+            pioneer_tools::ToolNoProgressMode::Disabled,
+            pioneer_tools::ToolNoProgressMode::Observe,
+            pioneer_tools::ToolNoProgressMode::Enforce,
+        ] {
+            assert!(
+                matches!(decide_execution_window_total_budget(&usage, &budget, mode),
+                ExecutionWindowTotalBudgetDecision::Block(block) if block.kind == ExecutionWindowTotalBudgetBlockKind::MaxUnconfirmedProgressWindows)
+            );
+        }
     }
 
     #[test]
@@ -2916,11 +3012,16 @@ mod tests {
             total_provider_tokens: 0,
             provider_token_usage_unknown: true,
             consecutive_no_progress_windows: 3,
+            consecutive_unconfirmed_progress_windows: 3,
         };
 
         let mut budget = total_budget(8, 100, Some(10_000), None);
         budget.max_consecutive_no_progress_windows = 3;
-        let decision = decide_execution_window_total_budget(&usage, &budget);
+        let decision = decide_execution_window_total_budget(
+            &usage,
+            &budget,
+            pioneer_tools::ToolNoProgressMode::Enforce,
+        );
 
         let ExecutionWindowTotalBudgetDecision::Block(block) = decision else {
             panic!("consecutive no-progress budget should block continuation");

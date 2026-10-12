@@ -200,6 +200,7 @@ pub(crate) async fn execution_window_usage_snapshot(
         total_provider_tokens: usage.total_provider_tokens,
         provider_token_usage_unknown: usage.provider_token_usage_unknown,
         consecutive_no_progress_windows: usage.consecutive_no_progress_windows,
+        consecutive_unconfirmed_progress_windows: usage.consecutive_unconfirmed_progress_windows,
     })
 }
 

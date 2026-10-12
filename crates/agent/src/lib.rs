@@ -13,7 +13,7 @@ mod native_initial;
 pub use native_initial::{NativeInitialPreparation, NativeInitialResumeRequirements};
 
 /// Agent owns this bounded semantic codec; readers must reject other versions.
-pub const NATIVE_SEMANTIC_STATE_SCHEMA_VERSION: u32 = 6;
+pub const NATIVE_SEMANTIC_STATE_SCHEMA_VERSION: u32 = 7;
 
 #[derive(Debug)]
 pub struct NativeHistorySourceUnavailable;
@@ -1274,6 +1274,7 @@ pub struct ExecutionWindowUsageSnapshot {
     pub total_provider_tokens: u64,
     pub provider_token_usage_unknown: bool,
     pub consecutive_no_progress_windows: u32,
+    pub consecutive_unconfirmed_progress_windows: u32,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1284,6 +1285,7 @@ struct TurnExecutionUsageCounters {
     total_provider_tokens: u64,
     provider_token_usage_unknown: bool,
     consecutive_no_progress_windows: u32,
+    consecutive_unconfirmed_progress_windows: u32,
 }
 
 impl TurnExecutionUsageCounters {
@@ -1295,6 +1297,8 @@ impl TurnExecutionUsageCounters {
             total_provider_tokens: snapshot.total_provider_tokens,
             provider_token_usage_unknown: snapshot.provider_token_usage_unknown,
             consecutive_no_progress_windows: snapshot.consecutive_no_progress_windows,
+            consecutive_unconfirmed_progress_windows: snapshot
+                .consecutive_unconfirmed_progress_windows,
         }
     }
 
@@ -1306,6 +1310,7 @@ impl TurnExecutionUsageCounters {
             total_provider_tokens: self.total_provider_tokens,
             provider_token_usage_unknown: self.provider_token_usage_unknown,
             consecutive_no_progress_windows: self.consecutive_no_progress_windows,
+            consecutive_unconfirmed_progress_windows: self.consecutive_unconfirmed_progress_windows,
         }
     }
 
@@ -1345,27 +1350,29 @@ impl TurnExecutionUsageCounters {
             }
         }
 
-        if execution_checkpoint_payload_is_no_progress_recovery(payload) {
-            self.consecutive_no_progress_windows =
-                self.consecutive_no_progress_windows.saturating_add(1);
-        } else {
-            self.consecutive_no_progress_windows = 0;
+        match payload.window.progress.map_or(
+            pioneer_protocol::ExecutionProgressKind::Unknown,
+            |progress| progress.kind(),
+        ) {
+            pioneer_protocol::ExecutionProgressKind::Advanced => {
+                self.consecutive_no_progress_windows = 0;
+                self.consecutive_unconfirmed_progress_windows = 0;
+            }
+            pioneer_protocol::ExecutionProgressKind::Unchanged => {
+                self.consecutive_no_progress_windows =
+                    self.consecutive_no_progress_windows.saturating_add(1);
+                self.consecutive_unconfirmed_progress_windows = self
+                    .consecutive_unconfirmed_progress_windows
+                    .saturating_add(1);
+            }
+            pioneer_protocol::ExecutionProgressKind::Unknown => {
+                // Unknown neither confirms another stall nor clears known stall.
+                self.consecutive_unconfirmed_progress_windows = self
+                    .consecutive_unconfirmed_progress_windows
+                    .saturating_add(1);
+            }
         }
     }
-}
-
-fn execution_checkpoint_payload_is_no_progress_recovery(
-    payload: &ExecutionCheckpointPayload,
-) -> bool {
-    payload.window.agent_round_count == 0
-        && payload.tools.executed_count == 0
-        && matches!(
-            payload.window.exhaustion_reason,
-            Some(
-                ExecutionWindowExhaustionReason::ProviderFailureContinuation
-                    | ExecutionWindowExhaustionReason::RuntimeShutdownContinuation
-            )
-        )
 }
 
 #[derive(Debug, Clone)]
