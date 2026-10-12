@@ -8603,7 +8603,8 @@ impl CrudStore {
                 );
                 metadata["accountingSchemaVersion"] = serde_json::json!(1);
                 metadata["providerUsageAvailable"] = serde_json::json!(
-                    available
+                    attempts > 0
+                        && available
                         && attempts >= rounds
                         && tokens == window.provider_token_count.max(tokens)
                 );
@@ -42589,121 +42590,137 @@ mod tests {
 
     #[tokio::test]
     async fn partial_row_token_lower_bound_is_not_completed_by_smaller_known_receipts() {
-        let (store, thread, turn) =
-            test_store_with_started_turn("ws_lower_bound", "thr_lower_bound", "turn_lower_bound")
-                .await;
-        let now = chrono::Utc::now().fixed_offset();
-        let window = store
-            .create_turn_execution_window(
-                NewTurnExecutionWindowRecord {
-                    workspace_id: thread.workspace_id.clone(),
-                    thread_id: thread.id.clone(),
-                    turn_id: turn.id.clone(),
-                    window_index: 1,
-                    status: ExecutionWindowStatus::Running,
-                    exhaustion_reason: None,
-                    agent_round_count: 1,
-                    tool_call_count: 0,
-                    // Accepted partial accounting, including older charged information
-                    // not fully represented by the current bounded receipt projection.
-                    provider_token_count: 100,
-                    metadata_json: serde_json::json!({"accountingSchemaVersion":1,
+        for (lower_bound, receipt, unknown) in [
+            (100, Some((40, 10)), true),
+            (0, Some((0, 0)), false),
+            (0, None, true),
+        ] {
+            let rounds = u32::from(receipt.is_some());
+            let (store, thread, turn) = test_store_with_started_turn(
+                "ws_lower_bound",
+                "thr_lower_bound",
+                "turn_lower_bound",
+            )
+            .await;
+            let now = chrono::Utc::now().fixed_offset();
+            let window = store
+                .create_turn_execution_window(
+                    NewTurnExecutionWindowRecord {
+                        workspace_id: thread.workspace_id.clone(),
+                        thread_id: thread.id.clone(),
+                        turn_id: turn.id.clone(),
+                        window_index: 1,
+                        status: ExecutionWindowStatus::Running,
+                        exhaustion_reason: None,
+                        agent_round_count: rounds,
+                        tool_call_count: 0,
+                        // Accepted partial accounting, including older charged information
+                        // not fully represented by the current bounded receipt projection.
+                        provider_token_count: lower_bound,
+                        metadata_json: serde_json::json!({"accountingSchemaVersion":1,
                 "providerUsageAvailable":false,"runtimeWindowId":"original-runtime"}),
-                    started_at: now,
-                },
-                now,
-                now,
-            )
-            .await
-            .unwrap();
-        let item = pioneer_protocol::TurnItem::SystemEvent {
-            id: "known_usage_receipt".into(),
-            level: pioneer_protocol::SystemEventLevel::Info,
-            message: "Provider usage observation".into(),
-            code: Some("provider_usage".into()),
-            details: Some(serde_json::json!({"schema_version":1,"window_index":1,
-                "status":"completed","usage":{"input_tokens":40,"output_tokens":10}})),
-        };
-        store
-            .materialize_item_started(
-                pioneer_protocol::ItemStartedNotification {
-                    workspace_id: thread.workspace_id.clone(),
-                    thread_id: thread.id.clone(),
-                    turn_id: turn.id.clone(),
-                    item: item.clone(),
-                },
-                now.timestamp(),
-            )
-            .await
-            .unwrap();
-        store
-            .materialize_item_completed(
-                pioneer_protocol::ItemCompletedNotification {
-                    workspace_id: thread.workspace_id.clone(),
-                    thread_id: thread.id.clone(),
-                    turn_id: turn.id.clone(),
-                    item,
-                },
-                now.timestamp(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(
+                        started_at: now,
+                    },
+                    now,
+                    now,
+                )
+                .await
+                .unwrap();
+            if let Some((input, output)) = receipt {
+                let item = pioneer_protocol::TurnItem::SystemEvent {
+                    id: "known_usage_receipt".into(),
+                    level: pioneer_protocol::SystemEventLevel::Info,
+                    message: "Provider usage observation".into(),
+                    code: Some("provider_usage".into()),
+                    details: Some(serde_json::json!({"schema_version":1,"window_index":1,
+                "status":"completed","usage":{"input_tokens":input,"output_tokens":output}})),
+                };
+                store
+                    .materialize_item_started(
+                        pioneer_protocol::ItemStartedNotification {
+                            workspace_id: thread.workspace_id.clone(),
+                            thread_id: thread.id.clone(),
+                            turn_id: turn.id.clone(),
+                            item: item.clone(),
+                        },
+                        now.timestamp(),
+                    )
+                    .await
+                    .unwrap();
+                store
+                    .materialize_item_completed(
+                        pioneer_protocol::ItemCompletedNotification {
+                            workspace_id: thread.workspace_id.clone(),
+                            thread_id: thread.id.clone(),
+                            turn_id: turn.id.clone(),
+                            item,
+                        },
+                        now.timestamp(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(
+                store
+                    .summarize_execution_window_provider_usage(&turn.id, 1)
+                    .await
+                    .unwrap(),
+                (
+                    rounds,
+                    receipt.map_or(0, |(input, output)| input + output),
+                    true
+                )
+            );
+            let active = store
+                .aggregate_turn_execution_window_usage(&turn.id)
+                .await
+                .unwrap();
+            assert_eq!(active.total_agent_rounds, u64::from(rounds));
+            assert_eq!(active.total_provider_tokens, lower_bound);
+            assert_eq!(active.provider_token_usage_unknown, unknown);
             store
-                .summarize_execution_window_provider_usage(&turn.id, 1)
+                .update_turn_status(
+                    &thread.id,
+                    &turn.id,
+                    TurnStatus::Failed,
+                    Some("fixture"),
+                    now.timestamp(),
+                )
                 .await
-                .unwrap(),
-            (1, 50, true)
-        );
-        let active = store
-            .aggregate_turn_execution_window_usage(&turn.id)
-            .await
-            .unwrap();
-        assert_eq!(active.total_agent_rounds, 1);
-        assert_eq!(active.total_provider_tokens, 100);
-        assert!(active.provider_token_usage_unknown);
-        store
-            .update_turn_status(
-                &thread.id,
-                &turn.id,
-                TurnStatus::Failed,
-                Some("fixture"),
-                now.timestamp(),
-            )
-            .await
-            .unwrap();
-        let fresh = store.with_maintenance_access();
-        assert_eq!(
-            fresh
-                .close_active_execution_windows_for_terminal_turns(now)
+                .unwrap();
+            let fresh = store.with_maintenance_access();
+            assert_eq!(
+                fresh
+                    .close_active_execution_windows_for_terminal_turns(now)
+                    .await
+                    .unwrap(),
+                1
+            );
+            assert_eq!(
+                fresh
+                    .close_active_execution_windows_for_terminal_turns(now)
+                    .await
+                    .unwrap(),
+                0
+            );
+            let closed = fresh
+                .get_turn_execution_window(&window.id)
                 .await
-                .unwrap(),
-            1
-        );
-        assert_eq!(
-            fresh
-                .close_active_execution_windows_for_terminal_turns(now)
+                .unwrap()
+                .unwrap();
+            assert_eq!(closed.status, ExecutionWindowStatus::Failed);
+            assert_eq!(closed.agent_round_count, rounds);
+            assert_eq!(closed.provider_token_count, lower_bound);
+            assert_eq!(closed.metadata_json["providerUsageAvailable"], !unknown);
+            assert_eq!(closed.metadata_json["runtimeWindowId"], "original-runtime");
+            let restored = fresh
+                .aggregate_turn_execution_window_usage(&turn.id)
                 .await
-                .unwrap(),
-            0
-        );
-        let closed = fresh
-            .get_turn_execution_window(&window.id)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(closed.status, ExecutionWindowStatus::Failed);
-        assert_eq!(closed.agent_round_count, 1);
-        assert_eq!(closed.provider_token_count, 100);
-        assert_eq!(closed.metadata_json["providerUsageAvailable"], false);
-        assert_eq!(closed.metadata_json["runtimeWindowId"], "original-runtime");
-        let restored = fresh
-            .aggregate_turn_execution_window_usage(&turn.id)
-            .await
-            .unwrap();
-        assert_eq!(restored.total_provider_tokens, active.total_provider_tokens);
-        assert_eq!(restored.total_agent_rounds, active.total_agent_rounds);
-        assert!(restored.provider_token_usage_unknown);
+                .unwrap();
+            assert_eq!(restored.total_provider_tokens, active.total_provider_tokens);
+            assert_eq!(restored.total_agent_rounds, active.total_agent_rounds);
+            assert_eq!(restored.provider_token_usage_unknown, unknown);
+        }
     }
 
     #[tokio::test]
