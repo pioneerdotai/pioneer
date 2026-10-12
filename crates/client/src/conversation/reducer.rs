@@ -412,6 +412,53 @@ impl ConversationProjector {
         self.upsert_turn(turn_id, TurnPhase::Running, Some(ts_unix_ms), None, None);
     }
 
+    // Detached admission errors belong to the semantic outcome row. Keep its
+    // legacy Turn metadata in sync without creating an additional RPC error item.
+    pub(super) fn apply_admission_outcome(
+        &mut self,
+        turn_id: &str,
+        status: TurnStatus,
+        error: Option<&str>,
+        now_unix_ms: i64,
+        update_flow_error: bool,
+        resume: Option<&TurnBlockedResumeMetadata>,
+    ) {
+        let phase = match status {
+            TurnStatus::InProgress | TurnStatus::Completed => TurnPhase::Completed,
+            TurnStatus::Failed => TurnPhase::Failed,
+            TurnStatus::Blocked => TurnPhase::Blocked,
+            TurnStatus::Interrupted => TurnPhase::Cancelled,
+        };
+        // Snapshot metadata can insert a TurnView before the projector has indexed it.
+        // Reuse that view so a fresh/reconnected client keeps one admission Turn.
+        if !self.turn_index.contains_key(turn_id)
+            && let Some(index) = self
+                .view_state
+                .turns
+                .iter()
+                .position(|turn| turn.id == turn_id)
+        {
+            self.turn_index.insert(turn_id.to_owned(), index);
+        }
+        self.upsert_turn(turn_id, phase, None, None, None);
+        let turn = self
+            .view_state
+            .turns
+            .get_mut(self.turn_index[turn_id])
+            .expect("upserted admission");
+        // None is authoritative here: successful confirmation clears a local timeout.
+        turn.error = error.map(str::to_owned);
+        turn.completed_at_unix_ms.get_or_insert(now_unix_ms);
+        if status != TurnStatus::Blocked {
+            turn.resume = None;
+        } else if let Some(resume) = resume {
+            turn.resume = Some(resume.clone());
+        }
+        if update_flow_error {
+            self.view_state.last_error = error.map(str::to_owned);
+        }
+    }
+
     pub fn apply_local_turn_start_rejected(&mut self, turn_id: &str, error: &str, ts_unix_ms: i64) {
         self.upsert_turn(
             turn_id,

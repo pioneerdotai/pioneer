@@ -2112,6 +2112,44 @@ impl MessageProcessor {
             else {
                 return;
             };
+            // Materialization has released all DB capacity. Publish the exact
+            // committed user lifecycle before the Task service can start/fanout
+            // its occurrence; do not wait for the optional native outbox.
+            if let Err(error) = self
+                .emit_user_message_item_lifecycle_with_live_delivery(
+                    thread.workspace_id.as_str(),
+                    thread.id.as_str(),
+                    turn_id.as_str(),
+                    outcome.materialization.input.as_slice(),
+                    capability_attachments.as_slice(),
+                    true,
+                )
+                .await
+            {
+                self.mark_turn_blocked(
+                    thread.id.clone(),
+                    turn_id.clone(),
+                    format!("failed to publish Composer user message: {error:#}"),
+                )
+                .await;
+                self.send_turn_start_failure(
+                    connection_id,
+                    request_id.clone(),
+                    &success_response,
+                    thread.id.as_str(),
+                    turn_id.as_str(),
+                    format!("failed to publish Composer user message: {error:#}"),
+                )
+                .await;
+                return;
+            }
+            #[cfg(test)]
+            self.completed_history_preparation_barrier
+                .wait_if_armed(
+                    "__detached_composer_before_task_create__",
+                    &tokio_util::sync::CancellationToken::new(),
+                )
+                .await;
             let task_created_phase = message_future(async {
                 let first_text = first_user_text(launch.input.as_slice());
                 let goal = first_text
@@ -9590,14 +9628,21 @@ impl MessageProcessor {
         outcome: &crate::thread::TurnStartOutcome,
         user_message_capability_attachments: &[pioneer_protocol::UserMessageAttachment],
     ) -> bool {
-        if let Err(error) = message_future(self.emit_user_message_item_lifecycle(
-            outcome.started_notification.workspace_id.as_str(),
-            outcome.started_notification.thread_id.as_str(),
-            outcome.started_notification.turn.id.as_str(),
-            outcome.materialization.input.as_slice(),
-            user_message_capability_attachments,
-        ))
-        .await
+        // Detached Composer published this lifecycle before Task creation.
+        if !outcome
+            .materialization
+            .thread
+            .origin_kind
+            .composer_execution_mode()
+            .is_detached_admission(&outcome.started_notification.turn)
+            && let Err(error) = message_future(self.emit_user_message_item_lifecycle(
+                outcome.started_notification.workspace_id.as_str(),
+                outcome.started_notification.thread_id.as_str(),
+                outcome.started_notification.turn.id.as_str(),
+                outcome.materialization.input.as_slice(),
+                user_message_capability_attachments,
+            ))
+            .await
         {
             warn!(
                 thread_id = outcome.started_notification.thread_id,
