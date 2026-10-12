@@ -6410,7 +6410,7 @@ mod tests {
             &mut state,
             thread_page(vec![
                 user_block("thread_a", "block_user", "001", "turn_a"),
-                turn_work_block("thread_a", "block_work", "002"),
+                turn_work_block("thread_a", "turn:turn_a:work", "002"),
             ]),
             TopLevelPageMergeMode::Reset
         ));
@@ -6444,6 +6444,15 @@ mod tests {
 
         let flattened =
             flatten_semantic_timeline(&state, "thread_a").expect("flattened rows should exist");
+        assert_eq!(
+            flattened
+                .rows
+                .iter()
+                .filter(|row| matches!(row.kind, SemanticTimelineRowKind::WorkHeader { .. }))
+                .count(),
+            1,
+            "the terminal event must update the existing work header"
+        );
         let work_row = flattened
             .rows
             .iter()
