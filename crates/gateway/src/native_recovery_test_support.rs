@@ -138,7 +138,7 @@ pub(crate) async fn charged_native_window(
     .unwrap();
     snapshot.initial_phase_json = Some(phase);
     let contract = pioneer_provider::Provider::capture_model_contract(
-        &pioneer_provider::EchoProvider::new(),
+        &pioneer_provider::echo::EchoProvider::new(),
         "test-model",
     )
     .unwrap();

@@ -720,7 +720,9 @@ impl MessageProcessor {
         } else {
             counts.agent_round_count
         });
-        usage_available &= observed_attempts >= accounted_rounds;
+        usage_available &= observed_attempts > 0
+            && observed_attempts >= accounted_rounds
+            && observed_tokens == window.provider_token_count.max(observed_tokens);
         let mut metadata = execution_window_terminal_metadata(
             &window.metadata_json,
             terminal_status,
@@ -11062,6 +11064,209 @@ mod recovery_resume_reason_contract_tests {
             (ProviderFailureClass::Unknown, "recovery_blocked"),
         ] {
             assert_eq!(recovery_resume_reason_class(class), expected);
+        }
+    }
+}
+
+#[cfg(test)]
+mod terminal_usage_close_contract_tests {
+    use super::*;
+    use migration::MigratorTrait;
+    use pioneer_protocol::{ExecutionWindowStatus, Thread, Turn};
+
+    #[tokio::test]
+    async fn actual_gateway_terminal_close_preserves_partial_zero_and_missing_usage_after_restart()
+    {
+        for (lower_bound, receipt, unknown) in [
+            (100, Some((40, 10)), true),
+            (0, Some((0, 0)), false),
+            (0, None, true),
+        ] {
+            let db = sea_orm::Database::connect("sqlite::memory:").await.unwrap();
+            migration::Migrator::up(&db, None).await.unwrap();
+            crate::bootstrap::bootstrap(&db).await.unwrap();
+            let workspace_manager = Arc::new(crate::workspace::WorkspaceManager::new(db.clone()));
+            let workspace = workspace_manager
+                .list_workspaces()
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|w| w.is_current)
+                .unwrap()
+                .id;
+            let store = Arc::new(pioneer_crud::CrudStore::new(db));
+            let processor = MessageProcessor::new(
+                Arc::new(crate::thread::ThreadManager::new("test-model", "echo")),
+                Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+                    "echo",
+                    Arc::new(pioneer_provider::echo::EchoProvider::new()),
+                )),
+                Arc::new(crate::session::SessionManager::new()),
+                workspace_manager,
+                store.clone(),
+                Arc::new(crate::secrets::GatewaySecrets::new(Arc::new(
+                    pioneer_keystore::MemorySecretStore::new(),
+                ))),
+                crate::message::summary::SummaryConfig {
+                    summary_model: None,
+                    summary_model_provider: None,
+                    title_model: None,
+                    title_model_provider: None,
+                },
+                pioneer_agent::ToolLoopConfig::default(),
+            );
+            let now = chrono::Utc::now().fixed_offset();
+            let thread = Thread {
+                workspace_id: workspace.clone(),
+                id: "terminal_usage_thread".into(),
+                name: None,
+                preview: String::new(),
+                preview_author: None,
+                mode: pioneer_protocol::ThreadMode::Agent,
+                model: "test-model".into(),
+                model_provider: "echo".into(),
+                reasoning_effort: None,
+                created_at: now.timestamp(),
+                updated_at: now.timestamp(),
+                status: pioneer_protocol::ThreadStatus::Active,
+                origin_kind: Default::default(),
+                sidebar_visibility: Default::default(),
+                agent_nickname: None,
+                agent_role: None,
+                visibility: None,
+                turns: vec![],
+            };
+            let turn = Turn {
+                id: "terminal_usage_turn".into(),
+                status: pioneer_protocol::TurnStatus::InProgress,
+                turn_kind: Default::default(),
+                origin: Default::default(),
+                mode: Default::default(),
+                author: None,
+                reply_to_turn_id: None,
+                mentions: vec![],
+                message_revision: 0,
+                message_deleted: false,
+                error: None,
+                prompt_manifest: None,
+                permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
+            };
+            store
+                .materialize_turn_start(
+                    &thread,
+                    pioneer_protocol::SandboxMode::FullAccess,
+                    &turn,
+                    &[],
+                    pioneer_protocol::PersistedActorRef::System,
+                )
+                .await
+                .unwrap();
+            let window = store.create_turn_execution_window(pioneer_crud::NewTurnExecutionWindowRecord {
+                workspace_id: workspace.clone(), thread_id: thread.id.clone(), turn_id: turn.id.clone(), window_index: 1,
+                status: ExecutionWindowStatus::Running, exhaustion_reason: None,
+                agent_round_count: 1, tool_call_count: 0, provider_token_count: lower_bound,
+                metadata_json: serde_json::json!({"runtimeWindowId":"original-owner", "accountingSchemaVersion":1,"providerUsageAvailable":false}), started_at: now,
+            }, now, now).await.unwrap();
+            if let Some((input, output)) = receipt {
+                let item = TurnItem::SystemEvent {
+                    id: "terminal_usage_receipt".into(),
+                    level: pioneer_protocol::SystemEventLevel::Info,
+                    message: "Provider usage observation".into(),
+                    code: Some("provider_usage".into()),
+                    details: Some(
+                        serde_json::json!({"schema_version":1,"window_index":1,"status":"completed","complete":true,"usage":{"input_tokens":input,"output_tokens":output}}),
+                    ),
+                };
+                store
+                    .materialize_item_started(
+                        pioneer_protocol::ItemStartedNotification {
+                            workspace_id: workspace.clone(),
+                            thread_id: thread.id.clone(),
+                            turn_id: turn.id.clone(),
+                            item: item.clone(),
+                        },
+                        now.timestamp(),
+                    )
+                    .await
+                    .unwrap();
+                store
+                    .materialize_item_completed(
+                        pioneer_protocol::ItemCompletedNotification {
+                            workspace_id: workspace.clone(),
+                            thread_id: thread.id.clone(),
+                            turn_id: turn.id.clone(),
+                            item,
+                        },
+                        now.timestamp(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            let before = store
+                .aggregate_turn_execution_window_usage(&turn.id)
+                .await
+                .unwrap();
+            store
+                .update_turn_status(
+                    &thread.id,
+                    &turn.id,
+                    pioneer_protocol::TurnStatus::Failed,
+                    Some("fixture failure"),
+                    now.timestamp(),
+                )
+                .await
+                .unwrap();
+            processor
+                .close_latest_active_execution_window_for_terminal_turn(
+                    &turn.id,
+                    ExecutionWindowStatus::Failed,
+                    Some("fixture failure"),
+                )
+                .await
+                .unwrap();
+            let closed = store
+                .latest_turn_execution_window(&turn.id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(closed.id, window.id);
+            assert_eq!(closed.status, ExecutionWindowStatus::Failed);
+            assert_eq!(closed.provider_token_count, lower_bound);
+            assert_eq!(closed.agent_round_count, 1);
+            assert_eq!(closed.metadata_json["providerUsageAvailable"], !unknown);
+            assert_eq!(closed.metadata_json["runtimeWindowId"], "original-owner");
+            let fresh =
+                pioneer_crud::CrudStore::new(store.database_connection()).with_maintenance_access();
+            let after = fresh
+                .aggregate_turn_execution_window_usage(&turn.id)
+                .await
+                .unwrap();
+            assert_eq!(after.total_provider_tokens, before.total_provider_tokens);
+            assert_eq!(after.total_agent_rounds, before.total_agent_rounds);
+            assert_eq!(after.provider_token_usage_unknown, unknown);
+            processor
+                .close_latest_active_execution_window_for_terminal_turn(
+                    &turn.id,
+                    ExecutionWindowStatus::Failed,
+                    Some("duplicate"),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                store
+                    .latest_turn_execution_window(&turn.id)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                closed
+            );
+            assert_eq!(
+                fresh
+                    .aggregate_turn_execution_window_usage(&turn.id)
+                    .await
+                    .unwrap(),
+                after
+            );
         }
     }
 }
