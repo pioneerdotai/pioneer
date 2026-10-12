@@ -8746,7 +8746,7 @@ async fn load_execution_checkpoint_context_for_turn(
         recovered.window.completed_at_unix_ms = Some(completed_at.timestamp_millis());
         recovered.window.exhaustion_reason =
             Some(pioneer_protocol::ExecutionWindowExhaustionReason::RuntimeShutdownContinuation);
-        processor
+        recovered = processor
             .crud_store
             .checkpoint_native_running_window_for_recovery(
                 &window,
@@ -11538,6 +11538,283 @@ mod tests {
             reviewer.post_turn_dispatch_mode,
             pioneer_agent::AgentTurnPostTurnDispatchMode::Immediate
         );
+    }
+
+    #[tokio::test]
+    async fn hidden_task_cold_close_preserves_progress_accounting_and_agent_budget_decisions() {
+        for mode in [
+            pioneer_tools::ToolNoProgressMode::Disabled,
+            pioneer_tools::ToolNoProgressMode::Observe,
+            pioneer_tools::ToolNoProgressMode::Enforce,
+        ] {
+            for (frontier, stalls, unconfirmed) in
+                [([1, 2, 0], 0, 0), ([0, 3, 0], 3, 3), ([0, 2, 1], 2, 3)]
+            {
+                for complete in [true, false] {
+                    for token_cap in [None, Some(120)] {
+                        let (processor, task, run_turn, _) =
+                            task_artifact_harness("cold_progress_budget").await;
+                        let store = processor.crud_store.as_ref();
+                        let (workspace, thread, turn) = (
+                            task.workspace_id.as_str(),
+                            run_turn.thread_id.as_str(),
+                            run_turn.turn_id.as_str(),
+                        );
+                        let now = utc_now();
+                        let thread_model = pioneer_protocol::Thread {
+                            workspace_id: workspace.into(),
+                            id: thread.into(),
+                            name: None,
+                            preview: String::new(),
+                            preview_author: None,
+                            mode: ThreadMode::Agent,
+                            model: "test-model".into(),
+                            model_provider: "echo".into(),
+                            reasoning_effort: None,
+                            created_at: now.timestamp(),
+                            updated_at: now.timestamp(),
+                            status: pioneer_protocol::ThreadStatus::Active,
+                            origin_kind: pioneer_protocol::ThreadOriginKind::TaskRun,
+                            sidebar_visibility: pioneer_protocol::ThreadSidebarVisibility::Hidden,
+                            agent_nickname: None,
+                            agent_role: None,
+                            visibility: None,
+                            turns: vec![],
+                        };
+                        let turn_model = pioneer_protocol::Turn {
+                            id: turn.into(),
+                            status: pioneer_protocol::TurnStatus::InProgress,
+                            turn_kind: Default::default(),
+                            origin: Default::default(),
+                            mode: Default::default(),
+                            author: None,
+                            reply_to_turn_id: None,
+                            mentions: vec![],
+                            message_revision: 0,
+                            message_deleted: false,
+                            error: None,
+                            prompt_manifest: None,
+                            permission_profile:
+                                pioneer_protocol::default_turn_permission_profile_snapshot(),
+                        };
+                        store
+                            .materialize_turn_start(
+                                &thread_model,
+                                pioneer_protocol::SandboxMode::FullAccess,
+                                &turn_model,
+                                &[],
+                                pioneer_protocol::PersistedActorRef::System,
+                            )
+                            .await
+                            .unwrap();
+                        for index in 1..=2 {
+                            store.create_turn_execution_window(pioneer_crud::NewTurnExecutionWindowRecord {
+                                workspace_id:workspace.into(),thread_id:thread.into(),turn_id:turn.into(),window_index:index,
+                                status:pioneer_protocol::ExecutionWindowStatus::Checkpointed,exhaustion_reason:None,
+                                agent_round_count:1,tool_call_count:0,provider_token_count:10,
+                                metadata_json:serde_json::json!({"runtimeWindowId":format!("{turn}:window:{index}"),
+                                    "accountingSchemaVersion":1,"providerUsageAvailable":true,
+                                    "semanticProgress":pioneer_protocol::ExecutionProgressSummary {
+                                        schema_version:1,baseline:[0,u64::from(index-1),0],frontier:[0,u64::from(index),0]}}),
+                                started_at:now-chrono::Duration::seconds(1),
+                            },now,now).await.unwrap();
+                        }
+                        let mut config = test_tool_loop_config_for_task_artifacts();
+                        config.no_progress_mode = mode;
+                        config
+                            .execution_windows
+                            .total
+                            .max_consecutive_no_progress_windows = 2;
+                        config.execution_windows.total.max_provider_tokens_per_turn = token_cap;
+                        let progress = pioneer_protocol::ExecutionProgressSummary {
+                            schema_version: 1,
+                            baseline: [0, 2, 0],
+                            frontier,
+                        };
+                        let (window, semantic) =
+                            crate::native_recovery_test_support::charged_native_window(
+                                store,
+                                workspace,
+                                thread,
+                                turn,
+                                processor.turn_execution_owner_id.as_ref(),
+                                3,
+                                &config,
+                                [(Some(40), Some(10)), (Some(50), complete.then_some(0))],
+                                progress,
+                            )
+                            .await;
+                        assert!(
+                            window.metadata_json.get("semanticProgress").is_none(),
+                            "exercise the actual cold consumer, not a pre-correct row"
+                        );
+                        let before = store
+                            .aggregate_turn_execution_window_usage(turn)
+                            .await
+                            .unwrap();
+                        assert_eq!(before.total_provider_tokens, 120);
+                        assert_eq!(before.total_agent_rounds, 4);
+                        assert_eq!(before.consecutive_no_progress_windows, 2);
+                        let context = load_execution_checkpoint_context_for_turn(&processor, turn)
+                            .await
+                            .unwrap()
+                            .unwrap();
+                        assert_eq!(context.payload.window.progress, Some(progress));
+                        assert_eq!(
+                            context.payload.native_semantic_state,
+                            semantic.native_semantic_state
+                        );
+                        assert_eq!(
+                            context.payload.provider_budget.provider_usage_available,
+                            complete
+                        );
+                        assert_eq!(context.payload.window.provider_token_count, Some(100));
+                        assert_eq!(context.usage.total_provider_tokens, 120);
+                        assert_eq!(context.usage.consecutive_no_progress_windows, stalls);
+                        assert_eq!(
+                            context.usage.consecutive_unconfirmed_progress_windows,
+                            unconfirmed
+                        );
+                        assert_eq!(context.usage.provider_token_usage_unknown, !complete);
+                        assert_eq!(context.window_id, format!("{turn}:window:3"));
+                        let closed = store
+                            .get_turn_execution_window(&window.id)
+                            .await
+                            .unwrap()
+                            .unwrap();
+                        assert_eq!(
+                            closed.metadata_json["semanticProgress"],
+                            serde_json::to_value(progress).unwrap()
+                        );
+                        assert_eq!(closed.metadata_json["accountingSchemaVersion"], 1);
+                        assert_eq!(closed.metadata_json["providerUsageAvailable"], complete);
+                        assert_eq!(closed.metadata_json["acceptedOwnerMarker"], "keep");
+                        let fresh = store.with_maintenance_access();
+                        let aggregate = fresh
+                            .aggregate_turn_execution_window_usage(turn)
+                            .await
+                            .unwrap();
+                        assert_eq!(aggregate.total_agent_rounds, before.total_agent_rounds);
+                        assert_eq!(
+                            aggregate.total_provider_tokens,
+                            before.total_provider_tokens
+                        );
+                        assert_eq!(aggregate.consecutive_no_progress_windows, stalls);
+                        assert_eq!(
+                            aggregate.consecutive_unconfirmed_progress_windows,
+                            unconfirmed
+                        );
+                        let checkpoint_count = fresh
+                            .list_turn_execution_checkpoints_for_window(&window.id)
+                            .await
+                            .unwrap()
+                            .len();
+                        let restarted_processor = Arc::new(MessageProcessor::new(
+                            Arc::new(ThreadManager::new("test-model", "echo")),
+                            Arc::new(ProviderRegistry::with_provider(
+                                "echo",
+                                Arc::new(EchoProvider::new()),
+                            )),
+                            Arc::new(SessionManager::new()),
+                            processor.workspace_manager.clone(),
+                            Arc::new(fresh.clone()),
+                            Arc::new(GatewaySecrets::new(Arc::new(MemorySecretStore::new()))),
+                            summary::SummaryConfig {
+                                summary_model: Some("test-model".into()),
+                                summary_model_provider: Some("echo".into()),
+                                title_model: Some("test-model".into()),
+                                title_model_provider: Some("echo".into()),
+                            },
+                            config.clone(),
+                        ));
+                        let repeated =
+                            load_execution_checkpoint_context_for_turn(&restarted_processor, turn)
+                                .await
+                                .unwrap()
+                                .unwrap();
+                        assert_eq!(repeated.payload, context.payload);
+                        assert_eq!(repeated.usage, context.usage);
+                        assert_eq!(
+                            fresh
+                                .list_turn_execution_checkpoints_for_window(&window.id)
+                                .await
+                                .unwrap()
+                                .len(),
+                            checkpoint_count
+                        );
+
+                        // Feed this actual loader result into the real Agent admission,
+                        // including the original frozen mode/caps. The event receiver
+                        // only acknowledges deterministic in-process events; no provider
+                        // or app is invoked by the source/compilation phase.
+                        let providers = Arc::new(ProviderRegistry::with_provider(
+                            "echo",
+                            Arc::new(EchoProvider::new()),
+                        ));
+                        let manager = pioneer_agent::AgentManager::new(providers, config.clone());
+                        manager.ensure_thread(thread, workspace).await.unwrap();
+                        let mut receiver = manager.take_durable_receiver(thread).await.unwrap();
+                        let drain = tokio::spawn(async move {
+                            while receiver.recv().await.is_some() {
+                                receiver.acknowledge_last(Ok(()));
+                            }
+                        });
+                        let phase = fresh
+                            .get_turn_runtime_snapshot(turn)
+                            .await
+                            .unwrap()
+                            .unwrap()
+                            .initial_phase_json
+                            .unwrap();
+                        let initial = pioneer_agent::NativeInitialPreparation::restore(
+                            &phase,
+                            workspace,
+                            thread,
+                            turn,
+                            pioneer_protocol::TURN_EXECUTION_REQUEST_MAX_BYTES,
+                        )
+                        .unwrap();
+                        let outcome = tokio::time::timeout(std::time::Duration::from_secs(5),manager.start_restored_recovery_turn(
+                            thread,workspace,pioneer_agent::RestoredRecoveryTurnRequest {
+                                turn_id:turn.into(),execution_window_index:4,mode:ThreadMode::Agent,
+                                hook_runtime_context:pioneer_agent::AgentTurnHookRuntimeContext::task(&task.id),
+                                model:"test-model".into(),provider_name:"echo".into(),azure_connection:None,provider_model_contract:None,
+                                initial_preparation:Some(initial),reasoning:None,workspace_skill_policies:Default::default(),
+                                skill_catalog:pioneer_skills::SkillCatalogSnapshot {version:1,generated_at_unix:0,skills:vec![]},
+                                agent_skill_overlay:vec![],input:vec![],capabilities:vec![],resolved_artifacts:vec![],runtime_environment:Default::default(),
+                                history:vec![],permission_profile:turn_model.permission_profile.clone(),
+                                execution_security_snapshot:Some(pioneer_protocol::TurnExecutionSecuritySnapshot::unrestricted_full_access("/tmp",1)),
+                            },pioneer_agent::RecoveryAttemptRequest {
+                                recovery_job_id:"cold_progress_job".into(),recovery_attempt_id:"cold_progress_attempt".into(),
+                                turn_id:turn.into(),item_id:"cold_reasoning".into(),item_type:pioneer_protocol::TurnItemType::Reasoning,
+                                force_non_stream:false,disable_tool_calling:false,disable_image_input:false,refresh_provider_auth:false,
+                                compact_history:false,context_recovery_deadline_ms:None,continue_generation:false,model_override:None,
+                                retained_provider_history:vec![],execution_checkpoint_context:Some(context),
+                            },
+                        )).await;
+                        manager.remove_thread(thread).await;
+                        drain.abort();
+                        let _ = drain.await;
+                        let outcome = outcome.expect("Agent admission must stay bounded");
+                        if token_cap.is_some() {
+                            assert!(
+                                matches!(outcome,Err(pioneer_agent::AgentControlError::ExecutionWindowContinuationBlocked {reason,..})
+                                if reason.contains("max_total_provider_tokens_per_turn"))
+                            );
+                        } else if mode == pioneer_tools::ToolNoProgressMode::Enforce && stalls >= 2
+                        {
+                            assert!(matches!(outcome,Err(pioneer_agent::AgentControlError::ExecutionWindowContinuationBlocked {
+                                stop_reason:Some(pioneer_protocol::RecoveryStopReason::NoProgress),..})));
+                        } else {
+                            assert!(
+                                outcome.is_ok(),
+                                "Advanced/disabled/observe must retain legitimate admission: {outcome:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[tokio::test]

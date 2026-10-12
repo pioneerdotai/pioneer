@@ -9230,6 +9230,8 @@ impl CrudStore {
             serde_json::Value::Object(stats.metadata_json.as_object().cloned().unwrap_or_default());
         stats.metadata_json["accountingSchemaVersion"] = serde_json::json!(1);
         stats.metadata_json["providerUsageAvailable"] = serde_json::json!(usage_available);
+        stats.metadata_json["semanticProgress"] =
+            serde_json::to_value(next_payload.window.progress)?;
         checkpoint.payload_json = serde_json::to_value(&next_payload)?;
         let statement = turn_execution_window::prepare_semantic_recovery_close(
             window,
