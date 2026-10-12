@@ -4666,6 +4666,7 @@ impl MessageProcessor {
                 .join("upload_sessions"),
         ));
         let normalized_tool_loop_config = ToolLoopConfig {
+            no_progress_mode: pioneer_tools::ToolNoProgressMode::Enforce,
             provider: pioneer_provider::ProviderTimeoutPolicy::default(),
             preflight: pioneer_agent::PreflightLoopConfig::default(),
             web: pioneer_tools::WebToolsConfig {

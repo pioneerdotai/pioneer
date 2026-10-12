@@ -40,6 +40,7 @@ pub struct NativeInitialResumeRequirements {
     pub native_agent_action_contract: Option<String>,
     pub mcp_projection: Option<(String, usize)>,
     pub tool_retry_budget: pioneer_tools::ToolRetryBudgetConfig,
+    pub no_progress_mode: pioneer_tools::ToolNoProgressMode,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -220,6 +221,7 @@ impl NativeInitialPreparation {
             .any(|e| e.domain.as_str() == "mcp");
         Ok(Some(NativeInitialResumeRequirements {
             tool_retry_budget: outputs.config.retry.clone(),
+            no_progress_mode: outputs.config.no_progress_mode,
             native_agent_action_contract: has_turn_owner
                 .then_some(outputs.native_agent_action_contract)
                 .flatten(),
@@ -584,6 +586,7 @@ pub(crate) mod tests {
         let previous = encode(&preparing, LIMIT).unwrap();
         let mut completed = preparing.clone();
         let mut owned = outputs();
+        owned.config.no_progress_mode = pioneer_tools::ToolNoProgressMode::Observe;
         owned
             .config
             .execution_windows
@@ -608,6 +611,17 @@ pub(crate) mod tests {
                 .window
                 .max_agent_rounds_per_window,
             7
+        );
+        assert_eq!(
+            restored.frozen_config().await.unwrap().no_progress_mode,
+            pioneer_tools::ToolNoProgressMode::Observe
+        );
+        assert_eq!(
+            NativeInitialPreparation::completed_resume_requirements(&encoded, LIMIT)
+                .unwrap()
+                .unwrap()
+                .no_progress_mode,
+            pioneer_tools::ToolNoProgressMode::Observe
         );
         let state = restored.inner.lock().await;
         assert!(state.warm_tools.is_none());

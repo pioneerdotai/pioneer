@@ -19,12 +19,33 @@ const CHECKPOINT_MAX_TOOL_NAME_CHARS: usize = 128;
 const CHECKPOINT_MAX_EXECUTABLE_CHARS: usize = 256;
 const CHECKPOINT_MAX_HASH_CHARS: usize = 64;
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolNoProgressMode {
+    Disabled,
+    Observe,
+    #[default]
+    Enforce,
+}
+
+impl std::str::FromStr for ToolNoProgressMode {
+    type Err = &'static str;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "disabled" => Ok(Self::Disabled),
+            "observe" => Ok(Self::Observe),
+            "enforce" => Ok(Self::Enforce),
+            _ => Err("no-progress mode must be disabled, observe, or enforce"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolNoProgressGuardConfig {
     /// A future invocation with the same normalized arguments is rejected after this many
     /// timeouts. Execution controls such as `timeout_ms` are excluded from normalization.
     pub exact_timeout_limit: u32,
-    /// A future structurally similar invocation is rejected after this many timeouts.
+    /// Advisory only; a similar invocation never inherits a hard denial.
     pub structural_timeout_limit: u32,
     pub warning_timeout_count: u32,
     /// Jaccard similarity threshold in thousandths.
@@ -89,6 +110,7 @@ impl ToolNoProgressFeedback {
 #[derive(Debug, Clone)]
 pub struct ToolNoProgressGuard {
     config: ToolNoProgressGuardConfig,
+    mode: ToolNoProgressMode,
     state: ExecutionCheckpointToolNoProgressState,
 }
 
@@ -100,8 +122,13 @@ impl Default for ToolNoProgressGuard {
 
 impl ToolNoProgressGuard {
     pub fn new(config: ToolNoProgressGuardConfig) -> Self {
+        Self::new_with_mode(config, ToolNoProgressMode::Enforce)
+    }
+
+    pub fn new_with_mode(config: ToolNoProgressGuardConfig, mode: ToolNoProgressMode) -> Self {
         Self {
             config: config.normalized(),
+            mode,
             state: ExecutionCheckpointToolNoProgressState::default(),
         }
     }
@@ -110,8 +137,17 @@ impl ToolNoProgressGuard {
         config: ToolNoProgressGuardConfig,
         state: ExecutionCheckpointToolNoProgressState,
     ) -> Self {
+        Self::from_checkpoint_with_mode(config, state, ToolNoProgressMode::Enforce)
+    }
+
+    pub fn from_checkpoint_with_mode(
+        config: ToolNoProgressGuardConfig,
+        state: ExecutionCheckpointToolNoProgressState,
+        mode: ToolNoProgressMode,
+    ) -> Self {
         let mut guard = Self {
             config: config.normalized(),
+            mode,
             state,
         };
         guard.bound_state();
@@ -123,6 +159,9 @@ impl ToolNoProgressGuard {
     }
 
     pub fn preflight(&self, tool_name: &str, arguments: &str) -> ToolNoProgressPreflightDecision {
+        if self.mode != ToolNoProgressMode::Enforce {
+            return ToolNoProgressPreflightDecision::Allow;
+        }
         let candidate =
             StrategyFingerprint::new(tool_name, arguments, self.config.max_features_per_strategy);
         let Some(index) = self.best_matching_strategy(&candidate) else {
@@ -133,15 +172,11 @@ impl ToolNoProgressGuard {
             variant.arguments_fingerprint == candidate.exact
                 && variant.timeout_count >= self.config.exact_timeout_limit
         });
-        if !exact_exhausted && !strategy.exhausted {
+        if !exact_exhausted {
             return ToolNoProgressPreflightDecision::Allow;
         }
 
-        let reason = if exact_exhausted {
-            "the same normalized invocation already timed out repeatedly"
-        } else {
-            "this structurally similar strategy exhausted its no-progress budget"
-        };
+        let reason = "the same exact invocation exhausted its confirmed no-progress allowance";
         let message = serde_json::json!({
             "error": "repeated no-progress strategy blocked",
             "code": "tool_strategy_no_progress",
@@ -150,7 +185,7 @@ impl ToolNoProgressGuard {
             "reason": reason,
             "timeoutCount": strategy.timeout_count,
             "cumulativeTimeoutMs": strategy.cumulative_timeout_ms,
-            "guidance": "Do not retry the same or structurally similar invocation with only a larger timeout or changed literal values. Change executable, interaction mode, decomposition, or another material part of the strategy. Other strategies and tools remain available."
+            "guidance": "Change this exact strategy. A materially different resource, executable, interaction mode or argument remains eligible under the Turn budgets."
         })
         .to_string();
         ToolNoProgressPreflightDecision::Block {
@@ -161,12 +196,27 @@ impl ToolNoProgressGuard {
 
     pub fn observe(&mut self, observations: &[ToolRetryObservation]) -> ToolNoProgressFeedback {
         let mut feedback = ToolNoProgressFeedback::default();
+        if self.mode == ToolNoProgressMode::Disabled {
+            return feedback;
+        }
         for observation in observations {
             let fingerprint = StrategyFingerprint::new(
                 observation.tool_name.as_str(),
                 observation.arguments.as_str(),
                 self.config.max_features_per_strategy,
             );
+            if self.best_matching_strategy(&fingerprint).is_none()
+                && self.state.strategies.iter().any(|strategy| {
+                    strategy.tool_name == fingerprint.tool_name
+                        && jaccard_millis(&strategy.structural_features, &fingerprint.features)
+                            >= self.config.structural_similarity_millis
+                })
+            {
+                feedback.fact_lines.push(format!(
+                    "tool={} status=similar_strategy_advisory hard_denial=false",
+                    observation.tool_name
+                ));
+            }
             if observation.success
                 || matches!(
                     observation.outcome.status,
@@ -241,7 +291,7 @@ impl ToolNoProgressGuard {
 
             if exact_exhausted || structural_exhausted {
                 feedback.fact_lines.push(format!(
-                    "strategy_id={} status=exhausted tool={} timeout_count={} cumulative_timeout_ms={} guidance=change_the_strategy_not_only_timeout_or_literal_values",
+                    "strategy_id={} status=exhausted tool={} timeout_count={} cumulative_timeout_ms={} guidance=change_the_exact_strategy_materially",
                     strategy.strategy_id,
                     strategy.tool_name,
                     strategy.timeout_count,
@@ -252,7 +302,7 @@ impl ToolNoProgressGuard {
             {
                 strategy.warning_emitted = true;
                 feedback.fact_lines.push(format!(
-                    "strategy_id={} status=warning tool={} timeout_count={} cumulative_timeout_ms={} guidance=another_structurally_similar_timeout_will_exhaust_this_strategy",
+                    "strategy_id={} status=warning tool={} timeout_count={} cumulative_timeout_ms={} guidance=another_confirmed_stall_of_this_exact_invocation_will_exhaust_it",
                     strategy.strategy_id,
                     strategy.tool_name,
                     strategy.timeout_count,
@@ -273,8 +323,7 @@ impl ToolNoProgressGuard {
         self.state
             .strategies
             .push(ExecutionCheckpointToolNoProgressStrategy {
-                strategy_id: fingerprint.structural[..16.min(fingerprint.structural.len())]
-                    .to_owned(),
+                strategy_id: fingerprint.exact[..16.min(fingerprint.exact.len())].to_owned(),
                 tool_name: fingerprint.tool_name.clone(),
                 executable: fingerprint.executable.clone(),
                 structural_fingerprint: fingerprint.structural.clone(),
@@ -305,15 +354,7 @@ impl ToolNoProgressGuard {
                 {
                     return Some((index, 1_000u16));
                 }
-                if strategy.structural_fingerprint == candidate.structural {
-                    return Some((index, 1_000u16));
-                }
-                let similarity = jaccard_millis(
-                    strategy.structural_features.as_slice(),
-                    candidate.features.as_slice(),
-                );
-                (similarity >= self.config.structural_similarity_millis)
-                    .then_some((index, similarity))
+                None
             })
             .max_by_key(|(_, similarity)| *similarity)
             .map(|(index, _)| index)
@@ -401,8 +442,21 @@ impl StrategyFingerprint {
     fn new(tool_name: &str, arguments: &str, max_features: usize) -> Self {
         let parsed = serde_json::from_str::<JsonValue>(arguments)
             .unwrap_or_else(|_| JsonValue::String(arguments.to_owned()));
-        let normalized = normalized_exact_arguments(&parsed);
-        let exact = hash_value(&normalized);
+        let mut normalized = canonical_exact_arguments(&parsed);
+        // Only the documented root execution controls of these builtins are
+        // nonsemantic. Dynamic/nested keys retain their original values.
+        if matches!(tool_name, "exec_command" | "write_stdin")
+            && let Some(map) = normalized.as_object_mut()
+        {
+            for key in CONTROL_ARGUMENT_KEYS {
+                map.remove(*key);
+            }
+        }
+        let exact = hex::encode(Sha256::digest(
+            serde_json::json!([tool_name, normalized])
+                .to_string()
+                .as_bytes(),
+        ));
         let mut bounded_tool_name = tool_name.to_owned();
         truncate_chars(&mut bounded_tool_name, CHECKPOINT_MAX_TOOL_NAME_CHARS);
         let executable = executable_identity(tool_name, &parsed);
@@ -428,24 +482,21 @@ impl StrategyFingerprint {
     }
 }
 
-fn normalized_exact_arguments(value: &JsonValue) -> JsonValue {
+fn canonical_exact_arguments(value: &JsonValue) -> JsonValue {
     match value {
         JsonValue::Object(map) => {
-            let mut normalized = serde_json::Map::new();
             let mut keys = map.keys().collect::<Vec<_>>();
             keys.sort();
-            for key in keys {
-                if CONTROL_ARGUMENT_KEYS.contains(&key.as_str()) {
-                    continue;
-                }
-                normalized.insert(key.clone(), normalized_exact_arguments(&map[key]));
-            }
-            JsonValue::Object(normalized)
+            JsonValue::Object(
+                keys.into_iter()
+                    .map(|key| (key.clone(), canonical_exact_arguments(&map[key])))
+                    .collect(),
+            )
         }
-        JsonValue::Array(items) => {
-            JsonValue::Array(items.iter().map(normalized_exact_arguments).collect())
+        JsonValue::Array(values) => {
+            JsonValue::Array(values.iter().map(canonical_exact_arguments).collect())
         }
-        other => other.clone(),
+        value => value.clone(),
     }
 }
 
@@ -607,10 +658,6 @@ fn find_duration_ms(value: &JsonValue) -> Option<u64> {
     }
 }
 
-fn hash_value(value: &JsonValue) -> String {
-    short_hash(value.to_string().as_bytes())
-}
-
 fn short_hash(value: &[u8]) -> String {
     let digest = Sha256::digest(value);
     hex::encode(&digest[..16])
@@ -719,7 +766,7 @@ mod tests {
     }
 
     #[test]
-    fn structurally_similar_variants_exhaust_but_materially_different_executable_is_allowed() {
+    fn structurally_similar_resources_never_inherit_another_exact_denial() {
         let mut guard = ToolNoProgressGuard::default();
         for date in ["2026-08-01", "2026-08-02", "2026-08-03"] {
             let arguments = format!(
@@ -732,7 +779,7 @@ mod tests {
                 "exec_command",
                 r#"{"command":["runner","--date","2026-08-04","--format","json"]}"#
             ),
-            ToolNoProgressPreflightDecision::Block { .. }
+            ToolNoProgressPreflightDecision::Allow
         ));
         assert_eq!(
             guard.preflight(
@@ -744,7 +791,7 @@ mod tests {
     }
 
     #[test]
-    fn second_structurally_similar_timeout_warns_before_count_based_exhaustion() {
+    fn a_different_structurally_similar_resource_receives_advisory_only() {
         let mut guard = ToolNoProgressGuard::default();
         let first = timeout_observation(
             r#"{"command":["runner","--date","2026-08-01"],"timeout_ms":30000}"#,
@@ -755,7 +802,7 @@ mod tests {
         assert!(guard.observe(&[first]).is_empty());
         let feedback = guard.observe(&[second]);
         assert_eq!(feedback.fact_lines.len(), 1);
-        assert!(feedback.fact_lines[0].contains("status=warning"));
+        assert!(feedback.fact_lines[0].contains("status=similar_strategy_advisory"));
         assert_eq!(
             guard.preflight(
                 "exec_command",
@@ -779,8 +826,15 @@ mod tests {
         }
 
         let state = guard.checkpoint_state();
-        assert_eq!(state.strategies.len(), 1);
-        assert_eq!(state.strategies[0].cumulative_timeout_ms, 7_200_000);
+        assert_eq!(state.strategies.len(), 2);
+        assert_eq!(
+            state
+                .strategies
+                .iter()
+                .map(|entry| entry.cumulative_timeout_ms)
+                .sum::<u64>(),
+            7_200_000
+        );
         assert!(!state.strategies[0].exhausted);
         assert!(matches!(
             guard.preflight(
@@ -810,7 +864,7 @@ mod tests {
     }
 
     #[test]
-    fn a_successful_structurally_similar_call_resets_no_progress_evidence() {
+    fn a_successful_exact_call_resets_only_its_own_evidence() {
         let mut guard = ToolNoProgressGuard::default();
         let timed_out = timeout_observation(
             r#"{"command":["runner","--date","2026-08-01"],"timeout_ms":30000}"#,
@@ -862,6 +916,68 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn modes_preserve_exact_state_but_only_enforce_denies() {
+        let args = r#"{"command":["/original/runner","same-resource"]}"#;
+        for mode in [
+            ToolNoProgressMode::Disabled,
+            ToolNoProgressMode::Observe,
+            ToolNoProgressMode::Enforce,
+        ] {
+            let mut guard =
+                ToolNoProgressGuard::new_with_mode(ToolNoProgressGuardConfig::default(), mode);
+            let observation = timeout_observation(args);
+            guard.observe(&[observation.clone(), observation]);
+            let saved = guard.checkpoint_state();
+            assert_eq!(saved.is_empty(), mode == ToolNoProgressMode::Disabled);
+            let restored = ToolNoProgressGuard::from_checkpoint_with_mode(
+                ToolNoProgressGuardConfig::default(),
+                saved,
+                mode,
+            );
+            assert_eq!(
+                matches!(
+                    restored.preflight("exec_command", args),
+                    ToolNoProgressPreflightDecision::Block { .. }
+                ),
+                mode == ToolNoProgressMode::Enforce
+            );
+            assert_eq!(
+                restored.preflight(
+                    "exec_command",
+                    r#"{"command":["/other/runner","same-resource"]}"#
+                ),
+                ToolNoProgressPreflightDecision::Allow
+            );
+        }
+        assert!("future".parse::<ToolNoProgressMode>().is_err());
+    }
+
+    #[test]
+    fn exact_identity_retains_nested_controls_dynamic_literals_and_full_canonical_name() {
+        let identity = |tool: &str, args: &str| StrategyFingerprint::new(tool, args, 32).exact;
+        assert_ne!(
+            identity("dynamic", r#"{"timeout_ms":1}"#),
+            identity("dynamic", r#"{"timeout_ms":2}"#)
+        );
+        assert_ne!(
+            identity("exec_command", r#"{"nested":{"timeout_ms":1}}"#),
+            identity("exec_command", r#"{"nested":{"timeout_ms":2}}"#)
+        );
+        let prefix = "namespace".repeat(32);
+        assert_ne!(
+            identity(&format!("{prefix}one"), "{}"),
+            identity(&format!("{prefix}two"), "{}")
+        );
+        assert_ne!(
+            identity("read_file", r#"{"path":"данные/一"}"#),
+            identity("read_file", r#"{"path":"данные/二"}"#)
+        );
+        assert_eq!(
+            identity("read_file", r#"{"path":"a","start_line":1}"#),
+            identity("read_file", r#"{"start_line":1,"path":"a"}"#)
+        );
+    }
     #[test]
     fn maximum_checkpoint_state_is_deterministically_compacted_below_its_wire_budget() {
         let oversized = ExecutionCheckpointToolNoProgressState {

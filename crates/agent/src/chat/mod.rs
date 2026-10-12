@@ -5379,6 +5379,7 @@ async fn execute_agent_provider_response(
         execution_window_index,
         &tool_loop_config.retry,
         !reused_initial,
+        tool_loop_config.no_progress_mode,
     )?;
     let mut native_controls =
         native_control::NativeControlRuntime::restore(semantic.controls.clone(), context_session)
@@ -5725,9 +5726,10 @@ async fn execute_agent_provider_response(
         .as_ref()
         .map(|context| context.payload.tool_no_progress.clone())
         .unwrap_or_default();
-    let mut tool_no_progress_guard = ToolNoProgressGuard::from_checkpoint(
+    let mut tool_no_progress_guard = ToolNoProgressGuard::from_checkpoint_with_mode(
         ToolNoProgressGuardConfig::default(),
         restored_no_progress_state,
+        semantic.no_progress_mode,
     );
     let mut tool_retry_lifecycle = ToolRetryLifecycleTracker::from_checkpoint(
         turn_id,
@@ -5756,6 +5758,7 @@ async fn execute_agent_provider_response(
                     &tool_loop_config.retry,
                     &native_controls.state,
                     &provider_history_roots,
+                    tool_loop_config.no_progress_mode,
                     &tool_retry_controller,
                     &tool_retry_lifecycle,
                     &pending_retry_instruction,
@@ -10407,6 +10410,7 @@ mod tests {
                 &budget,
                 &super::native_control::NativeControlState::default(),
                 &roots,
+                pioneer_tools::ToolNoProgressMode::Enforce,
                 &controller,
                 &lifecycle,
                 &pending,
@@ -10428,9 +10432,47 @@ mod tests {
             context.window_index + 1,
             &budget,
             false,
+            pioneer_tools::ToolNoProgressMode::Enforce,
         )
         .unwrap();
         assert_eq!(state.provider_history_roots, roots);
+        assert_eq!(
+            state.no_progress_mode,
+            pioneer_tools::ToolNoProgressMode::Enforce
+        );
+        assert!(!crate::native_semantic_checkpoint_compatible(
+            &context.payload,
+            &budget,
+            pioneer_tools::ToolNoProgressMode::Observe
+        ));
+        assert!(
+            super::semantic_state::NativeSemanticState::restore(
+                Some(&context),
+                "workspace_1",
+                "thread_1",
+                "turn_1",
+                context.window_index + 1,
+                &budget,
+                false,
+                pioneer_tools::ToolNoProgressMode::Observe
+            )
+            .is_err()
+        );
+        let mut legacy_mode = context.clone();
+        legacy_mode
+            .payload
+            .native_semantic_state
+            .as_mut()
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .remove("no_progress_mode");
+        assert!(!crate::native_semantic_checkpoint_compatible(
+            &legacy_mode.payload,
+            &budget,
+            pioneer_tools::ToolNoProgressMode::Enforce
+        ));
+
         let mut legacy_roots = context.clone();
         legacy_roots
             .payload
@@ -10442,14 +10484,16 @@ mod tests {
             .remove("provider_history_roots");
         assert!(!crate::native_semantic_checkpoint_compatible(
             &legacy_roots.payload,
-            &budget
+            &budget,
+            pioneer_tools::ToolNoProgressMode::Enforce,
         ));
         let mut bad_roots = context.clone();
         bad_roots.payload.native_semantic_state.as_mut().unwrap()["provider_history_roots"][0]["version"] =
             serde_json::json!("v".repeat(257));
         assert!(!crate::native_semantic_checkpoint_compatible(
             &bad_roots.payload,
-            &budget
+            &budget,
+            pioneer_tools::ToolNoProgressMode::Enforce,
         ));
         assert_eq!(state.checkpoint_revision, 1);
         assert_eq!(state.pending_retry_instruction, pending);
@@ -10472,7 +10516,8 @@ mod tests {
                 "turn_1",
                 2,
                 &budget,
-                false
+                false,
+                pioneer_tools::ToolNoProgressMode::Enforce,
             )
             .is_err()
         );
@@ -10487,7 +10532,8 @@ mod tests {
                 "turn_1",
                 2,
                 &budget,
-                false
+                false,
+                pioneer_tools::ToolNoProgressMode::Enforce,
             )
             .is_err()
         );
@@ -10500,7 +10546,8 @@ mod tests {
                 "turn_1",
                 2,
                 &budget,
-                false
+                false,
+                pioneer_tools::ToolNoProgressMode::Enforce,
             )
             .is_err()
         );
@@ -10512,7 +10559,8 @@ mod tests {
                 "turn_1",
                 1,
                 &budget,
-                false
+                false,
+                pioneer_tools::ToolNoProgressMode::Enforce,
             )
             .is_err()
         );
@@ -10524,6 +10572,7 @@ mod tests {
                 &budget,
                 &super::native_control::NativeControlState::default(),
                 &[],
+                pioneer_tools::ToolNoProgressMode::Enforce,
                 &controller,
                 &lifecycle,
                 &oversized,

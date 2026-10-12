@@ -9042,6 +9042,7 @@ fn test_summary_config() -> super::summary::SummaryConfig {
 pub(super) fn test_tool_loop_config() -> ToolLoopConfig {
     let web = GatewayWebToolsConfig::default();
     ToolLoopConfig {
+        no_progress_mode: pioneer_tools::ToolNoProgressMode::Enforce,
         provider: pioneer_provider::ProviderTimeoutPolicy::default(),
         preflight: pioneer_agent::PreflightLoopConfig::default(),
         web: WebToolsConfig {

@@ -13,7 +13,7 @@ mod native_initial;
 pub use native_initial::{NativeInitialPreparation, NativeInitialResumeRequirements};
 
 /// Agent owns this bounded semantic codec; readers must reject other versions.
-pub const NATIVE_SEMANTIC_STATE_SCHEMA_VERSION: u32 = 4;
+pub const NATIVE_SEMANTIC_STATE_SCHEMA_VERSION: u32 = 5;
 
 #[derive(Debug)]
 pub struct NativeHistorySourceUnavailable;
@@ -28,8 +28,9 @@ impl std::error::Error for NativeHistorySourceUnavailable {}
 pub fn native_semantic_checkpoint_compatible(
     payload: &pioneer_protocol::ExecutionCheckpointPayload,
     accepted_budget: &pioneer_tools::ToolRetryBudgetConfig,
+    mode: pioneer_tools::ToolNoProgressMode,
 ) -> bool {
-    chat::semantic_state::checkpoint_compatible(payload, accepted_budget)
+    chat::semantic_state::checkpoint_compatible(payload, accepted_budget, mode)
 }
 #[cfg(test)]
 mod manager_tests;
@@ -120,6 +121,8 @@ const MAX_CONTROL_ACK_TIMEOUT: Duration = Duration::from_secs(120);
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ToolLoopConfig {
+    #[serde(default)]
+    pub no_progress_mode: pioneer_tools::ToolNoProgressMode,
     pub provider: ProviderTimeoutPolicy,
     pub preflight: PreflightLoopConfig,
     pub web: WebToolsConfig,
@@ -685,6 +688,7 @@ pub trait TaskToolProvider: Send + Sync {
 impl ToolLoopConfig {
     pub fn normalized(&self) -> Self {
         Self {
+            no_progress_mode: self.no_progress_mode,
             provider: self.provider,
             preflight: self.preflight.normalized(),
             web: self.web.normalized(),

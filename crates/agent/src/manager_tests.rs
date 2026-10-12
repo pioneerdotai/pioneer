@@ -79,6 +79,7 @@ use tokio_util::sync::CancellationToken;
 pub(crate) fn test_tool_loop_config() -> ToolLoopConfig {
     crate::chat::preflight::load_test_catalog();
     ToolLoopConfig {
+        no_progress_mode: pioneer_tools::ToolNoProgressMode::Enforce,
         provider: pioneer_provider::ProviderTimeoutPolicy::default(),
         preflight: super::PreflightLoopConfig::default(),
         web: WebToolsConfig {

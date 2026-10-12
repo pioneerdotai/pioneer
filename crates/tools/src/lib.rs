@@ -81,7 +81,7 @@ pub use network_policy::{
     NetworkPolicyGrant, enforce_network_url,
 };
 pub use no_progress_guard::{
-    ToolNoProgressFeedback, ToolNoProgressGuard, ToolNoProgressGuardConfig,
+    ToolNoProgressFeedback, ToolNoProgressGuard, ToolNoProgressGuardConfig, ToolNoProgressMode,
     ToolNoProgressPreflightDecision,
 };
 pub use orchestrator::{ApprovalState, OrchestratorPolicy, SandboxTarget, ToolOrchestrator};

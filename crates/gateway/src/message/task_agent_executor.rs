@@ -11701,6 +11701,7 @@ mod tests {
     fn test_tool_loop_config_for_task_artifacts() -> ToolLoopConfig {
         let web = GatewayWebToolsConfig::default();
         ToolLoopConfig {
+            no_progress_mode: pioneer_tools::ToolNoProgressMode::Enforce,
             provider: pioneer_provider::ProviderTimeoutPolicy::default(),
             preflight: pioneer_agent::PreflightLoopConfig::default(),
             web: WebToolsConfig {

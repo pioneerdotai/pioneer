@@ -19,6 +19,7 @@ pub(super) struct NativeSemanticState {
     pub checkpoint_revision: u64,
     pub controls: super::native_control::NativeControlState,
     pub provider_history_roots: Vec<pioneer_compaction::SourceRef>,
+    pub no_progress_mode: pioneer_tools::ToolNoProgressMode,
     pub retry: ToolRetryCheckpoint,
     pub retry_lifecycle: ToolRetryLifecycleCheckpoint,
     pub pending_retry_instruction: Option<String>,
@@ -64,6 +65,7 @@ fn unavailable() -> ChatTurnError {
 pub(crate) fn checkpoint_compatible(
     payload: &pioneer_protocol::ExecutionCheckpointPayload,
     budget: &ToolRetryBudgetConfig,
+    mode: pioneer_tools::ToolNoProgressMode,
 ) -> bool {
     if payload.schema_version != pioneer_protocol::EXECUTION_CHECKPOINT_PAYLOAD_SCHEMA_VERSION {
         return false;
@@ -85,7 +87,9 @@ pub(crate) fn checkpoint_compatible(
     encode(value)
         .ok()
         .and_then(|bytes| serde_json::from_slice::<NativeSemanticState>(&bytes).ok())
-        .is_some_and(|state| state.validate(&payload.turn_id, budget).is_ok())
+        .is_some_and(|state| {
+            state.no_progress_mode == mode && state.validate(&payload.turn_id, budget).is_ok()
+        })
 }
 
 pub(super) fn history_roots_valid(roots: &[pioneer_compaction::SourceRef]) -> bool {
@@ -147,6 +151,7 @@ impl NativeSemanticState {
         window_index: u32,
         budget: &ToolRetryBudgetConfig,
         new_turn: bool,
+        mode: pioneer_tools::ToolNoProgressMode,
     ) -> Result<Self, ChatTurnError> {
         let Some(context) = context else {
             if window_index != 1 || !new_turn {
@@ -156,6 +161,7 @@ impl NativeSemanticState {
                 schema_version: crate::NATIVE_SEMANTIC_STATE_SCHEMA_VERSION,
                 controls: Default::default(),
                 provider_history_roots: Vec::new(),
+                no_progress_mode: mode,
                 checkpoint_revision: 0,
                 retry: ToolRetryController::new(budget.clone())
                     .checkpoint()
@@ -195,6 +201,9 @@ impl NativeSemanticState {
             .ok_or_else(unavailable)?;
         let state: Self = serde_json::from_slice(&encode(value)?).map_err(|_| unavailable())?;
         state.validate(turn, budget)?;
+        if state.no_progress_mode != mode {
+            return Err(unavailable());
+        }
         Ok(state)
     }
 
@@ -247,6 +256,7 @@ pub(super) fn capture(
     budget: &ToolRetryBudgetConfig,
     controls: &super::native_control::NativeControlState,
     history_roots: &[pioneer_compaction::SourceRef],
+    mode: pioneer_tools::ToolNoProgressMode,
     controller: &ToolRetryController,
     lifecycle: &ToolRetryLifecycleTracker,
     pending: &Option<String>,
@@ -264,6 +274,7 @@ pub(super) fn capture(
         checkpoint_revision: u64,
         controls: &'a super::native_control::NativeControlState,
         provider_history_roots: &'a [pioneer_compaction::SourceRef],
+        no_progress_mode: pioneer_tools::ToolNoProgressMode,
         retry: ToolRetryCheckpoint,
         retry_lifecycle: ToolRetryLifecycleCheckpoint,
         pending_retry_instruction: &'a Option<String>,
@@ -280,6 +291,7 @@ pub(super) fn capture(
         checkpoint_revision,
         controls,
         provider_history_roots: history_roots,
+        no_progress_mode: mode,
         retry: controller.checkpoint().map_err(|_| unavailable())?,
         retry_lifecycle: lifecycle.checkpoint(),
         pending_retry_instruction: pending,

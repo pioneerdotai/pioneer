@@ -610,6 +610,14 @@ async fn run_gateway_until_shutdown_inner(
     )?;
 
     let tool_loop_config = ToolLoopConfig {
+        no_progress_mode: config
+            .gateway
+            .tools
+            .no_progress_mode
+            .as_deref()
+            .unwrap_or("enforce")
+            .parse::<pioneer_tools::ToolNoProgressMode>()
+            .map_err(anyhow::Error::msg)?,
         provider: provider_timeout_policy,
         preflight: pioneer_agent::PreflightLoopConfig {
             provider_name: config.gateway.preflight_model.model_provider_override(),

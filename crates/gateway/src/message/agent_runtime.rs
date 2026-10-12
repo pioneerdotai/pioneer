@@ -4488,7 +4488,8 @@ impl MessageProcessor {
                     anyhow::ensure!(
                         pioneer_agent::native_semantic_checkpoint_compatible(
                             &checkpoint,
-                            &requirements.tool_retry_budget
+                            &requirements.tool_retry_budget,
+                            requirements.no_progress_mode,
                         ),
                         "semantic checkpoint is incompatible"
                     );
@@ -8774,6 +8775,7 @@ impl MessageProcessor {
                 })
         });
         let mut accepted_retry_budget = None;
+        let mut accepted_no_progress_mode = None;
         if snapshot_compatible {
             let snapshot = snapshot.as_ref().expect("validated snapshot");
             let requirements =
@@ -8786,6 +8788,7 @@ impl MessageProcessor {
                 )?
                 .expect("validated completed phase");
             accepted_retry_budget = Some(requirements.tool_retry_budget);
+            accepted_no_progress_mode = Some(requirements.no_progress_mode);
             if let Some(contract) = requirements.native_agent_action_contract {
                 snapshot_compatible = crate::authorization::BoundAgentActionAdapter::native_launch_contract_can_restore(
                     &self.crud_store, &snapshot.workspace_id, &snapshot.thread_id, turn_id, &contract,
@@ -8822,7 +8825,11 @@ impl MessageProcessor {
                             && payload.thread_id == snapshot.thread_id
                     })
                     && accepted_retry_budget.as_ref().is_some_and(|budget| {
-                        pioneer_agent::native_semantic_checkpoint_compatible(&payload, budget)
+                        accepted_no_progress_mode.is_some_and(|mode| {
+                            pioneer_agent::native_semantic_checkpoint_compatible(
+                                &payload, budget, mode,
+                            )
+                        })
                     })
             })
         });

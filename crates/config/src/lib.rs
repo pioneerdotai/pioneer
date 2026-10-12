@@ -1491,6 +1491,9 @@ impl Default for GatewayProviderAttachmentsConfig {
 
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct GatewayToolsConfig {
+    /// Accepted at Turn admission; later configuration changes affect new Turns.
+    #[serde(default)]
+    pub no_progress_mode: Option<String>,
     #[serde(default)]
     pub web: GatewayWebToolsConfig,
     #[serde(default)]

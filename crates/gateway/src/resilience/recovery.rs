@@ -6125,6 +6125,7 @@ mod tests {
 
     fn test_tool_loop_config() -> ToolLoopConfig {
         ToolLoopConfig {
+            no_progress_mode: pioneer_tools::ToolNoProgressMode::Enforce,
             provider: pioneer_provider::ProviderTimeoutPolicy::default(),
             preflight: pioneer_agent::PreflightLoopConfig::default(),
             web: WebToolsConfig {
