@@ -17369,3 +17369,145 @@ async fn applied_tool_retry_accepts_first_ordinary_final_with_optional_tools() {
     );
     assert!(requests[1].tool_choice.is_none());
 }
+
+struct ToollessTypedFailureProvider {
+    stream: bool,
+}
+#[async_trait::async_trait]
+impl Provider for ToollessTypedFailureProvider {
+    fn name(&self) -> &str {
+        "tool-less-rate-limit"
+    }
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            streaming: self.stream,
+            tool_calling: false,
+            ..Default::default()
+        }
+    }
+    fn model_tool_support(&self, _: &str) -> pioneer_provider::ModelToolSupport {
+        pioneer_provider::ModelToolSupport::Unsupported
+    }
+    async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
+        assert!(request.tools.is_none());
+        Err(pioneer_provider::failure::ProviderTransportFailure {
+            classification: pioneer_provider::failure::classify_transport_status(Some(429), None),
+        }
+        .into())
+    }
+    async fn stream_chat(
+        &self,
+        request: ChatRequest,
+    ) -> anyhow::Result<futures_util::stream::BoxStream<'static, anyhow::Result<StreamChunk>>> {
+        assert!(request.tools.is_none());
+        Ok(futures_util::stream::iter(vec![
+            Ok(StreamChunk::delta("partial native response")),
+            Ok(StreamChunk::provider_replay_state(
+                pioneer_provider::ProviderReplayState::for_model(
+                    "tool-less-rate-limit",
+                    request.model,
+                    serde_json::json!({"opaque":"original signed failed accumulator"}),
+                ),
+            )),
+            Err(pioneer_provider::failure::ProviderTransportFailure {
+                classification: pioneer_provider::failure::classify_transport_status(
+                    Some(429),
+                    None,
+                ),
+            }
+            .into()),
+        ])
+        .boxed())
+    }
+}
+
+#[tokio::test]
+async fn native_toolless_failure_closes_charged_semantic_window_before_failure_on_both_transports()
+{
+    for stream in [false, true] {
+        let provider = Arc::new(ToollessTypedFailureProvider { stream });
+        let manager = AgentManager::new(
+            Arc::new(ProviderRegistry::with_provider(
+                "tool-less-rate-limit",
+                provider,
+            )),
+            test_tool_loop_config(),
+        );
+        let thread = if stream {
+            "native_toolless_failed_stream"
+        } else {
+            "native_toolless_failed_chat"
+        };
+        manager.ensure_thread(thread, "workspace").await.unwrap();
+        let mut receiver = manager.take_durable_receiver(thread).await.unwrap();
+        manager
+            .start_test_turn_with_default_profile(
+                thread,
+                "original_toolless_turn",
+                ThreadMode::Agent,
+                "fixture",
+                "tool-less-rate-limit",
+                HashMap::new(),
+                vec![UserInput::Text {
+                    text: "original goal".into(),
+                    text_elements: vec![],
+                }],
+                vec![],
+            )
+            .await
+            .unwrap();
+        let mut closing = None;
+        let mut failed_observation = false;
+        loop {
+            let event = timeout(Duration::from_secs(5), receiver.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            receiver.acknowledge_last(Ok(()));
+            match event {
+                AgentDurableEvent::TurnProviderHistoryAppended { payload, .. } => {
+                    assert_eq!(payload["termination"]["kind"], "provider_error");
+                    assert_eq!(
+                        payload["message"]["provider_replay_state"]["payload"]["opaque"],
+                        "original signed failed accumulator"
+                    );
+                    failed_observation = true;
+                }
+                AgentDurableEvent::TurnExecutionWindowCheckpointed { payload, .. } => {
+                    assert_eq!(payload.window.agent_round_count, 1);
+                    assert_eq!(
+                        payload.window.exhaustion_reason,
+                        Some(ExecutionWindowExhaustionReason::ProviderFailureContinuation)
+                    );
+                    assert_eq!(payload.turn_id, "original_toolless_turn");
+                    assert_eq!(
+                        payload.native_semantic_state.as_ref().unwrap()["schema_version"],
+                        pioneer_protocol::NATIVE_SEMANTIC_STATE_SCHEMA_VERSION
+                    );
+                    assert_eq!(
+                        payload.native_semantic_state.as_ref().unwrap()["attached_task_wait"],
+                        serde_json::Value::Null
+                    );
+                    assert!(payload.window.progress.unwrap().valid());
+                    closing = Some(payload);
+                }
+                AgentDurableEvent::ProviderFailureDetected { failure, .. } => {
+                    assert_eq!(failure.class, ProviderFailureClass::RateLimit);
+                    assert!(
+                        closing.is_some(),
+                        "closing semantic state and real charged budget must precede failure/recovery"
+                    );
+                    assert_eq!(
+                        failed_observation, stream,
+                        "partial streaming opaque replay stays acknowledged and non-executable"
+                    );
+                    break;
+                }
+                AgentDurableEvent::TurnFinalizationPrepared { .. } => {
+                    panic!("failed response cannot publish final success")
+                }
+                _ => {}
+            }
+        }
+    }
+}

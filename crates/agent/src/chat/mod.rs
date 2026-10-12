@@ -6139,6 +6139,46 @@ async fn execute_agent_provider_response(
                 });
             }
             Err(error) => {
+                if let Some(mut continuation) = build_failure_execution_window_continuation(
+                    workspace_id,
+                    thread_id,
+                    turn_id,
+                    input,
+                    &post_turn_model,
+                    &post_turn_model_provider,
+                    &window_stats,
+                    &error,
+                    Default::default(),
+                    &requested_tool_names,
+                ) {
+                    send_reasoning_completed(
+                        workspace_id,
+                        thread_id,
+                        turn_id,
+                        &standard_thinking_id,
+                        "",
+                        event_tx.as_ref(),
+                    )
+                    .await?;
+                    semantic.checkpoint_revision =
+                        semantic.checkpoint_revision.checked_add(1).ok_or_else(|| {
+                            ChatTurnError::Blocked("semantic revision exhausted".into())
+                        })?;
+                    attach_native_semantic_state(
+                        &mut continuation.checkpoint_payload,
+                        semantic.to_value()?,
+                        window_stats.progress_baseline,
+                    )?;
+                    emit_execution_window_exhausted_and_checkpointed(
+                        workspace_id,
+                        thread_id,
+                        turn_id,
+                        &window_stats,
+                        &continuation,
+                        event_tx.as_ref(),
+                    )
+                    .await?;
+                }
                 return Err(with_post_turn_failure_dispatch(
                     error,
                     hook_context,
@@ -11124,9 +11164,9 @@ mod tests {
             .unwrap();
         let pending = Some("Retry only the unresolved mutation".to_owned());
         let applied = Some("Original accepted guidance".to_owned());
-        let reviews = std::collections::BTreeSet::from([hex::encode(sha2::Sha256::digest(
-            b"original review record",
-        ))]);
+        let reviews = std::collections::BTreeSet::from([hex::encode(
+            <sha2::Sha256 as sha2::Digest>::digest(b"original review record"),
+        )]);
         let terminal = std::collections::BTreeSet::from(["terminal-original".to_owned()]);
         let roots = vec![pioneer_compaction::SourceRef {
             scope: "checkpoint:native-owner".into(),
