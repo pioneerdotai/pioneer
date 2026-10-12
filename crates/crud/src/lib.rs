@@ -9118,12 +9118,12 @@ impl CrudStore {
         &self,
         window: &TurnExecutionWindowRecord,
         semantic: &TurnExecutionCheckpointRecord,
-        checkpoint: NewTurnExecutionCheckpointRecord,
-        stats: TurnExecutionWindowStatsRecord,
+        mut checkpoint: NewTurnExecutionCheckpointRecord,
+        mut stats: TurnExecutionWindowStatsRecord,
         reason: pioneer_protocol::ExecutionWindowExhaustionReason,
         owner_id: &str,
         owner_generation: u64,
-    ) -> Result<()> {
+    ) -> Result<pioneer_protocol::ExecutionCheckpointPayload> {
         anyhow::ensure!(
             window.turn_id == semantic.turn_id
                 && window.id == semantic.window_id
@@ -9142,7 +9142,7 @@ impl CrudStore {
         .context("native recovery semantic predecessor unavailable")?;
         let payload: pioneer_protocol::ExecutionCheckpointPayload =
             serde_json::from_str(&previous.payload_json)?;
-        let next_payload: pioneer_protocol::ExecutionCheckpointPayload =
+        let mut next_payload: pioneer_protocol::ExecutionCheckpointPayload =
             serde_json::from_value(checkpoint.payload_json.clone())?;
         anyhow::ensure!(
             payload.schema_version == pioneer_protocol::EXECUTION_CHECKPOINT_PAYLOAD_SCHEMA_VERSION
@@ -9182,6 +9182,55 @@ impl CrudStore {
             .native_cancellation_context(&window.turn_id)
             .await?
             .context("native recovery cancellation unavailable")?;
+        // These are overlapping cumulative views of this window, not separate
+        // bills. Canonical usage updates advance the same source frontier that
+        // the atomic close revalidates; all receipt reads/decoding stay outside
+        // the writer. Never infer full availability from a positive scalar.
+        let (attempts, tokens, available) = self
+            .summarize_execution_window_provider_usage(&window.turn_id, window.window_index)
+            .await?;
+        stats.agent_round_count = stats
+            .agent_round_count
+            .max(window.agent_round_count)
+            .max(payload.window.agent_round_count)
+            .max(attempts);
+        stats.tool_call_count = stats
+            .tool_call_count
+            .max(window.tool_call_count)
+            .max(payload.window.tool_call_count);
+        stats.provider_token_count = stats
+            .provider_token_count
+            .max(window.provider_token_count)
+            .max(payload.window.provider_token_count.unwrap_or(0))
+            .max(tokens);
+        let usage_available = (payload.provider_budget.provider_usage_available
+            && payload.window.agent_round_count == stats.agent_round_count
+            && payload.window.provider_token_count == Some(stats.provider_token_count))
+            || (attempts > 0
+                && available
+                && attempts == stats.agent_round_count
+                && tokens == stats.provider_token_count)
+            || (window.metadata_json["accountingSchemaVersion"].as_u64() == Some(1)
+                && window.metadata_json["providerUsageAvailable"].as_bool() == Some(true)
+                && window.agent_round_count == stats.agent_round_count
+                && window.provider_token_count == stats.provider_token_count);
+        let known_tokens = (stats.provider_token_count > 0
+            || payload.window.provider_token_count.is_some()
+            || next_payload.window.provider_token_count.is_some()
+            || usage_available)
+            .then_some(stats.provider_token_count);
+        next_payload.window.agent_round_count = stats.agent_round_count;
+        next_payload.window.tool_call_count = stats.tool_call_count;
+        next_payload.window.provider_token_count = known_tokens;
+        next_payload.provider_budget.agent_round_count = stats.agent_round_count;
+        next_payload.provider_budget.tool_call_count = stats.tool_call_count;
+        next_payload.provider_budget.provider_token_count = known_tokens;
+        next_payload.provider_budget.provider_usage_available = usage_available;
+        stats.metadata_json =
+            serde_json::Value::Object(stats.metadata_json.as_object().cloned().unwrap_or_default());
+        stats.metadata_json["accountingSchemaVersion"] = serde_json::json!(1);
+        stats.metadata_json["providerUsageAvailable"] = serde_json::json!(usage_available);
+        checkpoint.payload_json = serde_json::to_value(&next_payload)?;
         let statement = turn_execution_window::prepare_semantic_recovery_close(
             window,
             previous.payload_json,
@@ -9208,7 +9257,8 @@ impl CrudStore {
                 Ok(())
             }
         })
-        .await
+        .await?;
+        Ok(next_payload)
     }
 
     pub async fn get_turn_execution_checkpoint(

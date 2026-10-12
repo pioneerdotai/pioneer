@@ -120,6 +120,7 @@ pub(crate) fn prepare_semantic_recovery_close(
         WHERE id=?8 AND turn_id=?9 AND workspace_id=?10 AND thread_id=?11 AND status='running' \
         AND window_index=(SELECT max(window_index) FROM turn_execution_window WHERE turn_id=?9) \
         AND metadata_json=?12 \
+        AND agent_round_count=?20 AND tool_call_count=?21 AND provider_token_count=?22 \
         AND EXISTS(SELECT 1 FROM \"turn\" t JOIN thread th ON th.id=t.thread_id \
           JOIN turn_execution e ON e.turn_id=t.id JOIN native_cancellation_context c ON c.turn_id=t.id \
           WHERE t.id=?9 AND t.thread_id=?11 AND th.workspace_id=?10 AND t.status='in_progress' \
@@ -151,6 +152,9 @@ pub(crate) fn prepare_semantic_recovery_close(
             previous_json.into(),
             frontier.event_sequence.into(),
             frontier.context_sequence.into(),
+            i64::from(window.agent_round_count).into(),
+            i64::from(window.tool_call_count).into(),
+            i64::try_from(window.provider_token_count)?.into(),
         ],
     ))
 }

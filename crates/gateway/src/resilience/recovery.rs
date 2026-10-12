@@ -3818,7 +3818,8 @@ impl RecoveryCoordinator {
                     self.turn_execution_owner_id.as_ref(),
                     execution.owner_generation,
                 )
-                .await;
+                .await
+                .map(|_| ());
         }
 
         let checkpoint_exists = self
@@ -7999,6 +8000,180 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.is::<super::NativeSemanticCheckpointUnavailable>());
+    }
+
+    #[tokio::test]
+    async fn native_recovery_close_preserves_preflight_and_main_charges_across_restart() {
+        for (receipts, known, available) in [
+            ([(Some(40), Some(10)), (Some(45), Some(5))], 100, true),
+            ([(Some(40), Some(10)), (Some(50), None)], 100, false),
+            ([(Some(0), Some(0)), (Some(0), Some(0))], 0, true),
+            ([(None, None), (None, None)], 0, false),
+        ] {
+            let mut config = test_tool_loop_config();
+            config.execution_windows.total.max_provider_tokens_per_turn = Some(100);
+            let (store, manager, coordinator) =
+                setup_coordinator_with_tool_loop_config(config.clone()).await;
+            let (workspace, thread, turn) = (
+                "ws_cold_charges",
+                "thread_cold_charges",
+                "turn_cold_charges",
+            );
+            materialize_turn_with_tool_item(&store, workspace, thread, turn, "before_window", None)
+                .await;
+            let (window, original) = crate::native_recovery_test_support::charged_native_window(
+                &store,
+                workspace,
+                thread,
+                turn,
+                coordinator.turn_execution_owner_id.as_ref(),
+                1,
+                &config,
+                receipts,
+                pioneer_protocol::ExecutionProgressSummary {
+                    schema_version: 1,
+                    baseline: [0; 3],
+                    frontier: [1, 0, 0],
+                },
+            )
+            .await;
+            assert_eq!(
+                window.provider_token_count, 0,
+                "charged semantic state does not update the Running scalar row"
+            );
+            let before = store
+                .aggregate_turn_execution_window_usage(turn)
+                .await
+                .unwrap();
+            assert_eq!(before.total_agent_rounds, 2);
+            assert_eq!(before.total_provider_tokens, known);
+            assert_eq!(before.provider_token_usage_unknown, !available);
+            let phase = store
+                .get_turn_runtime_snapshot(turn)
+                .await
+                .unwrap()
+                .unwrap()
+                .initial_phase_json;
+            let decision = coordinator
+                .prepare_recovery_execution_window(
+                    turn,
+                    chrono::Utc::now().timestamp() + 1,
+                    "native_fixture",
+                    "transport interruption",
+                )
+                .await
+                .unwrap();
+            if known >= 100 {
+                assert!(
+                    matches!(decision,super::ExecutionWindowContinuationAdmission::Block {reason,..}
+                    if reason.contains("max_total_provider_tokens_per_turn"))
+                );
+            } else {
+                assert_eq!(
+                    decision,
+                    super::ExecutionWindowContinuationAdmission::Open { window_index: 2 }
+                );
+            }
+            let closed = store
+                .get_turn_execution_window(&window.id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(closed.status, ExecutionWindowStatus::Checkpointed);
+            assert_eq!(closed.agent_round_count, 2);
+            assert_eq!(closed.provider_token_count, known);
+            assert_eq!(closed.metadata_json["accountingSchemaVersion"], 1);
+            assert_eq!(closed.metadata_json["providerUsageAvailable"], available);
+            assert_eq!(closed.metadata_json["acceptedOwnerMarker"], "keep");
+            let checkpoint = store
+                .latest_turn_execution_checkpoint_for_turn(turn)
+                .await
+                .unwrap()
+                .unwrap();
+            let recovered: ExecutionCheckpointPayload =
+                serde_json::from_value(checkpoint.payload_json).unwrap();
+            assert_eq!(recovered.window.agent_round_count, 2);
+            assert_eq!(recovered.window.provider_token_count, Some(known));
+            assert_eq!(recovered.provider_budget.provider_token_count, Some(known));
+            assert_eq!(
+                recovered.provider_budget.provider_usage_available,
+                available
+            );
+            assert_eq!(
+                recovered.native_semantic_state,
+                original.native_semantic_state
+            );
+            assert_eq!(recovered.original_request, original.original_request);
+            let after = store
+                .aggregate_turn_execution_window_usage(turn)
+                .await
+                .unwrap();
+            assert_eq!(after.total_agent_rounds, before.total_agent_rounds);
+            assert_eq!(after.total_provider_tokens, before.total_provider_tokens);
+            assert_eq!(
+                after.provider_token_usage_unknown,
+                before.provider_token_usage_unknown
+            );
+            let checkpoints = store
+                .list_turn_execution_checkpoints_for_window(&window.id)
+                .await
+                .unwrap();
+            let fresh_store = Arc::new(store.with_maintenance_access());
+            let restarted = RecoveryCoordinator::new(
+                fresh_store.clone(),
+                manager,
+                Arc::new(ProviderRegistry::with_provider(
+                    "echo",
+                    Arc::new(EchoProvider::new()),
+                )),
+                RecoveryPolicyRegistry::default(),
+                config.normalized(),
+            );
+            let repeated = restarted
+                .prepare_recovery_execution_window(
+                    turn,
+                    chrono::Utc::now().timestamp() + 2,
+                    "duplicate_close",
+                    "same outcome",
+                )
+                .await
+                .unwrap();
+            if known >= 100 {
+                assert!(matches!(
+                    repeated,
+                    super::ExecutionWindowContinuationAdmission::Block { .. }
+                ));
+            } else {
+                assert_eq!(
+                    repeated,
+                    super::ExecutionWindowContinuationAdmission::Open { window_index: 2 }
+                );
+            }
+            assert_eq!(
+                fresh_store
+                    .aggregate_turn_execution_window_usage(turn)
+                    .await
+                    .unwrap(),
+                after
+            );
+            assert_eq!(
+                fresh_store
+                    .list_turn_execution_checkpoints_for_window(&window.id)
+                    .await
+                    .unwrap(),
+                checkpoints
+            );
+            assert_eq!(
+                fresh_store
+                    .get_turn_runtime_snapshot(turn)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .initial_phase_json,
+                phase,
+                "cold reconciliation does not repeat or replace accepted preflight"
+            );
+        }
     }
 
     #[tokio::test]

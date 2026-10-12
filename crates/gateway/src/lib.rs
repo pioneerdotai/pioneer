@@ -34,6 +34,8 @@ mod memory_policy;
 mod memory_runtime;
 mod memory_tools;
 mod message;
+#[cfg(test)]
+mod native_recovery_test_support;
 mod operations;
 mod patch_history_observer;
 mod permissions;
