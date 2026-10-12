@@ -8440,6 +8440,19 @@ async fn raw_assertion_publication_seals_exact_empty_proofs_and_immutable_owners
     assert_eq!(ownership.len(), 1);
     assert_eq!(ownership[0].source, assertion.reference());
     assert_eq!(ownership[0].thread_id, "thread");
+    // Genuine no-runner/no-manifest bootstrap still supports exact candidate
+    // retry once historical ownership was established in the first save.
+    store.compaction_save_candidate(&cp, 0).await.unwrap();
+    let retried = store
+        .compaction_manifest_page(&cp.operation_id, false, 0, 0)
+        .await
+        .unwrap();
+    assert_eq!(retried.len(), 1);
+    assert_eq!(retried[0].ordinal, ownership[0].ordinal);
+    assert_eq!(retried[0].unit, ownership[0].unit);
+    assert_eq!(retried[0].source, ownership[0].source);
+    assert_eq!(retried[0].thread_id, ownership[0].thread_id);
+    assert_eq!(checkpoint_proof_version(&store, &cp.id).await, 0);
     assert_eq!(
         store
             .compaction_apply(&cp, None, &[assertion.clone()])
@@ -8502,6 +8515,662 @@ async fn raw_assertion_publication_seals_exact_empty_proofs_and_immutable_owners
     );
 }
 #[tokio::test]
+async fn raw_assertion_next_candidate_adds_unclaimed_original_source_and_publishes() {
+    let store = store().await;
+    let db = store.database_connection();
+    db.execute_unprepared("PRAGMA foreign_keys=OFF")
+        .await
+        .unwrap();
+    let foreign_keys: i64 = db
+        .query_one_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "PRAGMA foreign_keys",
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "foreign_keys")
+        .unwrap();
+    assert_eq!(foreign_keys, 0);
+    let a = source(&store, "A", 1, "original A").await;
+    let b = source(&store, "B", 2, "original B").await;
+    let selection = ModelSelection {
+        transport: Transport::Api,
+        instance: "p".into(),
+        model: "m".into(),
+        effort: None,
+    };
+    let snapshot = OperationSnapshot {
+        id: "incremental-raw-op".into(),
+        owner: "owner".into(),
+        expected_checkpoint: None,
+        projection_version: 1,
+        source_epochs: Default::default(),
+        admission: CompactionSettings::default()
+            .admit(&selection, None, 10)
+            .unwrap(),
+        plan: CompactionPlan {
+            mode: CompactionMode::Normal,
+            coverage_domain: CoverageDomain::OwnContribution,
+            compact: vec![0, 1],
+            retain: vec![],
+            coverage: vec![a.reference(), b.reference()],
+            fingerprint: "incremental-raw-op".into(),
+        },
+    };
+    let admitted = store
+        .compaction_admit("ws", "thread", &snapshot)
+        .await
+        .unwrap();
+    // One genuine raw admission: no runner preparation, seeded ownership,
+    // frozen binding, or later snapshot replacement supplies B.
+    assert!(
+        store
+            .compaction_runner_plan(&snapshot.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .compaction_runner_state(&snapshot.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .compaction_bound_source_projection(&snapshot.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .compaction_manifest_page(&snapshot.id, false, 0, 0)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(admitted.snapshot, serde_json::to_string(&snapshot).unwrap());
+    let k0 = Checkpoint {
+        id: "raw-K0".into(),
+        operation_id: snapshot.id.clone(),
+        owner: snapshot.owner.clone(),
+        previous: None,
+        summary: "First portion, only A".into(),
+        selection,
+        coverage: vec![a.reference()],
+        projection_version: 1,
+        format_version: 1,
+    };
+    store.compaction_save_candidate(&k0, 0).await.unwrap();
+    let first = store
+        .compaction_manifest_page(&snapshot.id, false, 0, 0)
+        .await
+        .unwrap();
+    assert_eq!(first.len(), 1);
+    assert_eq!(first[0].source, a.reference());
+    assert_eq!(first[0].ordinal, 0);
+    assert_eq!(first[0].unit, 0);
+    assert_eq!(first[0].thread_id, "thread");
+    assert!(!first[0].reference_only);
+    store.compaction_save_candidate(&k0, 0).await.unwrap();
+    let k1 = Checkpoint {
+        id: "raw-K1".into(),
+        previous: None, // independent of unpublished-previous publication
+        summary: "Next portion, original A and B".into(),
+        coverage: snapshot.plan.coverage.clone(),
+        ..k0.clone()
+    };
+    // B's fresh insert and the candidate belong to one atomic write set.
+    // A conflicting closed portion rolls that insert back too.
+    assert!(store.compaction_save_candidate(&k1, 0).await.is_err());
+    assert!(store.compaction_checkpoint(&k1.id).await.unwrap().is_none());
+    let rolled_back = store
+        .compaction_manifest_page(&snapshot.id, false, 0, 0)
+        .await
+        .unwrap();
+    assert_eq!(rolled_back.len(), first.len());
+    assert_eq!(rolled_back[0].source, first[0].source);
+    assert_eq!(rolled_back[0].ordinal, first[0].ordinal);
+    assert_eq!(rolled_back[0].unit, first[0].unit);
+    assert_eq!(rolled_back[0].thread_id, first[0].thread_id);
+    assert_eq!(
+        store
+            .compaction_operation(&snapshot.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .next_portion,
+        1
+    );
+    // Corrupt unclaimed staging is not absence, even without a runner. The
+    // bootstrap above was genuine; these negative rows never seed a valid
+    // manifest for K1 and must survive each rejected save unchanged.
+    for (role, version) in [
+        ("1", b.reference().version),
+        ("2", b.reference().version),
+        ("0.5", b.reference().version),
+        ("0", "event-revision:999".into()),
+    ] {
+        let r = b.reference();
+        db.execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "INSERT INTO compaction_manifest(operation_id,ordinal,unit_ordinal,reference_only,source_thread,source_scope,source_id,source_version) VALUES(?1,7,7,?2,'thread',?3,?4,?5)",
+            [snapshot.id.clone().into(), role.into(), r.scope.into(), r.id.into(), version.clone().into()],
+        )).await.unwrap();
+        if role == "0.5" {
+            // Valid extrema 0/1 must not conceal an invalid interior value.
+            // This unrelated corrupt unclaimed row never enters coverage.
+            db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+                "INSERT INTO compaction_manifest(operation_id,ordinal,unit_ordinal,reference_only,source_thread,source_scope,source_id,source_version) VALUES(?1,8,8,1,'thread','event:turn','unclaimed-role-boundary','event-revision:1')",
+                [snapshot.id.clone().into()])).await.unwrap();
+        }
+        let error = store.compaction_save_candidate(&k1, 1).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("raw candidate missing expected manifest ownership"),
+            "{role}/{version}: {error:#}"
+        );
+        assert!(store.compaction_checkpoint(&k1.id).await.unwrap().is_none());
+        assert_eq!(store.compaction_head(&k1.owner).await.unwrap(), None);
+        assert_eq!(checkpoint_proof_version(&store, &k0.id).await, 0);
+        let operation = store
+            .compaction_operation(&snapshot.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(operation.snapshot, admitted.snapshot);
+        assert_eq!(operation.next_portion, 1);
+        assert_eq!(operation.status, "running");
+        let row = db.query_one_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+            "SELECT CAST(reference_only AS TEXT) AS role,source_version FROM compaction_manifest WHERE operation_id=?1 AND ordinal=7",
+            [snapshot.id.clone().into()])).await.unwrap().unwrap();
+        assert_eq!(row.try_get::<String>("", "role").unwrap(), role);
+        assert_eq!(
+            row.try_get::<String>("", "source_version").unwrap(),
+            version
+        );
+        let boundary_row = db.query_one_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+            "SELECT 1 FROM compaction_manifest WHERE operation_id=?1 AND ordinal=8 AND unit_ordinal=8 AND reference_only=1 AND source_thread='thread' AND source_scope='event:turn' AND source_id='unclaimed-role-boundary' AND source_version='event-revision:1'",
+            [snapshot.id.clone().into()])).await.unwrap();
+        assert_eq!(boundary_row.is_some(), role == "0.5");
+        // B is not covered by K0; removal of this corrupt unsealed staging
+        // row uses the existing permitted path, with all guards still active.
+        db.execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "DELETE FROM compaction_manifest WHERE operation_id=?1 AND ordinal IN (7,8)",
+            [snapshot.id.clone().into()],
+        ))
+        .await
+        .unwrap();
+    }
+    for _ in 0..2 {
+        for assertion in [&a, &b] {
+            assert_eq!(
+                store
+                    .compaction_reference_thread("ws", &assertion.reference())
+                    .await
+                    .unwrap(),
+                Some("thread".into())
+            );
+        }
+        store.compaction_save_candidate(&k1, 1).await.unwrap();
+        let saved = store
+            .compaction_manifest_page(&snapshot.id, false, 0, 0)
+            .await
+            .unwrap();
+        assert_eq!(saved.len(), 2);
+        for (entry, expected) in saved.iter().zip([a.reference(), b.reference()]) {
+            assert_eq!(entry.source, expected);
+            assert_eq!(entry.thread_id, "thread");
+            assert!(!entry.reference_only);
+        }
+        assert_eq!(
+            (saved[0].ordinal, saved[0].unit),
+            (first[0].ordinal, first[0].unit)
+        );
+        assert_eq!((saved[1].ordinal, saved[1].unit), (1, 1));
+        let operation = store
+            .compaction_operation(&snapshot.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(operation.snapshot, admitted.snapshot);
+        assert_eq!(operation.status, "running");
+        assert_eq!(operation.next_portion, 2);
+        assert_eq!(store.compaction_head(&k1.owner).await.unwrap(), None);
+        assert_eq!(checkpoint_proof_version(&store, &k0.id).await, 0);
+        assert_eq!(checkpoint_proof_version(&store, &k1.id).await, 0);
+    }
+    assert_eq!(
+        store
+            .compaction_apply(&k1, None, &[a.clone(), b.clone()])
+            .await
+            .unwrap(),
+        CommitOutcome::Applied
+    );
+    assert_eq!(checkpoint_proof_version(&store, &k1.id).await, 1);
+    assert_eq!(
+        store.compaction_head(&k1.owner).await.unwrap(),
+        Some(k1.id.clone())
+    );
+    for (cp, expected) in [
+        (&k0, vec![a.reference()]),
+        (&k1, vec![a.reference(), b.reference()]),
+    ] {
+        let edges = store
+            .compaction_checkpoint_edges(&cp.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            edges
+                .coverage
+                .iter()
+                .map(|entry| entry.source.clone())
+                .collect::<std::collections::BTreeSet<_>>(),
+            expected
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>()
+        );
+        assert!(
+            edges
+                .coverage
+                .iter()
+                .all(|entry| entry.source_thread == "thread")
+        );
+        assert!(edges.replay_aliases.is_empty());
+        assert!(edges.event_input_evidence.is_empty());
+        for table in [
+            "compaction_checkpoint_replay_alias",
+            "compaction_checkpoint_event_input",
+            "compaction_checkpoint_import",
+        ] {
+            let n: i64 = db
+                .query_one_raw(Statement::from_sql_and_values(
+                    DbBackend::Sqlite,
+                    format!("SELECT count(*) AS n FROM {table} WHERE checkpoint_id=?1"),
+                    [cp.id.clone().into()],
+                ))
+                .await
+                .unwrap()
+                .unwrap()
+                .try_get("", "n")
+                .unwrap();
+            assert_eq!(n, 0, "raw proof set stays empty; K0 does not claim B");
+        }
+    }
+    let status: String = db
+        .query_one_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "SELECT status FROM compaction_checkpoint WHERE id=?1",
+            [k1.id.clone().into()],
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "status")
+        .unwrap();
+    assert_eq!(status, "applied");
+    let operation = store
+        .compaction_operation(&snapshot.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(operation.status, "completed");
+    assert_eq!(operation.snapshot, admitted.snapshot);
+    assert!(
+        store
+            .compaction_runner_plan(&snapshot.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .compaction_runner_state(&snapshot.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let saved = store
+        .compaction_manifest_page(&snapshot.id, false, 0, 0)
+        .await
+        .unwrap();
+    assert_eq!(saved.len(), 2);
+    for (ordinal, (entry, expected)) in saved.iter().zip([a.reference(), b.reference()]).enumerate()
+    {
+        assert_eq!(entry.source, expected);
+        assert_eq!(entry.ordinal, ordinal as u64);
+        assert_eq!(entry.unit, ordinal as u64);
+        assert_eq!(entry.thread_id, "thread");
+        assert!(!entry.reference_only);
+    }
+    assert_eq!(
+        store.compaction_apply(&k1, None, &[a, b]).await.unwrap(),
+        CommitOutcome::AlreadyApplied
+    );
+}
+
+#[tokio::test]
+async fn raw_assertion_api_saves_permuted_prebuilt_manifest_and_publishes_exactly() {
+    let store = store().await;
+    let a1 = source(&store, "A1", 1, "first A").await;
+    let b1 = source(&store, "B1", 2, "only B").await;
+    let a2 = source(&store, "A2", 3, "second A").await;
+    let selection = ModelSelection {
+        transport: Transport::Api,
+        instance: "p".into(),
+        model: "m".into(),
+        effort: None,
+    };
+    let coverage = vec![a1.reference(), a2.reference(), b1.reference()];
+    let snapshot = OperationSnapshot {
+        id: "permuted-raw-op".into(),
+        owner: "owner".into(),
+        expected_checkpoint: None,
+        projection_version: 1,
+        source_epochs: Default::default(),
+        admission: CompactionSettings::default()
+            .admit(&selection, None, 10)
+            .unwrap(),
+        plan: CompactionPlan {
+            mode: CompactionMode::Normal,
+            coverage_domain: CoverageDomain::OwnContribution,
+            compact: vec![0, 1],
+            retain: vec![],
+            coverage: coverage.clone(),
+            fingerprint: "permuted-raw-op".into(),
+        },
+    };
+    store
+        .compaction_admit("ws", "thread", &snapshot)
+        .await
+        .unwrap();
+    store
+        .compaction_prepare_runner(&snapshot.id, &ModelBudget::new(None, None, None), 3, 0)
+        .await
+        .unwrap();
+    let ordered = vec![a1.reference(), b1.reference(), a2.reference()];
+    let manifest = ordered
+        .iter()
+        .enumerate()
+        .map(|(ordinal, source)| ManifestEntry {
+            ordinal: ordinal as u64,
+            unit: 5,
+            reference_only: false,
+            thread_id: "thread".into(),
+            source: source.clone(),
+        })
+        .collect::<Vec<_>>();
+    store
+        .compaction_append_manifest(&snapshot.id, &manifest)
+        .await
+        .unwrap();
+    assert_ne!(coverage, ordered);
+    assert!(
+        store
+            .compaction_manifest_sources_current(&snapshot.id)
+            .await
+            .unwrap()
+    );
+    assert!(
+        store
+            .compaction_bound_source_projection(&snapshot.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let cp = Checkpoint {
+        id: "permuted-raw-checkpoint".into(),
+        operation_id: snapshot.id.clone(),
+        owner: snapshot.owner.clone(),
+        previous: None,
+        summary: "Exact complete units A and B".into(),
+        selection,
+        coverage: coverage.clone(),
+        projection_version: 1,
+        format_version: 1,
+    };
+    for _ in 0..2 {
+        // This is the first public candidate save, not just a runner's retry.
+        store.compaction_save_candidate(&cp, 0).await.unwrap();
+        let saved = store
+            .compaction_manifest_page(&snapshot.id, false, 0, 0)
+            .await
+            .unwrap();
+        assert_eq!(saved.len(), 3);
+        assert_eq!(
+            saved
+                .iter()
+                .map(|entry| entry.source.clone())
+                .collect::<Vec<_>>(),
+            ordered
+        );
+        for (entry, expected) in saved.iter().zip(&manifest) {
+            assert_eq!(entry.ordinal, expected.ordinal);
+            assert_eq!(entry.unit, expected.unit);
+            assert_eq!(entry.thread_id, expected.thread_id);
+            assert!(!entry.reference_only);
+        }
+        assert_eq!(checkpoint_proof_version(&store, &cp.id).await, 0);
+        assert_eq!(store.compaction_head(&cp.owner).await.unwrap(), None);
+    }
+    assert_eq!(
+        store
+            .compaction_apply(&cp, None, &[a1, a2, b1])
+            .await
+            .unwrap(),
+        CommitOutcome::Applied
+    );
+    assert_eq!(checkpoint_proof_version(&store, &cp.id).await, 1);
+    assert_eq!(
+        store.compaction_head(&cp.owner).await.unwrap(),
+        Some(cp.id.clone())
+    );
+    let edges = store
+        .compaction_checkpoint_edges(&cp.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        edges
+            .coverage
+            .iter()
+            .map(|entry| entry.source.clone())
+            .collect::<std::collections::BTreeSet<_>>(),
+        coverage
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>()
+    );
+    assert!(
+        edges
+            .coverage
+            .iter()
+            .all(|entry| entry.source_thread == "thread")
+    );
+}
+
+#[tokio::test]
+async fn raw_candidate_rejects_corrupt_or_missing_prepared_ownership_without_bootstrap() {
+    async fn manifest_identity(store: &CrudStore, op: &str) -> Vec<String> {
+        let mut rows = store
+            .compaction_manifest_page(op, false, 0, 0)
+            .await
+            .unwrap();
+        rows.extend(
+            store
+                .compaction_manifest_page(op, true, 0, 0)
+                .await
+                .unwrap(),
+        );
+        rows.sort_by_key(|row| row.ordinal);
+        rows.iter()
+            .map(|row| {
+                serde_json::to_string(&(
+                    row.ordinal,
+                    row.unit,
+                    row.reference_only,
+                    &row.thread_id,
+                    &row.source,
+                ))
+                .unwrap()
+            })
+            .collect()
+    }
+    for ready in [false, true] {
+        for defect in [
+            "thread",
+            "version",
+            "reference-only",
+            "ambiguous",
+            "missing",
+            "operation",
+        ] {
+            let store = store().await;
+            let db = store.database_connection();
+            db.execute_unprepared("PRAGMA foreign_keys=OFF")
+                .await
+                .unwrap();
+            let fk: i64 = db
+                .query_one_raw(Statement::from_string(
+                    DbBackend::Sqlite,
+                    "PRAGMA foreign_keys",
+                ))
+                .await
+                .unwrap()
+                .unwrap()
+                .try_get("", "foreign_keys")
+                .unwrap();
+            assert_eq!(fk, 0);
+            let assertion = source(&store, "prepared-owner-source", 1, "original").await;
+            let cp = candidate_admission_fixture(
+                &store,
+                "prepared-owner-op",
+                None,
+                &assertion,
+                Default::default(),
+                true,
+            )
+            .await;
+            let record = store
+                .compaction_operation(&cp.operation_id)
+                .await
+                .unwrap()
+                .unwrap();
+            if ready {
+                let snapshot: OperationSnapshot = serde_json::from_str(&record.snapshot).unwrap();
+                // Only activate. ready_operation also saves a candidate and
+                // closes ownership, which would make this corruption fixture
+                // hit the immutable guard before the action under test.
+                let budget = ModelBudget::new(None, None, None);
+                let initial = pioneer_compaction::runner::RunnerState::new(
+                    snapshot.admission.deadline_ms,
+                    &budget,
+                    1000,
+                    None,
+                )
+                .unwrap();
+                store
+                    .compaction_activate_runner(&cp.operation_id, &initial)
+                    .await
+                    .unwrap();
+            }
+            // Corrupt the unsealed fixture before candidate creation. No DDL or
+            // production guard is disabled; prepared/ready state remains intact.
+            let sql = match defect {
+                "thread" => {
+                    "UPDATE compaction_manifest SET source_thread='wrong-thread' WHERE operation_id='prepared-owner-op'"
+                }
+                "version" => {
+                    "UPDATE compaction_manifest SET source_version='event-revision:999' WHERE operation_id='prepared-owner-op'"
+                }
+                "reference-only" => {
+                    "UPDATE compaction_manifest SET reference_only=1 WHERE operation_id='prepared-owner-op'"
+                }
+                "ambiguous" => {
+                    "INSERT INTO compaction_manifest(operation_id,ordinal,unit_ordinal,reference_only,source_thread,source_scope,source_id,source_version) SELECT operation_id,7,unit_ordinal,reference_only,source_thread,source_scope,source_id,source_version FROM compaction_manifest WHERE operation_id='prepared-owner-op'"
+                }
+                "missing" => {
+                    "DELETE FROM compaction_manifest WHERE operation_id='prepared-owner-op'"
+                }
+                "operation" => {
+                    "UPDATE compaction_manifest SET operation_id='orphan-operation' WHERE operation_id='prepared-owner-op'"
+                }
+                _ => unreachable!(),
+            };
+            db.execute_unprepared(sql).await.unwrap();
+            assert_eq!(
+                store
+                    .compaction_reference_thread("ws", &assertion.reference())
+                    .await
+                    .unwrap(),
+                Some("thread".into()),
+                "current assertion itself must remain valid"
+            );
+            let before = manifest_identity(&store, &cp.operation_id).await;
+            let orphan_before = manifest_identity(&store, "orphan-operation").await;
+            let state = serde_json::to_string(
+                &store
+                    .compaction_runner_state(&cp.operation_id)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            for _ in 0..2 {
+                let error = store.compaction_save_candidate(&cp, 0).await.unwrap_err();
+                assert!(
+                    error
+                        .to_string()
+                        .contains("raw historical ownership conflict")
+                        || error
+                            .to_string()
+                            .contains("raw candidate missing expected manifest ownership"),
+                    "{ready}/{defect}: {error:#}"
+                );
+                assert!(store.compaction_checkpoint(&cp.id).await.unwrap().is_none());
+                assert_eq!(store.compaction_head(&cp.owner).await.unwrap(), None);
+                let after = store
+                    .compaction_operation(&cp.operation_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(after.status, record.status);
+                assert_eq!(after.next_portion, record.next_portion);
+                assert_eq!(after.snapshot, record.snapshot);
+                assert_eq!(
+                    serde_json::to_string(
+                        &store
+                            .compaction_runner_state(&cp.operation_id)
+                            .await
+                            .unwrap()
+                    )
+                    .unwrap(),
+                    state
+                );
+                assert_eq!(
+                    store
+                        .compaction_runner_plan(&cp.operation_id)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .ready,
+                    ready
+                );
+                assert_eq!(manifest_identity(&store, &cp.operation_id).await, before);
+                assert_eq!(
+                    manifest_identity(&store, "orphan-operation").await,
+                    orphan_before
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn raw_assertion_missing_historical_ownership_is_not_empty_proofs() {
     let store = store().await;
     let assertion = source(&store, "lost-owner-source", 1, "original").await;
@@ -8527,6 +9196,16 @@ async fn raw_assertion_missing_historical_ownership_is_not_empty_proofs() {
     db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
         "INSERT INTO compaction_coverage(checkpoint_id,source_scope,source_id,source_version) VALUES(?1,?2,?3,?4)",
         [cp.id.clone().into(),r.scope.into(),r.id.into(),r.version.into()])).await.unwrap();
+    // Candidate retry must not reconstruct a historical node from current
+    // assertions, even when neither a runner nor any manifest row survived.
+    assert!(store.compaction_save_candidate(&cp, 0).await.is_err());
+    assert!(
+        store
+            .compaction_manifest_page(&cp.operation_id, false, 0, 0)
+            .await
+            .unwrap()
+            .is_empty()
+    );
     assert!(
         store
             .compaction_apply(&cp, None, &[assertion])

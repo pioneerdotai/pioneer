@@ -37,6 +37,388 @@ fn test_checkpoint_domains(
         .collect()
 }
 
+// Exercise the real layout/admission path: never align coverage to manifest.
+async fn raw_layout_publication_preserves_actual_ownership(filtered_empty: bool) {
+    use pioneer_provider::{ChatMessage, MessageProvenance, MessageSourceRef};
+    let units_and_text = if filtered_empty {
+        vec![("empty", ""), ("A", "visible answer")]
+    } else {
+        vec![("A", "first A"), ("B", "only B"), ("A", "second A")]
+    };
+    let payloads = units_and_text
+        .iter()
+        .enumerate()
+        .map(|(i, (_, text))| {
+            serde_json::to_string(&pioneer_crud::CanonicalTurnEventPayload::ItemCompleted(
+                pioneer_protocol::ItemCompletedNotification {
+                    workspace_id: "ws".into(),
+                    thread_id: "thread".into(),
+                    turn_id: "turn".into(),
+                    item: pioneer_protocol::TurnItem::AgentMessage {
+                        id: format!("answer-{i}"),
+                        text: (*text).into(),
+                        phase: Default::default(),
+                        markdown: None,
+                        markdown_version: None,
+                    },
+                },
+            ))
+            .unwrap()
+        })
+        .collect();
+    let f = fixture_with_canonical_payloads(payloads, vec![Reply::Success], true, false).await;
+    let db = f.store.database_connection();
+    db.execute_unprepared("PRAGMA foreign_keys=OFF")
+        .await
+        .unwrap();
+    let fk: i64 = db
+        .query_one_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "PRAGMA foreign_keys",
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "foreign_keys")
+        .unwrap();
+    assert_eq!(fk, 0);
+    let sources = f
+        .store
+        .compaction_source_page("ws", "thread", "turn", PagedSource::Event, 0)
+        .await
+        .unwrap()
+        .entries
+        .into_iter()
+        .map(|entry| entry.reference)
+        .collect::<Vec<_>>();
+    assert_eq!(sources.len(), units_and_text.len());
+    let messages = units_and_text
+        .iter()
+        .zip(&sources)
+        .map(|((unit, text), source)| {
+            let mut message = ChatMessage::assistant(*text);
+            message.provenance = Some(MessageProvenance {
+                logical_turn_id: None,
+                workspace_id: "ws".into(),
+                thread_id: "thread".into(),
+                context_thread: Some("thread".into()),
+                unit_id: (*unit).into(),
+                sources: vec![MessageSourceRef {
+                    scope: source.scope.clone(),
+                    id: source.id.clone(),
+                    version: source.version.clone(),
+                }],
+                source_aliases: vec![],
+                ambiguous_input_aliases: vec![],
+                complete: true,
+                protected_input: false,
+                inherited: false,
+            });
+            message
+        })
+        .collect::<Vec<_>>();
+    let layout = pioneer_agent::compaction::history::NativeHistoryLayout::from_messages(
+        "ws",
+        "thread",
+        &messages,
+        &vec![10; messages.len()],
+    )
+    .unwrap();
+    assert!(
+        layout
+            .units
+            .iter()
+            .all(|unit| unit.complete && !unit.protected_input)
+    );
+    if !filtered_empty {
+        assert_eq!(layout.message_indexes, vec![vec![0, 2], vec![1]]);
+    }
+    let mut plan = f.runner.snapshot.plan.clone();
+    plan.compact = (0..layout.units.len()).collect();
+    plan.retain.clear();
+    plan.coverage_domain = pioneer_compaction::coverage_domain_for(&layout.units, &plan.compact);
+    // Same unit/source traversal as native preparation, before history_manifest.
+    plan.coverage = plan
+        .compact
+        .iter()
+        .flat_map(|i| layout.units[*i].sources.clone())
+        .collect();
+    plan.fingerprint = "raw-layout-membership".into();
+    let manifest = super::admission::history_manifest(&messages, &layout, &plan).unwrap();
+    assert_eq!(
+        manifest
+            .iter()
+            .map(|entry| entry.source.clone())
+            .collect::<Vec<_>>(),
+        sources
+    );
+    if !filtered_empty {
+        assert_ne!(plan.coverage, sources);
+        assert!(manifest.iter().all(|entry| entry.unit == manifest[0].unit));
+    } else {
+        let empty_payload = f
+            .store
+            .compaction_reference_payload("ws", "thread", &sources[0])
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            super::model_source_payload(&sources[0], empty_payload)
+                .unwrap()
+                .is_none()
+        );
+    }
+    let epoch = f
+        .store
+        .compaction_projection_version("ws", "thread")
+        .await
+        .unwrap();
+    let snapshot = admit_operation(
+        &f.store,
+        "ws",
+        "thread",
+        &CompactionSettings::default(),
+        &f.runner.snapshot.admission.selection,
+        None,
+        f.runner.summarizer.as_ref(),
+        PreparedOperation {
+            owner: "raw-layout-owner".into(),
+            execution_turn: "turn".into(),
+            source_projection: None,
+            expected_checkpoint: None,
+            summary_basis: None,
+            operation_deadline_ms: None,
+            projection_version: epoch,
+            source_epochs: std::collections::BTreeMap::from([("thread".into(), epoch)]),
+            plan: plan.clone(),
+            manifest: manifest.clone(),
+            target_identity: "raw-layout-target".into(),
+            target_tokens: 500,
+        },
+        10,
+    )
+    .await
+    .unwrap();
+    assert_eq!(snapshot.plan.coverage, plan.coverage);
+    assert!(
+        f.store
+            .compaction_bound_source_projection(&snapshot.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let actual = f
+        .store
+        .compaction_manifest_page(&snapshot.id, false, 0, 0)
+        .await
+        .unwrap();
+    let selected = actual
+        .iter()
+        .map(|entry| entry.source.clone())
+        .collect::<Vec<_>>();
+    // The mismatch exists before runner/candidate/publication, with valid owners.
+    assert_ne!(snapshot.plan.coverage, selected);
+    assert_eq!(
+        selected,
+        if filtered_empty {
+            sources[1..].to_vec()
+        } else {
+            sources.clone()
+        }
+    );
+    if filtered_empty {
+        assert_eq!(actual[0].ordinal, 0);
+        assert_eq!(actual[0].unit, manifest[1].unit);
+        assert_eq!(snapshot.plan.coverage[1], actual[0].source);
+    }
+    assert!(
+        f.store
+            .compaction_manifest_sources_current(&snapshot.id)
+            .await
+            .unwrap()
+    );
+    for entry in &actual {
+        assert!(!entry.reference_only);
+        assert_eq!(entry.thread_id, "thread");
+        assert_eq!(
+            f.store
+                .compaction_reference_thread("ws", &entry.source)
+                .await
+                .unwrap(),
+            Some("thread".into())
+        );
+        assert!(snapshot.plan.coverage.contains(&entry.source));
+    }
+    let identities = |entries: &[ManifestEntry]| {
+        entries
+            .iter()
+            .map(|entry| {
+                (
+                    entry.ordinal,
+                    entry.unit,
+                    entry.reference_only,
+                    entry.thread_id.clone(),
+                    entry.source.clone(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let before = identities(&actual);
+    let runner = Arc::new(CompactionRunner::new(
+        f.store.clone(),
+        "ws".into(),
+        "thread".into(),
+        snapshot.clone(),
+        f.runner.summarizer.clone(),
+        Arc::new(Target(true)),
+        f.observer.clone(),
+        f.clock.clone(),
+    ));
+    let mut hook =
+        arm_publication_test_hook(&f.store, &snapshot.id, PublicationTestPause::BeforeWriter);
+    let run = tokio::spawn(async move { runner.run(CancellationToken::new()).await.unwrap() });
+    hook.reached().await;
+    let state = f
+        .store
+        .compaction_runner_state(&snapshot.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let RunnerPhase::Commit { checkpoint: id } = &state.phase else {
+        panic!("expected real saved Commit")
+    };
+    let checkpoint = f.store.compaction_checkpoint(id).await.unwrap().unwrap();
+    assert_eq!(
+        checkpoint
+            .coverage
+            .iter()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>(),
+        selected
+            .iter()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>()
+    );
+    assert_eq!(
+        f.store.compaction_head(&snapshot.owner).await.unwrap(),
+        None
+    );
+    // The real runner sealed this candidate. Retrying its save must be exact
+    // even when closed/sealed ownership cannot be INSERTed or rewritten.
+    let saved = db
+        .query_one_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "SELECT proof_version,portion FROM compaction_checkpoint WHERE id=?",
+            [id.clone().into()],
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(saved.try_get::<i64>("", "proof_version").unwrap(), 1);
+    let portion = saved.try_get::<i64>("", "portion").unwrap();
+    f.store
+        .compaction_save_candidate(&checkpoint, portion)
+        .await
+        .unwrap();
+    assert_eq!(
+        identities(
+            &f.store
+                .compaction_manifest_page(&snapshot.id, false, 0, 0)
+                .await
+                .unwrap()
+        ),
+        before
+    );
+    assert_eq!(
+        serde_json::to_string(
+            &f.store
+                .compaction_runner_state(&snapshot.id)
+                .await
+                .unwrap()
+                .unwrap()
+        )
+        .unwrap(),
+        serde_json::to_string(&state).unwrap()
+    );
+    hook.release();
+    assert_eq!(run.await.unwrap(), CompactionExit::Applied(id.clone()));
+    let applied = f
+        .store
+        .compaction_runner_state(&snapshot.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(&applied.phase, RunnerPhase::Applied { checkpoint } if checkpoint == id));
+    assert_eq!(
+        f.store.compaction_head(&snapshot.owner).await.unwrap(),
+        Some(id.clone())
+    );
+    assert_eq!(
+        identities(
+            &f.store
+                .compaction_manifest_page(&snapshot.id, false, 0, 0)
+                .await
+                .unwrap()
+        ),
+        before
+    );
+    let edges = f
+        .store
+        .compaction_checkpoint_edges(id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(edges.thread_id, "thread");
+    assert!(
+        edges
+            .coverage
+            .iter()
+            .all(|entry| entry.source_thread == "thread")
+    );
+    assert_eq!(
+        edges
+            .coverage
+            .iter()
+            .map(|entry| entry.source.clone())
+            .collect::<std::collections::BTreeSet<_>>(),
+        selected
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>()
+    );
+    let published = db
+        .query_one_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "SELECT proof_version,status FROM compaction_checkpoint WHERE id=?",
+            [id.clone().into()],
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(published.try_get::<i64>("", "proof_version").unwrap(), 1);
+    assert_eq!(
+        published.try_get::<String>("", "status").unwrap(),
+        "applied"
+    );
+    assert_eq!(
+        f.store
+            .compaction_operation(&snapshot.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        "completed"
+    );
+}
+
+#[tokio::test]
+async fn raw_interleaved_layout_publishes_without_rewriting_manifest_ordinals() {
+    raw_layout_publication_preserves_actual_ownership(false).await;
+}
+#[tokio::test]
+async fn raw_filtered_empty_projection_publishes_with_original_membership() {
+    raw_layout_publication_preserves_actual_ownership(true).await;
+}
+
 #[tokio::test]
 async fn source_creation_order_keeps_child_tool_work_before_later_parent_input() {
     use pioneer_agent::compaction::composition::{AcceptedContextBranch, compose_context};
@@ -4971,6 +5353,7 @@ async fn admission_resumes_exact_plan_without_resetting_deadline() {
     .await
     .unwrap();
     assert!(first.plan.compact.is_empty());
+    assert!(first.plan.retain.is_empty());
     assert!(first.plan.coverage.is_empty());
     assert_eq!(
         f.store

@@ -25,7 +25,7 @@ use pioneer_entity::{
 use sea_orm::sea_query::{Alias as SqlAlias, Expr, ExprTrait, JoinType, OnConflict, Order, Query};
 use sea_orm::{
     ColumnTrait, Condition, ConnectionTrait, DbBackend, EntityTrait, FromQueryResult, QueryFilter,
-    QueryOrder, QuerySelect, QueryTrait, Statement, TransactionTrait,
+    QueryOrder, QuerySelect, QueryTrait, RelationTrait, Statement, TransactionTrait,
 };
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -2121,13 +2121,15 @@ pub(super) async fn prepare_raw_ownership(
         .one(&store.connection)
         .await?
         .ok_or_else(|| anyhow::anyhow!("raw context missing"))?;
-    let mut original_ordinals = BTreeMap::new();
+    // Coverage proves membership, not the order of an already prepared
+    // manifest. Its positions are used only for unclaimed legacy raw assertions.
+    let mut bootstrap_ordinals = BTreeMap::new();
     for (ordinal, source) in original.plan.coverage.iter().enumerate() {
-        original_ordinals.entry(source).or_insert(ordinal);
+        bootstrap_ordinals.entry(source).or_insert(ordinal);
     }
     let mut rows = Vec::new();
     for source in &checkpoint.coverage {
-        let ordinal = *original_ordinals
+        let ordinal = *bootstrap_ordinals
             .get(source)
             .ok_or_else(|| anyhow::anyhow!("raw candidate exceeds original admission"))?;
         let thread = compaction::compaction_reference_thread(&store.connection, &workspace, source)
@@ -2159,7 +2161,8 @@ pub(super) async fn write_raw_ownership<C: ConnectionTrait>(
         .one(db)
         .await?
         .ok_or_else(|| anyhow::anyhow!("raw context lost"))?;
-    for (ordinal, source, thread) in rows {
+    let mut bootstrap_allowed = None;
+    for (bootstrap_ordinal, source, thread) in rows {
         ensure!(
             compaction::compaction_reference_thread(db, &workspace, source)
                 .await?
@@ -2167,29 +2170,137 @@ pub(super) async fn write_raw_ownership<C: ConnectionTrait>(
                 == Some(thread),
             "raw assertion ownership changed"
         );
-        let exact = Condition::all()
+        let selected_source = Condition::all()
             .add(manifest::Column::OperationId.eq(&checkpoint.operation_id))
-            .add(manifest::Column::Ordinal.eq(*ordinal))
             .add(manifest::Column::ReferenceOnly.eq(0))
-            .add(manifest::Column::SourceThread.eq(thread))
             .add(manifest::Column::SourceScope.eq(&source.scope))
             .add(manifest::Column::SourceId.eq(&source.id))
             .add(manifest::Column::SourceVersion.eq(&source.version));
-        if manifest::Entity::find()
+        // The existing source index supports this exact selected identity.
+        // Return only scalar metadata (including an owner equality), never
+        // source payloads. Two rows suffice to reject ambiguous ownership.
+        let owners = manifest::Entity::find()
             .select_only()
-            .column(manifest::Column::OperationId)
-            .filter(exact.clone())
-            .into_tuple::<String>()
-            .one(db)
-            .await?
-            .is_some()
-        {
+            .columns([manifest::Column::Ordinal, manifest::Column::UnitOrdinal])
+            .expr(Expr::col(manifest::Column::SourceThread).eq(thread.clone()))
+            .filter(selected_source.clone())
+            .limit(2)
+            .into_tuple::<(i64, i64, bool)>()
+            .all(db)
+            .await?;
+        if !owners.is_empty() {
+            ensure!(
+                owners.len() == 1 && owners[0].0 >= 0 && owners[0].1 >= 0 && owners[0].2,
+                "raw historical ownership conflict"
+            );
+            // Ordinal/unit belong to this row, not to coverage order. An exact
+            // retry must not INSERT or rewrite the historical manifest.
             continue;
         }
+        let can_bootstrap = match bootstrap_allowed {
+            Some(allowed) => allowed,
+            None => {
+                // Prepared/incomplete runners require their existing manifest.
+                // A genuine raw operation can assert another originally admitted
+                // source in a later portion; check that source's history below.
+                let allowed = plan::Entity::find_by_id(&checkpoint.operation_id)
+                    .select_only()
+                    .expr(Expr::val(1))
+                    .into_tuple::<i64>()
+                    .one(db)
+                    .await?
+                    .is_none()
+                    && runner::Entity::find_by_id(&checkpoint.operation_id)
+                        .select_only()
+                        .expr(Expr::val(1))
+                        .into_tuple::<i64>()
+                        .one(db)
+                        .await?
+                        .is_none()
+                    // Boundary and empty-interior role seeks use the existing
+                    // operation/role index prefix. INTEGER affinity also allows
+                    // fractional values; bounds alone do not prove only 0/1.
+                    && manifest::Entity::find()
+                        .select_only()
+                        .expr(Expr::col(manifest::Column::ReferenceOnly).is_in([0, 1]))
+                        .filter(manifest::Column::OperationId.eq(&checkpoint.operation_id))
+                        .order_by_asc(manifest::Column::ReferenceOnly)
+                        .limit(1)
+                        .into_tuple::<bool>()
+                        .one(db)
+                        .await?
+                        .is_none_or(|valid| valid)
+                    && manifest::Entity::find()
+                        .select_only()
+                        .expr(Expr::col(manifest::Column::ReferenceOnly).is_in([0, 1]))
+                        .filter(manifest::Column::OperationId.eq(&checkpoint.operation_id))
+                        .order_by_desc(manifest::Column::ReferenceOnly)
+                        .limit(1)
+                        .into_tuple::<bool>()
+                        .one(db)
+                        .await?
+                        .is_none_or(|valid| valid)
+                    && manifest::Entity::find()
+                        .select_only()
+                        .expr(Expr::val(1))
+                        .filter(manifest::Column::OperationId.eq(&checkpoint.operation_id))
+                        .filter(manifest::Column::ReferenceOnly.gt(0))
+                        .filter(manifest::Column::ReferenceOnly.lt(1))
+                        .limit(1)
+                        .into_tuple::<i64>()
+                        .one(db)
+                        .await?
+                        .is_none();
+                bootstrap_allowed = Some(allowed);
+                allowed
+            }
+        };
+        ensure!(
+            can_bootstrap,
+            "raw candidate missing expected manifest ownership"
+        );
+        // Do not treat a different version/role as a fresh assertion. Both
+        // supported roles use the existing source index, without payload reads.
+        // Historical claims are checked independently of version: lost or
+        // corrupt ownership cannot be reconstructed under an old checkpoint.
+        ensure!(
+            manifest::Entity::find()
+                .select_only()
+                .expr(Expr::val(1))
+                .filter(manifest::Column::OperationId.eq(&checkpoint.operation_id))
+                .filter(manifest::Column::ReferenceOnly.is_in([0, 1]))
+                .filter(manifest::Column::SourceScope.eq(&source.scope))
+                .filter(manifest::Column::SourceId.eq(&source.id))
+                .limit(1)
+                .into_tuple::<i64>()
+                .one(db)
+                .await?
+                .is_none()
+                && coverage::Entity::find()
+                    .select_only()
+                    .expr(Expr::val(1))
+                    .join(
+                        JoinType::InnerJoin,
+                        coverage::Relation::CompactionCheckpoint.def()
+                    )
+                    .filter(checkpoint::Column::OperationId.eq(&checkpoint.operation_id))
+                    .filter(coverage::Column::SourceScope.eq(&source.scope))
+                    .filter(coverage::Column::SourceId.eq(&source.id))
+                    .limit(1)
+                    .into_tuple::<i64>()
+                    .one(db)
+                    .await?
+                    .is_none(),
+            "raw candidate missing expected manifest ownership"
+        );
+        let exact = selected_source
+            .add(manifest::Column::Ordinal.eq(*bootstrap_ordinal))
+            .add(manifest::Column::UnitOrdinal.eq(*bootstrap_ordinal))
+            .add(manifest::Column::SourceThread.eq(thread));
         manifest::Entity::insert(manifest::ActiveModel {
             operation_id: sea_orm::Set(checkpoint.operation_id.clone()),
-            ordinal: sea_orm::Set(*ordinal),
-            unit_ordinal: sea_orm::Set(*ordinal),
+            ordinal: sea_orm::Set(*bootstrap_ordinal),
+            unit_ordinal: sea_orm::Set(*bootstrap_ordinal),
             reference_only: sea_orm::Set(0),
             source_thread: sea_orm::Set(thread.clone()),
             source_scope: sea_orm::Set(source.scope.clone()),
