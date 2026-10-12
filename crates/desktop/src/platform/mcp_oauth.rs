@@ -263,6 +263,11 @@ impl Drop for DesktopMcpOAuthShell {
     }
 }
 fn handle_callback(mut stream: TcpStream, listener: &Listener) {
+    // Accepted sockets inherit the listener's nonblocking mode on macOS.
+    // The callback's bounded header read needs blocking I/O with its timeout.
+    if stream.set_nonblocking(false).is_err() {
+        return;
+    }
     let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
     let mut bytes = [0u8; 8192];
@@ -541,6 +546,50 @@ mod tests {
         let mut response = String::new();
         client.read_to_string(&mut response).unwrap();
         response
+    }
+
+    #[test]
+    fn callback_waits_for_fragmented_headers_from_the_nonblocking_listener() {
+        let reserved = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = reserved.local_addr().unwrap().port();
+        drop(reserved);
+        let shell = test_shell(port);
+        assert_eq!(
+            shell.authorize(
+                &test_event("flow", "state"),
+                Arc::new(|_| true),
+                OAuthBrowserAdmission::default()
+            ),
+            OAuthBrowserEffectResult::BrowserUnavailable
+        );
+        let mut client = TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port)).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        client
+            .write_all(b"GET /oauth/mcp/callback?state=state")
+            .unwrap();
+        // Let the real worker accept an incomplete request before its tail.
+        std::thread::sleep(Duration::from_millis(100));
+        client
+            .write_all(b"&code=code HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .unwrap();
+        let mut response = String::new();
+        let result = client.read_to_string(&mut response);
+        assert!(result.is_ok(), "callback read: {result:?}; {response}");
+        assert!(response.starts_with("HTTP/1.1 202"), "{response}");
+        assert!(
+            shell
+                .listener
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .pending
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

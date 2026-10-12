@@ -16,6 +16,7 @@ pub(crate) mod auth_session;
 pub(crate) mod authorization_persistence;
 pub(crate) mod authorization_scope;
 pub(crate) mod canonical_turn_event;
+pub(crate) mod checkpoint_proofs;
 pub mod cli_runtime_binding;
 pub mod compaction;
 pub(crate) mod compaction_background;
@@ -125,3 +126,5 @@ pub(crate) mod task_event_fanout;
 pub(crate) mod task_run_occurrence_reconcile;
 
 pub(crate) mod task_occurrence_reconcile;
+
+pub(crate) mod frozen_storage_lifetime;

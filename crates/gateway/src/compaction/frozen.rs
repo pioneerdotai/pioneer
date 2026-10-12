@@ -190,6 +190,9 @@ async fn accepted_history_scopes_prepared(
         return Ok(allowed);
     }
     let descriptor: FrozenHistoryRef = serde_json::from_str(history_json)?;
+    let _frozen_hold = store
+        .compaction_acquire_frozen_history(workspace, &descriptor)
+        .await?;
     ensure!(
         store
             .compaction_frozen_history_owner(workspace, &descriptor)
@@ -304,6 +307,9 @@ async fn hydrate_accepted_own_view(
             "missing accepted execution context"
         );
         let descriptor: FrozenHistoryRef = serde_json::from_str(history_json)?;
+        let _frozen_hold = store
+            .compaction_acquire_frozen_history(workspace, &descriptor)
+            .await?;
         let (_, references) =
             frozen_manifest_references(store, workspace, Some(parent), &descriptor, None).await?;
         let mut checkpoint_graphs = super::coverage::CheckpointGraphResolver::default();
@@ -464,6 +470,9 @@ async fn read_accepted_imports(
     execution_thread: Option<&str>,
     checkpoint_graphs: &mut super::coverage::CheckpointGraphResolver,
 ) -> Result<BTreeMap<usize, AcceptedMessageImports>> {
+    let _frozen_hold = store
+        .compaction_acquire_frozen_history(workspace, descriptor)
+        .await?;
     ensure!(
         store
             .compaction_frozen_history_owner(workspace, descriptor)
@@ -760,14 +769,17 @@ pub(crate) async fn capture_task_output(
         &fence,
     )
     .await?;
-    let history = capture(
+    let prepared = capture_with_imports_prepared(
         store,
         workspace,
         &turn.thread_id,
         &BTreeSet::from([turn.thread_id.clone()]),
         &messages,
+        &BTreeMap::new(),
+        super::coverage::CheckpointGraphResolver::default(),
     )
     .await?;
+    let history = &prepared.descriptor;
     ensure!(
         store
             .compaction_projection_version(workspace, &turn.thread_id)
@@ -788,6 +800,7 @@ pub(crate) async fn capture_task_output(
 
 /// `basis_turn` identifies the accepted parent execution independently of the
 /// Composer-only exclusion. Ordinary Tasks include completed creator rounds.
+#[cfg(test)]
 pub(crate) async fn capture_execution_basis_json(
     store: &CrudStore,
     workspace: &str,
@@ -832,7 +845,26 @@ pub(super) async fn capture_execution_basis_with_outputs(
     Ok(serde_json::to_string(&prepared.descriptor)?)
 }
 
+/// Outer reader/handoff boundary for existing JSON-bearing consumers.
+/// Inline legacy history has no frozen physical dependency.
+pub(crate) async fn acquire_history_json(
+    store: &CrudStore,
+    workspace: &str,
+    json: &str,
+) -> Result<Option<pioneer_crud::FrozenReadHold>> {
+    if json.trim_start().starts_with('[') {
+        return Ok(None);
+    }
+    let descriptor: FrozenHistoryRef = serde_json::from_str(json)?;
+    Ok(Some(
+        store
+            .compaction_acquire_frozen_history(workspace, &descriptor)
+            .await?,
+    ))
+}
+
 pub(crate) struct PreparedHistory {
+    pub(crate) frozen_hold: Option<pioneer_crud::FrozenReadHold>,
     pub(crate) descriptor: FrozenHistoryRef,
     pub(crate) messages: Vec<ChatMessage>,
     /// Scopes admitted while the messages and descriptor were prepared. This
@@ -893,7 +925,7 @@ pub(crate) async fn capture_execution_basis_prepared(
     .await
 }
 
-pub(super) async fn capture_execution_basis_prepared_with_outputs(
+pub(crate) async fn capture_execution_basis_prepared_with_outputs(
     store: &CrudStore,
     workspace: &str,
     thread: &str,
@@ -1078,6 +1110,20 @@ pub(super) async fn capture_execution_basis_prepared_with_outputs(
             } else {
                 None
             }
+        };
+        // Keep one accepted-basis pin across scopes, both streams, and the
+        // recapture handoff. Separate nested readers must not leave a gap.
+        let _basis_frozen_hold = if let Some(basis) = basis.as_ref()
+            && !basis.history_json.trim_start().starts_with('[')
+        {
+            let descriptor: FrozenHistoryRef = serde_json::from_str(&basis.history_json)?;
+            Some(
+                store
+                    .compaction_acquire_frozen_history(workspace, &descriptor)
+                    .await?,
+            )
+        } else {
+            None
         };
         if let Some(basis) = basis {
             messages = scope_current_stage(Stage::HistoryBasis, async {
@@ -2423,6 +2469,7 @@ async fn select_task_metadata_after_composition(
     }))
 }
 
+#[cfg(test)]
 pub(crate) async fn capture(
     store: &CrudStore,
     workspace: &str,
@@ -2430,7 +2477,21 @@ pub(crate) async fn capture(
     allowed_threads: &BTreeSet<String>,
     messages: &[ChatMessage],
 ) -> Result<FrozenHistoryRef> {
-    Ok(capture_with_imports_prepared(
+    Ok(
+        capture_prepared(store, workspace, owner_thread, allowed_threads, messages)
+            .await?
+            .descriptor,
+    )
+}
+
+pub(crate) async fn capture_prepared(
+    store: &CrudStore,
+    workspace: &str,
+    owner_thread: &str,
+    allowed_threads: &BTreeSet<String>,
+    messages: &[ChatMessage],
+) -> Result<PreparedHistory> {
+    capture_with_imports_prepared(
         store,
         workspace,
         owner_thread,
@@ -2439,8 +2500,7 @@ pub(crate) async fn capture(
         &BTreeMap::new(),
         super::coverage::CheckpointGraphResolver::default(),
     )
-    .await?
-    .descriptor)
+    .await
 }
 
 struct CaptureRenderer {
@@ -2784,18 +2844,9 @@ async fn capture_with_imports_prepared_using_renderer(
         }
         let import_digest = pioneer_crud::compaction::frozen_import_identity(&accepted)?;
         let identity_sha256 = hex::encode(digest.finalize());
-        let capture_key = serde_json::to_vec(&(
-            1_u32,
-            workspace,
-            owner_thread,
-            &identity_sha256,
-            references.len(),
-            &import_digest,
-            accepted.len(),
-        ))?;
         let descriptor = FrozenHistoryRef {
             format: 1,
-            manifest_id: format!("fh_{}", hex::encode(Sha256::digest(&capture_key))),
+            manifest_id: format!("fh_{}", uuid::Uuid::new_v4().simple()),
             messages: references.len() as u64,
             identity_sha256,
         };
@@ -2810,17 +2861,9 @@ async fn capture_with_imports_prepared_using_renderer(
                 )
                 .await?
             {
-                if existing == descriptor {
-                    return Ok(PreparedHistory {
-                        descriptor: existing,
-                        messages: verified_messages,
-                        accepted_scopes,
-                        source_epochs: BTreeMap::new(),
-                        expected_checkpoint: None,
-                        checkpoint: None,
-                        checkpoint_graphs,
-                    });
-                }
+                let frozen_hold = store
+                    .compaction_acquire_frozen_history(workspace, &existing)
+                    .await?;
                 let messages = restore_model_with_resolver(
                     store,
                     workspace,
@@ -2830,6 +2873,7 @@ async fn capture_with_imports_prepared_using_renderer(
                 )
                 .await?;
                 return Ok(PreparedHistory {
+                    frozen_hold: Some(frozen_hold),
                     descriptor: existing,
                     messages,
                     accepted_scopes,
@@ -2918,13 +2962,11 @@ async fn capture_with_imports_prepared_using_renderer(
                 record_work(Work::Pages, 1);
                 start = end;
             }
-            ensure!(
-                store
-                    .compaction_finish_frozen_history(workspace, owner_thread, &descriptor)
-                    .await?,
-                "frozen history publication failed"
-            );
+            let frozen_hold = store
+                .compaction_finish_frozen_history_held(workspace, owner_thread, &descriptor)
+                .await?;
             Ok(PreparedHistory {
+                frozen_hold: Some(frozen_hold),
                 descriptor,
                 messages: verified_messages,
                 accepted_scopes,
@@ -2960,6 +3002,9 @@ pub(crate) async fn restore(
     allowed_threads: &BTreeSet<String>,
     descriptor: &FrozenHistoryRef,
 ) -> Result<Vec<ChatMessage>> {
+    let _frozen_hold = store
+        .compaction_acquire_frozen_history(workspace, descriptor)
+        .await?;
     let mut checkpoint_graphs = super::coverage::CheckpointGraphResolver::default();
     restore_with_resolver(
         store,
@@ -2981,6 +3026,9 @@ async fn frozen_manifest_references(
     descriptor: &FrozenHistoryRef,
     allowed_threads: Option<&BTreeSet<String>>,
 ) -> Result<(String, Vec<FrozenMessageRef>)> {
+    let _frozen_hold = store
+        .compaction_acquire_frozen_history(workspace, descriptor)
+        .await?;
     let owner = store
         .compaction_frozen_history_owner(workspace, descriptor)
         .await?
@@ -3054,6 +3102,9 @@ pub(crate) async fn validate_frozen_history_current(
         anyhow::bail!("legacy inline history cannot prove provider continuity");
     }
     let descriptor: FrozenHistoryRef = serde_json::from_str(history_json)?;
+    let _frozen_hold = store
+        .compaction_acquire_frozen_history(workspace, &descriptor)
+        .await?;
     // The immutable accepted manifest is both the authority grant and the
     // source-version proof. Verify it once, then reuse its references for the
     // exact-current check below; do not re-read the manifest merely to derive
@@ -3088,6 +3139,9 @@ pub(crate) async fn validate_frozen_history_authority(
         anyhow::bail!("legacy inline history cannot prove provider continuity");
     }
     let descriptor: FrozenHistoryRef = serde_json::from_str(history_json)?;
+    let _frozen_hold = store
+        .compaction_acquire_frozen_history(workspace, &descriptor)
+        .await?;
     let (_, references) =
         frozen_manifest_references(store, workspace, Some(owner), &descriptor, None).await?;
     let mut checkpoint_graphs = super::coverage::CheckpointGraphResolver::default();
@@ -3333,6 +3387,9 @@ async fn restore_frozen_excluding_coverage(
     coverage: FrozenCoverageSelection<'_>,
     checkpoint_graphs: &mut super::coverage::CheckpointGraphResolver,
 ) -> Result<RestoredFrozenSelection> {
+    let _frozen_hold = store
+        .compaction_acquire_frozen_history(workspace, descriptor)
+        .await?;
     let (_, references) =
         frozen_manifest_references(store, workspace, Some(owner), descriptor, Some(allowed))
             .await?;
@@ -3553,6 +3610,9 @@ async fn restore_accepted_execution_basis_prepared(
     covered_history: &BTreeSet<ScopedHistorySource>,
     checkpoint_graphs: &mut super::coverage::CheckpointGraphResolver,
 ) -> Result<RestoredExecutionBasis> {
+    let _frozen_hold = store
+        .compaction_acquire_frozen_history(workspace, descriptor)
+        .await?;
     struct ExecutionProjection {
         anchor: usize,
         source_thread: String,
@@ -5135,6 +5195,9 @@ pub(crate) async fn restore_accepted_history_for_execution(
         });
     }
     let descriptor: FrozenHistoryRef = serde_json::from_str(history_json)?;
+    let _frozen_hold = store
+        .compaction_acquire_frozen_history(workspace, &descriptor)
+        .await?;
     let owner = store
         .compaction_frozen_history_owner(workspace, &descriptor)
         .await?;
@@ -5214,6 +5277,9 @@ pub(crate) async fn restore_accepted_snapshot_for_execution_without_checkpoint(
         return Ok(messages);
     }
     let descriptor: FrozenHistoryRef = serde_json::from_str(history_json)?;
+    let _frozen_hold = store
+        .compaction_acquire_frozen_history(workspace, &descriptor)
+        .await?;
     let mut allowed = accepted_history_scopes(store, workspace, parent, history_json).await?;
     allowed.insert(execution_thread.to_owned());
     let restored = restore_accepted_execution_projection_without_checkpoint(
@@ -5236,6 +5302,9 @@ async fn restore_accepted_execution_projection_without_checkpoint(
     descriptor: &FrozenHistoryRef,
     execution_thread: Option<&str>,
 ) -> Result<RestoredAcceptedHistory> {
+    let _frozen_hold = store
+        .compaction_acquire_frozen_history(workspace, descriptor)
+        .await?;
     let (_, references) =
         frozen_manifest_references(store, workspace, Some(owner), descriptor, Some(allowed))
             .await?;
@@ -5324,6 +5393,9 @@ pub(crate) async fn frozen_history_direct_sources(
     workspace: &str,
     descriptor: &FrozenHistoryRef,
 ) -> Result<Vec<ScopedHistorySource>> {
+    let _frozen_hold = store
+        .compaction_acquire_frozen_history(workspace, descriptor)
+        .await?;
     frozen_history_projection_sources(store, workspace, descriptor, None).await
 }
 
@@ -5335,6 +5407,9 @@ pub(crate) async fn frozen_history_projection_sources(
     descriptor: &FrozenHistoryRef,
     messages: Option<&[ChatMessage]>,
 ) -> Result<Vec<ScopedHistorySource>> {
+    let _frozen_hold = store
+        .compaction_acquire_frozen_history(workspace, descriptor)
+        .await?;
     let projected = messages.map(|messages| {
         messages
             .iter()
@@ -5391,6 +5466,9 @@ async fn restore_with_resolver(
     descriptor: &FrozenHistoryRef,
     checkpoint_graphs: &mut super::coverage::CheckpointGraphResolver,
 ) -> Result<Vec<ChatMessage>> {
+    let _frozen_hold = store
+        .compaction_acquire_frozen_history(workspace, descriptor)
+        .await?;
     scope_current_stage(Stage::HistoryRestore, async {
         #[cfg(test)]
         if let Some(state) = STORE_RESTORE_CALLS
@@ -5440,6 +5518,9 @@ async fn restore_model_with_resolver(
     descriptor: &FrozenHistoryRef,
     checkpoint_graphs: &mut super::coverage::CheckpointGraphResolver,
 ) -> Result<Vec<ChatMessage>> {
+    let _frozen_hold = store
+        .compaction_acquire_frozen_history(workspace, descriptor)
+        .await?;
     scope_current_stage(Stage::HistoryRestoreModel, async {
         let (owner, references) =
             frozen_manifest_references(store, workspace, None, descriptor, Some(allowed_threads))

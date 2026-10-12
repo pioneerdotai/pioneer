@@ -327,6 +327,16 @@ pub(crate) async fn admit_operation(
             admission.deadline_ms > now_ms,
             "context recovery deadline exceeded before admission"
         );
+        // Frozen admission stores a descriptor and binds its manifest below.
+        // Raw admission retains its original assertions: an empty plan without
+        // a binding denotes lost evidence to checkpoint proof validation.
+        let mut plan = prepared.plan;
+        if prepared.source_projection.is_some() {
+            plan.compact.clear();
+            plan.retain.clear();
+            plan.coverage.clear();
+        }
+        plan.fingerprint = fingerprint;
         let snapshot = OperationSnapshot {
             id: uuid::Uuid::new_v4().to_string(),
             owner: prepared.owner,
@@ -334,15 +344,7 @@ pub(crate) async fn admit_operation(
             projection_version: prepared.projection_version,
             source_epochs: prepared.source_epochs,
             admission,
-            // The bounded snapshot stores a descriptor, never another history.
-            plan: CompactionPlan {
-                mode: prepared.plan.mode,
-                coverage_domain: prepared.plan.coverage_domain,
-                compact: vec![],
-                retain: vec![],
-                coverage: vec![],
-                fingerprint,
-            },
+            plan,
         };
         store
             .compaction_admit_for_turn(workspace, thread, &snapshot, Some(&prepared.execution_turn))

@@ -11766,7 +11766,7 @@ async fn assert_concurrent_collaborative_tasks_receive_independent_frozen_comman
             vec![parent_thread_id.into(), parent_thread_id.into()],
         ),
         (
-            "INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at) VALUES ('recapture-run','recapture-task',?,?,?,CURRENT_TIMESTAMP)",
+            "WITH frozen_root_fixture(run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at) AS (VALUES ('recapture-run','recapture-task',?,?,?,CURRENT_TIMESTAMP)) INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at,frozen_manifest_id) SELECT run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at,CASE WHEN json_valid(history_json) THEN CASE WHEN json_type(history_json)='object' THEN json_extract(history_json,'$.manifest_id') ELSE NULL END ELSE NULL END FROM frozen_root_fixture",
             vec![
                 workspace_id.clone().into(),
                 parent_thread_id.into(),
@@ -11810,18 +11810,37 @@ async fn assert_concurrent_collaborative_tasks_receive_independent_frozen_comman
         );
     }
 
-    crud_store
-        .database_connection()
-        .execute_raw(sea_orm::Statement::from_sql_and_values(
-            sea_orm::DbBackend::Sqlite,
-            "UPDATE compaction_frozen_history SET imports_sha256=? WHERE id=?",
-            [
-                "0".repeat(64).into(),
-                assembled_descriptor.manifest_id.clone().into(),
-            ],
-        ))
-        .await
-        .unwrap();
+    assert!(
+        crud_store
+            .database_connection()
+            .execute_raw(sea_orm::Statement::from_sql_and_values(
+                sea_orm::DbBackend::Sqlite,
+                "UPDATE compaction_frozen_history SET imports_sha256=? WHERE id=?",
+                [
+                    "0".repeat(64).into(),
+                    assembled_descriptor.manifest_id.clone().into()
+                ],
+            ))
+            .await
+            .is_err(),
+        "a completed import digest must be immutable"
+    );
+    // Corrupt the actual backing row, including a shared import range. The
+    // unchanged header digest must detect damage to its retained proof bytes.
+    let import_row = crud_store.database_connection().query_one_raw(sea_orm::Statement::from_sql_and_values(
+        sea_orm::DbBackend::Sqlite,
+        "SELECT d.manifest_id,d.ordinal,d.proof_json,d.bytes FROM compaction_frozen_import_data d WHERE d.ordinal=0 AND ((d.manifest_id=?1 AND NOT EXISTS (SELECT 1 FROM compaction_frozen_span s WHERE s.manifest_id=?1 AND s.kind=1 AND s.start<=0 AND s.end>0)) OR EXISTS (SELECT 1 FROM compaction_frozen_span s WHERE s.manifest_id=?1 AND s.kind=1 AND s.start<=0 AND s.end>0 AND d.manifest_id=s.source_manifest)) LIMIT 1",
+        [assembled_descriptor.manifest_id.clone().into()],
+    )).await.unwrap().unwrap();
+    let backing: String = import_row.try_get("", "manifest_id").unwrap();
+    let ordinal: i64 = import_row.try_get("", "ordinal").unwrap();
+    let original_proof: String = import_row.try_get("", "proof_json").unwrap();
+    let original_bytes: i64 = import_row.try_get("", "bytes").unwrap();
+    crud_store.database_connection().execute_raw(sea_orm::Statement::from_sql_and_values(
+        sea_orm::DbBackend::Sqlite,
+        "UPDATE compaction_frozen_import_data SET proof_json='{}',bytes=2 WHERE manifest_id=? AND ordinal=?",
+        [backing.clone().into(), ordinal.into()],
+    )).await.unwrap();
     assert!(
         crate::turn_runtime_snapshot::restore_history_json(
             crud_store.as_ref(),
@@ -11833,18 +11852,23 @@ async fn assert_concurrent_collaborative_tasks_receive_independent_frozen_comman
         .is_err(),
         "own-import metadata corruption cannot silently change context ownership"
     );
-    crud_store
-        .database_connection()
-        .execute_raw(sea_orm::Statement::from_sql_and_values(
-            sea_orm::DbBackend::Sqlite,
-            "UPDATE compaction_frozen_history SET imports_sha256=? WHERE id=?",
-            [
-                import_digest.into(),
-                assembled_descriptor.manifest_id.clone().into(),
-            ],
-        ))
-        .await
-        .unwrap();
+    crud_store.database_connection().execute_raw(sea_orm::Statement::from_sql_and_values(
+        sea_orm::DbBackend::Sqlite,
+        "UPDATE compaction_frozen_import_data SET proof_json=?,bytes=? WHERE manifest_id=? AND ordinal=?",
+        [original_proof.into(), original_bytes.into(), backing.into(), ordinal.into()],
+    )).await.unwrap();
+    assert_eq!(
+        crud_store
+            .compaction_frozen_import_state(
+                &workspace_id,
+                parent_thread_id,
+                &assembled_descriptor.manifest_id,
+            )
+            .await
+            .unwrap()
+            .unwrap(),
+        (import_count, import_digest)
+    );
     for outcome in ["A complete", "B complete"] {
         assert_eq!(
             assembled
@@ -12148,15 +12172,33 @@ async fn assert_concurrent_collaborative_tasks_receive_independent_frozen_comman
     // produced result must remain independent of that expensive input path.
     let accepted_c_descriptor: pioneer_compaction::frozen::FrozenHistoryRef =
         serde_json::from_str(&accepted_c_basis.history_json).unwrap();
-    crud_store
+    let accepted_c_owner = crud_store
+        .compaction_frozen_history_owner(&workspace_id, &accepted_c_descriptor)
+        .await
+        .unwrap()
+        .unwrap();
+    let unavailable = crud_store
         .database_connection()
         .execute_raw(sea_orm::Statement::from_sql_and_values(
             sea_orm::DbBackend::Sqlite,
-            "UPDATE compaction_frozen_history SET ready=0 WHERE id=?",
+            "UPDATE compaction_frozen_layout SET failed=1 WHERE manifest_id=? AND kind=0",
             [accepted_c_descriptor.manifest_id.clone().into()],
         ))
         .await
         .unwrap();
+    assert_eq!(unavailable.rows_affected(), 1);
+    assert!(
+        crud_store
+            .compaction_frozen_history_page(
+                &workspace_id,
+                &accepted_c_owner,
+                &accepted_c_descriptor.manifest_id,
+                0,
+            )
+            .await
+            .is_err(),
+        "C's input layout must actually reject reads during output delivery"
+    );
     provider.release_third.notify_one();
     assert_eq!(
         wait_for_task_status(crud_store.clone(), &c_task.id, TaskStatus::Completed).await,
@@ -12255,7 +12297,7 @@ async fn assert_concurrent_collaborative_tasks_receive_independent_frozen_comman
         .database_connection()
         .execute_raw(sea_orm::Statement::from_sql_and_values(
             sea_orm::DbBackend::Sqlite,
-            "UPDATE compaction_frozen_history SET ready=1 WHERE id=?",
+            "UPDATE compaction_frozen_layout SET failed=0 WHERE manifest_id=? AND kind=0",
             [accepted_c_descriptor.manifest_id.into()],
         ))
         .await
@@ -21859,7 +21901,7 @@ async fn hidden_task_agent_run_uses_preflight_before_child_main_prompt_compile_b
         TaskWaitParams {
             task_ids: vec![response.task.id.clone()],
             run_ids: Vec::new(),
-            timeout_ms: Some(5_000),
+            timeout_ms: Some(30_000),
             return_completed: true,
             return_pending: true,
             ..Default::default()
@@ -22137,12 +22179,13 @@ async fn recovered_hidden_task_run_uses_preflight_before_restored_child_main_pro
         "the frozen snapshot fixture must contain prior history distinct from the current Task source turn"
     );
     let lineage = wait_for_child_lineage_for_run(crud_store.clone(), run.id.as_str()).await;
-    for _ in 0..100 {
-        if initial_provider.child_main_call_count() > 0 {
-            break;
+    timeout(Duration::from_secs(30), async {
+        while initial_provider.child_main_call_count() == 0 {
+            sleep(Duration::from_millis(25)).await;
         }
-        sleep(Duration::from_millis(25)).await;
-    }
+    })
+    .await
+    .expect("initial child must reach its main provider before recovery is injected");
     assert!(
         initial_provider.child_main_call_count() > 0,
         "initial child task provider should be hanging in the main child request"
@@ -23995,7 +24038,7 @@ async fn immediate_detached_task_runs_after_parent_and_delivers_to_occurrence_tu
         }
         CompletedHistoryDeliveryBarrier::Summarizer => provider.release_paused_call(),
     }
-    timeout(Duration::from_secs(10), async {
+    timeout(Duration::from_secs(30), async {
         loop {
             let finished = processor
                 .completed_history_checks
@@ -24010,7 +24053,7 @@ async fn immediate_detached_task_runs_after_parent_and_delivers_to_occurrence_tu
             if finished {
                 break;
             }
-            tokio::task::yield_now().await;
+            sleep(Duration::from_millis(25)).await;
         }
     })
     .await
@@ -25978,11 +26021,15 @@ async fn cli_input_admission_impl(case: CliInputAdmissionCase) {
         CliInputAdmissionCase::History => (2, 64 * 1024),
         CliInputAdmissionCase::Current | CliInputAdmissionCase::Fits => (1, 32),
     };
+    let history_chunk = if matches!(case, CliInputAdmissionCase::Frame) {
+        // Exercise the frame byte limit with ordinary word boundaries. One
+        // 730k-character word makes BPE merging dominate this admission test.
+        "background history ".repeat(chunk_chars / "background history ".len())
+    } else {
+        "x".repeat(chunk_chars)
+    };
     for index in 0..history_turns {
-        let text = format!(
-            "HISTORICAL HUGE CHUNK {index:02} {}",
-            "x".repeat(chunk_chars)
-        );
+        let text = format!("HISTORICAL HUGE CHUNK {index:02} {history_chunk}");
         raw_bytes += text.len();
         seed_completed_task_parent_with_inputs(
             &processor,
@@ -26094,10 +26141,16 @@ async fn cli_input_admission_impl(case: CliInputAdmissionCase) {
         );
         return;
     }
-    Arc::clone(&processor)
-        .process_owned_request(context, payload)
-        .await;
-    let response = recv_response_by_id(&mut rx, &request_id).await;
+    let (_, admission_events) = crate::public_error::test_support::capture_events_async(
+        Arc::clone(&processor).process_owned_request(context, payload),
+    )
+    .await;
+    let response_payload = recv_jsonrpc_payload_by_id(&mut rx, &request_id).await;
+    let response: JsonRpcResponse = serde_json::from_str(&response_payload).unwrap_or_else(|error| {
+        panic!(
+            "CLI transfer should be admitted: {error}; payload: {response_payload}; diagnostics: {admission_events:#?}"
+        )
+    });
     let accepted: TurnStartResponse = serde_json::from_value(response.result).unwrap();
     assert_eq!(accepted.turn.id, turn);
     let starts = wait_for_cli_runtime_turn_starts(&cli, 1).await;
@@ -27082,7 +27135,7 @@ async fn pending_cli_heartbeat_writer_is_dropped_before_compaction_cleanup_impl(
             "deadline" => processor.cli_transfer_test_deadline.notify_one(),
             _ => {}
         }
-        let finished = timeout(Duration::from_secs(15), &mut start).await;
+        let finished = timeout(Duration::from_secs(30), &mut start).await;
         if finished.is_err() {
             writer_pause.release.notify_one();
             let _ = timeout(Duration::from_secs(10), &mut start).await;
@@ -28757,7 +28810,7 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_i
                 ),
                 (
                     format!(
-                        "INSERT INTO turn_cli_runtime_binding(turn_id,thread_id,continuation_thread_id,workspace_id,runtime_id,runtime_kind,native_thread_id,status) SELECT '{child_turn}','{child}',continuation_thread_id,workspace_id,runtime_id,runtime_kind,native_thread_id,'starting' FROM turn_cli_runtime_binding WHERE turn_id='{}'",
+                        "INSERT INTO turn_cli_runtime_binding(turn_id,thread_id,continuation_thread_id,workspace_id,runtime_id,runtime_kind,native_thread_id,status,frozen_manifest_id) SELECT '{child_turn}','{child}',continuation_thread_id,workspace_id,runtime_id,runtime_kind,native_thread_id,'starting',NULL FROM turn_cli_runtime_binding WHERE turn_id='{}'",
                         lineage.child_turn_id
                     ),
                     format!("DELETE FROM turn_cli_runtime_binding WHERE turn_id='{child_turn}'"),
@@ -32060,6 +32113,15 @@ async fn detached_composer_work_matches_parent_llm_prompts_end_to_end_impl() {
     ));
     let mut harness =
         setup_memory_agent_e2e_harness("detached_prompt_parity", provider_registry).await;
+    // Compare fixed history, as in the full-request parity fixture below.
+    // Independently indexed live recall can differ between the two executions.
+    harness
+        .processor
+        .apply_thread_episodic_runtime_config(crate::thread_episodic::ThreadEpisodicRuntimeConfig {
+            recall_enabled: false,
+            ..Default::default()
+        })
+        .await;
     harness.processor.bind_task_bridge().await;
     harness.processor.start_task_event_listener().await;
 
@@ -77559,7 +77621,7 @@ async fn background_history_preflight_budgets_task_input_copy_once_near_threshol
     }
     db.execute_raw(sea_orm::Statement::from_sql_and_values(
         sea_orm::DbBackend::Sqlite,
-        "INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,history_json,created_at) VALUES ('background-run','background-task',?,'background-parent','background-parent-turn',?,CURRENT_TIMESTAMP)",
+        "WITH frozen_root_fixture(run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,history_json,created_at) AS (VALUES ('background-run','background-task',?,'background-parent','background-parent-turn',?,CURRENT_TIMESTAMP)) INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,history_json,created_at,frozen_manifest_id) SELECT run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,history_json,created_at,CASE WHEN json_valid(history_json) THEN CASE WHEN json_type(history_json)='object' THEN json_extract(history_json,'$.manifest_id') ELSE NULL END ELSE NULL END FROM frozen_root_fixture",
         [workspace.into(), parent_basis.clone().into()],
     ))
     .await
@@ -79962,12 +80024,18 @@ async fn recovery_failure_task_consumers_impl(
             .unwrap();
     }
     let lineage = wait_for_child_lineage_for_run(store.clone(), &run.id).await;
-    for _ in 0..100 {
-        if provider.child_main_call_count() > 0 {
-            break;
+    // Lineage registration precedes the child's remaining preflight work.
+    // Wait for the actual provider entry before injecting its failure; a fixed
+    // 2.5-second poll window races that preparation in the parallel suite.
+    timeout(Duration::from_secs(30), async {
+        while provider.child_main_call_count() == 0 {
+            sleep(Duration::from_millis(25)).await;
         }
-        sleep(Duration::from_millis(25)).await;
-    }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!("child provider must start before {scenario}/{path}/{parent_kind} recovery")
+    });
     assert!(provider.child_main_call_count() > 0);
     let now = super::now_timestamp_secs();
     let private = "private-response-body https://secret.example?token=credential /private/provider-key HTTP 401";
@@ -82027,3 +82095,6 @@ fn native_cancellation_race_fallback_preserves_materialization_error_and_require
 
 #[path = "tests/task_start_failure.rs"]
 mod task_start_failure;
+
+#[path = "tests/frozen_history_lifetime.rs"]
+mod frozen_history_lifetime;

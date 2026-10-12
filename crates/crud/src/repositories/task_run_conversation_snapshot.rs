@@ -28,7 +28,32 @@ pub struct TaskRunConversationSnapshotRecord {
 pub async fn insert_if_absent<C: ConnectionTrait>(
     db: &C,
     snapshot: NewTaskRunConversationSnapshot,
+    root: &crate::frozen_lifetime::PreparedFrozenRoot,
 ) -> Result<TaskRunConversationSnapshotRecord> {
+    // A losing insert does not acquire or replace the immutable winner's root.
+    if let Some(winner) = find_by_run(db, &snapshot.run_id).await? {
+        return Ok(winner);
+    }
+    root.verify(db, &snapshot.workspace_id).await?;
+    // Derived locator is not authority: bind the exact run/Task/workspace in
+    // the same creation/retry writer, including direct repository callers.
+    use sea_orm::{ColumnTrait, QueryFilter};
+    anyhow::ensure!(
+        pioneer_entity::task::Entity::find_by_id(&snapshot.task_id)
+            .filter(pioneer_entity::task::Column::WorkspaceId.eq(&snapshot.workspace_id))
+            .one(db)
+            .await?
+            .is_some(),
+        "Task snapshot workspace mismatch or missing Task"
+    );
+    anyhow::ensure!(
+        pioneer_entity::task_run::Entity::find_by_id(&snapshot.run_id)
+            .filter(pioneer_entity::task_run::Column::TaskId.eq(&snapshot.task_id))
+            .one(db)
+            .await?
+            .is_some(),
+        "Task snapshot run identity mismatch"
+    );
     let run_id = snapshot.run_id.clone();
     task_run_conversation_snapshot::Entity::insert(task_run_conversation_snapshot::ActiveModel {
         run_id: Set(snapshot.run_id),
@@ -37,6 +62,7 @@ pub async fn insert_if_absent<C: ConnectionTrait>(
         conversation_thread_id: Set(snapshot.conversation_thread_id),
         source_turn_id: Set(snapshot.source_turn_id),
         history_json: Set(snapshot.history_json),
+        frozen_manifest_id: Set(root.locator()),
         created_at: Set(snapshot.created_at),
     })
     .on_conflict(
