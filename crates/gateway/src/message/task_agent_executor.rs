@@ -8691,9 +8691,8 @@ async fn load_execution_checkpoint_context_for_turn(
             .latest_turn_execution_checkpoint_for_turn(turn_id)
             .await?
     };
-    let Some(mut checkpoint) = checkpoint else {
-        return Ok(None);
-    };
+    let mut checkpoint =
+        checkpoint.context("Task execution window has no recoverable semantic checkpoint")?;
     anyhow::ensure!(
         checkpoint.window_id == window.id,
         "Task checkpoint does not belong to current window"
@@ -8703,9 +8702,9 @@ async fn load_execution_checkpoint_context_for_turn(
             turn_id,
             checkpoint_id = %checkpoint.id,
             window_turn_id = %window.turn_id,
-            "skipping execution checkpoint whose window belongs to another turn"
+            "rejecting execution checkpoint whose window belongs to another turn"
         );
-        return Ok(None);
+        anyhow::bail!("Task checkpoint window belongs to another Turn");
     }
     let mut payload =
         match serde_json::from_value::<ExecutionCheckpointPayload>(checkpoint.payload_json.clone())
@@ -8716,9 +8715,9 @@ async fn load_execution_checkpoint_context_for_turn(
                     turn_id,
                     checkpoint_id = %checkpoint.id,
                     failure_class = "task_recovery_checkpoint_invalid",
-                    "skipping invalid execution checkpoint payload during task child recovery"
+                    "rejecting invalid execution checkpoint payload during task child recovery"
                 );
-                return Ok(None);
+                anyhow::bail!("Task execution checkpoint payload is unavailable");
             }
         };
     // `ExecutionCheckpointContext::window_id` is the provider/runtime window
@@ -11821,7 +11820,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_execution_checkpoint_context_falls_back_to_none() {
+    async fn fresh_turn_without_execution_window_has_no_checkpoint_context() {
         let (processor, _task, task_run_turn, _lineage) =
             task_artifact_harness("missing_checkpoint_context").await;
         let context =
@@ -11829,6 +11828,96 @@ mod tests {
                 .await
                 .expect("missing checkpoint should not fail");
         assert!(context.is_none());
+    }
+
+    #[tokio::test]
+    async fn hidden_task_existing_window_missing_or_corrupt_checkpoint_never_becomes_fresh_turn() {
+        for status in [
+            pioneer_protocol::ExecutionWindowStatus::Running,
+            pioneer_protocol::ExecutionWindowStatus::Checkpointed,
+        ] {
+            let (processor, task, run_turn, _) =
+                task_artifact_harness("unavailable_checkpoint").await;
+            let store = processor.crud_store.as_ref();
+            let now = utc_now();
+            let window = store
+                .create_turn_execution_window(
+                    pioneer_crud::NewTurnExecutionWindowRecord {
+                        workspace_id: task.workspace_id.clone(),
+                        thread_id: run_turn.thread_id.clone(),
+                        turn_id: run_turn.turn_id.clone(),
+                        window_index: 1,
+                        status,
+                        exhaustion_reason: None,
+                        agent_round_count: 2,
+                        tool_call_count: 1,
+                        provider_token_count: 100,
+                        metadata_json: serde_json::json!({"runtimeWindowId":"original-window"}),
+                        started_at: now,
+                    },
+                    now,
+                    now,
+                )
+                .await
+                .unwrap();
+            assert!(
+                load_execution_checkpoint_context_for_turn(&processor, &run_turn.turn_id)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                store
+                    .get_turn_execution_window(&window.id)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                window
+            );
+            assert!(
+                store
+                    .list_turn_execution_checkpoints_for_window(&window.id)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            let checkpoint = store.save_turn_execution_checkpoint(pioneer_crud::NewTurnExecutionCheckpointRecord {
+                id: Some(pioneer_protocol::native_semantic_checkpoint_id(&run_turn.turn_id)), window_id: window.id.clone(),
+                workspace_id: task.workspace_id.clone(), thread_id: run_turn.thread_id.clone(), turn_id: run_turn.turn_id.clone(),
+                checkpoint_kind: if status == pioneer_protocol::ExecutionWindowStatus::Running {pioneer_crud::TurnExecutionCheckpointKind::SemanticState} else {pioneer_crud::TurnExecutionCheckpointKind::StartupRecovery},
+                payload_json: serde_json::json!({"schema_version":99,"incompatible":"original-obligations-unavailable"}), created_at: now,
+            }).await.unwrap();
+            for _ in 0..2 {
+                assert!(
+                    load_execution_checkpoint_context_for_turn(&processor, &run_turn.turn_id)
+                        .await
+                        .is_err()
+                );
+                assert_eq!(
+                    store
+                        .get_turn_execution_window(&window.id)
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                    window
+                );
+                assert_eq!(
+                    store
+                        .get_turn_execution_checkpoint(&checkpoint.id)
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                    checkpoint
+                );
+                assert_eq!(
+                    store
+                        .aggregate_turn_execution_window_usage(&run_turn.turn_id)
+                        .await
+                        .unwrap()
+                        .total_provider_tokens,
+                    100
+                );
+            }
+        }
     }
 
     #[tokio::test]

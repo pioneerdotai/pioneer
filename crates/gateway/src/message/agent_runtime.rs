@@ -11113,7 +11113,7 @@ mod terminal_usage_close_contract_tests {
                     title_model: None,
                     title_model_provider: None,
                 },
-                pioneer_agent::ToolLoopConfig::default(),
+                crate::message::tests::test_tool_loop_config(),
             );
             let now = chrono::Utc::now().fixed_offset();
             let thread = Thread {
@@ -11129,8 +11129,8 @@ mod terminal_usage_close_contract_tests {
                 created_at: now.timestamp(),
                 updated_at: now.timestamp(),
                 status: pioneer_protocol::ThreadStatus::Active,
-                origin_kind: Default::default(),
-                sidebar_visibility: Default::default(),
+                origin_kind: pioneer_protocol::ThreadOriginKind::User,
+                sidebar_visibility: pioneer_protocol::ThreadSidebarVisibility::Visible,
                 agent_nickname: None,
                 agent_role: None,
                 visibility: None,
