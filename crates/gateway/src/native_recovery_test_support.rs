@@ -233,13 +233,39 @@ pub(crate) async fn charged_native_window(
         vec![],
     );
     payload.provider_budget.provider_usage_available = complete;
-    // Storage accepts the already Agent-validated state as opaque. Its exact
-    // cold codec/guard proof is covered by the Agent semantic fixtures.
-    payload.native_semantic_state = Some(
-        json!({"schema_version":pioneer_protocol::NATIVE_SEMANTIC_STATE_SCHEMA_VERSION,
-        "checkpoint_revision":1,"attached_task_wait":null,"progress_frontier":{"schema_version":1,
-            "advanced_observations":progress.frontier[0],"unchanged_observations":progress.frontier[1],"unknown_observations":progress.frontier[2]}}),
-    );
+    // A real cold continuation must satisfy the Agent's entire owned codec,
+    // even though the storage owner deliberately treats that state as opaque.
+    let mut frontier = pioneer_tools::ToolProgressFrontier::default();
+    frontier.advanced_observations = progress.frontier[0];
+    frontier.unchanged_observations = progress.frontier[1];
+    frontier.unknown_observations = progress.frontier[2];
+    let retry = pioneer_tools::ToolRetryController::new(config.retry.clone())
+        .checkpoint()
+        .unwrap();
+    payload.native_semantic_state = Some(json!({
+        "schema_version": pioneer_protocol::NATIVE_SEMANTIC_STATE_SCHEMA_VERSION,
+        "checkpoint_revision": 1,
+        "attached_task_wait": null,
+        "controls": pioneer_protocol::NativeControlCheckpointState::default(),
+        "provider_history_roots": [],
+        "no_progress_mode": config.no_progress_mode,
+        "progress_frontier": frontier,
+        "retry": retry,
+        "retry_lifecycle": {"active_episode_id": null, "next_episode_index": 0},
+        "pending_retry_instruction": null,
+        "applied_retry_instruction": null,
+        "observed_review_required_signatures": [],
+        "observed_terminal_task_ids": [],
+        "task_mutation_guard": {"failures_since_last_success": []},
+        "post_turn_assistant_text": "",
+        "post_turn_tool_events": [],
+        "post_turn_domain_events": [],
+    }));
+    assert!(pioneer_agent::native_semantic_checkpoint_compatible(
+        &payload,
+        &config.retry,
+        config.no_progress_mode,
+    ));
     store
         .commit_native_semantic_checkpoint(payload, None, 1, owner, 1)
         .await
@@ -249,8 +275,11 @@ pub(crate) async fn charged_native_window(
         .await
         .unwrap()
         .unwrap();
-    (
-        window,
-        serde_json::from_value(semantic.payload_json).unwrap(),
-    )
+    let accepted = serde_json::from_value(semantic.payload_json).unwrap();
+    assert!(pioneer_agent::native_semantic_checkpoint_compatible(
+        &accepted,
+        &config.retry,
+        config.no_progress_mode,
+    ));
+    (window, accepted)
 }
