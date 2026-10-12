@@ -1169,6 +1169,11 @@ async fn request_turn_preflight_provider_json(
                 )
                 .with_response_prefix(text.as_str())
             })?;
+            if chunk.is_final
+                && let Some(observation) = observation
+            {
+                observation.observe_completion();
+            }
             if let (Some(observation), Some(usage)) = (observation, &chunk.usage) {
                 observation
                     .observe_and_publish(usage)
@@ -1250,6 +1255,9 @@ async fn request_turn_preflight_provider_json(
                 error,
             )
         })?;
+    if let Some(observation) = observation {
+        observation.observe_completion();
+    }
     if let (Some(observation), Some(usage)) = (observation, &response.usage) {
         observation
             .observe_and_publish(usage)

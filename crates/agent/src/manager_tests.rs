@@ -17373,6 +17373,144 @@ async fn applied_tool_retry_accepts_first_ordinary_final_with_optional_tools() {
     assert!(requests[1].tool_choice.is_none());
 }
 
+struct DecreasingUsageProvider(AtomicUsize);
+#[async_trait::async_trait]
+impl Provider for DecreasingUsageProvider {
+    fn name(&self) -> &str {
+        "decreasing-usage"
+    }
+    fn model_tool_support(&self, _: &str) -> pioneer_provider::ModelToolSupport {
+        pioneer_provider::ModelToolSupport::Supported
+    }
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            streaming: true,
+            tool_calling: true,
+            ..Default::default()
+        }
+    }
+    async fn chat(&self, _: ChatRequest) -> anyhow::Result<ChatResponse> {
+        anyhow::bail!("unexpected nonstream")
+    }
+    async fn stream_chat(
+        &self,
+        request: ChatRequest,
+    ) -> anyhow::Result<futures_util::stream::BoxStream<'static, anyhow::Result<StreamChunk>>> {
+        if is_turn_preflight_request(&request) {
+            return Ok(futures_util::stream::iter(vec![
+                Ok(StreamChunk::delta(TEST_PREFLIGHT_RESPONSE)),
+                Ok(StreamChunk::final_chunk_with(
+                    pioneer_provider::ProviderTermination::Complete,
+                )),
+            ])
+            .boxed());
+        }
+        if self.0.fetch_add(1, Ordering::SeqCst) > 0 {
+            return Ok(futures_util::stream::iter(vec![
+                Ok(StreamChunk::delta("done")),
+                Ok(StreamChunk::final_chunk_with(
+                    pioneer_provider::ProviderTermination::Complete,
+                )),
+            ])
+            .boxed());
+        }
+        let mut charged = StreamChunk::delta("charged intent");
+        charged.usage = Some(pioneer_provider::TokenUsage {
+            input_tokens: Some(100),
+            output_tokens: Some(0),
+            ..Default::default()
+        });
+        let mut correction = StreamChunk::delta("");
+        correction.usage = Some(pioneer_provider::TokenUsage {
+            input_tokens: Some(0),
+            output_tokens: Some(0),
+            ..Default::default()
+        });
+        Ok(futures_util::stream::iter(vec![
+            Ok(charged),
+            Ok(correction),
+            Ok(StreamChunk::tool_calls(vec![ProviderToolCall {
+                id: "budget-effect".into(),
+                name: "budget_effect".into(),
+                arguments: "{}".into(),
+            }])),
+            Ok(StreamChunk::final_chunk_with(
+                pioneer_provider::ProviderTermination::ToolCalls,
+            )),
+        ])
+        .boxed())
+    }
+}
+struct BudgetEffectHandler(Arc<AtomicUsize>);
+#[async_trait::async_trait]
+impl ToolHandler for BudgetEffectHandler {
+    async fn handle(
+        &self,
+        _: ToolInvocation,
+        _: ToolEventTrace,
+    ) -> Result<Box<dyn pioneer_tools::ToolOutput>, pioneer_tools::ToolError> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Ok(Box::new(FunctionToolOutput::new("effect", true)))
+    }
+}
+
+#[tokio::test]
+async fn warm_native_known_token_cap_prevents_effect_after_decreasing_provider_snapshot() {
+    let provider = Arc::new(DecreasingUsageProvider(AtomicUsize::new(0)));
+    let effects = Arc::new(AtomicUsize::new(0));
+    let mut config = test_tool_loop_config();
+    config
+        .execution_windows
+        .window
+        .max_provider_tokens_per_window = Some(100);
+    config.execution_windows.total.max_windows_per_turn = Some(1);
+    let manager = AgentManager::new(
+        Arc::new(ProviderRegistry::with_provider(
+            "decreasing-usage",
+            provider.clone(),
+        )),
+        config,
+    );
+    manager
+        .set_turn_tool_provider(Some(Arc::new(StaticTurnToolProvider {
+            bundle: fake_task_tool_bundle_for_names(
+                &["budget_effect"],
+                Arc::new(BudgetEffectHandler(effects.clone())),
+            ),
+        })))
+        .await;
+    let observed = start_simple_turn(
+        &manager,
+        "warm_budget_thread",
+        "workspace",
+        "warm_budget_turn",
+        ThreadMode::Agent,
+        "decreasing-usage",
+        "observe charged budget before effects",
+    )
+    .await;
+    assert_eq!(
+        effects.load(Ordering::SeqCst),
+        0,
+        "known spend must reach the real warm gate before tool dispatch"
+    );
+    assert_eq!(provider.0.load(Ordering::SeqCst), 1);
+    let checkpoint = observed
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::TurnExecutionWindowCheckpointed { payload, .. } => Some(payload),
+            _ => None,
+        })
+        .expect("actual warm token quota must checkpoint the original Turn");
+    assert_eq!(checkpoint.turn_id, "warm_budget_turn");
+    assert_eq!(checkpoint.window.provider_token_count, Some(100));
+    assert!(!checkpoint.provider_budget.provider_usage_available);
+    assert_eq!(
+        checkpoint.window.exhaustion_reason,
+        Some(ExecutionWindowExhaustionReason::MaxProviderTokensPerWindow)
+    );
+}
+
 struct ToollessTypedFailureProvider {
     stream: bool,
 }

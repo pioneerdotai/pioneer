@@ -6984,7 +6984,7 @@ async fn execute_agent_provider_response(
             match tool_loop_guard.after_provider_round_with_usage(
                 round_plan.tools_enabled,
                 round.tool_calls.len(),
-                round.provider_token_count.or(Some(window_stats.provider_token_count.unwrap_or(0).saturating_sub(tokens_before_round))),
+                Some(round.provider_token_count.unwrap_or(0).max(window_stats.provider_token_count.unwrap_or(0).saturating_sub(tokens_before_round))),
             ) {
                 ToolLoopGuardDecision::Continue => {}
                 ToolLoopGuardDecision::RequestContinuation { budget_exceeded } => {

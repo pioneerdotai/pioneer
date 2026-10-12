@@ -258,6 +258,13 @@ async fn request_agent_round_observed(
             )
             .await?
             {
+                if chunk.is_final {
+                    observation.observe_completion();
+                }
+                if let Some(snapshot) = &chunk.usage {
+                    usage.get_or_insert_with(Default::default).update(snapshot);
+                    observation.observe_and_publish(snapshot).await?;
+                }
                 observe_startup_chunk(turn_id, &chunk);
                 if let Err(error) = response_limits.validate_stream_chunk(&chunk) {
                     return Err(provider_response_limit_error(
@@ -267,10 +274,6 @@ async fn request_agent_round_observed(
                         ProviderTransportKind::Stream,
                         error,
                     ));
-                }
-                if let Some(snapshot) = &chunk.usage {
-                    usage.get_or_insert_with(Default::default).update(snapshot);
-                    observation.observe_and_publish(snapshot).await?;
                 }
                 if chunk.provider_replay_state.is_some() {
                     provider_replay_state = chunk.provider_replay_state.take();
@@ -417,6 +420,7 @@ async fn request_agent_round_observed(
                 &error,
             )
         })?;
+    observation.observe_completion();
     if let Some(usage) = &response.usage {
         observation.observe_and_publish(usage).await?;
     }
@@ -580,6 +584,12 @@ async fn stream_provider_response_observed(
         )
         .await?
         {
+            if chunk.is_final {
+                observation.observe_completion();
+            }
+            if let Some(snapshot) = &chunk.usage {
+                observation.observe_and_publish(snapshot).await?;
+            }
             observe_startup_chunk(turn_id, &chunk);
             if let Err(error) = response_limits.validate_stream_chunk(&chunk) {
                 return Err(provider_response_limit_error(
@@ -602,7 +612,6 @@ async fn stream_provider_response_observed(
 
             if let Some(snapshot) = &chunk_usage {
                 usage.get_or_insert_with(Default::default).update(snapshot);
-                observation.observe_and_publish(snapshot).await?;
             }
             if chunk_replay.is_some() {
                 provider_replay_state = chunk_replay;
@@ -914,6 +923,7 @@ async fn non_stream_provider_response_observed(
             )
         })?;
 
+    observation.observe_completion();
     if let Some(usage) = &response.usage {
         observation.observe_and_publish(usage).await?;
     }
@@ -3445,6 +3455,8 @@ fn observe_startup_chunk(turn_id: &str, chunk: &pioneer_provider::StreamChunk) {
 pub(super) struct ProviderAttemptObservation<'a> {
     publication: Option<(&'a AgentEventHub, String, String, String)>,
     publication_failure: std::sync::atomic::AtomicU8,
+    physical_complete: std::sync::atomic::AtomicBool,
+    usage_inconsistent: std::sync::atomic::AtomicBool,
     started: tokio::time::Instant,
     id: String,
     window_index: Option<u32>,
@@ -3459,6 +3471,8 @@ impl<'a> ProviderAttemptObservation<'a> {
         Self {
             publication: None,
             publication_failure: std::sync::atomic::AtomicU8::new(0),
+            physical_complete: std::sync::atomic::AtomicBool::new(false),
+            usage_inconsistent: std::sync::atomic::AtomicBool::new(false),
             started: tokio::time::Instant::now(),
             id: super::generate_id(super::TURN_ITEM_ID_LEN),
             window_index: None,
@@ -3492,12 +3506,7 @@ impl<'a> ProviderAttemptObservation<'a> {
         &self,
         snapshot: &TokenUsage,
     ) -> Result<(), ChatTurnError> {
-        let changed = {
-            let mut usage = self.usage.lock().expect("usage observation");
-            let previous = (usage.input_tokens, usage.output_tokens);
-            usage.update(snapshot);
-            previous != (usage.input_tokens, usage.output_tokens)
-        };
+        let changed = self.observe(snapshot);
         if changed && let Some((events, workspace, thread, turn)) = &self.publication {
             let item = self.item(None);
             let result = Self::publish_usage_event(
@@ -3559,11 +3568,43 @@ impl<'a> ProviderAttemptObservation<'a> {
             _ => Some(TurnFailureDisposition::Unknown),
         }
     }
-    pub(super) fn observe(&self, snapshot: &TokenUsage) {
-        self.usage
-            .lock()
-            .expect("usage observation")
-            .update(snapshot);
+    pub(super) fn observe(&self, snapshot: &TokenUsage) -> bool {
+        let mut usage = self.usage.lock().expect("usage observation");
+        let previous = (usage.input_tokens, usage.output_tokens);
+        let decreased = snapshot
+            .input_tokens
+            .zip(previous.0)
+            .is_some_and(|(next, old)| next < old)
+            || snapshot
+                .output_tokens
+                .zip(previous.1)
+                .is_some_and(|(next, old)| next < old);
+        let was_inconsistent = if decreased {
+            self.usage_inconsistent
+                .swap(true, std::sync::atomic::Ordering::Relaxed)
+        } else {
+            self.usage_inconsistent
+                .load(std::sync::atomic::Ordering::Relaxed)
+        };
+        let before = previous
+            .0
+            .unwrap_or(0)
+            .saturating_add(previous.1.unwrap_or(0));
+        usage.update(snapshot);
+        let after = usage
+            .input_tokens
+            .unwrap_or(0)
+            .saturating_add(usage.output_tokens.unwrap_or(0));
+        if after < before {
+            // Preserve a real reported view, not a sum of overlapping snapshots
+            // or per-category maxima from contradictory reports.
+            (usage.input_tokens, usage.output_tokens) = previous;
+        }
+        previous != (usage.input_tokens, usage.output_tokens) || (decreased && !was_inconsistent)
+    }
+    pub(super) fn observe_completion(&self) {
+        self.physical_complete
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
     pub(super) fn observe_error(&self, error: &anyhow::Error) {
         if let Some(snapshot) = pioneer_provider::usage::error_usage(error) {
@@ -3578,6 +3619,15 @@ impl<'a> ProviderAttemptObservation<'a> {
             .saturating_add(usage.output_tokens.unwrap_or(0))
     }
     pub(super) fn token_count(&self) -> Option<u64> {
+        if !self
+            .physical_complete
+            .load(std::sync::atomic::Ordering::Relaxed)
+            || self
+                .usage_inconsistent
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return None;
+        }
         total_token_usage(Some(&self.usage.lock().expect("usage observation")))
     }
     pub(super) fn context(
@@ -3604,7 +3654,7 @@ impl<'a> ProviderAttemptObservation<'a> {
                 "request_sent":serde_json::Value::Null,
                 "provider":self.provider,"model":self.model,"api":self.api,"route":self.route,
                 "status":match completed {None=>"started",Some(true)=>"completed",Some(false)=>"failed"},
-                "complete":completed == Some(true),"usage":usage})),
+                "complete":self.token_count().is_some(),"usage":usage})),
         }
     }
     pub(super) async fn publish(
@@ -3974,6 +4024,204 @@ mod terminal_boundary_tests {
             }
             Ok(Box::pin(futures_util::stream::iter(chunks)))
         }
+    }
+
+    #[tokio::test]
+    async fn complete_accounting_requires_terminal_observation_even_with_both_token_categories() {
+        for (terminal, tokens) in [(true, 100), (false, 100), (true, 0), (false, 0)] {
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let mut charged = StreamChunk::delta("reported response");
+            charged.usage = Some(TokenUsage {
+                input_tokens: Some(tokens),
+                output_tokens: Some(0),
+                ..Default::default()
+            });
+            let mut chunks = vec![charged];
+            if terminal {
+                chunks.push(StreamChunk::final_chunk_with(ProviderTermination::Complete));
+            }
+            let provider: Arc<dyn Provider> = Arc::new(FixtureProvider {
+                chunks,
+                fail: !terminal,
+                attempts: attempts.clone(),
+            });
+            let hub = AgentEventHub::new();
+            let mut stats = super::super::ChatExecutionWindowStats::new(1);
+            let (result, events) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                tokio::join!(
+                    request_agent_round_accounted(
+                        &provider,
+                        request(),
+                        "ws",
+                        "thread",
+                        "turn",
+                        "reasoning",
+                        false,
+                        ProviderTimeoutPolicy::default(),
+                        &hub,
+                        Some(&mut stats)
+                    ),
+                    acknowledge_round_events(&hub)
+                )
+            })
+            .await
+            .unwrap();
+            assert_eq!(result.is_ok(), terminal);
+            assert_eq!(attempts.load(Ordering::SeqCst), 1);
+            assert_eq!(stats.agent_round_count, 1);
+            assert_eq!(stats.provider_token_count, Some(tokens));
+            assert_eq!(stats.provider_token_usage_unknown, !terminal);
+            let receipt = events
+                .iter()
+                .rev()
+                .find_map(|event| match event {
+                    AgentDurableEvent::ItemCompleted { notification } => match &notification.item {
+                        TurnItem::SystemEvent {
+                            code: Some(code),
+                            details: Some(details),
+                            ..
+                        } if code == "provider_usage" => Some(details),
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(receipt["complete"], terminal);
+            assert_eq!(receipt["usage"]["input_tokens"], tokens);
+            assert_eq!(receipt["usage"]["output_tokens"], 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn decreasing_usage_snapshot_cannot_uncharge_known_spend_or_claim_complete_accounting() {
+        let mut charged = StreamChunk::delta("charged response");
+        charged.usage = Some(TokenUsage {
+            input_tokens: Some(100),
+            output_tokens: Some(0),
+            ..Default::default()
+        });
+        let mut correction = StreamChunk::delta("");
+        correction.usage = Some(TokenUsage {
+            input_tokens: Some(0),
+            output_tokens: Some(0),
+            ..Default::default()
+        });
+        let provider: Arc<dyn Provider> = Arc::new(FixtureProvider {
+            chunks: vec![
+                charged,
+                correction,
+                StreamChunk::final_chunk_with(ProviderTermination::Complete),
+            ],
+            fail: false,
+            attempts: Arc::new(AtomicUsize::new(0)),
+        });
+        let hub = AgentEventHub::new();
+        let mut stats = super::super::ChatExecutionWindowStats::new(1);
+        let (result, events) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(
+                request_agent_round_accounted(
+                    &provider,
+                    request(),
+                    "ws",
+                    "thread",
+                    "turn",
+                    "reasoning",
+                    false,
+                    ProviderTimeoutPolicy::default(),
+                    &hub,
+                    Some(&mut stats)
+                ),
+                acknowledge_round_events(&hub)
+            )
+        })
+        .await
+        .unwrap();
+        let round = result.unwrap();
+        assert_eq!(
+            round.provider_token_count,
+            Some(0),
+            "original response data is retained, not rewritten by billing projection"
+        );
+        assert_eq!(round.usage.unwrap().input_tokens, Some(0));
+        assert_eq!(stats.agent_round_count, 1);
+        assert_eq!(stats.provider_token_count, Some(100));
+        assert!(stats.provider_token_usage_unknown);
+        let receipts = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentDurableEvent::ProviderUsageObserved { notification } => {
+                    match &notification.item {
+                        TurnItem::SystemEvent {
+                            code: Some(code),
+                            details: Some(details),
+                            ..
+                        } if code == "provider_usage" => Some(details),
+                        _ => None,
+                    }
+                }
+                AgentDurableEvent::ItemCompleted { notification } => match &notification.item {
+                    TurnItem::SystemEvent {
+                        code: Some(code),
+                        details: Some(details),
+                        ..
+                    } if code == "provider_usage" => Some(details),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(receipts.len() >= 2);
+        assert!(
+            receipts
+                .iter()
+                .all(|receipt| receipt["usage"]["input_tokens"] == 100)
+        );
+        assert_eq!(receipts.last().unwrap()["complete"], false);
+        assert_eq!(receipts.last().unwrap()["status"], "completed");
+    }
+
+    #[tokio::test]
+    async fn rejected_oversized_chunk_retains_already_reported_provider_spend() {
+        let mut charged =
+            StreamChunk::delta("x".repeat(ProviderResponseLimits::default().max_text_bytes + 1));
+        charged.usage = Some(TokenUsage {
+            input_tokens: Some(100),
+            output_tokens: Some(0),
+            ..Default::default()
+        });
+        let provider: Arc<dyn Provider> = Arc::new(FixtureProvider {
+            chunks: vec![charged],
+            fail: false,
+            attempts: Arc::new(AtomicUsize::new(0)),
+        });
+        let hub = AgentEventHub::new();
+        let mut stats = super::super::ChatExecutionWindowStats::new(1);
+        let (result, events) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(
+                request_agent_round_accounted(
+                    &provider,
+                    request(),
+                    "ws",
+                    "thread",
+                    "turn",
+                    "reasoning",
+                    false,
+                    ProviderTimeoutPolicy::default(),
+                    &hub,
+                    Some(&mut stats)
+                ),
+                acknowledge_round_events(&hub)
+            )
+        })
+        .await
+        .unwrap();
+        assert!(result.is_err());
+        assert_eq!(stats.provider_token_count, Some(100));
+        assert!(stats.provider_token_usage_unknown);
+        assert!(events.iter().any(|event| matches!(event,
+            AgentDurableEvent::ItemCompleted { notification } if matches!(&notification.item,
+                TurnItem::SystemEvent { code: Some(code), details: Some(details), .. }
+                if code == "provider_usage" && details["usage"]["input_tokens"] == 100 && details["complete"] == false))));
     }
 
     struct ExpiredReferenceProvider {

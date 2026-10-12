@@ -1012,7 +1012,15 @@ fn provider_usage_observation_payload(payload: &str) -> Option<(u64, bool)> {
         input.unwrap_or(0).saturating_add(output.unwrap_or(0)),
         input.is_some()
             && output.is_some()
-            && matches!(details["status"].as_str(), Some("completed" | "failed")),
+            && matches!(
+                details["status"].as_str(),
+                Some("started" | "completed" | "failed")
+            )
+            && match details.get("complete") {
+                Some(serde_json::Value::Bool(complete)) => *complete,
+                None => details["status"].as_str() == Some("completed"),
+                _ => false,
+            },
     ))
 }
 
@@ -1631,6 +1639,53 @@ mod usage_accounting_tests {
             "details":{"schema_version":1,"window_index":1,"status":status,"usage":usage}})
         .to_string()
     }
+    #[test]
+    fn explicit_usage_completion_and_legacy_safe_outcomes_preserve_known_lower_bound() {
+        for status in ["started", "failed", "completed"] {
+            for (completion, available) in [
+                (serde_json::json!(false), false),
+                (serde_json::json!(true), true),
+                (serde_json::json!("unknown"), false),
+            ] {
+                let mut item: serde_json::Value = serde_json::from_str(&payload(
+                    serde_json::json!({"input_tokens":100,"output_tokens":0}),
+                    status,
+                ))
+                .unwrap();
+                item["details"]["complete"] = completion;
+                assert_eq!(
+                    provider_usage_observation_tokens(&item.to_string()),
+                    (100, available)
+                );
+            }
+        }
+        assert_eq!(
+            provider_usage_observation_tokens(&payload(
+                serde_json::json!({"input_tokens":100,"output_tokens":0}),
+                "failed"
+            )),
+            (100, false),
+            "legacy failure with both fields cannot prove terminal usage"
+        );
+        assert_eq!(
+            provider_usage_observation_tokens(&payload(
+                serde_json::json!({"input_tokens":100,"output_tokens":0}),
+                "completed"
+            )),
+            (100, true)
+        );
+        let mut future: serde_json::Value = serde_json::from_str(&payload(
+            serde_json::json!({"input_tokens":100,"output_tokens":0}),
+            "future",
+        ))
+        .unwrap();
+        future["details"]["complete"] = true.into();
+        assert_eq!(
+            provider_usage_observation_tokens(&future.to_string()),
+            (100, false)
+        );
+    }
+
     #[test]
     fn terminal_usage_reads_confirmed_lower_bound_and_unknown_separately() {
         assert_eq!(
