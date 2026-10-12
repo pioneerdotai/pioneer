@@ -466,6 +466,37 @@ impl MessageProcessor {
         Ok(state)
     }
 
+    pub(super) async fn persist_native_execution_preparation(
+        &self,
+        preparation: pioneer_protocol::NativeTerminalEffectPreparation,
+        initial_turn: bool,
+        prepare_artifact_obligations: bool,
+        execution_owner_generation: Option<u64>,
+    ) -> Result<()> {
+        let thread = preparation.thread_id.clone();
+        let turn = preparation.turn_id.clone();
+        self.crud_store
+            .persist_native_cancellation_context(
+                preparation,
+                self.turn_execution_owner_id.as_ref(),
+                super::now_timestamp_secs(),
+                initial_turn,
+            )
+            .await?;
+        // This ACK gates normal provider work in every fresh native mode.
+        // Stop fallback persists cancellation independently of artifact state.
+        if initial_turn && prepare_artifact_obligations {
+            let context = self
+                .artifact_context_for_finalization(&thread, &turn)
+                .await?;
+            anyhow::ensure!(context.native_fence.as_ref().is_some_and(|fence|
+                Some(fence.owner_generation) == execution_owner_generation),
+                "initial artifact execution epoch changed");
+            self.artifact_tool_state_for_turn(&context, true).await?;
+        }
+        Ok(())
+    }
+
     async fn artifact_context_for_finalization(
         &self,
         thread: &str,

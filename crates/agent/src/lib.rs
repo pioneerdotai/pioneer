@@ -13,7 +13,16 @@ mod native_initial;
 pub use native_initial::{NativeInitialPreparation, NativeInitialResumeRequirements};
 
 /// Agent owns this bounded semantic codec; readers must reject other versions.
-pub const NATIVE_SEMANTIC_STATE_SCHEMA_VERSION: u32 = 3;
+pub const NATIVE_SEMANTIC_STATE_SCHEMA_VERSION: u32 = 4;
+
+#[derive(Debug)]
+pub struct NativeHistorySourceUnavailable;
+impl std::fmt::Display for NativeHistorySourceUnavailable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("required native history checkpoint source unavailable")
+    }
+}
+impl std::error::Error for NativeHistorySourceUnavailable {}
 
 /// Read-only structural proof; actual restore still revalidates all authority.
 pub fn native_semantic_checkpoint_compatible(

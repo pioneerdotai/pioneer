@@ -5652,6 +5652,19 @@ async fn execute_agent_provider_response(
         Ok::<(), AgentEventHubError>(())
     });
 
+    let mut provider_history_roots = semantic.provider_history_roots;
+    let restored_roots = if provider_history_roots.is_empty() {
+        Vec::new()
+    } else if let Some(session) = context_session {
+        session
+            .load_native_history_roots(&provider_history_roots)
+            .await
+            .map_err(|_| ChatTurnError::Blocked("native history roots unavailable".into()))?
+    } else {
+        return Err(ChatTurnError::Blocked(
+            "native history root owner unavailable".into(),
+        ));
+    };
     let mut messages = history
         .into_iter()
         .filter(|message| message.role != pioneer_provider::Role::System)
@@ -5659,6 +5672,22 @@ async fn execute_agent_provider_response(
 
     messages.push(user_message);
     let mut continuation_provider_history = retained_provider_history;
+    if !restored_roots.is_empty() {
+        continuation_provider_history.retain(|entry| {
+            !entry.message.provenance.as_ref().is_some_and(|origin| {
+                origin
+                    .sources
+                    .iter()
+                    .any(|source| source.scope.starts_with("checkpoint:"))
+            })
+        });
+        continuation_provider_history.extend(restored_roots.into_iter().enumerate().map(
+            |(index, message)| RetainedProviderHistoryMessage {
+                sequence: i64::MIN + index as i64,
+                message,
+            },
+        ));
+    }
     let mut continuation_provider_history_bytes = None;
     let mut next_provider_history_sequence =
         next_retained_provider_history_sequence(&continuation_provider_history);
@@ -5726,6 +5755,7 @@ async fn execute_agent_provider_response(
                     turn_id,
                     &tool_loop_config.retry,
                     &native_controls.state,
+                    &provider_history_roots,
                     &tool_retry_controller,
                     &tool_retry_lifecycle,
                     &pending_retry_instruction,
@@ -6002,6 +6032,8 @@ async fn execute_agent_provider_response(
             native_controls.sync_after_compaction(&covered_controls)
                 .map_err(|error| (error, current_thinking_id.clone()))?;
             if context_session.is_some() {
+                provider_history_roots = semantic_state::history_roots_from_request(&request.messages)
+                    .map_err(|error| (error, current_thinking_id.clone()))?;
                 continuation_provider_history_bytes = Some(synchronize_retained_provider_history(
                     &mut continuation_provider_history, &mut next_provider_history_sequence,
                     workspace_id, thread_id, turn_id, &request.messages,
@@ -10361,6 +10393,11 @@ mod tests {
         let applied = Some("Original accepted guidance".to_owned());
         let reviews = std::collections::BTreeSet::from(["review-original".to_owned()]);
         let terminal = std::collections::BTreeSet::from(["terminal-original".to_owned()]);
+        let roots = vec![pioneer_compaction::SourceRef {
+            scope: "checkpoint:native-owner".into(),
+            id: "acknowledged-root".into(),
+            version: "exact-version".into(),
+        }];
         let mut context = execution_checkpoint_context_fixture();
         context.window_index = context.payload.window.window_index;
         context.payload.native_semantic_state = Some(
@@ -10369,6 +10406,7 @@ mod tests {
                 "turn_1",
                 &budget,
                 &super::native_control::NativeControlState::default(),
+                &roots,
                 &controller,
                 &lifecycle,
                 &pending,
@@ -10392,6 +10430,27 @@ mod tests {
             false,
         )
         .unwrap();
+        assert_eq!(state.provider_history_roots, roots);
+        let mut legacy_roots = context.clone();
+        legacy_roots
+            .payload
+            .native_semantic_state
+            .as_mut()
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .remove("provider_history_roots");
+        assert!(!crate::native_semantic_checkpoint_compatible(
+            &legacy_roots.payload,
+            &budget
+        ));
+        let mut bad_roots = context.clone();
+        bad_roots.payload.native_semantic_state.as_mut().unwrap()["provider_history_roots"][0]["version"] =
+            serde_json::json!("v".repeat(257));
+        assert!(!crate::native_semantic_checkpoint_compatible(
+            &bad_roots.payload,
+            &budget
+        ));
         assert_eq!(state.checkpoint_revision, 1);
         assert_eq!(state.pending_retry_instruction, pending);
         assert_eq!(state.applied_retry_instruction, applied);
@@ -10464,6 +10523,7 @@ mod tests {
                 "turn_1",
                 &budget,
                 &super::native_control::NativeControlState::default(),
+                &[],
                 &controller,
                 &lifecycle,
                 &oversized,

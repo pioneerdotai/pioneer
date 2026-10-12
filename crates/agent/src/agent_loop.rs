@@ -1186,6 +1186,8 @@ pub(super) async fn run_agent_loop(
                     commit_terminal_or_stop!(
                         AgentDurableEvent::NativeCancellationContextPrepared {
                             preparation,
+                            prepare_artifact_obligations: false,
+                            execution_owner_generation: None,
                             initial_turn: recovery.is_none()
                                 && turn_request_snapshot
                                     .as_ref()
@@ -1734,6 +1736,11 @@ fn spawn_turn_task(
             AgentDurableEvent::NativeCancellationContextPrepared {
                 preparation: cancellation_context,
                 initial_turn,
+                prepare_artifact_obligations: true,
+                execution_owner_generation: turn_request
+                    .initial_preparation
+                    .as_ref()
+                    .and_then(|initial| initial.execution_owner_generation()),
             },
             Some(turn_control.cancellation_token()),
         )

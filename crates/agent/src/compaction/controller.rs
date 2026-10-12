@@ -147,6 +147,14 @@ pub trait NativeContextController: Send + Sync {
         );
         Ok(Vec::new())
     }
+    async fn load_native_history_roots(
+        &self,
+        _context: &NativeContext,
+        roots: &[SourceRef],
+    ) -> Result<Vec<pioneer_provider::ChatMessage>> {
+        anyhow::ensure!(roots.is_empty(), "native history root owner unavailable");
+        Ok(Vec::new())
+    }
     /// Persist the service Stop fence before its owned future is cancelled.
     async fn stop(&self, context: &NativeContext) -> Result<()>;
     async fn prepare(
@@ -185,6 +193,27 @@ impl NativeContextSession {
             recovery_pending: std::sync::atomic::AtomicBool::new(recovery),
             recovery_active: std::sync::atomic::AtomicBool::new(recovery),
             recovery_deadline,
+        }
+    }
+    pub async fn load_native_history_roots(
+        &self,
+        roots: &[SourceRef],
+    ) -> Result<Vec<pioneer_provider::ChatMessage>> {
+        let load = self
+            .controller
+            .load_native_history_roots(&self.context, roots);
+        let work = async {
+            if let Some(deadline) = self.provider_deadline() {
+                tokio::time::timeout_at(deadline, load)
+                    .await
+                    .map_err(|_| anyhow::anyhow!("native history restore deadline exceeded"))?
+            } else {
+                load.await
+            }
+        };
+        tokio::select! { biased;
+            _ = self.context.cancellation.cancelled() => anyhow::bail!("native history restore cancelled"),
+            result = work => result,
         }
     }
     pub async fn load_native_controls(

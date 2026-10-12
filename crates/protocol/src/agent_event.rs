@@ -248,6 +248,12 @@ pub enum AgentDurableEvent {
     NativeCancellationContextPrepared {
         preparation: NativeTerminalEffectPreparation,
         initial_turn: bool,
+        /// Normal execution admission prepares obligations; Stop fallback only
+        /// persists cancellation and must never depend on artifact state.
+        #[serde(default)]
+        prepare_artifact_obligations: bool,
+        #[serde(default)]
+        execution_owner_generation: Option<u64>,
     },
     /// Bounded obligations prepared before a canonical terminal result; the
     /// subsequent terminal projection atomically makes the current batch runnable.

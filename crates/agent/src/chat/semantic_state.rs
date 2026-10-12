@@ -18,6 +18,7 @@ pub(super) struct NativeSemanticState {
     pub schema_version: u32,
     pub checkpoint_revision: u64,
     pub controls: super::native_control::NativeControlState,
+    pub provider_history_roots: Vec<pioneer_compaction::SourceRef>,
     pub retry: ToolRetryCheckpoint,
     pub retry_lifecycle: ToolRetryLifecycleCheckpoint,
     pub pending_retry_instruction: Option<String>,
@@ -87,6 +88,56 @@ pub(crate) fn checkpoint_compatible(
         .is_some_and(|state| state.validate(&payload.turn_id, budget).is_ok())
 }
 
+pub(super) fn history_roots_valid(roots: &[pioneer_compaction::SourceRef]) -> bool {
+    roots.len() <= 64
+        && roots.iter().enumerate().all(|(index, root)| {
+            root.scope.starts_with("checkpoint:")
+                && root.scope.len() > "checkpoint:".len()
+                && root.scope.len() <= 512
+                && !root.id.is_empty()
+                && root.id.len() <= 21
+                && !root.version.is_empty()
+                && root.version.len() <= 256
+                && !roots[..index].contains(root)
+        })
+}
+
+pub(super) fn history_roots_from_request(
+    messages: &[pioneer_provider::ChatMessage],
+) -> Result<Vec<pioneer_compaction::SourceRef>, ChatTurnError> {
+    let mut roots = Vec::new();
+    for source in messages
+        .iter()
+        .filter_map(|message| message.provenance.as_ref())
+        .flat_map(|origin| &origin.sources)
+        .filter(|source| source.scope.starts_with("checkpoint:"))
+    {
+        if source.scope.len() > 512
+            || source.id.is_empty()
+            || source.id.len() > 21
+            || source.version.is_empty()
+            || source.version.len() > 256
+        {
+            return Err(unavailable());
+        }
+        let root = pioneer_compaction::SourceRef {
+            scope: source.scope.clone(),
+            id: source.id.clone(),
+            version: source.version.clone(),
+        };
+        if !roots.contains(&root) {
+            if roots.len() >= 64 {
+                return Err(unavailable());
+            }
+            roots.push(root);
+        }
+    }
+    if !history_roots_valid(&roots) {
+        return Err(unavailable());
+    }
+    Ok(roots)
+}
+
 impl NativeSemanticState {
     pub(super) fn restore(
         context: Option<&ExecutionCheckpointContext>,
@@ -104,6 +155,7 @@ impl NativeSemanticState {
             return Ok(Self {
                 schema_version: crate::NATIVE_SEMANTIC_STATE_SCHEMA_VERSION,
                 controls: Default::default(),
+                provider_history_roots: Vec::new(),
                 checkpoint_revision: 0,
                 retry: ToolRetryController::new(budget.clone())
                     .checkpoint()
@@ -153,6 +205,7 @@ impl NativeSemanticState {
     fn validate(&self, turn: &str, budget: &ToolRetryBudgetConfig) -> Result<(), ChatTurnError> {
         if self.schema_version != crate::NATIVE_SEMANTIC_STATE_SCHEMA_VERSION
             || !self.controls.valid()
+            || !history_roots_valid(&self.provider_history_roots)
             || self
                 .pending_retry_instruction
                 .as_ref()
@@ -193,6 +246,7 @@ pub(super) fn capture(
     turn: &str,
     budget: &ToolRetryBudgetConfig,
     controls: &super::native_control::NativeControlState,
+    history_roots: &[pioneer_compaction::SourceRef],
     controller: &ToolRetryController,
     lifecycle: &ToolRetryLifecycleTracker,
     pending: &Option<String>,
@@ -209,6 +263,7 @@ pub(super) fn capture(
         schema_version: u32,
         checkpoint_revision: u64,
         controls: &'a super::native_control::NativeControlState,
+        provider_history_roots: &'a [pioneer_compaction::SourceRef],
         retry: ToolRetryCheckpoint,
         retry_lifecycle: ToolRetryLifecycleCheckpoint,
         pending_retry_instruction: &'a Option<String>,
@@ -224,6 +279,7 @@ pub(super) fn capture(
         schema_version: crate::NATIVE_SEMANTIC_STATE_SCHEMA_VERSION,
         checkpoint_revision,
         controls,
+        provider_history_roots: history_roots,
         retry: controller.checkpoint().map_err(|_| unavailable())?,
         retry_lifecycle: lifecycle.checkpoint(),
         pending_retry_instruction: pending,

@@ -76373,6 +76373,18 @@ async fn native_foreground_controller_uses_interactive_database_scope() {
     })
     .await
     .unwrap();
+    assert!(
+        processor
+            .artifact_service
+            .native_artifact_state_compatible(
+                &workspace,
+                "native-foreground",
+                "native-foreground-turn",
+            )
+            .await
+            .unwrap(),
+        "ordinary native Chat must initialize durable obligations before provider use without binding Agent tools"
+    );
     let row = store
         .database_connection()
         .query_one_raw(sea_orm::Statement::from_string(

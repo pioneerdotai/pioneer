@@ -1602,16 +1602,17 @@ impl MessageProcessor {
                     AgentDurableEvent::NativeCancellationContextPrepared {
                         preparation,
                         initial_turn,
+                        prepare_artifact_obligations,
+                        execution_owner_generation,
                     } => Some(
-                        self.crud_store
-                            .persist_native_cancellation_context(
-                                preparation.clone(),
-                                self.turn_execution_owner_id.as_ref(),
-                                now_timestamp_secs(),
-                                *initial_turn,
-                            )
-                            .await
-                            .map_err(classify_native_preparation_error),
+                        self.persist_native_execution_preparation(
+                            preparation.clone(),
+                            *initial_turn,
+                            *prepare_artifact_obligations,
+                            *execution_owner_generation,
+                        )
+                        .await
+                        .map_err(classify_native_preparation_error),
                     ),
                     AgentDurableEvent::NativeTerminalEffectsPrepared { preparation } => Some(
                         match self
@@ -4583,16 +4584,17 @@ impl MessageProcessor {
             AgentDurableEvent::NativeCancellationContextPrepared {
                 preparation,
                 initial_turn,
+                prepare_artifact_obligations,
+                execution_owner_generation,
             } => message_future(async move {
-                self.crud_store
-                    .persist_native_cancellation_context(
-                        preparation,
-                        self.turn_execution_owner_id.as_ref(),
-                        now_timestamp_secs(),
-                        initial_turn,
-                    )
-                    .await
-                    .is_ok()
+                self.persist_native_execution_preparation(
+                    preparation,
+                    initial_turn,
+                    prepare_artifact_obligations,
+                    execution_owner_generation,
+                )
+                .await
+                .is_ok()
             }),
             AgentDurableEvent::NativeTerminalEffectsPrepared { preparation } => {
                 message_future(async move {
@@ -8894,6 +8896,32 @@ impl MessageProcessor {
                     &checkpoint.turn_id,
                 )
                 .await?;
+        }
+        if checkpoint_compatible && let Some(checkpoint) = checkpoint.as_ref() {
+            let roots: Vec<pioneer_compaction::SourceRef> = serde_json::from_value(
+                checkpoint
+                    .payload_json
+                    .get("native_semantic_state")
+                    .and_then(|state| state.get("provider_history_roots"))
+                    .context("compatible native history roots unavailable")?
+                    .clone(),
+            )?;
+            match crate::compaction::restore_native_history_roots(
+                self,
+                &self.crud_store,
+                &checkpoint.workspace_id,
+                &checkpoint.thread_id,
+                &checkpoint.turn_id,
+                &roots,
+            )
+            .await
+            {
+                Ok(_) => {}
+                Err(error) if error.is::<pioneer_agent::NativeHistorySourceUnavailable>() => {
+                    checkpoint_compatible = false
+                }
+                Err(error) => return Err(error),
+            }
         }
         let can_resume_same_turn = recovery_job.as_ref().is_some_and(|job| {
             job.turn_id == turn_id

@@ -16701,11 +16701,18 @@ async fn cancellation_context_freezes_interrupted_policy_request_handlers_and_cl
             )
             .await
             .unwrap();
-        let AgentDurableEvent::NativeCancellationContextPrepared { preparation, .. } =
-            receiver.recv().await.unwrap()
+        let AgentDurableEvent::NativeCancellationContextPrepared {
+            preparation,
+            prepare_artifact_obligations,
+            ..
+        } = receiver.recv().await.unwrap()
         else {
             panic!("provider work must begin with immutable cancellation registration");
         };
+        assert!(
+            prepare_artifact_obligations,
+            "normal start prepares obligations before dispatch"
+        );
         assert!(
             calls.lock().unwrap().is_empty(),
             "registration cannot run hooks"

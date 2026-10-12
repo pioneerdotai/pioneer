@@ -17,6 +17,98 @@ use pioneer_compaction::{
 use pioneer_provider::{ChatRequest, MessageProvenance, MessageSourceRef, ProviderRegistry};
 use std::collections::BTreeSet;
 
+/// Restore the exact acknowledged roots, including the active Turn's own
+/// working context, through the existing bounded coverage/body materializer.
+pub(crate) async fn restore_native_history_roots(
+    processor: &crate::message::MessageProcessor,
+    store: &CrudStore,
+    workspace: &str,
+    thread: &str,
+    turn: &str,
+    roots: &[pioneer_compaction::SourceRef],
+) -> Result<Vec<pioneer_provider::ChatMessage>> {
+    ensure!(
+        roots.len() <= 64,
+        "native history root cardinality exceeded"
+    );
+    if roots.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut prepared = processor
+        .capture_current_context_basis_prepared(store, workspace, thread, turn, Some(turn))
+        .await?;
+    restore_native_history_roots_with_scope(
+        store,
+        workspace,
+        thread,
+        roots,
+        &prepared.accepted_scopes,
+        &mut prepared.checkpoint_graphs,
+    )
+    .await
+}
+
+pub(super) async fn restore_native_history_roots_with_scope(
+    store: &CrudStore,
+    workspace: &str,
+    thread: &str,
+    roots: &[pioneer_compaction::SourceRef],
+    allowed: &BTreeSet<String>,
+    resolver: &mut super::coverage::CheckpointGraphResolver,
+) -> Result<Vec<pioneer_provider::ChatMessage>> {
+    ensure!(
+        roots.len() <= 64,
+        "native history root cardinality exceeded"
+    );
+    let mut messages = Vec::with_capacity(roots.len());
+    for (index, root) in roots.iter().enumerate() {
+        ensure!(
+            root.scope.starts_with("checkpoint:")
+                && root.scope.len() <= 512
+                && !root.id.is_empty()
+                && root.id.len() <= 21
+                && !root.version.is_empty()
+                && root.version.len() <= 256
+                && !roots[..index].contains(root),
+            "native history root identity unavailable"
+        );
+        let source_thread = store
+            .compaction_reference_thread(workspace, root)
+            .await?
+            .ok_or(pioneer_agent::NativeHistorySourceUnavailable)?;
+        if !allowed.contains(&source_thread) {
+            return Err(pioneer_agent::NativeHistorySourceUnavailable.into());
+        }
+        let owner = native_owner(workspace, &source_thread);
+        if root.scope != format!("checkpoint:{owner}") {
+            return Err(pioneer_agent::NativeHistorySourceUnavailable.into());
+        }
+        let message = super::checkpoint::checkpoint_message_with_resolver(
+            store,
+            super::checkpoint::ProjectionContext {
+                workspace,
+                context_thread: thread,
+                source_thread: &source_thread,
+                owner: &owner,
+                allowed,
+                allow_historical_gaps: false,
+            },
+            &root.id,
+            resolver,
+        )
+        .await?;
+        if !message.provenance.as_ref().is_some_and(|origin| {
+            origin.sources.iter().any(|source| {
+                source.scope == root.scope && source.id == root.id && source.version == root.version
+            })
+        }) {
+            return Err(pioneer_agent::NativeHistorySourceUnavailable.into());
+        }
+        messages.push(message);
+    }
+    Ok(messages)
+}
+
 fn history_check_metadata(
     prepared: &pioneer_agent::compaction::request::EvaluatedRequest,
 ) -> Result<NativeHistoryCheckMetadata> {
@@ -847,6 +939,26 @@ impl GatewayNativeContextController {
 impl pioneer_agent::compaction::controller::NativeContextController
     for GatewayNativeContextController
 {
+    async fn load_native_history_roots(
+        &self,
+        context: &NativeContext,
+        roots: &[pioneer_compaction::SourceRef],
+    ) -> Result<Vec<pioneer_provider::ChatMessage>> {
+        let processor = self
+            .processor
+            .upgrade()
+            .ok_or_else(|| anyhow::anyhow!("context owner stopped"))?;
+        let store = crate::message::ordinary_history_store(processor.crud_store.as_ref());
+        restore_native_history_roots(
+            &processor,
+            &store,
+            &context.workspace_id,
+            &context.thread_id,
+            &context.turn_id,
+            roots,
+        )
+        .await
+    }
     async fn load_native_controls(
         &self,
         context: &NativeContext,
