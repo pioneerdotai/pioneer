@@ -196,6 +196,10 @@ impl ToolHandler for UnifiedExecHandler {
                 self.handle_exec_command(args, invocation, trace).await
             }
             LocalShellPayload::WriteStdin(args) => {
+                let snapshot = invocation.execution_security_snapshot.as_ref().ok_or_else(|| {
+                    ToolError::Rejected("missing turn execution security snapshot; refusing interactive process input".into())
+                })?;
+                crate::process_policy::require_supported_process_execution(snapshot)?;
                 self.handle_write_stdin(args, invocation.cancellation, trace)
                     .await
             }
@@ -1439,6 +1443,69 @@ mod tests {
             apply_patch_preflight: None,
             cancellation: tokio_util::sync::CancellationToken::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn recursive_policy_denies_tty_one_shot_and_interactive_payload_without_retry() {
+        let handler = UnifiedExecHandler::default();
+        for tty in [false, true] {
+            let mut call = invocation(
+                "exec_command",
+                ToolPayload::Function {
+                    arguments: serde_json::json!({
+                        "command": ["/bin/sh", "-c", "exit 0"], "tty": tty,
+                    }),
+                },
+            );
+            call.execution_security_snapshot
+                .as_mut()
+                .unwrap()
+                .process
+                .command_risk
+                .denied_commands = vec!["rm".into()];
+            let error = match handler.handle(call.clone(), trace("exec_command")).await {
+                Ok(_) => {
+                    panic!("unsupported recursive policy must reject before spawning a session")
+                }
+                Err(error) => error,
+            };
+            assert!(matches!(error, ToolError::Rejected(_)));
+            let outcome = crate::classifier::ErrorClassifier::classify_error(
+                &crate::classifier::DefaultErrorClassifier,
+                &call,
+                &error,
+            );
+            assert_eq!(
+                outcome.status,
+                crate::context::ToolOutcomeStatus::FatalError
+            );
+            assert_eq!(
+                outcome.error_class,
+                Some(crate::context::ToolErrorClass::PermissionDenied)
+            );
+            assert!(!outcome.should_retry);
+            assert!(handler.sessions.lock().await.is_empty());
+        }
+        let mut call = invocation(
+            "write_stdin",
+            ToolPayload::Function {
+                arguments: serde_json::json!({"session_id": 999, "chars": "rm nonexistent-fixture\n"}),
+            },
+        );
+        call.execution_security_snapshot
+            .as_mut()
+            .unwrap()
+            .process
+            .command_risk
+            .allowed_command_families = vec!["sh".into()];
+        let error = match handler.handle(call, trace("write_stdin")).await {
+            Ok(_) => panic!("interactive input must not bypass recursive policy"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(error, ToolError::Rejected(_)),
+            "policy denial precedes even session lookup"
+        );
     }
 
     fn parse_session_id(output: &str) -> u64 {

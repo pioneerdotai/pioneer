@@ -49,6 +49,12 @@ impl ToolHandler for ComputerUseHandler {
         let args = parse_computer_use_args(invocation.payload)?;
         let action = args.action.trim().to_ascii_lowercase();
         validate_computer_use_action_contract(&args, action.as_str())?;
+        // GUI interaction can delegate arbitrary execution, including through
+        // an already-running interpreter. Unsupported recursive authority must
+        // fail before any OS/backend work; session cleanup stays available.
+        if !matches!(action.as_str(), "status" | "stop") {
+            process_environment.require_supported_spawn()?;
+        }
 
         let output = match action.as_str() {
             "preflight" => {

@@ -783,7 +783,30 @@ pub struct TurnProcessPolicySnapshot {
     pub command_risk: TurnCommandRiskPolicy,
 }
 
+/// Command execution capability derived from the already accepted process policy.
+/// This does not change independent filesystem, network or environment restrictions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnProcessExecutionProfile {
+    Disabled,
+    Unrestricted,
+    RequiredRecursive,
+}
+
 impl TurnProcessPolicySnapshot {
+    pub fn execution_profile(&self) -> TurnProcessExecutionProfile {
+        if !self.shell.enabled {
+            TurnProcessExecutionProfile::Disabled
+        } else if !self.command_risk.denied_commands.is_empty()
+            || !self.command_risk.allowed_command_families.is_empty()
+        {
+            // Existing command-risk lists are mandatory authority, never just
+            // an argv[0] hint or an implicit launch-only grant.
+            TurnProcessExecutionProfile::RequiredRecursive
+        } else {
+            TurnProcessExecutionProfile::Unrestricted
+        }
+    }
+
     pub fn unrestricted() -> Self {
         Self {
             shell: TurnShellPolicy::enabled(),

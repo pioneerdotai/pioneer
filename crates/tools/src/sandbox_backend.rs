@@ -195,6 +195,7 @@ pub fn configure_nono_command(
     snapshot: &TurnExecutionSecuritySnapshot,
     process_plan: &ProcessSpawnPlan,
 ) -> Result<(), ToolError> {
+    crate::process_policy::require_supported_process_execution(snapshot)?;
     if nono_policy_is_noop(snapshot) {
         return Ok(());
     }
@@ -567,6 +568,7 @@ pub fn prepare_native_sandbox_backend<B: NativeSandboxBackend>(
     backend: &B,
     request: &NativeSandboxRequest<'_>,
 ) -> Result<NativeSandboxPrepareOutcome, ToolError> {
+    crate::process_policy::require_supported_process_execution(request.snapshot)?;
     let outcome = backend.prepare(request);
     validate_native_sandbox_outcome(backend.kind(), request.snapshot, outcome)
 }
@@ -659,6 +661,36 @@ mod tests {
 
         fn prepare(&self, _request: &NativeSandboxRequest<'_>) -> NativeSandboxPrepareOutcome {
             self.outcome.clone()
+        }
+    }
+
+    #[test]
+    fn ready_or_degraded_backend_cannot_broaden_required_recursive_command_policy() {
+        let mut snapshot =
+            TurnExecutionSecuritySnapshot::unrestricted_full_access("/tmp/workspace", 1);
+        snapshot.process.command_risk.allowed_command_families = vec!["sh".into()];
+        let plan = process_plan();
+        for kind in [
+            SandboxBackendKind::Nono,
+            SandboxBackendKind::WindowsRestrictedToken,
+        ] {
+            for outcome in [
+                NativeSandboxPrepareOutcome::Ready(NativeSandboxPreparedSpawn {
+                    backend: kind,
+                    process_plan: plan.clone(),
+                    notes: vec![],
+                }),
+                NativeSandboxPrepareOutcome::Degraded {
+                    backend: kind,
+                    reason: "filesystem only".into(),
+                },
+            ] {
+                let backend = FakeBackend { kind, outcome };
+                assert!(matches!(
+                    prepare_native_sandbox_backend(&backend, &request(&snapshot, &plan)),
+                    Err(ToolError::Rejected(_))
+                ));
+            }
         }
     }
 
