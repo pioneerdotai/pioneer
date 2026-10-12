@@ -4410,6 +4410,15 @@ async fn independently_heartbeating_owner_keeps_terminal_authority_and_cancellat
                     .session_manager
                     .set_connection_workspace(connection, Some(workspace.clone()))
                     .await;
+                // The cancel RPC reads the terminal Turn back from live state.
+                // A subscribed client keeps it loaded through terminal cleanup.
+                subscribe_test_connection_to_materialized_thread(
+                    processor.as_ref(),
+                    connection,
+                    &workspace,
+                    BLOCKED_THREAD,
+                )
+                .await;
                 let request_id = generate_test_request_id("heartbeat", "cancel");
                 processor.process_request_for_connection(connection, &json!({
                     "jsonrpc":"2.0", "id":request_id, "method":"turn/cancel",
