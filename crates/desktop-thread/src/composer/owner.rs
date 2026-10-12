@@ -295,6 +295,7 @@ impl ComposerView {
             );
         }
         self.present_composer_authorization_notice();
+        self.present_composer_send_outcome();
         self.controlled_text(window, cx);
         self.synchronize_mention_items(window, cx);
         if self
@@ -1209,6 +1210,316 @@ mod tests {
                     .outcome(),
                 ClientTransitionOutcome::Changed
             );
+        }
+
+        #[derive(Default)]
+        struct TerminalAudio(
+            std::sync::Mutex<Vec<pioneer_client::composer::store::ComposerOperationIdentity>>,
+        );
+        impl crate::ports::ThreadAudioPort for TerminalAudio {
+            fn start_capture(
+                &self,
+                _: crate::ports::ThreadAudioRequest,
+                _: &mut gpui_kit::App,
+            ) -> gpui_kit::Task<
+                Result<crate::ports::ThreadAudioCompletion, crate::ports::ThreadAudioError>,
+            > {
+                unreachable!()
+            }
+            fn stop_recording(
+                &self,
+                _: &crate::ports::ThreadAudioRequest,
+            ) -> Result<crate::ports::ThreadAudioCompletion, crate::ports::ThreadAudioError>
+            {
+                unreachable!()
+            }
+            fn finalize_capture(
+                &self,
+                _: crate::ports::ThreadAudioRequest,
+                _: pioneer_client::composer::turn_prepare::PreparedVoiceComposerSnapshot,
+                _: &mut gpui_kit::App,
+            ) -> gpui_kit::Task<
+                Result<crate::ports::ThreadAudioCompletion, crate::ports::ThreadAudioError>,
+            > {
+                unreachable!()
+            }
+            fn cancel_capture(&self, request: &crate::ports::ThreadAudioRequest) {
+                self.0.lock().unwrap().push(request.plan().identity.clone());
+            }
+            fn retire_mount(&self, _: &str, _: u64) {}
+        }
+
+        #[gpui_kit::test]
+        fn terminal_voice_failure_and_native_cancel_release_only_their_owner(
+            cx: &mut TestAppContext,
+        ) {
+            use crate::composer::voice::DesktopVoiceComposerState;
+            use crate::ports::{
+                ThreadAudioCompletion, ThreadAudioRequest, ThreadPresentationOperation,
+            };
+            use pioneer_client::composer::store::ComposerOperationCompletion;
+            let mut fixture = Fixture::new(cx);
+            let voice = fixture
+                .composer
+                .read_with(fixture.cx, |view, _| view.voice.clone());
+            let audio = Arc::new(TerminalAudio::default());
+            for failed in [true, false] {
+                let draft = fixture.client.composer_snapshot("a").unwrap();
+                assert_eq!(
+                    fixture
+                        .client
+                        .composer_intent(ComposerIntent::BeginOperation {
+                            thread_id: "a".into(),
+                            draft_id: draft.draft_id(),
+                            operation: ComposerOperationKind::Voice,
+                        })
+                        .outcome(),
+                    ClientTransitionOutcome::Changed
+                );
+                let plan = fixture
+                    .client
+                    .composer_snapshot("a")
+                    .unwrap()
+                    .operation()
+                    .unwrap()
+                    .plan
+                    .clone()
+                    .unwrap();
+                let identity = plan.identity.clone();
+                voice.update(fixture.cx, |view, _| {
+                    view.audio = audio.clone();
+                    view.window_active = true;
+                    view.desktop_voice_operation = Some(identity.clone());
+                    view.desktop_voice_request = Some(ThreadAudioRequest::new(
+                        ThreadPresentationOperation::new(
+                            "a".into(),
+                            view.mount,
+                            identity.generation,
+                        ),
+                        plan,
+                    ));
+                    view.desktop_voice_composer = DesktopVoiceComposerState::Finalizing {
+                        thread_id: "a".into(),
+                    };
+                });
+                if failed {
+                    fixture.client.complete_composer_operation(
+                        identity.clone(),
+                        ComposerOperationCompletion::Failed {
+                            message: "raw technical error".into(),
+                        },
+                    );
+                    voice.update(fixture.cx, |view, cx| {
+                        view.composer_input = view.client.composer_snapshot("a");
+                        view.present_desktop_voice_publication(cx);
+                    });
+                } else {
+                    voice.update(fixture.cx, |view, cx| {
+                        view.finish_desktop_voice_native_finalize(
+                            &identity,
+                            Ok(ThreadAudioCompletion::Cancelled),
+                            cx,
+                        )
+                    });
+                }
+                voice.read_with(fixture.cx, |view, _| {
+                    assert!(view.desktop_voice_operation.is_none());
+                    assert!(view.desktop_voice_request.is_none());
+                    assert!(view.desktop_voice_prepare_task.is_none());
+                    assert!(!view.desktop_voice_composer.is_active());
+                    assert_eq!(view.desktop_voice_error_message().is_some(), failed);
+                    if failed {
+                        assert_ne!(
+                            view.desktop_voice_error_message(),
+                            Some("raw technical error")
+                        );
+                    }
+                });
+                assert_eq!(audio.0.lock().unwrap().last(), Some(&identity));
+                // A late native completion cannot change the next manually created owner.
+                let draft = fixture.client.composer_snapshot("a").unwrap();
+                fixture
+                    .client
+                    .composer_intent(ComposerIntent::BeginOperation {
+                        thread_id: "a".into(),
+                        draft_id: draft.draft_id(),
+                        operation: ComposerOperationKind::Voice,
+                    });
+                let next = fixture
+                    .client
+                    .composer_snapshot("a")
+                    .unwrap()
+                    .operation()
+                    .unwrap()
+                    .identity
+                    .clone();
+                voice.update(fixture.cx, |view, cx| {
+                    view.desktop_voice_operation = Some(next.clone());
+                    view.finish_desktop_voice_native_finalize(
+                        &identity,
+                        Ok(ThreadAudioCompletion::Cancelled),
+                        cx,
+                    );
+                    assert_eq!(view.desktop_voice_operation.as_ref(), Some(&next));
+                    view.cancel_desktop_voice_operation("test_end");
+                });
+            }
+            assert_eq!(audio.0.lock().unwrap().len(), 2);
+        }
+
+        #[gpui_kit::test]
+        fn client_terminal_outcome_precedes_native_cancel_and_late_binding(
+            cx: &mut TestAppContext,
+        ) {
+            use crate::composer::voice::DesktopVoiceComposerState;
+            use crate::ports::{
+                ThreadAudioCompletion, ThreadAudioRequest, ThreadPresentationOperation,
+            };
+            use pioneer_client::composer::store::ComposerOperationCompletion;
+            let mut fixture = Fixture::new(cx);
+            let voice = fixture
+                .composer
+                .read_with(fixture.cx, |view, _| view.voice.clone());
+            let audio = Arc::new(TerminalAudio::default());
+            for outcome in [
+                ComposerOperationCompletion::Failed {
+                    message: "raw technical failure".into(),
+                },
+                ComposerOperationCompletion::Cancelled,
+                ComposerOperationCompletion::Sent,
+            ] {
+                let failed = matches!(&outcome, ComposerOperationCompletion::Failed { .. });
+                let draft = fixture.client.composer_snapshot("a").unwrap();
+                assert_eq!(
+                    fixture
+                        .client
+                        .composer_intent(ComposerIntent::BeginOperation {
+                            thread_id: "a".into(),
+                            draft_id: draft.draft_id(),
+                            operation: ComposerOperationKind::Voice,
+                        })
+                        .outcome(),
+                    ClientTransitionOutcome::Changed
+                );
+                let pending = fixture.client.composer_snapshot("a").unwrap();
+                let plan = pending.operation().unwrap().plan.clone().unwrap();
+                let identity = plan.identity.clone();
+                voice.update(fixture.cx, |view, _| {
+                    view.audio = audio.clone();
+                    view.window_active = true;
+                    view.composer_input = Some(pending);
+                    view.desktop_voice_operation = Some(identity.clone());
+                    view.desktop_voice_request = Some(ThreadAudioRequest::new(
+                        ThreadPresentationOperation::new(
+                            "a".into(),
+                            view.mount,
+                            identity.generation,
+                        ),
+                        plan,
+                    ));
+                    view.desktop_voice_composer = DesktopVoiceComposerState::Finalizing {
+                        thread_id: "a".into(),
+                    };
+                });
+                let cancellations = audio.0.lock().unwrap().len();
+                assert!(
+                    fixture
+                        .client
+                        .complete_composer_operation(identity.clone(), outcome)
+                );
+                let terminal = fixture
+                    .client
+                    .composer_snapshot("a")
+                    .unwrap()
+                    .operation()
+                    .unwrap()
+                    .clone();
+                // Leave the binding undelivered: native completion must read Client's latest outcome.
+                voice.update(fixture.cx, |view, cx| {
+                    assert!(
+                        view.composer_input
+                            .as_ref()
+                            .unwrap()
+                            .operation()
+                            .unwrap()
+                            .pending()
+                    );
+                    view.finish_desktop_voice_native_finalize(
+                        &identity,
+                        Ok(ThreadAudioCompletion::Cancelled),
+                        cx,
+                    );
+                    if failed {
+                        assert!(view.desktop_voice_operation.is_none());
+                        assert_eq!(
+                            view.desktop_voice_error_message(),
+                            Some(t!("chat.composer.voice.transcription_failed").as_ref())
+                        );
+                    }
+                });
+                fixture.synchronize();
+                voice.read_with(fixture.cx, |view, _| {
+                    assert!(view.desktop_voice_operation.is_none());
+                    assert!(view.desktop_voice_request.is_none());
+                    assert!(view.desktop_voice_prepare_task.is_none());
+                    assert!(!view.desktop_voice_composer.is_active());
+                    assert_eq!(view.desktop_voice_error_message().is_some(), failed);
+                });
+                assert_eq!(audio.0.lock().unwrap().len(), cancellations + 1);
+                assert_eq!(audio.0.lock().unwrap().last(), Some(&identity));
+                assert_eq!(
+                    fixture
+                        .client
+                        .composer_snapshot("a")
+                        .unwrap()
+                        .operation()
+                        .unwrap(),
+                    &terminal
+                );
+                // A duplicate late native callback neither clears the error nor releases twice.
+                voice.update(fixture.cx, |view, cx| {
+                    view.finish_desktop_voice_native_finalize(
+                        &identity,
+                        Ok(ThreadAudioCompletion::Cancelled),
+                        cx,
+                    );
+                    assert_eq!(view.desktop_voice_error_message().is_some(), failed);
+                });
+                assert_eq!(audio.0.lock().unwrap().len(), cancellations + 1);
+            }
+        }
+
+        #[gpui_kit::test]
+        fn send_failure_is_localized_and_user_cancellation_is_quiet(cx: &mut TestAppContext) {
+            use pioneer_client::composer::store::ComposerOperationCompletion;
+            let mut fixture = Fixture::new(cx);
+            for failed in [true, false] {
+                fixture.type_text("message");
+                fixture.synchronize();
+                let plan = fixture.composer.update(fixture.cx, |view, _| {
+                    view.composer_upload_error = None;
+                    view.begin_operation(ComposerOperationKind::Send).unwrap()
+                });
+                fixture.client.complete_composer_operation(
+                    plan.identity,
+                    if failed {
+                        ComposerOperationCompletion::Failed {
+                            message: "raw technical error".into(),
+                        }
+                    } else {
+                        ComposerOperationCompletion::Cancelled
+                    },
+                );
+                fixture.synchronize();
+                fixture.composer.read_with(fixture.cx, |view, _| {
+                    assert!(view.send_operation.is_none());
+                    assert_eq!(view.composer_upload_error.is_some(), failed);
+                    assert_ne!(
+                        view.composer_upload_error.as_deref(),
+                        Some("raw technical error")
+                    );
+                });
+            }
         }
 
         #[gpui_kit::test]

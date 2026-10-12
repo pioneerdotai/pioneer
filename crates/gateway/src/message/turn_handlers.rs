@@ -672,6 +672,7 @@ struct PreparedCliRuntimeCombinedPreflight {
 }
 
 struct PreparedCliRuntimeDelivery {
+    frozen_hold: Option<pioneer_crud::FrozenReadHold>,
     plan: pioneer_promt::CompiledInstructionDeliveryPlan,
     sent_context_basis: Option<crate::cli_runtime::thread_binding::CliRuntimeSentContextBasis>,
 }
@@ -6047,6 +6048,7 @@ impl MessageProcessor {
                 .map(|skill| skill.install_name.clone())
                 .collect::<Vec<_>>();
             let PreparedCliRuntimeDelivery {
+                frozen_hold: cli_basis_hold,
                 plan: delivery_plan,
                 sent_context_basis,
             } = match self
@@ -6514,6 +6516,8 @@ impl MessageProcessor {
                 ));
                 return;
             }
+            // Sent mapping is now the durable root; provider awaits need no temporary pin.
+            drop(cli_basis_hold);
             let native_turn_input = match serde_json::to_value(&input_mapping.input) {
                 Ok(input) => input,
                 Err(error) => {
@@ -7796,6 +7800,86 @@ impl MessageProcessor {
         })
     }
 
+    // Both recovery paths must restore control before reporting success or
+    // taking an idempotent running-attempt exit. Database reads inherit the
+    // caller's reconciliation scope and finish before notification fanout.
+    pub(super) async fn restore_cli_runtime_recovery_turn_snapshot(
+        &self,
+        binding: &pioneer_crud::CliRuntimeTurnBindingRecord,
+    ) -> Result<(), CliRuntimeRecoveryStartFailure> {
+        let Some((workspace_id, turn)) = self
+            .crud_store
+            .get_turn(binding.thread_id.as_str(), binding.turn_id.as_str())
+            .await?
+        else {
+            return Err(CliRuntimeRecoveryStartFailure::InvalidBinding {
+                diagnostic: format!("Pioneer turn `{}` is missing", binding.turn_id),
+            });
+        };
+        if workspace_id != binding.workspace_id {
+            return Err(CliRuntimeRecoveryStartFailure::InvalidBinding {
+                diagnostic: "saved Pioneer turn belongs to a different workspace".into(),
+            });
+        }
+        if turn.status != TurnStatus::InProgress {
+            return Err(CliRuntimeRecoveryStartFailure::InvalidBinding {
+                diagnostic: format!(
+                    "Pioneer turn `{}` is `{}` and cannot restore CLI recovery",
+                    binding.turn_id,
+                    format!("{:?}", turn.status).to_ascii_lowercase()
+                ),
+            });
+        }
+        // Recovery continues the original Pioneer Turn, but after a Gateway
+        // restart thread/start may have loaded only an idle, turnless seed.
+        // The caller holds the CLI session transition gate shared with
+        // cancellation and terminal delivery. Existing subscribers need
+        // a domain snapshot; execution-window/native events cannot restore it.
+        self.ensure_runtime_turn_loaded_for_lifecycle(
+            binding.workspace_id.as_str(),
+            binding.thread_id.as_str(),
+            &turn,
+        )
+        .await?;
+        let thread = self
+            .thread_manager
+            .thread_get(binding.thread_id.as_str())
+            .await
+            .context("recovered Pioneer thread is not loaded")?;
+        if thread.workspace_id != binding.workspace_id {
+            return Err(CliRuntimeRecoveryStartFailure::InvalidBinding {
+                diagnostic: "recovered Pioneer thread belongs to a different workspace".into(),
+            });
+        }
+        let current_turn = thread
+            .turns
+            .iter()
+            .find(|turn| turn.id == binding.turn_id)
+            .context("recovered Pioneer turn is not loaded")?;
+        let current_status = current_turn.status;
+        // Publish the current merged runtime state, never the saved running
+        // seed: restoration deliberately preserves a turn already finalized
+        // in memory, along with other turns and authenticated subscribers.
+        self.send_notification_to_thread_subscribers(
+            binding.thread_id.as_str(),
+            events::THREAD_UPDATED,
+            &ThreadUpdatedNotification {
+                thread,
+                placement: None,
+            },
+        )
+        .await;
+        if current_status != TurnStatus::InProgress {
+            return Err(CliRuntimeRecoveryStartFailure::InvalidBinding {
+                diagnostic: format!(
+                    "Pioneer turn `{}` is no longer running in memory",
+                    binding.turn_id
+                ),
+            });
+        }
+        Ok(())
+    }
+
     pub(super) async fn start_cli_runtime_recovery_attempt(
         &self,
         request: crate::resilience::CliRuntimeRecoveryAttemptRequest,
@@ -7814,24 +7898,8 @@ impl MessageProcessor {
             .await;
         let _transition = transition_mutex.lock().await;
         let binding = restored.binding.clone();
-        let Some((_workspace_id, turn)) = self
-            .crud_store
-            .get_turn(binding.thread_id.as_str(), binding.turn_id.as_str())
-            .await?
-        else {
-            return Err(CliRuntimeRecoveryStartFailure::InvalidBinding {
-                diagnostic: format!("Pioneer turn `{}` is missing", binding.turn_id),
-            });
-        };
-        if turn.status != TurnStatus::InProgress {
-            return Err(CliRuntimeRecoveryStartFailure::InvalidBinding {
-                diagnostic: format!(
-                    "Pioneer turn `{}` is `{}` and cannot start CLI recovery",
-                    binding.turn_id,
-                    format!("{:?}", turn.status).to_ascii_lowercase()
-                ),
-            });
-        }
+        self.restore_cli_runtime_recovery_turn_snapshot(&binding)
+            .await?;
         if let Some(existing) = self
             .crud_store
             .get_cli_runtime_turn_attempt_by_recovery_attempt(request.recovery_attempt_id.as_str())
@@ -8737,6 +8805,7 @@ impl MessageProcessor {
         max_input_tokens: Option<u64>,
         attempt: u32,
         deadline_ms: u64,
+        codex_history_budget: Option<crate::cli_runtime::context::CodexTransferHistoryBudget>,
         accepted: crate::compaction::frozen::PreparedHistory,
     ) -> anyhow::Result<()> {
         scope_current_stage(Stage::CliCompaction, async {
@@ -8810,6 +8879,8 @@ impl MessageProcessor {
                 .min((crate::cli_runtime::context::MAX_CLI_TURN_INPUT_FRAME_BYTES / 8) as u64)
                 .max(1);
             let fixed_input_tokens = limits.context_window.saturating_sub(desired);
+            let codex_history_budget = codex_history_budget
+                .map(|budget| budget.with_token_target(desired, fraction));
             let transfer_store = ordinary_history_store(self.crud_store.as_ref());
             let owner = std::sync::Arc::new(self.clone());
             let hub = std::sync::Arc::new(pioneer_runtime_events::ExecutionEventHub::new());
@@ -8842,6 +8913,7 @@ impl MessageProcessor {
                     Some(deadline_ms),
                     None,
                     fixed_input_tokens,
+                    codex_history_budget,
                     std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                     Some(accepted),
                     &mut diagnostic,
@@ -9089,6 +9161,12 @@ impl MessageProcessor {
                     });
                     (None, basis, None)
                 };
+            let continuity_hold = if accepted_projection.is_none() {
+                if let Some(sent) = &sent_context_basis {
+                    crate::compaction::frozen::acquire_history_json(self.crud_store.as_ref(),
+                        outcome.started_notification.workspace_id.as_str(), &sent.completed.history_json).await?
+                } else { None }
+            } else { None };
             if continuation_thread_id != outcome.started_notification.thread_id
                 && let Some(sent) = sent_context_basis.as_mut()
             {
@@ -9219,6 +9297,14 @@ impl MessageProcessor {
                         runtime_kind,
                     ))
                     .context("current CLI input, attachment, or launch instructions cannot fit in one request")?;
+                    let codex_history_budget = if runtime_kind == CLIAgentRuntimeKind::Codex {
+                        crate::cli_runtime::context::CodexTransferHistoryBudget::from_prepared_input(
+                            input_mapping,
+                            &current_only,
+                        )
+                    } else {
+                        None
+                    };
                     let compaction_thread_id = outcome.started_notification.thread_id.as_str();
                     self.compact_cli_transfer_history(
                         outcome.started_notification.workspace_id.as_str(),
@@ -9230,6 +9316,7 @@ impl MessageProcessor {
                         max_input_tokens,
                         3 - remaining_compactions,
                         history_deadline_ms,
+                        codex_history_budget,
                         accepted_projection
                             .take()
                             .context("CLI transfer projection was lost")?,
@@ -9260,6 +9347,7 @@ impl MessageProcessor {
                 return Err(error);
             }
             Ok(PreparedCliRuntimeDelivery {
+                frozen_hold: accepted_projection.as_mut().and_then(|prepared| prepared.frozen_hold.take()).or(continuity_hold),
                 plan,
                 sent_context_basis,
             })

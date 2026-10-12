@@ -58,23 +58,33 @@ impl VoiceInputView {
                 self.desktop_voice_operation.as_ref() == Some(&operation.identity)
                     && operation.kind == ComposerOperationKind::Voice
             })
+            .cloned()
         else {
             return;
         };
-        if let Some(result) = &operation.voice_result {
+        if operation.voice_result.is_none()
+            && matches!(operation.status, ComposerOperationStatus::Failed { .. })
+        {
+            self.cancel_desktop_voice_operation("voice_failed");
+            self.desktop_voice_composer = DesktopVoiceComposerState::Error {
+                kind: DesktopVoiceCaptureErrorKind::GatewaySession,
+                message: t!("chat.composer.voice.transcription_failed").to_string(),
+            };
+        } else if let Some(result) = &operation.voice_result {
             match result.action {
                 VoiceFinalizeUiAction::KeepFinalizing => {}
                 VoiceFinalizeUiAction::ClearFinalizing => {
-                    self.desktop_voice_composer = DesktopVoiceComposerState::Idle;
-                    self.desktop_voice_operation = None;
+                    self.cancel_desktop_voice_operation("voice_completed");
                 }
                 VoiceFinalizeUiAction::ShowNoSpeechError => {
+                    self.cancel_desktop_voice_operation("voice_no_speech");
                     self.desktop_voice_composer = DesktopVoiceComposerState::Error {
                         kind: DesktopVoiceCaptureErrorKind::NoSpeech,
                         message: desktop_voice_no_speech_message(result.error.as_ref()),
                     };
                 }
                 VoiceFinalizeUiAction::ShowFinalizeError => {
+                    self.cancel_desktop_voice_operation("voice_finalize_failed");
                     self.desktop_voice_composer = DesktopVoiceComposerState::Error {
                         kind: DesktopVoiceCaptureErrorKind::GatewayFinalize,
                         message: desktop_voice_transcription_failed_message(result.error.as_ref()),
@@ -82,8 +92,7 @@ impl VoiceInputView {
                 }
             }
         } else if operation.status == ComposerOperationStatus::Completed {
-            self.desktop_voice_composer = DesktopVoiceComposerState::Idle;
-            self.desktop_voice_operation = None;
+            self.cancel_desktop_voice_operation("voice_completed");
         } else if operation
             .voice_finalize
             .as_ref()
@@ -253,7 +262,7 @@ impl VoiceInputView {
         self.desktop_voice_prepare_task = Some(cx.spawn(async move |view, cx| {
             let result = start.await;
             let _ = view.update(cx, |view, cx| {
-                if view.desktop_voice_operation.as_ref() != Some(&operation) {
+                if !view.owns_desktop_voice_operation(&operation) {
                     return;
                 }
                 let (candidate, release_requested) = match view.desktop_voice_composer {
@@ -281,6 +290,7 @@ impl VoiceInputView {
                                 message: error.message().into(),
                             },
                         );
+                        view.cancel_desktop_voice_operation("native_start_failed");
                         view.desktop_voice_composer =
                             desktop_voice_error_state_from_capture_error(error);
                     }
@@ -378,7 +388,7 @@ impl VoiceInputView {
                         message: error.message().into(),
                     },
                 );
-                self.audio.cancel_capture(&request);
+                self.cancel_desktop_voice_operation("native_stop_failed");
                 self.desktop_voice_composer = desktop_voice_error_state_from_capture_error(error);
                 self.publish_presentation(cx);
                 return;
@@ -400,7 +410,7 @@ impl VoiceInputView {
             let prepared = prepare.await;
             let finalization = view
                 .update(cx, |view, cx| {
-                    if view.desktop_voice_operation.as_ref() != Some(&operation) {
+                    if !view.owns_desktop_voice_operation(&operation) {
                         return None;
                     }
                     match prepared {
@@ -408,16 +418,16 @@ impl VoiceInputView {
                             Some(view.audio.finalize_capture(request.clone(), prepared, cx))
                         }
                         Err(error) => {
-                            view.audio.cancel_capture(&request);
-                            let message = format!("{error:#}");
+                            view.cancel_desktop_voice_operation("voice_prepare_failed");
+                            let message = t!(
+                                "chat.composer.voice.prepare_failed",
+                                error = format!("{error:#}").as_str()
+                            )
+                            .to_string();
                             cx.emit(VoiceInputEvent::UploadError(Some(message.clone())));
                             view.desktop_voice_composer = DesktopVoiceComposerState::Error {
                                 kind: DesktopVoiceCaptureErrorKind::GatewaySession,
-                                message: t!(
-                                    "chat.composer.voice.prepare_failed",
-                                    error = message.as_str()
-                                )
-                                .to_string(),
+                                message,
                             };
                             view.publish_presentation(cx);
                             None
@@ -433,24 +443,62 @@ impl VoiceInputView {
             if let Some(finalization) = finalization {
                 let result = finalization.await;
                 let _ = view.update(cx, |view, cx| {
-                    if view.desktop_voice_operation.as_ref() != Some(&operation) {
-                        return;
-                    }
-                    if let Err(error) = result {
-                        client.complete_composer_operation(
-                            operation,
-                            ComposerOperationCompletion::Failed {
-                                message: error.message().into(),
-                            },
-                        );
-                        view.desktop_voice_composer =
-                            desktop_voice_error_state_from_capture_error(error);
-                    }
-                    view.publish_presentation(cx);
+                    view.finish_desktop_voice_native_finalize(&operation, result, cx);
                 });
             }
         }));
         self.publish_presentation(cx);
+    }
+
+    pub(super) fn finish_desktop_voice_native_finalize(
+        &mut self,
+        operation: &pioneer_client::composer::store::ComposerOperationIdentity,
+        result: Result<ThreadAudioCompletion, DesktopVoiceCaptureError>,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.owns_desktop_voice_operation(operation) {
+            return;
+        }
+        match result {
+            Ok(ThreadAudioCompletion::Cancelled) => {
+                // Client may have failed before the binding delivered that publication.
+                // Present that exact outcome before discarding its local capture owner.
+                self.composer_input = self.client.composer_snapshot(&self.thread_id);
+                self.present_desktop_voice_publication(cx);
+                if self.desktop_voice_operation.as_ref() == Some(operation) {
+                    self.cancel_desktop_voice_operation("native_finalize_cancelled");
+                }
+            }
+            Err(error) => {
+                self.client.complete_composer_operation(
+                    operation.clone(),
+                    ComposerOperationCompletion::Failed {
+                        message: error.message().into(),
+                    },
+                );
+                self.cancel_desktop_voice_operation("native_finalize_failed");
+                self.desktop_voice_composer = desktop_voice_error_state_from_capture_error(error);
+            }
+            _ => {}
+        }
+        self.publish_presentation(cx);
+    }
+
+    fn owns_desktop_voice_operation(
+        &self,
+        identity: &pioneer_client::composer::store::ComposerOperationIdentity,
+    ) -> bool {
+        self.window_active
+            && self.thread_id == identity.thread_id
+            && self.desktop_voice_operation.as_ref() == Some(identity)
+            && self.desktop_voice_request.as_ref().is_some_and(|request| {
+                request.presentation().mount() == self.mount && request.plan().identity == *identity
+            })
+            && self.client.composer_snapshot(&self.thread_id).is_some_and(|input| {
+                input.operation().is_some_and(|operation| operation.identity == *identity
+                    && operation.voice_result.is_none()
+                    && !matches!(operation.status, pioneer_client::composer::store::ComposerOperationStatus::Completed | pioneer_client::composer::store::ComposerOperationStatus::Cancelled))
+            })
     }
 
     pub(crate) fn cancel_desktop_voice_hold(&mut self, reason: &str, cx: &mut Context<Self>) {
@@ -597,7 +645,16 @@ fn desktop_voice_error_state_from_capture_error(
 ) -> DesktopVoiceComposerState {
     DesktopVoiceComposerState::Error {
         kind: error.kind(),
-        message: error.message().to_owned(),
+        message: if matches!(
+            error.kind(),
+            DesktopVoiceCaptureErrorKind::GatewaySession
+                | DesktopVoiceCaptureErrorKind::GatewayChunk
+                | DesktopVoiceCaptureErrorKind::GatewayFinalize
+        ) {
+            t!("chat.composer.voice.transcription_failed").to_string()
+        } else {
+            error.message().to_owned()
+        },
     }
 }
 

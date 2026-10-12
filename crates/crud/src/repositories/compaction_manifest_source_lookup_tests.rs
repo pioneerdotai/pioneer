@@ -113,7 +113,7 @@ async fn fixture() -> Fixture {
         "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES ('other-turn','other-thread','completed','conversation','system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
         "INSERT INTO task(id,workspace_id,owner_kind,owner_id,created_by_thread_id,created_by_turn_id,executor_kind,status,title,goal) VALUES ('task','ws','thread','root-thread','root-thread','root-turn','agent','running','Task','fixture')",
         "INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES ('basis-run','task','basis-run',1,1,'succeeded','agent')",
-        "INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at) VALUES ('basis-run','task','ws','source-thread','[]',CURRENT_TIMESTAMP)",
+        "WITH frozen_root_fixture(run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at) AS (VALUES ('basis-run','task','ws','source-thread','[]',CURRENT_TIMESTAMP)) INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at,frozen_manifest_id) SELECT run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at,CASE WHEN json_valid(history_json) THEN CASE WHEN json_type(history_json)='object' THEN json_extract(history_json,'$.manifest_id') ELSE NULL END ELSE NULL END FROM frozen_root_fixture",
         "INSERT INTO turn_llm_context(id,turn_id,sequence,source,payload,created_at) VALUES ('context-source','source-turn',1,'fixture','{}',CURRENT_TIMESTAMP)",
         "INSERT INTO turn_item(id,turn_id,item_id,item_type,status,payload,created_at,updated_at) VALUES ('item-source','source-turn','item-source','command_execution','completed','{}',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
         "INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at) VALUES ('event-source','source-thread','source-turn',1,'fixture','{}',CURRENT_TIMESTAMP)",
@@ -133,6 +133,26 @@ async fn fixture() -> Fixture {
     db.execute_unprepared("DELETE FROM compaction_task_basis_revision WHERE run_id='basis-run'")
         .await
         .unwrap();
+    db.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "UPDATE compaction_operation SET snapshot=?1 WHERE id='source-operation'",
+        [raw_fixture_snapshot(
+            "source-operation",
+            "source-owner",
+            source_cases()
+                .into_iter()
+                .filter(|case| case.name != "checkpoint")
+                .map(|case| SourceRef {
+                    scope: case.scope.into(),
+                    id: case.id.into(),
+                    version: case.version.into(),
+                })
+                .collect(),
+        )
+        .into()],
+    ))
+    .await
+    .unwrap();
     Fixture {
         store,
         writer,
@@ -378,7 +398,7 @@ async fn manifest_source_lookup_checks_all_source_types() {
     let basis = source_cases()[5].clone();
     set_manifest(&db, &basis, true).await;
     db.execute_unprepared(
-        "UPDATE task_run_conversation_snapshot SET history_json='  []' WHERE run_id='basis-run'",
+        "UPDATE task_run_conversation_snapshot SET history_json='  []',frozen_manifest_id=NULL WHERE run_id='basis-run'",
     )
     .await
     .unwrap();
@@ -393,7 +413,7 @@ async fn manifest_source_lookup_checks_all_source_types() {
     )
     .await;
     db.execute_unprepared(
-        "UPDATE task_run_conversation_snapshot SET history_json=' {}' WHERE run_id='basis-run'",
+        "UPDATE task_run_conversation_snapshot SET history_json=' {}',frozen_manifest_id=NULL WHERE run_id='basis-run'",
     )
     .await
     .unwrap();
@@ -630,7 +650,7 @@ async fn task_basis_revision_and_ltrim_semantics_are_preserved() {
     set_manifest(&db, &basis, true).await;
 
     db.execute_unprepared(
-        "UPDATE task_run_conversation_snapshot SET history_json='[]' WHERE run_id='basis-run'",
+        "UPDATE task_run_conversation_snapshot SET history_json='[]',frozen_manifest_id=NULL WHERE run_id='basis-run'",
     )
     .await
     .unwrap();
@@ -688,7 +708,7 @@ async fn task_basis_revision_and_ltrim_semantics_are_preserved() {
     ] {
         db.execute_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
-            "UPDATE task_run_conversation_snapshot SET history_json=? WHERE run_id='basis-run'",
+            "WITH root_replacement(history_json) AS (VALUES (?)) UPDATE task_run_conversation_snapshot SET history_json=(SELECT history_json FROM root_replacement),frozen_manifest_id=(SELECT CASE WHEN json_valid(history_json) THEN CASE WHEN json_type(history_json)='object' THEN json_extract(history_json,'$.manifest_id') ELSE NULL END ELSE NULL END FROM root_replacement) WHERE run_id='basis-run'",
             [history.into()],
         ))
         .await
@@ -846,8 +866,9 @@ async fn accepted_imports_require_the_bound_ready_manifest_and_exact_metadata() 
         "INSERT INTO compaction_frozen_history(id,workspace_id,owner_thread,identity_sha256,message_count,next_ordinal,import_count,imports_sha256,next_import,ready) VALUES ('import-storage','ws','root-thread','storage',1,1,1,'storage',1,1)",
         "INSERT INTO compaction_frozen_import_data(manifest_id,ordinal,message_ordinal,source_scope,source_id,source_version,source_thread,proof_json,bytes) SELECT 'import-storage',ordinal,message_ordinal,source_scope,source_id,source_version,source_thread,proof_json,bytes FROM compaction_frozen_import_data WHERE manifest_id='accepted-manifest'",
         "DELETE FROM compaction_frozen_import_data WHERE manifest_id='accepted-manifest'",
-        "INSERT INTO compaction_frozen_layout(manifest_id,kind,active,pending) VALUES ('accepted-manifest',1,1,0)",
+        "INSERT INTO compaction_frozen_layout(manifest_id,kind,active,pending) VALUES ('accepted-manifest',1,0,1)",
         "INSERT INTO compaction_frozen_span(manifest_id,kind,start,end,source_manifest) VALUES ('accepted-manifest',1,0,1,'import-storage')",
+        "UPDATE compaction_frozen_layout SET active=1,pending=0 WHERE manifest_id='accepted-manifest' AND kind=1",
     ] {
         db.execute_unprepared(sql).await.unwrap();
     }
@@ -886,11 +907,9 @@ async fn accepted_imports_require_the_bound_ready_manifest_and_exact_metadata() 
         ("import_count", "2", "1"),
         ("next_import", "0", "1"),
     ] {
-        db.execute_unprepared(&format!(
+        crate::repositories::compaction::seed_legacy_frozen_header(&db, &format!(
             "UPDATE compaction_frozen_history SET {column}={invalid} WHERE id='accepted-manifest'"
-        ))
-        .await
-        .unwrap();
+        )).await;
         assert_manifest_current(
             &db,
             "manifest-operation",
@@ -898,11 +917,13 @@ async fn accepted_imports_require_the_bound_ready_manifest_and_exact_metadata() 
             &format!("invalid frozen {column}"),
         )
         .await;
-        db.execute_unprepared(&format!(
-            "UPDATE compaction_frozen_history SET {column}={valid} WHERE id='accepted-manifest'"
-        ))
-        .await
-        .unwrap();
+        crate::repositories::compaction::seed_legacy_frozen_header(
+            &db,
+            &format!(
+                "UPDATE compaction_frozen_history SET {column}={valid} WHERE id='accepted-manifest'"
+            ),
+        )
+        .await;
     }
     db.execute_unprepared("UPDATE compaction_operation_projection SET manifest_id='empty-import-manifest' WHERE operation_id='manifest-operation'")
         .await
@@ -1108,7 +1129,7 @@ async fn inherited_input_alias_admits_only_exact_historical_checkpoint_coverage(
         .unwrap()
         .validate()
         .unwrap();
-    update(reference).await;
+    update(reference.clone()).await;
     assert_manifest_current(
         &db,
         "manifest-operation",
@@ -1130,6 +1151,26 @@ async fn inherited_input_alias_admits_only_exact_historical_checkpoint_coverage(
     ))
     .await
     .unwrap();
+    let original_source = SourceRef {
+        scope: "input:foreign-turn".into(),
+        id: "original-input".into(),
+        version: "input-revision:1".into(),
+    };
+    db.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "UPDATE compaction_operation SET snapshot=?1 WHERE id='original-operation'",
+        [raw_fixture_snapshot(
+            "original-operation",
+            "original-owner",
+            vec![original_source],
+        )
+        .into()],
+    ))
+    .await
+    .unwrap();
+    let original_identity = finish_checkpoint_fixture(&f, "original-summary").await;
+    reference["sources"][0]["version"] = serde_json::json!(original_identity);
+    let source_identity = finish_checkpoint_fixture(&f, "source-checkpoint").await;
     let old = f
         .store
         .compaction_checkpoint("source-checkpoint")
@@ -1145,10 +1186,23 @@ async fn inherited_input_alias_admits_only_exact_historical_checkpoint_coverage(
         "UPDATE compaction_operation SET snapshot=json_set(snapshot,'$.plan.coverage_domain','working_context') WHERE id='alias-publication'",
         "UPDATE compaction_manifest SET source_thread='source-thread',source_scope='checkpoint:source-owner',source_id='source-checkpoint',source_version='source-version' WHERE operation_id='alias-publication'",
         "UPDATE compaction_coverage SET source_scope='checkpoint:source-owner',source_id='source-checkpoint',source_version='source-version' WHERE checkpoint_id='alias-publication-checkpoint'",
-        "INSERT INTO compaction_operation_projection(operation_id,manifest_id,identity_sha256,imports_sha256,import_count) SELECT 'alias-publication',manifest_id,identity_sha256,imports_sha256,import_count FROM compaction_operation_projection WHERE operation_id='manifest-operation'",
     ] {
         db.execute_unprepared(sql).await.unwrap();
     }
+    for sql in [
+        "UPDATE compaction_manifest SET source_version=?1 WHERE operation_id='alias-publication'",
+        "UPDATE compaction_coverage SET source_version=?1 WHERE checkpoint_id='alias-publication-checkpoint'",
+    ] {
+        db.execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            sql,
+            [source_identity.clone().into()],
+        ))
+        .await
+        .unwrap();
+    }
+    install_verified_projection(&f, "alias-publication", &reference).await;
+    finish_checkpoint_fixture(&f, "alias-publication-checkpoint").await;
     assert_positive_publication_preflight(&f, "alias-publication", &state).await;
     assert_eq!(
         f.store
@@ -1260,8 +1314,9 @@ async fn inherited_checkpoint_basis_is_an_atomic_accepted_reference() {
     .unwrap();
     for sql in [
         "DELETE FROM compaction_frozen_message_data WHERE manifest_id='basis-manifest'",
-        "INSERT INTO compaction_frozen_layout(manifest_id,kind,active,pending) VALUES ('basis-manifest',0,1,0)",
+        "INSERT INTO compaction_frozen_layout(manifest_id,kind,active,pending) VALUES ('basis-manifest',0,0,1)",
         "INSERT INTO compaction_frozen_span(manifest_id,kind,start,end,source_manifest) VALUES ('basis-manifest',0,0,1,'basis-storage')",
+        "UPDATE compaction_frozen_layout SET active=1,pending=0 WHERE manifest_id='basis-manifest' AND kind=0",
     ] {
         db.execute_unprepared(sql).await.unwrap();
     }
@@ -1292,21 +1347,19 @@ async fn inherited_checkpoint_basis_is_an_atomic_accepted_reference() {
         "shared basis binding restored",
     )
     .await;
-    db.execute_unprepared(
+    crate::repositories::compaction::seed_legacy_frozen_header(
+        &db,
         "UPDATE compaction_frozen_history SET next_ordinal=0 WHERE id='basis-manifest'",
     )
-    .await
-    .unwrap();
+    .await;
     assert_manifest_current(&db, "manifest-operation", false, "basis message cursor").await;
-    db.execute_unprepared("UPDATE compaction_frozen_history SET next_ordinal=1,message_count=2 WHERE id='basis-manifest'")
-        .await
-        .unwrap();
+    crate::repositories::compaction::seed_legacy_frozen_header(&db, "UPDATE compaction_frozen_history SET next_ordinal=1,message_count=2 WHERE id='basis-manifest'").await;
     assert_manifest_current(&db, "manifest-operation", false, "basis message count").await;
-    db.execute_unprepared(
+    crate::repositories::compaction::seed_legacy_frozen_header(
+        &db,
         "UPDATE compaction_frozen_history SET message_count=1 WHERE id='basis-manifest'",
     )
-    .await
-    .unwrap();
+    .await;
     db.execute_unprepared("UPDATE compaction_operation SET snapshot='{\"plan\":{\"coverage_domain\":\"own_contribution\"},\"source_epochs\":{\"root-thread\":0,\"foreign-thread\":0}}' WHERE id='manifest-operation'")
         .await
         .unwrap();
@@ -1593,9 +1646,7 @@ async fn accepted_checkpoint_import_is_an_atomic_grant_for_a_later_checkpoint() 
         "accepted S cannot cover the additional unaccepted X input of T",
     )
     .await;
-    db.execute_unprepared("INSERT INTO compaction_frozen_import_data(manifest_id,ordinal,message_ordinal,source_scope,source_id,source_version,source_thread,proof_json,bytes) VALUES ('atomic-import-manifest',1,0,'event:foreign-turn','foreign-event','event-revision:1','foreign-thread','{}',2); UPDATE compaction_frozen_history SET import_count=2,next_import=2 WHERE id='atomic-import-manifest'; UPDATE compaction_operation_projection SET import_count=2 WHERE operation_id='manifest-operation'")
-        .await
-        .unwrap();
+    crate::repositories::compaction::seed_legacy_frozen_header(&db, "INSERT INTO compaction_frozen_import_data(manifest_id,ordinal,message_ordinal,source_scope,source_id,source_version,source_thread,proof_json,bytes) VALUES ('atomic-import-manifest',1,0,'event:foreign-turn','foreign-event','event-revision:1','foreign-thread','{}',2); UPDATE compaction_frozen_history SET import_count=2,next_import=2 WHERE id='atomic-import-manifest'; UPDATE compaction_operation_projection SET import_count=2 WHERE operation_id='manifest-operation'").await;
     assert_manifest_current(
         &db,
         "manifest-operation",
@@ -1632,9 +1683,7 @@ async fn accepted_checkpoint_import_is_an_atomic_grant_for_a_later_checkpoint() 
         "an atomic grant on S does not grant direct access to current raw A",
     )
     .await;
-    db.execute_unprepared("INSERT INTO compaction_frozen_import_data(manifest_id,ordinal,message_ordinal,source_scope,source_id,source_version,source_thread,proof_json,bytes) VALUES ('atomic-import-manifest',2,0,'event:source-turn','event-source','event-revision:1','source-thread','{}',2); UPDATE compaction_frozen_history SET import_count=3,next_import=3 WHERE id='atomic-import-manifest'; UPDATE compaction_operation_projection SET import_count=3 WHERE operation_id='manifest-operation'")
-        .await
-        .unwrap();
+    crate::repositories::compaction::seed_legacy_frozen_header(&db, "INSERT INTO compaction_frozen_import_data(manifest_id,ordinal,message_ordinal,source_scope,source_id,source_version,source_thread,proof_json,bytes) VALUES ('atomic-import-manifest',2,0,'event:source-turn','event-source','event-revision:1','source-thread','{}',2); UPDATE compaction_frozen_history SET import_count=3,next_import=3 WHERE id='atomic-import-manifest'; UPDATE compaction_operation_projection SET import_count=3 WHERE operation_id='manifest-operation'").await;
     assert_manifest_current(
         &db,
         "manifest-operation",
@@ -1643,9 +1692,7 @@ async fn accepted_checkpoint_import_is_an_atomic_grant_for_a_later_checkpoint() 
     )
     .await;
 
-    db.execute_unprepared("DELETE FROM compaction_frozen_import_data WHERE manifest_id='atomic-import-manifest' AND ordinal=2; UPDATE compaction_frozen_history SET import_count=2,next_import=2 WHERE id='atomic-import-manifest'; UPDATE compaction_operation_projection SET import_count=2 WHERE operation_id='manifest-operation'")
-        .await
-        .unwrap();
+    crate::repositories::compaction::seed_legacy_frozen_header(&db, "DELETE FROM compaction_frozen_import_data WHERE manifest_id='atomic-import-manifest' AND ordinal=2; UPDATE compaction_frozen_history SET import_count=2,next_import=2 WHERE id='atomic-import-manifest'; UPDATE compaction_operation_projection SET import_count=2 WHERE operation_id='manifest-operation'").await;
     set_manifest(&db, &target, false).await;
     db.execute_unprepared("DELETE FROM turn_event WHERE id='event-source'")
         .await
@@ -1812,9 +1859,7 @@ SELECT 'accepted-basis-boundary',value,?1,length(CAST(?1 AS BLOB)) FROM n"#,
     ))
     .await
     .unwrap();
-    db.execute_unprepared("UPDATE compaction_frozen_history SET message_count=65537,next_ordinal=65537 WHERE id='accepted-basis-boundary'")
-        .await
-        .unwrap();
+    crate::repositories::compaction::seed_legacy_frozen_header(&db, "UPDATE compaction_frozen_history SET message_count=65537,next_ordinal=65537 WHERE id='accepted-basis-boundary'").await;
     assert_manifest_current(
         &db,
         "manifest-operation",
@@ -1823,15 +1868,14 @@ SELECT 'accepted-basis-boundary',value,?1,length(CAST(?1 AS BLOB)) FROM n"#,
     )
     .await;
 
-    db.execute_unprepared(
+    crate::repositories::compaction::seed_legacy_frozen_header(&db,
         "DELETE FROM compaction_frozen_message_data WHERE manifest_id='accepted-basis-boundary' AND ordinal=65536; \
          UPDATE compaction_frozen_history SET message_count=65536,next_ordinal=65536 WHERE id='accepted-basis-boundary'; \
          UPDATE compaction_operation SET snapshot='{\"plan\":{\"coverage_domain\":\"working_context\"},\"source_epochs\":{\"root-thread\":0,\"source-thread\":0}}' WHERE id='manifest-operation'; \
          DELETE FROM compaction_manifest WHERE operation_id='manifest-operation'; \
          INSERT INTO compaction_manifest(operation_id,ordinal,unit_ordinal,reference_only,source_thread,source_scope,source_id,source_version) VALUES ('manifest-operation',0,0,0,'source-thread','checkpoint:source-owner','source-checkpoint','source-version')",
     )
-    .await
-    .unwrap();
+    .await;
     let checkpoint_reference = serde_json::json!({
         "inherited": true,
         "source_thread": "source-thread",
@@ -1863,9 +1907,7 @@ SELECT 'accepted-basis-boundary',value,?1,length(CAST(?1 AS BLOB)) FROM n"#,
     ))
     .await
     .unwrap();
-    db.execute_unprepared("UPDATE compaction_frozen_history SET message_count=65537,next_ordinal=65537 WHERE id='accepted-basis-boundary'")
-        .await
-        .unwrap();
+    crate::repositories::compaction::seed_legacy_frozen_header(&db, "UPDATE compaction_frozen_history SET message_count=65537,next_ordinal=65537 WHERE id='accepted-basis-boundary'").await;
     assert_manifest_current(
         &db,
         "manifest-operation",
@@ -2059,7 +2101,8 @@ fn assert_projection_page_statement(
     let (sql, expected_values) = match bounds {
         ProjectionPageBounds::Sizes { start } => (
             "SELECT d.ordinal,d.bytes FROM compaction_frozen_message_data d \
-             WHERE d.manifest_id=? AND d.ordinal>=? \
+             JOIN compaction_frozen_history h ON h.id=d.manifest_id \
+             WHERE h.expired=0 AND h.ready=1 AND h.message_count>=0 AND h.import_count>=0 AND h.next_ordinal=h.message_count AND h.next_import=h.import_count AND d.ordinal>=0 AND d.ordinal<h.message_count AND d.manifest_id=? AND d.ordinal>=? \
                AND NOT EXISTS (SELECT 1 FROM compaction_frozen_layout l \
                                WHERE l.manifest_id=d.manifest_id AND l.kind=0 AND l.active=1) \
              UNION ALL \
@@ -2068,7 +2111,8 @@ fn assert_projection_page_statement(
                ON d.manifest_id=s.source_manifest AND d.ordinal>=s.start AND d.ordinal<s.end \
              JOIN compaction_frozen_layout l \
                ON l.manifest_id=s.manifest_id AND l.kind=s.kind AND l.active=1 \
-             WHERE s.manifest_id=? AND s.kind=0 AND d.ordinal>=? \
+             JOIN compaction_frozen_history h ON h.id=s.manifest_id \
+             WHERE h.expired=0 AND h.ready=1 AND h.message_count>=0 AND h.import_count>=0 AND h.next_ordinal=h.message_count AND h.next_import=h.import_count AND d.ordinal>=0 AND d.ordinal<h.message_count AND s.manifest_id=? AND s.kind=0 AND d.ordinal>=? \
              ORDER BY ordinal LIMIT ?",
             vec![
                 Value::from(manifest),
@@ -2080,7 +2124,8 @@ fn assert_projection_page_statement(
         ),
         ProjectionPageBounds::Data { start, end } => (
             "SELECT d.ordinal,d.reference_json,d.bytes FROM compaction_frozen_message_data d \
-             WHERE d.manifest_id=? AND d.ordinal>=? AND d.ordinal<? \
+             JOIN compaction_frozen_history h ON h.id=d.manifest_id \
+             WHERE h.expired=0 AND h.ready=1 AND h.message_count>=0 AND h.import_count>=0 AND h.next_ordinal=h.message_count AND h.next_import=h.import_count AND d.ordinal>=0 AND d.ordinal<h.message_count AND d.manifest_id=? AND d.ordinal>=? AND d.ordinal<? AND d.bytes BETWEEN 0 AND 262144 AND length(CAST(d.reference_json AS BLOB))=d.bytes \
                AND NOT EXISTS (SELECT 1 FROM compaction_frozen_layout l \
                                WHERE l.manifest_id=d.manifest_id AND l.kind=0 AND l.active=1) \
              UNION ALL \
@@ -2089,7 +2134,8 @@ fn assert_projection_page_statement(
                ON d.manifest_id=s.source_manifest AND d.ordinal>=s.start AND d.ordinal<s.end \
              JOIN compaction_frozen_layout l \
                ON l.manifest_id=s.manifest_id AND l.kind=s.kind AND l.active=1 \
-             WHERE s.manifest_id=? AND s.kind=0 AND d.ordinal>=? AND d.ordinal<? \
+             JOIN compaction_frozen_history h ON h.id=s.manifest_id \
+             WHERE h.expired=0 AND h.ready=1 AND h.message_count>=0 AND h.import_count>=0 AND h.next_ordinal=h.message_count AND h.next_import=h.import_count AND d.ordinal>=0 AND d.ordinal<h.message_count AND s.manifest_id=? AND s.kind=0 AND d.ordinal>=? AND d.ordinal<? AND d.bytes BETWEEN 0 AND 262144 AND length(CAST(d.reference_json AS BLOB))=d.bytes \
              ORDER BY ordinal",
             vec![
                 Value::from(manifest),
@@ -2275,10 +2321,9 @@ fn assert_frozen_view_plan(plan: &[PlanNode], view: &str) {
         ordinary.iter().any(|node| {
             plan_subject(&node.detail, "SEARCH", "d")
                 && has_constraint(&node.detail, "manifest_id", "=")
-                && !has_constraint(&node.detail, "ordinal", ">")
-                && !has_constraint(&node.detail, "ordinal", "<")
+                && has_constraint(&node.detail, "ordinal", ">")
         }),
-        "ordinary {view} data lookup must not require an ordinal range: {ordinary:#?}"
+        "ordinary {view} data lookup must seek the logical ordinal prefix: {ordinary:#?}"
     );
     assert!(
         ordinary.iter().any(|node| {
@@ -2420,7 +2465,7 @@ fn synthetic_frozen_view_plan(
         PlanNode {
             id: root + 3,
             parent: root + 2,
-            detail: "SEARCH d USING INDEX frozen_data (manifest_id=?)".into(),
+            detail: "SEARCH d USING INDEX frozen_data (manifest_id=? AND ordinal>?)".into(),
         },
         PlanNode {
             id: root + 4,
@@ -2553,7 +2598,7 @@ async fn seed_plan_noise(db: &SqliteDatabase) {
         for kind in [0_i64, 1_i64] {
             db.execute_raw(Statement::from_sql_and_values(
                 DbBackend::Sqlite,
-                "INSERT INTO compaction_frozen_layout(manifest_id,kind,active,pending) VALUES (?,?,1,0)",
+                "INSERT INTO compaction_frozen_layout(manifest_id,kind,active,pending) VALUES (?,?,0,1)",
                 [id.clone().into(), kind.into()],
             ))
             .await
@@ -2565,6 +2610,7 @@ async fn seed_plan_noise(db: &SqliteDatabase) {
             ))
             .await
             .unwrap();
+            db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,"UPDATE compaction_frozen_layout SET active=1,pending=0 WHERE manifest_id=?1 AND kind=?2",[id.clone().into(),kind.into()])).await.unwrap();
         }
     }
 }
@@ -2660,31 +2706,53 @@ async fn production_plan_scopes_zstd_source_and_logical_frozen_view_lookups() {
     assert_production_plan(&plan, true);
 }
 
+fn raw_fixture_snapshot(operation: &str, owner: &str, coverage: Vec<SourceRef>) -> String {
+    let selection = ModelSelection {
+        transport: Transport::Api,
+        instance: "publication-fixture".into(),
+        model: "publication-model".into(),
+        effort: None,
+    };
+    serde_json::to_string(&pioneer_compaction::OperationSnapshot {
+        id: operation.into(),
+        owner: owner.into(),
+        expected_checkpoint: None,
+        projection_version: 0,
+        source_epochs: std::collections::BTreeMap::new(),
+        admission: pioneer_compaction::CompactionSettings::default()
+            .admit(&selection, None, 0)
+            .unwrap(),
+        plan: pioneer_compaction::CompactionPlan {
+            mode: pioneer_compaction::CompactionMode::Normal,
+            coverage_domain: pioneer_compaction::CoverageDomain::WorkingContext,
+            compact: (0..coverage.len()).collect(),
+            retain: vec![],
+            coverage,
+            fingerprint: operation.into(),
+        },
+    })
+    .unwrap()
+}
+
 async fn publication_candidate(fixture: &Fixture, operation: &str, sources: usize) -> RunnerState {
     assert!(sources > 0);
     let db = fixture.db();
     for ordinal in 0..sources {
         let id = format!("{operation}-source-{ordinal}");
-        db.execute_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "INSERT INTO turn_event(\
-                id,thread_id,turn_id,sequence,event_type,payload,created_at) \
-             VALUES (?,'root-thread','root-turn',?,'fixture','{}',CURRENT_TIMESTAMP)",
-            [id.into(), (10_000_i64 + ordinal as i64).into()],
-        ))
-        .await
-        .unwrap();
+        db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+            "INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at) VALUES (?1,'root-thread','root-turn',?2,'fixture','{}',CURRENT_TIMESTAMP)",
+            [id.into(),(10_000_i64+ordinal as i64).into()])).await.unwrap();
     }
-    db.execute_raw(Statement::from_sql_and_values(
-        DbBackend::Sqlite,
-        "INSERT INTO compaction_operation(\
-            id,owner,fingerprint,status,snapshot,deadline_ms) \
-         VALUES (?,'root-owner',?,'running',\
-          '{\"plan\":{\"coverage_domain\":\"own_contribution\"},\"source_epochs\":{\"root-thread\":0,\"source-thread\":0,\"foreign-thread\":0}}',900000)",
-        [operation.into(), operation.into()],
-    ))
-    .await
-    .unwrap();
+    let coverage = (0..sources)
+        .map(|ordinal| SourceRef {
+            scope: "event:root-turn".into(),
+            id: format!("{operation}-source-{ordinal}"),
+            version: "event-revision:1".into(),
+        })
+        .collect::<Vec<_>>();
+    db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+        "INSERT INTO compaction_operation(id,owner,fingerprint,status,snapshot,deadline_ms) VALUES (?1,'root-owner',?1,'running',?2,900000)",
+        [operation.into(),raw_fixture_snapshot(operation,"root-owner",coverage.clone()).into()])).await.unwrap();
     for ordinal in 0..sources {
         let id = format!("{operation}-source-{ordinal}");
         db.execute_raw(Statement::from_sql_and_values(
@@ -2712,15 +2780,28 @@ async fn publication_candidate(fixture: &Fixture, operation: &str, sources: usiz
         effort: None,
     })
     .unwrap();
+    let exact_candidate = pioneer_compaction::Checkpoint {
+        id: checkpoint.clone(),
+        operation_id: operation.into(),
+        owner: "root-owner".into(),
+        previous: None,
+        coverage: coverage.clone(),
+        summary: "prepared summary".into(),
+        selection: serde_json::from_str(&selection).unwrap(),
+        projection_version: 0,
+        format_version: 1,
+    };
+    let identity = checkpoint_identity(&exact_candidate).unwrap();
     db.execute_raw(Statement::from_sql_and_values(
         DbBackend::Sqlite,
         "INSERT INTO compaction_checkpoint(\
             id,operation_id,owner,portion,summary,identity_sha256,selection,\
             projection_version,format_version,status) \
-         VALUES (?,?,'root-owner',0,'prepared summary','candidate-identity',?,0,1,'candidate')",
+         VALUES (?,?,'root-owner',0,'prepared summary',?,?,0,1,'candidate')",
         [
             checkpoint.clone().into(),
             operation.into(),
+            identity.into(),
             selection.into(),
         ],
     ))
@@ -2812,6 +2893,58 @@ async fn assert_positive_publication_preflight(
     );
 }
 
+// Finish intentionally mutable marker-0 fixture metadata before publication.
+async fn finish_checkpoint_fixture(fixture: &Fixture, id: &str) -> String {
+    let checkpoint = fixture
+        .store
+        .compaction_checkpoint(id)
+        .await
+        .unwrap()
+        .unwrap();
+    let identity = crate::repositories::compaction::checkpoint_identity(&checkpoint).unwrap();
+    fixture
+        .db()
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE compaction_checkpoint SET identity_sha256=?1 WHERE id=?2 AND proof_version=0",
+            [identity.clone().into(), id.into()],
+        ))
+        .await
+        .unwrap();
+    identity
+}
+
+async fn install_verified_projection(
+    fixture: &Fixture,
+    operation: &str,
+    reference: &serde_json::Value,
+) {
+    use sha2::{Digest, Sha256};
+    let typed: pioneer_compaction::frozen::FrozenMessageRef =
+        serde_json::from_value(reference.clone()).unwrap();
+    typed.validate().unwrap();
+    let canonical = serde_json::to_vec(&typed).unwrap();
+    let mut digest = Sha256::new();
+    digest.update((canonical.len() as u64).to_be_bytes());
+    digest.update(&canonical);
+    let identity = hex::encode(digest.finalize());
+    let json = serde_json::to_string(&typed).unwrap();
+    let manifest = format!("{operation}-verified-origin");
+    let db = fixture.db();
+    db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+        "INSERT INTO compaction_frozen_history(id,workspace_id,owner_thread,identity_sha256,message_count,import_count,imports_sha256,ready,next_ordinal,next_import) VALUES (?1,'ws','root-thread',?2,1,0,?3,1,1,0)",
+        [manifest.clone().into(),identity.clone().into(),hex::encode(Sha256::digest([])).into()])).await.unwrap();
+    db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+        "INSERT INTO compaction_frozen_message_data(manifest_id,ordinal,reference_json,bytes) VALUES (?1,0,?2,?3)",
+        [manifest.clone().into(),json.clone().into(),(json.len() as i64).into()])).await.unwrap();
+    db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+        "INSERT INTO compaction_operation_projection(operation_id,manifest_id,identity_sha256,imports_sha256,import_count) VALUES (?1,?2,?3,?4,0)",
+        [operation.into(),manifest.into(),identity.into(),hex::encode(Sha256::digest([])).into()])).await.unwrap();
+    db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+        "INSERT INTO compaction_runner_plan(operation_id,source_count,reference_count,descriptor,ready) VALUES (?1,1,0,'fixture ready plan',1)",
+        [operation.into()])).await.unwrap();
+}
+
 async fn bind_reference_checkpoint_chain(fixture: &Fixture, operation: &str, nodes: usize) {
     assert!(nodes > 0);
     let db = fixture.db();
@@ -2858,6 +2991,7 @@ async fn bind_reference_checkpoint_chain(fixture: &Fixture, operation: &str, nod
     ))
     .await
     .unwrap();
+    finish_checkpoint_fixture(fixture, &format!("{operation}-checkpoint")).await;
 }
 
 #[tokio::test]
@@ -2995,10 +3129,6 @@ async fn publication_keeps_atomic_cancellation_generation_identity_and_head_guar
             CommitOutcome::Stale,
         ),
         (
-            "UPDATE compaction_checkpoint SET owner='source-owner' WHERE id='publication-control-checkpoint'",
-            CommitOutcome::Stale,
-        ),
-        (
             "UPDATE compaction_context SET head='source-checkpoint' WHERE owner='root-owner'",
             CommitOutcome::Stale,
         ),
@@ -3037,6 +3167,52 @@ async fn publication_keeps_atomic_cancellation_generation_identity_and_head_guar
             "completed"
         );
     }
+}
+
+#[tokio::test]
+async fn publication_rejects_changed_candidate_owner_before_seal_and_guard_blocks_it_after_seal() {
+    use crate::repositories::compaction::CommitOutcome;
+    let fixture = fixture().await;
+    let operation = "publication-owner-before";
+    let state = publication_candidate(&fixture, operation, 1).await;
+    fixture.db().execute_unprepared("UPDATE compaction_checkpoint SET owner='source-owner' WHERE id='publication-owner-before-checkpoint'").await.unwrap();
+    assert_eq!(
+        fixture
+            .store
+            .compaction_apply_runner(operation, &state, None)
+            .await
+            .unwrap(),
+        CommitOutcome::Stale
+    );
+    assert_ne!(
+        fixture
+            .store
+            .compaction_operation(operation)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        "completed"
+    );
+
+    let fixture = self::fixture().await;
+    let operation = "publication-owner-after";
+    let state = publication_candidate(&fixture, operation, 1).await;
+    assert_positive_publication_preflight(&fixture, operation, &state).await;
+    let error = fixture.db().execute_unprepared("UPDATE compaction_checkpoint SET owner='source-owner' WHERE id='publication-owner-after-checkpoint'").await.unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("sealed checkpoint identity immutable")
+    );
+    assert_eq!(
+        fixture
+            .store
+            .compaction_apply_runner(operation, &state, None)
+            .await
+            .unwrap(),
+        CommitOutcome::Applied
+    );
 }
 
 #[tokio::test]
@@ -3268,14 +3444,18 @@ async fn writer_publication_boundary_has_no_heavy_checks_as_manifest_and_dag_gro
         assert_eq!(metrics.coverage_checks, 1);
         assert_eq!(metrics.manifest_checks, 0);
         assert_eq!(metrics.heavy_checks_while_writer, 0);
-        assert_eq!(metrics.writer_entries, 1);
+        assert_eq!(metrics.proof_seal_writer_entries, 1);
+        assert!(metrics.topology_pages > 0 && metrics.dependency_checks > 0);
+        assert_eq!(
+            metrics.writer_entries,
+            metrics.proof_seal_writer_entries + 1
+        );
     }
 
     for (operation, nodes) in [("publication-dag-small", 1), ("publication-dag-large", 257)] {
         let fixture = fixture().await;
         let state = publication_candidate(&fixture, operation, 2).await;
         bind_reference_checkpoint_chain(&fixture, operation, nodes).await;
-        assert_positive_publication_preflight(&fixture, operation, &state).await;
         reset_publication_test_metrics(operation);
         assert_eq!(
             fixture
@@ -3290,7 +3470,12 @@ async fn writer_publication_boundary_has_no_heavy_checks_as_manifest_and_dag_gro
         assert_eq!(metrics.manifest_checks, 0);
         assert_eq!(metrics.heavy_checks_while_writer, 0);
         assert_eq!(
-            metrics.writer_entries, 1,
+            metrics.proof_seal_writer_entries, 1,
+            "actual new seal must be observed"
+        );
+        assert_eq!(
+            metrics.writer_entries,
+            metrics.proof_seal_writer_entries + 1,
             "writer traversed {nodes} DAG nodes"
         );
     }
@@ -3689,14 +3874,13 @@ async fn checkpoint_projection_metadata_is_paged_deduplicated_and_releases_each_
     let db = fixture.db();
     let count = SOURCE_PAGE_ROWS as i64 * 2 + 2;
     db.execute_raw(sqlite_specific_sql(
-        "INSERT INTO compaction_frozen_history(id,workspace_id,owner_thread,identity_sha256,message_count,next_ordinal,import_count,imports_sha256,next_import,ready) VALUES ('projection-pages','ws','source-thread','identity',?,?,0,'imports',0,1)",
+        "INSERT INTO compaction_frozen_history(id,workspace_id,owner_thread,identity_sha256,message_count,next_ordinal,import_count,imports_sha256,next_import,ready) VALUES ('projection-pages','ws','source-thread','preparing',?,?,0,'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855',0,0)",
         [count.into(), count.into()],
     ))
     .await
     .unwrap();
-    db.execute_unprepared("INSERT INTO compaction_operation_projection(operation_id,manifest_id,identity_sha256,imports_sha256,import_count) VALUES ('source-operation','projection-pages','identity','imports',0)")
-        .await
-        .unwrap();
+    use sha2::{Digest, Sha256};
+    let mut digest = Sha256::new();
     for ordinal in 0..count {
         let reference = serde_json::json!({
             "source_thread": "source-thread",
@@ -3717,10 +3901,12 @@ async fn checkpoint_projection_metadata_is_paged_deduplicated_and_releases_each_
             "tool_name": null
         })
         .to_string();
-        serde_json::from_str::<pioneer_compaction::frozen::FrozenMessageRef>(&reference)
-            .unwrap()
-            .validate()
-            .unwrap();
+        let typed: pioneer_compaction::frozen::FrozenMessageRef =
+            serde_json::from_str(&reference).unwrap();
+        typed.validate().unwrap();
+        let canonical = serde_json::to_vec(&typed).unwrap();
+        digest.update((canonical.len() as u64).to_be_bytes());
+        digest.update(canonical);
         db.execute_raw(sqlite_specific_sql(
             "INSERT INTO compaction_frozen_message_data(manifest_id,ordinal,reference_json,bytes) VALUES ('projection-pages',?,?,?)",
             [ordinal.into(), reference.clone().into(), (reference.len() as i64).into()],
@@ -3728,6 +3914,10 @@ async fn checkpoint_projection_metadata_is_paged_deduplicated_and_releases_each_
         .await
         .unwrap();
     }
+
+    let identity = hex::encode(digest.finalize());
+    db.execute_raw(sqlite_specific_sql("UPDATE compaction_frozen_history SET identity_sha256=?,ready=1 WHERE id='projection-pages'", [identity.clone().into()])).await.unwrap();
+    db.execute_raw(sqlite_specific_sql("INSERT INTO compaction_operation_projection(operation_id,manifest_id,identity_sha256,imports_sha256,import_count) VALUES ('source-operation','projection-pages',?,'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855',0)", [identity.into()])).await.unwrap();
 
     for shared in [false, true] {
         let observer = observe_checkpoint_projection_page_test_reads(&db, "projection-pages");
@@ -3793,12 +3983,783 @@ async fn checkpoint_projection_metadata_is_paged_deduplicated_and_releases_each_
             for sql in [
                 "INSERT INTO compaction_frozen_history(id,workspace_id,owner_thread,identity_sha256,message_count,next_ordinal,import_count,imports_sha256,next_import,ready) SELECT 'projection-storage',workspace_id,owner_thread,identity_sha256,message_count,next_ordinal,import_count,imports_sha256,next_import,ready FROM compaction_frozen_history WHERE id='projection-pages'",
                 "INSERT INTO compaction_frozen_message_data SELECT 'projection-storage',ordinal,reference_json,bytes FROM compaction_frozen_message_data WHERE manifest_id='projection-pages'",
-                "INSERT INTO compaction_frozen_layout(manifest_id,kind,active,pending) VALUES ('projection-pages',0,1,0)",
+                "INSERT INTO compaction_frozen_layout(manifest_id,kind,active,pending) VALUES ('projection-pages',0,0,1)",
                 "INSERT INTO compaction_frozen_span(manifest_id,kind,start,end,source_manifest) SELECT 'projection-pages',0,0,message_count,'projection-storage' FROM compaction_frozen_history WHERE id='projection-pages'",
+                "UPDATE compaction_frozen_layout SET active=1,pending=0 WHERE manifest_id='projection-pages' AND kind=0",
                 "DELETE FROM compaction_frozen_message_data WHERE manifest_id='projection-pages'",
             ] {
                 db.execute_unprepared(sql).await.unwrap();
             }
         }
     }
+}
+
+// Published legacy foreign nodes, with one exact historical raw leaf each.
+// The root is a saved raw assertion candidate with selected (not reference-only)
+// foreign sources. Large aggregate strings fit individually in a quantum.
+async fn publication_foreign_fanout(f: &Fixture, operation: &str, n: usize) -> RunnerState {
+    let mut state = publication_candidate(f, operation, 1).await;
+    let root = format!("{operation}-checkpoint");
+    let mut checkpoint = f.store.compaction_checkpoint(&root).await.unwrap().unwrap();
+    let leaf = SourceRef {
+        scope: "event:source-turn".into(),
+        id: "event-source".into(),
+        version: "event-revision:1".into(),
+    };
+    let db = f.db();
+    let mut sources = Vec::new();
+    for i in 0..n {
+        let owner = format!("{operation}-foreign-{i:04}-{}", "x".repeat(1024));
+        let op = format!("{operation}-dependency-{i:04}");
+        let cp = pioneer_compaction::Checkpoint {
+            id: format!("{op}-cp"),
+            operation_id: op.clone(),
+            owner: owner.clone(),
+            previous: None,
+            summary: "foreign historical summary".into(),
+            selection: checkpoint.selection.clone(),
+            coverage: vec![leaf.clone()],
+            projection_version: 0,
+            format_version: 1,
+        };
+        let identity = checkpoint_identity(&cp).unwrap();
+        db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+            "INSERT INTO compaction_context(owner,workspace_id,thread_id,format_version) VALUES(?1,'ws','source-thread',1)",[owner.clone().into()])).await.unwrap();
+        db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+            "INSERT INTO compaction_operation(id,owner,fingerprint,status,snapshot,deadline_ms) VALUES(?1,?2,?1,'completed',?3,900000)",
+            [op.clone().into(),owner.clone().into(),raw_fixture_snapshot(&op,&owner,vec![leaf.clone()]).into()])).await.unwrap();
+        db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+            "INSERT INTO compaction_checkpoint(id,operation_id,owner,portion,summary,selection,projection_version,format_version,identity_sha256,status) VALUES(?1,?2,?3,0,?4,?5,0,1,?6,'applied')",
+            [cp.id.clone().into(),op.clone().into(),owner.clone().into(),cp.summary.clone().into(),serde_json::to_string(&cp.selection).unwrap().into(),identity.clone().into()])).await.unwrap();
+        db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+            "INSERT INTO compaction_coverage(checkpoint_id,source_scope,source_id,source_version) VALUES(?1,?2,?3,?4)",
+            [cp.id.clone().into(),leaf.scope.clone().into(),leaf.id.clone().into(),leaf.version.clone().into()])).await.unwrap();
+        db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+            "INSERT INTO compaction_manifest(operation_id,ordinal,unit_ordinal,reference_only,source_thread,source_scope,source_id,source_version) VALUES(?1,0,0,0,'source-thread',?2,?3,?4)",
+            [op.into(),leaf.scope.clone().into(),leaf.id.clone().into(),leaf.version.clone().into()])).await.unwrap();
+        sources.push(SourceRef {
+            scope: format!("checkpoint:{owner}"),
+            id: cp.id,
+            version: identity,
+        });
+    }
+    db.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "UPDATE compaction_operation SET snapshot=?2 WHERE id=?1",
+        [
+            operation.into(),
+            raw_fixture_snapshot(operation, "root-owner", sources.clone()).into(),
+        ],
+    ))
+    .await
+    .unwrap();
+    db.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "DELETE FROM compaction_manifest WHERE operation_id=?1",
+        [operation.into()],
+    ))
+    .await
+    .unwrap();
+    db.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "DELETE FROM compaction_coverage WHERE checkpoint_id=?1",
+        [root.clone().into()],
+    ))
+    .await
+    .unwrap();
+    for (ordinal, r) in sources.iter().enumerate() {
+        db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+            "INSERT INTO compaction_manifest(operation_id,ordinal,unit_ordinal,reference_only,source_thread,source_scope,source_id,source_version) VALUES(?1,?2,?2,0,'source-thread',?3,?4,?5)",
+            [operation.into(),(ordinal as i64).into(),r.scope.clone().into(),r.id.clone().into(),r.version.clone().into()])).await.unwrap();
+        db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+            "INSERT INTO compaction_coverage(checkpoint_id,source_scope,source_id,source_version) VALUES(?1,?2,?3,?4)",
+            [root.clone().into(),r.scope.clone().into(),r.id.clone().into(),r.version.clone().into()])).await.unwrap();
+    }
+    if n == CHECKPOINT_SOURCE_LIMIT {
+        assert!(
+            sources
+                .iter()
+                .map(|source| source.scope.len() + source.id.len() + source.version.len())
+                .sum::<usize>()
+                > SOURCE_PAGE_BYTES,
+            "supported fan-out must still exceed one byte quantum"
+        );
+    }
+    checkpoint.coverage = sources;
+    db.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "UPDATE compaction_checkpoint SET identity_sha256=?2 WHERE id=?1",
+        [
+            root.into(),
+            checkpoint_identity(&checkpoint).unwrap().into(),
+        ],
+    ))
+    .await
+    .unwrap();
+    state.cursor.unit = n as u64;
+    db.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "UPDATE compaction_runner_state SET state=?2 WHERE operation_id=?1",
+        [
+            operation.into(),
+            serde_json::to_string(&state).unwrap().into(),
+        ],
+    ))
+    .await
+    .unwrap();
+    state
+}
+#[tokio::test]
+async fn large_selected_foreign_fanout_pages_every_set_and_observes_constant_actual_seal_writer() {
+    use crate::repositories::compaction::CommitOutcome;
+    for n in [2, CHECKPOINT_SOURCE_LIMIT] {
+        let f = fixture().await;
+        let operation = format!("seal-fanout-{n}");
+        let state = publication_foreign_fanout(&f, &operation, n).await;
+        reset_publication_test_metrics(&operation);
+        assert_eq!(
+            f.store
+                .compaction_apply_runner(&operation, &state, None)
+                .await
+                .unwrap(),
+            CommitOutcome::Applied
+        );
+        let metrics = publication_test_metrics(&operation);
+        assert_eq!(
+            metrics.proof_seal_writer_entries, 1,
+            "root's real seal must be cold, not precredited"
+        );
+        assert_eq!(
+            metrics.writer_entries, 2,
+            "one short root seal and one final publication"
+        );
+        assert_eq!(metrics.heavy_checks_while_writer, 0);
+        assert!(metrics.topology_pages >= 4 && metrics.dependency_checks >= n);
+        assert!(metrics.topology_page_rows <= SOURCE_PAGE_ROWS as usize);
+        assert!(metrics.topology_page_bytes <= SOURCE_PAGE_BYTES);
+        let root = format!("{operation}-checkpoint");
+        let edges = f
+            .store
+            .compaction_checkpoint_edges(&root)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(edges.coverage.len(), n);
+        let sealed:i64=f.db().query_one_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+            "SELECT count(*) AS n FROM compaction_checkpoint WHERE id LIKE ?1 AND proof_version=1",[format!("{operation}-dependency-%").into()])).await.unwrap().unwrap().try_get("","n").unwrap();
+        assert_eq!(
+            sealed, n as i64,
+            "all foreign dependencies were prepared, not just a final summary"
+        );
+    }
+}
+#[tokio::test]
+async fn actual_proof_seal_boundary_rejects_mutation_and_stop_but_allows_historical_source_edits() {
+    use crate::repositories::compaction::CommitOutcome;
+    for before in [false, true] {
+        let f = fixture().await;
+        let operation = "seal-source-edit";
+        let state = publication_candidate(&f, operation, 130).await;
+        let sql = "UPDATE turn_event SET payload='changed after summary' WHERE id='seal-source-edit-source-0'";
+        if before {
+            f.db().execute_unprepared(sql).await.unwrap();
+        }
+        let mut hook =
+            arm_publication_test_hook(&f.store, operation, PublicationTestPause::ProofSeal);
+        let store = f.store.clone();
+        let task =
+            tokio::spawn(
+                async move { store.compaction_apply_runner(operation, &state, None).await },
+            );
+        hook.reached().await;
+        for sql in [
+            "DELETE FROM compaction_coverage WHERE checkpoint_id='seal-source-edit-checkpoint'",
+            "UPDATE compaction_coverage SET source_version='lost' WHERE checkpoint_id='seal-source-edit-checkpoint'",
+            "UPDATE compaction_manifest SET source_thread='foreign-thread' WHERE operation_id='seal-source-edit'",
+            "UPDATE compaction_operation SET snapshot='{}' WHERE id='seal-source-edit'",
+            "UPDATE compaction_operation SET next_portion=0 WHERE id='seal-source-edit'",
+        ] {
+            assert!(
+                f.db().execute_unprepared(sql).await.is_err(),
+                "prepared sets must be immutable"
+            );
+        }
+        if !before {
+            f.db().execute_unprepared(sql).await.unwrap();
+        }
+        hook.release();
+        assert_eq!(task.await.unwrap().unwrap(), CommitOutcome::Applied);
+    }
+    for cancel_first in [false, true] {
+        let f = fixture().await;
+        let operation = "seal-stop";
+        let state = publication_candidate(&f, operation, 130).await;
+        if cancel_first {
+            f.db()
+                .execute_unprepared(
+                    "UPDATE compaction_operation SET status='cancelled' WHERE id='seal-stop'",
+                )
+                .await
+                .unwrap();
+            assert!(
+                f.store
+                    .compaction_apply_runner(operation, &state, None)
+                    .await
+                    .is_err()
+            );
+        } else {
+            let mut hook =
+                arm_publication_test_hook(&f.store, operation, PublicationTestPause::ProofSeal);
+            let store = f.store.clone();
+            let task = tokio::spawn(async move {
+                store.compaction_apply_runner(operation, &state, None).await
+            });
+            hook.reached().await;
+            f.db()
+                .execute_unprepared(
+                    "UPDATE compaction_operation SET status='cancelled' WHERE id='seal-stop'",
+                )
+                .await
+                .unwrap();
+            hook.release();
+            assert!(task.await.unwrap().is_err());
+        }
+        assert_eq!(f.store.compaction_head("root-owner").await.unwrap(), None);
+        let version: i64 = f
+            .db()
+            .query_one_raw(Statement::from_string(
+                DbBackend::Sqlite,
+                "SELECT proof_version FROM compaction_checkpoint WHERE id='seal-stop-checkpoint'",
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get("", "proof_version")
+            .unwrap();
+        assert_eq!(version, 0, "Stop must not seal a stale preparation");
+    }
+}
+#[tokio::test]
+async fn proof_seal_cancelled_preparation_and_marker_rollback_restart_exactly() {
+    use crate::repositories::compaction::CommitOutcome;
+    for rollback in [false, true] {
+        let f = fixture().await;
+        let operation = "seal-restart";
+        let state = publication_candidate(&f, operation, 130).await;
+        if rollback {
+            f.db().execute_unprepared("CREATE TRIGGER fixture_seal_fault BEFORE UPDATE OF proof_version ON compaction_checkpoint WHEN NEW.id='seal-restart-checkpoint' AND NEW.proof_version=1 BEGIN SELECT RAISE(ABORT,'seal fixture fault'); END").await.unwrap();
+            assert!(
+                f.store
+                    .compaction_apply_runner(operation, &state, None)
+                    .await
+                    .is_err()
+            );
+            f.db()
+                .execute_unprepared("DROP TRIGGER fixture_seal_fault")
+                .await
+                .unwrap();
+        } else {
+            let mut hook =
+                arm_publication_test_hook(&f.store, operation, PublicationTestPause::ProofSeal);
+            let store = f.store.clone();
+            let saved = state.clone();
+            let task = tokio::spawn(async move {
+                store.compaction_apply_runner(operation, &saved, None).await
+            });
+            hook.reached().await;
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+            drop(hook);
+        }
+        let marker:i64=f.db().query_one_raw(Statement::from_string(DbBackend::Sqlite,"SELECT proof_version FROM compaction_checkpoint WHERE id='seal-restart-checkpoint'")).await.unwrap().unwrap().try_get("","proof_version").unwrap();
+        assert_eq!(marker, 0);
+        assert_eq!(f.store.compaction_head("root-owner").await.unwrap(), None);
+        assert_eq!(
+            f.store
+                .compaction_apply_runner(operation, &state, None)
+                .await
+                .unwrap(),
+            CommitOutcome::Applied
+        );
+    }
+}
+
+#[tokio::test]
+async fn topology_pages_keep_domain_bounds_and_reject_single_poison_or_ambiguous_ownership() {
+    for poison in ["source", "owner", "ambiguous", "version", "missing"] {
+        let f = fixture().await;
+        let operation = format!("topology-poison-{poison}");
+        let state = publication_candidate(&f, &operation, 1).await;
+        let root = format!("{operation}-checkpoint");
+        let source = format!("{operation}-source-0");
+        match poison {
+            "source" => {
+                f.db()
+                    .execute_raw(Statement::from_sql_and_values(
+                        DbBackend::Sqlite,
+                        "UPDATE compaction_coverage SET source_id=?2 WHERE checkpoint_id=?1",
+                        [
+                            root.clone().into(),
+                            "x".repeat(SOURCE_PAGE_BYTES + 1).into(),
+                        ],
+                    ))
+                    .await
+                    .unwrap();
+            }
+            "owner" => {
+                f.db()
+                    .execute_raw(Statement::from_sql_and_values(
+                        DbBackend::Sqlite,
+                        "UPDATE compaction_manifest SET source_thread=?2 WHERE operation_id=?1",
+                        [
+                            operation.clone().into(),
+                            "x".repeat(SOURCE_PAGE_BYTES + 1).into(),
+                        ],
+                    ))
+                    .await
+                    .unwrap();
+            }
+            "ambiguous" => {
+                f.db().execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+                    "INSERT INTO compaction_manifest(operation_id,ordinal,unit_ordinal,reference_only,source_thread,source_scope,source_id,source_version) VALUES(?1,1,0,0,'foreign-thread','event:root-turn',?2,'event-revision:1')",[operation.clone().into(),source.into()])).await.unwrap();
+            }
+            "version" => {
+                f.db().execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+                    "UPDATE compaction_coverage SET source_version='lost-version' WHERE checkpoint_id=?1",[root.clone().into()])).await.unwrap();
+            }
+            "missing" => {
+                f.db()
+                    .execute_raw(Statement::from_sql_and_values(
+                        DbBackend::Sqlite,
+                        "DELETE FROM compaction_manifest WHERE operation_id=?1",
+                        [operation.clone().into()],
+                    ))
+                    .await
+                    .unwrap();
+            }
+            _ => unreachable!(),
+        }
+        // Marker 0 + open portion represent an already corrupt legacy fixture.
+        // New candidate writers never permit these changes after their commit.
+        reset_publication_test_metrics(&operation);
+        let error =
+            crate::repositories::compaction::checkpoint_topology(&f.store.connection, &root)
+                .await
+                .err()
+                .expect("poison must not become an empty set");
+        if matches!(poison, "source" | "owner") {
+            assert!(format!("{error:#}").contains("byte quantum"));
+        }
+        let result = f
+            .store
+            .compaction_apply_runner(&operation, &state, None)
+            .await;
+        assert!(
+            !matches!(
+                result,
+                Ok(crate::repositories::compaction::CommitOutcome::Applied
+                    | crate::repositories::compaction::CommitOutcome::AlreadyApplied)
+            ),
+            "poison must refuse publication"
+        );
+        let marker: i64 = f
+            .db()
+            .query_one_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "SELECT proof_version FROM compaction_checkpoint WHERE id=?1",
+                [root.into()],
+            ))
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get("", "proof_version")
+            .unwrap();
+        assert_eq!(marker, 0);
+        assert_eq!(f.store.compaction_head("root-owner").await.unwrap(), None);
+        let metrics = publication_test_metrics(&operation);
+        assert!(
+            metrics.topology_page_rows <= SOURCE_PAGE_ROWS as usize
+                && metrics.topology_page_bytes <= SOURCE_PAGE_BYTES
+        );
+    }
+}
+#[tokio::test]
+async fn legacy_topology_replacement_lost_coverage_and_version_between_pages_are_consistency_failures()
+ {
+    use crate::repositories::compaction::CheckpointTopologyRead;
+    for mutation in [
+        "header",
+        "coverage",
+        "version",
+        "coverage-close",
+        "version-close",
+        "ownership-close",
+        "status",
+        "format",
+        "unsupported-proof",
+    ] {
+        let f = fixture().await;
+        let operation = format!("topology-page-{mutation}");
+        let _ = publication_candidate(&f, &operation, 130).await;
+        let root = format!("{operation}-checkpoint");
+        let mut read = CheckpointTopologyRead::new(&f.store.connection, &root)
+            .await
+            .unwrap()
+            .unwrap();
+        read.step(&f.store.connection).await.unwrap();
+        assert!(
+            !read.done,
+            "one worker step must not read the whole checkpoint"
+        );
+        if mutation == "ownership-close" {
+            // Observe actual owners before they are changed in the open legacy
+            // portion. Close must recheck these, not just the coverage keys.
+            for _ in 0..3 {
+                read.step(&f.store.connection).await.unwrap();
+            }
+        }
+        let first = format!("{operation}-source-0");
+        let sql = match mutation {
+            "header" => {
+                "UPDATE compaction_checkpoint SET identity_sha256='replaced' WHERE id=?1 AND ?2 IS NOT NULL"
+            }
+            "coverage" | "coverage-close" => {
+                "DELETE FROM compaction_coverage WHERE checkpoint_id=?1 AND source_id=?2"
+            }
+            "version" | "version-close" => {
+                "UPDATE compaction_coverage SET source_version='changed' WHERE checkpoint_id=?1 AND source_id=?2"
+            }
+            "ownership-close" => {
+                "UPDATE compaction_manifest SET source_thread='source-thread' WHERE operation_id=(SELECT operation_id FROM compaction_checkpoint WHERE id=?1) AND source_id=?2"
+            }
+            "status" => {
+                "UPDATE compaction_checkpoint SET status='stale' WHERE id=?1 AND ?2 IS NOT NULL"
+            }
+            "format" => {
+                "UPDATE compaction_checkpoint SET format_version=2 WHERE id=?1 AND ?2 IS NOT NULL"
+            }
+            "unsupported-proof" => {
+                "UPDATE compaction_checkpoint SET proof_version=2 WHERE id=?1 AND ?2 IS NOT NULL"
+            }
+            _ => unreachable!(),
+        };
+        if mutation == "unsupported-proof" {
+            let mut invalid = read.row.clone();
+            invalid.proof_version = 2;
+            assert!(
+                crate::repositories::compaction::refresh_checkpoint_row(
+                    &f.store.connection,
+                    &invalid
+                )
+                .await
+                .is_err()
+            );
+            assert!(
+                f.db()
+                    .execute_raw(Statement::from_sql_and_values(
+                        DbBackend::Sqlite,
+                        sql,
+                        [root.clone().into(), first.into()]
+                    ))
+                    .await
+                    .is_err(),
+                "schema also rejects unsupported durable marker"
+            );
+            continue;
+        }
+        f.db()
+            .execute_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                sql,
+                [root.clone().into(), first.into()],
+            ))
+            .await
+            .unwrap();
+        if mutation.ends_with("-close") {
+            let mut preparation =
+                crate::repositories::checkpoint_proofs::GraphPreparation::new(&root);
+            preparation.step(&f.store).await.unwrap(); // real freeze, guards live
+        }
+        let mut failed = false;
+        for _ in 0..10 {
+            match read.step(&f.store.connection).await {
+                Err(_) => {
+                    failed = true;
+                    break;
+                }
+                Ok(()) => {
+                    if read.done {
+                        break;
+                    }
+                }
+            }
+        }
+        assert!(
+            failed,
+            "{mutation} cannot silently finish a mixed legacy topology"
+        );
+    }
+}
+
+#[tokio::test]
+async fn prepared_unsealed_parent_edges_prevent_dependency_demotion_before_actual_seal() {
+    use crate::repositories::compaction::CommitOutcome;
+    let f = fixture().await;
+    let operation = "seal-incoming";
+    let state = publication_foreign_fanout(&f, operation, 2).await;
+    let mut hook = arm_publication_test_hook(&f.store, operation, PublicationTestPause::ProofSeal);
+    let store = f.store.clone();
+    let task =
+        tokio::spawn(async move { store.compaction_apply_runner(operation, &state, None).await });
+    hook.reached().await;
+    // Remove other published-root predicates in this isolated fixture, so the
+    // guard is proved specifically by incoming coverage from a marker-0 node.
+    f.db().execute_unprepared("UPDATE compaction_checkpoint SET status='candidate' WHERE id='seal-incoming-dependency-0000-cp'").await.unwrap();
+    f.db().execute_unprepared("UPDATE compaction_operation SET status='failed' WHERE id='seal-incoming-dependency-0000'").await.unwrap();
+    let version: i64 = f
+        .db()
+        .query_one_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT proof_version FROM compaction_checkpoint WHERE id='seal-incoming-checkpoint'",
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "proof_version")
+        .unwrap();
+    assert_eq!(version, 0);
+    assert!(f.db().execute_unprepared("UPDATE compaction_checkpoint SET proof_version=0 WHERE id='seal-incoming-dependency-0000-cp'").await.is_err());
+    f.db().execute_unprepared("UPDATE compaction_operation SET status='completed' WHERE id='seal-incoming-dependency-0000'").await.unwrap();
+    f.db().execute_unprepared("UPDATE compaction_checkpoint SET status='applied' WHERE id='seal-incoming-dependency-0000-cp'").await.unwrap();
+    hook.release();
+    assert_eq!(task.await.unwrap().unwrap(), CommitOutcome::Applied);
+}
+
+#[tokio::test]
+async fn dense_selected_ownership_page_plan_seeks_thread_extrema_without_duplicate_scan() {
+    use crate::repositories::compaction::CheckpointTopologyRead;
+    let f = fixture().await;
+    let operation = "topology-plan";
+    publication_candidate(&f, operation, 130).await;
+    let db = f.db();
+    // Many duplicate ordinals must not make a single ownership lookup a full
+    // range DISTINCT/sort. The sole thread is checked by indexed extrema.
+    db.execute_unprepared("WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i+1 FROM n WHERE i<2047) INSERT INTO compaction_manifest(operation_id,ordinal,unit_ordinal,reference_only,source_thread,source_scope,source_id,source_version) SELECT 'topology-plan',1000+i,1000+i,0,'root-thread','event:root-turn','topology-plan-source-0','event-revision:1' FROM n").await.unwrap();
+    let mut read = CheckpointTopologyRead::new(&f.store.connection, "topology-plan-checkpoint")
+        .await
+        .unwrap()
+        .unwrap();
+    // Three steps exhaust coverage and enter ownership while retaining progress.
+    for _ in 0..3 {
+        read.step(&f.store.connection).await.unwrap();
+    }
+    let mut statement = read.page_statement().unwrap();
+    statement.sql = format!("EXPLAIN QUERY PLAN {}", statement.sql);
+    let plan = db
+        .query_all_raw(statement)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| PlanNode {
+            id: row.try_get("", "id").unwrap(),
+            parent: row.try_get("", "parent").unwrap(),
+            detail: row.try_get("", "detail").unwrap(),
+        })
+        .collect::<Vec<_>>();
+    let seeks = plan
+        .iter()
+        .filter(|node| {
+            node.detail
+                .starts_with("SEARCH m USING COVERING INDEX compaction_manifest_source")
+                && node.detail.contains("operation_id=?")
+                && node.detail.contains("reference_only=?")
+                && node.detail.contains("source_scope=?")
+                && node.detail.contains("source_id=?")
+                && node.detail.contains("source_version=?")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        seeks.len(),
+        2,
+        "both ascending and descending owner extrema need exact indexed bounds: {plan:?}"
+    );
+    assert!(
+        !plan.iter().any(|node| node.detail.starts_with("SCAN m")),
+        "no duplicate-range scan: {plan:?}"
+    );
+    while !read.done {
+        read.step(&f.store.connection).await.unwrap();
+    }
+    assert_eq!(read.finish().unwrap().ownership.len(), 130);
+}
+
+#[tokio::test]
+async fn actual_freeze_and_seal_between_topology_pages_preserve_exact_edges_with_one_restart() {
+    use crate::repositories::{
+        checkpoint_proofs::{GraphPreparation, prepare_graph},
+        compaction::{CheckpointTopologyRead, checkpoint_topology},
+    };
+    for (transition, observed_steps) in [
+        ("freeze", 1),
+        ("freeze", 4),
+        ("seal", 1),
+        ("seal", 4),
+        ("seal-closed", 1),
+        ("seal-closed", 4),
+    ] {
+        let f = fixture().await;
+        let operation = format!("benign-{transition}-{observed_steps}");
+        publication_candidate(&f, &operation, 130).await;
+        let root = format!("{operation}-checkpoint");
+        let original = checkpoint_topology(&f.store.connection, &root)
+            .await
+            .unwrap()
+            .unwrap();
+        if transition == "seal-closed" {
+            GraphPreparation::new(&root).step(&f.store).await.unwrap();
+        }
+        let mut read = CheckpointTopologyRead::new(&f.store.connection, &root)
+            .await
+            .unwrap()
+            .unwrap();
+        for _ in 0..observed_steps {
+            read.step(&f.store.connection).await.unwrap();
+        }
+        assert!(!read.done);
+        let mut preparation = GraphPreparation::new(&root);
+        preparation.step(&f.store).await.unwrap(); // existing serialized freeze
+        if transition.starts_with("seal") {
+            prepare_graph(&f.store, &root).await.unwrap();
+        }
+        let mut steps = 0;
+        while !read.done && steps < 12 {
+            read.step(&f.store.connection).await.unwrap();
+            steps += 1;
+        }
+        assert!(
+            read.done,
+            "one monotonic close cannot cause endless restart"
+        );
+        if transition == "seal-closed" {
+            assert!(
+                steps <= 6 - observed_steps,
+                "seal does not restart an already immutable cursor"
+            );
+        }
+        let completed = read.finish().unwrap();
+        assert_eq!(completed.ownership, original.ownership);
+        assert_eq!(completed.row.identity_sha256, original.row.identity_sha256);
+        assert_eq!(completed.row.coverage_closed, 1);
+        assert_eq!(
+            completed.row.proof_version,
+            if transition.starts_with("seal") { 1 } else { 0 }
+        );
+        if transition == "freeze" {
+            prepare_graph(&f.store, &root).await.unwrap();
+        }
+        // Foreground wrappers consume the same complete exact sources.
+        let checkpoint = f.store.compaction_checkpoint(&root).await.unwrap().unwrap();
+        let edges = f
+            .store
+            .compaction_checkpoint_edges(&root)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(checkpoint.coverage.len(), 130);
+        assert_eq!(edges.coverage.len(), 130);
+        assert_eq!(edges.identity_sha256, original.row.identity_sha256);
+        assert_eq!(
+            edges
+                .coverage
+                .iter()
+                .map(|s| s.source.clone())
+                .collect::<std::collections::BTreeSet<_>>(),
+            original.ownership.keys().cloned().collect()
+        );
+        assert!(
+            edges
+                .coverage
+                .iter()
+                .all(|s| s.source_thread == "root-thread")
+        );
+        // A sealed observation accepts no demotion or scope/owner rewrite.
+        assert!(f.db().execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+            "UPDATE compaction_manifest SET source_thread='source-thread' WHERE operation_id=?1 AND ordinal=0",[operation.clone().into()])).await.is_err());
+    }
+}
+
+#[tokio::test]
+async fn coverage_eof_restart_rejects_extra_key_after_observed_maximum() {
+    use crate::repositories::{
+        checkpoint_proofs::GraphPreparation,
+        compaction::{CheckpointTopologyRead, checkpoint_source_owner, checkpoint_topology},
+    };
+    let f = fixture().await;
+    let operation = "topology-eof-extra";
+    publication_candidate(&f, operation, 130).await;
+    let root = format!("{operation}-checkpoint");
+    let original = checkpoint_topology(&f.store.connection, &root)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(original.ownership.len(), 130);
+    let mut read = CheckpointTopologyRead::new(&f.store.connection, &root)
+        .await
+        .unwrap()
+        .unwrap();
+    // Two coverage pages (128 + 2), coverage EOF, then the first ownership
+    // page. Restart must preserve the observed full set, not just its prefix.
+    for _ in 0..4 {
+        read.step(&f.store.connection).await.unwrap();
+    }
+    assert!(!read.done);
+    assert_eq!(read.row.coverage_closed, 0);
+    let extra = SourceRef {
+        scope: "event:root-turn".into(),
+        id: format!("{operation}-source-zz-extra"),
+        version: "event-revision:1".into(),
+    };
+    assert!(&extra > original.ownership.keys().next_back().unwrap());
+    // Corrupt the still-open legacy sets without rewriting checkpoint identity
+    // or disabling guards. Give the extra key a valid single historical owner
+    // so current coverage/ownership equality cannot detect this discrepancy.
+    f.db().execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+        "INSERT INTO compaction_manifest(operation_id,ordinal,unit_ordinal,reference_only,source_thread,source_scope,source_id,source_version) VALUES (?1,130,130,0,'root-thread',?2,?3,?4)",
+        [operation.into(),extra.scope.clone().into(),extra.id.clone().into(),extra.version.clone().into()])).await.unwrap();
+    f.db().execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+        "INSERT INTO compaction_coverage(checkpoint_id,source_scope,source_id,source_version) VALUES (?1,?2,?3,?4)",
+        [root.clone().into(),extra.scope.clone().into(),extra.id.clone().into(),extra.version.clone().into()])).await.unwrap();
+    assert_eq!(
+        checkpoint_source_owner(&f.store.connection, &original.row, &extra)
+            .await
+            .unwrap(),
+        "root-thread"
+    );
+    // Only the real freeze step runs: a later graph identity check would mask
+    // the reader defect by independently rejecting the corrupted full hash.
+    GraphPreparation::new(&root).step(&f.store).await.unwrap();
+    read.step(&f.store.connection).await.unwrap(); // observes close; one restart
+    assert_eq!(read.row.coverage_closed, 1);
+    let mut identity = read.row.clone();
+    identity.coverage_closed = original.row.coverage_closed;
+    assert_eq!(identity, original.row);
+    let mut failure = None;
+    for _ in 0..12 {
+        match read.step(&f.store.connection).await {
+            Err(error) => {
+                failure = Some(error);
+                break;
+            }
+            Ok(()) if read.done => break,
+            Ok(()) => {}
+        }
+    }
+    let failure = failure.expect("observed coverage EOF must reject an extra key after close");
+    assert!(
+        failure
+            .to_string()
+            .contains("checkpoint coverage changed at close"),
+        "the replay must reject the extra key itself: {failure}"
+    );
+    assert!(!read.done, "corrupt topology cannot reach finish");
 }

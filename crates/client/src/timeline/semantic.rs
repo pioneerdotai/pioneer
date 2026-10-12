@@ -1097,6 +1097,29 @@ pub fn apply_top_level_page(
     }
 
     let was_empty = cache.ordered_block_ids.is_empty();
+    // Interior refresh pages must not move the pagination boundaries inward.
+    let extends_before = page
+        .blocks
+        .iter()
+        .map(|block| &block.sort_key)
+        .min()
+        .is_some_and(|first| {
+            cache
+                .ordered_blocks()
+                .next()
+                .is_none_or(|cached| first <= &cached.sort_key)
+        });
+    let extends_after = page
+        .blocks
+        .iter()
+        .map(|block| &block.sort_key)
+        .max()
+        .is_some_and(|last| {
+            cache
+                .ordered_blocks()
+                .last()
+                .is_none_or(|cached| last >= &cached.sort_key)
+        });
     let mut changed = false;
     let mut blocks_changed = false;
     for incoming in page.blocks {
@@ -1114,7 +1137,14 @@ pub fn apply_top_level_page(
         sort_top_level_blocks(cache);
     }
     let previous_loaded_range = cache.loaded_range.clone();
-    merge_top_level_loaded_range(cache, &page.page, merge_mode, was_empty);
+    merge_top_level_loaded_range(
+        cache,
+        &page.page,
+        merge_mode,
+        was_empty,
+        extends_before,
+        extends_after,
+    );
     changed |= cache.loaded_range != previous_loaded_range;
     changed |= !cache.has_loaded_page;
     cache.has_loaded_page = true;
@@ -1172,9 +1202,7 @@ pub fn apply_thread_timeline_blocks_changed(
             changed |= thread.top_level.stale_block_ids.insert(block_id);
         }
     }
-    changed |= thread.top_level.request_status != TimelineRequestStatus::Ready;
-    thread.top_level.request_status = TimelineRequestStatus::Ready;
-
+    // Invalidation does not acknowledge a read, or clear a failed recovery.
     changed
 }
 
@@ -2876,6 +2904,19 @@ fn newest_top_level_block(
         },
     ) = (&existing.kind, &incoming.kind)
     else {
+        if let (
+            TimelineBlockKind::UserMessage {
+                revision: cached, ..
+            },
+            TimelineBlockKind::UserMessage {
+                revision: fetched, ..
+            },
+        ) = (&existing.kind, &incoming.kind)
+        {
+            if cached > fetched {
+                return existing.clone();
+            }
+        }
         return incoming;
     };
     if existing_task.id != incoming_task.id {
@@ -3787,6 +3828,8 @@ fn merge_top_level_loaded_range(
     page: &TimelinePageInfo,
     merge_mode: TopLevelPageMergeMode,
     was_empty: bool,
+    extends_before: bool,
+    extends_after: bool,
 ) {
     if was_empty || merge_mode == TopLevelPageMergeMode::Reset {
         cache.loaded_range = page.into();
@@ -3796,19 +3839,20 @@ fn merge_top_level_loaded_range(
     match merge_mode {
         TopLevelPageMergeMode::Reset => unreachable!("reset handled before merge"),
         TopLevelPageMergeMode::Merge => {
+            if extends_before {
+                cache.loaded_range.before_cursor = page.before_cursor.clone();
+                cache.loaded_range.has_more_before = page.has_more_before;
+            }
+            if extends_after {
+                cache.loaded_range.after_cursor = page.after_cursor.clone();
+                cache.loaded_range.has_more_after = page.has_more_after;
+            }
+        }
+        TopLevelPageMergeMode::MergeBefore => {
             cache.loaded_range.before_cursor = page
                 .before_cursor
                 .clone()
                 .or(cache.loaded_range.before_cursor.clone());
-            cache.loaded_range.after_cursor = page
-                .after_cursor
-                .clone()
-                .or(cache.loaded_range.after_cursor.clone());
-            cache.loaded_range.has_more_before |= page.has_more_before;
-            cache.loaded_range.has_more_after |= page.has_more_after;
-        }
-        TopLevelPageMergeMode::MergeBefore => {
-            cache.loaded_range.before_cursor = page.before_cursor.clone();
             cache.loaded_range.has_more_before = page.has_more_before;
             if cache.loaded_range.after_cursor.is_none() {
                 cache.loaded_range.after_cursor = page.after_cursor.clone();
@@ -3816,7 +3860,10 @@ fn merge_top_level_loaded_range(
             }
         }
         TopLevelPageMergeMode::MergeAfter => {
-            cache.loaded_range.after_cursor = page.after_cursor.clone();
+            cache.loaded_range.after_cursor = page
+                .after_cursor
+                .clone()
+                .or(cache.loaded_range.after_cursor.clone());
             cache.loaded_range.has_more_after = page.has_more_after;
             if cache.loaded_range.before_cursor.is_none() {
                 cache.loaded_range.before_cursor = page.before_cursor.clone();

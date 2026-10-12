@@ -2201,6 +2201,7 @@ struct TurnExecutionControl {
     command_tx: mpsc::Sender<AgentCommand>,
     run_id: u64,
     durable_cancellation: Arc<StdRwLock<Option<DurableCancellationObservation>>>,
+    restored_recovery: Option<(String, pioneer_protocol::RecoveryAttemptContext)>,
 }
 
 #[derive(Clone)]
@@ -2224,6 +2225,7 @@ impl TurnExecutionControl {
             command_tx,
             run_id,
             durable_cancellation: Arc::new(StdRwLock::new(None)),
+            restored_recovery: None,
         }
     }
 
@@ -3991,6 +3993,26 @@ impl AgentManager {
         let thread = state.threads.get(thread_id)?;
         (thread.control_plane.active_turn_id().as_deref() == Some(turn_id))
             .then_some(thread.generation)
+    }
+
+    /// Identity of the restored actor waiting at the durable pre-start boundary.
+    /// Read the existing control plane without sending a command to the actor.
+    pub async fn restored_turn_recovery_context(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        preparation_batch_id: &str,
+    ) -> Option<pioneer_protocol::RecoveryAttemptContext> {
+        let state = self.state.read().await;
+        let control = state
+            .threads
+            .get(thread_id)?
+            .control_plane
+            .execution_for(turn_id)?;
+        control
+            .restored_recovery
+            .filter(|(batch_id, _)| batch_id == preparation_batch_id)
+            .map(|(_, recovery)| recovery)
     }
 
     /// Records the first committed durable event for an active Turn exactly

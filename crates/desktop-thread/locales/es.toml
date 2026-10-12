@@ -130,7 +130,7 @@
 "chat.composer.model.select_label" = "Seleccionar modelo"
 "chat.composer.placeholder" = "Escribe un mensaje"
 "chat.composer.reply.cancel" = "Cancelar respuesta"
-"chat.composer.send_failed" = "El mensaje no se envió. Revísalo e inténtalo de nuevo."
+"chat.composer.send_failed" = "Se produjo un error al enviar. Revisa la conversación antes de volver a intentarlo."
 "chat.composer.steer_cli_runtime" = "Enviar al turno CLI en ejecución"
 "chat.composer.stop_reason" = "Turn cancelado por el usuario"
 "chat.composer.voice.desktop_hold_prompt" = "Suelta fuera del círculo para cancelar"

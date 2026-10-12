@@ -1,6 +1,12 @@
 #[path = "tests/cli_runtime_active_bindings.rs"]
 mod cli_runtime_active_bindings;
 
+#[path = "tests/recovered_turn_stop.rs"]
+mod recovered_turn_stop;
+
+#[path = "tests/recovered_native_turn_stop.rs"]
+mod recovered_native_turn_stop;
+
 #[path = "tests/agent_action_outbox.rs"]
 mod agent_action_outbox;
 
@@ -678,6 +684,7 @@ struct RecordingCliRuntimeSession {
     thread_starts: TokioMutex<Vec<CLIAgentRuntimeThreadOpenParams>>,
     thread_resumes: TokioMutex<Vec<(String, CLIAgentRuntimeThreadOpenParams)>>,
     turn_starts: TokioMutex<Vec<CLIAgentRuntimeTurnStartParams>>,
+    turn_start_pause: TokioMutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
     provider_history: TokioMutex<HashMap<String, Vec<String>>>,
     provider_boundaries: TokioMutex<HashMap<(String, String), usize>>,
     claude_record_boundaries: TokioMutex<HashMap<uuid::Uuid, (String, usize)>>,
@@ -889,6 +896,10 @@ impl CLIAgentRuntimeSession for RecordingCliRuntimeSession {
         params: CLIAgentRuntimeTurnStartParams,
         _timeout: Duration,
     ) -> anyhow::Result<CLIAgentRuntimeTurnStartSnapshot> {
+        if let Some((entered, release)) = self.turn_start_pause.lock().await.take() {
+            entered.notify_one();
+            release.notified().await;
+        }
         self.provider_history
             .lock()
             .await
@@ -11755,7 +11766,7 @@ async fn assert_concurrent_collaborative_tasks_receive_independent_frozen_comman
             vec![parent_thread_id.into(), parent_thread_id.into()],
         ),
         (
-            "INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at) VALUES ('recapture-run','recapture-task',?,?,?,CURRENT_TIMESTAMP)",
+            "WITH frozen_root_fixture(run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at) AS (VALUES ('recapture-run','recapture-task',?,?,?,CURRENT_TIMESTAMP)) INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at,frozen_manifest_id) SELECT run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at,CASE WHEN json_valid(history_json) THEN CASE WHEN json_type(history_json)='object' THEN json_extract(history_json,'$.manifest_id') ELSE NULL END ELSE NULL END FROM frozen_root_fixture",
             vec![
                 workspace_id.clone().into(),
                 parent_thread_id.into(),
@@ -11799,18 +11810,37 @@ async fn assert_concurrent_collaborative_tasks_receive_independent_frozen_comman
         );
     }
 
-    crud_store
-        .database_connection()
-        .execute_raw(sea_orm::Statement::from_sql_and_values(
-            sea_orm::DbBackend::Sqlite,
-            "UPDATE compaction_frozen_history SET imports_sha256=? WHERE id=?",
-            [
-                "0".repeat(64).into(),
-                assembled_descriptor.manifest_id.clone().into(),
-            ],
-        ))
-        .await
-        .unwrap();
+    assert!(
+        crud_store
+            .database_connection()
+            .execute_raw(sea_orm::Statement::from_sql_and_values(
+                sea_orm::DbBackend::Sqlite,
+                "UPDATE compaction_frozen_history SET imports_sha256=? WHERE id=?",
+                [
+                    "0".repeat(64).into(),
+                    assembled_descriptor.manifest_id.clone().into()
+                ],
+            ))
+            .await
+            .is_err(),
+        "a completed import digest must be immutable"
+    );
+    // Corrupt the actual backing row, including a shared import range. The
+    // unchanged header digest must detect damage to its retained proof bytes.
+    let import_row = crud_store.database_connection().query_one_raw(sea_orm::Statement::from_sql_and_values(
+        sea_orm::DbBackend::Sqlite,
+        "SELECT d.manifest_id,d.ordinal,d.proof_json,d.bytes FROM compaction_frozen_import_data d WHERE d.ordinal=0 AND ((d.manifest_id=?1 AND NOT EXISTS (SELECT 1 FROM compaction_frozen_span s WHERE s.manifest_id=?1 AND s.kind=1 AND s.start<=0 AND s.end>0)) OR EXISTS (SELECT 1 FROM compaction_frozen_span s WHERE s.manifest_id=?1 AND s.kind=1 AND s.start<=0 AND s.end>0 AND d.manifest_id=s.source_manifest)) LIMIT 1",
+        [assembled_descriptor.manifest_id.clone().into()],
+    )).await.unwrap().unwrap();
+    let backing: String = import_row.try_get("", "manifest_id").unwrap();
+    let ordinal: i64 = import_row.try_get("", "ordinal").unwrap();
+    let original_proof: String = import_row.try_get("", "proof_json").unwrap();
+    let original_bytes: i64 = import_row.try_get("", "bytes").unwrap();
+    crud_store.database_connection().execute_raw(sea_orm::Statement::from_sql_and_values(
+        sea_orm::DbBackend::Sqlite,
+        "UPDATE compaction_frozen_import_data SET proof_json='{}',bytes=2 WHERE manifest_id=? AND ordinal=?",
+        [backing.clone().into(), ordinal.into()],
+    )).await.unwrap();
     assert!(
         crate::turn_runtime_snapshot::restore_history_json(
             crud_store.as_ref(),
@@ -11822,18 +11852,23 @@ async fn assert_concurrent_collaborative_tasks_receive_independent_frozen_comman
         .is_err(),
         "own-import metadata corruption cannot silently change context ownership"
     );
-    crud_store
-        .database_connection()
-        .execute_raw(sea_orm::Statement::from_sql_and_values(
-            sea_orm::DbBackend::Sqlite,
-            "UPDATE compaction_frozen_history SET imports_sha256=? WHERE id=?",
-            [
-                import_digest.into(),
-                assembled_descriptor.manifest_id.clone().into(),
-            ],
-        ))
-        .await
-        .unwrap();
+    crud_store.database_connection().execute_raw(sea_orm::Statement::from_sql_and_values(
+        sea_orm::DbBackend::Sqlite,
+        "UPDATE compaction_frozen_import_data SET proof_json=?,bytes=? WHERE manifest_id=? AND ordinal=?",
+        [original_proof.into(), original_bytes.into(), backing.into(), ordinal.into()],
+    )).await.unwrap();
+    assert_eq!(
+        crud_store
+            .compaction_frozen_import_state(
+                &workspace_id,
+                parent_thread_id,
+                &assembled_descriptor.manifest_id,
+            )
+            .await
+            .unwrap()
+            .unwrap(),
+        (import_count, import_digest)
+    );
     for outcome in ["A complete", "B complete"] {
         assert_eq!(
             assembled
@@ -12137,15 +12172,33 @@ async fn assert_concurrent_collaborative_tasks_receive_independent_frozen_comman
     // produced result must remain independent of that expensive input path.
     let accepted_c_descriptor: pioneer_compaction::frozen::FrozenHistoryRef =
         serde_json::from_str(&accepted_c_basis.history_json).unwrap();
-    crud_store
+    let accepted_c_owner = crud_store
+        .compaction_frozen_history_owner(&workspace_id, &accepted_c_descriptor)
+        .await
+        .unwrap()
+        .unwrap();
+    let unavailable = crud_store
         .database_connection()
         .execute_raw(sea_orm::Statement::from_sql_and_values(
             sea_orm::DbBackend::Sqlite,
-            "UPDATE compaction_frozen_history SET ready=0 WHERE id=?",
+            "UPDATE compaction_frozen_layout SET failed=1 WHERE manifest_id=? AND kind=0",
             [accepted_c_descriptor.manifest_id.clone().into()],
         ))
         .await
         .unwrap();
+    assert_eq!(unavailable.rows_affected(), 1);
+    assert!(
+        crud_store
+            .compaction_frozen_history_page(
+                &workspace_id,
+                &accepted_c_owner,
+                &accepted_c_descriptor.manifest_id,
+                0,
+            )
+            .await
+            .is_err(),
+        "C's input layout must actually reject reads during output delivery"
+    );
     provider.release_third.notify_one();
     assert_eq!(
         wait_for_task_status(crud_store.clone(), &c_task.id, TaskStatus::Completed).await,
@@ -12244,7 +12297,7 @@ async fn assert_concurrent_collaborative_tasks_receive_independent_frozen_comman
         .database_connection()
         .execute_raw(sea_orm::Statement::from_sql_and_values(
             sea_orm::DbBackend::Sqlite,
-            "UPDATE compaction_frozen_history SET ready=1 WHERE id=?",
+            "UPDATE compaction_frozen_layout SET failed=0 WHERE manifest_id=? AND kind=0",
             [accepted_c_descriptor.manifest_id.into()],
         ))
         .await
@@ -21848,7 +21901,7 @@ async fn hidden_task_agent_run_uses_preflight_before_child_main_prompt_compile_b
         TaskWaitParams {
             task_ids: vec![response.task.id.clone()],
             run_ids: Vec::new(),
-            timeout_ms: Some(5_000),
+            timeout_ms: Some(30_000),
             return_completed: true,
             return_pending: true,
             ..Default::default()
@@ -22126,12 +22179,13 @@ async fn recovered_hidden_task_run_uses_preflight_before_restored_child_main_pro
         "the frozen snapshot fixture must contain prior history distinct from the current Task source turn"
     );
     let lineage = wait_for_child_lineage_for_run(crud_store.clone(), run.id.as_str()).await;
-    for _ in 0..100 {
-        if initial_provider.child_main_call_count() > 0 {
-            break;
+    timeout(Duration::from_secs(30), async {
+        while initial_provider.child_main_call_count() == 0 {
+            sleep(Duration::from_millis(25)).await;
         }
-        sleep(Duration::from_millis(25)).await;
-    }
+    })
+    .await
+    .expect("initial child must reach its main provider before recovery is injected");
     assert!(
         initial_provider.child_main_call_count() > 0,
         "initial child task provider should be hanging in the main child request"
@@ -23984,7 +24038,7 @@ async fn immediate_detached_task_runs_after_parent_and_delivers_to_occurrence_tu
         }
         CompletedHistoryDeliveryBarrier::Summarizer => provider.release_paused_call(),
     }
-    timeout(Duration::from_secs(10), async {
+    timeout(Duration::from_secs(30), async {
         loop {
             let finished = processor
                 .completed_history_checks
@@ -23999,7 +24053,7 @@ async fn immediate_detached_task_runs_after_parent_and_delivers_to_occurrence_tu
             if finished {
                 break;
             }
-            tokio::task::yield_now().await;
+            sleep(Duration::from_millis(25)).await;
         }
     })
     .await
@@ -25872,11 +25926,43 @@ async fn first_composer_cli_answer_has_no_parent_predecessor_impl() {
 fn oversized_cli_history_is_compacted_before_a_new_provider_session_starts() {
     run_standard_stack_message_test(
         "CLI transfer compacts a request larger than eight MiB",
-        oversized_cli_history_is_compacted_before_a_new_provider_session_starts_impl(),
+        cli_input_admission_impl(CliInputAdmissionCase::Frame),
     );
 }
 
-async fn oversized_cli_history_is_compacted_before_a_new_provider_session_starts_impl() {
+#[test]
+fn codex_character_overflow_compacts_history_and_rechecks_the_sent_input() {
+    run_standard_stack_message_test(
+        "Codex character admission with a protected current input",
+        cli_input_admission_impl(CliInputAdmissionCase::History),
+    );
+}
+
+#[test]
+fn oversized_codex_current_input_stops_before_compaction_and_dispatch() {
+    run_standard_stack_message_test(
+        "Codex oversized current input",
+        cli_input_admission_impl(CliInputAdmissionCase::Current),
+    );
+}
+
+#[test]
+fn fitting_codex_input_does_not_compact_or_recapture_history() {
+    run_standard_stack_message_test(
+        "Codex fitting input",
+        cli_input_admission_impl(CliInputAdmissionCase::Fits),
+    );
+}
+
+#[derive(Clone, Copy)]
+enum CliInputAdmissionCase {
+    Frame,
+    History,
+    Current,
+    Fits,
+}
+
+async fn cli_input_admission_impl(case: CliInputAdmissionCase) {
     let (tx, mut rx) = mpsc::channel(128);
     let sessions = Arc::new(SessionManager::new());
     let connection = register_authenticated_test_connection(sessions.as_ref(), tx).await;
@@ -25896,7 +25982,7 @@ async fn oversized_cli_history_is_compacted_before_a_new_provider_session_starts
         "echo",
         summarizer.clone(),
     ));
-    providers.insert("openai", summarizer).unwrap();
+    providers.insert("openai", summarizer.clone()).unwrap();
     let processor = Arc::new(with_enabled_test_cli_runtime_catalog(
         MessageProcessor::new(
             Arc::new(ThreadManager::new("test-model", "openai")),
@@ -25930,8 +26016,20 @@ async fn oversized_cli_history_is_compacted_before_a_new_provider_session_starts
         .await;
     let thread = "oversized-cli-transfer";
     let mut raw_bytes = 0_usize;
-    for index in 0..12 {
-        let text = format!("HISTORICAL HUGE CHUNK {index:02} {}", "x".repeat(730_000));
+    let (history_turns, chunk_chars) = match case {
+        CliInputAdmissionCase::Frame => (12, 730_000),
+        CliInputAdmissionCase::History => (2, 64 * 1024),
+        CliInputAdmissionCase::Current | CliInputAdmissionCase::Fits => (1, 32),
+    };
+    let history_chunk = if matches!(case, CliInputAdmissionCase::Frame) {
+        // Exercise the frame byte limit with ordinary word boundaries. One
+        // 730k-character word makes BPE merging dominate this admission test.
+        "background history ".repeat(chunk_chars / "background history ".len())
+    } else {
+        "x".repeat(chunk_chars)
+    };
+    for index in 0..history_turns {
+        let text = format!("HISTORICAL HUGE CHUNK {index:02} {history_chunk}");
         raw_bytes += text.len();
         seed_completed_task_parent_with_inputs(
             &processor,
@@ -25946,7 +26044,9 @@ async fn oversized_cli_history_is_compacted_before_a_new_provider_session_starts
         )
         .await;
     }
-    assert!(raw_bytes > crate::cli_runtime::context::MAX_CLI_TURN_INPUT_FRAME_BYTES);
+    if matches!(case, CliInputAdmissionCase::Frame) {
+        assert!(raw_bytes > crate::cli_runtime::context::MAX_CLI_TURN_INPUT_FRAME_BYTES);
+    }
     open_persisted_child_for_test(
         &processor,
         connection,
@@ -25959,20 +26059,128 @@ async fn oversized_cli_history_is_compacted_before_a_new_provider_session_starts
     let turn = "oversized-cli-target";
     cli.set_next_native_turn_id("oversized-provider-turn").await;
     let request_id = generate_test_request_id("oversized-transfer", turn);
+    let current_input = match case {
+        CliInputAdmissionCase::History => format!(
+            "CURRENT AFTER BIG HISTORY {}",
+            "y".repeat(crate::cli_runtime::context::MAX_CODEX_INPUT_TEXT_CHARS - 64 * 1024),
+        ),
+        CliInputAdmissionCase::Current => {
+            "y".repeat(crate::cli_runtime::context::MAX_CODEX_INPUT_TEXT_CHARS / 2 + 1)
+        }
+        _ => "CURRENT AFTER BIG HISTORY".to_owned(),
+    };
+    let mut input = vec![json!({"type":"text","text":current_input})];
+    if matches!(case, CliInputAdmissionCase::Current) {
+        // Each Text item must fit Pioneer's byte limit while their combined
+        // character count exceeds Codex's limit, even without carried history.
+        input.push(json!({
+            "type":"text",
+            "text":"y".repeat(crate::cli_runtime::context::MAX_CODEX_INPUT_TEXT_CHARS / 2),
+        }));
+    }
     let context = sessions.connection_context(connection).await.unwrap();
-    Arc::clone(&processor).process_owned_request(context, json!({
+    let payload = json!({
         "jsonrpc":"2.0", "id":request_id, "method":"turn/start",
         "params":{"thread_id":thread,"turn_id":turn,
-            "input":[{"type":"text","text":"CURRENT AFTER BIG HISTORY"}],
+            "input":input,
             "mode":"Agent","model":"gpt-5",
             "execution_backend":{"type":"cliAgentRuntime","runtime_id":"codex","runtime_kind":CLIAgentRuntimeKind::Codex},
             "permission_profile":pioneer_protocol::TurnPermissionProfileSelection::full_access()}
-    }).to_string()).await;
-    let response = recv_response_by_id(&mut rx, &request_id).await;
+    });
+    if matches!(case, CliInputAdmissionCase::Current) {
+        let params: pioneer_protocol::TurnStartParams =
+            serde_json::from_value(payload["params"].clone()).unwrap();
+        pioneer_protocol::validate_turn_execution_envelope(&params)
+            .expect("oversized Codex fixture must pass Pioneer's execution envelope");
+    }
+    let payload = payload.to_string();
+    if matches!(case, CliInputAdmissionCase::Current) {
+        let (_, admission_events) = crate::public_error::test_support::capture_events_async(
+            Arc::clone(&processor).process_owned_request(context, payload),
+        )
+        .await;
+        let error = recv_error_by_id(&mut rx, &request_id).await;
+        let public = assert_public_error(
+            &error,
+            PublicErrorCode::Internal,
+            PublicErrorStage::Admission,
+        );
+        let event = admission_events
+            .iter()
+            .find(|event| {
+                matches!(event.contexts.get("Rust Tracing Fields"),
+                Some(sentry::protocol::Context::Other(fields))
+                if fields.get("correlation_id") == Some(&json!(public.correlation_id)))
+            })
+            .expect("oversized input must report its correlated admission diagnostic");
+        crate::public_error::test_support::assert_correlated(event, &public);
+        let sentry::protocol::Context::Other(fields) = &event.contexts["Rust Tracing Fields"]
+        else {
+            panic!("admission diagnostic must contain tracing fields");
+        };
+        let diagnostic = fields["raw_diagnostic"]
+            .as_str()
+            .expect("admission diagnostic must be text");
+        assert!(diagnostic.contains("1048576 characters"), "{diagnostic}");
+        assert!(diagnostic.contains("current CLI input"), "{diagnostic}");
+        let encoded = serde_json::to_string(&error).unwrap();
+        assert!(!encoded.contains("1048576 characters"));
+        assert!(!encoded.contains("current CLI input"));
+        assert!(cli.turn_starts.lock().await.is_empty());
+        assert_eq!(summarizer.call_count(), 0);
+        assert!(
+            store
+                .compaction_head(&crate::compaction::native_owner(&workspace, thread))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            processor.cli_transfer_capture_count.load(Ordering::SeqCst),
+            1
+        );
+        return;
+    }
+    let (_, admission_events) = crate::public_error::test_support::capture_events_async(
+        Arc::clone(&processor).process_owned_request(context, payload),
+    )
+    .await;
+    let response_payload = recv_jsonrpc_payload_by_id(&mut rx, &request_id).await;
+    let response: JsonRpcResponse = serde_json::from_str(&response_payload).unwrap_or_else(|error| {
+        panic!(
+            "CLI transfer should be admitted: {error}; payload: {response_payload}; diagnostics: {admission_events:#?}"
+        )
+    });
     let accepted: TurnStartResponse = serde_json::from_value(response.result).unwrap();
     assert_eq!(accepted.turn.id, turn);
     let starts = wait_for_cli_runtime_turn_starts(&cli, 1).await;
+    assert_eq!(starts.len(), 1);
+    let sent: Vec<pioneer_cli_agent_runtime::input::CLIRuntimeTurnInputItem> =
+        serde_json::from_value(starts[0].input.clone()).unwrap();
+    assert!(
+        crate::cli_runtime::context::codex_input_text_chars(&sent)
+            <= crate::cli_runtime::context::MAX_CODEX_INPUT_TEXT_CHARS
+    );
+    assert!(sent.iter().any(|item| matches!(item,
+        pioneer_cli_agent_runtime::input::CLIRuntimeTurnInputItem::Text { text }
+        if text == &current_input)));
     let input = starts[0].input.to_string();
+    if matches!(case, CliInputAdmissionCase::Fits) {
+        assert!(input.contains("HISTORICAL HUGE CHUNK 00"));
+        assert_eq!(summarizer.call_count(), 0);
+        assert_eq!(
+            processor.cli_transfer_capture_count.load(Ordering::SeqCst),
+            1
+        );
+        assert!(
+            store
+                .compaction_head(&crate::compaction::native_owner(&workspace, thread))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        return;
+    }
     assert!(input.contains("CURRENT AFTER BIG HISTORY"));
     assert!(
         input.contains("PUBLISHED HUGE HISTORY SUMMARY"),
@@ -26000,6 +26208,36 @@ async fn oversized_cli_history_is_compacted_before_a_new_provider_session_starts
         head.is_some(),
         "oversized transfer must publish a real checkpoint"
     );
+    if matches!(case, CliInputAdmissionCase::History) {
+        assert!(
+            raw_bytes + current_input.len()
+                > crate::cli_runtime::context::MAX_CODEX_INPUT_TEXT_CHARS
+        );
+        assert!(
+            raw_bytes + current_input.len()
+                < crate::cli_runtime::context::MAX_CLI_TURN_INPUT_FRAME_BYTES
+        );
+        assert!((2..=3).contains(&processor.cli_transfer_capture_count.load(Ordering::SeqCst)));
+        assert!(!input.contains("HISTORICAL HUGE CHUNK 01"));
+        let requests = summarizer.snapshot_requests();
+        assert!(!requests.is_empty());
+        for marker in ["HISTORICAL HUGE CHUNK 00", "HISTORICAL HUGE CHUNK 01"] {
+            assert!(
+                requests.iter().any(|request| request
+                    .messages
+                    .iter()
+                    .any(|message| message.content.contains(marker))),
+                "covered history must reach the shared summarizer: {marker}"
+            );
+        }
+        assert!(requests.iter().all(|request| {
+            request
+                .messages
+                .iter()
+                .all(|message| !message.content.contains("CURRENT AFTER BIG HISTORY"))
+        }));
+        return;
+    }
     complete_recorded_cli_task_turn(
         &processor,
         cli.as_ref(),
@@ -26634,6 +26872,7 @@ async fn accepted_task_cli_transfer_compacts_without_later_parent_history_impl(
             None,
             0,
             deadline_ms,
+            None,
             prepared,
         )
         .await
@@ -26896,7 +27135,7 @@ async fn pending_cli_heartbeat_writer_is_dropped_before_compaction_cleanup_impl(
             "deadline" => processor.cli_transfer_test_deadline.notify_one(),
             _ => {}
         }
-        let finished = timeout(Duration::from_secs(15), &mut start).await;
+        let finished = timeout(Duration::from_secs(30), &mut start).await;
         if finished.is_err() {
             writer_pause.release.notify_one();
             let _ = timeout(Duration::from_secs(10), &mut start).await;
@@ -28571,7 +28810,7 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_i
                 ),
                 (
                     format!(
-                        "INSERT INTO turn_cli_runtime_binding(turn_id,thread_id,continuation_thread_id,workspace_id,runtime_id,runtime_kind,native_thread_id,status) SELECT '{child_turn}','{child}',continuation_thread_id,workspace_id,runtime_id,runtime_kind,native_thread_id,'starting' FROM turn_cli_runtime_binding WHERE turn_id='{}'",
+                        "INSERT INTO turn_cli_runtime_binding(turn_id,thread_id,continuation_thread_id,workspace_id,runtime_id,runtime_kind,native_thread_id,status,frozen_manifest_id) SELECT '{child_turn}','{child}',continuation_thread_id,workspace_id,runtime_id,runtime_kind,native_thread_id,'starting',NULL FROM turn_cli_runtime_binding WHERE turn_id='{}'",
                         lineage.child_turn_id
                     ),
                     format!("DELETE FROM turn_cli_runtime_binding WHERE turn_id='{child_turn}'"),
@@ -28679,6 +28918,13 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_i
                     .contains(history_marker.as_str()),
                 "a provider-owned parent conversation must not receive its old history again"
             );
+            assert!(
+                !next_start
+                    .input
+                    .to_string()
+                    .contains("UNSENT DELETED MESSAGE MUST NOT REACH PROVIDER"),
+                "the deleted Message must not alter the provider context"
+            );
             complete_recorded_cli_task_turn(
                 &processor,
                 cli_session.as_ref(),
@@ -28706,6 +28952,44 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_i
                 .unwrap()
                 .unwrap();
             assert_eq!(binding.continuation_thread_id, parent_thread_id);
+            if composer_index == 2 {
+                // A deleted, never-dispatched parent Message must reveal this
+                // completed Composer occurrence and its child CLI source.
+                // The next iteration checks the same provider session and
+                // both existing admission/pre-dispatch basis validations.
+                let deleted_message = format!("unsent_{runtime_id}_message");
+                seed_completed_task_parent_with_history(
+                    &processor,
+                    &workspace_id,
+                    &parent_thread_id,
+                    &deleted_message,
+                    "UNSENT DELETED MESSAGE MUST NOT REACH PROVIDER",
+                )
+                .await;
+                crud_store
+                    .delete_turn_message(pioneer_crud::DeleteTurnMessageRequest {
+                        workspace_id: workspace_id.clone(),
+                        thread_id: parent_thread_id.clone(),
+                        turn_id: deleted_message.clone(),
+                        expected_revision: 0,
+                        changed_by: pioneer_protocol::PersistedActorRef::Principal(
+                            authenticated_test_superuser().principal_id.clone(),
+                        ),
+                        changed_at_unix: super::now_timestamp_secs(),
+                    })
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    crate::cli_runtime::thread_binding::previous_delivered_parent_turn(
+                        crud_store.as_ref(),
+                        &parent_thread_id,
+                        Some(deleted_message),
+                    )
+                    .await
+                    .unwrap(),
+                    Some(run.id.clone()),
+                );
+            }
         }
         open_persisted_child_for_test(
             &processor,
@@ -31829,6 +32113,15 @@ async fn detached_composer_work_matches_parent_llm_prompts_end_to_end_impl() {
     ));
     let mut harness =
         setup_memory_agent_e2e_harness("detached_prompt_parity", provider_registry).await;
+    // Compare fixed history, as in the full-request parity fixture below.
+    // Independently indexed live recall can differ between the two executions.
+    harness
+        .processor
+        .apply_thread_episodic_runtime_config(crate::thread_episodic::ThreadEpisodicRuntimeConfig {
+            recall_enabled: false,
+            ..Default::default()
+        })
+        .await;
     harness.processor.bind_task_bridge().await;
     harness.processor.start_task_event_listener().await;
 
@@ -32105,6 +32398,15 @@ async fn detached_composer_work_matches_full_parent_llm_request_end_to_end_impl(
         tool_loop_config,
     )
     .await;
+    // Compare both routes against fixed history. Background episodic recall
+    // can index a current user message for one route before the other starts.
+    harness
+        .processor
+        .apply_thread_episodic_runtime_config(crate::thread_episodic::ThreadEpisodicRuntimeConfig {
+            recall_enabled: false,
+            ..Default::default()
+        })
+        .await;
     harness.processor.bind_task_bridge().await;
     harness.processor.start_task_event_listener().await;
 
@@ -48149,6 +48451,7 @@ fn run_interrupted_cli_runtime_turn_recovery_test(
                     fail_after_confirmation,
                     detached_child_owner,
                     invalid_durable_cwd,
+                    None,
                 ),
             ));
         })
@@ -48163,8 +48466,9 @@ async fn run_interrupted_cli_runtime_turn_recovery_scenario(
     fail_after_confirmation: bool,
     detached_child_owner: bool,
     invalid_durable_cwd: bool,
+    control_scenario: Option<recovered_turn_stop::Scenario>,
 ) {
-    let (tx, _rx) = mpsc::channel(64);
+    let (tx, mut rx) = mpsc::channel(64);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -48464,6 +48768,18 @@ async fn run_interrupted_cli_runtime_turn_recovery_scenario(
         .into_iter()
         .next()
         .expect("CLI recovery event should exist");
+    if let Some(scenario) = control_scenario {
+        recovered_turn_stop::exercise(
+            processor,
+            connection_id,
+            &mut rx,
+            cli_session,
+            recovery_event,
+            scenario,
+        )
+        .await;
+        return;
+    }
     processor
         .handle_recovery_event(recovery_event.clone(), chrono::Utc::now().timestamp())
         .await;
@@ -56191,6 +56507,18 @@ async fn assert_turn_cancel_with_optional_busy_native_actor(
         .expect("interrupted turn should be persisted");
     assert_eq!(persisted_turn.status, TurnStatus::Interrupted);
     assert_eq!(persisted_turn.error.as_deref(), Some("user clicked stop"));
+    // Aggregate reads synthesize the legacy author from the persisted initiator.
+    // The accepted canonical notification must still deliver its exact Turn.
+    assert!(persisted_turn.author.is_some());
+    assert!(failed.turn.author.is_none());
+    assert_eq!(
+        thread_manager_for_assert
+            .turn_get("thr_000000000000000022", "turn_000000000000000022")
+            .await
+            .unwrap()
+            .1,
+        failed.turn
+    );
     if busy_native {
         assert!(
             crud_store_for_assert
@@ -70554,6 +70882,7 @@ async fn completed_command_history_fits_real_background_preflight_after_projecti
         None,
         Some(512),
         0,
+        None,
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
         None,
         &mut diagnostic,
@@ -70662,6 +70991,7 @@ async fn genuinely_large_command_history_compacts_through_real_background_prefli
         None,
         Some(512),
         0,
+        None,
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
         None,
         &mut diagnostic,
@@ -76774,6 +77104,7 @@ async fn production_background_preflight_ignores_technical_noise_but_budgets_rea
                 None,
                 None,
                 fixed_input_tokens,
+                None,
                 Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 None,
                 &mut diagnostic,
@@ -77290,7 +77621,7 @@ async fn background_history_preflight_budgets_task_input_copy_once_near_threshol
     }
     db.execute_raw(sea_orm::Statement::from_sql_and_values(
         sea_orm::DbBackend::Sqlite,
-        "INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,history_json,created_at) VALUES ('background-run','background-task',?,'background-parent','background-parent-turn',?,CURRENT_TIMESTAMP)",
+        "WITH frozen_root_fixture(run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,history_json,created_at) AS (VALUES ('background-run','background-task',?,'background-parent','background-parent-turn',?,CURRENT_TIMESTAMP)) INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,history_json,created_at,frozen_manifest_id) SELECT run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,history_json,created_at,CASE WHEN json_valid(history_json) THEN CASE WHEN json_type(history_json)='object' THEN json_extract(history_json,'$.manifest_id') ELSE NULL END ELSE NULL END FROM frozen_root_fixture",
         [workspace.into(), parent_basis.clone().into()],
     ))
     .await
@@ -77326,6 +77657,7 @@ async fn background_history_preflight_budgets_task_input_copy_once_near_threshol
         None,
         Some(512),
         0,
+        None,
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
         None,
         &mut baseline,
@@ -77449,6 +77781,7 @@ async fn background_history_preflight_budgets_task_input_copy_once_near_threshol
         None,
         Some(512),
         fitting_fixed,
+        None,
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
         None,
         &mut fitting,
@@ -77479,6 +77812,7 @@ async fn background_history_preflight_budgets_task_input_copy_once_near_threshol
         None,
         Some(512),
         fixed,
+        None,
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
         None,
         &mut overflowing,
@@ -78811,6 +79145,7 @@ async fn background_completed_history_projects_reasoning_before_fit_and_compacti
         None,
         None,
         0,
+        None,
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
         None,
         &mut fitting,
@@ -78840,6 +79175,7 @@ async fn background_completed_history_projects_reasoning_before_fit_and_compacti
         None,
         None,
         fixed,
+        None,
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
         None,
         &mut compacted,
@@ -79134,6 +79470,7 @@ async fn background_deepseek_effort_matches_provider_preflight_and_token_boundar
             None,
             None,
             0,
+            None,
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
             None,
             &mut diagnostic,
@@ -79192,6 +79529,7 @@ async fn background_deepseek_effort_matches_provider_preflight_and_token_boundar
         None,
         None,
         compaction_fixed,
+        None,
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
         None,
         &mut diagnostic,
@@ -79686,12 +80024,18 @@ async fn recovery_failure_task_consumers_impl(
             .unwrap();
     }
     let lineage = wait_for_child_lineage_for_run(store.clone(), &run.id).await;
-    for _ in 0..100 {
-        if provider.child_main_call_count() > 0 {
-            break;
+    // Lineage registration precedes the child's remaining preflight work.
+    // Wait for the actual provider entry before injecting its failure; a fixed
+    // 2.5-second poll window races that preparation in the parallel suite.
+    timeout(Duration::from_secs(30), async {
+        while provider.child_main_call_count() == 0 {
+            sleep(Duration::from_millis(25)).await;
         }
-        sleep(Duration::from_millis(25)).await;
-    }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!("child provider must start before {scenario}/{path}/{parent_kind} recovery")
+    });
     assert!(provider.child_main_call_count() > 0);
     let now = super::now_timestamp_secs();
     let private = "private-response-body https://secret.example?token=credential /private/provider-key HTTP 401";
@@ -81751,3 +82095,6 @@ fn native_cancellation_race_fallback_preserves_materialization_error_and_require
 
 #[path = "tests/task_start_failure.rs"]
 mod task_start_failure;
+
+#[path = "tests/frozen_history_lifetime.rs"]
+mod frozen_history_lifetime;

@@ -130,7 +130,7 @@
 "chat.composer.model.select_label" = "モデルを選択"
 "chat.composer.placeholder" = "メッセージを書く"
 "chat.composer.reply.cancel" = "返信をキャンセル"
-"chat.composer.send_failed" = "メッセージを送信できませんでした。確認して再試行してください。"
+"chat.composer.send_failed" = "送信中にエラーが発生しました。再試行する前に会話を確認してください。"
 "chat.composer.steer_cli_runtime" = "実行中の CLI ターンへ送信"
 "chat.composer.stop_reason" = "ユーザーがターンをキャンセルしました"
 "chat.composer.voice.desktop_hold_prompt" = "キャンセルするには円の外で離します"

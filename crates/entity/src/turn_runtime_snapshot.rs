@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Serialize, Deserialize)]
 #[sea_orm(table_name = "turn_runtime_snapshot")]
 pub struct Model {
+    #[sea_orm(column_type = "Text", nullable)]
+    pub frozen_manifest_id: Option<String>,
     #[sea_orm(primary_key, auto_increment = false)]
     pub turn_id: String,
     pub thread_id: String,
