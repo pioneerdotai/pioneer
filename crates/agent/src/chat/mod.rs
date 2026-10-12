@@ -379,15 +379,40 @@ impl TaskMutationIdentity {
         let task_id = value
             .get("taskId")
             .and_then(JsonValue::as_str)
+            .filter(|_| operation != TaskMutationOperation::Create)
             .map(str::to_owned);
         let expected_revision = value.get("expectedRevision").and_then(JsonValue::as_i64);
+        // Create has no target yet. The Task owner derives a creation key from
+        // the actual item when no explicit key was accepted; equal arguments
+        // on another item are an independent creation, never its receipt.
+        let explicit_key = value
+            .as_object()
+            .and_then(|object| {
+                match (object.get("idempotencyKey"), object.get("idempotency_key")) {
+                    (Some(key), None) | (None, Some(key)) => key.as_str(),
+                    _ => None,
+                }
+            })
+            .map(str::trim)
+            .filter(|key| !key.is_empty())
+            .map(str::to_owned);
         if let Some(object) = value.as_object_mut() {
             object.remove("expectedRevision");
+            object.remove("idempotencyKey");
+            object.remove("idempotency_key");
         }
         let fingerprint = if value.is_object() {
+            let creation = if operation == TaskMutationOperation::Create {
+                Some(match explicit_key {
+                    Some(key) => serde_json::json!(["explicit_key", key]),
+                    None => serde_json::json!(["item", result.item_id]),
+                })
+            } else {
+                None
+            };
             let signature = pioneer_tools::ToolFailureSignature::from_arguments(
                 &result.tool_name,
-                &value.to_string(),
+                &serde_json::json!([value, creation]).to_string(),
                 ToolErrorClass::Unknown,
             );
             hex::encode(Sha256::digest(signature.arguments_fingerprint.as_bytes()))
@@ -416,20 +441,20 @@ impl TaskMutationIdentity {
             .get("taskId")
             .and_then(JsonValue::as_str)
             .or_else(|| output.pointer("/task/id").and_then(JsonValue::as_str));
-        let Some(output_task) = output_task.filter(|id| !id.is_empty()) else {
+        let Some(output_task) = output_task.filter(|id| id.len() == 21) else {
             return false;
         };
+        let revision = output
+            .get("revision")
+            .and_then(JsonValue::as_i64)
+            .or_else(|| output.pointer("/task/revision").and_then(JsonValue::as_i64));
+        if !revision.is_some_and(|revision| {
+            revision > 0 && expected_revision.is_none_or(|expected| revision > expected)
+        }) {
+            return false;
+        }
         if let Some(expected_task) = &self.task_id {
-            if expected_task != output_task {
-                return false;
-            }
-            let revision = output
-                .get("revision")
-                .and_then(JsonValue::as_i64)
-                .or_else(|| output.pointer("/task/revision").and_then(JsonValue::as_i64));
-            return revision.is_some_and(|revision| {
-                revision > 0 && expected_revision.is_none_or(|expected| revision > expected)
-            });
+            return expected_task == output_task;
         }
         self.operation == TaskMutationOperation::Create
     }
@@ -649,8 +674,11 @@ impl TaskMutationFinalizationGuard {
         let (identity, expected_revision) = TaskMutationIdentity::from_result(result);
         if result.success {
             self.failures_since_last_success.retain(|failure| {
-                failure.identity != identity
-                    || !identity.confirmed(result, failure.expected_revision)
+                let precondition = match (failure.expected_revision, expected_revision) {
+                    (Some(a), Some(b)) => Some(a.max(b)),
+                    (a, b) => a.or(b),
+                };
+                failure.identity != identity || !identity.confirmed(result, precondition)
             });
             return Ok(());
         }
@@ -11079,64 +11107,238 @@ mod tests {
         assert!(!phase03_names.contains(&"task_cancel".to_owned()));
     }
 
+    fn task_guard_checkpoint_context(
+        guard: &TaskMutationFinalizationGuard,
+    ) -> ExecutionCheckpointContext {
+        let budget = pioneer_tools::ToolRetryBudgetConfig::default();
+        let mut context = execution_checkpoint_context_fixture();
+        context.payload.native_semantic_state = Some(
+            super::semantic_state::capture(
+                1,
+                &None,
+                "turn_1",
+                &budget,
+                &super::native_control::NativeControlState::default(),
+                &[],
+                pioneer_tools::ToolNoProgressMode::Enforce,
+                &pioneer_tools::ToolProgressFrontier::default(),
+                &super::ToolRetryController::new(budget.clone()),
+                &super::ToolRetryLifecycleTracker::default(),
+                &None,
+                &None,
+                &Default::default(),
+                &Default::default(),
+                guard,
+                "",
+                &[],
+                &[],
+            )
+            .unwrap(),
+        );
+        context.payload.window.progress = Some(pioneer_protocol::ExecutionProgressSummary {
+            schema_version: 1,
+            baseline: [0; 3],
+            frontier: [0; 3],
+        });
+        // Exercise the persisted checkpoint codec, not just guard serialization.
+        context.payload =
+            serde_json::from_slice(&serde_json::to_vec(&context.payload).unwrap()).unwrap();
+        context
+    }
+
+    fn restore_task_guard(
+        context: &ExecutionCheckpointContext,
+    ) -> Result<TaskMutationFinalizationGuard, ChatTurnError> {
+        super::semantic_state::NativeSemanticState::restore(
+            Some(context),
+            "workspace_1",
+            "thread_1",
+            "turn_1",
+            context.window_index + 1,
+            &pioneer_tools::ToolRetryBudgetConfig::default(),
+            false,
+            pioneer_tools::ToolNoProgressMode::Enforce,
+        )
+        .map(|state| state.task_mutation_guard)
+    }
+
     #[test]
     fn task_mutation_finalization_guard_reports_failed_mutation_until_success() {
         let mut guard = TaskMutationFinalizationGuard::default();
-        guard
-            .observe(&task_result("task_create", false, "trigger must be object"))
-            .unwrap();
-
-        let message = guard
-            .deterministic_failure_message()
-            .expect("failed task mutation should block success finalization");
+        let mut failed = task_result("task_create", false, "task service temporarily unavailable");
+        failed.arguments =
+            r#"{"title":"report","goal":"write report","idempotencyKey":" creation-1 "}"#
+                .to_owned();
+        guard.observe(&failed).unwrap();
+        let message = guard.deterministic_failure_message().unwrap();
         assert!(message.contains("task_create"));
-        assert!(message.contains("trigger must be object"));
+        assert!(message.contains("task service temporarily unavailable"));
+        let mut restored = restore_task_guard(&task_guard_checkpoint_context(&guard)).unwrap();
+        let mut success = task_result("task_create", true, r#"{"taskId":"abc"}"#);
+        success.arguments =
+            r#"{"title":"report","goal":"write report","idempotency_key":"creation-1"}"#.to_owned();
+        success.item_id = "another-delivery".to_owned();
+        restored.observe(&success).unwrap();
+        assert!(
+            restored.deterministic_failure_message().is_some(),
+            "arbitrary text without a real creation receipt is not acceptance"
+        );
+        success.model_visible_text =
+            r#"{"taskId":"AAAAAAAAAAAAAAAAAAAAA","revision":1}"#.to_owned();
+        restored.observe(&success).unwrap();
+        assert!(restored.deterministic_failure_message().is_none());
+    }
 
-        guard
-            .observe(&task_result("task_create", true, "{\"taskId\":\"abc\"}"))
-            .unwrap();
-        assert!(guard.deterministic_failure_message().is_none());
+    #[test]
+    fn independent_same_arguments_creations_do_not_clear_cold_failure() {
+        let mut failed = task_result("task_create", false, "temporary failure");
+        failed.arguments = r#"{"title":"report","goal":"write report"}"#.to_owned();
+        failed.item_id = "creation-call-A".to_owned();
+        let mut guard = TaskMutationFinalizationGuard::default();
+        guard.observe(&failed).unwrap();
+        let context = task_guard_checkpoint_context(&guard);
+        let mut restored = restore_task_guard(&context).unwrap();
+        let mut success = task_result(
+            "task_create",
+            true,
+            r#"{"taskId":"BBBBBBBBBBBBBBBBBBBBB","revision":1}"#,
+        );
+        success.arguments = failed.arguments.clone();
+        success.item_id = "creation-call-B".to_owned();
+        success.provider_call_id = "provider-call-B".to_owned();
+        restored.observe(&success).unwrap();
+        assert!(restored.deterministic_failure_message().is_some());
+        assert_eq!(restored.failures_since_last_success.len(), 1);
+        // A proven receipt on the original item can resolve that creation.
+        success.item_id = failed.item_id.clone();
+        success.model_visible_text =
+            r#"{"taskId":"AAAAAAAAAAAAAAAAAAAAA","revision":1}"#.to_owned();
+        restored.observe(&success).unwrap();
+        assert!(restored.deterministic_failure_message().is_none());
+
+        failed.arguments =
+            r#"{"title":"report","goal":"write report","idempotencyKey":"key-A"}"#.to_owned();
+        guard = TaskMutationFinalizationGuard::default();
+        guard.observe(&failed).unwrap();
+        let mut restored = restore_task_guard(&task_guard_checkpoint_context(&guard)).unwrap();
+        for args in [
+            r#"{"title":"report","goal":"write report","idempotencyKey":"key-B"}"#,
+            r#"{"title":"another report","goal":"write report","idempotencyKey":"key-A"}"#,
+        ] {
+            success.arguments = args.to_owned();
+            restored.observe(&success).unwrap();
+            assert!(restored.deterministic_failure_message().is_some());
+        }
     }
 
     #[test]
     fn task_mutation_success_requires_same_task_postcondition_and_newer_revision() {
-        let mut guard = TaskMutationFinalizationGuard::default();
         let mut failed = task_result("task_update", false, "revision conflict");
-        failed.arguments =
-            r#"{"taskId":"AAAAAAAAAAAAAAAAAAAAA","title":"accepted title","expectedRevision":7}"#
-                .to_owned();
+        failed.arguments = r#"{"taskId":"AAAAAAAAAAAAAAAAAAAAA","title":"accepted title","expectedRevision":7,"idempotencyKey":"k1"}"#.to_owned();
+        let mut guard = TaskMutationFinalizationGuard::default();
         guard.observe(&failed).unwrap();
-        let mut unrelated = task_result(
+        let mut restored = restore_task_guard(&task_guard_checkpoint_context(&guard)).unwrap();
+        let mut success = task_result(
             "task_update",
             true,
-            r#"{"task":{"id":"BBBBBBBBBBBBBBBBBBBBB"},"revision":9}"#,
+            r#"{"task":{"id":"AAAAAAAAAAAAAAAAAAAAA"},"revision":10}"#,
         );
-        unrelated.arguments =
-            r#"{"taskId":"BBBBBBBBBBBBBBBBBBBBB","title":"accepted title","expectedRevision":8}"#
-                .to_owned();
-        guard.observe(&unrelated).unwrap();
-        assert!(guard.deterministic_failure_message().is_some());
-        unrelated.arguments =
-            r#"{"taskId":"AAAAAAAAAAAAAAAAAAAAA","title":"another title","expectedRevision":8}"#
-                .to_owned();
-        unrelated.model_visible_text =
-            r#"{"task":{"id":"AAAAAAAAAAAAAAAAAAAAA"},"revision":9}"#.to_owned();
-        guard.observe(&unrelated).unwrap();
-        assert!(guard.deterministic_failure_message().is_some());
-        let encoded = serde_json::to_vec(&guard).unwrap();
-        let mut restored: TaskMutationFinalizationGuard = serde_json::from_slice(&encoded).unwrap();
-        assert!(restored.checkpoint_valid());
-        unrelated.arguments =
-            r#"{"taskId":"AAAAAAAAAAAAAAAAAAAAA","title":"accepted title","expectedRevision":8}"#
-                .to_owned();
-        unrelated.model_visible_text =
-            r#"{"task":{"id":"AAAAAAAAAAAAAAAAAAAAA"},"revision":7}"#.to_owned();
-        restored.observe(&unrelated).unwrap();
+        success.item_id = "new-delivery".to_owned();
+        for args in [
+            r#"{"taskId":"BBBBBBBBBBBBBBBBBBBBB","title":"accepted title","expectedRevision":9,"idempotencyKey":"k2"}"#,
+            r#"{"taskId":"AAAAAAAAAAAAAAAAAAAAA","title":"another title","expectedRevision":9,"idempotencyKey":"k2"}"#,
+        ] {
+            success.arguments = args.to_owned();
+            restored.observe(&success).unwrap();
+            assert!(restored.deterministic_failure_message().is_some());
+        }
+        success.arguments = r#"{"taskId":"AAAAAAAAAAAAAAAAAAAAA","title":"accepted title","expectedRevision":9,"idempotency_key":"k2"}"#.to_owned();
+        success.tool_name = "task_reschedule".to_owned();
+        restored.observe(&success).unwrap();
         assert!(restored.deterministic_failure_message().is_some());
-        unrelated.model_visible_text =
-            r#"{"task":{"id":"AAAAAAAAAAAAAAAAAAAAA"},"revision":9}"#.to_owned();
-        restored.observe(&unrelated).unwrap();
+        success.tool_name = "task_update".to_owned();
+        for output in [
+            r#"{"task":{"id":"BBBBBBBBBBBBBBBBBBBBB"},"revision":10}"#,
+            r#"{"task":{"id":"AAAAAAAAAAAAAAAAAAAAA"}}"#,
+            r#"{"task":{"id":"AAAAAAAAAAAAAAAAAAAAA"},"revision":7}"#,
+            r#"{"task":{"id":"AAAAAAAAAAAAAAAAAAAAA"},"revision":8}"#,
+            r#"{"task":{"id":"AAAAAAAAAAAAAAAAAAAAA"},"revision":9}"#,
+        ] {
+            success.model_visible_text = output.to_owned();
+            restored.observe(&success).unwrap();
+            assert!(restored.deterministic_failure_message().is_some());
+        }
+        success.model_visible_text =
+            r#"{"task":{"id":"AAAAAAAAAAAAAAAAAAAAA"},"revision":10}"#.to_owned();
+        success.outcome = ToolOutcome::fatal(ToolErrorClass::Unknown, None);
+        restored.observe(&success).unwrap();
+        assert!(restored.deterministic_failure_message().is_some());
+        success.outcome = ToolOutcome::ok();
+        restored.observe(&success).unwrap();
         assert!(restored.deterministic_failure_message().is_none());
+    }
+
+    #[test]
+    fn reschedule_postcondition_survives_cold_restore_and_new_delivery_key() {
+        // Reschedule has no expectedRevision input; require an actual positive receipt revision.
+        let mut failed = task_result("task_reschedule", false, "temporary failure");
+        failed.arguments = r#"{"taskId":"AAAAAAAAAAAAAAAAAAAAA","trigger":{"kind":"interval","intervalSeconds":60},"idempotencyKey":"k1"}"#.to_owned();
+        let mut guard = TaskMutationFinalizationGuard::default();
+        guard.observe(&failed).unwrap();
+        let mut restored = restore_task_guard(&task_guard_checkpoint_context(&guard)).unwrap();
+        let mut success = task_result(
+            "task_reschedule",
+            true,
+            r#"{"task":{"id":"AAAAAAAAAAAAAAAAAAAAA","revision":10}}"#,
+        );
+        success.item_id = "reschedule-new-delivery".to_owned();
+        for args in [
+            r#"{"taskId":"BBBBBBBBBBBBBBBBBBBBB","trigger":{"kind":"interval","intervalSeconds":60},"idempotencyKey":"k2"}"#,
+            r#"{"taskId":"AAAAAAAAAAAAAAAAAAAAA","trigger":{"kind":"interval","intervalSeconds":90},"idempotencyKey":"k2"}"#,
+        ] {
+            success.arguments = args.to_owned();
+            restored.observe(&success).unwrap();
+            assert!(restored.deterministic_failure_message().is_some());
+        }
+        success.arguments = r#"{"taskId":"AAAAAAAAAAAAAAAAAAAAA","trigger":{"kind":"interval","intervalSeconds":60},"idempotency_key":"k2"}"#.to_owned();
+        for output in [
+            r#"{"task":{"id":"AAAAAAAAAAAAAAAAAAAAA"}}"#,
+            r#"{"task":{"id":"AAAAAAAAAAAAAAAAAAAAA","revision":0}}"#,
+        ] {
+            success.model_visible_text = output.to_owned();
+            restored.observe(&success).unwrap();
+            assert!(restored.deterministic_failure_message().is_some());
+        }
+        success.model_visible_text =
+            r#"{"task":{"id":"AAAAAAAAAAAAAAAAAAAAA","revision":10}}"#.to_owned();
+        restored.observe(&success).unwrap();
+        assert!(restored.deterministic_failure_message().is_none());
+    }
+
+    #[test]
+    fn incompatible_task_guard_identity_codec_never_restores_an_empty_guard() {
+        let mut guard = TaskMutationFinalizationGuard::default();
+        let mut failed = task_result("task_create", false, "unresolved creation");
+        failed.arguments = r#"{"title":"report","goal":"write report"}"#.to_owned();
+        guard.observe(&failed).unwrap();
+        let context = task_guard_checkpoint_context(&guard);
+        assert!(
+            restore_task_guard(&context)
+                .unwrap()
+                .deterministic_failure_message()
+                .is_some()
+        );
+        for version in [8, 99] {
+            let mut incompatible = context.clone();
+            incompatible.payload.native_semantic_state.as_mut().unwrap()["schema_version"] =
+                version.into();
+            assert!(!super::semantic_state::checkpoint_compatible(
+                &incompatible.payload,
+                &pioneer_tools::ToolRetryBudgetConfig::default(),
+                pioneer_tools::ToolNoProgressMode::Enforce,
+            ));
+            assert!(restore_task_guard(&incompatible).is_err());
+        }
     }
 
     #[test]

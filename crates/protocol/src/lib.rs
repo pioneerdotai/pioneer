@@ -578,7 +578,7 @@ pub use model_selection::{GatewayModelSelection, ModelSelectionTransport};
 
 /// Agent-owned semantic checkpoint codec shared with persistence readers.
 /// Agent remains the serializer and full restore authority.
-pub const NATIVE_SEMANTIC_STATE_SCHEMA_VERSION: u32 = 8;
+pub const NATIVE_SEMANTIC_STATE_SCHEMA_VERSION: u32 = 9;
 
 /// Agent-owned host wait in the existing semantic checkpoint; never work progress.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
