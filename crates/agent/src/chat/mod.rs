@@ -3760,29 +3760,11 @@ fn retain_current_review_delivery(
         .iter()
         .filter_map(|record| {
             let signature = review_required_observation_signature(record);
-            (delivered.contains(&signature)
-                || delivered.contains(&legacy_review_required_observation_signature(record)))
-            .then_some(signature)
+            delivered.contains(&signature).then_some(signature)
         })
         .collect();
     *delivered = retained;
     Ok(())
-}
-
-fn legacy_review_required_observation_signature(
-    observation: &ReviewRequiredTaskObservation,
-) -> String {
-    format!(
-        "{}:{}:{}:{}:{}:{}:{}:{}",
-        observation.task_id,
-        observation.run_id,
-        observation.candidate_id,
-        observation.candidate_status,
-        observation.round,
-        observation.remaining_revision_rounds,
-        observation.allowed_actions.join(","),
-        observation.revision_blocked_reason.as_deref().unwrap_or("")
-    )
 }
 
 fn review_required_observation_payload(observation: &ReviewRequiredTaskObservation) -> JsonValue {
@@ -11142,7 +11124,9 @@ mod tests {
             .unwrap();
         let pending = Some("Retry only the unresolved mutation".to_owned());
         let applied = Some("Original accepted guidance".to_owned());
-        let reviews = std::collections::BTreeSet::from(["review-original".to_owned()]);
+        let reviews = std::collections::BTreeSet::from([hex::encode(sha2::Sha256::digest(
+            b"original review record",
+        ))]);
         let terminal = std::collections::BTreeSet::from(["terminal-original".to_owned()]);
         let roots = vec![pioneer_compaction::SourceRef {
             scope: "checkpoint:native-owner".into(),

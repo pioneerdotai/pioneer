@@ -262,8 +262,13 @@ impl NativeSemanticState {
             || self
                 .observed_review_required_signatures
                 .iter()
-                .chain(&self.observed_terminal_task_ids)
-                .any(|s| s.is_empty() || s.len() > 4096)
+                .any(|signature| {
+                    signature.len() != 64 || !signature.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
+            || self
+                .observed_terminal_task_ids
+                .iter()
+                .any(|id| id.is_empty() || id.len() > 4096)
             || !self.task_mutation_guard.checkpoint_valid()
             || self.post_turn_assistant_text.len() > MAX_SUMMARY_TEXT_BYTES
             || self.post_turn_tool_events.len() > MAX_SUMMARY_EVENTS

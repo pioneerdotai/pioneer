@@ -350,6 +350,18 @@ fn full_native_checkpoint_restores_wait_and_review_suffix_without_fresh_state() 
         restore(&missing).is_err(),
         "missing durable wait state never defaults to a fresh goal"
     );
+    // Codec8 has no producer for legacy display signatures. Matching IDs cannot
+    // prove delivery of a mutable candidate's new authoritative version.
+    for signature in [
+        "task_000:run_000:candidate_000:pending_review:1:2:task_accept,task_revise,task_cancel:"
+            .to_owned(),
+        "g".repeat(64),
+    ] {
+        let mut incompatible = context.clone();
+        incompatible.payload.native_semantic_state.as_mut().unwrap()["observed_review_required_signatures"] =
+            serde_json::json!([signature]);
+        assert!(restore(&incompatible).is_err());
+    }
     let mut old = context.clone();
     old.payload.native_semantic_state.as_mut().unwrap()["schema_version"] = 7.into();
     assert!(restore(&old).is_err());
