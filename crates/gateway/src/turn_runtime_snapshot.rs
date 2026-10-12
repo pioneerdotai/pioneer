@@ -1154,7 +1154,7 @@ fn to_snapshot_json_bounded<T: Serialize + ?Sized>(
     String::from_utf8(writer.bytes).map_err(|_| anyhow::anyhow!("invalid encoded {label} snapshot"))
 }
 
-fn from_snapshot_json<T: DeserializeOwned>(value: &str, label: &str) -> Result<T> {
+pub(crate) fn from_snapshot_json<T: DeserializeOwned>(value: &str, label: &str) -> Result<T> {
     anyhow::ensure!(
         value.len() <= pioneer_protocol::TURN_EXECUTION_REQUEST_MAX_BYTES,
         "{label} snapshot encoded byte limit exceeded"

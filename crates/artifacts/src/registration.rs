@@ -85,6 +85,16 @@ impl ArtifactService {
         context: ArtifactRegistrationContext,
         candidate: ArtifactRegistrationCandidate,
     ) -> ArtifactResult<ArtifactSummary> {
+        self.register_candidate_fenced(context, candidate, None)
+            .await
+    }
+
+    pub(crate) async fn register_candidate_fenced(
+        &self,
+        context: ArtifactRegistrationContext,
+        candidate: ArtifactRegistrationCandidate,
+        fence: Option<pioneer_crud::NativeArtifactRegistrationFence>,
+    ) -> ArtifactResult<ArtifactSummary> {
         let mut policy = ArtifactLocalPathPolicy::new(context.allowed_roots.clone());
         if let Some(max_file_bytes) = context.max_file_bytes {
             policy.max_file_bytes = max_file_bytes;
@@ -141,31 +151,40 @@ impl ArtifactService {
             metadata.insert("description".to_owned(), json!(description));
         }
 
+        if let Some(fence) = &fence {
+            metadata.insert(
+                "native_registration_request_sha256".to_owned(),
+                json!(fence.request_sha256),
+            );
+        }
         let summary = self
-            .ingest_bytes(IngestArtifactBytesRequest {
-                workspace_id: context.workspace_id.clone(),
-                primary_thread_id: Some(context.thread_id.clone()),
-                bytes: local_file.bytes,
-                display_name,
-                kind,
-                mime_type: candidate.mime_type,
-                created_by_kind: context.created_by_kind,
-                created_by_actor_id: context.created_by_actor_id,
-                binding: Some(ArtifactBindingTarget {
-                    thread_id: Some(context.thread_id),
-                    turn_id: Some(context.turn_id),
-                    message_id: context.message_id,
-                    turn_item_id: context.turn_item_id,
-                    tool_call_id: context.tool_call_id,
-                    task_id: None,
-                    task_run_id: None,
-                    binding_kind: context.binding_kind,
-                    direction: context.binding_direction,
-                    role: context.binding_role,
-                    item_index: context.item_index,
-                }),
-                metadata,
-            })
+            .ingest_bytes_fenced(
+                IngestArtifactBytesRequest {
+                    workspace_id: context.workspace_id.clone(),
+                    primary_thread_id: Some(context.thread_id.clone()),
+                    bytes: local_file.bytes,
+                    display_name,
+                    kind,
+                    mime_type: candidate.mime_type,
+                    created_by_kind: context.created_by_kind,
+                    created_by_actor_id: context.created_by_actor_id,
+                    binding: Some(ArtifactBindingTarget {
+                        thread_id: Some(context.thread_id),
+                        turn_id: Some(context.turn_id),
+                        message_id: context.message_id,
+                        turn_item_id: context.turn_item_id,
+                        tool_call_id: context.tool_call_id,
+                        task_id: None,
+                        task_run_id: None,
+                        binding_kind: context.binding_kind,
+                        direction: context.binding_direction,
+                        role: context.binding_role,
+                        item_index: context.item_index,
+                    }),
+                    metadata,
+                },
+                fence,
+            )
             .await?;
 
         Ok(summary)

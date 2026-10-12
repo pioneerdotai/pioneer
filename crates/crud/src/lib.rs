@@ -1492,6 +1492,10 @@ pub use crate::repositories::hook_run::{
     HookRunAttemptRecord, HookRunCompletionRecord, HookRunRecord, HookRunScope, HookRunScopeKind,
     NewHookAuditEventRecord, NewHookRunAttemptRecord, NewHookRunRecord, RecoverableHookRunRecord,
 };
+pub use crate::repositories::native_artifact_obligations::{
+    NativeArtifactExecutionFence, NativeArtifactRegistrationAlreadyCommitted,
+    NativeArtifactRegistrationFence, NativeArtifactRegistrationReceipt,
+};
 pub use crate::repositories::task_execution_admission::{
     NewTaskExecutionAdmission, TaskExecutionAdmissionRecord,
 };
@@ -9172,12 +9176,258 @@ impl CrudStore {
         turn_execution_window::delete_turn_execution_data_for_turn(&self.connection, turn_id).await
     }
 
+    /// The original native execution binding is captured before any tool I/O.
+    pub async fn native_artifact_execution_fence(
+        &self,
+        workspace: &str,
+        thread: &str,
+        turn: &str,
+        expected_owner: &str,
+    ) -> Result<Option<NativeArtifactExecutionFence>> {
+        let Some(owner) = self.get_turn_execution(turn).await? else {
+            return Ok(None);
+        };
+        if !matches!(
+            owner.executor_kind,
+            TurnExecutorKind::NativeAgent | TurnExecutorKind::ApiProvider
+        ) {
+            return Ok(None);
+        }
+        anyhow::ensure!(
+            owner.owner_id == expected_owner
+                && owner.workspace_id == workspace
+                && owner.thread_id == thread
+                && owner.status.is_active(),
+            "artifact original execution owner unavailable"
+        );
+        let context = self
+            .native_cancellation_context(turn)
+            .await?
+            .context("artifact native generation unavailable")?;
+        anyhow::ensure!(
+            context.preparation.workspace_id == workspace
+                && context.preparation.thread_id == thread
+                && context.accepted_event_id.is_none(),
+            "artifact native generation differs"
+        );
+        Ok(Some(NativeArtifactExecutionFence {
+            workspace_id: workspace.to_owned(),
+            thread_id: thread.to_owned(),
+            turn_id: turn.to_owned(),
+            owner_id: owner.owner_id,
+            owner_generation: owner.owner_generation,
+            context_sha256: context.context_sha256,
+        }))
+    }
+
+    pub async fn native_artifact_obligation_item(
+        &self,
+        workspace: &str,
+        thread: &str,
+        turn: &str,
+    ) -> Result<Option<String>> {
+        repositories::native_artifact_obligations::load(&self.connection, workspace, thread, turn)
+            .await
+    }
+
+    pub async fn native_artifact_registration_receipt(
+        &self,
+        workspace: &str,
+        thread: &str,
+        turn: &str,
+        call: &str,
+    ) -> Result<Option<NativeArtifactRegistrationReceipt>> {
+        repositories::native_artifact_obligations::registration_receipt(
+            &self.connection,
+            workspace,
+            thread,
+            turn,
+            call,
+        )
+        .await
+    }
+
+    pub async fn native_artifact_fence_is_current(
+        &self,
+        fence: &NativeArtifactExecutionFence,
+        item: &str,
+    ) -> Result<()> {
+        let statement =
+            repositories::native_artifact_obligations::fence_statement(fence, Some(item))?;
+        repositories::native_artifact_obligations::validate_fence(&self.connection, statement).await
+    }
+
+    pub async fn native_artifact_final_text(
+        &self,
+        workspace: &str,
+        thread: &str,
+        turn: &str,
+    ) -> Result<Option<String>> {
+        repositories::native_artifact_obligations::final_text(
+            &self.connection,
+            workspace,
+            thread,
+            turn,
+        )
+        .await
+    }
+
+    pub async fn commit_native_artifact_obligations(
+        &self,
+        fence: &NativeArtifactExecutionFence,
+        expected: Option<String>,
+        state: serde_json::Value,
+    ) -> Result<String> {
+        use repositories::native_artifact_obligations as obligations;
+        anyhow::ensure!(
+            expected
+                .as_ref()
+                .is_none_or(|value| value.len() <= obligations::MAX_ITEM_BYTES),
+            "artifact predecessor exceeds bound"
+        );
+        // The service codec bounds serialization before constructing this Value.
+        let state_json = String::from_utf8(
+            pioneer_protocol::encode_native_control(&state).map_err(anyhow::Error::msg)?,
+        )?;
+        anyhow::ensure!(
+            state_json.len() <= obligations::MAX_STATE_BYTES,
+            "artifact obligation wire bound exceeded"
+        );
+        let event = TurnEventPayload::ItemCompleted(pioneer_protocol::ItemCompletedNotification {
+            workspace_id: fence.workspace_id.clone(),
+            thread_id: fence.thread_id.clone(),
+            turn_id: fence.turn_id.clone(),
+            item: TurnItem::SystemEvent {
+                id: obligations::item_id(&fence.turn_id),
+                level: pioneer_protocol::SystemEventLevel::Info,
+                message: "Artifact obligations recorded.".to_owned(),
+                code: Some("artifact.obligations".to_owned()),
+                details: Some(serde_json::json!({"artifactObligations": state})),
+            },
+        });
+        let TurnEventPayload::ItemCompleted(notification) = &event else {
+            unreachable!();
+        };
+        let next_item_json = serde_json::to_string(&notification.item)?;
+        anyhow::ensure!(
+            next_item_json.len() <= obligations::MAX_ITEM_BYTES,
+            "artifact item bound exceeded"
+        );
+        let current = self
+            .native_artifact_obligation_item(&fence.workspace_id, &fence.thread_id, &fence.turn_id)
+            .await?;
+        if current.as_deref() == Some(next_item_json.as_str()) {
+            self.native_artifact_fence_is_current(fence, &next_item_json)
+                .await?;
+            return Ok(next_item_json);
+        }
+        let state = notification.item.clone();
+        let TurnItem::SystemEvent {
+            details: Some(details),
+            ..
+        } = state
+        else {
+            unreachable!();
+        };
+        let next_state = details
+            .get("artifactObligations")
+            .context("artifact codec missing")?;
+        let next_revision = next_state
+            .get("state")
+            .and_then(|state| state.get("revision"))
+            .and_then(serde_json::Value::as_u64)
+            .context("artifact revision missing")?;
+        anyhow::ensure!(
+            next_state
+                .get("schema_version")
+                .and_then(serde_json::Value::as_u64)
+                == Some(1)
+                && next_state
+                    .get("workspace_id")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(&fence.workspace_id)
+                && next_state
+                    .get("thread_id")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(&fence.thread_id)
+                && next_state
+                    .get("turn_id")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(&fence.turn_id),
+            "artifact codec owner differs"
+        );
+        let old_revision = if let Some(previous) = &expected {
+            let item: TurnItem = serde_json::from_str(previous)?;
+            let TurnItem::SystemEvent {
+                code,
+                details: Some(details),
+                ..
+            } = item
+            else {
+                anyhow::bail!("artifact predecessor differs");
+            };
+            anyhow::ensure!(
+                code.as_deref() == Some("artifact.obligations"),
+                "artifact predecessor code differs"
+            );
+            details
+                .get("artifactObligations")
+                .and_then(|state| state.get("state"))
+                .and_then(|state| state.get("revision"))
+                .and_then(serde_json::Value::as_u64)
+                .context("artifact predecessor revision missing")?
+        } else {
+            0
+        };
+        anyhow::ensure!(
+            old_revision.checked_add(1) == Some(next_revision) && next_revision < u64::MAX,
+            "artifact revision is stale or has a gap"
+        );
+        let now = chrono::Utc::now().fixed_offset();
+        let prepared =
+            prepare_projected_turn_event_for_permanent_storage(&self.connection, event, now)
+                .await?;
+        let statement = obligations::fence_statement(fence, expected.as_deref())?;
+        self.run_serialized_write(|| {
+            let prepared = prepared.clone();
+            let statement = statement.clone();
+            async move {
+                let transaction = self.connection.begin().await?;
+                obligations::validate_fence(&transaction, statement).await?;
+                self.append_and_project_turn_event_in_transaction(
+                    &transaction,
+                    prepared,
+                    now,
+                    now + chrono::Duration::seconds(30),
+                    false,
+                )
+                .await?;
+                transaction.commit().await?;
+                Ok(())
+            }
+        })
+        .await?;
+        Ok(next_item_json)
+    }
+
     pub async fn ingest_artifact_metadata(
         &self,
         blob: NewArtifactBlobRecord,
         artifact: IngestArtifactMetadataRecord,
         binding: Option<ArtifactBindingTargetRecord>,
         version_metadata: BTreeMap<String, serde_json::Value>,
+    ) -> Result<IngestedArtifactRecord> {
+        self.ingest_artifact_metadata_fenced(blob, artifact, binding, version_metadata, None)
+            .await
+    }
+
+    pub async fn ingest_artifact_metadata_fenced(
+        &self,
+        blob: NewArtifactBlobRecord,
+        artifact: IngestArtifactMetadataRecord,
+        binding: Option<ArtifactBindingTargetRecord>,
+        version_metadata: BTreeMap<String, serde_json::Value>,
+        fence: Option<NativeArtifactRegistrationFence>,
     ) -> Result<IngestedArtifactRecord> {
         let prepared_at = chrono::Utc::now().fixed_offset();
         let blob_id = generate_id(DB_ID_LEN);
@@ -9189,7 +9439,44 @@ impl CrudStore {
         let artifact_metadata_json = artifact_repository::metadata_to_db(&artifact.metadata)?;
         let version_metadata_json = artifact_repository::metadata_to_db(&version_metadata)?;
         let binding_metadata_json = artifact_repository::metadata_to_db(&BTreeMap::new())?;
+        let statement = fence
+            .as_ref()
+            .map(|fence| {
+                anyhow::ensure!(
+                    version_metadata_json.len() <= 128 * 1024
+                        && fence.request_sha256.len() == 64
+                        && fence
+                            .request_sha256
+                            .bytes()
+                            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+                    "native artifact registration metadata bound exceeded"
+                );
+                anyhow::ensure!(
+                    artifact.workspace_id == fence.execution.workspace_id
+                        && binding
+                            .as_ref()
+                            .is_some_and(|binding| binding.thread_id.as_deref()
+                                == Some(&fence.execution.thread_id)
+                                && binding.turn_id.as_deref() == Some(&fence.execution.turn_id)
+                                && binding.tool_call_id.as_deref() == Some(&fence.tool_call_id)),
+                    "artifact registration fence scope differs"
+                );
+                anyhow::ensure!(
+                    version_metadata
+                        .get("native_registration_request_sha256")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(&fence.request_sha256),
+                    "artifact receipt producer identity differs"
+                );
+                repositories::native_artifact_obligations::fence_statement(
+                    &fence.execution,
+                    Some(&fence.expected_item_json),
+                )
+            })
+            .transpose()?;
         self.run_serialized_write(|| {
+            let statement = statement.clone();
+            let fence = fence.clone();
             let blob = blob.clone();
             let artifact = artifact.clone();
             let binding = binding.clone();
@@ -9207,6 +9494,25 @@ impl CrudStore {
                     .begin()
                     .await
                     .context("failed to begin artifact ingest transaction")?;
+                if let (Some(statement), Some(fence)) = (statement, fence) {
+                    repositories::native_artifact_obligations::validate_fence(
+                        &transaction,
+                        statement,
+                    )
+                    .await?;
+                    if repositories::native_artifact_obligations::registration_exists(
+                        &transaction,
+                        &fence.execution.workspace_id,
+                        &fence.execution.thread_id,
+                        &fence.execution.turn_id,
+                        &fence.tool_call_id,
+                    )
+                    .await?
+                    {
+                        transaction.rollback().await?;
+                        return Err(NativeArtifactRegistrationAlreadyCommitted.into());
+                    }
+                }
                 let repository = artifact_repository::ArtifactRepository::new();
                 let result = async {
                     let blob = repository
@@ -30757,7 +31063,7 @@ impl CrudStore {
         }
         if !matches!(&appended_event.payload,
             TurnEventPayload::ItemCompleted(payload) if matches!(&payload.item,
-                TurnItem::SystemEvent { code: Some(code), .. } if code == "native.control"))
+                TurnItem::SystemEvent { code: Some(code), .. } if code == "native.control" || code == "artifact.obligations"))
         {
             self.project_semantic_timeline_live_turn_event(transaction, &appended_event)
                 .await
@@ -36991,6 +37297,305 @@ mod tests {
                 max_attempts: 3,
             }],
         }
+    }
+
+    #[tokio::test]
+    async fn native_artifact_obligations_fence_generation_preserve_retry_and_reconcile_exact_version_once()
+     {
+        use crate::{NativeArtifactRegistrationAlreadyCommitted, NativeArtifactRegistrationFence};
+        let (store, _, _) = native_semantic_store_fixture().await;
+        let fence = store
+            .native_artifact_execution_fence(
+                "ws_semantic",
+                "thr_semantic",
+                "turn_semantic",
+                "semantic-owner",
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store.connection.read_class(),
+            pioneer_sqlite::SqliteReadClass::Maintenance
+        );
+        let mut state = serde_json::json!({
+            "schema_version":1,"workspace_id":"ws_semantic","thread_id":"thr_semantic","turn_id":"turn_semantic",
+            "state":{"revision":1,"retry_used":false,"registrations":{},"prepared_by_path":{},"filename_counters":{}},
+        });
+        let original = store
+            .commit_native_artifact_obligations(&fence, None, state.clone())
+            .await
+            .unwrap();
+        let frontier = crate::repositories::turn_execution_window::native_event_frontier(
+            &store.connection,
+            "turn_semantic",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            store
+                .commit_native_artifact_obligations(&fence, None, state.clone())
+                .await
+                .unwrap(),
+            original
+        );
+        assert_eq!(
+            crate::repositories::turn_execution_window::native_event_frontier(
+                &store.connection,
+                "turn_semantic"
+            )
+            .await
+            .unwrap(),
+            frontier,
+            "duplicate unknown-result ACK must not append another event"
+        );
+        assert!(
+            store
+                .native_artifact_obligation_item("other", "thr_semantic", "turn_semantic")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        state["state"]["revision"] = serde_json::json!(2);
+        state["state"]["retry_used"] = serde_json::json!(true);
+        let mut stale = fence.clone();
+        stale.owner_generation += 1;
+        assert!(
+            store
+                .commit_native_artifact_obligations(&stale, Some(original.clone()), state.clone())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .native_artifact_obligation_item("ws_semantic", "thr_semantic", "turn_semantic")
+                .await
+                .unwrap()
+                .unwrap(),
+            original
+        );
+        let current = store
+            .commit_native_artifact_obligations(&fence, Some(original.clone()), state.clone())
+            .await
+            .unwrap();
+        let mut raced = state.clone();
+        raced["state"]["retry_used"] = serde_json::json!(false);
+        assert!(
+            store
+                .commit_native_artifact_obligations(&fence, Some(original), raced)
+                .await
+                .is_err()
+        );
+        let registration = NativeArtifactRegistrationFence {
+            execution: fence.clone(),
+            expected_item_json: current.clone(),
+            tool_call_id: "original-artifact-call".into(),
+            request_sha256: "b".repeat(64),
+        };
+        let blob = NewArtifactBlobRecord {
+            workspace_id: "ws_semantic".into(),
+            sha256: "c".repeat(64),
+            size_bytes: 7,
+            mime_type: Some("text/plain".into()),
+            storage_backend: "memory".into(),
+            storage_key: "artifact-native-fixture".into(),
+            metadata: BTreeMap::new(),
+        };
+        let artifact = IngestArtifactMetadataRecord {
+            workspace_id: "ws_semantic".into(),
+            primary_thread_id: Some("thr_semantic".into()),
+            display_name: "report.txt".into(),
+            kind: ArtifactKind::Text,
+            mime_type: Some("text/plain".into()),
+            created_by_kind: ArtifactCreatedByKind::Agent,
+            created_by_actor_id: Some("artifact_register".into()),
+            metadata: BTreeMap::new(),
+        };
+        let binding = Some(ArtifactBindingTargetRecord {
+            thread_id: Some("thr_semantic".into()),
+            turn_id: Some("turn_semantic".into()),
+            message_id: None,
+            turn_item_id: Some("original-artifact-call".into()),
+            tool_call_id: Some("original-artifact-call".into()),
+            task_id: None,
+            task_run_id: None,
+            binding_kind: ArtifactBindingKind::AgentOutput,
+            direction: ArtifactBindingDirection::Output,
+            role: Some(pioneer_protocol::ArtifactRole::Assistant),
+            item_index: None,
+        });
+        let metadata = BTreeMap::from([(
+            "native_registration_request_sha256".into(),
+            serde_json::json!("b".repeat(64)),
+        )]);
+        let effect = store
+            .ingest_artifact_metadata_fenced(
+                blob.clone(),
+                artifact.clone(),
+                binding.clone(),
+                metadata.clone(),
+                Some(registration.clone()),
+            )
+            .await
+            .unwrap();
+        // Simulate effect committed, following Registered ACK absent. Existing
+        // exact binding is the receipt; retrying the same effect cannot insert.
+        let error = store
+            .ingest_artifact_metadata_fenced(
+                blob.clone(),
+                artifact.clone(),
+                binding.clone(),
+                metadata.clone(),
+                Some(registration.clone()),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.is::<NativeArtifactRegistrationAlreadyCommitted>());
+        assert_eq!(
+            store
+                .count_artifacts_by_workspace("ws_semantic")
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .count_artifact_versions_by_workspace("ws_semantic")
+                .await
+                .unwrap(),
+            1
+        );
+        let receipt = store
+            .native_artifact_registration_receipt(
+                "ws_semantic",
+                "thr_semantic",
+                "turn_semantic",
+                "original-artifact-call",
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(receipt.artifact_id, effect.artifact.id);
+        assert_eq!(receipt.version_id, effect.version.id);
+        assert_eq!(receipt.sha256, "c".repeat(64));
+        assert_eq!(receipt.request_sha256, "b".repeat(64));
+        assert!(
+            store
+                .native_artifact_registration_receipt(
+                    "ws_semantic",
+                    "other",
+                    "turn_semantic",
+                    "original-artifact-call"
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+        state["state"]["revision"] = serde_json::json!(3);
+        let _resolved = store
+            .commit_native_artifact_obligations(&fence, Some(current), state)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .ingest_artifact_metadata_fenced(
+                    blob,
+                    artifact,
+                    binding,
+                    metadata,
+                    Some(registration)
+                )
+                .await
+                .is_err(),
+            "a replaced obligation predecessor must fence a late registration effect"
+        );
+        assert_eq!(
+            store
+                .count_artifacts_by_workspace("ws_semantic")
+                .await
+                .unwrap(),
+            1
+        );
+        store
+            .connection
+            .execute_raw(sea_orm::Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Sqlite,
+                "UPDATE turn_item SET payload=?1 WHERE turn_id=?2 AND item_id=?3",
+                [
+                    "界".repeat(40 * 1024).into(),
+                    "turn_semantic".into(),
+                    crate::repositories::native_artifact_obligations::item_id("turn_semantic")
+                        .into(),
+                ],
+            ))
+            .await
+            .unwrap();
+        assert!(
+            store
+                .native_artifact_obligation_item("ws_semantic", "thr_semantic", "turn_semantic")
+                .await
+                .is_err(),
+            "physical poison source cannot restore as an empty obligation set"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_artifact_final_message_uses_committed_sequence_and_rejects_latest_poison() {
+        let (store, _, _) = native_semantic_store_fixture().await;
+        for (id, text, phase) in [
+            (
+                "zz_commentary",
+                "intermediate",
+                pioneer_protocol::AgentMessagePhase::Commentary,
+            ),
+            (
+                "aa_final",
+                "accepted artifact reply",
+                pioneer_protocol::AgentMessagePhase::FinalAnswer,
+            ),
+        ] {
+            store
+                .materialize_item_completed(
+                    ItemCompletedNotification {
+                        workspace_id: "ws_semantic".into(),
+                        thread_id: "thr_semantic".into(),
+                        turn_id: "turn_semantic".into(),
+                        item: TurnItem::AgentMessage {
+                            id: id.into(),
+                            text: text.into(),
+                            phase,
+                            markdown: None,
+                            markdown_version: None,
+                        },
+                    },
+                    1_700_000_000,
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            store
+                .native_artifact_final_text("ws_semantic", "thr_semantic", "turn_semantic")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("accepted artifact reply")
+        );
+        assert!(
+            store
+                .native_artifact_final_text("other", "thr_semantic", "turn_semantic")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        store.connection.execute_unprepared("UPDATE turn_event SET payload='poison' WHERE turn_id='turn_semantic' AND sequence=(SELECT MAX(sequence) FROM turn_event WHERE turn_id='turn_semantic')").await.unwrap();
+        assert!(
+            store
+                .native_artifact_final_text("ws_semantic", "thr_semantic", "turn_semantic")
+                .await
+                .is_err(),
+            "latest poison cannot silently select an older assistant message"
+        );
     }
 
     #[tokio::test]

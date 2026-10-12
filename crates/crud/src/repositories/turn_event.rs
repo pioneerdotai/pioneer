@@ -43,7 +43,7 @@ impl PreparedTurnEvent {
         let (context_item_id, context_projection_kind) =
             crate::compaction::history::event_projection_metadata(&payload);
         if matches!(&payload, TurnEventPayload::ItemCompleted(notification) if matches!(&notification.item,
-            TurnItem::SystemEvent { code: Some(code), .. } if code == "native.control"))
+            TurnItem::SystemEvent { code: Some(code), .. } if code == "native.control" || code == "artifact.obligations"))
         {
             anyhow::ensure!(
                 payload_json.len() <= pioneer_protocol::NATIVE_CONTROL_STORAGE_MAX_BYTES,
@@ -101,7 +101,7 @@ async fn find_existing_prepared_event<C: ConnectionTrait>(
     prepared: &PreparedTurnEvent,
 ) -> Result<Option<turn_event::Model>> {
     if matches!(prepared.payload(), TurnEventPayload::ItemCompleted(notification) if matches!(&notification.item,
-        TurnItem::SystemEvent { code: Some(code), .. } if code == "native.control"))
+        TurnItem::SystemEvent { code: Some(code), .. } if code == "native.control" || code == "artifact.obligations"))
     {
         let row = db
             .query_one_raw(sea_orm::Statement::from_sql_and_values(

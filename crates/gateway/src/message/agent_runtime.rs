@@ -8885,6 +8885,16 @@ impl MessageProcessor {
             )
             .await?;
         }
+        if checkpoint_compatible && let Some(checkpoint) = checkpoint.as_ref() {
+            checkpoint_compatible = self
+                .artifact_service
+                .native_artifact_state_compatible(
+                    &checkpoint.workspace_id,
+                    &checkpoint.thread_id,
+                    &checkpoint.turn_id,
+                )
+                .await?;
+        }
         let can_resume_same_turn = recovery_job.as_ref().is_some_and(|job| {
             job.turn_id == turn_id
                 && !matches!(

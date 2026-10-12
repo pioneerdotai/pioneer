@@ -254,6 +254,14 @@ impl ArtifactService {
         &self,
         request: IngestArtifactBytesRequest,
     ) -> ArtifactResult<ArtifactSummary> {
+        self.ingest_bytes_fenced(request, None).await
+    }
+
+    pub(crate) async fn ingest_bytes_fenced(
+        &self,
+        request: IngestArtifactBytesRequest,
+        fence: Option<pioneer_crud::NativeArtifactRegistrationFence>,
+    ) -> ArtifactResult<ArtifactSummary> {
         validate_ingest_request(&request)?;
         let request = normalize_ingest_mime(request);
         self.enforce_quota(&request.workspace_id, request.bytes.len() as u64)
@@ -269,10 +277,11 @@ impl ArtifactService {
         let projection_bytes = (!request.bytes.is_empty()
             && (needs_plain_text_projection || needs_thumbnail_projection))
             .then(|| request.bytes.clone());
-        self.ingest_blob_input(
+        self.ingest_blob_input_fenced(
             request.clone(),
             ArtifactBlobInput::Bytes(request.bytes.clone()),
             projection_bytes,
+            fence,
         )
         .await
     }
@@ -371,6 +380,17 @@ impl ArtifactService {
         input: ArtifactBlobInput,
         projection_bytes: Option<Vec<u8>>,
     ) -> ArtifactResult<ArtifactSummary> {
+        self.ingest_blob_input_fenced(request, input, projection_bytes, None)
+            .await
+    }
+
+    async fn ingest_blob_input_fenced(
+        &self,
+        request: IngestArtifactBytesRequest,
+        input: ArtifactBlobInput,
+        projection_bytes: Option<Vec<u8>>,
+        fence: Option<pioneer_crud::NativeArtifactRegistrationFence>,
+    ) -> ArtifactResult<ArtifactSummary> {
         let stored_blob = self
             .blob_store
             .put_bytes(&request.workspace_id, input)
@@ -378,7 +398,7 @@ impl ArtifactService {
 
         let ingested = match self
             .store
-            .ingest_artifact_metadata(
+            .ingest_artifact_metadata_fenced(
                 NewArtifactBlobRecord {
                     workspace_id: request.workspace_id.clone(),
                     sha256: stored_blob.sha256.clone(),
@@ -394,11 +414,47 @@ impl ArtifactService {
                     .as_ref()
                     .map(binding_target_record_from_model),
                 request.metadata.clone(),
+                fence.clone(),
             )
             .await
         {
             Ok(ingested) => ingested,
             Err(error) => {
+                if error.is::<pioneer_crud::NativeArtifactRegistrationAlreadyCommitted>() {
+                    let fence = fence
+                        .as_ref()
+                        .ok_or_else(|| ArtifactError::InvalidRequest {
+                            message: "native artifact receipt fence unavailable".to_owned(),
+                        })?;
+                    let receipt = self
+                        .store
+                        .native_artifact_registration_receipt(
+                            &fence.execution.workspace_id,
+                            &fence.execution.thread_id,
+                            &fence.execution.turn_id,
+                            &fence.tool_call_id,
+                        )
+                        .await?
+                        .ok_or_else(|| ArtifactError::InvalidRequest {
+                            message: "native artifact receipt unavailable".to_owned(),
+                        })?;
+                    if receipt.request_sha256 != fence.request_sha256
+                        || receipt.sha256 != stored_blob.sha256
+                        || receipt.size_bytes != stored_blob.size_bytes
+                    {
+                        return Err(ArtifactError::InvalidRequest {
+                            message: "native artifact registration receipt differs".to_owned(),
+                        });
+                    }
+                    return Ok(self
+                        .store
+                        .get_artifact_summary(
+                            &request.workspace_id,
+                            &receipt.artifact_id,
+                            Some(&receipt.version_id),
+                        )
+                        .await?);
+                }
                 let registration_error = ArtifactError::from(error);
                 cleanup_stored_blob_after_failed_registration(
                     self.blob_store.as_ref(),

@@ -3,6 +3,7 @@ use pioneer_artifacts::PreparedArtifactOutput;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ArtifactFinalizationDiagnosticCode {
     PreparedOutputUnregistered,
+    RegistrationUnconfirmed,
     PrivateOutputPathMentioned,
 }
 
@@ -10,6 +11,7 @@ impl ArtifactFinalizationDiagnosticCode {
     pub(super) fn as_str(self) -> &'static str {
         match self {
             Self::PreparedOutputUnregistered => "artifact_output.prepared_unregistered",
+            Self::RegistrationUnconfirmed => "artifact_output.registration_unconfirmed",
             Self::PrivateOutputPathMentioned => "artifact_output.private_path_mentioned",
         }
     }
@@ -42,7 +44,7 @@ pub(super) fn artifact_finalization_retry_instruction(
     paths.dedup();
 
     let mut instruction = String::from(
-        "Artifact finalization correction required. Your previous final answer cannot be accepted because an artifact output prepared through `artifact_prepare` was written or referenced but not registered. Call `artifact_register` for each prepared artifact output before giving the final answer. Do not mention `$PIONEER_ARTIFACT_OUTPUT_DIR` or private gateway paths in the final answer.",
+        "Artifact finalization correction required. Your previous final answer cannot be accepted because a prepared artifact output remains unresolved or a registration has no confirmed receipt. Resolve each artifact registration obligation with `artifact_register` before giving the final answer. Do not mention `$PIONEER_ARTIFACT_OUTPUT_DIR` or private gateway paths in the final answer.",
     );
     if !paths.is_empty() {
         instruction.push_str("\n\nPrepared output paths to register:");
@@ -94,8 +96,7 @@ pub(super) fn diagnose_artifact_finalization(
 
     for output in prepared_outputs
         .iter()
-        .filter(|output| !output.is_registered())
-        .filter(|output| prepared_output_is_materialized(output))
+        .filter(|output| output.is_reserved())
     {
         let path = output.output_path.display().to_string();
         diagnostics.push(ArtifactFinalizationDiagnostic {
@@ -134,14 +135,6 @@ pub(super) fn diagnose_artifact_finalization(
     diagnostics
 }
 
-fn prepared_output_is_materialized(output: &PreparedArtifactOutput) -> bool {
-    match std::fs::symlink_metadata(output.output_path.as_path()) {
-        Ok(metadata) => metadata.is_file() || metadata.file_type().is_symlink(),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-        Err(_) => true,
-    }
-}
-
 fn private_artifact_output_paths(
     prepared_outputs: &[PreparedArtifactOutput],
     output_dir: Option<&str>,
@@ -171,6 +164,7 @@ mod tests {
     fn prepared(path: &str, registered: bool) -> PreparedArtifactOutput {
         PreparedArtifactOutput {
             tool_call_id: "tool-call-1".to_owned(),
+            request_sha256: "0".repeat(64),
             output_path: PathBuf::from(path),
             output_dir: PathBuf::from("/tmp/pioneer-output"),
             display_name: "report.txt".to_owned(),
@@ -219,14 +213,15 @@ mod tests {
     }
 
     #[test]
-    fn artifact_diagnostic_ignores_unused_unregistered_prepare_without_file() {
+    fn artifact_diagnostic_keeps_reserved_obligation_without_a_file() {
         let diagnostics = diagnose_artifact_finalization(
             &[prepared("/tmp/pioneer-output/missing-report.txt", false)],
             Some("/tmp/pioneer-output"),
             Some("Done."),
         );
 
-        assert!(diagnostics.is_empty());
+        assert!(diagnostics.iter().any(|diagnostic| diagnostic.code
+            == ArtifactFinalizationDiagnosticCode::PreparedOutputUnregistered));
     }
 
     #[test]

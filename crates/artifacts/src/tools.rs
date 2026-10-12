@@ -21,7 +21,7 @@ use pioneer_tools::{
     ToolSpec, dynamic_unknown_output_policy, normalize_tool_arguments_from_schema,
 };
 use schemars::{JsonSchema, schema_for};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
 use sha2::{Digest, Sha256};
 
@@ -41,7 +41,8 @@ const MAX_FILENAME_CHARS: usize = 120;
 const ARTIFACT_READ_MAX_BYTES: u64 = 2 * 1024 * 1024;
 const PREPARED_FINGERPRINT_MAX_BYTES: u64 = 50 * 1024 * 1024;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum PreparedArtifactOutputStatus {
     Reserved,
     Registered {
@@ -51,9 +52,11 @@ pub enum PreparedArtifactOutputStatus {
     Abandoned,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PreparedArtifactOutput {
     pub tool_call_id: String,
+    pub request_sha256: String,
     pub output_path: PathBuf,
     pub output_dir: PathBuf,
     pub display_name: String,
@@ -76,16 +79,54 @@ impl PreparedArtifactOutput {
 
 #[derive(Default)]
 pub struct ArtifactToolState {
-    inner: Mutex<ArtifactToolStateInner>,
+    pub(crate) inner: Mutex<ArtifactToolStateInner>,
+    pub(crate) mutation: tokio::sync::Mutex<()>,
+    pub(crate) durable_item_json: Mutex<Option<String>>,
 }
 
-#[derive(Default)]
-struct ArtifactToolStateInner {
-    prepared_by_path: BTreeMap<String, PreparedArtifactOutput>,
-    filename_counters: BTreeMap<String, u64>,
+#[derive(Default, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ArtifactToolStateInner {
+    pub(crate) revision: u64,
+    pub(crate) retry_used: bool,
+    pub(crate) registrations:
+        BTreeMap<String, crate::native_obligations::ArtifactRegistrationOperation>,
+    pub(crate) prepared_by_path: BTreeMap<String, PreparedArtifactOutput>,
+    pub(crate) filename_counters: BTreeMap<String, u64>,
 }
 
 impl ArtifactToolState {
+    pub async fn mutation_guard(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.mutation.lock().await
+    }
+
+    pub fn try_prepared_outputs(&self) -> Result<Vec<PreparedArtifactOutput>, ToolError> {
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|_| ToolError::internal("artifact state is unavailable"))?;
+        Ok(inner.prepared_by_path.values().cloned().collect())
+    }
+
+    pub fn try_pending_registration_count(&self) -> Result<usize, ToolError> {
+        Ok(self
+            .inner
+            .lock()
+            .map_err(|_| ToolError::internal("artifact state unavailable"))?
+            .registrations
+            .values()
+            .filter(|operation| operation.receipt.is_none())
+            .count())
+    }
+
+    pub fn try_retry_used(&self) -> Result<bool, ToolError> {
+        Ok(self
+            .inner
+            .lock()
+            .map_err(|_| ToolError::internal("artifact state unavailable"))?
+            .retry_used)
+    }
+
     pub fn prepared_outputs(&self) -> Vec<PreparedArtifactOutput> {
         self.inner
             .lock()
@@ -123,6 +164,9 @@ impl ArtifactToolState {
         tool_call_id: String,
         expires_at: String,
     ) -> Result<PreparedArtifactOutput, ToolError> {
+        let request_sha256 = hex::encode(Sha256::digest(serde_json::to_vec(&params).map_err(
+            |_| ToolError::invalid_arguments("artifact prepare arguments unavailable"),
+        )?));
         let sanitized = truncate_filename(
             display_name_with_mime_extension(
                 sanitize_display_name(params.display_name.as_str()),
@@ -139,13 +183,35 @@ impl ArtifactToolState {
             .lock()
             .map_err(|_| ToolError::internal("artifact tool state lock poisoned"))?;
 
+        if let Some(prepared) = inner
+            .prepared_by_path
+            .values()
+            .find(|output| output.tool_call_id == tool_call_id)
+        {
+            if prepared.request_sha256 != request_sha256 {
+                return Err(ToolError::execution_failed(
+                    "artifact prepare identity was reused with changed arguments",
+                ));
+            }
+            return Ok(prepared.clone());
+        }
+        if inner.prepared_by_path.len() >= 64 || inner.filename_counters.len() >= 64 {
+            return Err(ToolError::execution_failed(
+                "artifact obligation capacity exceeded",
+            ));
+        }
         let mut sequence = inner
             .filename_counters
             .get(&counter_key)
             .copied()
             .unwrap_or(0);
         let output_path = loop {
-            sequence = sequence.saturating_add(1);
+            sequence = sequence
+                .checked_add(1)
+                .filter(|value| *value <= 4096)
+                .ok_or_else(|| {
+                    ToolError::execution_failed("artifact filename reservation capacity exceeded")
+                })?;
             let file_name = numbered_filename(stem.as_str(), extension.as_deref(), sequence);
             let candidate = output_dir.join(file_name);
             if candidate.starts_with(output_dir)
@@ -163,6 +229,7 @@ impl ArtifactToolState {
 
         let prepared = PreparedArtifactOutput {
             tool_call_id,
+            request_sha256,
             output_path,
             output_dir: output_dir.to_path_buf(),
             display_name: sanitized,
@@ -185,6 +252,7 @@ pub struct ArtifactToolContext {
     pub workspace_id: String,
     pub thread_id: String,
     pub turn_id: String,
+    pub native_fence: Option<pioneer_crud::NativeArtifactExecutionFence>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
@@ -258,6 +326,10 @@ impl ArtifactToolHandler {
         invocation: ToolInvocation,
     ) -> Result<Box<dyn ToolOutput>, ToolError> {
         let params = decode_artifact_tool_args::<ArtifactPrepareParams>(invocation.clone())?;
+        let _mutation = self.state.mutation.lock().await;
+        self.artifact_service
+            .restore_native_artifact_state(&self.context, &self.state, false)
+            .await?;
         let output_dir = invocation
             .environment
             .get(ARTIFACT_OUTPUT_DIR_ENV)
@@ -304,6 +376,9 @@ impl ArtifactToolHandler {
             "artifact_prepare output path",
         )?;
 
+        self.artifact_service
+            .persist_native_artifact_state(&self.context, &self.state)
+            .await?;
         let response = ArtifactPrepareResponse {
             output_path: prepared.output_path.display().to_string(),
             output_dir: prepared.output_dir.display().to_string(),
@@ -330,6 +405,10 @@ impl ArtifactToolHandler {
         invocation: ToolInvocation,
     ) -> Result<Box<dyn ToolOutput>, ToolError> {
         let input = decode_artifact_tool_args::<ArtifactRegisterParams>(invocation.clone())?;
+        let _mutation = self.state.mutation.lock().await;
+        self.artifact_service
+            .restore_native_artifact_state(&self.context, &self.state, false)
+            .await?;
         let outcome = register_artifact_for_invocation(
             self.artifact_service.as_ref(),
             &self.context,
@@ -762,6 +841,9 @@ async fn register_artifact_for_invocation(
     invocation: &ToolInvocation,
     input: ArtifactRegisterParams,
 ) -> Result<ArtifactRegisterOutcome, ToolError> {
+    let request_sha256 = hex::encode(Sha256::digest(serde_json::to_vec(&input).map_err(
+        |_| ToolError::invalid_arguments("artifact registration arguments unavailable"),
+    )?));
     let workspace_root = artifact_register_workspace_root(invocation)?;
     let source_path =
         resolve_artifact_register_path(workspace_root.as_path(), input.path.as_str())?;
@@ -786,6 +868,31 @@ async fn register_artifact_for_invocation(
     }
     let allowed_roots =
         artifact_register_allowed_roots(invocation, workspace_root.as_path()).await?;
+    if context.native_fence.is_some() {
+        let operation = artifact_state
+            .inner
+            .lock()
+            .map_err(|_| ToolError::internal("artifact state unavailable"))?
+            .registrations
+            .get(&invocation.call_id)
+            .cloned();
+        if let Some(operation) = operation {
+            if operation.request_sha256 != request_sha256 {
+                return Err(ToolError::execution_failed(
+                    "artifact registration invocation identity differs",
+                ));
+            }
+            if let Some((artifact, version)) = operation.receipt {
+                let summary = artifact_service
+                    .get_artifact(&context.workspace_id, &artifact, Some(&version))
+                    .await
+                    .map_err(|_| {
+                        ToolError::execution_failed("native artifact receipt unavailable")
+                    })?;
+                return artifact_registration_outcome(summary);
+            }
+        }
+    }
     let source_canonical = tokio::fs::canonicalize(source_path.as_path()).await.ok();
     let prepared_canonical = prepared_output_path
         .as_ref()
@@ -797,7 +904,40 @@ async fn register_artifact_for_invocation(
         prepared_canonical.as_deref(),
     )
     .await?;
-    let expected_source_fingerprint = prepared_registration_plan.source_fingerprint.clone();
+    let expected_source_fingerprint = if context.native_fence.is_some() {
+        Some(
+            file_fingerprint(source_canonical.as_deref().ok_or_else(|| {
+                ToolError::execution_failed("native artifact source unavailable")
+            })?)
+            .await?
+            .ok_or_else(|| ToolError::execution_failed("native artifact source unavailable"))?,
+        )
+    } else {
+        prepared_registration_plan.source_fingerprint.clone()
+    };
+    let registration_fence = if let Some(fingerprint) = &expected_source_fingerprint {
+        artifact_service
+            .begin_native_artifact_registration(
+                context,
+                artifact_state,
+                &invocation.call_id,
+                crate::native_obligations::ArtifactRegistrationOperation {
+                    request_sha256,
+                    content_sha256: fingerprint.sha256.clone(),
+                    size_bytes: fingerprint.size_bytes,
+                    prepared_paths: prepared_registration_plan
+                        .prepared_outputs
+                        .iter()
+                        .map(|output| path_key(&output.output_path))
+                        .collect(),
+                    receipt: None,
+                    receipt_call_id: None,
+                },
+            )
+            .await?
+    } else {
+        None
+    };
     let registration_context = ArtifactRegistrationContext {
         workspace_id: context.workspace_id.clone(),
         thread_id: context.thread_id.clone(),
@@ -830,10 +970,40 @@ async fn register_artifact_for_invocation(
     };
 
     let summary = artifact_service
-        .register_candidate(registration_context, candidate)
+        .register_candidate_fenced(registration_context, candidate, registration_fence)
         .await
-        .map_err(|error| ToolError::execution_failed(format!("{error:#}")))?;
+        .map_err(|error| {
+            if context.native_fence.is_some() {
+                ToolError::execution_failed("native artifact registration is unavailable")
+            } else {
+                ToolError::execution_failed(format!("{error:#}"))
+            }
+        })?;
 
+    if context.native_fence.is_some() {
+        artifact_service
+            .restore_native_artifact_state(context, artifact_state, false)
+            .await?;
+    } else {
+        let version = summary
+            .artifact
+            .version_id
+            .as_deref()
+            .ok_or_else(|| ToolError::internal("artifact version unavailable"))?;
+        for prepared in prepared_registration_plan.prepared_outputs {
+            artifact_state.mark_registered(
+                &prepared.output_path,
+                &summary.artifact.artifact_id,
+                version,
+            );
+        }
+    }
+    artifact_registration_outcome(summary)
+}
+
+fn artifact_registration_outcome(
+    summary: ArtifactSummary,
+) -> Result<ArtifactRegisterOutcome, ToolError> {
     let artifact = &summary.artifact;
     let version_id = artifact.version_id.clone().ok_or_else(|| {
         ToolError::internal(format!(
@@ -841,13 +1011,6 @@ async fn register_artifact_for_invocation(
             artifact.artifact_id
         ))
     })?;
-    for prepared in prepared_registration_plan.prepared_outputs {
-        artifact_state.mark_registered(
-            prepared.output_path.as_path(),
-            artifact.artifact_id.as_str(),
-            version_id.as_str(),
-        );
-    }
     let size_bytes = artifact.size_bytes.ok_or_else(|| {
         ToolError::internal(format!(
             "registered artifact `{}` has no size",
@@ -1622,6 +1785,7 @@ mod tests {
             workspace_id: "ws_artifact_register".to_owned(),
             thread_id: "thr_artifact_register".to_owned(),
             turn_id: "turn_artifact_register".to_owned(),
+            native_fence: None,
         }
     }
 
