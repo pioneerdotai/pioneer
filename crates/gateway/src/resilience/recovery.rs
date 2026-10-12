@@ -6737,7 +6737,9 @@ mod tests {
                 None,
             )
             .await;
-            persist_test_runtime_snapshot(&crud_store, &workspace_id, &thread_id, &turn_id).await;
+            persist_test_runtime_snapshot_only(&crud_store, &workspace_id, &thread_id, &turn_id)
+                .await;
+            persist_test_execution_security_snapshot(&crud_store, &thread_id, &turn_id).await;
             insert_test_turn_execution(
                 &crud_store,
                 &workspace_id,
@@ -7182,9 +7184,191 @@ mod tests {
         workspace_id: &str,
         thread_id: &str,
         turn_id: &str,
+        coordinator: &RecoveryCoordinator,
     ) {
         persist_test_runtime_snapshot_only(crud_store, workspace_id, thread_id, turn_id).await;
         persist_test_execution_security_snapshot(crud_store, thread_id, turn_id).await;
+        if crud_store
+            .get_turn_execution(turn_id)
+            .await
+            .unwrap()
+            .is_none()
+        {
+            insert_test_turn_execution(
+                crud_store,
+                workspace_id,
+                thread_id,
+                turn_id,
+                coordinator.turn_execution_owner_id.as_ref(),
+                TurnExecutorKind::NativeAgent,
+                chrono::Utc::now().timestamp() + 120,
+            )
+            .await;
+        }
+        let snapshot = crud_store
+            .get_turn_runtime_snapshot(turn_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let phase = crate::native_recovery_test_support::completed_native_phase(
+            workspace_id,
+            thread_id,
+            turn_id,
+            &coordinator.tool_loop_config,
+            serde_json::json!({"attempts":0,"known_tokens":0,"unknown":false}),
+        );
+        crud_store
+            .upsert_turn_runtime_snapshot(NewTurnRuntimeSnapshot {
+                turn_id: snapshot.turn_id,
+                thread_id: snapshot.thread_id,
+                workspace_id: snapshot.workspace_id,
+                mode_json: snapshot.mode_json,
+                model: snapshot.model,
+                provider_name: snapshot.provider_name,
+                reasoning_effort: snapshot.reasoning_effort,
+                agent_skill_versions_json: snapshot.agent_skill_versions_json,
+                ordinary_skill_catalog_json: snapshot.ordinary_skill_catalog_json,
+                provider_model_contract_json: snapshot.provider_model_contract_json,
+                hook_runtime_context_json: snapshot.hook_runtime_context_json,
+                workspace_skill_policies_json: snapshot.workspace_skill_policies_json,
+                input_json: snapshot.input_json,
+                capabilities_json: snapshot.capabilities_json,
+                resolved_artifacts_json: snapshot.resolved_artifacts_json,
+                runtime_environment_json: snapshot.runtime_environment_json,
+                history_json: snapshot.history_json,
+                created_at: snapshot.created_at,
+                updated_at: snapshot.updated_at,
+                initial_phase_json: Some(phase),
+            })
+            .await
+            .unwrap();
+    }
+
+    // Positive cold restore needs the actual semantic predecessor, not just a scalar row.
+    async fn seed_test_native_semantic_checkpoint(
+        crud_store: &CrudStore,
+        workspace_id: &str,
+        thread_id: &str,
+        turn_id: &str,
+        coordinator: &RecoveryCoordinator,
+    ) {
+        let now = chrono::Utc::now().fixed_offset();
+        let owner = crud_store
+            .get_turn_execution(turn_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(owner.owner_id, coordinator.turn_execution_owner_id.as_ref());
+        crud_store
+            .persist_native_cancellation_context(
+                pioneer_protocol::NativeTerminalEffectPreparation {
+                    batch_id: format!("{turn_id}:cancel"),
+                    workspace_id: workspace_id.into(),
+                    thread_id: thread_id.into(),
+                    turn_id: turn_id.into(),
+                    runtime_generation: 1,
+                    effects: vec![],
+                },
+                &owner.owner_id,
+                now.timestamp(),
+                true,
+            )
+            .await
+            .unwrap();
+        let window = match crud_store.latest_turn_execution_window(turn_id).await.unwrap() {
+            Some(window) => window,
+            None => crud_store.create_turn_execution_window(NewTurnExecutionWindowRecord {
+                workspace_id: workspace_id.into(), thread_id: thread_id.into(), turn_id: turn_id.into(),
+                window_index: 1, status: ExecutionWindowStatus::Running, exhaustion_reason: None,
+                agent_round_count: 0, tool_call_count: 0, provider_token_count: 0,
+                metadata_json: serde_json::json!({"runtimeWindowId":format!("{turn_id}:window:1")}),
+                started_at: now,
+            }, now, now).await.unwrap(),
+        };
+        assert_eq!(window.status, ExecutionWindowStatus::Running);
+        let snapshot = crud_store
+            .get_turn_runtime_snapshot(turn_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let input: Vec<UserInput> = serde_json::from_str(&snapshot.input_json).unwrap();
+        let mut payload = build_execution_checkpoint_payload(
+            workspace_id,
+            thread_id,
+            turn_id,
+            pioneer_protocol::build_execution_checkpoint_original_request_summary(&input),
+            pioneer_protocol::ExecutionCheckpointWindowSummary {
+                progress: Some(pioneer_protocol::ExecutionProgressSummary {
+                    schema_version: 1,
+                    baseline: [0, 0, 0],
+                    frontier: [0, 0, 0],
+                }),
+                window_id: Some(
+                    window
+                        .metadata_json
+                        .get("runtimeWindowId")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| format!("{turn_id}:window:{}", window.window_index)),
+                ),
+                window_index: window.window_index,
+                started_at_unix_ms: Some(window.started_at.timestamp_millis()),
+                completed_at_unix_ms: None,
+                agent_round_count: window.agent_round_count,
+                tool_call_count: window.tool_call_count,
+                provider_token_count: (window.provider_token_count > 0)
+                    .then_some(window.provider_token_count),
+                exhaustion_reason: None,
+            },
+            pioneer_protocol::build_execution_checkpoint_provider_budget_summary(
+                pioneer_protocol::ExecutionCheckpointProviderBudgetInput {
+                    model: Some(snapshot.model),
+                    model_provider: Some(snapshot.provider_name),
+                    agent_round_count: window.agent_round_count,
+                    tool_call_count: window.tool_call_count,
+                    provider_token_count: (window.provider_token_count > 0)
+                        .then_some(window.provider_token_count),
+                    exhaustion_reason: None,
+                    exhausted_limit: None,
+                    exhausted_observed: None,
+                },
+            ),
+            pioneer_protocol::build_execution_checkpoint_tool_summary(&[], 32),
+            vec![],
+        );
+        payload.provider_budget.provider_usage_available = false;
+        let revision = crud_store
+            .native_semantic_checkpoint_for_turn(turn_id)
+            .await
+            .unwrap()
+            .map(|cp| {
+                cp.payload_json["native_semantic_state"]["checkpoint_revision"]
+                    .as_u64()
+                    .unwrap()
+                    + 1
+            })
+            .unwrap_or(1);
+        let mut state = crate::native_recovery_test_support::native_semantic_fixture_state(
+            &coordinator.tool_loop_config,
+            [0, 0, 0],
+        );
+        state["checkpoint_revision"] = serde_json::json!(revision);
+        payload.native_semantic_state = Some(state);
+        assert!(pioneer_agent::native_semantic_checkpoint_compatible(
+            &payload,
+            &coordinator.tool_loop_config.retry,
+            coordinator.tool_loop_config.no_progress_mode
+        ));
+        crud_store
+            .commit_native_semantic_checkpoint(
+                payload,
+                None,
+                1,
+                &owner.owner_id,
+                owner.owner_generation,
+            )
+            .await
+            .unwrap();
     }
 
     async fn persist_test_runtime_snapshot_only(
@@ -7376,7 +7560,22 @@ mod tests {
             )
             .await
             .expect("recovery skill installation should persist");
-        persist_test_runtime_snapshot(crud_store.as_ref(), workspace_id, thread_id, turn_id).await;
+        persist_test_runtime_snapshot(
+            crud_store.as_ref(),
+            workspace_id,
+            thread_id,
+            turn_id,
+            &coordinator,
+        )
+        .await;
+        seed_test_native_semantic_checkpoint(
+            crud_store.as_ref(),
+            workspace_id,
+            thread_id,
+            turn_id,
+            &coordinator,
+        )
+        .await;
         let stored_snapshot = crud_store
             .get_turn_runtime_snapshot(turn_id)
             .await
@@ -7994,7 +8193,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.is::<super::NativeSemanticCheckpointUnavailable>());
-        persist_test_runtime_snapshot(&store, ws, thread, turn).await;
+        persist_test_runtime_snapshot_only(&store, ws, thread, turn).await;
         let error = coordinator
             .accepted_execution_window_policy(turn)
             .await
@@ -8571,7 +8770,14 @@ mod tests {
             None,
         )
         .await;
-        persist_test_runtime_snapshot(crud_store.as_ref(), workspace_id, thread_id, turn_id).await;
+        persist_test_runtime_snapshot(
+            crud_store.as_ref(),
+            workspace_id,
+            thread_id,
+            turn_id,
+            &coordinator,
+        )
+        .await;
         let timestamp = chrono::Utc::now().fixed_offset();
         let first_window = crud_store
             .create_turn_execution_window(
@@ -8593,6 +8799,14 @@ mod tests {
             )
             .await
             .expect("initial native execution window should persist");
+        seed_test_native_semantic_checkpoint(
+            crud_store.as_ref(),
+            workspace_id,
+            thread_id,
+            turn_id,
+            &coordinator,
+        )
+        .await;
         let job = coordinator
             .enqueue_runtime_failure_job(
                 &RuntimeFailureCandidate {
@@ -8663,7 +8877,14 @@ mod tests {
             None,
         )
         .await;
-        persist_test_runtime_snapshot(crud_store.as_ref(), workspace_id, thread_id, turn_id).await;
+        persist_test_runtime_snapshot(
+            crud_store.as_ref(),
+            workspace_id,
+            thread_id,
+            turn_id,
+            &coordinator,
+        )
+        .await;
 
         let timestamp = chrono::Utc::now().fixed_offset();
         let window = crud_store
@@ -8687,6 +8908,14 @@ mod tests {
             .await
             .expect("running window should persist");
 
+        seed_test_native_semantic_checkpoint(
+            crud_store.as_ref(),
+            workspace_id,
+            thread_id,
+            turn_id,
+            &coordinator,
+        )
+        .await;
         let restored = coordinator
             .restored_recovery_turn_request(thread_id, turn_id, 1_700_000_010)
             .await
@@ -8716,7 +8945,18 @@ mod tests {
             .list_turn_execution_checkpoints_for_window(window.id.as_str())
             .await
             .expect("startup checkpoint should load");
-        assert_eq!(checkpoints.len(), 1);
+        assert_eq!(checkpoints.len(), 2);
+        assert_eq!(
+            checkpoints
+                .iter()
+                .filter(|cp| cp.checkpoint_kind == TurnExecutionCheckpointKind::SemanticState)
+                .count(),
+            1
+        );
+        let checkpoints: Vec<_> = checkpoints
+            .into_iter()
+            .filter(|cp| cp.checkpoint_kind != TurnExecutionCheckpointKind::SemanticState)
+            .collect();
         assert_eq!(
             checkpoints[0].checkpoint_kind,
             TurnExecutionCheckpointKind::StartupRecovery
@@ -8753,7 +8993,14 @@ mod tests {
             None,
         )
         .await;
-        persist_test_runtime_snapshot(crud_store.as_ref(), workspace_id, thread_id, turn_id).await;
+        persist_test_runtime_snapshot(
+            crud_store.as_ref(),
+            workspace_id,
+            thread_id,
+            turn_id,
+            &coordinator,
+        )
+        .await;
         let timestamp = chrono::Utc::now().fixed_offset();
         crud_store
             .create_turn_execution_window(
@@ -8776,6 +9023,14 @@ mod tests {
             .await
             .expect("initial startup execution window should persist");
 
+        seed_test_native_semantic_checkpoint(
+            crud_store.as_ref(),
+            workspace_id,
+            thread_id,
+            turn_id,
+            &coordinator,
+        )
+        .await;
         let restored = coordinator
             .restored_recovery_turn_request(thread_id, turn_id, 1_700_000_010)
             .await
@@ -8815,7 +9070,14 @@ mod tests {
             None,
         )
         .await;
-        persist_test_runtime_snapshot(crud_store.as_ref(), workspace_id, thread_id, turn_id).await;
+        persist_test_runtime_snapshot(
+            crud_store.as_ref(),
+            workspace_id,
+            thread_id,
+            turn_id,
+            &coordinator,
+        )
+        .await;
 
         let timestamp = chrono::Utc::now().fixed_offset();
         let window = crud_store
@@ -8838,6 +9100,14 @@ mod tests {
             )
             .await
             .expect("running window should persist");
+        seed_test_native_semantic_checkpoint(
+            crud_store.as_ref(),
+            workspace_id,
+            thread_id,
+            turn_id,
+            &coordinator,
+        )
+        .await;
         let job = coordinator
             .enqueue_runtime_failure_job(
                 &RuntimeFailureCandidate {
@@ -8895,7 +9165,18 @@ mod tests {
             .list_turn_execution_checkpoints_for_window(window.id.as_str())
             .await
             .expect("runtime checkpoint should load");
-        assert_eq!(checkpoints.len(), 1);
+        assert_eq!(checkpoints.len(), 2);
+        assert_eq!(
+            checkpoints
+                .iter()
+                .filter(|cp| cp.checkpoint_kind == TurnExecutionCheckpointKind::SemanticState)
+                .count(),
+            1
+        );
+        let checkpoints: Vec<_> = checkpoints
+            .into_iter()
+            .filter(|cp| cp.checkpoint_kind != TurnExecutionCheckpointKind::SemanticState)
+            .collect();
         assert_eq!(
             checkpoints[0].checkpoint_kind,
             TurnExecutionCheckpointKind::WindowExhausted
@@ -8922,6 +9203,14 @@ mod tests {
             )
             .await
             .expect("second running window should persist");
+        seed_test_native_semantic_checkpoint(
+            crud_store.as_ref(),
+            workspace_id,
+            thread_id,
+            turn_id,
+            &coordinator,
+        )
+        .await;
         let second_context = coordinator
             .prepare_execution_checkpoint_for_recovery(
                 workspace_id,
@@ -9104,7 +9393,22 @@ mod tests {
             None,
         )
         .await;
-        persist_test_runtime_snapshot(crud_store.as_ref(), workspace_id, thread_id, turn_id).await;
+        persist_test_runtime_snapshot(
+            crud_store.as_ref(),
+            workspace_id,
+            thread_id,
+            turn_id,
+            &coordinator,
+        )
+        .await;
+        seed_test_native_semantic_checkpoint(
+            crud_store.as_ref(),
+            workspace_id,
+            thread_id,
+            turn_id,
+            &coordinator,
+        )
+        .await;
         let job = crud_store
             .enqueue_recovery_job(
                 turn_id.to_owned(),
@@ -9173,8 +9477,23 @@ mod tests {
             None,
         )
         .await;
-        persist_test_runtime_snapshot(crud_store.as_ref(), workspace_id, thread_id, turn_id).await;
+        persist_test_runtime_snapshot(
+            crud_store.as_ref(),
+            workspace_id,
+            thread_id,
+            turn_id,
+            &coordinator,
+        )
+        .await;
 
+        seed_test_native_semantic_checkpoint(
+            crud_store.as_ref(),
+            workspace_id,
+            thread_id,
+            turn_id,
+            &coordinator,
+        )
+        .await;
         let assistant_round = ChatMessage::assistant_tool_calls_with_provider_state(
             None::<String>,
             Some("reasoning that produced the side effect"),
@@ -9554,7 +9873,14 @@ mod tests {
             None,
         )
         .await;
-        persist_test_runtime_snapshot(crud_store.as_ref(), workspace_id, thread_id, turn_id).await;
+        persist_test_runtime_snapshot(
+            crud_store.as_ref(),
+            workspace_id,
+            thread_id,
+            turn_id,
+            &coordinator,
+        )
+        .await;
 
         let timestamp = chrono::Utc::now().fixed_offset();
         let window = crud_store
@@ -9592,7 +9918,7 @@ mod tests {
             )
             .await
             .expect("window should mark exhausted");
-        let payload = build_execution_checkpoint_payload(
+        let mut payload = build_execution_checkpoint_payload(
             workspace_id.to_owned(),
             thread_id.to_owned(),
             turn_id.to_owned(),
@@ -9639,6 +9965,22 @@ mod tests {
             },
             Vec::new(),
         );
+        payload.window.progress = Some(pioneer_protocol::ExecutionProgressSummary {
+            schema_version: 1,
+            baseline: [0, 0, 0],
+            frontier: [0, 0, 0],
+        });
+        payload.native_semantic_state = Some(
+            crate::native_recovery_test_support::native_semantic_fixture_state(
+                &coordinator.tool_loop_config,
+                [0, 0, 0],
+            ),
+        );
+        assert!(pioneer_agent::native_semantic_checkpoint_compatible(
+            &payload,
+            &coordinator.tool_loop_config.retry,
+            coordinator.tool_loop_config.no_progress_mode
+        ));
         crud_store
             .save_turn_execution_checkpoint(NewTurnExecutionCheckpointRecord {
                 id: None,
@@ -12295,7 +12637,22 @@ mod tests {
             None,
         )
         .await;
-        persist_test_runtime_snapshot(crud_store.as_ref(), workspace_id, thread_id, turn_id).await;
+        persist_test_runtime_snapshot(
+            crud_store.as_ref(),
+            workspace_id,
+            thread_id,
+            turn_id,
+            &coordinator,
+        )
+        .await;
+        seed_test_native_semantic_checkpoint(
+            crud_store.as_ref(),
+            workspace_id,
+            thread_id,
+            turn_id,
+            &coordinator,
+        )
+        .await;
         crud_store
             .update_turn_status(
                 thread_id,

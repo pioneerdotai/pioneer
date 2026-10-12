@@ -64,54 +64,15 @@ pub(crate) async fn charged_native_window(
         metadata_json: json!({"runtimeWindowId":format!("{turn}:window:{index}"),"acceptedOwnerMarker":"keep"}),
         started_at: now,
     },now,now).await.unwrap();
-    let root = tempfile::tempdir().unwrap();
-    let prompt = pioneer_promt::compile_prompt(pioneer_promt::PromptCompileInput {
-        workspace_root: root.path().into(),
-        profile: pioneer_promt::PromptProfile::AssistantFull,
-        skills_prompt: None,
-        retry_instruction: None,
-        include_tool_recovery_policy: true,
-        include_task_orchestration_policy: false,
-        continue_generation_hint: false,
-        runtime_sections: vec![],
-        dynamic_sections: vec![],
-        dynamic_context: None,
-        extra_system: Some("original admission clock".into()),
-        limits: Default::default(),
-    })
-    .unwrap();
-    let instructions = pioneer_promt::compile_instruction_delivery_plan(prompt).unwrap();
-    let manifest = json!({"sources":[],"diagnostics":[]});
-    let mut phase: serde_json::Value = serde_json::from_str(
-        &pioneer_agent::NativeInitialPreparation::new_admission_json(
-            workspace,
-            thread,
-            turn,
-            pioneer_protocol::TURN_EXECUTION_REQUEST_MAX_BYTES,
-        )
-        .unwrap(),
-    )
-    .unwrap();
-    phase["state"] = json!({"phase":"completed","outputs":{
-        "native_agent_action_contract":null,"mcp_descriptors":[],"mcp_manifest_hash":null,
-        "policy":{"policies":pioneer_hooks::HookPolicySet::default()},
-        "prompt_context":{"contexts":pioneer_hooks::HookPromptContextSet::default(),"manifest":manifest},
-        "prompt_sections":{"sections":pioneer_hooks::HookPromptSectionSet::default(),"manifest":manifest},
-        "instructions":instructions,"capability_diagnostics":[],
-        "skill_plan":{"tools":[],"read_skill_index":{},"excluded_tools":[]},
-        "tool_metadata":pioneer_hooks::HookToolBundleSet::default(),"extension_specs":[],
-        "provider_tool_calling":true,"initiating_thread_id":null,"visible_tools":[],"core_tools":[],
-        "selected_optional_tools":[],"requested_tools":[],"config":config,
-        "preflight_usage":{"attempts":1,"known_tokens":receipts[0].0.unwrap_or(0)+receipts[0].1.unwrap_or(0),
-            "unknown":receipts[0].0.is_none() || receipts[0].1.is_none()}
-    }});
-    let phase = phase.to_string();
-    assert!(
-        pioneer_agent::NativeInitialPreparation::completed_for_resume(
-            &phase,
-            pioneer_protocol::TURN_EXECUTION_REQUEST_MAX_BYTES
-        )
-        .unwrap()
+    let phase = completed_native_phase(
+        workspace,
+        thread,
+        turn,
+        config,
+        json!({
+            "attempts":1,"known_tokens":receipts[0].0.unwrap_or(0)+receipts[0].1.unwrap_or(0),
+            "unknown":receipts[0].0.is_none() || receipts[0].1.is_none()
+        }),
     );
     let mut snapshot = crate::turn_runtime_snapshot::new_turn_runtime_snapshot(
         thread,
@@ -241,32 +202,7 @@ pub(crate) async fn charged_native_window(
     payload.provider_budget.provider_usage_available = complete;
     // A real cold continuation must satisfy the Agent's entire owned codec,
     // even though the storage owner deliberately treats that state as opaque.
-    let mut frontier = pioneer_tools::ToolProgressFrontier::default();
-    frontier.advanced_observations = progress.frontier[0];
-    frontier.unchanged_observations = progress.frontier[1];
-    frontier.unknown_observations = progress.frontier[2];
-    let retry = pioneer_tools::ToolRetryController::new(config.retry.clone())
-        .checkpoint()
-        .unwrap();
-    payload.native_semantic_state = Some(json!({
-        "schema_version": pioneer_protocol::NATIVE_SEMANTIC_STATE_SCHEMA_VERSION,
-        "checkpoint_revision": 1,
-        "attached_task_wait": null,
-        "controls": pioneer_protocol::NativeControlCheckpointState::default(),
-        "provider_history_roots": [],
-        "no_progress_mode": config.no_progress_mode,
-        "progress_frontier": frontier,
-        "retry": retry,
-        "retry_lifecycle": {"active_episode_id": null, "next_episode_index": 0},
-        "pending_retry_instruction": null,
-        "applied_retry_instruction": null,
-        "observed_review_required_signatures": [],
-        "observed_terminal_task_ids": [],
-        "task_mutation_guard": {"failures_since_last_success": []},
-        "post_turn_assistant_text": "",
-        "post_turn_tool_events": [],
-        "post_turn_domain_events": [],
-    }));
+    payload.native_semantic_state = Some(native_semantic_fixture_state(config, progress.frontier));
     assert!(pioneer_agent::native_semantic_checkpoint_compatible(
         &payload,
         &config.retry,
@@ -288,4 +224,94 @@ pub(crate) async fn charged_native_window(
         config.no_progress_mode,
     ));
     (window, accepted)
+}
+
+pub(crate) fn completed_native_phase(
+    workspace: &str,
+    thread: &str,
+    turn: &str,
+    config: &ToolLoopConfig,
+    preflight_usage: serde_json::Value,
+) -> String {
+    let root = tempfile::tempdir().unwrap();
+    let prompt = pioneer_promt::compile_prompt(pioneer_promt::PromptCompileInput {
+        workspace_root: root.path().into(),
+        profile: pioneer_promt::PromptProfile::AssistantFull,
+        skills_prompt: None,
+        retry_instruction: None,
+        include_tool_recovery_policy: true,
+        include_task_orchestration_policy: false,
+        continue_generation_hint: false,
+        runtime_sections: vec![],
+        dynamic_sections: vec![],
+        dynamic_context: None,
+        extra_system: Some("original admission clock".into()),
+        limits: Default::default(),
+    })
+    .unwrap();
+    let instructions = pioneer_promt::compile_instruction_delivery_plan(prompt).unwrap();
+    let manifest = json!({"sources":[],"diagnostics":[]});
+    let mut phase: serde_json::Value = serde_json::from_str(
+        &pioneer_agent::NativeInitialPreparation::new_admission_json(
+            workspace,
+            thread,
+            turn,
+            pioneer_protocol::TURN_EXECUTION_REQUEST_MAX_BYTES,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    phase["state"] = json!({"phase":"completed","outputs":{
+        "native_agent_action_contract":null,"mcp_descriptors":[],"mcp_manifest_hash":null,
+        "policy":{"policies":pioneer_hooks::HookPolicySet::default()},
+        "prompt_context":{"contexts":pioneer_hooks::HookPromptContextSet::default(),"manifest":manifest},
+        "prompt_sections":{"sections":pioneer_hooks::HookPromptSectionSet::default(),"manifest":manifest},
+        "instructions":instructions,"capability_diagnostics":[],
+        "skill_plan":{"tools":[],"read_skill_index":{},"excluded_tools":[]},
+        "tool_metadata":pioneer_hooks::HookToolBundleSet::default(),"extension_specs":[],
+        "provider_tool_calling":true,"initiating_thread_id":null,"visible_tools":[],"core_tools":[],
+        "selected_optional_tools":[],"requested_tools":[],"config":config,
+        "preflight_usage":preflight_usage
+    }});
+    let phase = phase.to_string();
+    assert!(
+        pioneer_agent::NativeInitialPreparation::completed_for_resume(
+            &phase,
+            pioneer_protocol::TURN_EXECUTION_REQUEST_MAX_BYTES
+        )
+        .unwrap()
+    );
+    phase
+}
+
+pub(crate) fn native_semantic_fixture_state(
+    config: &ToolLoopConfig,
+    counts: [u64; 3],
+) -> serde_json::Value {
+    let mut frontier = pioneer_tools::ToolProgressFrontier::default();
+    frontier.advanced_observations = counts[0];
+    frontier.unchanged_observations = counts[1];
+    frontier.unknown_observations = counts[2];
+    let retry = pioneer_tools::ToolRetryController::new(config.retry.clone())
+        .checkpoint()
+        .unwrap();
+    json!({
+        "schema_version": pioneer_protocol::NATIVE_SEMANTIC_STATE_SCHEMA_VERSION,
+        "checkpoint_revision": 1,
+        "attached_task_wait": null,
+        "controls": pioneer_protocol::NativeControlCheckpointState::default(),
+        "provider_history_roots": [],
+        "no_progress_mode": config.no_progress_mode,
+        "progress_frontier": frontier,
+        "retry": retry,
+        "retry_lifecycle": {"active_episode_id": null, "next_episode_index": 0},
+        "pending_retry_instruction": null,
+        "applied_retry_instruction": null,
+        "observed_review_required_signatures": [],
+        "observed_terminal_task_ids": [],
+        "task_mutation_guard": {"failures_since_last_success": []},
+        "post_turn_assistant_text": "",
+        "post_turn_tool_events": [],
+        "post_turn_domain_events": [],
+    })
 }
