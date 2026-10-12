@@ -130,7 +130,7 @@
 "chat.composer.model.select_label" = "Select model"
 "chat.composer.placeholder" = "Write a message"
 "chat.composer.reply.cancel" = "Cancel reply"
-"chat.composer.send_failed" = "Message was not sent. Review and retry."
+"chat.composer.send_failed" = "An error occurred while sending. Check the conversation before trying again."
 "chat.composer.steer_cli_runtime" = "Send to running CLI turn"
 "chat.composer.stop_reason" = "Turn cancelled by user"
 "chat.composer.voice.desktop_hold_prompt" = "Release outside of circle to cancel"

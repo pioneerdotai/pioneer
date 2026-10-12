@@ -143,6 +143,8 @@ struct RuntimeScope {
     source_revision: u64,
     minimum_revision: u64,
     loaded: bool,
+    // Accepted data belongs to authorization, while requests also belong to a connection.
+    accepted_auth: Option<(u64, u64)>,
     prefetch: bool,
     demand: usize,
     retained_demand: Vec<Weak<()>>,
@@ -272,11 +274,40 @@ impl ClientCore {
         refresh: bool,
         probe: Option<Option<String>>,
     ) -> anyhow::Result<CLIRuntimeListResponse> {
+        self.read_provider_runtime_request_with_wait(workspace, refresh, probe, |receiver| {
+            match receiver.recv_timeout(Duration::from_millis(100)) {
+                Ok(()) | Err(mpsc::RecvTimeoutError::Timeout) => Ok(()),
+                Err(_) => anyhow::bail!("provider_runtime_cancelled"),
+            }
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn read_provider_runtimes_with_events_for_test(
+        &self,
+        workspace: &str,
+        mut event: impl FnMut(),
+    ) -> anyhow::Result<CLIRuntimeListResponse> {
+        self.read_provider_runtime_request_with_wait(workspace, true, None, |_| {
+            event();
+            Ok(())
+        })
+    }
+
+    fn read_provider_runtime_request_with_wait(
+        &self,
+        workspace: &str,
+        refresh: bool,
+        probe: Option<Option<String>>,
+        mut wait: impl FnMut(&mpsc::Receiver<()>) -> anyhow::Result<()>,
+    ) -> anyhow::Result<CLIRuntimeListResponse> {
         anyhow::ensure!(
             !workspace.trim().is_empty() && !self.is_stopped(),
             "provider_runtime_unavailable"
         );
-        let epoch = self.provider_runtime_epoch();
+        let mut epoch = self.provider_runtime_epoch();
+        let mut connection_transitions = 0;
+        let allow_connection_transition = probe.is_none();
         let _demand = self.retain_provider_runtime(workspace);
         if let Some(runtime_id) = probe {
             self.schedule_provider_runtime_refresh(workspace, runtime_id)?;
@@ -305,10 +336,36 @@ impl ClientCore {
             scope.listeners.push(sender);
         }
         loop {
+            let current = self.provider_runtime_epoch();
             anyhow::ensure!(
-                !self.is_stopped() && self.provider_runtime_epoch() == epoch,
+                !self.is_stopped()
+                    && (current.0, current.1) == (epoch.0, epoch.1)
+                    && self.provider_runtime_allowed(workspace),
                 "provider_runtime_cancelled"
             );
+            if current != epoch {
+                // Only the safe list read can cross at most two connection replacements.
+                anyhow::ensure!(
+                    allow_connection_transition && connection_transitions < 2,
+                    "provider_runtime_cancelled"
+                );
+                connection_transitions += 1;
+                epoch = current;
+                let current_request = self
+                    .provider_runtimes
+                    .lock()
+                    .expect("provider runtimes poisoned")
+                    .scopes
+                    .get(workspace)
+                    .is_some_and(|scope| {
+                        scope.auth == epoch && (scope.loaded || scope.request.is_some())
+                    });
+                if !current_request {
+                    self.provider_runtime_intent(ProviderRuntimeIntent::Refresh {
+                        workspace_id: workspace.into(),
+                    });
+                }
+            }
             {
                 let owner = self
                     .provider_runtimes
@@ -318,6 +375,10 @@ impl ClientCore {
                     .scopes
                     .get(workspace)
                     .ok_or_else(|| anyhow::anyhow!("provider_runtime_cancelled"))?;
+                anyhow::ensure!(
+                    scope.auth == epoch && scope.demanded(),
+                    "provider_runtime_cancelled"
+                );
                 match scope.publication.request {
                     ProviderRuntimeRequestState::Ready => {
                         return Ok(CLIRuntimeListResponse {
@@ -334,10 +395,7 @@ impl ClientCore {
                     _ => anyhow::bail!("provider_runtime_unavailable"),
                 }
             }
-            match receiver.recv_timeout(Duration::from_millis(100)) {
-                Ok(()) | Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(_) => anyhow::bail!("provider_runtime_cancelled"),
-            }
+            wait(&receiver)?;
         }
     }
     pub(crate) fn resume_provider_runtime_demand(&self) {
@@ -364,6 +422,15 @@ impl ClientCore {
                 let capabilities = crate::authorization::principal_presentation_capabilities(&p);
                 capabilities.can_manage_capabilities || capabilities.can_use_cli_runtimes
             })
+    }
+    pub(crate) fn provider_runtime_data_valid(&self, workspace: &str) -> bool {
+        let auth = self.provider_runtime_epoch();
+        self.provider_runtimes
+            .lock()
+            .expect("provider runtimes poisoned")
+            .scopes
+            .get(workspace)
+            .is_some_and(|scope| scope.accepted_auth == Some((auth.0, auth.1)))
     }
     pub fn provider_runtime_snapshot(
         &self,
@@ -480,6 +547,7 @@ impl ClientCore {
                 source_revision: 0,
                 minimum_revision: 0,
                 loaded: false,
+                accepted_auth: None,
                 prefetch: false,
                 demand: 0,
                 retained_demand: Vec::new(),
@@ -521,9 +589,15 @@ impl ClientCore {
                 .checked_add(1)
                 .expect("provider runtime demand exhausted");
         }
-        if scope.auth != auth {
+        let epoch_changed = scope.auth != auth;
+        if epoch_changed {
             scope.auth = auth;
             scope.loaded = false;
+            if scope.accepted_auth != Some((auth.0, auth.1)) {
+                scope.accepted_auth = None;
+            }
+            // Revision fences belong to this connection's stream. Accepted rows
+            // remain useful while its replacement obtains a new full snapshot.
             scope.source_revision = 0;
             scope.minimum_revision = 0;
             scope.request = None;
@@ -534,6 +608,7 @@ impl ClientCore {
             scope.due = None;
             scope.prefetch = false;
             scope.loaded = false;
+            scope.accepted_auth = None;
             let mut next = (*scope.publication).clone();
             next.runtimes.clear();
             next.request = ProviderRuntimeRequestState::Cancelled;
@@ -542,7 +617,10 @@ impl ClientCore {
         if scope.request.is_some() {
             return self.navigation_outcome(ClientTransitionOutcome::Noop);
         }
-        if observe && scope.publication.request == ProviderRuntimeRequestState::Failed {
+        if observe
+            && !epoch_changed
+            && scope.publication.request == ProviderRuntimeRequestState::Failed
+        {
             return self.navigation_outcome(ClientTransitionOutcome::Noop);
         }
         if observe && scope.loaded {
@@ -562,7 +640,7 @@ impl ClientCore {
             .get_mut(workspace)
             .expect("registered runtime scope");
         let mut next = (*scope.publication).clone();
-        if !scope.loaded {
+        if scope.accepted_auth != Some((auth.0, auth.1)) {
             next.runtimes.clear();
         }
         next.request = ProviderRuntimeRequestState::Loading;
@@ -632,6 +710,7 @@ impl ClientCore {
                 scope.source_revision = response.revision;
                 scope.minimum_revision = scope.minimum_revision.max(response.revision);
                 scope.loaded = true;
+                scope.accepted_auth = Some((auth.0, auth.1));
                 scope.prefetch = false;
                 scope.request = None;
                 scope.due = None;
@@ -664,6 +743,7 @@ impl ClientCore {
             scope.due = None;
             scope.prefetch = false;
             scope.loaded = false;
+            scope.accepted_auth = None;
             scope.source_revision = 0;
             scope.minimum_revision = 0;
             let mut next = (*scope.publication).clone();
@@ -821,22 +901,38 @@ impl ClientCore {
                             }
                             let sender = core.transport_runtime().ws_command_sender();
                             drop(core);
+                            let Some(connection) = request.auth.2 else {
+                                if let Some(core) = weak.upgrade() {
+                                    core.complete_provider_runtime(
+                                        &request,
+                                        Err(()),
+                                        Instant::now(),
+                                    );
+                                }
+                                continue;
+                            };
+                            let transport = sender.requests_for_connection(connection);
                             let result = if let Some(runtime_id) = &request.refresh_runtime {
-                                sender
-                                    .cli_runtime_refresh(
-                                        pioneer_protocol::CLIRuntimeRefreshParams {
-                                            workspace_id: request.workspace_id.clone(),
-                                            runtime_id: runtime_id.clone(),
-                                        },
-                                    )
-                                    .map(|response| CLIRuntimeListResponse {
+                                crate::transport::ws::command_sender::cli_runtime_refresh(
+                                    &transport,
+                                    pioneer_protocol::CLIRuntimeRefreshParams {
+                                        workspace_id: request.workspace_id.clone(),
+                                        runtime_id: runtime_id.clone(),
+                                    },
+                                )
+                                .map(|response| {
+                                    CLIRuntimeListResponse {
                                         revision: response.revision,
                                         runtimes: response.runtimes,
-                                    })
-                            } else {
-                                sender.cli_runtime_list(CLIRuntimeListParams {
-                                    workspace_id: request.workspace_id.clone(),
+                                    }
                                 })
+                            } else {
+                                crate::transport::ws::command_sender::cli_runtime_list(
+                                    &transport,
+                                    CLIRuntimeListParams {
+                                        workspace_id: request.workspace_id.clone(),
+                                    },
+                                )
                             }
                             .map_err(|_| ());
                             let Some(core) = weak.upgrade() else {
@@ -926,6 +1022,87 @@ mod tests {
             runtimes: ids.iter().map(|id| runtime(id)).collect(),
         }
     }
+    fn replace_connection(core: &ClientCore, connection: u64) {
+        let scope = ClientScope::Administration { workspace_id: None };
+        let previous = core.snapshot(&scope).unwrap();
+        let mut identity = (*previous
+            .snapshot()
+            .payload::<crate::gateway::identity_authorization::IdentityAuthorizationPublication>()
+            .unwrap())
+        .clone();
+        identity.connection_id = Some(connection);
+        core.publish(
+            &ClientMutationAuthority { _private: () },
+            scope,
+            crate::threads::registry::revisions(previous.revisions().scoped().get() + 1),
+            Arc::new(identity),
+            vec![],
+        );
+    }
+
+    #[test]
+    fn catalog_wait_follows_only_bounded_same_authorization_connections() {
+        for replacements in [1, 2, 3] {
+            let core = authorized_core();
+            let mut waits = 0;
+            let result =
+                core.read_provider_runtime_request_with_wait("workspace", true, None, |_| {
+                    waits += 1;
+                    if waits <= replacements {
+                        let old = request(&core, "workspace");
+                        replace_connection(&core, waits as u64);
+                        core.complete_provider_runtime(
+                            &old,
+                            Ok(response(100, &["stale"])),
+                            Instant::now(),
+                        );
+                    } else {
+                        let current = request(&core, "workspace");
+                        core.complete_provider_runtime(
+                            &current,
+                            Ok(response(1, &["current"])),
+                            Instant::now(),
+                        );
+                    }
+                    Ok(())
+                });
+            if replacements <= 2 {
+                assert_eq!(result.unwrap().runtimes[0].runtime_id, "current");
+                assert_eq!(waits, replacements + 1);
+            } else {
+                assert_eq!(
+                    result.unwrap_err().to_string(),
+                    "provider_runtime_cancelled"
+                );
+                assert_eq!(waits, 3);
+            }
+        }
+    }
+
+    #[test]
+    fn catalog_wait_cannot_cross_authorization_loss_or_repeat_a_probe() {
+        for probe in [false, true] {
+            let core = authorized_core();
+            let mut waits = 0;
+            let result = core.read_provider_runtime_request_with_wait(
+                "workspace",
+                true,
+                probe.then_some(None),
+                |_| {
+                    waits += 1;
+                    if probe {
+                        replace_connection(&core, 9);
+                    } else {
+                        core.clear_authorization_projections();
+                    }
+                    Ok(())
+                },
+            );
+            assert!(result.is_err());
+            assert_eq!(waits, 1);
+        }
+    }
+
     #[test]
     fn explicit_probe_supersedes_snapshot_once_and_shares_the_existing_worker_generation() {
         let core = authorized_core();

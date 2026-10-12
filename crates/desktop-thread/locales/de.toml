@@ -130,7 +130,7 @@
 "chat.composer.model.select_label" = "Modell auswählen"
 "chat.composer.placeholder" = "Nachricht schreiben"
 "chat.composer.reply.cancel" = "Antwort abbrechen"
-"chat.composer.send_failed" = "Nachricht wurde nicht gesendet. Prüfen und erneut versuchen."
+"chat.composer.send_failed" = "Beim Senden ist ein Fehler aufgetreten. Prüfen Sie den Chat vor einem erneuten Versuch."
 "chat.composer.steer_cli_runtime" = "An laufenden CLI-Turn senden"
 "chat.composer.stop_reason" = "Turn vom Benutzer abgebrochen"
 "chat.composer.voice.desktop_hold_prompt" = "Außerhalb des Kreises loslassen, um abzubrechen"

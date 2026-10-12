@@ -1732,6 +1732,18 @@ impl ClientCore {
         {
             return None;
         }
+        // Accepted retiring-connection events still own exact Voice cleanup even
+        // when they can no longer update the current authorization presentation.
+        match event {
+            crate::transport::ws::GatewayWsEvent::Connected { .. } => {
+                self.retire_disconnected_composer_voice(None);
+            }
+            crate::transport::ws::GatewayWsEvent::Reconnecting { connection_id, .. }
+            | crate::transport::ws::GatewayWsEvent::Disconnected { connection_id, .. } => {
+                self.retire_disconnected_composer_voice(Some(*connection_id));
+            }
+            _ => {}
+        }
         if let crate::transport::ws::GatewayWsEvent::Notification { notification, .. } = event {
             self.observe_administration_notification(notification);
             self.observe_provider_runtime_notification(notification);

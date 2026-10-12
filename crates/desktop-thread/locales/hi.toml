@@ -130,7 +130,7 @@
 "chat.composer.model.select_label" = "मॉडल चुनें"
 "chat.composer.placeholder" = "संदेश लिखें"
 "chat.composer.reply.cancel" = "जवाब रद्द करें"
-"chat.composer.send_failed" = "संदेश नहीं भेजा गया। जाँचें और फिर प्रयास करें।"
+"chat.composer.send_failed" = "भेजते समय त्रुटि हुई। फिर प्रयास करने से पहले बातचीत जाँचें।"
 "chat.composer.steer_cli_runtime" = "चल रहे CLI टर्न को भेजें"
 "chat.composer.stop_reason" = "उपयोगकर्ता ने टर्न रद्द किया"
 "chat.composer.voice.desktop_hold_prompt" = "रद्द करने के लिए वृत्त के बाहर छोड़ें"

@@ -130,7 +130,7 @@
 "chat.composer.model.select_label" = "选择模型"
 "chat.composer.placeholder" = "编写消息"
 "chat.composer.reply.cancel" = "取消回复"
-"chat.composer.send_failed" = "消息未发送。请检查后重试。"
+"chat.composer.send_failed" = "发送时发生错误。重试前请检查对话。"
 "chat.composer.steer_cli_runtime" = "发送到正在运行的 CLI 回合"
 "chat.composer.stop_reason" = "用户取消了回合"
 "chat.composer.voice.desktop_hold_prompt" = "在圆圈外松开以取消"
