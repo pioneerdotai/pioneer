@@ -4410,11 +4410,12 @@ async fn independently_heartbeating_owner_keeps_terminal_authority_and_cancellat
                     .session_manager
                     .set_connection_workspace(connection, Some(workspace.clone()))
                     .await;
+                let request_id = generate_test_request_id("heartbeat", "cancel");
                 processor.process_request_for_connection(connection, &json!({
-                    "jsonrpc":"2.0", "id":"heartbeat-cancel", "method":"turn/cancel",
+                    "jsonrpc":"2.0", "id":request_id, "method":"turn/cancel",
                     "params":{"thread_id":BLOCKED_THREAD,"turn_id":BLOCKED_TURN,"reason":"accepted stop"}
                 }).to_string()).await;
-                let response = recv_response_by_id(&mut rx, "heartbeat-cancel").await;
+                let response = recv_response_by_id(&mut rx, &request_id).await;
                 let response: TurnCancelResponse = serde_json::from_value(response.result).unwrap();
                 assert_eq!(response.turn.status, TurnStatus::Interrupted);
                 assert!(
