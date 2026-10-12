@@ -41,7 +41,9 @@ async fn harness_with_bad_root(bad_root: bool) -> Harness {
     harness_with_layout(bad_root, false).await
 }
 async fn harness_with_layout(bad_root: bool, overlap: bool) -> Harness {
-    let directory = tempfile::tempdir().unwrap();
+    // Production jobs use physical roots. Keep fixture paths physical too,
+    // including when the platform's temporary directory is a symlink.
+    let directory = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
     let path = directory.path().join("skills.sqlite");
     let mut options = ConnectOptions::new(pioneer_sqlite::sqlite_connection_url(&path));
     options.max_connections(1).sqlx_logging(false);
@@ -878,6 +880,11 @@ async fn settled(signals: &Signals) {
 async fn one_need_rescan_recovers_once_and_returns_the_real_worker_to_idle() {
     let harness = harness().await;
     let signals = Arc::new(Signals::default());
+    // This test injects one rescan. Unrelated native callbacks must not add
+    // recovery rounds while asserting that exact event's idle behaviour.
+    signals
+        .native_events_disabled
+        .store(true, Ordering::Release);
     let stop = CancellationToken::new();
     let worker = tokio::spawn(run_with_signals(
         harness.processor.clone(),
@@ -888,7 +895,9 @@ async fn one_need_rescan_recovers_once_and_returns_the_real_worker_to_idle() {
     signals.event(Ok(
         Event::new(EventKind::Other).set_flag(notify::event::Flag::Rescan)
     ));
-    tokio::time::timeout(Duration::from_secs(10), async {
+    // Recovery includes the real 5s backoff and a joined native backend
+    // teardown/recreation. Allow scheduling headroom in the workspace suite.
+    tokio::time::timeout(Duration::from_secs(30), async {
         while signals.backend_creations.load(Ordering::Acquire) < 2 {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }

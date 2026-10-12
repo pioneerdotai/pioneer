@@ -609,6 +609,8 @@ pub struct MessageProcessor {
     native_cancellation_finish_barrier: Arc<Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>>,
     #[cfg(test)]
     native_cancellation_materialization_failure: Arc<Mutex<Option<sea_orm::DbErr>>>,
+    #[cfg(test)]
+    native_cancellation_materialization_barrier: Arc<Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>>,
     workspace_compaction_settings: Arc<StdRwLock<std::collections::BTreeMap<String, crate::settings::WorkspaceCompactionSettings>>>,
     agent_listener_tasks: Arc<Mutex<HashMap<String, AgentListenerTask>>>,
     agent_listener_generation: Arc<AtomicU64>,
@@ -1244,6 +1246,8 @@ impl MessageProcessor {
             native_cancellation_finish_barrier: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             native_cancellation_materialization_failure: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            native_cancellation_materialization_barrier: Arc::new(Mutex::new(None)),
             workspace_compaction_settings: Arc::new(StdRwLock::new(
                 std::collections::BTreeMap::new(),
             )),
@@ -4169,6 +4173,7 @@ impl MessageProcessor {
             if canonical { &[] } else { history },
             agent_skill_overlay,
         )?;
+        let mut frozen_prepared = None;
         if canonical {
             let allowed = crate::compaction::frozen::execution_history_scopes(
                 self.crud_store.as_ref(),
@@ -4178,7 +4183,7 @@ impl MessageProcessor {
                 hook_runtime_context.conversation_thread_id.as_deref(),
             )
             .await?;
-            let descriptor = crate::compaction::frozen::capture(
+            let prepared = crate::compaction::frozen::capture_prepared(
                 self.crud_store.as_ref(),
                 workspace_id,
                 thread_id,
@@ -4187,7 +4192,8 @@ impl MessageProcessor {
             )
             .await
             .context("failed to freeze canonical runtime history")?;
-            snapshot.history_json = serde_json::to_string(&descriptor)?;
+            snapshot.history_json = serde_json::to_string(&prepared.descriptor)?;
+            frozen_prepared = Some(prepared);
         }
         // Temporary compatibility for the ordinary legacy loader is removed
         // when that loader is replaced. Canonical Task histories never enter it.
@@ -4195,6 +4201,7 @@ impl MessageProcessor {
             .upsert_turn_runtime_snapshot(snapshot)
             .await
             .with_context(|| format!("failed to persist runtime snapshot for turn `{turn_id}`"))?;
+        drop(frozen_prepared);
         Ok(())
     }
 
@@ -4785,6 +4792,8 @@ impl MessageProcessor {
             native_cancellation_finish_barrier: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             native_cancellation_materialization_failure: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            native_cancellation_materialization_barrier: Arc::new(Mutex::new(None)),
             workspace_compaction_settings: Arc::new(StdRwLock::new(
                 std::collections::BTreeMap::new(),
             )),

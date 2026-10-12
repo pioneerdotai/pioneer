@@ -2382,7 +2382,7 @@ mod tests {
     async fn deleted_directly_delivered_message_keeps_head_conflict_check() {
         let (store, _) = deleted_message_fixture().await;
         store.database_connection().execute_unprepared(
-            "INSERT INTO turn_cli_runtime_binding(turn_id,thread_id,continuation_thread_id,workspace_id,runtime_id,runtime_kind,native_thread_id,native_turn_id,status,created_at,updated_at) SELECT 'message',thread_id,continuation_thread_id,workspace_id,runtime_id,runtime_kind,native_thread_id,'provider-message','completed',created_at,updated_at FROM turn_cli_runtime_binding WHERE turn_id='cli'",
+            "INSERT INTO turn_cli_runtime_binding(turn_id,thread_id,continuation_thread_id,workspace_id,runtime_id,runtime_kind,native_thread_id,native_turn_id,status,created_at,updated_at,frozen_manifest_id) SELECT 'message',thread_id,continuation_thread_id,workspace_id,runtime_id,runtime_kind,native_thread_id,'provider-message','completed',created_at,updated_at,NULL FROM turn_cli_runtime_binding WHERE turn_id='cli'",
         ).await.unwrap();
         assert_eq!(resolve_message(&store).await.as_deref(), Some("message"));
         let mut binding = store
@@ -2558,7 +2558,7 @@ mod tests {
         // hand-written date string can sort differently in SQLite's TEXT column.
         db.execute_raw(sea_orm::Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Sqlite,
-            "INSERT INTO turn_cli_runtime_binding(turn_id,thread_id,continuation_thread_id,workspace_id,runtime_id,runtime_kind,native_thread_id,status,created_at,updated_at) SELECT 'uncertain-child','child',continuation_thread_id,workspace_id,runtime_id,runtime_kind,native_thread_id,'starting',?,? FROM turn_cli_runtime_binding WHERE turn_id='cli'",
+            "INSERT INTO turn_cli_runtime_binding(turn_id,thread_id,continuation_thread_id,workspace_id,runtime_id,runtime_kind,native_thread_id,status,created_at,updated_at,frozen_manifest_id) SELECT 'uncertain-child','child',continuation_thread_id,workspace_id,runtime_id,runtime_kind,native_thread_id,'starting',?,?,NULL FROM turn_cli_runtime_binding WHERE turn_id='cli'",
             [unix_to_datetime(300).into(), unix_to_datetime(300).into()],
         ))
         .await
@@ -2905,13 +2905,18 @@ mod tests {
                 native_root_thread_id: None,
                 native_cwd: Some("/tmp/project".to_owned()),
                 native_model: Some("gpt-5".to_owned()),
-                resume_cursor_json: "{malformed".to_owned(),
+                resume_cursor_json: "{}".to_owned(),
                 status: "active".to_owned(),
                 created_at: opened_at,
                 updated_at: opened_at,
             })
             .await
-            .expect("malformed cursor fixture should persist");
+            .expect("valid cursor fixture should persist");
+        // Simulate corrupt historical bytes; authoritative new writes reject
+        // malformed JSON before touching the existing root.
+        store.database_connection().execute_unprepared(
+            "UPDATE thread_cli_runtime_binding SET resume_cursor_json='{malformed' WHERE thread_id='thread_cli_bad_cursor' AND frozen_manifest_id IS NULL",
+        ).await.unwrap();
         let client = FakeCliRuntimeThreadClient::new();
         let malformed = store
             .get_cli_runtime_thread_binding("thread_cli_bad_cursor")

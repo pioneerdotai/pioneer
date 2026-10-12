@@ -370,9 +370,11 @@ async fn authorized_path_and_url_pins_survive_budget_renderer_and_replay_without
         config.security.enforce_path_allowlist = true;
         config.security.allowed_path_roots = vec![file.path().parent().unwrap().into()];
         config.security.allow_url_sources = true;
-        config.security.url_allowed_domains = vec!["example.com".into()];
+        // HTTP bytes are fixture-owned; an IP literal keeps policy validation
+        // deterministic without an external DNS lookup.
+        config.security.url_allowed_domains = vec!["198.51.100.10".into()];
         state.pipeline_config = Some(config);
-        let url = "https://example.com/evidence.png";
+        let url = "https://198.51.100.10/evidence.png";
         state
             .url_fixtures
             .write()

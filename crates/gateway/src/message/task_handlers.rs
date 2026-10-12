@@ -614,8 +614,8 @@ impl MessageProcessor {
             .as_ref()
             .and_then(|spec| spec.context_policy.as_ref())
             .unwrap_or(&default_policy);
-        let history_json = if let Some(principal) = principal {
-            self.capture_authorized_task_basis(
+        let mut prepared_history = if let Some(principal) = principal {
+            self.capture_authorized_task_basis_prepared(
                 self.crud_store.as_ref(),
                 principal,
                 params.workspace_id.as_str(),
@@ -628,19 +628,22 @@ impl MessageProcessor {
         } else {
             // Unauthenticated fixture construction has no authority to adopt
             // foreign Task output. Product callers supply their current actor.
-            crate::compaction::frozen::capture_execution_basis_json(
+            crate::compaction::frozen::capture_execution_basis_prepared_with_outputs(
                 self.crud_store.as_ref(),
                 params.workspace_id.as_str(),
                 conversation_thread_id.as_str(),
                 source_turn_id,
                 composer.map(|work| work.launch.turn_id.as_str()),
                 composer.is_none().then_some(policy),
+                None,
             )
             .await
         }
         .context("failed to freeze Task conversation sources")?;
 
+        let history_json = serde_json::to_string(&prepared_history.descriptor)?;
         Ok(pioneer_tasks::TaskCreateContext {
+            conversation_frozen_hold: prepared_history.frozen_hold.take().map(std::sync::Arc::new),
             conversation_snapshot: Some(pioneer_tasks::TaskRunConversationSnapshotSeed {
                 conversation_thread_id,
                 source_turn_id: source_turn_id.map(str::to_owned),
