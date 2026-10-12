@@ -577,6 +577,9 @@ pub struct MessageProcessor {
     completed_history_preparation_barrier:
         Arc<compaction_background::CompletedHistoryPreparationBarrier>,
     #[cfg(test)]
+    turn_execution_heartbeat_barrier:
+        Arc<compaction_background::CompletedHistoryPreparationBarrier>,
+    #[cfg(test)]
     task_history_preparation_failure: Arc<std::sync::Mutex<Option<anyhow::Error>>>,
     #[cfg(test)]
     task_cli_terminal_preparation_finished: Arc<tokio::sync::Notify>,
@@ -1211,6 +1214,8 @@ impl MessageProcessor {
             compaction_lifecycle_not_before: Arc::new(StdRwLock::new(None)),
             #[cfg(test)]
             completed_history_preparation_barrier: Arc::new(Default::default()),
+            #[cfg(test)]
+            turn_execution_heartbeat_barrier: Arc::new(Default::default()),
             #[cfg(test)]
             task_history_preparation_failure: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(test)]
@@ -2301,6 +2306,55 @@ impl MessageProcessor {
         }
     }
 
+    async fn run_turn_execution_owner_heartbeat_worker(processor: Weak<Self>) {
+        loop {
+            let Some(this) = processor.upgrade() else {
+                break;
+            };
+            let store = this.crud_store.with_maintenance_reads_and_critical_writes();
+            let owner = this.turn_execution_owner_id.clone();
+            #[cfg(test)]
+            let barrier = this.turn_execution_heartbeat_barrier.clone();
+            // Keep only the DB scope and owner identity during I/O, retry and
+            // sleep. The heartbeat must not keep MessageProcessor alive.
+            drop(this);
+            let cycle = AssertUnwindSafe(async {
+                if let Err(error) = crate::database::attribution::scope_database_workload_result(
+                    pioneer_observability::DatabaseWorkload::ExecutionSupervision,
+                    retry_transient_storage_access(|| {
+                        store.heartbeat_turn_executions_owned_by(
+                            owner.as_ref(),
+                            TURN_EXECUTION_OWNER_LEASE_SECONDS,
+                        )
+                    }),
+                )
+                .await
+                {
+                    record_resilience_worker_error(
+                        "Turn execution owner heartbeat",
+                        &error,
+                        ResilienceWorkerFailureImpact::CriticalPoll,
+                    );
+                }
+            })
+            .catch_unwind()
+            .await;
+            if cycle.is_err() {
+                error!("contained panic in Turn execution owner heartbeat worker");
+            }
+            #[cfg(test)]
+            barrier
+                .wait_if_armed(
+                    "__execution_owner_heartbeat_written__",
+                    &tokio_util::sync::CancellationToken::new(),
+                )
+                .await;
+            // Retries are bounded by the existing storage policy; subsequent
+            // polls remain serial and use the existing short service interval.
+            sleep(Duration::from_secs(RESILIENCE_WORKER_POLL_INTERVAL_SECONDS)).await;
+        }
+    }
+
     async fn run_projection_delivery_resilience_worker(processor: Weak<Self>) {
         let mut finalization_reporting = reconciliation_diagnostics::Reporter::new(
             reconciliation_diagnostics::Operation::NativeFinalization,
@@ -2690,7 +2744,8 @@ impl MessageProcessor {
         }
 
         let processor = Arc::downgrade(self);
-        let handle = tokio::spawn(async move {
+        let cancellation = cancellation.clone();
+        let worker = async move {
             struct IsolatedWorkerGuard(Vec<JoinHandle<()>>);
 
             impl Drop for IsolatedWorkerGuard {
@@ -2702,6 +2757,9 @@ impl MessageProcessor {
             }
 
             let _isolated_workers = IsolatedWorkerGuard(vec![
+                tokio::spawn(Self::run_turn_execution_owner_heartbeat_worker(
+                    processor.clone(),
+                )),
                 tokio::spawn(Self::run_projection_delivery_resilience_worker(
                     processor.clone(),
                 )),
@@ -2722,6 +2780,13 @@ impl MessageProcessor {
                 let maintenance = this.with_database_class(SqliteWriteClass::Maintenance);
                 let now = now_timestamp_secs();
                 let mut transient_storage_poll_failed = false;
+                #[cfg(test)]
+                this.completed_history_preparation_barrier
+                    .wait_if_armed(
+                        "__resilience_before_history_poll__",
+                        &tokio_util::sync::CancellationToken::new(),
+                    )
+                    .await;
                 if maintenance.poll_completed_history_checks().await.is_err() {
                     warn!("failed to poll completed history checks");
                 }
@@ -2732,28 +2797,6 @@ impl MessageProcessor {
                     )
                     .await;
                     next_skill_upload_cleanup = now.saturating_add(60);
-                }
-
-                if let Err(error) = crate::database::attribution::scope_database_workload_result(
-                    pioneer_observability::DatabaseWorkload::ExecutionSupervision,
-                    retry_transient_storage_access(|| {
-                        this.crud_store.heartbeat_turn_executions_owned_by(
-                            this.turn_execution_owner_id.as_ref(),
-                            now,
-                            now.saturating_add(TURN_EXECUTION_OWNER_LEASE_SECONDS),
-                        )
-                    }),
-                )
-                .await
-                {
-                    record_resilience_worker_poll_error(
-                        "Turn execution owner heartbeat",
-                        &error,
-                        &mut transient_storage_poll_failed,
-                    );
-                }
-                if sleep_after_transient_storage_poll_failure(transient_storage_poll_failed).await {
-                    continue;
                 }
 
                 // Confirm live native command activity before timeout polling.
@@ -3107,6 +3150,12 @@ impl MessageProcessor {
                 .await;
 
                 sleep(Duration::from_secs(RESILIENCE_WORKER_POLL_INTERVAL_SECONDS)).await;
+            }
+        };
+        let handle = tokio::spawn(async move {
+            tokio::select! {
+                _ = cancellation.cancelled() => {},
+                _ = worker => {},
             }
         });
 
@@ -4757,6 +4806,8 @@ impl MessageProcessor {
             compaction_lifecycle_not_before: Arc::new(StdRwLock::new(None)),
             #[cfg(test)]
             completed_history_preparation_barrier: Arc::new(Default::default()),
+            #[cfg(test)]
+            turn_execution_heartbeat_barrier: Arc::new(Default::default()),
             #[cfg(test)]
             task_history_preparation_failure: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(test)]
