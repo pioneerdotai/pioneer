@@ -13384,7 +13384,7 @@ async fn failed_task_create_cannot_finalize_as_success_claim() {
     let final_text =
         completed_agent_message_text(&observed).expect("final assistant text should be emitted");
     assert!(
-        final_text.contains("Task mutation failed"),
+        final_text.contains("unresolved postcondition"),
         "final text should report the primary failed mutation, got: {final_text}"
     );
     assert!(
@@ -13436,7 +13436,10 @@ async fn task_mutation_failure_preserves_root_cause_when_provider_returns_tools_
     );
     let final_text =
         completed_agent_message_text(&observed).expect("final assistant text should be emitted");
-    assert!(final_text.contains("Task mutation failed"), "{final_text}");
+    assert!(
+        final_text.contains("unresolved postcondition"),
+        "{final_text}"
+    );
     assert!(final_text.contains("task_create"), "{final_text}");
     assert!(
         !final_text.contains("provider_returned_tools_after_tools_disabled"),
