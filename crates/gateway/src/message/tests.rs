@@ -13120,7 +13120,9 @@ async fn detached_composer_live_ordering_impl() {
         .native_turn_event_delivery_kick_running
         .store(true, Ordering::SeqCst);
     processor.arm_completed_history_preparation_barrier("__detached_composer_before_task_create__");
-    let full_text = "Full Composer message ".repeat(12);
+    // Keep the full message longer than the Task title without depending on
+    // whitespace that the existing UserMessage materialization normalizes.
+    let full_text = ["Full Composer message"; 12].join(" ");
     let request_id = generate_test_request_id("composer", "live-order");
     let request = json!({"jsonrpc":"2.0", "id":request_id, "method":"turn/start", "params":{
         "thread_id":parent, "turn_id":turn_id, "input":[{"type":"text", "text":full_text}],
