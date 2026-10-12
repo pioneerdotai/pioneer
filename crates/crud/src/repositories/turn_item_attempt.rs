@@ -28,10 +28,17 @@ pub(crate) fn native_attached_wait_predicate() -> &'static str {
     "turn_item_attempt.execution_class='durable_wait' AND turn_item_attempt.item_type='reasoning'"
 }
 
-fn wait_aware_deadline(value: Option<DateTimeWithTimeZone>) -> sea_orm::sea_query::SimpleExpr {
+fn work_aware_deadline(
+    value: Option<DateTimeWithTimeZone>,
+    current_column: &'static str,
+) -> sea_orm::sea_query::SimpleExpr {
+    // The receipt and its work horizons commit together. A queued repair or
+    // heartbeat must inspect that exact current attempt at the physical write,
+    // rather than overwrite it using a policy read before the receipt existed.
+    let accepted_work = "EXISTS (SELECT 1 FROM tool_output_chunk p WHERE p.turn_id=turn_item_attempt.turn_id AND p.item_id=turn_item_attempt.item_id AND json_extract(p.metadata,'$.stage')='attempt_work_started' AND json_extract(p.metadata,'$.observation.attempt_id')=turn_item_attempt.attempt_number AND json_extract(p.metadata,'$.observation.trace_id')=json_extract(turn_item_attempt.payload,'$.observation.traceId'))";
     Expr::cust_with_values(
         format!(
-            "CASE WHEN {} THEN NULL ELSE ? END",
+            "CASE WHEN {} THEN NULL WHEN {accepted_work} THEN {current_column} ELSE ? END",
             native_attached_wait_predicate()
         ),
         [value],
@@ -217,13 +224,13 @@ pub async fn heartbeat_running_attempt<C: ConnectionTrait>(
     if let Some(idle) = next_idle_deadline_at {
         update = update.col_expr(
             turn_item_attempt::Column::IdleDeadlineAt,
-            wait_aware_deadline(Some(idle)),
+            work_aware_deadline(Some(idle), "idle_deadline_at"),
         );
     }
     if let Some(hard_deadline_at) = next_hard_deadline_at {
         update = update.col_expr(
             turn_item_attempt::Column::HardDeadlineAt,
-            wait_aware_deadline(Some(hard_deadline_at)),
+            work_aware_deadline(Some(hard_deadline_at), "hard_deadline_at"),
         );
     }
     let affected = update
@@ -290,11 +297,11 @@ pub async fn configure_running_attempt_deadlines<C: ConnectionTrait>(
         )
         .col_expr(
             turn_item_attempt::Column::IdleDeadlineAt,
-            wait_aware_deadline(idle_deadline_at),
+            work_aware_deadline(idle_deadline_at, "idle_deadline_at"),
         )
         .col_expr(
             turn_item_attempt::Column::HardDeadlineAt,
-            wait_aware_deadline(hard_deadline_at),
+            work_aware_deadline(hard_deadline_at, "hard_deadline_at"),
         )
         .col_expr(
             turn_item_attempt::Column::UpdatedAt,

@@ -50918,6 +50918,36 @@ mod tests {
                 .unwrap()
                 .unwrap();
             let expected_deadline = (!delegated).then(|| unix_to_datetime(at + 602));
+            // A generic backfill prepared before the receipt may arrive later.
+            // Its default horizons cannot replace the committed work policy.
+            store
+                .configure_turn_item_attempt_deadlines(
+                    &turn.id,
+                    item_id,
+                    at + 400,
+                    Some(at + 520),
+                    Some(at + 90),
+                    Some(at + 300),
+                )
+                .await
+                .unwrap();
+            store
+                .heartbeat_turn_item_attempt(
+                    &turn.id,
+                    item_id,
+                    TurnItemType::DynamicToolCall,
+                    at + 400,
+                    Some(at + 520),
+                    Some(at + 490),
+                    Some(at + 700),
+                )
+                .await
+                .unwrap();
+            let attempt = pioneer_entity::turn_item_attempt::Entity::find_by_id(&attempt.id)
+                .one(&store.connection)
+                .await
+                .unwrap()
+                .unwrap();
             assert_eq!(attempt.idle_deadline_at, expected_deadline);
             assert_eq!(attempt.hard_deadline_at, expected_deadline);
             assert_eq!(attempt.lease_expires_at, Some(unix_to_datetime(at + 520)));
