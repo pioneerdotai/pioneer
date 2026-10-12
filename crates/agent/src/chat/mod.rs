@@ -11148,7 +11148,7 @@ mod tests {
 
     fn restore_task_guard(
         context: &ExecutionCheckpointContext,
-    ) -> Result<TaskMutationFinalizationGuard, ChatTurnError> {
+    ) -> Result<TaskMutationFinalizationGuard, super::ChatTurnError> {
         super::semantic_state::NativeSemanticState::restore(
             Some(context),
             "workspace_1",
