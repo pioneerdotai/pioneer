@@ -11099,7 +11099,7 @@ mod terminal_usage_close_contract_tests {
                 Arc::new(crate::thread::ThreadManager::new("test-model", "echo")),
                 Arc::new(pioneer_provider::ProviderRegistry::with_provider(
                     "echo",
-                    Arc::new(pioneer_provider::echo::EchoProvider::new()),
+                    Arc::new(pioneer_provider::providers::EchoProvider::new()),
                 )),
                 Arc::new(crate::session::SessionManager::new()),
                 workspace_manager,
