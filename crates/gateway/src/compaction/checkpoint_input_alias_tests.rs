@@ -107,6 +107,7 @@ async fn scenario() -> Scenario {
             ("copy-thread".into(), work_source.clone()),
         ],
         pioneer_compaction::CoverageDomain::WorkingContext,
+        None,
     )
     .await;
     let origin = |thread: &str, unit: &str, reference: MessageSourceRef| MessageProvenance {
@@ -441,6 +442,7 @@ async fn overlapping_original_and_task_copy_summaries_keep_the_covering_checkpoi
         "original-summary",
         &[("thread".into(), original_source)],
         pioneer_compaction::CoverageDomain::WorkingContext,
+        None,
     )
     .await;
     let original_context = || checkpoint::ProjectionContext {
@@ -626,6 +628,7 @@ async fn absorbed_alias_conflict_survives_gateway_capture_and_restore() {
         "summary-conflict-a",
         &[("thread".into(), a.clone())],
         CoverageDomain::WorkingContext,
+        None,
     )
     .await;
     let covering = publish_projection_checkpoint(
@@ -637,6 +640,7 @@ async fn absorbed_alias_conflict_survives_gateway_capture_and_restore() {
             ("copy-c-thread".into(), c.clone()),
         ],
         CoverageDomain::WorkingContext,
+        None,
     )
     .await;
     let competing = publish_projection_checkpoint(
@@ -645,6 +649,7 @@ async fn absorbed_alias_conflict_survives_gateway_capture_and_restore() {
         "summary-conflict-x",
         &[("conflict-thread".into(), x.clone())],
         CoverageDomain::WorkingContext,
+        None,
     )
     .await;
     let mut allowed = s.allowed.clone();
@@ -956,6 +961,7 @@ async fn exact_cross_domain_absorption_keeps_only_covered_input_evidence() {
             "cross-domain-small",
             &[("thread".into(), a.clone())],
             CoverageDomain::WorkingContext,
+            None,
         )
         .await;
         let old_source =
@@ -973,6 +979,7 @@ async fn exact_cross_domain_absorption_keeps_only_covered_input_evidence() {
                 ("copy-thread".into(), b.clone()),
             ],
             CoverageDomain::OwnContribution,
+            None,
         )
         .await;
         let competing = publish_projection_checkpoint(
@@ -981,6 +988,7 @@ async fn exact_cross_domain_absorption_keeps_only_covered_input_evidence() {
             "cross-domain-competing",
             &[("cross-domain-x".into(), x.clone())],
             CoverageDomain::OwnContribution,
+            None,
         )
         .await;
         let mut allowed = s.allowed.clone();
@@ -1304,6 +1312,7 @@ async fn competing_checkpoint_candidate_cannot_remove_saved_summary() {
             "saved-summary-a",
             &[("thread".into(), a.clone())],
             CoverageDomain::WorkingContext,
+            None,
         )
         .await;
         let b_checkpoint = publish_projection_checkpoint(
@@ -1312,6 +1321,7 @@ async fn competing_checkpoint_candidate_cannot_remove_saved_summary() {
             "candidate-summary-b",
             &[(b_thread.into(), b.clone())],
             CoverageDomain::WorkingContext,
+            None,
         )
         .await;
         let runtime_source = |source: &SourceRef| MessageSourceRef {
@@ -1354,17 +1364,9 @@ async fn competing_checkpoint_candidate_cannot_remove_saved_summary() {
             "candidate-summary-x",
             &[(x_thread.into(), x.clone())],
             CoverageDomain::WorkingContext,
+            Some(&x_projection),
         )
         .await;
-        s.f.store
-            .database_connection()
-            .execute_raw(Statement::from_sql_and_values(
-                DbBackend::Sqlite,
-                "INSERT INTO compaction_operation_projection(operation_id,manifest_id,identity_sha256,imports_sha256,import_count) SELECT ?,id,identity_sha256,imports_sha256,import_count FROM compaction_frozen_history WHERE id=?",
-                [x_checkpoint.operation_id.clone().into(), x_projection.manifest_id.clone().into()],
-            ))
-            .await
-            .unwrap();
         let x_edges =
             s.f.store
                 .compaction_checkpoint_edges(&x_checkpoint.id)
@@ -1648,6 +1650,7 @@ async fn absorbed_frozen_candidate_keeps_conflict_from_published_graph() {
             "frozen-candidate-a",
             &[("thread".into(), a.clone())],
             CoverageDomain::WorkingContext,
+            Some(&a_projection),
         )
         .await;
         let c_checkpoint = publish_projection_checkpoint(
@@ -1656,6 +1659,7 @@ async fn absorbed_frozen_candidate_keeps_conflict_from_published_graph() {
             "frozen-candidate-c",
             &[(c_thread.into(), c.clone())],
             CoverageDomain::WorkingContext,
+            None,
         )
         .await;
         let x_checkpoint = publish_projection_checkpoint(
@@ -1664,22 +1668,9 @@ async fn absorbed_frozen_candidate_keeps_conflict_from_published_graph() {
             "frozen-candidate-x",
             &[(x_thread.into(), x.clone())],
             CoverageDomain::WorkingContext,
+            Some(&x_projection),
         )
         .await;
-        for (checkpoint, projection) in [
-            (&a_checkpoint, &a_projection),
-            (&x_checkpoint, &x_projection),
-        ] {
-            s.f.store
-                .database_connection()
-                .execute_raw(Statement::from_sql_and_values(
-                    DbBackend::Sqlite,
-                    "INSERT INTO compaction_operation_projection(operation_id,manifest_id,identity_sha256,imports_sha256,import_count) SELECT ?,id,identity_sha256,imports_sha256,import_count FROM compaction_frozen_history WHERE id=?",
-                    [checkpoint.operation_id.clone().into(), projection.manifest_id.clone().into()],
-                ))
-                .await
-                .unwrap();
-        }
         let saved = vec![raw_a, raw_c, raw_x];
         assert!(saved.iter().all(|message| {
             message
@@ -1738,6 +1729,7 @@ async fn absorbed_frozen_candidate_keeps_conflict_from_published_graph() {
             "frozen-candidate-d",
             &[(d_thread.into(), d.clone())],
             CoverageDomain::WorkingContext,
+            None,
         )
         .await;
         let d_summary = checkpoint::checkpoint_message_with_resolver(
@@ -1946,6 +1938,7 @@ async fn accepted_raw_history_sees_all_candidate_claims_before_projection() {
                 "live-candidate-a",
                 &[(a_thread.into(), a.clone())],
                 CoverageDomain::WorkingContext,
+                Some(&a_projection),
             )
             .await;
             let b_checkpoint = publish_projection_checkpoint(
@@ -1954,6 +1947,7 @@ async fn accepted_raw_history_sees_all_candidate_claims_before_projection() {
                 "live-candidate-b",
                 &[(b_thread.into(), b.clone())],
                 CoverageDomain::WorkingContext,
+                None,
             )
             .await;
             let x_checkpoint = publish_projection_checkpoint(
@@ -1962,22 +1956,9 @@ async fn accepted_raw_history_sees_all_candidate_claims_before_projection() {
                 "live-candidate-x",
                 &[(x_thread.into(), x.clone())],
                 CoverageDomain::WorkingContext,
+                Some(&x_projection),
             )
             .await;
-            for (checkpoint, projection) in [
-                (&a_checkpoint, &a_projection),
-                (&x_checkpoint, &x_projection),
-            ] {
-                s.f.store
-                    .database_connection()
-                    .execute_raw(Statement::from_sql_and_values(
-                        DbBackend::Sqlite,
-                        "INSERT INTO compaction_operation_projection(operation_id,manifest_id,identity_sha256,imports_sha256,import_count) SELECT ?,id,identity_sha256,imports_sha256,import_count FROM compaction_frozen_history WHERE id=?",
-                        [checkpoint.operation_id.clone().into(), projection.manifest_id.clone().into()],
-                    ))
-                    .await
-                    .unwrap();
-            }
             let expected = if conflicting {
                 BTreeSet::from([
                     a_checkpoint.id.clone(),

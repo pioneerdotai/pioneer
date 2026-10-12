@@ -2065,7 +2065,7 @@ impl ClientCore {
                 let requests = thread_reconcile_actions(&update);
                 if self.apply_thread_semantic_live_update(update) {
                     for action in requests {
-                        self.schedule_thread_semantic_request(action);
+                        self.schedule_thread_semantic_request_inner(action, None, true);
                     }
                 }
             }
@@ -2313,12 +2313,9 @@ mod tests {
         *core.thread_request_sender.lock().unwrap() = Some(sender);
         core.resume_visible_thread_delivery();
         let requests: Vec<_> = receiver.try_iter().collect();
-        assert_eq!(requests.len(), 2);
+        assert_eq!(requests.len(), 1);
         assert!(
             matches!(&requests[0], ThreadControllerRequest::Subscribe { id, .. } if id == "visible")
-        );
-        assert!(
-            matches!(&requests[1], ThreadControllerRequest::Semantic(request) if request.id == "visible")
         );
         core.shutdown();
         core.resume_visible_thread_delivery();
@@ -2345,6 +2342,797 @@ mod tests {
             agent_role: None,
             visibility: None,
             turns: Vec::new(),
+        }
+    }
+
+    fn reconciliation_history() -> Vec<TimelineBlock> {
+        (0..280)
+            .map(|ix| {
+                let mut block = presentation_page(&[("placeholder", "cached")])
+                    .blocks
+                    .remove(0);
+                block.block_id = format!("block-{ix}");
+                block.turn_id = Some(format!("turn-{ix}"));
+                block.sort_key = format!("{ix:05}:a");
+                block
+            })
+            .collect()
+    }
+
+    fn reconciliation_result(ix: usize) -> TimelineBlock {
+        let mut block = reconciliation_history().remove(ix);
+        block.block_id = format!("result-{ix}");
+        block.sort_key = format!("{ix:05}:b");
+        block.kind = TimelineBlockKind::AssistantMessage {
+            item_id: format!("task-result-{ix}"),
+            text: "child result".into(),
+            status: TurnWorkItemStatus::Completed,
+            markdown: None,
+            author: None,
+            route: None,
+        };
+        block
+    }
+
+    // Test cursors model the server's opaque boundary tokens. Only the fake
+    // transport decodes them; production receives and forwards them unchanged.
+    fn reconciliation_cursor(key: &str) -> TimelineCursor {
+        TimelineCursor {
+            value: format!("issued:{key}"),
+        }
+    }
+
+    fn reconciliation_page(
+        blocks: Vec<TimelineBlock>,
+        before: bool,
+        after: bool,
+    ) -> ThreadTimelinePageResponse {
+        ThreadTimelinePageResponse {
+            page: TimelinePageInfo {
+                before_cursor: blocks
+                    .first()
+                    .map(|block| reconciliation_cursor(&block.sort_key)),
+                after_cursor: blocks
+                    .last()
+                    .map(|block| reconciliation_cursor(&block.sort_key)),
+                has_more_before: before,
+                has_more_after: after,
+            },
+            blocks,
+            ..presentation_page(&[])
+        }
+    }
+
+    fn reconciliation_server_page(
+        history: &[TimelineBlock],
+        params: &ThreadTimelinePageParams,
+    ) -> ThreadTimelinePageResponse {
+        let limit = params.limit.unwrap() as usize;
+        let (start, end) = match &params.anchor {
+            TimelinePageAnchor::Newest => (history.len().saturating_sub(limit), history.len()),
+            TimelinePageAnchor::Around { cursor } => {
+                let key = cursor.value.strip_prefix("issued:").unwrap();
+                let at = history.partition_point(|block| block.sort_key.as_str() < key);
+                let start = at.saturating_sub(limit / 2);
+                (start, (start + limit).min(history.len()))
+            }
+            TimelinePageAnchor::After { cursor } => {
+                let key = cursor.value.strip_prefix("issued:").unwrap();
+                let start = history.partition_point(|block| block.sort_key.as_str() <= key);
+                (start, (start + limit).min(history.len()))
+            }
+            _ => panic!("unexpected reconciliation anchor"),
+        };
+        reconciliation_page(history[start..end].to_vec(), start > 0, end < history.len())
+    }
+
+    struct ReconciliationTransport<F> {
+        calls: std::cell::RefCell<Vec<ThreadTimelinePageParams>>,
+        reply: F,
+    }
+    impl<F> crate::rpc::JsonRpcRequestTransport for ReconciliationTransport<F>
+    where
+        F: Fn(usize, &ThreadTimelinePageParams) -> Result<ThreadTimelinePageResponse, String>,
+    {
+        fn send_json_rpc_request(
+            &self,
+            _: String,
+            payload: String,
+            response: crate::rpc::JsonRpcResponseSender,
+        ) -> Result<(), String> {
+            let request: serde_json::Value = serde_json::from_str(&payload).unwrap();
+            assert_eq!(request["method"], "thread/timeline/page");
+            let params: ThreadTimelinePageParams =
+                serde_json::from_value(request["params"].clone()).unwrap();
+            let ix = self.calls.borrow().len();
+            self.calls.borrow_mut().push(params.clone());
+            let page = (self.reply)(ix, &params)?;
+            response
+                .send(Ok(serde_json::to_value(page).unwrap()))
+                .unwrap();
+            Ok(())
+        }
+    }
+
+    fn reconciliation_core() -> (
+        Arc<ClientCore>,
+        std::sync::mpsc::Receiver<ThreadControllerRequest>,
+    ) {
+        let core = core();
+        core.upsert_thread(thread("a", "ws"));
+        core.apply_thread_timeline_page(
+            reconciliation_page(reconciliation_history()[80..=210].to_vec(), true, true),
+            crate::timeline::semantic::TopLevelPageMergeMode::Reset,
+        );
+        let (sender, receiver) = std::sync::mpsc::channel();
+        *core.thread_request_sender.lock().unwrap() = Some(sender);
+        (core, receiver)
+    }
+
+    fn reconciliation_request(
+        receiver: &std::sync::mpsc::Receiver<ThreadControllerRequest>,
+    ) -> ThreadSemanticRequest {
+        let ThreadControllerRequest::Semantic(request) = receiver.try_recv().unwrap() else {
+            panic!("expected timeline request")
+        };
+        request
+    }
+
+    fn reconciliation_notification(ids: &[&str]) -> GatewayNotification {
+        GatewayNotification::ThreadTimelineBlocksChanged(ThreadTimelineBlocksChangedNotification {
+            workspace_id: "ws".into(),
+            thread_id: "a".into(),
+            changed_block_ids: ids.iter().map(|id| (*id).into()).collect(),
+            removed_block_ids: vec![],
+            turn_work_tombstones: vec![],
+            before_cursor: None,
+            after_cursor: None,
+            reason: TimelineChangeReason::LiveEvent,
+        })
+    }
+
+    #[test]
+    fn changed_old_parent_range_discovers_unknown_and_boundary_results_without_duplicates() {
+        let (core, receiver) = reconciliation_core();
+        let _lease = core.subscribe(
+            ClientScope::Timeline {
+                thread_id: "a".into(),
+            },
+            NonZeroUsize::new(16).unwrap(),
+        );
+        core.materialize_demanded_timelines();
+        let anchor = core
+            .thread_presentation_snapshot("a")
+            .unwrap()
+            .timeline()
+            .rows()[60]
+            .id()
+            .clone();
+        core.set_thread_turn_work_expanded("a", "turn-140", true);
+        let before = core.thread_semantic_snapshot("a");
+        assert!(
+            before
+                .thread("a")
+                .unwrap()
+                .top_level
+                .block("result-140")
+                .is_none()
+        );
+        core.apply_thread_notification(reconciliation_notification(&[
+            "result-80",
+            "result-140",
+            "result-210",
+        ]));
+        core.apply_thread_notification(reconciliation_notification(&[
+            "result-80",
+            "result-140",
+            "result-210",
+        ]));
+        let request = reconciliation_request(&receiver);
+        assert_eq!(receiver.try_iter().count(), 0);
+        let owner = request.request_generation;
+        let mut history = reconciliation_history();
+        history.extend([
+            reconciliation_result(80),
+            reconciliation_result(140),
+            reconciliation_result(210),
+        ]);
+        history.sort_by(|a, b| a.sort_key.cmp(&b.sort_key));
+        let transport = ReconciliationTransport {
+            calls: Default::default(),
+            reply: |ix: usize, params: &ThreadTimelinePageParams| {
+                assert_eq!(core.thread_semantic_in_flight("a").len(), 1);
+                let page = reconciliation_server_page(&history, params);
+                if ix == 0 {
+                    assert_eq!(page.blocks.len(), 12);
+                    assert!(
+                        !page
+                            .blocks
+                            .iter()
+                            .any(|block| block.block_id.starts_with("result-"))
+                    );
+                }
+                if ix == 1 {
+                    // Repeated notifications during a walk coalesce into one trailing
+                    // operation. The current continuation keeps its original owner.
+                    core.apply_thread_notification(reconciliation_notification(&["block-120"]));
+                    core.apply_thread_notification(reconciliation_notification(&["block-120"]));
+                    let mut live = reconciliation_history().remove(140);
+                    live.updated_at_unix_ms = Some(100);
+                    if let TimelineBlockKind::UserMessage { text, revision, .. } = &mut live.kind {
+                        *text = "newer live edit".into();
+                        *revision = 1;
+                    }
+                    core.apply_thread_timeline_page(
+                        reconciliation_page(vec![live], true, true),
+                        crate::timeline::semantic::TopLevelPageMergeMode::Merge,
+                    );
+                }
+                if ix < 4 {
+                    let registry = core.thread_registry.lock().unwrap();
+                    assert!(registry.timeline.accepts(
+                        &SemanticTimelineRequestKey::ThreadNewest {
+                            thread_id: "a".into()
+                        },
+                        owner
+                    ));
+                }
+                Ok(page)
+            },
+        };
+        core.execute_thread_semantic_request(&transport, request);
+        let calls = transport.calls.borrow();
+        assert!(matches!(calls[0].anchor, TimelinePageAnchor::Newest));
+        assert!(
+            matches!(calls[1].anchor, TimelinePageAnchor::Around { ref cursor } if cursor == &before.thread("a").unwrap().top_level.loaded_range.after_cursor.clone().unwrap())
+        );
+        assert!(
+            matches!(calls[2].anchor, TimelinePageAnchor::Around { ref cursor } if cursor == &before.thread("a").unwrap().top_level.loaded_range.before_cursor.clone().unwrap())
+        );
+        assert!(matches!(calls[3].anchor, TimelinePageAnchor::After { .. }));
+        assert!(
+            matches!(calls[4].anchor, TimelinePageAnchor::Newest),
+            "the first walk stops at the frozen cached boundary, before the refreshed tail"
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|params| params.anchor == TimelinePageAnchor::Newest)
+                .count(),
+            2
+        );
+        assert!(calls.len() <= 10);
+        let semantic = core.thread_semantic_snapshot("a");
+        let cached = semantic.thread("a").unwrap();
+        for id in ["result-80", "result-140", "result-210"] {
+            assert_eq!(
+                cached
+                    .top_level
+                    .ordered_block_ids
+                    .iter()
+                    .filter(|block_id| block_id.as_str() == id)
+                    .count(),
+                1
+            );
+        }
+        assert!(
+            matches!(&cached.top_level.block("block-140").unwrap().kind, TimelineBlockKind::UserMessage { text, .. } if text == "newer live edit")
+        );
+        assert!(cached.expansion.expanded_turn_work.contains("turn-140"));
+        assert_eq!(
+            cached.top_level.request_status,
+            crate::timeline::semantic::TimelineRequestStatus::Ready
+        );
+        assert!(core.thread_semantic_in_flight("a").is_empty());
+        core.materialize_demanded_timelines();
+        assert!(
+            core.thread_presentation_snapshot("a")
+                .unwrap()
+                .timeline()
+                .rows()
+                .iter()
+                .any(|row| row.id() == &anchor)
+        );
+    }
+
+    #[test]
+    fn canonical_pages_accept_lower_server_timestamps_and_preserve_live_changes_after_begin() {
+        use crate::timeline::semantic::{TimelineRequestStatus, TopLevelPageMergeMode};
+        let (core, receiver) = reconciliation_core();
+        let mut completed = reconciliation_result(140);
+        completed.block_id = "turn:turn-140:assistant:task-result-140".into();
+        completed.sort_key = "00140:turn-140:200:task-result-140".into();
+        if let TimelineBlockKind::AssistantMessage { text, .. } = &mut completed.kind {
+            *text = "full canonical completed answer".into();
+        }
+        let mut concurrent = reconciliation_result(150);
+        concurrent.block_id = "turn:turn-150:assistant:task-result-150".into();
+        concurrent.sort_key = "00150:turn-150:200:task-result-150".into();
+        let partial = |block: &TimelineBlock| {
+            let mut cached = block.clone();
+            cached.updated_at_unix_ms = Some(1_000);
+            if let TimelineBlockKind::AssistantMessage { text, status, .. } = &mut cached.kind {
+                *text = "partial".into();
+                *status = TurnWorkItemStatus::Running;
+            }
+            cached
+        };
+        let mut cached_user = reconciliation_history().remove(130);
+        cached_user.updated_at_unix_ms = Some(1_000);
+        if let TimelineBlockKind::UserMessage { revision, .. } = &mut cached_user.kind {
+            *revision = 1;
+        }
+        core.apply_thread_timeline_page(
+            reconciliation_page(
+                vec![partial(&completed), partial(&concurrent), cached_user],
+                true,
+                true,
+            ),
+            TopLevelPageMergeMode::Merge,
+        );
+        let delta = |turn_id: &str, item_id: &str, text: &str| ConversationEvent::ItemDelta {
+            thread_id: "a".into(),
+            turn_id: turn_id.into(),
+            item_id: item_id.into(),
+            delta: text.into(),
+            stream: Some(ItemDeltaStream::AgentMessage),
+            payload: None,
+            markdown: None,
+            markdown_version: None,
+        };
+        // A delayed intermediate event uses the client's clock, although the
+        // server has already persisted the complete answer below.
+        core.apply_thread_conversation_event(
+            "ws",
+            delta("turn-140", "task-result-140", " delayed"),
+            None,
+        );
+        let before = core.thread_semantic_snapshot("a");
+        assert!(
+            before
+                .thread("a")
+                .unwrap()
+                .top_level
+                .block(&completed.block_id)
+                .unwrap()
+                .updated_at_unix_ms
+                > completed.updated_at_unix_ms
+        );
+        let mut history = reconciliation_history();
+        if let TimelineBlockKind::UserMessage { revision, text, .. } = &mut history[130].kind {
+            *revision = 2;
+            *text = "canonical edit".into();
+        }
+        history.extend([completed.clone(), concurrent.clone()]);
+        history.sort_by(|a, b| a.sort_key.cmp(&b.sort_key));
+        core.apply_thread_notification(reconciliation_notification(&[
+            &completed.block_id,
+            "block-130",
+        ]));
+        let request = reconciliation_request(&receiver);
+        let transport = ReconciliationTransport {
+            calls: Default::default(),
+            reply: |ix: usize, params: &ThreadTimelinePageParams| {
+                let page = reconciliation_server_page(&history, params);
+                if ix == 0 {
+                    core.apply_thread_conversation_event(
+                        "ws",
+                        delta("turn-150", "task-result-150", " during read"),
+                        None,
+                    );
+                }
+                Ok(page)
+            },
+        };
+        core.execute_thread_semantic_request(&transport, request);
+        let after = core.thread_semantic_snapshot("a");
+        let cached = &after.thread("a").unwrap().top_level;
+        assert_eq!(cached.block(&completed.block_id), Some(&completed));
+        assert!(matches!(&cached.block(&concurrent.block_id).unwrap().kind,
+            TimelineBlockKind::AssistantMessage { text, status: TurnWorkItemStatus::Running, .. }
+                if text == "partial during read"));
+        let user = cached.block("block-130").unwrap();
+        assert_eq!(user.updated_at_unix_ms, Some(2));
+        assert!(
+            matches!(&user.kind, TimelineBlockKind::UserMessage { revision: 2, text, .. } if text == "canonical edit")
+        );
+        assert_eq!(cached.request_status, TimelineRequestStatus::Ready);
+        assert!(core.thread_semantic_in_flight("a").is_empty());
+        assert_eq!(receiver.try_iter().count(), 0);
+    }
+
+    #[test]
+    fn missed_result_is_read_only_after_subscription_ack_with_cached_or_initial_timeline() {
+        for cached in [false, true] {
+            let (core, receiver) = reconciliation_core();
+            if !cached {
+                core.apply_thread_timeline_page(
+                    presentation_page(&[]),
+                    crate::timeline::semantic::TopLevelPageMergeMode::Reset,
+                );
+            }
+            struct AckTransport<'a> {
+                receiver: &'a std::sync::mpsc::Receiver<ThreadControllerRequest>,
+                fail: bool,
+            }
+            impl crate::rpc::JsonRpcRequestTransport for AckTransport<'_> {
+                fn send_json_rpc_request(
+                    &self,
+                    _: String,
+                    _: String,
+                    response: crate::rpc::JsonRpcResponseSender,
+                ) -> Result<(), String> {
+                    assert_eq!(
+                        self.receiver.try_iter().count(),
+                        0,
+                        "no read before acknowledgement"
+                    );
+                    if self.fail {
+                        return Err("subscription failed".into());
+                    }
+                    response
+                        .send(Ok(serde_json::to_value(ThreadStartResponse {
+                            thread: thread("a", "ws"),
+                            sandbox: SandboxPolicy::from_mode(SandboxMode::FullAccess),
+                        })
+                        .unwrap()))
+                        .unwrap();
+                    Ok(())
+                }
+            }
+            let token = || ThreadOperationToken {
+                id: "a".into(),
+                generation: core.thread_registry.lock().unwrap().stores["a"].generation,
+            };
+            if cached {
+                // A new confirmed connection can recover even when notifications
+                // have been stopped by a previous failed refresh.
+                core.apply_thread_notification(reconciliation_notification(&["result-140"]));
+                let request = reconciliation_request(&receiver);
+                core.execute_thread_semantic_request(
+                    &ReconciliationTransport {
+                        calls: Default::default(),
+                        reply: |_: usize, _: &ThreadTimelinePageParams| {
+                            Err("previous connection read failed".into())
+                        },
+                    },
+                    request,
+                );
+                core.apply_thread_notification(reconciliation_notification(&["block-130"]));
+                assert_eq!(receiver.try_iter().count(), 0);
+                assert!(matches!(
+                    core.thread_semantic_snapshot("a")
+                        .thread("a")
+                        .unwrap()
+                        .top_level
+                        .request_status,
+                    crate::timeline::semantic::TimelineRequestStatus::Failed { .. }
+                ));
+            }
+            assert!(
+                core.refresh_opened_thread_subscription(
+                    &AckTransport {
+                        receiver: &receiver,
+                        fail: true
+                    },
+                    token(),
+                    "ws"
+                )
+                .is_err()
+            );
+            assert_eq!(receiver.try_iter().count(), 0);
+            core.refresh_opened_thread_subscription(
+                &AckTransport {
+                    receiver: &receiver,
+                    fail: false,
+                },
+                token(),
+                "ws",
+            )
+            .unwrap();
+            let request = reconciliation_request(&receiver);
+            let result_ix = if cached { 140 } else { 279 };
+            let mut history = reconciliation_history();
+            history.push(reconciliation_result(result_ix));
+            history.sort_by(|a, b| a.sort_key.cmp(&b.sort_key));
+            let transport = ReconciliationTransport {
+                calls: Default::default(),
+                reply: |_: usize, params: &ThreadTimelinePageParams| {
+                    Ok(reconciliation_server_page(&history, params))
+                },
+            };
+            core.execute_thread_semantic_request(&transport, request);
+            assert!(
+                core.thread_semantic_snapshot("a")
+                    .thread("a")
+                    .unwrap()
+                    .top_level
+                    .block(&format!("result-{result_ix}"))
+                    .is_some()
+            );
+            assert_eq!(transport.calls.borrow().len(), if cached { 4 } else { 1 });
+            assert_eq!(
+                core.thread_semantic_snapshot("a")
+                    .thread("a")
+                    .unwrap()
+                    .top_level
+                    .request_status,
+                crate::timeline::semantic::TimelineRequestStatus::Ready
+            );
+        }
+    }
+
+    #[test]
+    fn cached_range_failures_stop_and_existing_retry_schedules_a_new_owned_walk() {
+        use crate::timeline::{
+            controller::{TimelineDemand, TimelineIntent},
+            semantic::TimelineRequestStatus,
+        };
+        for failure in ["rpc", "cursor", "sort", "budget"] {
+            let (core, receiver) = reconciliation_core();
+            let _lease = core.subscribe(
+                ClientScope::Timeline {
+                    thread_id: "a".into(),
+                },
+                NonZeroUsize::new(16).unwrap(),
+            );
+            core.materialize_demanded_timelines();
+            let timeline = core.thread_presentation_snapshot("a").unwrap().timeline();
+            let mut demand = TimelineDemand {
+                thread_id: "a".into(),
+                consumer_id: "review".into(),
+                generation: 1,
+                source_revision: timeline.source_revision(),
+                row_ids: vec![timeline.rows()[60].id().as_str().into()],
+                threshold: 0,
+                before: false,
+                after: false,
+                work: false,
+                presented_rows: false,
+                scroll_generation: 17,
+                latest_user_turn_id: None,
+                viewed_through_turn_id: None,
+                read_requires_unread: false,
+                prefetch_on_visibility: false,
+                boundary_request_limit: 1,
+            };
+            core.plan_timeline_intent(
+                TimelineIntent::Update {
+                    demand: demand.clone(),
+                },
+                0,
+            );
+            core.apply_thread_notification(reconciliation_notification(&["result-140"]));
+            let request = reconciliation_request(&receiver);
+            let owner = request.request_generation;
+            let history = reconciliation_history();
+            let transport = ReconciliationTransport {
+                calls: Default::default(),
+                reply: |ix: usize, params: &ThreadTimelinePageParams| {
+                    if ix < 2 {
+                        return Ok(reconciliation_server_page(&history, params));
+                    }
+                    if ix == 2 {
+                        core.apply_thread_notification(reconciliation_notification(&["block-120"]));
+                        core.apply_thread_notification(reconciliation_notification(&["block-120"]));
+                    }
+                    if failure == "rpc" {
+                        return Err("range read failed".into());
+                    }
+                    let mut block = history[80].clone();
+                    block.sort_key = if failure == "sort" {
+                        "00081:a".into()
+                    } else {
+                        format!("{:05}:a", 80 + ix)
+                    };
+                    let mut page = reconciliation_page(vec![block], true, true);
+                    if failure == "cursor" {
+                        page.page.after_cursor = Some(reconciliation_cursor("stuck"));
+                    }
+                    Ok(page)
+                },
+            };
+            core.execute_thread_semantic_request(&transport, request);
+            let expected = match failure {
+                "rpc" => 3,
+                "cursor" | "sort" => 4,
+                _ => CACHED_TIMELINE_REQUEST_BUDGET,
+            };
+            assert_eq!(transport.calls.borrow().len(), expected);
+            assert!(core.thread_semantic_in_flight("a").is_empty());
+            assert_eq!(receiver.try_iter().count(), 0);
+            assert!(matches!(
+                core.thread_semantic_snapshot("a")
+                    .thread("a")
+                    .unwrap()
+                    .top_level
+                    .request_status,
+                TimelineRequestStatus::Failed { .. }
+            ));
+            // A notification or unrelated successful pagination cannot acknowledge
+            // recovery of the interval that failed.
+            let failed = core
+                .thread_semantic_snapshot("a")
+                .thread("a")
+                .unwrap()
+                .top_level
+                .request_status
+                .clone();
+            for id in ["block-130", "block-131", "result-150"] {
+                core.apply_thread_notification(reconciliation_notification(&[id]));
+                assert_eq!(
+                    receiver.try_iter().count(),
+                    0,
+                    "notifications cannot restart a failed walk"
+                );
+                assert!(core.thread_semantic_in_flight("a").is_empty());
+                let semantic = core.thread_semantic_snapshot("a");
+                let cached = &semantic.thread("a").unwrap().top_level;
+                assert!(
+                    cached.stale_block_ids.contains(id),
+                    "invalidation is retained"
+                );
+                assert_eq!(cached.request_status, failed);
+            }
+            let request = core
+                .begin_thread_semantic_request(SemanticTimelineRequestAction::ThreadTimelinePage {
+                    key: SemanticTimelineRequestKey::ThreadAfter {
+                        thread_id: "a".into(),
+                        cursor: "issued:00279:a".into(),
+                    },
+                    params: ThreadTimelinePageParams {
+                        thread_id: "a".into(),
+                        anchor: TimelinePageAnchor::After {
+                            cursor: reconciliation_cursor("00279:a"),
+                        },
+                        limit: Some(12),
+                    },
+                })
+                .unwrap();
+            // begin also shares the top-level status, so a boundary request must
+            // preserve the failed refresh before and after its response.
+            core.execute_thread_semantic_request(
+                &ReconciliationTransport {
+                    calls: Default::default(),
+                    reply: |_: usize, _: &ThreadTimelinePageParams| {
+                        Ok(reconciliation_page(vec![], true, false))
+                    },
+                },
+                request,
+            );
+            assert!(matches!(
+                core.thread_semantic_snapshot("a")
+                    .thread("a")
+                    .unwrap()
+                    .top_level
+                    .request_status,
+                TimelineRequestStatus::Failed { .. }
+            ));
+            core.materialize_demanded_timelines();
+            demand.source_revision = core
+                .thread_presentation_snapshot("a")
+                .unwrap()
+                .timeline()
+                .source_revision();
+            core.plan_timeline_intent(TimelineIntent::Update { demand }, 1);
+            let retry = core.plan_timeline_intent(
+                TimelineIntent::Retry {
+                    thread_id: "a".into(),
+                    consumer_id: "review".into(),
+                    generation: 1,
+                },
+                2,
+            );
+            assert_eq!(retry.pages.len(), 1);
+            assert!(retry.pages[0].generation > owner);
+            core.schedule_planned_timeline_request(retry.pages[0].clone());
+            let request = reconciliation_request(&receiver);
+            assert_eq!(receiver.try_iter().count(), 0, "Retry queues one walk");
+            let mut history = reconciliation_history();
+            history.extend([reconciliation_result(140), reconciliation_result(150)]);
+            history.sort_by(|a, b| a.sort_key.cmp(&b.sort_key));
+            core.execute_thread_semantic_request(
+                &ReconciliationTransport {
+                    calls: Default::default(),
+                    reply: |_: usize, params: &ThreadTimelinePageParams| {
+                        Ok(reconciliation_server_page(&history, params))
+                    },
+                },
+                request,
+            );
+            assert_eq!(
+                core.thread_semantic_snapshot("a")
+                    .thread("a")
+                    .unwrap()
+                    .top_level
+                    .request_status,
+                TimelineRequestStatus::Ready
+            );
+            assert!(
+                core.thread_semantic_snapshot("a")
+                    .thread("a")
+                    .unwrap()
+                    .top_level
+                    .block("result-140")
+                    .is_some()
+            );
+            assert!(
+                core.thread_semantic_snapshot("a")
+                    .thread("a")
+                    .unwrap()
+                    .top_level
+                    .block("result-150")
+                    .is_some()
+            );
+        }
+    }
+
+    #[test]
+    fn replacement_owner_rejects_late_range_response_and_its_continuation() {
+        for retire_at in [0, 2] {
+            let (core, receiver) = reconciliation_core();
+            core.apply_thread_notification(reconciliation_notification(&["previous-result"]));
+            let failed_request = reconciliation_request(&receiver);
+            core.execute_thread_semantic_request(
+                &ReconciliationTransport {
+                    calls: Default::default(),
+                    reply: |_: usize, _: &ThreadTimelinePageParams| {
+                        Err("old owner read failed".into())
+                    },
+                },
+                failed_request,
+            );
+            // Failure belongs to the old store. A new owner's notification can
+            // start recovery normally, before testing another late response.
+            core.remove_thread_store("a");
+            core.upsert_thread(thread("a", "ws"));
+            core.apply_thread_timeline_page(
+                reconciliation_page(reconciliation_history()[80..=210].to_vec(), true, true),
+                crate::timeline::semantic::TopLevelPageMergeMode::Reset,
+            );
+            core.apply_thread_notification(reconciliation_notification(&["result-140"]));
+            let request = reconciliation_request(&receiver);
+            let replacement = std::cell::RefCell::new(None);
+            let history = reconciliation_history();
+            let transport = ReconciliationTransport {
+                calls: Default::default(),
+                reply: |ix: usize, params: &ThreadTimelinePageParams| {
+                    let mut page = reconciliation_server_page(&history, params);
+                    if ix == retire_at {
+                        core.remove_thread_store("a");
+                        core.upsert_thread(thread("a", "ws"));
+                        core.refresh_thread_timeline("a");
+                        *replacement.borrow_mut() = Some(reconciliation_request(&receiver));
+                        page.blocks.push(reconciliation_result(140));
+                    }
+                    Ok(page)
+                },
+            };
+            core.execute_thread_semantic_request(&transport, request);
+            assert_eq!(transport.calls.borrow().len(), retire_at + 1);
+            assert!(
+                core.thread_semantic_snapshot("a")
+                    .thread("a")
+                    .unwrap()
+                    .top_level
+                    .block("result-140")
+                    .is_none()
+            );
+            assert_eq!(
+                core.thread_semantic_in_flight("a").len(),
+                1,
+                "replacement owner is still active"
+            );
+            core.execute_thread_semantic_request(
+                &ReconciliationTransport {
+                    calls: Default::default(),
+                    reply: |_: usize, params: &ThreadTimelinePageParams| {
+                        Ok(reconciliation_server_page(&history, params))
+                    },
+                },
+                replacement.borrow_mut().take().unwrap(),
+            );
+            assert!(core.thread_semantic_in_flight("a").is_empty());
         }
     }
 
@@ -2548,6 +3336,239 @@ mod tests {
             error: None,
             prompt_manifest: None,
             permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
+        }
+    }
+
+    fn recovered_running_thread() -> Thread {
+        let mut snapshot = thread("a", "ws");
+        snapshot.status = ThreadStatus::Active;
+        let mut later = running_turn("later-terminal");
+        later.status = TurnStatus::Completed;
+        snapshot.turns = vec![running_turn("original"), later];
+        snapshot
+    }
+
+    #[test]
+    fn recovered_turn_snapshot_completed_agent_child_restores_original_control_immediately() {
+        let core = core();
+        // Concurrent Agent-authored child Turns are ordinary Conversation
+        // Turns in the parent's thread and can finish before the parent.
+        let mut original = running_turn("original");
+        original.mode = ThreadMode::Agent;
+        let mut child = running_turn("child");
+        child.mode = ThreadMode::Agent;
+        child.author = Some(TurnAuthorSnapshot {
+            actor: PersistedActorRef::System,
+            display_name: "Child Agent".into(),
+            nickname: "child-agent".into(),
+            avatar_revision: None,
+            agent: None,
+        });
+        let mut snapshot = thread("a", "ws");
+        snapshot.mode = ThreadMode::Agent;
+        snapshot.status = ThreadStatus::Active;
+        snapshot.turns = vec![original, child];
+        core.upsert_thread(snapshot.clone());
+        assert_eq!(
+            core.thread_coordinator_snapshot("a")
+                .unwrap()
+                .conversation
+                .in_flight_turn_id(),
+            Some("child")
+        );
+        snapshot.turns[1].status = TurnStatus::Completed;
+        snapshot.turns[1].permission_profile =
+            system_turn_permission_profile_snapshot(TurnPermissionMode::FullAccess);
+        let update = GatewayNotification::ThreadUpdated(ThreadUpdatedNotification {
+            thread: snapshot.clone(),
+            placement: None,
+        });
+        core.apply_thread_notification(update.clone());
+        let coordinator = core.thread_coordinator_snapshot("a").unwrap();
+        assert_eq!(coordinator.thread(), Some(&snapshot));
+        let active = crate::state::snapshot::ActiveThreadSnapshot::from_coordinator(
+            Some("a"),
+            Some(&coordinator),
+            false,
+        );
+        assert_eq!(active.in_flight_turn_id.as_deref(), Some("original"));
+        assert!(active.can_request_turn_cancel(true));
+        assert!(!active.can_request_turn_cancel(false));
+        let completed = coordinator
+            .conversation
+            .projection()
+            .turns
+            .iter()
+            .find(|turn| turn.id == "child")
+            .unwrap();
+        assert_eq!(completed.phase, crate::conversation::TurnPhase::Completed);
+        assert_eq!(
+            completed.permission_profile.as_ref(),
+            Some(&snapshot.turns[1].permission_profile)
+        );
+
+        // The first accepted snapshot already permits cancelling the original;
+        // no later event is needed to restore the cancellation target.
+        let (token, params) = core.begin_thread_turn_cancellation("a", None).unwrap();
+        assert_eq!(params.thread_id, "a");
+        assert_eq!(params.turn_id, "original");
+        core.apply_thread_notification(update);
+        let coordinator = core.thread_coordinator_snapshot("a").unwrap();
+        assert_eq!(
+            coordinator.conversation.in_flight_turn_id(),
+            Some("original")
+        );
+        assert!(coordinator.conversation.is_cancelling_turn());
+        assert_eq!(
+            coordinator
+                .conversation
+                .projection()
+                .turns
+                .iter()
+                .find(|turn| turn.id == "child")
+                .unwrap()
+                .phase,
+            crate::conversation::TurnPhase::Completed
+        );
+        assert!(!core.finish_thread_turn_cancellation(&token, "child", None, true));
+    }
+
+    #[test]
+    fn recovered_turn_snapshot_terminal_conversation_does_not_hide_cancel_target() {
+        let core = core();
+        let mut snapshot = recovered_running_thread();
+        core.upsert_thread(snapshot.clone());
+        assert_eq!(
+            core.thread_coordinator_snapshot("a")
+                .unwrap()
+                .conversation
+                .in_flight_turn_id(),
+            Some("original")
+        );
+        // Lose Conversation while retaining the thread snapshot, then deliver
+        // a differing ThreadUpdated through the production notification reducer.
+        core.thread_mutation("a", "ws")
+            .unwrap()
+            .conversation_mutation()
+            .reset();
+        assert!(
+            core.thread_coordinator_snapshot("a")
+                .unwrap()
+                .conversation
+                .in_flight_turn_id()
+                .is_none()
+        );
+        snapshot.preview = "recovered execution".into();
+        core.apply_thread_notification(GatewayNotification::ThreadUpdated(
+            ThreadUpdatedNotification {
+                thread: snapshot,
+                placement: None,
+            },
+        ));
+        let (_, params) = core.begin_thread_turn_cancellation("a", None).unwrap();
+        assert_eq!(params.thread_id, "a");
+        assert_eq!(params.turn_id, "original");
+    }
+
+    #[test]
+    fn recovered_turn_snapshot_preserves_pending_cancellation_and_accepts_response() {
+        for rejected in [false, true] {
+            let core = core();
+            let mut snapshot = recovered_running_thread();
+            core.upsert_thread(snapshot.clone());
+            let (token, params) = core.begin_thread_turn_cancellation("a", None).unwrap();
+            snapshot.preview = "activity during cancellation".into();
+            core.apply_thread_notification(GatewayNotification::ThreadUpdated(
+                ThreadUpdatedNotification {
+                    thread: snapshot.clone(),
+                    placement: None,
+                },
+            ));
+            let coordinator = core.thread_coordinator_snapshot("a").unwrap();
+            assert_eq!(
+                coordinator.thread().unwrap().preview,
+                snapshot.preview,
+                "the differing running snapshot must actually be accepted"
+            );
+            assert!(coordinator.conversation.is_cancelling_turn());
+            assert_eq!(
+                coordinator.conversation.in_flight_turn_id(),
+                Some("original")
+            );
+            assert!(core.begin_thread_turn_cancellation("a", None).is_none());
+            assert!(!core.finish_thread_turn_cancellation(&token, "later-terminal", None, true));
+            let mut wrong_generation = token.clone();
+            wrong_generation.generation += 1;
+            assert!(!core.finish_thread_turn_cancellation(
+                &wrong_generation,
+                &params.turn_id,
+                None,
+                true
+            ));
+            let event = if rejected {
+                crate::turns::cancel::local_turn_cancel_rejected_event(
+                    "a",
+                    "original",
+                    "RPC failed",
+                )
+            } else {
+                let mut cancelled = running_turn("original");
+                cancelled.status = TurnStatus::Interrupted;
+                crate::turns::cancel::turn_cancel_response_event(TurnCancelResponse {
+                    workspace_id: "ws".into(),
+                    thread_id: "a".into(),
+                    turn: cancelled,
+                })
+                .unwrap()
+            };
+            assert!(core.finish_thread_turn_cancellation(
+                &token,
+                &params.turn_id,
+                Some(event),
+                false
+            ));
+            let coordinator = core.thread_coordinator_snapshot("a").unwrap();
+            assert!(!coordinator.conversation.is_cancelling_turn());
+            if rejected {
+                assert_eq!(
+                    coordinator.conversation.in_flight_turn_id(),
+                    Some("original")
+                );
+                assert!(core.begin_thread_turn_cancellation("a", None).is_some());
+            } else {
+                assert_eq!(coordinator.conversation.in_flight_turn_id(), None);
+                assert!(coordinator.conversation.can_submit_message());
+            }
+        }
+    }
+
+    #[test]
+    fn recovered_turn_snapshot_terminalizes_pending_cancellation() {
+        for status in [TurnStatus::Interrupted, TurnStatus::Completed] {
+            let core = core();
+            let mut snapshot = recovered_running_thread();
+            core.upsert_thread(snapshot.clone());
+            let (token, params) = core.begin_thread_turn_cancellation("a", None).unwrap();
+            snapshot.turns[0].status = status;
+            core.apply_thread_notification(GatewayNotification::ThreadUpdated(
+                ThreadUpdatedNotification {
+                    thread: snapshot,
+                    placement: None,
+                },
+            ));
+            let coordinator = core.thread_coordinator_snapshot("a").unwrap();
+            assert_eq!(coordinator.conversation.in_flight_turn_id(), None);
+            assert!(!coordinator.conversation.is_cancelling_turn());
+            assert!(coordinator.conversation.can_submit_message());
+            assert_eq!(
+                coordinator.conversation.status_label(),
+                if status == TurnStatus::Interrupted {
+                    "cancelled"
+                } else {
+                    "completed"
+                }
+            );
+            assert!(!core.finish_thread_turn_cancellation(&token, &params.turn_id, None, true));
         }
     }
 
@@ -3999,19 +5020,128 @@ pub struct ThreadSemanticRequest {
     generation: u64,
     request_generation: u64,
     action: SemanticTimelineRequestAction,
+    reconciliation: Option<CachedTimelineReconciliation>,
 }
+
+// One controller request owns the tail refresh and the entire cached-range walk.
+// Cursors are opaque, server-issued boundaries; never manufacture one from an ID.
+const CACHED_TIMELINE_PAGE_LIMIT: u32 = 100;
+const CACHED_TIMELINE_REQUEST_BUDGET: usize = 32;
+
+struct CachedTimelineReconciliation {
+    first_cursor: Option<pioneer_protocol::TimelineCursor>,
+    last_cursor: Option<pioneer_protocol::TimelineCursor>,
+    last_sort_key: String,
+    anchor: pioneer_protocol::TimelinePageAnchor,
+    remaining: usize,
+    previous_sort_key: Option<String>,
+    visited_cursors: HashSet<String>,
+    read_last_boundary: bool,
+    baseline: Arc<SemanticTimelineState>,
+}
+
+impl CachedTimelineReconciliation {
+    fn capture(store: &ThreadDomainStore, action: &SemanticTimelineRequestAction) -> Option<Self> {
+        use pioneer_protocol::TimelinePageAnchor;
+        let SemanticTimelineRequestAction::ThreadTimelinePage {
+            key: SemanticTimelineRequestKey::ThreadNewest { thread_id },
+            params,
+        } = action
+        else {
+            return None;
+        };
+        if params.anchor != TimelinePageAnchor::Newest {
+            return None;
+        }
+        let cache = &store.semantic.thread(thread_id)?.top_level;
+        if !cache.has_loaded_page || cache.is_empty() {
+            return None;
+        }
+        Some(Self {
+            first_cursor: cache.loaded_range.before_cursor.clone(),
+            last_cursor: cache.loaded_range.after_cursor.clone(),
+            last_sort_key: cache.ordered_blocks().last()?.sort_key.clone(),
+            anchor: TimelinePageAnchor::Newest,
+            remaining: CACHED_TIMELINE_REQUEST_BUDGET,
+            previous_sort_key: None,
+            visited_cursors: HashSet::new(),
+            read_last_boundary: false,
+            baseline: store.snapshot.as_ref()?.semantic.clone(),
+        })
+    }
+
+    fn advance(
+        &mut self,
+        page: &pioneer_protocol::ThreadTimelinePageResponse,
+    ) -> anyhow::Result<bool> {
+        use pioneer_protocol::TimelinePageAnchor;
+        self.remaining = self.remaining.saturating_sub(1);
+        let next = match &self.anchor {
+            TimelinePageAnchor::Newest => {
+                // Read the far boundary separately so a result just after the last
+                // cached block is included even when a forward page ends on it.
+                TimelinePageAnchor::Around {
+                    cursor: self.last_cursor.clone().ok_or_else(|| {
+                        anyhow::anyhow!("Cached timeline reconciliation boundary cursor missing")
+                    })?,
+                }
+            }
+            TimelinePageAnchor::Around { .. } if !self.read_last_boundary => {
+                self.read_last_boundary = true;
+                TimelinePageAnchor::Around {
+                    cursor: self.first_cursor.clone().ok_or_else(|| {
+                        anyhow::anyhow!("Cached timeline reconciliation boundary cursor missing")
+                    })?,
+                }
+            }
+            _ => {
+                let last = page.blocks.iter().map(|block| &block.sort_key).max();
+                if last.is_some_and(|key| key >= &self.last_sort_key) || !page.page.has_more_after {
+                    return Ok(false);
+                }
+                let last = last.ok_or_else(|| {
+                    anyhow::anyhow!("Cached timeline reconciliation made no progress")
+                })?;
+                anyhow::ensure!(
+                    self.previous_sort_key
+                        .as_ref()
+                        .is_none_or(|previous| last > previous),
+                    "Cached timeline reconciliation made no progress"
+                );
+                let cursor = page.page.after_cursor.clone().ok_or_else(|| {
+                    anyhow::anyhow!("Cached timeline reconciliation cursor missing")
+                })?;
+                anyhow::ensure!(
+                    self.visited_cursors.insert(cursor.value.clone()),
+                    "Cached timeline reconciliation cursor did not advance"
+                );
+                self.previous_sort_key = Some(last.clone());
+                TimelinePageAnchor::After { cursor }
+            }
+        };
+        anyhow::ensure!(
+            self.remaining > 0,
+            "Cached timeline reconciliation request budget exhausted"
+        );
+        self.anchor = next;
+        Ok(true)
+    }
+}
+
 impl ClientCore {
     pub fn begin_thread_semantic_request(
         &self,
         action: SemanticTimelineRequestAction,
     ) -> Option<ThreadSemanticRequest> {
-        self.accept_timeline_request(action, None)
+        self.accept_timeline_request(action, None, None, false)
     }
 
     fn accept_timeline_request(
         &self,
         action: SemanticTimelineRequestAction,
         reserved: Option<u64>,
+        expected_store: Option<u64>,
+        notification: bool,
     ) -> Option<ThreadSemanticRequest> {
         if self.is_stopped() {
             return None;
@@ -4024,7 +5154,22 @@ impl ClientCore {
             .thread_registry
             .lock()
             .expect("thread registry poisoned");
-        registry.stores.get(&id)?;
+        let store = registry.stores.get(&id)?;
+        if expected_store.is_some_and(|generation| store.generation != generation) {
+            return None;
+        }
+        // Invalidation still applies, but notifications cannot restart a failed
+        // refresh. Check under the same lock as begin and the status transition.
+        // Explicit Retry and confirmed subscriptions use the other entry paths.
+        if notification
+            && matches!(
+                crate::timeline::semantic::semantic_timeline_request_key(&action),
+                SemanticTimelineRequestKey::ThreadNewest { .. }
+            )
+            && registry.timeline.has_failed_refresh(&id)
+        {
+            return None;
+        }
         let action = if let Some(generation) = reserved {
             if !registry.timeline.accepts(
                 crate::timeline::semantic::semantic_timeline_request_key(&action),
@@ -4042,18 +5187,31 @@ impl ClientCore {
         let request_generation = registry.timeline.request_generation(
             crate::timeline::semantic::semantic_timeline_request_key(&action),
         );
+        let key = crate::timeline::semantic::semantic_timeline_request_key(&action);
+        let preserve_refresh_status = matches!(
+            key,
+            SemanticTimelineRequestKey::ThreadBefore { .. }
+                | SemanticTimelineRequestKey::ThreadAfter { .. }
+        ) && (registry.timeline.in_flight.contains(
+            &SemanticTimelineRequestKey::ThreadNewest {
+                thread_id: id.clone(),
+            },
+        ) || registry.timeline.has_failed_refresh(&id));
         let store = registry.stores.get_mut(&id)?;
         let generation = store.generation;
-        set_request_status(
-            &mut store.semantic,
-            crate::timeline::semantic::semantic_timeline_request_key(&action),
-            crate::timeline::semantic::TimelineRequestStatus::Loading {
-                request_key: format!(
-                    "{:?}",
-                    crate::timeline::semantic::semantic_timeline_request_key(&action)
-                ),
-            },
-        );
+        let reconciliation = CachedTimelineReconciliation::capture(store, &action);
+        if !preserve_refresh_status {
+            set_request_status(
+                &mut store.semantic,
+                crate::timeline::semantic::semantic_timeline_request_key(&action),
+                crate::timeline::semantic::TimelineRequestStatus::Loading {
+                    request_key: format!(
+                        "{:?}",
+                        crate::timeline::semantic::semantic_timeline_request_key(&action)
+                    ),
+                },
+            );
+        }
         let drafts = registry.publish(&id);
         self.transition_directory(
             &mut registry,
@@ -4066,9 +5224,27 @@ impl ClientCore {
             generation,
             request_generation,
             action,
+            reconciliation,
         })
     }
     pub fn schedule_thread_semantic_request(&self, action: SemanticTimelineRequestAction) {
+        self.schedule_thread_semantic_request_generation(action, None);
+    }
+
+    fn schedule_thread_semantic_request_generation(
+        &self,
+        action: SemanticTimelineRequestAction,
+        expected_store: Option<u64>,
+    ) {
+        self.schedule_thread_semantic_request_inner(action, expected_store, false);
+    }
+
+    fn schedule_thread_semantic_request_inner(
+        &self,
+        action: SemanticTimelineRequestAction,
+        expected_store: Option<u64>,
+        notification: bool,
+    ) {
         let sender = self
             .thread_request_sender
             .lock()
@@ -4077,7 +5253,9 @@ impl ClientCore {
         let Some(sender) = sender else {
             return;
         };
-        if let Some(request) = self.begin_thread_semantic_request(action) {
+        if let Some(request) =
+            self.accept_timeline_request(action, None, expected_store, notification)
+        {
             let _ = sender.send(ThreadControllerRequest::Semantic(request));
         }
     }
@@ -4086,7 +5264,9 @@ impl ClientCore {
         &self,
         page: crate::timeline::controller::TimelinePageRequest,
     ) {
-        let Some(request) = self.accept_timeline_request(page.action, Some(page.generation)) else {
+        let Some(request) =
+            self.accept_timeline_request(page.action, Some(page.generation), None, false)
+        else {
             return;
         };
         let sender = self
@@ -4165,8 +5345,14 @@ impl ClientCore {
                     Some(params.turn_id.clone())
                 }
             };
-            let result = match request.action {
-                SemanticTimelineRequestAction::ThreadTimelinePage { key, params } => {
+            let result = match request.action.clone() {
+                SemanticTimelineRequestAction::ThreadTimelinePage { key, mut params } => {
+                    if let Some(reconciliation) = &request.reconciliation {
+                        params.anchor = reconciliation.anchor.clone();
+                        if params.anchor != pioneer_protocol::TimelinePageAnchor::Newest {
+                            params.limit = Some(CACHED_TIMELINE_PAGE_LIMIT);
+                        }
+                    }
                     let mode = match key {
                         SemanticTimelineRequestKey::ThreadBefore { .. } => {
                             TopLevelPageMergeMode::MergeBefore
@@ -4220,6 +5406,15 @@ impl ClientCore {
             if !registry.timeline.accepts(&key, request.request_generation) {
                 return;
             }
+            let refresh_key = SemanticTimelineRequestKey::ThreadNewest {
+                thread_id: request.id.clone(),
+            };
+            let is_refresh = matches!(&request.action,
+                SemanticTimelineRequestAction::ThreadTimelinePage { key: SemanticTimelineRequestKey::ThreadNewest { .. }, params }
+                    if params.anchor == pioneer_protocol::TimelinePageAnchor::Newest);
+            let preserve_refresh_status = !is_refresh
+                && (registry.timeline.in_flight.contains(&refresh_key)
+                    || registry.timeline.has_failed_refresh(&request.id));
             let Some(store) = registry.stores.get_mut(&request.id) else {
                 return;
             };
@@ -4229,12 +5424,67 @@ impl ClientCore {
             let valid_scope = |workspace: &str, id: &str| {
                 workspace == store.coordinator.workspace_id && id == request.id
             };
-            let succeeded = result.is_ok();
+            let mut succeeded = result.is_ok();
+            let mut continue_reconciliation = false;
             match result {
-                Ok(Page::Thread(page, mode))
+                Ok(Page::Thread(mut page, mode))
                     if valid_scope(&page.workspace_id, &page.thread_id) =>
                 {
+                    let progress = request
+                        .reconciliation
+                        .as_mut()
+                        .map(|walk| walk.advance(&page));
+                    if let Some(walk) = &request.reconciliation {
+                        // Preserve blocks changed since this operation began, including
+                        // same-millisecond live updates and explicit live removals.
+                        page.blocks.retain(|incoming| {
+                            let cached = store
+                                .semantic
+                                .thread(&request.id)
+                                .and_then(|thread| thread.top_level.block(&incoming.block_id));
+                            let baseline = walk
+                                .baseline
+                                .thread(&request.id)
+                                .and_then(|thread| thread.top_level.block(&incoming.block_id));
+                            cached == baseline || cached == Some(incoming)
+                        });
+                    }
+                    let refresh_status = preserve_refresh_status.then(|| {
+                        store
+                            .semantic
+                            .thread(&request.id)
+                            .unwrap()
+                            .top_level
+                            .request_status
+                            .clone()
+                    });
                     apply_thread_timeline_page(&mut store.semantic, page, mode);
+                    if let Some(status) = refresh_status {
+                        set_request_status(&mut store.semantic, &refresh_key, status);
+                    }
+                    match progress {
+                        Some(Ok(true)) => {
+                            continue_reconciliation = true;
+                            set_request_status(
+                                &mut store.semantic,
+                                &key,
+                                TimelineRequestStatus::Loading {
+                                    request_key: format!("{key:?}"),
+                                },
+                            );
+                        }
+                        Some(Err(error)) => {
+                            succeeded = false;
+                            set_request_status(
+                                &mut store.semantic,
+                                &key,
+                                TimelineRequestStatus::Failed {
+                                    message: format!("{error:#}"),
+                                },
+                            );
+                        }
+                        _ => {}
+                    }
                 }
                 Ok(Page::Work(page, mode))
                     if valid_scope(&page.workspace_id, &page.thread_id)
@@ -4261,12 +5511,35 @@ impl ClientCore {
                     },
                 ),
             }
+            if continue_reconciliation {
+                let drafts = registry.publish(&request.id);
+                self.transition_directory(
+                    &mut registry,
+                    &ClientMutationAuthority { _private: () },
+                    drafts,
+                    vec![],
+                );
+                drop(registry);
+                continue;
+            }
             let next = registry
                 .timeline
                 .finish(&key, succeeded, self.timeline_now_ms())
                 .and_then(|action| registry.timeline.begin(action));
             let next_generation = registry.timeline.request_generation(&key);
+            if next.is_some() && is_refresh {
+                set_request_status(
+                    &mut registry.stores.get_mut(&request.id).unwrap().semantic,
+                    &key,
+                    TimelineRequestStatus::Loading {
+                        request_key: format!("{key:?}"),
+                    },
+                );
+            }
             let drafts = registry.publish(&request.id);
+            let next_reconciliation = next.as_ref().and_then(|action| {
+                CachedTimelineReconciliation::capture(&registry.stores[&request.id], action)
+            });
             self.transition_directory(
                 &mut registry,
                 &ClientMutationAuthority { _private: () },
@@ -4279,6 +5552,7 @@ impl ClientCore {
             };
             request.action = action;
             request.request_generation = next_generation;
+            request.reconciliation = next_reconciliation;
         }
     }
 }
@@ -4831,6 +6105,12 @@ impl ClientCore {
             drafts,
             vec![],
         );
+        drop(registry);
+        // Owned subscriptions are the opened/reconnected-thread path. Composer
+        // subscriptions use the metadata-only public entry point.
+        if expected.is_some() {
+            self.refresh_thread_timeline_generation(id, Some(generation));
+        }
         Ok(())
     }
 }
@@ -5079,7 +6359,6 @@ impl ClientCore {
         };
         for (id, workspace) in visible {
             self.schedule_thread_subscription(&id, &workspace);
-            self.refresh_thread_timeline(&id);
         }
     }
 
@@ -5550,20 +6829,27 @@ impl ClientCore {
     }
 
     pub fn refresh_thread_timeline(&self, id: &str) {
+        self.refresh_thread_timeline_generation(id, None);
+    }
+
+    fn refresh_thread_timeline_generation(&self, id: &str, expected_store: Option<u64>) {
         use crate::timeline::semantic::*;
         if self.thread_snapshot(id).is_none() {
             return;
         }
-        self.schedule_thread_semantic_request(SemanticTimelineRequestAction::ThreadTimelinePage {
-            key: SemanticTimelineRequestKey::ThreadNewest {
-                thread_id: id.to_owned(),
+        self.schedule_thread_semantic_request_generation(
+            SemanticTimelineRequestAction::ThreadTimelinePage {
+                key: SemanticTimelineRequestKey::ThreadNewest {
+                    thread_id: id.to_owned(),
+                },
+                params: pioneer_protocol::ThreadTimelinePageParams {
+                    thread_id: id.to_owned(),
+                    anchor: pioneer_protocol::TimelinePageAnchor::Newest,
+                    limit: Some(DEFAULT_TOP_LEVEL_PAGE_LIMIT),
+                },
             },
-            params: pioneer_protocol::ThreadTimelinePageParams {
-                thread_id: id.to_owned(),
-                anchor: pioneer_protocol::TimelinePageAnchor::Newest,
-                limit: Some(DEFAULT_TOP_LEVEL_PAGE_LIMIT),
-            },
-        });
+            expected_store,
+        );
         let semantic = self.thread_semantic_snapshot(id);
         let Some(thread) = semantic.thread(id) else {
             return;
@@ -5573,7 +6859,7 @@ impl ClientCore {
                 .cached_turn_work_block(turn_id)
                 .is_some_and(|work| resolve_work_expanded(work, &thread.expansion))
             {
-                self.schedule_thread_semantic_request(
+                self.schedule_thread_semantic_request_generation(
                     SemanticTimelineRequestAction::TurnWorkPage {
                         key: SemanticTimelineRequestKey::TurnWorkInitial {
                             thread_id: id.to_owned(),
@@ -5586,6 +6872,7 @@ impl ClientCore {
                             limit: Some(DEFAULT_TURN_WORK_PAGE_LIMIT),
                         },
                     },
+                    expected_store,
                 );
             }
             let mut work_item_ids: Vec<_> = range
@@ -5597,7 +6884,7 @@ impl ClientCore {
             work_item_ids.sort();
             work_item_ids.dedup();
             if !work_item_ids.is_empty() {
-                self.schedule_thread_semantic_request(
+                self.schedule_thread_semantic_request_generation(
                     SemanticTimelineRequestAction::TurnWorkItemsGet {
                         key: SemanticTimelineRequestKey::TurnWorkItems {
                             thread_id: id.to_owned(),
@@ -5609,6 +6896,7 @@ impl ClientCore {
                             work_item_ids,
                         },
                     },
+                    expected_store,
                 );
             }
         }

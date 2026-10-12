@@ -89,6 +89,7 @@ pub(crate) async fn compaction_begin_frozen_history_with_imports<C: ConnectionTr
         .one(db)
         .await?
         .ok_or_else(|| anyhow::anyhow!("frozen history scope is unavailable"))?;
+    crate::frozen_lifetime::logical_bounds(&row)?;
     ensure!(
         row.identity_sha256 == descriptor.identity_sha256
             && row.message_count == messages
@@ -140,7 +141,8 @@ pub(crate) async fn compaction_append_frozen_history(
         .one(&tx)
         .await?
         .ok_or_else(|| anyhow::anyhow!("frozen history owner is unavailable"))?;
-    let ready = row.ready != 0;
+    crate::frozen_lifetime::logical_bounds(&row)?;
+    let ready = row.ready == 1;
     let count = row.message_count;
     let next = row.next_ordinal;
     let start = i64::try_from(start)?;
@@ -178,16 +180,6 @@ pub(crate) async fn compaction_append_frozen_history(
             .exec_without_returning(&tx)
             .await?;
         }
-        let matches =
-            compaction_frozen_message::Entity::find_by_id((manifest.to_owned(), *ordinal))
-                .select_only()
-                .column(compaction_frozen_message::Column::Ordinal)
-                .filter(compaction_frozen_message::Column::ReferenceJson.eq(json.clone()))
-                .into_tuple::<i64>()
-                .one(&tx)
-                .await?
-                .is_some();
-        ensure!(matches, "frozen history retry changed an immutable entry");
     }
     if start == next && !ready {
         compaction_frozen_history::Entity::update_many()
@@ -207,6 +199,19 @@ pub(crate) async fn compaction_append_frozen_history(
             .exec(&tx)
             .await?;
     }
+    for (ordinal, json) in &batch {
+        let matches =
+            compaction_frozen_message::Entity::find_by_id((manifest.to_owned(), *ordinal))
+                .select_only()
+                .column(compaction_frozen_message::Column::Ordinal)
+                .filter(compaction_frozen_message::Column::ReferenceJson.eq(json.clone()))
+                .filter(compaction_frozen_message::Column::Bytes.eq(i64::try_from(json.len())?))
+                .into_tuple::<i64>()
+                .one(&tx)
+                .await?
+                .is_some();
+        ensure!(matches, "frozen history retry changed an immutable entry");
+    }
     tx.commit().await?;
     Ok(())
 }
@@ -223,6 +228,10 @@ pub(crate) async fn compaction_finish_frozen_history<C: ConnectionTrait>(
     // sequential batch, so finalization never scans the whole manifest.
     Ok(compaction_frozen_history::Entity::update_many()
         .col_expr(compaction_frozen_history::Column::Ready, Expr::val(1_i64))
+        .filter(compaction_frozen_history::Column::Expired.eq(0))
+        .filter(compaction_frozen_history::Column::Ready.is_in([0_i64, 1]))
+        .filter(compaction_frozen_history::Column::MessageCount.gte(0))
+        .filter(compaction_frozen_history::Column::ImportCount.gte(0))
         .filter(
             Expr::col(compaction_frozen_history::Column::Id)
                 .eq(Expr::Value(descriptor.manifest_id.clone().into()))
@@ -265,14 +274,24 @@ pub(crate) async fn compaction_frozen_history_owner<C: ConnectionTrait>(
     use pioneer_entity::compaction_frozen_history as history;
     use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
     ensure!(descriptor.format == 1, "unsupported frozen history format");
-    let row = history::Entity::find_by_id(descriptor.manifest_id.clone())
+    let row = history::Entity::find_by_id(&descriptor.manifest_id)
         .filter(history::Column::WorkspaceId.eq(workspace))
-        .filter(history::Column::Ready.eq(1_i64))
-        .filter(history::Column::IdentitySha256.eq(descriptor.identity_sha256.clone()))
-        .filter(history::Column::MessageCount.eq(i64::try_from(descriptor.messages)?))
         .one(db)
         .await?;
-    Ok(row.map(|row| row.owner_thread))
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    crate::frozen_lifetime::logical_bounds(&row)?;
+    if row.ready == 0 {
+        return Ok(None);
+    }
+    ensure!(
+        row.ready == 1
+            && row.identity_sha256 == descriptor.identity_sha256
+            && row.message_count == i64::try_from(descriptor.messages)?,
+        "frozen history identity mismatch"
+    );
+    Ok(Some(row.owner_thread))
 }
 
 pub(crate) async fn compaction_frozen_history_page<C: ConnectionTrait>(
@@ -282,6 +301,28 @@ pub(crate) async fn compaction_frozen_history_page<C: ConnectionTrait>(
     manifest: &str,
     start: u64,
 ) -> Result<Vec<FrozenMessageRef>> {
+    let mut complete_count = None;
+    if let Some(h) = compaction_frozen_history::Entity::find_by_id(manifest)
+        .filter(compaction_frozen_history::Column::WorkspaceId.eq(workspace))
+        .filter(compaction_frozen_history::Column::OwnerThread.eq(owner_thread))
+        .one(db)
+        .await?
+    {
+        crate::frozen_lifetime::logical_bounds(&h)?;
+        if let Some(layout) = pioneer_entity::compaction_frozen_layout::Entity::find_by_id((
+            manifest.to_owned(),
+            0_i64,
+        ))
+        .one(db)
+        .await?
+        {
+            ensure!(layout.failed == 0, "invalid frozen layout state");
+        }
+        if h.ready == 1 {
+            complete_count = Some(h.message_count);
+        }
+    }
+    let start_ordinal = i64::try_from(start)?;
     // Fetch bounded sizes first, release the reader, then choose a byte-bounded page.
     let scoped = compaction_frozen_message::Entity::find()
         .inner_join(compaction_frozen_history::Entity)
@@ -314,14 +355,23 @@ pub(crate) async fn compaction_frozen_history_page<C: ConnectionTrait>(
         bytes += size;
         end += 1;
     }
+    ensure!(
+        complete_count.is_none_or(|count| start_ordinal >= count || end > start_ordinal),
+        "frozen history page missing before declared count"
+    );
     let rows = scoped
         .select_only()
         .column(compaction_frozen_message::Column::ReferenceJson)
         .filter(compaction_frozen_message::Column::Ordinal.lt(end))
+        .filter(Expr::cust("length(CAST(compaction_frozen_message.reference_json AS BLOB))=compaction_frozen_message.bytes AND compaction_frozen_message.bytes BETWEEN 0 AND 262144"))
         .order_by_asc(compaction_frozen_message::Column::Ordinal)
         .into_tuple::<String>()
         .all(db)
         .await?;
+    ensure!(
+        rows.len() == usize::try_from(end - start_ordinal)?,
+        "frozen history bounded readback incomplete"
+    );
     let mut result = Vec::new();
     for json in rows {
         let message: FrozenMessageRef = serde_json::from_str(&json)?;

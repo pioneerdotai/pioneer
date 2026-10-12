@@ -6933,6 +6933,12 @@ async fn load_task_execution_conversation_scope(
                 .get_task_run_conversation_snapshot(retry_of_run_id)
                 .await?
         {
+            let _retry_hold = crate::compaction::frozen::acquire_history_json(
+                &history_store,
+                &snapshot.workspace_id,
+                &snapshot.history_json,
+            )
+            .await?;
             restore_task_run_conversation_snapshot(
                 &history_store,
                 &snapshot,
@@ -7165,6 +7171,12 @@ async fn restore_task_run_conversation_snapshot_literal_fields(
         conversation_thread,
         source_turn_id,
     )?;
+    let _frozen_hold = crate::compaction::frozen::acquire_history_json(
+        store,
+        &snapshot.workspace_id,
+        &snapshot.history_json,
+    )
+    .await?;
     let allowed = crate::compaction::frozen::accepted_history_scopes(
         store,
         &snapshot.workspace_id,
@@ -7215,7 +7227,7 @@ mod prepared_snapshot_tests {
     use migration::{Migrator, MigratorTrait};
     use pioneer_crud::compaction::PagedSource;
     use pioneer_provider::{ChatMessage, MessageProvenance, MessageSourceRef};
-    use sea_orm::{ConnectionTrait, Database};
+    use sea_orm::{ConnectionTrait, Database, TransactionTrait};
     use std::{collections::BTreeSet, sync::Arc};
 
     #[tokio::test]
@@ -7299,6 +7311,7 @@ mod prepared_snapshot_tests {
         .await
         .unwrap();
         crate::compaction::frozen::PreparedHistory {
+            frozen_hold: None,
             descriptor,
             messages,
             accepted_scopes: BTreeSet::from(["parent".to_owned()]),
@@ -7526,51 +7539,6 @@ mod prepared_snapshot_tests {
             identity.update(bytes);
         }
         let identity_sha256 = hex::encode(identity.finalize());
-        let empty_import_digest = pioneer_crud::compaction::EMPTY_FROZEN_IMPORT_SHA256;
-        let capture_key = serde_json::to_vec(&(
-            1_u32,
-            "race-legacy-ws",
-            "parent",
-            &identity_sha256,
-            references.len(),
-            empty_import_digest,
-            0_usize,
-        ))
-        .unwrap();
-        winner.descriptor = pioneer_compaction::frozen::FrozenHistoryRef {
-            format: 1,
-            manifest_id: format!("fh_{}", hex::encode(sha2::Sha256::digest(capture_key))),
-            messages: references.len() as u64,
-            identity_sha256,
-        };
-        store
-            .compaction_begin_frozen_history_with_imports(
-                "race-legacy-ws",
-                "parent",
-                &winner.descriptor,
-                0,
-                empty_import_digest,
-            )
-            .await
-            .unwrap();
-        store
-            .compaction_append_frozen_history(
-                "race-legacy-ws",
-                "parent",
-                &winner.descriptor.manifest_id,
-                0,
-                &references,
-            )
-            .await
-            .unwrap();
-        assert!(
-            store
-                .compaction_finish_frozen_history("race-legacy-ws", "parent", &winner.descriptor,)
-                .await
-                .unwrap()
-        );
-        let winner_json = serde_json::to_string(&winner.descriptor).unwrap();
-
         // Model the already published legacy import metadata. Production
         // preparation/append proof validation is covered independently; this
         // fixture isolates the positional hydration of an accepted manifest.
@@ -7594,8 +7562,46 @@ mod prepared_snapshot_tests {
         let mut digest = sha2::Sha256::new();
         digest.update((record_bytes.len() as u64).to_le_bytes());
         digest.update(&record_bytes);
-        let db = store.database_connection();
-        db.execute_raw(Statement::from_sql_and_values(
+        let imports_sha256 = hex::encode(digest.finalize());
+        let capture_key = serde_json::to_vec(&(
+            1_u32,
+            "race-legacy-ws",
+            "parent",
+            &identity_sha256,
+            references.len(),
+            &imports_sha256,
+            1_usize,
+        ))
+        .unwrap();
+        winner.descriptor = pioneer_compaction::frozen::FrozenHistoryRef {
+            format: 1,
+            manifest_id: format!("fh_{}", hex::encode(sha2::Sha256::digest(capture_key))),
+            messages: references.len() as u64,
+            identity_sha256,
+        };
+        store
+            .compaction_begin_frozen_history_with_imports(
+                "race-legacy-ws",
+                "parent",
+                &winner.descriptor,
+                1,
+                &imports_sha256,
+            )
+            .await
+            .unwrap();
+        store
+            .compaction_append_frozen_history(
+                "race-legacy-ws",
+                "parent",
+                &winner.descriptor.manifest_id,
+                0,
+                &references,
+            )
+            .await
+            .unwrap();
+        let record_json = serde_json::to_string(&record).unwrap();
+        let tx = store.database_connection().begin().await.unwrap();
+        tx.execute_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
             "INSERT INTO compaction_frozen_import_data(manifest_id,ordinal,message_ordinal,source_scope,source_id,source_version,source_thread,proof_json,bytes) VALUES (?,0,2,?,?,?,?,?,?)",
             [
@@ -7604,19 +7610,30 @@ mod prepared_snapshot_tests {
                 source.id.clone().into(),
                 source.version.clone().into(),
                 "parent".into(),
-                serde_json::to_string(&record).unwrap().into(),
+                record_json.into(),
                 i64::try_from(record_bytes.len()).unwrap().into(),
             ],
         ))
         .await
         .unwrap();
-        db.execute_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            "UPDATE compaction_frozen_history SET import_count=1,next_import=1,imports_sha256=? WHERE id=?",
-            [hex::encode(digest.finalize()).into(), winner.descriptor.manifest_id.clone().into()],
-        ))
-        .await
-        .unwrap();
+        let advanced = tx
+            .execute_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "UPDATE compaction_frozen_history SET next_import=1 WHERE id=? AND ready=0",
+                [winner.descriptor.manifest_id.clone().into()],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(advanced.rows_affected(), 1);
+        tx.commit().await.unwrap();
+
+        assert!(
+            store
+                .compaction_finish_frozen_history("race-legacy-ws", "parent", &winner.descriptor,)
+                .await
+                .unwrap()
+        );
+        let winner_json = serde_json::to_string(&winner.descriptor).unwrap();
 
         let accepted_scopes = crate::compaction::frozen::accepted_history_scopes(
             &store,
@@ -7980,6 +7997,12 @@ async fn restore_task_run_conversation_snapshot_fields(
         conversation_thread,
         source_turn_id,
     )?;
+    let _frozen_hold = crate::compaction::frozen::acquire_history_json(
+        store,
+        &snapshot.workspace_id,
+        &snapshot.history_json,
+    )
+    .await?;
     let allowed = crate::compaction::frozen::accepted_history_scopes(
         store,
         &snapshot.workspace_id,

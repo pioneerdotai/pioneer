@@ -496,14 +496,25 @@ impl Conversation {
             return;
         }
 
-        let Some(turn) = thread.turns.iter().rev().find(|turn| {
-            turn.turn_kind == TurnKind::Conversation
-                && turn.mode != pioneer_protocol::ThreadMode::Message
-        }) else {
+        let current_in_flight_turn_id = self.state_machine.in_flight_turn_id().map(str::to_owned);
+        let eligible_turns = || {
+            thread.turns.iter().rev().filter(|turn| {
+                turn.turn_kind == TurnKind::Conversation
+                    && turn.mode != pioneer_protocol::ThreadMode::Message
+            })
+        };
+        // Apply the current Turn's terminal transition before considering any
+        // other Turn. Otherwise, a later completed Conversation must not hide
+        // the running Turn that a fresh or reset client needs to control.
+        let turn = current_in_flight_turn_id
+            .as_deref()
+            .and_then(|current| eligible_turns().find(|turn| turn.id == current))
+            .or_else(|| eligible_turns().find(|turn| turn.status == TurnStatus::InProgress))
+            .or_else(|| eligible_turns().next());
+        let Some(turn) = turn else {
             return;
         };
 
-        let current_in_flight_turn_id = self.state_machine.in_flight_turn_id().map(str::to_owned);
         if current_in_flight_turn_id.as_deref().is_some_and(|current| {
             current != turn.id.as_str() && turn.status != TurnStatus::InProgress
         }) {
@@ -512,6 +523,16 @@ impl Conversation {
 
         self.state_machine.sync_snapshot_turn(turn);
         self.projector.upsert_turn_snapshot_metadata(turn);
+        // Finishing the current Turn must retain its terminal metadata while
+        // restoring control of any concurrent execution in this same snapshot.
+        if turn.status != TurnStatus::InProgress {
+            if let Some(running) =
+                eligible_turns().find(|turn| turn.status == TurnStatus::InProgress)
+            {
+                self.state_machine.sync_snapshot_turn(running);
+                self.projector.upsert_turn_snapshot_metadata(running);
+            }
+        }
         self.projector.sync_flow_state(&self.state_machine);
         self.projector.bump_revision();
     }

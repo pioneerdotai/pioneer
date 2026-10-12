@@ -576,6 +576,19 @@ async fn durable_final_case(
         )
         .await
         .unwrap();
+    store
+        .compaction_activate_runner(
+            &operation.id,
+            &pioneer_compaction::runner::RunnerState::new(
+                operation.admission.deadline_ms,
+                &ModelBudget::new(None, None, None),
+                500,
+                None,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
     let checkpoint = Checkpoint {
         id: "g05-final-checkpoint".into(),
         operation_id: operation.id.clone(),

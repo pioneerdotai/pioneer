@@ -1633,8 +1633,15 @@ pub(super) async fn run_agent_loop(
 
                 let run_id = next_turn_run_id;
                 next_turn_run_id = next_turn_run_id.saturating_add(1);
-                let turn_control = TurnExecutionControl::new(command_tx.clone(), run_id);
+                let mut turn_control = TurnExecutionControl::new(command_tx.clone(), run_id);
                 let recovery = recovery_context(&recovery_request);
+                turn_control.restored_recovery = Some((
+                    format!(
+                        "{}:terminal-effects:{run_id}:{}:recovery:{}",
+                        active_request.turn_id, runtime_snapshot.generation, recovery.attempt_id
+                    ),
+                    recovery.clone(),
+                ));
 
                 active_turn_id = Some(active_request.turn_id.clone());
                 active_turn_run_id = Some(run_id);
@@ -1758,6 +1765,11 @@ fn spawn_turn_task(
             ));
         if !initial_turn {
             cancellation_context.effects.clear();
+        }
+        if let Some((batch_id, _)) = turn_control.restored_recovery.as_ref() {
+            // The durable delivery identity must distinguish restored attempts,
+            // even when a replacement actor restarts its local run counter.
+            cancellation_context.batch_id = batch_id.clone();
         }
         match publish_loop_durable_event(
             &event_hub,

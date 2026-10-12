@@ -130,7 +130,7 @@
 "chat.composer.model.select_label" = "Sélectionner le modèle"
 "chat.composer.placeholder" = "Écrivez un message"
 "chat.composer.reply.cancel" = "Annuler la réponse"
-"chat.composer.send_failed" = "Le message n’a pas été envoyé. Vérifiez puis réessayez."
+"chat.composer.send_failed" = "Une erreur est survenue lors de l’envoi. Vérifiez la conversation avant de réessayer."
 "chat.composer.steer_cli_runtime" = "Envoyer au tour CLI en cours"
 "chat.composer.stop_reason" = "Tour annule par l'utilisateur"
 "chat.composer.voice.desktop_hold_prompt" = "Relâchez hors du cercle pour annuler"

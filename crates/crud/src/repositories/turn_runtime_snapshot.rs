@@ -122,14 +122,20 @@ impl TurnRuntimeSnapshotRecord {
 }
 
 // SQLite byte lengths are checked before a driver materializes TEXT columns.
-// Keep this exact stored-column set aligned with validate_storage_size above.
-const SNAPSHOT_STORAGE_BYTES_SQL: &str = "coalesce(length(cast(turn_id as blob)),0) + coalesce(length(cast(thread_id as blob)),0) + coalesce(length(cast(workspace_id as blob)),0) + coalesce(length(cast(mode_json as blob)),0) + coalesce(length(cast(model as blob)),0) + coalesce(length(cast(provider_name as blob)),0) + coalesce(length(cast(reasoning_effort as blob)),0) + coalesce(length(cast(agent_skill_versions_json as blob)),0) + coalesce(length(cast(hook_runtime_context_json as blob)),0) + coalesce(length(cast(workspace_skill_policies_json as blob)),0) + coalesce(length(cast(input_json as blob)),0) + coalesce(length(cast(capabilities_json as blob)),0) + coalesce(length(cast(resolved_artifacts_json as blob)),0) + coalesce(length(cast(runtime_environment_json as blob)),0) + coalesce(length(cast(history_json as blob)),0) + coalesce(length(cast(ordinary_skill_catalog_json as blob)),0) + coalesce(length(cast(provider_model_contract_json as blob)),0) + coalesce(length(cast(initial_phase_json as blob)),0)";
+// Include the runtime-owned frozen locator as well as the encoded payload.
+// Row preparation reserves its bytes before SQL; reads guard all stored TEXT.
+const SNAPSHOT_STORAGE_BYTES_SQL: &str = "coalesce(length(cast(turn_id as blob)),0) + coalesce(length(cast(thread_id as blob)),0) + coalesce(length(cast(workspace_id as blob)),0) + coalesce(length(cast(mode_json as blob)),0) + coalesce(length(cast(model as blob)),0) + coalesce(length(cast(provider_name as blob)),0) + coalesce(length(cast(reasoning_effort as blob)),0) + coalesce(length(cast(agent_skill_versions_json as blob)),0) + coalesce(length(cast(hook_runtime_context_json as blob)),0) + coalesce(length(cast(workspace_skill_policies_json as blob)),0) + coalesce(length(cast(input_json as blob)),0) + coalesce(length(cast(capabilities_json as blob)),0) + coalesce(length(cast(resolved_artifacts_json as blob)),0) + coalesce(length(cast(runtime_environment_json as blob)),0) + coalesce(length(cast(history_json as blob)),0) + coalesce(length(cast(ordinary_skill_catalog_json as blob)),0) + coalesce(length(cast(provider_model_contract_json as blob)),0) + coalesce(length(cast(initial_phase_json as blob)),0) + coalesce(length(cast(frozen_manifest_id as blob)),0)";
 
 // Encoded values are prepared before opening the admission transaction.
 pub(crate) fn prepare_snapshot_row(
     snapshot: NewTurnRuntimeSnapshot,
-) -> turn_runtime_snapshot::ActiveModel {
-    turn_runtime_snapshot::ActiveModel {
+    frozen_manifest_id: Option<String>,
+) -> Result<turn_runtime_snapshot::ActiveModel> {
+    anyhow::ensure!(
+        snapshot.remaining_storage_bytes()? >= frozen_manifest_id.as_ref().map_or(0, String::len),
+        "runtime snapshot frozen locator exceeds accepted execution byte limit"
+    );
+    Ok(turn_runtime_snapshot::ActiveModel {
         turn_id: Set(snapshot.turn_id),
         thread_id: Set(snapshot.thread_id),
         workspace_id: Set(snapshot.workspace_id),
@@ -148,16 +154,20 @@ pub(crate) fn prepare_snapshot_row(
         resolved_artifacts_json: Set(snapshot.resolved_artifacts_json),
         runtime_environment_json: Set(snapshot.runtime_environment_json),
         history_json: Set(snapshot.history_json),
+        frozen_manifest_id: Set(frozen_manifest_id),
         created_at: Set(snapshot.created_at),
         updated_at: Set(snapshot.updated_at),
-    }
+    })
 }
 
 pub(crate) async fn insert_snapshot_if_absent<C: ConnectionTrait>(
     db: &C,
     snapshot: turn_runtime_snapshot::ActiveModel,
     turn_id: &str,
+    workspace_id: &str,
+    root: &crate::frozen_lifetime::PreparedFrozenRoot,
 ) -> Result<TurnRuntimeSnapshotRecord> {
+    root.verify(db, workspace_id).await?;
     turn_runtime_snapshot::Entity::insert(snapshot)
         .on_conflict(
             OnConflict::column(turn_runtime_snapshot::Column::TurnId)
@@ -284,10 +294,13 @@ impl NewTurnRuntimeSnapshot {
 
 pub async fn upsert_turn_runtime_snapshot<C: ConnectionTrait>(
     db: &C,
-    snapshot: NewTurnRuntimeSnapshot,
+    snapshot: turn_runtime_snapshot::ActiveModel,
+    turn_id: &str,
+    workspace_id: &str,
+    root: &crate::frozen_lifetime::PreparedFrozenRoot,
 ) -> Result<TurnRuntimeSnapshotRecord> {
-    let turn_id = snapshot.turn_id.clone();
-    turn_runtime_snapshot::Entity::insert(prepare_snapshot_row(snapshot))
+    root.verify(db, workspace_id).await?;
+    turn_runtime_snapshot::Entity::insert(snapshot)
         .on_conflict(
             OnConflict::column(turn_runtime_snapshot::Column::TurnId)
                 .update_columns([
@@ -308,6 +321,7 @@ pub async fn upsert_turn_runtime_snapshot<C: ConnectionTrait>(
                     turn_runtime_snapshot::Column::ResolvedArtifactsJson,
                     turn_runtime_snapshot::Column::RuntimeEnvironmentJson,
                     turn_runtime_snapshot::Column::HistoryJson,
+                    turn_runtime_snapshot::Column::FrozenManifestId,
                     turn_runtime_snapshot::Column::UpdatedAt,
                 ])
                 .to_owned(),
@@ -316,7 +330,7 @@ pub async fn upsert_turn_runtime_snapshot<C: ConnectionTrait>(
         .await
         .context("failed to upsert turn_runtime_snapshot row")?;
 
-    find_turn_runtime_snapshot(db, turn_id.as_str())
+    find_turn_runtime_snapshot(db, turn_id)
         .await?
         .context("upserted turn_runtime_snapshot row is missing")
 }

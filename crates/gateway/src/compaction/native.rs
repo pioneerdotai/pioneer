@@ -159,6 +159,7 @@ pub(super) async fn prepare_native_projection(
 }
 
 struct PreparedProjection {
+    frozen_hold: Option<pioneer_crud::FrozenReadHold>,
     descriptor: pioneer_compaction::frozen::FrozenHistoryRef,
     accepted_scopes: BTreeSet<String>,
     source_epochs: std::collections::BTreeMap<String, u64>,
@@ -780,6 +781,12 @@ async fn prepare_native_projection_with_prepared(
         _ = clock.sleep_until(preparation_deadline) => anyhow::bail!("native context preparation deadline exceeded"),
         prepared = prepared => prepared?,
     };
+    // Admission has transferred the hold to the durable running operation.
+    // No frozen byte read follows for the saved request; provider await must
+    // not keep a temporary pin alive.
+    if let Some(AcceptedProjection::Prepared(projection)) = &mut accepted_projection {
+        drop(projection.frozen_hold.take());
+    }
     let Some((snapshot, summarizer, projection, summary_index)) = operation else {
         return Ok(NativePreparedRequest {
             covered_native_control_ids: Vec::new(),
@@ -880,6 +887,7 @@ pub(super) async fn prepare_native_projection_from_history(
     clock: Arc<dyn CompactionClock>,
 ) -> Result<NativePreparedRequest> {
     let super::frozen::PreparedHistory {
+        frozen_hold,
         descriptor,
         messages: _,
         accepted_scopes,
@@ -899,6 +907,7 @@ pub(super) async fn prepare_native_projection_from_history(
         observer,
         clock,
         Some(AcceptedProjection::Prepared(PreparedProjection {
+            frozen_hold,
             descriptor,
             accepted_scopes,
             source_epochs,
@@ -1169,6 +1178,7 @@ async fn refresh_native_history(
         )
         .await?;
     let super::frozen::PreparedHistory {
+        frozen_hold,
         descriptor,
         messages: mut history,
         accepted_scopes: allowed,
@@ -1264,6 +1274,7 @@ async fn refresh_native_history(
     }
     request.messages = history;
     let projection = PreparedProjection {
+        frozen_hold,
         descriptor,
         accepted_scopes: allowed,
         source_epochs,

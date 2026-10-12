@@ -1211,6 +1211,60 @@ impl RecoveryCoordinator {
         now_unix: i64,
         accepted_cli_outcome: Option<&pioneer_protocol::CliRuntimeBlockedTurnGuard>,
     ) -> Result<Vec<RecoveryCoordinatorEvent>> {
+        self.record_active_recovery_failure_with_native_source(
+            job,
+            active_attempt_id,
+            failure_message,
+            retry_after_ms,
+            diagnostic,
+            now_unix,
+            accepted_cli_outcome,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn record_native_recovery_start_failure(
+        &self,
+        execution: &TurnExecutionRecord,
+        recovery: &RecoveryAttemptContext,
+        failure_message: String,
+        now_unix: i64,
+    ) -> Result<Vec<RecoveryCoordinatorEvent>> {
+        let Some(job) = self.crud_store.get_recovery_job(&recovery.job_id).await? else {
+            return Ok(Vec::new());
+        };
+        if job.turn_id != execution.turn_id
+            || job.status != RecoveryJobStatus::Active
+            || job.active_attempt_id.as_deref() != Some(recovery.attempt_id.as_str())
+            || execution.owner_id != self.turn_execution_owner_id.as_ref()
+        {
+            return Ok(Vec::new());
+        }
+        self.record_active_recovery_failure_with_native_source(
+            job,
+            &recovery.attempt_id,
+            Some(failure_message),
+            None,
+            None,
+            now_unix,
+            None,
+            Some(execution),
+        )
+        .await
+    }
+
+    async fn record_active_recovery_failure_with_native_source(
+        &self,
+        job: RecoveryJobRecord,
+        active_attempt_id: &str,
+        failure_message: Option<String>,
+        retry_after_ms: Option<u64>,
+        diagnostic: Option<pioneer_protocol::RecoveryDiagnostic>,
+        now_unix: i64,
+        accepted_cli_outcome: Option<&pioneer_protocol::CliRuntimeBlockedTurnGuard>,
+        native_source: Option<&TurnExecutionRecord>,
+    ) -> Result<Vec<RecoveryCoordinatorEvent>> {
         let policy = self.policy_for_recovery_job(&job).await?;
         let attempt_number = attempt_number_for_job(&job);
         let progress = match self
@@ -1222,7 +1276,7 @@ impl RecoveryCoordinator {
             Ok(None) => return Ok(Vec::new()),
             Err(error) if error.is::<pioneer_crud::RecoveryProgressUnavailable>() => {
                 return self
-                    .block_active_recovery_with_source(
+                    .block_active_recovery_with_native_source(
                         job,
                         active_attempt_id.to_owned(),
                         error.to_string(),
@@ -1230,6 +1284,8 @@ impl RecoveryCoordinator {
                         now_unix,
                         diagnostic.clone(),
                         accepted_cli_outcome,
+                        native_source,
+                        None,
                     )
                     .await;
             }
@@ -1239,7 +1295,7 @@ impl RecoveryCoordinator {
             Ok((_, mode)) => mode,
             Err(error) if error.is::<NativeSemanticCheckpointUnavailable>() => {
                 return self
-                    .block_active_recovery_with_source(
+                    .block_active_recovery_with_native_source(
                         job,
                         active_attempt_id.to_owned(),
                         error.to_string(),
@@ -1247,6 +1303,8 @@ impl RecoveryCoordinator {
                         now_unix,
                         diagnostic.clone(),
                         accepted_cli_outcome,
+                        native_source,
+                        Some(&progress),
                     )
                     .await;
             }
@@ -1281,20 +1339,38 @@ impl RecoveryCoordinator {
                 .map(|detail| format!("{message}: {detail}"))
                 .unwrap_or_else(|| message.clone());
 
-            if self
-                .crud_store
-                .mark_recovery_job_terminal_after_attempt_with_diagnostic_and_progress(
-                    job.id.as_str(),
-                    active_attempt_id,
-                    RecoveryJobStatus::Exhausted,
-                    Some(last_error),
-                    Some(diagnostic),
-                    now_unix,
-                    accepted_cli_outcome,
-                    Some(&progress),
-                )
-                .await?
-            {
+            let applied = if let Some(execution) = native_source {
+                self.crud_store
+                    .record_native_recovery_start_failure_owned_and_progress(
+                        execution,
+                        &RecoveryAttemptContext {
+                            job_id: job.id.clone(),
+                            attempt_id: active_attempt_id.to_owned(),
+                        },
+                        RecoveryJobStatus::Exhausted,
+                        None,
+                        Some(last_error),
+                        Some(diagnostic),
+                        now_unix,
+                        None,
+                        Some(&progress),
+                    )
+                    .await?
+            } else {
+                self.crud_store
+                    .mark_recovery_job_terminal_after_attempt_with_diagnostic_and_progress(
+                        job.id.as_str(),
+                        active_attempt_id,
+                        RecoveryJobStatus::Exhausted,
+                        Some(last_error),
+                        Some(diagnostic),
+                        now_unix,
+                        accepted_cli_outcome,
+                        Some(&progress),
+                    )
+                    .await?
+            };
+            if applied {
                 self.cancel_other_open_jobs_after_terminal_recovery(
                     job.turn_id.as_str(),
                     job.id.as_str(),
@@ -1329,21 +1405,39 @@ impl RecoveryCoordinator {
             next_run_at_unix.saturating_sub(consumed_wall_clock_secs)
         });
         let reason = failure_message;
-        if self
-            .crud_store
-            .mark_recovery_job_retrying_with_diagnostic_and_progress(
-                job.id.as_str(),
-                active_attempt_id,
-                next_run_at_unix,
-                budget_origin_after_cooldown_unix,
-                reason.clone(),
-                diagnostic,
-                now_unix,
-                accepted_cli_outcome,
-                Some(&progress),
-            )
-            .await?
-        {
+        let applied = if let Some(execution) = native_source {
+            self.crud_store
+                .record_native_recovery_start_failure_owned_and_progress(
+                    execution,
+                    &RecoveryAttemptContext {
+                        job_id: job.id.clone(),
+                        attempt_id: active_attempt_id.to_owned(),
+                    },
+                    RecoveryJobStatus::Pending,
+                    Some(next_run_at_unix),
+                    reason.clone(),
+                    diagnostic,
+                    now_unix,
+                    budget_origin_after_cooldown_unix,
+                    Some(&progress),
+                )
+                .await?
+        } else {
+            self.crud_store
+                .mark_recovery_job_retrying_with_diagnostic_and_progress(
+                    job.id.as_str(),
+                    active_attempt_id,
+                    next_run_at_unix,
+                    budget_origin_after_cooldown_unix,
+                    reason.clone(),
+                    diagnostic,
+                    now_unix,
+                    accepted_cli_outcome,
+                    Some(&progress),
+                )
+                .await?
+        };
+        if applied {
             let next_attempt_number = attempt_number.saturating_add(1);
             return Ok(vec![RecoveryCoordinatorEvent::RetryScheduled {
                 job_id: job.id,
@@ -2821,6 +2915,18 @@ impl RecoveryCoordinator {
                                     )
                                     .await;
                             }
+                            let execution_source =
+                                self.crud_store.get_turn_execution(&job.turn_id).await?;
+                            if execution_source.as_ref().is_some_and(|execution| {
+                                execution.owner_id != self.turn_execution_owner_id.as_ref()
+                                    || execution.thread_id != thread_id
+                                    || execution.workspace_id != workspace_id
+                                    || !execution.status.is_active()
+                            }) {
+                                // Ownership may change after the earlier admission read.
+                                // Do not admit an actor or update another owner's execution.
+                                return Ok(events);
+                            }
                             match self
                                 .agent_manager
                                 .start_restored_recovery_turn(
@@ -2832,13 +2938,34 @@ impl RecoveryCoordinator {
                                 .await
                             {
                                 Ok(()) => {
-                                    if let Err(error) = self
-                                        .mark_recovered_execution_running(
-                                            job.turn_id.as_str(),
-                                            now_unix,
-                                        )
-                                        .await
-                                    {
+                                    let admission =
+                                        if let Some(execution) = execution_source.as_ref() {
+                                            self.crud_store
+                                                .mark_native_recovery_start_running_owned(
+                                                    execution,
+                                                    &RecoveryAttemptContext {
+                                                        job_id: job.id.clone(),
+                                                        attempt_id: active_attempt_id.clone(),
+                                                    },
+                                                    now_unix,
+                                                    now_unix.saturating_add(
+                                                        RECOVERY_JOB_CLAIM_LEASE_SECS as i64,
+                                                    ),
+                                                )
+                                                .await
+                                        } else {
+                                            self.mark_recovered_execution_running(
+                                                &job.turn_id,
+                                                now_unix,
+                                            )
+                                            .await
+                                            .map(|()| true)
+                                        };
+                                    if matches!(admission, Ok(false)) {
+                                        // A pre-start refusal or terminal transition already won.
+                                        return Ok(events);
+                                    }
+                                    if let Err(error) = admission {
                                         let reason = format!(
                                             "failed to commit restored Turn execution ownership: {error:#}"
                                         );
@@ -3001,6 +3128,32 @@ impl RecoveryCoordinator {
         source_diagnostic: Option<pioneer_protocol::RecoveryDiagnostic>,
         accepted_cli_outcome: Option<&pioneer_protocol::CliRuntimeBlockedTurnGuard>,
     ) -> Result<Vec<RecoveryCoordinatorEvent>> {
+        self.block_active_recovery_with_native_source(
+            job,
+            active_attempt_id,
+            reason,
+            stop_reason,
+            now_unix,
+            source_diagnostic,
+            accepted_cli_outcome,
+            None,
+            None,
+        )
+        .await
+    }
+
+    async fn block_active_recovery_with_native_source(
+        &self,
+        job: RecoveryJobRecord,
+        active_attempt_id: String,
+        reason: String,
+        stop_reason: Option<pioneer_protocol::RecoveryStopReason>,
+        now_unix: i64,
+        source_diagnostic: Option<pioneer_protocol::RecoveryDiagnostic>,
+        accepted_cli_outcome: Option<&pioneer_protocol::CliRuntimeBlockedTurnGuard>,
+        native_source: Option<&TurnExecutionRecord>,
+        progress: Option<&pioneer_crud::PreparedRecoveryProgress>,
+    ) -> Result<Vec<RecoveryCoordinatorEvent>> {
         let diagnostic = source_diagnostic
             .or_else(|| stop_reason.map(|stop_reason| terminal_diagnostic(&job, stop_reason)));
         // Keep the last provider failure separate from the reason retries stopped.
@@ -3010,19 +3163,40 @@ impl RecoveryCoordinator {
             Some(reason.clone())
         };
         let mut events = Vec::new();
-        if self
-            .crud_store
-            .mark_recovery_job_terminal_after_attempt_with_diagnostic(
-                job.id.as_str(),
-                active_attempt_id.as_str(),
-                RecoveryJobStatus::Blocked,
-                last_error,
-                diagnostic,
-                now_unix,
-                accepted_cli_outcome,
-            )
-            .await?
-        {
+        let applied = if let Some(execution) = native_source {
+            // Unknown progress cannot authorize a reset of the private accounting
+            // state. Preserve its existing diagnostic unless an exact prepared
+            // predecessor can carry that state into the same native transition.
+            self.crud_store
+                .record_native_recovery_start_failure_owned_and_progress(
+                    execution,
+                    &RecoveryAttemptContext {
+                        job_id: job.id.clone(),
+                        attempt_id: active_attempt_id.clone(),
+                    },
+                    RecoveryJobStatus::Blocked,
+                    None,
+                    last_error,
+                    if progress.is_some() { diagnostic } else { None },
+                    now_unix,
+                    None,
+                    progress,
+                )
+                .await?
+        } else {
+            self.crud_store
+                .mark_recovery_job_terminal_after_attempt_with_diagnostic(
+                    job.id.as_str(),
+                    active_attempt_id.as_str(),
+                    RecoveryJobStatus::Blocked,
+                    last_error,
+                    diagnostic,
+                    now_unix,
+                    accepted_cli_outcome,
+                )
+                .await?
+        };
+        if applied {
             self.cancel_other_open_jobs_after_terminal_recovery(
                 job.turn_id.as_str(),
                 job.id.as_str(),

@@ -1,5 +1,5 @@
 use super::agent_runtime::TurnFailureRecoveryKind;
-use super::turn_handlers::CliRuntimeLaunchSpecRestore;
+use super::turn_handlers::{CliRuntimeLaunchSpecRestore, CliRuntimeRecoveryStartFailure};
 use super::*;
 use crate::authorization::{
     AuthorizationExternalError, AuthorizationResolver, AuthorizationService, ProofResolution,
@@ -5750,7 +5750,7 @@ impl MessageProcessor {
                     .get_turn(&turn_binding.thread_id, &turn_binding.turn_id)
                     .await?
                     .context("native terminal Turn is missing")?;
-                self.ensure_cli_runtime_turn_loaded_for_lifecycle(
+                self.ensure_runtime_turn_loaded_for_lifecycle(
                     &workspace_id,
                     &turn_binding.thread_id,
                     &turn,
@@ -6528,6 +6528,23 @@ impl MessageProcessor {
         };
 
         if observation.status == CLIAgentRuntimeObservedTurnStatus::InProgress {
+            // The production handler holds `transition` and revalidates the
+            // recovery source before entering reconciliation. Active native
+            // execution still needs the original Pioneer Turn restored, just
+            // like a restart attempt, before recovery can be marked successful.
+            if let Err(error) = self
+                .restore_cli_runtime_recovery_turn_snapshot(binding)
+                .await
+            {
+                return match error {
+                    CliRuntimeRecoveryStartFailure::Unavailable { diagnostic } => {
+                        CLIRuntimeObservationGapReconciliation::Unavailable { diagnostic }
+                    }
+                    CliRuntimeRecoveryStartFailure::InvalidBinding { diagnostic } => {
+                        CLIRuntimeObservationGapReconciliation::InvalidBinding { diagnostic }
+                    }
+                };
+            }
             let now_unix = now_timestamp_secs();
             if let Err(error) = self
                 .timeout_supervisor
@@ -6753,7 +6770,7 @@ impl MessageProcessor {
                     }
                 };
                 if let Err(error) = self
-                    .ensure_cli_runtime_turn_loaded_for_lifecycle(
+                    .ensure_runtime_turn_loaded_for_lifecycle(
                         binding.workspace_id.as_str(),
                         binding.thread_id.as_str(),
                         &turn,
@@ -7689,7 +7706,7 @@ impl MessageProcessor {
                     return Ok(CLIRuntimeAuthoritativeTurnState::Unavailable);
                 }
             };
-            self.ensure_cli_runtime_turn_loaded_for_lifecycle(
+            self.ensure_runtime_turn_loaded_for_lifecycle(
                 workspace_id,
                 binding.thread_id.as_str(),
                 turn,
@@ -7809,7 +7826,7 @@ impl MessageProcessor {
         if !self.finalize_codex_history(binding).await {
             return Ok(CLIRuntimeAuthoritativeTurnState::Unavailable);
         }
-        self.ensure_cli_runtime_turn_loaded_for_lifecycle(
+        self.ensure_runtime_turn_loaded_for_lifecycle(
             workspace_id,
             binding.thread_id.as_str(),
             turn,
@@ -7942,7 +7959,7 @@ impl MessageProcessor {
         Ok(CLIRuntimeAuthoritativeTurnState::Terminal)
     }
 
-    async fn ensure_cli_runtime_turn_loaded_for_lifecycle(
+    pub(super) async fn ensure_runtime_turn_loaded_for_lifecycle(
         &self,
         workspace_id: &str,
         thread_id: &str,

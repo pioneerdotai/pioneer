@@ -543,7 +543,25 @@ fn confirm_owned_cancellation_lookup(
     result.map_err(classify_native_preparation_error)
 }
 
+#[derive(Debug)]
+struct NativeTurnControlTransitionPending;
+impl std::fmt::Display for NativeTurnControlTransitionPending {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("native Turn terminal transition is awaiting its durable outcome")
+    }
+}
+impl std::error::Error for NativeTurnControlTransitionPending {}
+
 fn classify_native_preparation_error(error: anyhow::Error) -> DurableCommitRejection {
+    if error
+        .downcast_ref::<NativeTurnControlTransitionPending>()
+        .is_some()
+    {
+        return DurableCommitRejection::retryable(
+            "native_terminal_transition_pending",
+            "native Turn control is waiting for a terminal commit or rollback",
+        );
+    }
     if error
         .downcast_ref::<pioneer_crud::NativeCancellationContextUnavailable>()
         .is_some()
@@ -1355,6 +1373,283 @@ impl MessageProcessor {
         .await
     }
 
+    async fn prepare_native_turn_control(
+        &self,
+        preparation: pioneer_protocol::NativeTerminalEffectPreparation,
+        initial_turn: bool,
+        prepare_artifact_obligations: bool,
+        execution_owner_generation: Option<u64>,
+    ) -> Result<(), DurableCommitRejection> {
+        if initial_turn {
+            return self
+                .persist_native_execution_preparation(
+                    preparation,
+                    true,
+                    prepare_artifact_obligations,
+                    execution_owner_generation,
+                )
+                .await
+                .map_err(classify_native_preparation_error);
+        }
+        // Capture the actor's exact delivery source before any await which can
+        // retire it. A late delivery from another run must not fail its successor.
+        let recovery = self
+            .agent_manager
+            .restored_turn_recovery_context(
+                &preparation.thread_id,
+                &preparation.turn_id,
+                &preparation.batch_id,
+            )
+            .await;
+        let execution = if recovery.is_some() {
+            self.crud_store
+                .get_turn_execution(&preparation.turn_id)
+                .await
+                .map_err(|_| {
+                    DurableCommitRejection::retryable(
+                        "native_recovery_source_unavailable",
+                        "native recovery start outcome could not be checked",
+                    )
+                })?
+        } else {
+            None
+        };
+        let restored = async {
+            self.crud_store
+                .persist_native_cancellation_context(
+                    preparation.clone(),
+                    self.turn_execution_owner_id.as_ref(),
+                    now_timestamp_secs(),
+                    false,
+                )
+                .await?;
+            let (workspace_id, turn) = self
+                .crud_store
+                .get_turn(&preparation.thread_id, &preparation.turn_id)
+                .await?
+                .context("native recovery Turn is missing")?;
+            anyhow::ensure!(
+                workspace_id == preparation.workspace_id
+                    && turn.id == preparation.turn_id
+                    && turn.status == TurnStatus::InProgress,
+                "native recovery Turn scope or status changed"
+            );
+            self.ensure_runtime_turn_loaded_for_lifecycle(
+                &preparation.workspace_id,
+                &preparation.thread_id,
+                &turn,
+            )
+            .await?;
+            let thread = self
+                .thread_manager
+                .thread_get(&preparation.thread_id)
+                .await
+                .context("native recovery thread is not loaded")?;
+            anyhow::ensure!(
+                thread.workspace_id == preparation.workspace_id,
+                "native recovery thread workspace changed"
+            );
+            let status = thread
+                .turns
+                .iter()
+                .find(|turn| turn.id == preparation.turn_id)
+                .context("native recovery Turn is not loaded")?
+                .status;
+            // A terminal in memory may still roll back. Confirm durable fences
+            // before asking the existing delivery loop to retry this preparation.
+            if status != TurnStatus::InProgress {
+                self.defer_native_turn_control_transition(&preparation)
+                    .await?;
+            }
+            self.send_notification_to_thread_subscribers(
+                &preparation.thread_id,
+                events::THREAD_UPDATED,
+                &ThreadUpdatedNotification {
+                    thread,
+                    placement: None,
+                },
+            )
+            .await;
+            #[cfg(test)]
+            self.completed_history_preparation_barrier
+                .wait_if_armed(
+                    "__native_recovery_before_control_ack__",
+                    &tokio_util::sync::CancellationToken::new(),
+                )
+                .await;
+
+            // Fanout holds no database capacity and can yield to cancellation.
+            // Revalidate continuation authority and the writer fence afterwards,
+            // before returning the ACK that admits provider/tool execution.
+            self.guard_execution_commit(&preparation.turn_id).await?;
+            if let (Some(recovery), Some(execution)) = (recovery.as_ref(), execution.as_ref()) {
+                self.crud_store
+                    .confirm_native_recovery_cancellation_context(
+                        preparation.clone(),
+                        execution,
+                        recovery,
+                        self.turn_execution_owner_id.as_ref(),
+                        now_timestamp_secs(),
+                    )
+                    .await?;
+            } else {
+                self.crud_store
+                    .persist_native_cancellation_context(
+                        preparation.clone(),
+                        self.turn_execution_owner_id.as_ref(),
+                        now_timestamp_secs(),
+                        false,
+                    )
+                    .await?;
+            }
+            let (workspace_id, current) = self
+                .thread_manager
+                .turn_get(&preparation.thread_id, &preparation.turn_id)
+                .await
+                .context("native recovery Turn disappeared before ACK")?;
+            anyhow::ensure!(
+                workspace_id == preparation.workspace_id,
+                "native recovery Turn workspace changed before ACK"
+            );
+            if current.status != TurnStatus::InProgress {
+                self.defer_native_turn_control_transition(&preparation)
+                    .await?;
+            }
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        if let Err(error) = restored {
+            // An accepted terminal event fences execution even before projection,
+            // but only the projected durable Turn confirms a snapshot for fanout.
+            // Conflicting provisional state is left to rollback and existing delivery.
+            let durable = self
+                .crud_store
+                .get_turn(&preparation.thread_id, &preparation.turn_id)
+                .await
+                .map_err(|_| {
+                    DurableCommitRejection::retryable(
+                        "native_recovery_outcome_unavailable",
+                        "native recovery outcome could not be checked",
+                    )
+                })?;
+            if let Some((workspace, terminal)) = durable.as_ref()
+                && workspace == &preparation.workspace_id
+                && terminal.id == preparation.turn_id
+                && terminal.status != TurnStatus::InProgress
+                && matches!(
+                    self.thread_manager
+                        .commit_terminal_turn(&preparation.thread_id, terminal)
+                        .await,
+                    Ok(true)
+                )
+                && let Some(thread) = self.thread_manager.thread_get(&preparation.thread_id).await
+                && thread.workspace_id == preparation.workspace_id
+                && thread.turns.iter().any(|turn| turn == terminal)
+            {
+                self.send_notification_to_thread_subscribers(
+                    &preparation.thread_id,
+                    events::THREAD_UPDATED,
+                    &ThreadUpdatedNotification {
+                        thread,
+                        placement: None,
+                    },
+                )
+                .await;
+            }
+            let failure_message = format!("native Turn control restoration failed: {error:#}");
+            let rejection = classify_native_preparation_error(error);
+            if !rejection.is_retryable()
+                && let (Some(recovery), Some(execution)) = (recovery.as_ref(), execution.as_ref())
+                && execution.turn_id == preparation.turn_id
+                && execution.thread_id == preparation.thread_id
+                && execution.workspace_id == preparation.workspace_id
+            {
+                let now = now_timestamp_secs();
+                let events = self
+                    .recovery_coordinator
+                    .record_native_recovery_start_failure(execution, recovery, failure_message, now)
+                    .await
+                    .map_err(|_| {
+                        DurableCommitRejection::retryable(
+                            "native_recovery_refusal_uncommitted",
+                            "native recovery refusal could not be committed",
+                        )
+                    })?;
+                if events.is_empty() {
+                    // Replay only a recorded refusal for this exact attempt.
+                    // A terminal or superseded source legitimately produces none.
+                    let job = self
+                        .crud_store
+                        .get_recovery_job(&recovery.job_id)
+                        .await
+                        .map_err(|_| {
+                            DurableCommitRejection::retryable(
+                                "native_recovery_refusal_uncommitted",
+                                "native recovery refusal could not be confirmed",
+                            )
+                        })?;
+                    if job.is_some_and(|job| {
+                        job.last_failure_attempt_id.as_deref() == Some(recovery.attempt_id.as_str())
+                            && matches!(
+                                job.status,
+                                pioneer_protocol::RecoveryJobStatus::Pending
+                                    | pioneer_protocol::RecoveryJobStatus::Exhausted
+                                    | pioneer_protocol::RecoveryJobStatus::Blocked
+                            )
+                    }) && !self
+                        .replay_applied_recovery_provider_failure(
+                            &preparation.turn_id,
+                            recovery,
+                            now,
+                            None,
+                        )
+                        .await
+                    {
+                        return Err(DurableCommitRejection::retryable(
+                            "native_recovery_refusal_uncommitted",
+                            "native recovery refusal could not be delivered",
+                        ));
+                    }
+                } else {
+                    for event in events {
+                        if !self.handle_recovery_event(event, now).await {
+                            return Err(DurableCommitRejection::retryable(
+                                "native_recovery_refusal_uncommitted",
+                                "native recovery refusal could not be delivered",
+                            ));
+                        }
+                    }
+                }
+            }
+            return Err(rejection);
+        }
+        Ok(())
+    }
+
+    async fn defer_native_turn_control_transition(
+        &self,
+        preparation: &pioneer_protocol::NativeTerminalEffectPreparation,
+    ) -> Result<()> {
+        // This writer confirmation checks durable status, cancellation receipt,
+        // accepted terminal marker and owner, without overwriting immutable data.
+        self.crud_store
+            .persist_native_cancellation_context(
+                preparation.clone(),
+                self.turn_execution_owner_id.as_ref(),
+                now_timestamp_secs(),
+                false,
+            )
+            .await?;
+        #[cfg(test)]
+        self.completed_history_preparation_barrier
+            .wait_if_armed(
+                "__native_recovery_transition_pending__",
+                &tokio_util::sync::CancellationToken::new(),
+            )
+            .await;
+        Err(NativeTurnControlTransitionPending.into())
+    }
+
     pub(super) fn handle_durable_agent_event<'a>(
         &'a self,
         event: AgentDurableEvent,
@@ -1607,14 +1902,13 @@ impl MessageProcessor {
                         prepare_artifact_obligations,
                         execution_owner_generation,
                     } => Some(
-                        self.persist_native_execution_preparation(
+                        self.prepare_native_turn_control(
                             preparation.clone(),
                             *initial_turn,
                             *prepare_artifact_obligations,
                             *execution_owner_generation,
                         )
-                        .await
-                        .map_err(classify_native_preparation_error),
+                        .await,
                     ),
                     AgentDurableEvent::NativeTerminalEffectsPrepared { preparation } => Some(
                         match self
@@ -3090,14 +3384,25 @@ impl MessageProcessor {
         #[cfg(test)]
         if matches!(&event, pioneer_crud::CanonicalTurnEventPayload::TurnFailed(n)
             if n.turn.status == TurnStatus::Interrupted)
-            && let Some(error) = self
+        {
+            let barrier = self
+                .native_cancellation_materialization_barrier
+                .lock()
+                .await
+                .take();
+            if let Some((reached, release)) = barrier {
+                reached.notify_one();
+                release.notified().await;
+            }
+            if let Some(error) = self
                 .native_cancellation_materialization_failure
                 .lock()
                 .await
                 .take()
-        {
-            // Fault at the materialization boundary, before any DB capacity.
-            return Err(error.into());
+            {
+                // Fault before canonical commit and before any DB capacity.
+                return Err(error.into());
+            }
         }
         let cancellation = if let pioneer_crud::CanonicalTurnEventPayload::TurnFailed(notification) =
             &event
@@ -3333,12 +3638,101 @@ impl MessageProcessor {
         }
     }
 
+    /// Synchronize loaded control state only from the projected durable Turn.
+    /// A conflicting provisional terminal remains untouched: live delivery must
+    /// retain its existing outbox obligation until the local transition resolves.
+    /// Returns false while the authoritative terminal projection is unavailable.
+    async fn synchronize_projected_native_terminal_turn(
+        &self,
+        workspace_id: &str,
+        thread_id: &str,
+        turn_id: &str,
+    ) -> Result<bool> {
+        let Some((workspace, terminal)) = self.crud_store.get_turn(thread_id, turn_id).await?
+        else {
+            return Ok(false);
+        };
+        anyhow::ensure!(workspace == workspace_id, "terminal Turn workspace changed");
+        anyhow::ensure!(
+            terminal.id == turn_id,
+            "projected terminal Turn identity changed"
+        );
+        if terminal.status == TurnStatus::InProgress {
+            // Acceptance alone fences execution, but cannot confirm memory state.
+            return Ok(false);
+        }
+        let Some((workspace, current)) = self.thread_manager.turn_get(thread_id, turn_id).await
+        else {
+            return Ok(true);
+        };
+        anyhow::ensure!(
+            workspace == workspace_id,
+            "loaded terminal Turn workspace changed"
+        );
+        if current == terminal {
+            return Ok(true);
+        }
+        if !self
+            .thread_manager
+            .commit_terminal_turn(thread_id, &terminal)
+            .await?
+        {
+            return Ok(true);
+        }
+        if let Some(thread) = self.thread_manager.thread_get(thread_id).await {
+            anyhow::ensure!(
+                thread.workspace_id == workspace_id
+                    && thread.turns.iter().any(|turn| turn == &terminal),
+                "projected terminal Turn changed before delivery"
+            );
+            self.send_notification_to_thread_subscribers(
+                thread_id,
+                events::THREAD_UPDATED,
+                &ThreadUpdatedNotification {
+                    thread,
+                    placement: None,
+                },
+            )
+            .await;
+        }
+        Ok(true)
+    }
+
     async fn deliver_native_turn_event_live(
         &self,
         payload: &pioneer_crud::CanonicalTurnEventPayload,
     ) -> Result<()> {
         use pioneer_crud::CanonicalTurnEventPayload as Event;
 
+        let terminal = match payload {
+            Event::TurnCompleted(n) => Some((&n.workspace_id, &n.thread_id, &n.turn)),
+            Event::TurnFailed(n) => Some((&n.workspace_id, &n.thread_id, &n.turn)),
+            // Blocked has an explicit resume lifecycle. Optional delivery must
+            // not introduce a memory transition into that admission path.
+            Event::TurnBlocked(_) => None,
+            _ => None,
+        };
+        if let Some((workspace_id, thread_id, turn)) = terminal {
+            // The outbox claim already proves canonical acceptance.
+            // A matching local result is confirmed by that exact event, even if
+            // aggregate hydration adds author or prompt metadata to the DB Turn.
+            let matches_canonical = self
+                .thread_manager
+                .turn_get(thread_id, &turn.id)
+                .await
+                .is_some_and(|(workspace, current)| workspace == *workspace_id && current == *turn);
+            if !matches_canonical {
+                anyhow::ensure!(
+                    self.synchronize_projected_native_terminal_turn(
+                        workspace_id,
+                        thread_id,
+                        &turn.id,
+                    )
+                    .await?,
+                    "canonical terminal projection is pending before control synchronization"
+                );
+            }
+        }
         match payload {
             Event::ItemStarted(notification) => {
                 self.send_notification_to_thread_subscribers(
@@ -4590,7 +4984,7 @@ impl MessageProcessor {
                 prepare_artifact_obligations,
                 execution_owner_generation,
             } => message_future(async move {
-                self.persist_native_execution_preparation(
+                self.prepare_native_turn_control(
                     preparation,
                     initial_turn,
                     prepare_artifact_obligations,
@@ -5616,6 +6010,15 @@ impl MessageProcessor {
                     attempt_number: current_attempt.saturating_add(1),
                     next_run_at_unix: job.next_run_at_unix,
                     reason: job.last_error,
+                }
+            }
+            pioneer_protocol::RecoveryJobStatus::Blocked => {
+                crate::resilience::RecoveryCoordinatorEvent::RecoveryBlocked {
+                    job_id: job.id,
+                    turn_id: job.turn_id,
+                    reason: job.last_error.or(job.reason).unwrap_or_else(|| {
+                        "Automatic recovery requires compatible saved state.".to_owned()
+                    }),
                 }
             }
             pioneer_protocol::RecoveryJobStatus::Failed
@@ -9937,6 +10340,25 @@ impl MessageProcessor {
                     error = %format!("{error:#}"),
                     "failed to persist turn/interrupted event"
                 );
+                // A competing canonical terminal result may already have projected
+                // while this cancellation held provisional Interrupted in memory.
+                // Rollback resolves that conflict; later projection is handled by
+                // the existing terminal live-delivery obligation instead.
+                if let Err(sync_error) = self
+                    .synchronize_projected_native_terminal_turn(
+                        &turn_failed.workspace_id,
+                        &thread_id,
+                        &turn_id,
+                    )
+                    .await
+                {
+                    warn!(
+                        thread_id,
+                        turn_id,
+                        error = %format!("{sync_error:#}"),
+                        "failed to synchronize competing terminal result after cancellation rollback"
+                    );
+                }
                 return Err(classify_native_preparation_error(error));
             }
         }

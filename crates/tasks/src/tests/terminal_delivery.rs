@@ -1058,6 +1058,7 @@ async fn delivery_output_binding_and_candidate_keep_the_original_delivery_identi
             next_import: Set(0),
             ready: Set(1),
             storage_registered: Set(0),
+            expired: Set(0),
         },
     )
     .exec(&db)

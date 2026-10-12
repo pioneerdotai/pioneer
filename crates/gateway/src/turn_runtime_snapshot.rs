@@ -880,6 +880,12 @@ pub(crate) async fn restored_conversation_scope_projection_from_snapshot(
     snapshot.validate_storage_size()?;
     let context: AgentTurnHookRuntimeContext =
         from_snapshot_json(&snapshot.hook_runtime_context_json, "hook runtime context")?;
+    let _frozen_hold = crate::compaction::frozen::acquire_history_json(
+        store,
+        &snapshot.workspace_id,
+        &snapshot.history_json,
+    )
+    .await?;
     let allowed = crate::compaction::frozen::execution_history_scopes(
         store,
         &snapshot.workspace_id,
