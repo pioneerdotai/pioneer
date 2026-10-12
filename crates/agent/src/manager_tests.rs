@@ -17479,29 +17479,59 @@ async fn warm_native_known_token_cap_prevents_effect_after_decreasing_provider_s
             ),
         })))
         .await;
-    let observed = start_simple_turn(
-        &manager,
-        "warm_budget_thread",
-        "workspace",
-        "warm_budget_turn",
-        ThreadMode::Agent,
-        "decreasing-usage",
-        "observe charged budget before effects",
-    )
-    .await;
+    let thread = "warm_budget_thread";
+    manager.ensure_thread(thread, "workspace").await.unwrap();
+    let mut receiver = manager.take_durable_receiver(thread).await.unwrap();
+    manager
+        .start_test_turn_with_default_profile_and_capabilities(
+            thread,
+            "warm_budget_turn",
+            ThreadMode::Agent,
+            "test-model",
+            "decreasing-usage",
+            HashMap::new(),
+            vec![UserInput::Text {
+                text: "observe charged budget before effects".into(),
+                text_elements: vec![],
+            }],
+            vec![],
+            vec![],
+        )
+        .await
+        .unwrap();
+    let mut checkpoint = None;
+    let mut terminal = false;
+    for _ in 0..160 {
+        let event = timeout(Duration::from_secs(5), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        receiver.acknowledge_last(Ok(()));
+        match event {
+            AgentDurableEvent::TurnExecutionWindowCheckpointed { payload, .. } => {
+                checkpoint = Some(payload);
+            }
+            AgentDurableEvent::TurnCompleted { .. }
+            | AgentDurableEvent::TurnFailed { .. }
+            | AgentDurableEvent::TurnBlocked { .. }
+            | AgentDurableEvent::TurnInterrupted { .. } => {
+                terminal = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        terminal,
+        "actual warm admission must reach a terminal event"
+    );
     assert_eq!(
         effects.load(Ordering::SeqCst),
         0,
         "known spend must reach the real warm gate before tool dispatch"
     );
     assert_eq!(provider.0.load(Ordering::SeqCst), 1);
-    let checkpoint = observed
-        .iter()
-        .find_map(|event| match event {
-            AgentEvent::TurnExecutionWindowCheckpointed { payload, .. } => Some(payload),
-            _ => None,
-        })
-        .expect("actual warm token quota must checkpoint the original Turn");
+    let checkpoint = checkpoint.expect("actual warm token quota must checkpoint the original Turn");
     assert_eq!(checkpoint.turn_id, "warm_budget_turn");
     assert_eq!(checkpoint.window.provider_token_count, Some(100));
     assert!(!checkpoint.provider_budget.provider_usage_available);
