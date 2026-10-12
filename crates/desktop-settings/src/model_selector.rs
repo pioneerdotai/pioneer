@@ -297,7 +297,7 @@ impl Drop for ModelSelectorOwner {
     }
 }
 
-#[derive(IntoElement)]
+#[derive(gpui_kit::IntoElement)]
 struct SelectorPopoverTrigger {
     id: ElementId,
     label: SharedString,

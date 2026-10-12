@@ -32,7 +32,7 @@ pub(crate) enum HeaderCommand {
 }
 
 /// Value-like header; its mounted feature region handles all commands.
-#[derive(IntoElement)]
+#[derive(gpui_kit::IntoElement)]
 pub(crate) struct ThreadHeader {
     pub action_region: FocusHandle,
     pub operation: ThreadPresentationOperation,

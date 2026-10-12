@@ -24,6 +24,13 @@ pub(crate) async fn prepare(
     capabilities: &crate::ProviderCapabilities,
     mut request: ChatRequest,
 ) -> Result<PreparedInputBudget> {
+    // Budget indexes must address the same provider view that materialization
+    // emits, including tool-to-user preview media follow-ups.
+    if let std::borrow::Cow::Owned(messages) =
+        super::project_html_preview_media(provider, &request.messages)
+    {
+        request.messages = messages;
+    }
     if !request
         .messages
         .iter()

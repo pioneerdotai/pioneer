@@ -55,6 +55,11 @@ pub(crate) struct RowPresentation {
     projection: pioneer_client::conversation::ConversationViewState,
     content: super::TimelineItemPresentations,
     terminal: Option<super::terminal_registry::TerminalPresentation>,
+    pub(super) html: Option<Entity<super::html::HtmlView>>,
+    html_client: Arc<pioneer_client::core::ClientCore>,
+    html_runtime: PathBuf,
+    html_permitted: bool,
+    html_auth_generation: u64,
     pub(super) body_only: bool,
     body: Option<(Entity<WorkItemBodyView>, Pixels)>,
     key: RowMeasurementKey,
@@ -123,7 +128,7 @@ impl RowPresentation {
             })
             .unwrap_or_default();
         let (dino, elapsed) = (None, None);
-        Self {
+        let presentation = Self {
             actions: RowActions {
                 owner: cx.weak_entity(),
             },
@@ -168,11 +173,40 @@ impl RowPresentation {
             projection: slot.projection.clone(),
             content: slot.content.clone(),
             terminal: None,
+            html: slot.view.as_ref().and_then(|row| row.read(cx).presentation.html.clone()).filter(|html| {
+                slot.snapshot().content().and_then(|c| c.html_publication.as_ref()).is_some_and(|publication| html.read(cx).matches(publication))
+            }),
+            html_client: screen.client.clone(),
+            html_runtime: screen.files.runtime_root().as_path().into(),
+            html_permitted: screen.thread_presentation_capabilities(&screen.thread_id).is_some_and(|capability|capability.can_read_artifacts) && slot.snapshot().content().and_then(|c| c.html_publication.as_ref()).is_none_or(|publication| {
+                publication.artifact.status == pioneer_client::artifacts::ArtifactStatus::Ready
+                    && screen.artifact_input.as_ref().and_then(|input| input.items.iter().find(|summary| summary.artifact.artifact_id == publication.artifact.artifact_id))
+                        .is_none_or(|summary| summary.artifact.status == pioneer_client::artifacts::ArtifactStatus::Ready && summary.artifact.version_id == publication.artifact.version_id)
+            }),
+            html_auth_generation: screen.client.authorization_connection_generation(),
             body_only: false,
             body: None,
             key,
             group_author,
+        };
+        if let Some(html) = &presentation.html {
+            if let Some(publication) = presentation
+                .snapshot
+                .content()
+                .and_then(|c| c.html_publication.clone())
+            {
+                html.update(cx, |html, cx| {
+                    html.synchronize(
+                        publication,
+                        presentation.key.clone(),
+                        presentation.html_permitted,
+                        presentation.artifact_policy.can_share,
+                        cx,
+                    )
+                });
+            }
         }
+        presentation
     }
     pub(super) fn render(&self, cx: &mut App) -> AnyElement {
         self.render_timeline_row(
@@ -196,6 +230,9 @@ impl RowPresentation {
             && self.pending_request_views == other.pending_request_views
             && self.task_review_views == other.task_review_views
             && self.highlights == other.highlights
+            && self.artifact_policy == other.artifact_policy
+            && self.html_permitted == other.html_permitted
+            && self.html_auth_generation == other.html_auth_generation
     }
     pub(super) fn tool_content(
         &self,
@@ -272,6 +309,7 @@ pub(crate) struct TimelineRowView {
     renders: usize,
     presentation: RowPresentation,
     visible: bool,
+    html_visible: bool,
 }
 impl TimelineRowView {
     pub(super) fn new(
@@ -284,10 +322,54 @@ impl TimelineRowView {
             renders: 0,
             presentation,
             visible: false,
+            html_visible: false,
         };
         owner.prepare_activity(cx);
+        owner.prepare_html(cx);
         owner.prepare_body(body_height, cx);
         owner
+    }
+    fn prepare_html(&mut self, cx: &mut Context<Self>) {
+        let Some(publication) = self
+            .presentation
+            .snapshot
+            .content()
+            .and_then(|c| c.html_publication.clone())
+        else {
+            self.presentation.html = None;
+            return;
+        };
+        let html = self
+            .presentation
+            .html
+            .take()
+            .filter(|html| html.read(cx).matches(&publication));
+        let view = if let Some(view) = html {
+            view.update(cx, |view, cx| {
+                view.synchronize(
+                    publication,
+                    self.presentation.key.clone(),
+                    self.presentation.html_permitted,
+                    self.presentation.artifact_policy.can_share,
+                    cx,
+                )
+            });
+            view
+        } else {
+            cx.new(|_| {
+                super::html::HtmlView::new(
+                    publication,
+                    self.presentation.html_client.clone(),
+                    self.presentation.html_runtime.clone(),
+                    self.presentation.actions.owner.clone(),
+                    self.presentation.key.clone(),
+                    self.presentation.html_permitted,
+                    self.presentation.artifact_policy.can_share,
+                )
+            })
+        };
+        view.update(cx, |view, cx| view.set_visible(self.html_visible, cx));
+        self.presentation.html = Some(view);
     }
     fn prepare_body(&mut self, height: Option<Pixels>, cx: &mut Context<Self>) {
         if !self.presentation.supports_body() {
@@ -332,6 +414,7 @@ impl TimelineRowView {
         if self.presentation.same_input(&presentation) {
             return;
         }
+        presentation.html = self.presentation.html.take();
         presentation.body = self.presentation.body.take();
         presentation.terminal = self.presentation.terminal.take();
         if self.presentation.activity_input() == presentation.activity_input() {
@@ -340,6 +423,7 @@ impl TimelineRowView {
             presentation.spinner = self.presentation.spinner.take();
         }
         self.presentation = presentation;
+        self.prepare_html(cx);
         self.prepare_activity(cx);
         self.prepare_body(body_height, cx);
         cx.notify();
@@ -604,6 +688,12 @@ impl TimelineRowView {
             cx.notify();
         }
     }
+    pub(super) fn set_html_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
+        self.html_visible = visible;
+        if let Some(view) = &self.presentation.html {
+            view.update(cx, |view, cx| view.set_visible(visible, cx));
+        }
+    }
     pub(super) fn set_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
         self.visible = visible;
         if let Some(view) = &self.presentation.dino {
@@ -619,6 +709,20 @@ impl TimelineRowView {
 }
 
 impl TimelineView {
+    pub(crate) fn set_row_html_visible(
+        &self,
+        visible: &std::collections::HashSet<String>,
+        cx: &mut Context<Self>,
+    ) {
+        for slot in self.row_registry.slots() {
+            if let Some(view) = &slot.view {
+                let shown = visible.contains(slot.snapshot().id().as_str());
+                if view.read(cx).html_visible != shown {
+                    view.update(cx, |view, cx| view.set_html_visible(shown, cx));
+                }
+            }
+        }
+    }
     pub(crate) fn set_row_activities_visible(
         &self,
         visible: &std::collections::HashSet<String>,
@@ -724,6 +828,21 @@ pub(super) fn row_dependency_revision(
             ptr(&screen.catalog_input).hash(&mut hash);
         }
         _ => {}
+    }
+    if row
+        .content()
+        .is_some_and(|content| content.html_publication.is_some())
+    {
+        ptr(&screen.artifact_input).hash(&mut hash);
+        ptr(&screen.thread_capability_input).hash(&mut hash);
+        screen
+            .active_artifact_presentation_policy()
+            .can_share
+            .hash(&mut hash);
+        screen
+            .client
+            .authorization_connection_generation()
+            .hash(&mut hash);
     }
     if row
         .content()

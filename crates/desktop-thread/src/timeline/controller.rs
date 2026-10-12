@@ -177,6 +177,12 @@ impl DesktopTimelineController {
             std::collections::HashSet::new()
         };
         view.set_row_terminals_visible(&terminal_rows, cx);
+        let html_rows = if window.is_visible() {
+            terminal_rows.clone()
+        } else {
+            std::collections::HashSet::new()
+        };
+        view.set_row_html_visible(&html_rows, cx);
         let visible_rows = if available {
             ids.iter().cloned().collect()
         } else {

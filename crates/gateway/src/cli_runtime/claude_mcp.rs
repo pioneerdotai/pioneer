@@ -122,6 +122,21 @@ impl ClaudeMcpSessionLaunchProjection {
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
+        let mut limits = limits;
+        limits.max_tools += self.canonical_projection.html_tool_count();
+        // Claude's two existing managed file tools are added by provider
+        // preflight, outside the external catalog and the canonical HTML tools.
+        limits.max_tools += self
+            .preflight
+            .tools
+            .iter()
+            .filter(|tool| {
+                reserved_file_tool_definition(&tool.canonical_callable_name).is_some()
+                    && !self.canonical_projection.tools.iter().any(|canonical| {
+                        canonical.canonical_callable_name == tool.canonical_callable_name
+                    })
+            })
+            .count();
         CliMcpFacadeProjection::new(tools, limits)
     }
 
@@ -1202,6 +1217,68 @@ mod tests {
             alpha.canonical_schema_fingerprint,
             alpha.transformed_schema_fingerprint
         );
+    }
+
+    #[test]
+    fn html_required_definitions_fit_configured_external_boundary_through_launch() {
+        for external in [8, 128, 512] {
+            let runtime =
+                crate::cli_runtime::mcp::limits::CliMcpRuntimeLimits::new(external, 1_048_576, 8)
+                    .unwrap();
+            let projection = projection_with_tool_count(external)
+                .with_html_tools(McpProjectionLimits {
+                    max_tools: external,
+                    max_total_schema_bytes: runtime.max_total_schema_bytes(),
+                    ..McpProjectionLimits::default()
+                })
+                .unwrap();
+            let frozen = projection.manifest_hash.clone();
+            let launch =
+                build_claude_mcp_session_launch_projection(projection, "a".repeat(64)).unwrap();
+            let facade = launch
+                .facade_projection(runtime.facade_projection_limits())
+                .unwrap();
+            assert_eq!(facade.tools().len(), external + 4);
+            assert_eq!(launch.canonical_projection.manifest_hash, frozen);
+            for definition in pioneer_tools::html::html_tool_specs() {
+                let canonical = launch
+                    .canonical_projection
+                    .tools
+                    .iter()
+                    .find(|t| t.raw_tool_name == definition.spec.name)
+                    .unwrap();
+                assert_eq!(canonical.input_schema, definition.spec.parameters);
+                assert!(facade.contains_tool(&canonical.canonical_callable_name));
+                let transformed = launch
+                    .preflight
+                    .tools
+                    .iter()
+                    .find(|t| t.canonical_callable_name == canonical.canonical_callable_name)
+                    .unwrap();
+                assert_eq!(
+                    transformed.canonical_schema_fingerprint,
+                    canonical.schema_fingerprint
+                );
+            }
+            let smaller = crate::cli_runtime::mcp::limits::CliMcpRuntimeLimits::new(
+                external - 1,
+                1_048_576,
+                8,
+            )
+            .unwrap();
+            assert!(
+                launch
+                    .facade_projection(smaller.facade_projection_limits())
+                    .is_err()
+            );
+            assert!(facade.contains_tool(CLAUDE_RESERVED_READ_FILE));
+            assert!(facade.contains_tool(CLAUDE_RESERVED_APPLY_PATCH));
+            assert_eq!(launch.preflight.allowed_tool_names.len(), external + 4);
+            assert!(
+                launch.preflight.encoded_managed_config_upper_bound
+                    <= ClaudeProjectionBudget::default().max_managed_config_bytes
+            );
+        }
     }
 
     #[test]

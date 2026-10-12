@@ -1636,7 +1636,7 @@ fn apply_terminal_turn_to_semantic_timeline(
             .is_some_and(|range| !range.items_by_id.is_empty())
             || thread
                 .cached_turn_work_block(turn.id.as_str())
-                .is_some_and(|work| work.work_count > 0);
+                .is_some_and(|work| work.work_count > 0 || !work.html_publications.is_empty());
         if !has_final && !has_work {
             let before = thread.clone();
             remove_turn_work_state(thread, turn.id.as_str());
@@ -3302,6 +3302,10 @@ fn upsert_turn_work_summary(
         .unwrap_or(0);
     let (first_work_item_id, last_work_item_id) = live_first_last_work_item_ids(thread, turn_id);
     let work = TurnWorkBlock {
+        html_publications: existing
+            .as_ref()
+            .map(|work| work.html_publications.clone())
+            .unwrap_or_default(),
         turn_id: turn_id.to_owned(),
         presentation,
         state,
@@ -5177,6 +5181,59 @@ mod tests {
     }
 
     #[test]
+    fn completed_turn_without_tool_echo_keeps_its_authoritative_publication() {
+        let mut state = SemanticTimelineState::default();
+        let mut work = work_block("turn_a");
+        work.work_count = 0;
+        work.visible_work_count = 0;
+        work.html_publications
+            .push(pioneer_protocol::HtmlPublication {
+                workspace_id: "workspace_a".into(),
+                thread_id: "thread_a".into(),
+                turn_id: "turn_a".into(),
+                call_id: "call".into(),
+                title: "Page".into(),
+                artifact: pioneer_protocol::ArtifactRef {
+                    artifact_id: "document".into(),
+                    version_id: Some("version".into()),
+                    display_name: "Page".into(),
+                    kind: pioneer_protocol::ArtifactKind::File,
+                    mime_type: Some("text/html".into()),
+                    size_bytes: Some(10),
+                    sha256: Some("a".repeat(64)),
+                    status: pioneer_protocol::ArtifactStatus::Ready,
+                    preview: None,
+                },
+            });
+        apply_turn_work_page(
+            &mut state,
+            work_page_with_work(work.clone(), vec![]),
+            WorkPageMergeMode::Reset,
+        );
+        let mut turn = detached_task_turn("turn_a");
+        turn.status = TurnStatus::Completed;
+        turn.turn_kind = TurnKind::Conversation;
+        turn.origin = TurnOrigin::User;
+        apply_conversation_event_to_semantic_timeline(
+            &mut state,
+            "workspace_a",
+            &ConversationEvent::TurnCompleted {
+                thread_id: "thread_a".into(),
+                turn,
+            },
+            20,
+        );
+        let retained = state
+            .thread("thread_a")
+            .unwrap()
+            .cached_turn_work_block("turn_a")
+            .unwrap();
+        assert_eq!(retained.html_publications, work.html_publications);
+        assert_eq!(retained.state, TurnWorkState::Completed);
+        assert_eq!(retained.work_count, 0);
+    }
+
+    #[test]
     fn durable_pack_snapshot_replaces_optimistic_user_block_without_live_lookup() {
         let mut state = SemanticTimelineState::default();
         let pack_id = pioneer_protocol::SkillPackId::new("P".repeat(21)).expect("pack id");
@@ -6843,6 +6900,7 @@ mod tests {
 
     fn work_block(turn_id: &str) -> TurnWorkBlock {
         TurnWorkBlock {
+            html_publications: Vec::new(),
             turn_id: turn_id.to_owned(),
             presentation: TurnWorkPresentation::ExpandedLive,
             state: TurnWorkState::Running,

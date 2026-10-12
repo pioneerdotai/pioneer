@@ -1006,6 +1006,14 @@ async fn refresh_turn_work_summary<C: ConnectionTrait>(
         .await?,
     );
     let work_count = visible_work_count.saturating_add(hidden_work_count);
+    let has_html_publication = crate::repositories::artifact::ArtifactRepository::new()
+        .has_html_publication(
+            db,
+            &thread_model.workspace_id,
+            &thread_model.id,
+            &turn_model.id,
+        )
+        .await?;
     let has_final = timeline_repository::count_thread_timeline_blocks_for_turn_kind(
         db,
         turn_model.id.as_str(),
@@ -1017,6 +1025,7 @@ async fn refresh_turn_work_summary<C: ConnectionTrait>(
         .await?
         || detached_task_run_origin_hint(turn_model);
     let terminal_system_task_delivery_without_work = work_count == 0
+        && !has_html_publication
         && turn_model.status != "in_progress"
         && turn_model.turn_kind == "conversation"
         && turn_model.origin == "task_delivery"
@@ -1028,7 +1037,7 @@ async fn refresh_turn_work_summary<C: ConnectionTrait>(
     let completed_without_work = turn_model.status == "completed" && work_count == 0;
     let needs_work_block = !has_detached_task_run
         && !terminal_system_task_delivery_without_work
-        && (work_count > 0 || (!has_final && !completed_without_work));
+        && (has_html_publication || work_count > 0 || (!has_final && !completed_without_work));
 
     if !needs_work_block {
         timeline_repository::delete_turn_work_projection(db, turn_model.id.as_str()).await?;
@@ -1053,7 +1062,11 @@ async fn refresh_turn_work_summary<C: ConnectionTrait>(
         .map(|projection| projection.source_high_watermark)
         .unwrap_or(0)
         .max(source_sequence);
-    let summary_updated_at = max_datetime(turn_model.updated_at, refreshed_at);
+    let mut summary_updated_at = max_datetime(turn_model.updated_at, refreshed_at);
+    if has_html_publication && let Some(existing) = &existing {
+        // An event rounded to seconds must not rewind an artifact-only revision.
+        summary_updated_at = max_datetime(summary_updated_at, existing.updated_at);
+    }
     let pending_request_count =
         count_pending_cli_runtime_requests(db, thread_model.id.as_str(), turn_model.id.as_str())
             .await?;

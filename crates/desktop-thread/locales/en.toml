@@ -331,3 +331,6 @@
 "timeline.web_search.results_count" = "%{count} results"
 "timeline.web_search.running" = "Searching the web"
 "timeline.work_group.completed" = "Worked"
+
+"timeline.html.loading" = "Loading page…"
+"timeline.html.failed" = "Couldn’t display this page"

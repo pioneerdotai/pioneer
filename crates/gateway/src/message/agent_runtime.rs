@@ -3313,10 +3313,12 @@ impl MessageProcessor {
 
         match payload {
             Event::ItemStarted(notification) => {
+                let mut presented = notification.clone();
+                pioneer_protocol::compact_html_timeline_item(&mut presented.item);
                 self.send_notification_to_thread_subscribers(
                     notification.thread_id.as_str(),
                     events::ITEM_STARTED,
-                    notification,
+                    &presented,
                 )
                 .await;
                 self.notify_semantic_timeline_item_changed(
@@ -3331,10 +3333,12 @@ impl MessageProcessor {
             Event::ItemCompleted(notification) => {
                 self.register_artifacts_for_completed_item(notification)
                     .await;
+                let mut presented = notification.clone();
+                pioneer_protocol::compact_html_timeline_item(&mut presented.item);
                 self.send_notification_to_thread_subscribers(
                     notification.thread_id.as_str(),
                     events::ITEM_COMPLETED,
-                    notification,
+                    &presented,
                 )
                 .await;
                 self.notify_semantic_timeline_item_changed(
@@ -3347,10 +3351,12 @@ impl MessageProcessor {
                 .await;
             }
             Event::ItemUpdated(notification) => {
+                let mut presented = notification.clone();
+                pioneer_protocol::compact_html_timeline_item(&mut presented.item);
                 self.send_notification_to_thread_subscribers(
                     notification.thread_id.as_str(),
                     events::ITEM_UPDATED,
-                    notification,
+                    &presented,
                 )
                 .await;
                 self.notify_semantic_timeline_item_changed(

@@ -331,3 +331,6 @@
 "timeline.web_search.results_count" = "%{count} результатов"
 "timeline.web_search.running" = "Ищу в интернете"
 "timeline.work_group.completed" = "Работал"
+
+"timeline.html.loading" = "Загрузка страницы…"
+"timeline.html.failed" = "Не удалось показать страницу"

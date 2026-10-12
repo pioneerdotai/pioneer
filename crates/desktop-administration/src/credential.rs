@@ -2,7 +2,7 @@ use gpui_kit::component::{StyledExt, h_flex, theme::ActiveTheme, v_flex};
 use gpui_kit::{prelude::*, *};
 use pioneer_client::gateway::device_activation::DeviceActivationQrPresentation;
 
-#[derive(IntoElement)]
+#[derive(gpui_kit::IntoElement)]
 pub(crate) struct CredentialPresentationForm {
     id_prefix: &'static str,
     qr_width: usize,
@@ -51,7 +51,7 @@ pub(crate) enum DeviceActivationFormPhase {
     Ready(DeviceActivationQrPresentation),
 }
 
-#[derive(IntoElement)]
+#[derive(gpui_kit::IntoElement)]
 pub(crate) struct DeviceActivationForm {
     phase: DeviceActivationFormPhase,
     description: SharedString,

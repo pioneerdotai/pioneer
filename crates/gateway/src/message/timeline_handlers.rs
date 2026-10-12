@@ -2223,8 +2223,9 @@ impl MessageProcessor {
 
     fn turn_work_item_from_row(
         row: &turn_work_item_projection::Model,
-        item: TurnItem,
+        mut item: TurnItem,
     ) -> Result<TurnWorkItem> {
+        pioneer_protocol::compact_html_timeline_item(&mut item);
         Ok(TurnWorkItem {
             work_item_id: row.work_item_id.clone(),
             item_id: row.item_id.clone(),
@@ -2276,7 +2277,55 @@ impl MessageProcessor {
             .crud_store
             .get_agent_work_graph_projection_for_turn(projection.turn_id.as_str())
             .await?;
+        let page = self
+            .artifact_service
+            .list_artifacts(
+                &projection.workspace_id,
+                pioneer_artifacts::ArtifactListFilter {
+                    thread_id: Some(projection.thread_id.clone()),
+                    turn_id: Some(projection.turn_id.clone()),
+                    include_deleted: true,
+                    created_by_actor_id: Some(pioneer_tools::html::HTML_RENDER.into()),
+                    limit: Some(200),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        if page.next_cursor.is_some() {
+            return Err(anyhow!(
+                "turn artifact publication page exceeds timeline delivery budget"
+            ));
+        }
+        let mut publications = page
+            .items
+            .into_iter()
+            .filter_map(|summary| {
+                let publication = pioneer_protocol::HtmlPublication::from_summary(
+                    &summary,
+                    &projection.thread_id,
+                    &projection.turn_id,
+                )?;
+                let order = summary
+                    .bindings
+                    .iter()
+                    .filter(|b| {
+                        b.thread_id.as_deref() == Some(projection.thread_id.as_str())
+                            && b.turn_id.as_deref() == Some(projection.turn_id.as_str())
+                            && b.tool_call_id.as_deref() == Some(publication.call_id.as_str())
+                            && b.version_id == publication.artifact.version_id
+                            && b.binding_kind == pioneer_protocol::ArtifactBindingKind::ToolOutput
+                            && b.direction == pioneer_protocol::ArtifactBindingDirection::Output
+                            && b.role == Some(pioneer_protocol::ArtifactRole::Tool)
+                    })
+                    .filter_map(|b| b.item_index)
+                    .min()
+                    .unwrap_or_default();
+                Some((order, publication))
+            })
+            .collect::<Vec<_>>();
+        publications.sort_by_key(|(order, _)| *order);
         Ok(TurnWorkBlock {
+            html_publications: publications.into_iter().map(|(_, p)| p).collect(),
             turn_id: projection.turn_id,
             presentation: parse_turn_work_presentation(projection.presentation.as_str()),
             state: parse_turn_work_state(projection.state.as_str()),

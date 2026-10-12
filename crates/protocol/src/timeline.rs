@@ -65,6 +65,8 @@ pub enum TurnWorkState {
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct TurnWorkBlock {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub html_publications: Vec<crate::HtmlPublication>,
     pub turn_id: String,
     pub presentation: TurnWorkPresentation,
     pub state: TurnWorkState,

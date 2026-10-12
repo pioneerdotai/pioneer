@@ -13,6 +13,7 @@ mod cli_post_turn;
 mod cli_runtime;
 mod compaction_background;
 mod dispatch;
+pub(crate) mod html_tools;
 mod invitation_handlers;
 mod invitation_lifecycle;
 mod markdown;

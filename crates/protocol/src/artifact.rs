@@ -210,6 +210,8 @@ pub struct ArtifactRef {
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
 pub struct ArtifactBindingSummary {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version_id: Option<String>,
     pub binding_id: String,
     pub workspace_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -676,5 +678,130 @@ mod tests {
                 "missing schema document {expected}"
             );
         }
+    }
+}
+
+/// An exact Gateway-created HTML publication. Generic HTML attachments never
+/// acquire this descriptor based on MIME alone.
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HtmlPublication {
+    pub workspace_id: String,
+    pub thread_id: String,
+    pub turn_id: String,
+    pub call_id: String,
+    pub title: String,
+    pub artifact: ArtifactRef,
+}
+impl HtmlPublication {
+    pub fn from_summary(summary: &ArtifactSummary, thread: &str, turn: &str) -> Option<Self> {
+        if summary.created_by_kind != ArtifactCreatedByKind::Tool
+            || summary.created_by_actor_id.as_deref() != Some("html_render")
+            || summary.artifact.mime_type.as_deref() != Some("text/html")
+            || summary
+                .artifact
+                .version_id
+                .as_ref()
+                .is_none_or(|v| v.is_empty())
+            || summary
+                .artifact
+                .sha256
+                .as_ref()
+                .is_none_or(|v| v.len() != 64 || !v.bytes().all(|c| c.is_ascii_hexdigit()))
+        {
+            return None;
+        }
+        let marker = summary.metadata.get("htmlTool")?;
+        if marker["version"] != 1 || marker["publication"] != true || marker["turnId"] != turn {
+            return None;
+        }
+        let call = marker["callId"].as_str()?;
+        let title = marker["title"].as_str()?;
+        if call.is_empty()
+            || !(1..=200).contains(&title.chars().count())
+            || marker["index"] != "document"
+            || summary.primary_thread_id.as_deref() != Some(thread)
+        {
+            return None;
+        }
+        if !summary.bindings.iter().any(|b| {
+            b.thread_id.as_deref() == Some(thread)
+                && b.turn_id.as_deref() == Some(turn)
+                && b.tool_call_id.as_deref() == Some(call)
+                && b.version_id.as_ref() == summary.artifact.version_id.as_ref()
+                && b.binding_kind == ArtifactBindingKind::ToolOutput
+                && b.direction == ArtifactBindingDirection::Output
+                && b.role == Some(ArtifactRole::Tool)
+        }) {
+            return None;
+        }
+        Some(Self {
+            workspace_id: summary.workspace_id.clone(),
+            thread_id: thread.into(),
+            turn_id: turn.into(),
+            call_id: call.into(),
+            title: title.into(),
+            artifact: summary.artifact.clone(),
+        })
+    }
+}
+
+/// Compact timeline lifecycle snapshots. Canonical provider inputs remain in the
+/// existing history store; exact HTML/screenshot bytes live in artifact versions.
+pub fn compact_html_timeline_item(item: &mut crate::TurnItem) {
+    if let crate::TurnItem::DynamicToolCall {
+        tool_name,
+        arguments,
+        ..
+    } = item
+    {
+        if matches!(tool_name.as_str(), "html_render" | "html_preview") {
+            if let Some(partial) = arguments.as_str() {
+                *arguments = serde_json::json!({"argumentsCharacters":partial.chars().count()});
+            } else {
+                compact_html_timeline_value(arguments);
+            }
+        }
+    }
+}
+
+pub fn compact_html_timeline_value(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(object) => {
+            if let Some(html) = object
+                .remove("html")
+                .and_then(|v| v.as_str().map(|v| v.chars().count()))
+            {
+                object.insert("htmlCharacters".into(), html.into());
+            }
+            if object.get("type").and_then(|v| v.as_str()) == Some("image") {
+                object.remove("data");
+            }
+            for value in object.values_mut() {
+                compact_html_timeline_value(value);
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                compact_html_timeline_value(value);
+            }
+        }
+        _ => {}
+    }
+}
+
+#[cfg(test)]
+mod html_projection_tests {
+    use super::*;
+    #[test]
+    fn html_timeline_compaction_keeps_exact_refs_and_discards_document_and_image_bytes() {
+        let mut value = serde_json::json!({"arguments":{"html":"<p>private source</p>","title":"Page"},"result":{"content":[{"type":"image","mimeType":"image/png","data":"encoded-bytes"}],"structuredContent":{"source":{"artifact_id":"source","version_id":"source-version"},"previews":[{"artifact":{"artifact_id":"shot","version_id":"shot-version"}}]}}});
+        compact_html_timeline_value(&mut value);
+        let serialized = value.to_string();
+        assert!(!serialized.contains("private source"));
+        assert!(!serialized.contains("encoded-bytes"));
+        assert!(serialized.contains("source-version"));
+        assert!(serialized.contains("shot-version"));
+        assert_eq!(value["arguments"]["title"], "Page");
     }
 }

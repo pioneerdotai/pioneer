@@ -3752,6 +3752,7 @@ impl MessageProcessor {
                 )));
             }
 
+            let (max_tools, max_total_schema_bytes) = self.mcp_service.projection_limit_values();
             let mcp_projection = match scope_current_stage(
                 Stage::CliMcpResolve,
                 self.mcp_service.resolve_mcp_turn_projection(
@@ -3765,7 +3766,15 @@ impl MessageProcessor {
             )
             .await
             {
-                Ok(projection) => Some(projection),
+                Ok(projection) => Some(
+                    projection
+                        .with_html_tools(crate::turn_mcp::McpProjectionLimits {
+                            max_tools,
+                            max_total_schema_bytes,
+                            ..crate::turn_mcp::McpProjectionLimits::default()
+                        })
+                        .map_err(|error| TurnStartFailure::internal(error.to_string()))?,
+                ),
                 Err(error) => {
                     let code = match error.reason {
                         pioneer_agent::AgentMcpMaterializationFailureReason::ExplicitCapabilityRejected => {

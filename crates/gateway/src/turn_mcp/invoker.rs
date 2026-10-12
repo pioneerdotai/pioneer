@@ -492,7 +492,9 @@ impl GatewayTurnMcpInvoker {
                 )
             })?;
 
-        if binding.server_installation_id != FIRST_PARTY_FILE_SERVER_ID {
+        if binding.server_installation_id != FIRST_PARTY_FILE_SERVER_ID
+            && binding.server_installation_id != pioneer_tools::html::HTML_SERVER_ID
+        {
             let action_gate = AuthorizationService::new().authorize_action(
                 revalidated.principal().kind,
                 revalidated.principal().role_key.as_ref(),

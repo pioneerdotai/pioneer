@@ -1724,3 +1724,73 @@ async fn gemini_aggregate_uses_confirmed_trim_or_scanned_upper_bound() {
         }
     }
 }
+
+/// Canonical parallel result + exact screenshot references, replayed through
+/// production registry admission/budget/materialization by each adapter test.
+pub(crate) fn html_preview_fixture(
+    provider: &str,
+    endpoint: &str,
+) -> (Arc<AdmissionState>, ChatRequest) {
+    use crate::{AttachmentArtifactContext, ProviderToolCall};
+    let key = if provider == "copilot" {
+        "github-copilot"
+    } else {
+        provider
+    };
+    let models = json!({key:{"html-vision":{
+        "id":"html-vision","name":"HTML vision fixture","provider":key,"api":endpoint,
+        "contextWindow":1000000,"maxTokens":16000,"reasoning":false,"input":["text","image"],
+        "cost":{},"inputOrigin":{"kind":"source","expression":"HTML preview contract fixture"},"output":["text"],
+        "inputConstraints":{"image":{"roles":["user"]}}
+    }}});
+    let provenance = json!({key:{"html-vision":{
+        "contextWindow":{"kind":"source","expression":"fixture.context"},
+        "maxTokens":{"kind":"source","expression":"fixture.output"}
+    }}});
+    let catalog =
+        crate::catalog::ModelCatalog::parse(&models.to_string(), &provenance.to_string()).unwrap();
+    let state = Arc::new(AdmissionState::for_test(Arc::new(catalog)));
+    let mut preview = ChatMessage::tool_result("preview-call", "html_preview", json!({
+        "previews":([360,768,1024].map(|width|json!({"width":width,"diagnostics":["resource load error"],"artifact":{"artifact_id":format!("capture-{width}"),"version_id":format!("version-{width}")}})))
+    }).to_string());
+    for width in [360, 768, 1024] {
+        let png = image(image::ImageFormat::Png, width, 8);
+        let mut image = match part(InputContentType::Image, "image/png", &png) {
+            MessageContentPart::Image { image } => image,
+            _ => unreachable!(),
+        };
+        image.artifact = Some(AttachmentArtifactContext {
+            workspace_id: "workspace".into(),
+            artifact_id: format!("capture-{width}"),
+            artifact_version_id: Some(format!("version-{width}")),
+        });
+        preview.content_parts.push(MessageContentPart::text(format!(
+            "HTML preview — {width} CSS px"
+        )));
+        preview.content_parts.push(MessageContentPart::image(image));
+    }
+    let mut request = request("html-vision", vec![]);
+    request.messages = vec![
+        ChatMessage::assistant_tool_calls(
+            None::<String>,
+            vec![
+                ProviderToolCall {
+                    id: "preview-call".into(),
+                    name: "html_preview".into(),
+                    arguments: "{}".into(),
+                },
+                ProviderToolCall {
+                    id: "echo-call".into(),
+                    name: "echo".into(),
+                    arguments: "{}".into(),
+                },
+            ],
+        ),
+        ChatMessage::tool_result("echo-call", "echo", "done"),
+        preview,
+    ];
+    // Durable canonical history/reconnect reconstructs the same messages.
+    request.messages =
+        serde_json::from_value(serde_json::to_value(&request.messages).unwrap()).unwrap();
+    (state, request)
+}

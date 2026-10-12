@@ -871,7 +871,7 @@ impl Render for DesktopShellView {
             .into_any_element()
     }
 }
-#[derive(IntoElement)]
+#[derive(gpui_kit::IntoElement)]
 struct TitleBarSurface {
     content: AnyElement,
 }
@@ -880,7 +880,7 @@ impl RenderOnce for TitleBarSurface {
         self.content
     }
 }
-#[derive(IntoElement)]
+#[derive(gpui_kit::IntoElement)]
 struct BottomBarSurface {
     content: AnyElement,
 }
@@ -889,7 +889,7 @@ impl RenderOnce for BottomBarSurface {
         self.content
     }
 }
-#[derive(IntoElement)]
+#[derive(gpui_kit::IntoElement)]
 struct ScreenHostView {
     selected: Option<AnyView>,
 }
@@ -950,7 +950,7 @@ impl Render for SidebarHostView {
             .into_any_element()
     }
 }
-#[derive(IntoElement)]
+#[derive(gpui_kit::IntoElement)]
 struct DesktopBody {
     sidebar: AnyElement,
     screen: AnyElement,

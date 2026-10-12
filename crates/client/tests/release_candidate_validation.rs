@@ -224,6 +224,7 @@ fn turn_work_block(presentation: TurnWorkPresentation, work_count: u64) -> Timel
 
 fn turn_work(presentation: TurnWorkPresentation, work_count: u64) -> TurnWorkBlock {
     TurnWorkBlock {
+        html_publications: Vec::new(),
         turn_id: TURN_ID.to_owned(),
         presentation,
         state: TurnWorkState::Completed,

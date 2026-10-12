@@ -21,7 +21,7 @@ impl Render for SidebarDragSession {
         SidebarTreeDragPreview(self.0.clone())
     }
 }
-#[derive(IntoElement)]
+#[derive(gpui_kit::IntoElement)]
 struct SidebarTreeDragPreview(SidebarTreeDragPayload);
 impl RenderOnce for SidebarTreeDragPreview {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
