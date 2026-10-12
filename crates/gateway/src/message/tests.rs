@@ -1,6 +1,12 @@
 #[path = "tests/cli_runtime_active_bindings.rs"]
 mod cli_runtime_active_bindings;
 
+#[path = "tests/recovered_turn_stop.rs"]
+mod recovered_turn_stop;
+
+#[path = "tests/recovered_native_turn_stop.rs"]
+mod recovered_native_turn_stop;
+
 #[path = "tests/agent_action_outbox.rs"]
 mod agent_action_outbox;
 
@@ -678,6 +684,7 @@ struct RecordingCliRuntimeSession {
     thread_starts: TokioMutex<Vec<CLIAgentRuntimeThreadOpenParams>>,
     thread_resumes: TokioMutex<Vec<(String, CLIAgentRuntimeThreadOpenParams)>>,
     turn_starts: TokioMutex<Vec<CLIAgentRuntimeTurnStartParams>>,
+    turn_start_pause: TokioMutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
     provider_history: TokioMutex<HashMap<String, Vec<String>>>,
     provider_boundaries: TokioMutex<HashMap<(String, String), usize>>,
     claude_record_boundaries: TokioMutex<HashMap<uuid::Uuid, (String, usize)>>,
@@ -889,6 +896,10 @@ impl CLIAgentRuntimeSession for RecordingCliRuntimeSession {
         params: CLIAgentRuntimeTurnStartParams,
         _timeout: Duration,
     ) -> anyhow::Result<CLIAgentRuntimeTurnStartSnapshot> {
+        if let Some((entered, release)) = self.turn_start_pause.lock().await.take() {
+            entered.notify_one();
+            release.notified().await;
+        }
         self.provider_history
             .lock()
             .await
@@ -48378,6 +48389,7 @@ fn run_interrupted_cli_runtime_turn_recovery_test(
                     fail_after_confirmation,
                     detached_child_owner,
                     invalid_durable_cwd,
+                    None,
                 ),
             ));
         })
@@ -48392,8 +48404,9 @@ async fn run_interrupted_cli_runtime_turn_recovery_scenario(
     fail_after_confirmation: bool,
     detached_child_owner: bool,
     invalid_durable_cwd: bool,
+    control_scenario: Option<recovered_turn_stop::Scenario>,
 ) {
-    let (tx, _rx) = mpsc::channel(64);
+    let (tx, mut rx) = mpsc::channel(64);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
@@ -48693,6 +48706,18 @@ async fn run_interrupted_cli_runtime_turn_recovery_scenario(
         .into_iter()
         .next()
         .expect("CLI recovery event should exist");
+    if let Some(scenario) = control_scenario {
+        recovered_turn_stop::exercise(
+            processor,
+            connection_id,
+            &mut rx,
+            cli_session,
+            recovery_event,
+            scenario,
+        )
+        .await;
+        return;
+    }
     processor
         .handle_recovery_event(recovery_event.clone(), chrono::Utc::now().timestamp())
         .await;
@@ -56420,6 +56445,18 @@ async fn assert_turn_cancel_with_optional_busy_native_actor(
         .expect("interrupted turn should be persisted");
     assert_eq!(persisted_turn.status, TurnStatus::Interrupted);
     assert_eq!(persisted_turn.error.as_deref(), Some("user clicked stop"));
+    // Aggregate reads synthesize the legacy author from the persisted initiator.
+    // The accepted canonical notification must still deliver its exact Turn.
+    assert!(persisted_turn.author.is_some());
+    assert!(failed.turn.author.is_none());
+    assert_eq!(
+        thread_manager_for_assert
+            .turn_get("thr_000000000000000022", "turn_000000000000000022")
+            .await
+            .unwrap()
+            .1,
+        failed.turn
+    );
     if busy_native {
         assert!(
             crud_store_for_assert

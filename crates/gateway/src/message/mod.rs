@@ -608,6 +608,8 @@ pub struct MessageProcessor {
     native_cancellation_finish_barrier: Arc<Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>>,
     #[cfg(test)]
     native_cancellation_materialization_failure: Arc<Mutex<Option<sea_orm::DbErr>>>,
+    #[cfg(test)]
+    native_cancellation_materialization_barrier: Arc<Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>>,
     workspace_compaction_settings: Arc<StdRwLock<std::collections::BTreeMap<String, crate::settings::WorkspaceCompactionSettings>>>,
     agent_listener_tasks: Arc<Mutex<HashMap<String, AgentListenerTask>>>,
     agent_listener_generation: Arc<AtomicU64>,
@@ -1243,6 +1245,8 @@ impl MessageProcessor {
             native_cancellation_finish_barrier: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             native_cancellation_materialization_failure: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            native_cancellation_materialization_barrier: Arc::new(Mutex::new(None)),
             workspace_compaction_settings: Arc::new(StdRwLock::new(
                 std::collections::BTreeMap::new(),
             )),
@@ -4784,6 +4788,8 @@ impl MessageProcessor {
             native_cancellation_finish_barrier: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             native_cancellation_materialization_failure: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            native_cancellation_materialization_barrier: Arc::new(Mutex::new(None)),
             workspace_compaction_settings: Arc::new(StdRwLock::new(
                 std::collections::BTreeMap::new(),
             )),

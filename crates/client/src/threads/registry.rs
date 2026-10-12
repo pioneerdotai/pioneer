@@ -2551,6 +2551,239 @@ mod tests {
         }
     }
 
+    fn recovered_running_thread() -> Thread {
+        let mut snapshot = thread("a", "ws");
+        snapshot.status = ThreadStatus::Active;
+        let mut later = running_turn("later-terminal");
+        later.status = TurnStatus::Completed;
+        snapshot.turns = vec![running_turn("original"), later];
+        snapshot
+    }
+
+    #[test]
+    fn recovered_turn_snapshot_completed_agent_child_restores_original_control_immediately() {
+        let core = core();
+        // Concurrent Agent-authored child Turns are ordinary Conversation
+        // Turns in the parent's thread and can finish before the parent.
+        let mut original = running_turn("original");
+        original.mode = ThreadMode::Agent;
+        let mut child = running_turn("child");
+        child.mode = ThreadMode::Agent;
+        child.author = Some(TurnAuthorSnapshot {
+            actor: PersistedActorRef::System,
+            display_name: "Child Agent".into(),
+            nickname: "child-agent".into(),
+            avatar_revision: None,
+            agent: None,
+        });
+        let mut snapshot = thread("a", "ws");
+        snapshot.mode = ThreadMode::Agent;
+        snapshot.status = ThreadStatus::Active;
+        snapshot.turns = vec![original, child];
+        core.upsert_thread(snapshot.clone());
+        assert_eq!(
+            core.thread_coordinator_snapshot("a")
+                .unwrap()
+                .conversation
+                .in_flight_turn_id(),
+            Some("child")
+        );
+        snapshot.turns[1].status = TurnStatus::Completed;
+        snapshot.turns[1].permission_profile =
+            system_turn_permission_profile_snapshot(TurnPermissionMode::FullAccess);
+        let update = GatewayNotification::ThreadUpdated(ThreadUpdatedNotification {
+            thread: snapshot.clone(),
+            placement: None,
+        });
+        core.apply_thread_notification(update.clone());
+        let coordinator = core.thread_coordinator_snapshot("a").unwrap();
+        assert_eq!(coordinator.thread(), Some(&snapshot));
+        let active = crate::state::snapshot::ActiveThreadSnapshot::from_coordinator(
+            Some("a"),
+            Some(&coordinator),
+            false,
+        );
+        assert_eq!(active.in_flight_turn_id.as_deref(), Some("original"));
+        assert!(active.can_request_turn_cancel(true));
+        assert!(!active.can_request_turn_cancel(false));
+        let completed = coordinator
+            .conversation
+            .projection()
+            .turns
+            .iter()
+            .find(|turn| turn.id == "child")
+            .unwrap();
+        assert_eq!(completed.phase, crate::conversation::TurnPhase::Completed);
+        assert_eq!(
+            completed.permission_profile.as_ref(),
+            Some(&snapshot.turns[1].permission_profile)
+        );
+
+        // The first accepted snapshot already permits cancelling the original;
+        // no later event is needed to restore the cancellation target.
+        let (token, params) = core.begin_thread_turn_cancellation("a", None).unwrap();
+        assert_eq!(params.thread_id, "a");
+        assert_eq!(params.turn_id, "original");
+        core.apply_thread_notification(update);
+        let coordinator = core.thread_coordinator_snapshot("a").unwrap();
+        assert_eq!(
+            coordinator.conversation.in_flight_turn_id(),
+            Some("original")
+        );
+        assert!(coordinator.conversation.is_cancelling_turn());
+        assert_eq!(
+            coordinator
+                .conversation
+                .projection()
+                .turns
+                .iter()
+                .find(|turn| turn.id == "child")
+                .unwrap()
+                .phase,
+            crate::conversation::TurnPhase::Completed
+        );
+        assert!(!core.finish_thread_turn_cancellation(&token, "child", None, true));
+    }
+
+    #[test]
+    fn recovered_turn_snapshot_terminal_conversation_does_not_hide_cancel_target() {
+        let core = core();
+        let mut snapshot = recovered_running_thread();
+        core.upsert_thread(snapshot.clone());
+        assert_eq!(
+            core.thread_coordinator_snapshot("a")
+                .unwrap()
+                .conversation
+                .in_flight_turn_id(),
+            Some("original")
+        );
+        // Lose Conversation while retaining the thread snapshot, then deliver
+        // a differing ThreadUpdated through the production notification reducer.
+        core.thread_mutation("a", "ws")
+            .unwrap()
+            .conversation_mutation()
+            .reset();
+        assert!(
+            core.thread_coordinator_snapshot("a")
+                .unwrap()
+                .conversation
+                .in_flight_turn_id()
+                .is_none()
+        );
+        snapshot.preview = "recovered execution".into();
+        core.apply_thread_notification(GatewayNotification::ThreadUpdated(
+            ThreadUpdatedNotification {
+                thread: snapshot,
+                placement: None,
+            },
+        ));
+        let (_, params) = core.begin_thread_turn_cancellation("a", None).unwrap();
+        assert_eq!(params.thread_id, "a");
+        assert_eq!(params.turn_id, "original");
+    }
+
+    #[test]
+    fn recovered_turn_snapshot_preserves_pending_cancellation_and_accepts_response() {
+        for rejected in [false, true] {
+            let core = core();
+            let mut snapshot = recovered_running_thread();
+            core.upsert_thread(snapshot.clone());
+            let (token, params) = core.begin_thread_turn_cancellation("a", None).unwrap();
+            snapshot.preview = "activity during cancellation".into();
+            core.apply_thread_notification(GatewayNotification::ThreadUpdated(
+                ThreadUpdatedNotification {
+                    thread: snapshot.clone(),
+                    placement: None,
+                },
+            ));
+            let coordinator = core.thread_coordinator_snapshot("a").unwrap();
+            assert_eq!(
+                coordinator.thread().unwrap().preview,
+                snapshot.preview,
+                "the differing running snapshot must actually be accepted"
+            );
+            assert!(coordinator.conversation.is_cancelling_turn());
+            assert_eq!(
+                coordinator.conversation.in_flight_turn_id(),
+                Some("original")
+            );
+            assert!(core.begin_thread_turn_cancellation("a", None).is_none());
+            assert!(!core.finish_thread_turn_cancellation(&token, "later-terminal", None, true));
+            let mut wrong_generation = token.clone();
+            wrong_generation.generation += 1;
+            assert!(!core.finish_thread_turn_cancellation(
+                &wrong_generation,
+                &params.turn_id,
+                None,
+                true
+            ));
+            let event = if rejected {
+                crate::turns::cancel::local_turn_cancel_rejected_event(
+                    "a",
+                    "original",
+                    "RPC failed",
+                )
+            } else {
+                let mut cancelled = running_turn("original");
+                cancelled.status = TurnStatus::Interrupted;
+                crate::turns::cancel::turn_cancel_response_event(TurnCancelResponse {
+                    workspace_id: "ws".into(),
+                    thread_id: "a".into(),
+                    turn: cancelled,
+                })
+                .unwrap()
+            };
+            assert!(core.finish_thread_turn_cancellation(
+                &token,
+                &params.turn_id,
+                Some(event),
+                false
+            ));
+            let coordinator = core.thread_coordinator_snapshot("a").unwrap();
+            assert!(!coordinator.conversation.is_cancelling_turn());
+            if rejected {
+                assert_eq!(
+                    coordinator.conversation.in_flight_turn_id(),
+                    Some("original")
+                );
+                assert!(core.begin_thread_turn_cancellation("a", None).is_some());
+            } else {
+                assert_eq!(coordinator.conversation.in_flight_turn_id(), None);
+                assert!(coordinator.conversation.can_submit_message());
+            }
+        }
+    }
+
+    #[test]
+    fn recovered_turn_snapshot_terminalizes_pending_cancellation() {
+        for status in [TurnStatus::Interrupted, TurnStatus::Completed] {
+            let core = core();
+            let mut snapshot = recovered_running_thread();
+            core.upsert_thread(snapshot.clone());
+            let (token, params) = core.begin_thread_turn_cancellation("a", None).unwrap();
+            snapshot.turns[0].status = status;
+            core.apply_thread_notification(GatewayNotification::ThreadUpdated(
+                ThreadUpdatedNotification {
+                    thread: snapshot,
+                    placement: None,
+                },
+            ));
+            let coordinator = core.thread_coordinator_snapshot("a").unwrap();
+            assert_eq!(coordinator.conversation.in_flight_turn_id(), None);
+            assert!(!coordinator.conversation.is_cancelling_turn());
+            assert!(coordinator.conversation.can_submit_message());
+            assert_eq!(
+                coordinator.conversation.status_label(),
+                if status == TurnStatus::Interrupted {
+                    "cancelled"
+                } else {
+                    "completed"
+                }
+            );
+            assert!(!core.finish_thread_turn_cancellation(&token, &params.turn_id, None, true));
+        }
+    }
+
     struct ResumeTransport;
     impl crate::rpc::JsonRpcRequestTransport for ResumeTransport {
         fn send_json_rpc_request(

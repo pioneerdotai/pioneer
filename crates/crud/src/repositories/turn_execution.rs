@@ -316,6 +316,33 @@ pub async fn list_expired_foreign_active<C: ConnectionTrait>(
         .collect()
 }
 
+/// A rejected native pre-start admission remains owned, resumable recovery work.
+pub async fn mark_recovering_owned<C: ConnectionTrait>(
+    db: &C,
+    turn_id: &str,
+    owner_id: &str,
+    now: DateTimeWithTimeZone,
+) -> Result<bool> {
+    Ok(turn_execution::Entity::update_many()
+        .filter(turn_execution::Column::TurnId.eq(turn_id.to_owned()))
+        .filter(turn_execution::Column::OwnerId.eq(owner_id.to_owned()))
+        .filter(turn_execution::Column::Status.is_in([
+            TurnExecutionStatus::Queued.as_str(),
+            TurnExecutionStatus::Starting.as_str(),
+            TurnExecutionStatus::Running.as_str(),
+            TurnExecutionStatus::Recovering.as_str(),
+        ]))
+        .col_expr(
+            turn_execution::Column::Status,
+            Expr::value(TurnExecutionStatus::Recovering.as_str()),
+        )
+        .col_expr(turn_execution::Column::UpdatedAt, Expr::value(now))
+        .exec(db)
+        .await?
+        .rows_affected
+        == 1)
+}
+
 pub async fn list_owned_recovering<C: ConnectionTrait>(
     db: &C,
     owner_id: &str,

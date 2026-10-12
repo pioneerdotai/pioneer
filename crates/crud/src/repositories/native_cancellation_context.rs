@@ -138,22 +138,10 @@ pub async fn insert_once<C: ConnectionTrait>(
     preparation: &NativeTerminalEffectPreparation,
     candidate: context::ActiveModel,
     initial_turn: bool,
+    owner: &str,
 ) -> Result<()> {
-    let exists = context::Entity::find_by_id(preparation.turn_id.clone())
-        .filter(context::Column::ThreadId.eq(preparation.thread_id.clone()))
-        .filter(context::Column::WorkspaceId.eq(preparation.workspace_id.clone()))
-        .select_only()
-        .column(context::Column::TurnId)
-        .into_tuple::<String>()
-        .one(db)
-        .await?
-        .is_some();
-    if exists {
-        return Ok(());
-    }
-    if !initial_turn {
-        return Err(NativeCancellationContextUnavailable.into());
-    }
+    // Confirmation is a pre-start fence too. An immutable row from an earlier
+    // execution cannot authorize a terminal Turn or an accepted cancellation.
     let turn_scope = turn::Entity::find_by_id(preparation.turn_id.clone())
         .filter(turn::Column::ThreadId.eq(preparation.thread_id.clone()))
         .filter(turn::Column::Status.eq("in_progress"))
@@ -173,6 +161,27 @@ pub async fn insert_once<C: ConnectionTrait>(
         turn_scope.is_some() && workspace.is_some(),
         "native cancellation context registration lost its turn scope"
     );
+    let mut existing = owned_query(&preparation.turn_id, owner);
+    existing
+        .expr(Expr::val(1))
+        .and_where(
+            Expr::col((context::Entity, context::Column::ThreadId)).eq(&preparation.thread_id),
+        )
+        .and_where(
+            Expr::col((context::Entity, context::Column::WorkspaceId))
+                .eq(&preparation.workspace_id),
+        )
+        .and_where(Expr::col((context::Entity, context::Column::AcceptedEventId)).is_null());
+    if db
+        .query_one_raw(DbBackend::Sqlite.build(&existing))
+        .await?
+        .is_some()
+    {
+        return Ok(());
+    }
+    if !initial_turn {
+        return Err(NativeCancellationContextUnavailable.into());
+    }
     context::Entity::insert(candidate)
         .exec_without_returning(db)
         .await?;
