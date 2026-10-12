@@ -71,19 +71,29 @@ pub(crate) fn tool_attempt_work_budget(
 async fn await_owned_tool_attempt<T>(
     work: impl std::future::Future<Output = Result<T, ToolError>>,
     cancellation: tokio_util::sync::CancellationToken,
-    budget: std::time::Duration,
+    budget: Option<std::time::Duration>,
 ) -> Result<T, ToolError> {
     if cancellation.is_cancelled() {
         return Err(ToolError::cancelled("tool dispatch cancelled"));
     }
-    if budget.is_zero() {
+    if budget.is_some_and(|budget| budget.is_zero()) {
         cancellation.cancel();
         return Err(ToolError::TimedOut);
     }
     tokio::pin!(work);
-    let deadline = tokio::time::Instant::now()
-        .checked_add(budget)
-        .ok_or_else(|| ToolError::invalid_arguments("tool timeout is out of range"))?;
+    let deadline = budget
+        .map(|budget| {
+            tokio::time::Instant::now()
+                .checked_add(budget)
+                .ok_or_else(|| ToolError::invalid_arguments("tool timeout is out of range"))
+        })
+        .transpose()?;
+    let timeout = async {
+        match deadline {
+            Some(deadline) => tokio::time::sleep_until(deadline).await,
+            None => std::future::pending::<()>().await,
+        }
+    };
     let polled = std::sync::atomic::AtomicBool::new(false);
     let poll_owned = std::future::poll_fn(|cx| {
         polled.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -97,7 +107,7 @@ async fn await_owned_tool_attempt<T>(
             }
             Err(ToolError::cancelled("tool dispatch cancelled"))
         }
-        _ = tokio::time::sleep_until(deadline) => {
+        _ = timeout => {
             cancellation.cancel();
             if polled.load(std::sync::atomic::Ordering::Relaxed) {
                 let _ = tokio::time::timeout(std::time::Duration::from_secs(1), &mut work).await;
@@ -1716,39 +1726,42 @@ impl ToolOrchestrator {
         );
         // Dispatch wrapper only. Concrete process, filesystem, and network handlers enforce
         // the immutable turn snapshot supplied with the invocation.
-        let work_budget = registry.attempt_work_budget(&invocation)?;
-        let work_started = tokio::time::Instant::now();
-        let budget_ms = i64::try_from(work_budget.as_millis())
-            .map_err(|_| ToolError::invalid_arguments("tool timeout is out of range"))?;
-        let deadline_ms = chrono::Utc::now()
-            .timestamp_millis()
-            .checked_add(budget_ms)
-            .and_then(|deadline| deadline.checked_add(2_000))
-            .filter(|deadline| chrono::DateTime::from_timestamp_millis(*deadline).is_some())
-            .ok_or_else(|| ToolError::invalid_arguments("tool timeout is out of range"))?;
-        // Publish the declared silence/cap after approval, before side effects.
-        // Canonical ACK consumes the same monotonic allowance as execution.
-        let work_deadline = work_started
-            .checked_add(work_budget)
-            .ok_or_else(|| ToolError::invalid_arguments("tool timeout is out of range"))?;
-        if invocation.cancellation.is_cancelled() {
-            return Err(ToolError::cancelled("tool dispatch cancelled"));
-        }
-        tokio::select! {
-            biased;
-            _ = invocation.cancellation.cancelled() => return Err(ToolError::cancelled("tool dispatch cancelled")),
-            result = tokio::time::timeout_at(work_deadline, trace.emit_progress_delta(
-                invocation.attempt_id, "attempt_work_started",
-                Some(serde_json::json!({"schemaVersion":1,"deadlineAtUnixMs":deadline_ms})),
-            )) => result.map_err(|_| ToolError::TimedOut)??,
+        let work_budget = if registry.delegates_runtime_execution(&invocation.tool_name) {
+            None
+        } else {
+            Some(registry.attempt_work_budget(&invocation)?)
         };
+        let work_started = tokio::time::Instant::now();
+        let policy = match work_budget {
+            Some(budget) => {
+                let budget_ms = i64::try_from(budget.as_millis())
+                    .map_err(|_| ToolError::invalid_arguments("tool timeout is out of range"))?;
+                let deadline_ms = chrono::Utc::now()
+                    .timestamp_millis()
+                    .checked_add(budget_ms)
+                    .and_then(|deadline| deadline.checked_add(2_000))
+                    .filter(|deadline| chrono::DateTime::from_timestamp_millis(*deadline).is_some())
+                    .ok_or_else(|| ToolError::invalid_arguments("tool timeout is out of range"))?;
+                serde_json::json!({"schemaVersion":1,"deadlineAtUnixMs":deadline_ms})
+            }
+            None => serde_json::json!({"schemaVersion":2,"kind":"delegated"}),
+        };
+        // Concrete work owns one monotonic allowance including its receipt ACK.
+        // Transparent wrappers retain Stop/lease ownership; each child starts
+        // its own finite work clock after that child's fresh approval.
+        await_owned_tool_attempt(
+            trace.emit_progress_delta(invocation.attempt_id, "attempt_work_started", Some(policy)),
+            invocation.cancellation.child_token(),
+            work_budget,
+        )
+        .await?;
         let cancellation = invocation.cancellation.child_token();
         let mut owned_invocation = invocation.clone();
         owned_invocation.cancellation = cancellation.clone();
         let dispatched = await_owned_tool_attempt(
             registry.dispatch(owned_invocation, trace),
             cancellation,
-            work_budget.saturating_sub(work_started.elapsed()),
+            work_budget.map(|budget| budget.saturating_sub(work_started.elapsed())),
         )
         .await;
         match dispatched {
@@ -4740,7 +4753,8 @@ mod attempt_deadline_tests {
             Ok(())
         };
         let result =
-            await_owned_tool_attempt(work, cancellation.clone(), Duration::from_secs(10)).await;
+            await_owned_tool_attempt(work, cancellation.clone(), Some(Duration::from_secs(10)))
+                .await;
         assert!(matches!(result, Err(ToolError::TimedOut)));
         assert!(cancellation.is_cancelled());
         assert!(observed.load(std::sync::atomic::Ordering::SeqCst));
@@ -4754,7 +4768,7 @@ mod attempt_deadline_tests {
             Ok(42)
         };
         assert_eq!(
-            await_owned_tool_attempt(work, cancellation.clone(), Duration::from_secs(180))
+            await_owned_tool_attempt(work, cancellation.clone(), Some(Duration::from_secs(180)))
                 .await
                 .unwrap(),
             42
@@ -4778,10 +4792,36 @@ mod attempt_deadline_tests {
                     Ok(())
                 },
                 child,
-                Duration::from_secs(180)
+                Some(Duration::from_secs(180))
             ),
             async move {
                 tokio::time::sleep(Duration::from_secs(1)).await;
+                owner.cancel();
+            }
+        );
+        assert!(matches!(result, Err(ToolError::Cancelled(_))));
+        assert!(cleaned.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delegated_stop_cancels_and_drains_the_owned_child() {
+        let owner = CancellationToken::new();
+        let child = owner.child_token();
+        let child_work = child.clone();
+        let cleaned = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let marker = cleaned.clone();
+        let (result, ()) = tokio::join!(
+            await_owned_tool_attempt(
+                async move {
+                    child_work.cancelled().await;
+                    marker.store(true, std::sync::atomic::Ordering::SeqCst);
+                    Ok(())
+                },
+                child,
+                None
+            ),
+            async move {
+                tokio::time::sleep(Duration::from_secs(360)).await;
                 owner.cancel();
             }
         );
@@ -4796,7 +4836,7 @@ mod attempt_deadline_tests {
         let result: Result<(), ToolError> = await_owned_tool_attempt(
             std::future::pending(),
             cancellation,
-            Duration::from_secs(180),
+            Some(Duration::from_secs(180)),
         )
         .await;
         assert!(matches!(result, Err(ToolError::Cancelled(_))));

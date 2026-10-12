@@ -168,11 +168,13 @@ pub(crate) async fn tool_output_page(
     Ok(rows.into_iter().map(|row| (row.ordinal, row)).collect())
 }
 
-// New work policy is two fixed scalars in the existing durable progress receipt.
+// Work policy is two fixed scalars in the existing durable progress receipt.
+// Schema1 owns a finite leaf deadline; schema2 delegates work to an owned child.
+// Neither can clear the original attempt lease or authorize effects.
 // Decode before writer admission; immutable observation binds its exact owner.
 fn prepare_work_policy(
     n: &pioneer_protocol::ItemDeltaNotification,
-) -> Result<Option<(chrono::DateTime<chrono::FixedOffset>, i64, String)>> {
+) -> Result<Option<(Option<chrono::DateTime<chrono::FixedOffset>>, i64, String)>> {
     let Some(payload) = &n.payload else {
         return Ok(None);
     };
@@ -202,15 +204,21 @@ fn prepare_work_policy(
         serde_json::from_value(payload["metadata"].clone())?;
     let policy = metadata.to_json();
     ensure!(
-        policy["schemaVersion"].as_u64() == Some(1)
-            && policy.as_object().is_some_and(|p| p.len() == 2),
+        policy.as_object().is_some_and(|p| p.len() == 2),
         "unsupported tool work policy"
     );
-    let deadline = policy["deadlineAtUnixMs"]
-        .as_i64()
-        .and_then(chrono::DateTime::from_timestamp_millis)
-        .ok_or_else(|| anyhow::anyhow!("invalid tool work deadline"))?
-        .fixed_offset();
+    let deadline = match policy["schemaVersion"].as_u64() {
+        Some(1) => Some(
+            policy["deadlineAtUnixMs"]
+                .as_i64()
+                .filter(|deadline| *deadline > 0)
+                .and_then(chrono::DateTime::from_timestamp_millis)
+                .ok_or_else(|| anyhow::anyhow!("invalid tool work deadline"))?
+                .fixed_offset(),
+        ),
+        Some(2) if policy["kind"].as_str() == Some("delegated") => None,
+        _ => anyhow::bail!("unsupported tool work policy"),
+    };
     let observation = &payload["observation"];
     let attempt = observation["attempt_id"]
         .as_u64()
@@ -264,4 +272,41 @@ pub(crate) async fn has_native_tool_work_policy(
         markdown_version: None,
     };
     Ok(prepare_work_policy(&notification)?.is_some())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::prepare_work_policy;
+    #[test]
+    fn work_receipt_rejects_future_malformed_and_overlarge_policy() {
+        let mut n = pioneer_protocol::ItemDeltaNotification {
+            workspace_id: "ws".into(),
+            thread_id: "thread".into(),
+            turn_id: "turn".into(),
+            item_id: "item".into(),
+            delta: String::new(),
+            stream: Some(pioneer_protocol::ItemDeltaStream::ToolProgress),
+            payload: Some(
+                serde_json::json!({"stage":"attempt_work_started", "metadata":
+                pioneer_protocol::ToolMetadata::from_json(serde_json::json!({"schemaVersion":2,"kind":"delegated"})),
+                "observation":{"turn_id":"turn","tool_call_id":"item","attempt_id":1,"trace_id":"trace"}}),
+            ),
+            markdown: None,
+            markdown_version: None,
+        };
+        assert!(prepare_work_policy(&n).unwrap().unwrap().0.is_none());
+        for invalid in [
+            serde_json::json!({"schemaVersion":3,"kind":"delegated"}),
+            serde_json::json!({"schemaVersion":2,"kind":"unknown"}),
+            serde_json::json!({"schemaVersion":2,"kind":"delegated","deadlineAtUnixMs":1}),
+            serde_json::json!({"schemaVersion":1,"deadlineAtUnixMs":0}),
+        ] {
+            let mut bad = n.clone();
+            bad.payload.as_mut().unwrap()["metadata"] =
+                serde_json::to_value(pioneer_protocol::ToolMetadata::from_json(invalid)).unwrap();
+            assert!(prepare_work_policy(&bad).is_err());
+        }
+        n.payload.as_mut().unwrap()["padding"] = serde_json::json!("x".repeat(4096));
+        assert!(prepare_work_policy(&n).is_err());
+    }
 }

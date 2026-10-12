@@ -5656,7 +5656,7 @@ async fn execute_agent_provider_response(
                         Ok(event)
                             if matches!(
                                 &event.payload,
-                                ToolEventPayload::Heartbeat
+                                ToolEventPayload::Heartbeat | ToolEventPayload::OwnerHeartbeat
                             ) =>
                         {
                             tooling::forward_tool_event_to_agent(

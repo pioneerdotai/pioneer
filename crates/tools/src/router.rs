@@ -79,8 +79,8 @@ impl ToolRouter {
                 .is_some_and(|spec| matches!(spec.execution_class, ExecutionClass::Shared))
     }
 
-    pub(crate) fn delegates_runtime_locks(&self, tool_name: &str) -> bool {
-        self.registry.delegates_runtime_locks(tool_name)
+    pub(crate) fn delegates_runtime_execution(&self, tool_name: &str) -> bool {
+        self.registry.delegates_runtime_execution(tool_name)
     }
 
     pub fn new(

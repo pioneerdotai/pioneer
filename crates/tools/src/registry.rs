@@ -14,9 +14,11 @@ pub trait ToolHandler: Send + Sync {
         false
     }
 
-    /// A composition handler delegates all effects to this runtime's nested
-    /// dispatch. The children, rather than their wrapper, own runtime locks.
-    fn delegates_runtime_locks(&self) -> bool {
+    /// A transparent composition performs bounded local preparation/projection
+    /// and delegates all work to exactly one owned nested dispatch. Its child
+    /// owns locks and the finite attempt budget after fresh authorization.
+    /// Never enable this for a handler that also performs external work.
+    fn delegates_runtime_execution(&self) -> bool {
         false
     }
 
@@ -51,14 +53,14 @@ impl ToolRegistry {
 
     pub(crate) fn supports_parallel_reads(&self, tool_name: &str) -> bool {
         self.handlers.get(tool_name).is_some_and(|handler| {
-            handler.supports_parallel_reads() && !handler.delegates_runtime_locks()
+            handler.supports_parallel_reads() && !handler.delegates_runtime_execution()
         })
     }
 
-    pub(crate) fn delegates_runtime_locks(&self, tool_name: &str) -> bool {
+    pub(crate) fn delegates_runtime_execution(&self, tool_name: &str) -> bool {
         self.handlers
             .get(tool_name)
-            .is_some_and(|handler| handler.delegates_runtime_locks())
+            .is_some_and(|handler| handler.delegates_runtime_execution())
     }
 
     pub(crate) fn attempt_work_budget(

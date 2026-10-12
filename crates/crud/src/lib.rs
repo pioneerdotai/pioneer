@@ -50191,208 +50191,229 @@ mod tests {
 
     #[tokio::test]
     async fn declared_silent_work_policy_is_atomic_owned_and_lease_only_renewable() {
-        let (store, thread, turn) =
-            test_store_with_started_turn("ws_work_policy", "thr_work_policy", "turn_work_policy")
-                .await;
-        let at = 1_700_000_000;
-        let item_id = "call_work_policy";
-        let observation = pioneer_protocol::ToolObservation {
-            trace_id: "trace_work_policy".into(),
-            turn_id: turn.id.clone(),
-            tool_call_id: item_id.into(),
-            attempt_id: 1,
-            pipeline_stage: "runtime.call.started".into(),
-            ts_unix_ms: at * 1000,
-            mono_ns: 0,
-            event_seq: 1,
-        };
-        let item = TurnItem::DynamicToolCall {
-            id: item_id.into(),
-            tool_name: "mcp_silent_work".into(),
-            arguments: serde_json::json!({}),
-            status: ToolCallStatus::InProgress,
-            recovery_policy: None,
-            execution_class: pioneer_protocol::TurnItemExecutionClass::Standard,
-            output_policy: ToolOutputPolicySnapshot::for_tool_name("mcp_silent_work"),
-            display: ToolDisplayPayload::Hidden,
-            storage: ToolStoragePayload::Metadata {
-                metadata: ToolMetadata::empty(),
-            },
-            recovery: None,
-            success: None,
-            outcome: None,
-            observation: Some(observation),
-        };
-        store
-            .materialize_item_started_with_attempt_deadlines(
-                ItemStartedNotification {
-                    workspace_id: thread.workspace_id.clone(),
-                    thread_id: thread.id.clone(),
-                    turn_id: turn.id.clone(),
-                    item,
-                },
-                at,
-                TurnItemAttemptDeadlines {
-                    lease_expires_at_unix: Some(at + 120),
-                    idle_deadline_at_unix: Some(at + 90),
-                    hard_deadline_at_unix: Some(at + 300),
-                },
+        for delegated in [false, true] {
+            let (store, thread, turn) = test_store_with_started_turn(
+                "ws_work_policy",
+                "thr_work_policy",
+                "turn_work_policy",
             )
-            .await
-            .unwrap();
-        let liveness = store.get_turn_liveness(&turn.id).await.unwrap();
-        let policy = ToolMetadata::from_json(
-            serde_json::json!({"schemaVersion":1,"deadlineAtUnixMs":(at + 602)*1000}),
-        );
-        let notification = pioneer_protocol::ItemDeltaNotification {
-            workspace_id: thread.workspace_id.clone(),
-            thread_id: thread.id.clone(),
-            turn_id: turn.id.clone(),
-            item_id: item_id.into(),
-            delta: String::new(),
-            stream: Some(pioneer_protocol::ItemDeltaStream::ToolProgress),
-            payload: Some(
-                serde_json::json!({"kind":"progress","stage":"attempt_work_started","metadata":policy,
+            .await;
+            let at = 1_700_000_000;
+            let item_id = "call_work_policy";
+            let observation = pioneer_protocol::ToolObservation {
+                trace_id: "trace_work_policy".into(),
+                turn_id: turn.id.clone(),
+                tool_call_id: item_id.into(),
+                attempt_id: 1,
+                pipeline_stage: "runtime.call.started".into(),
+                ts_unix_ms: at * 1000,
+                mono_ns: 0,
+                event_seq: 1,
+            };
+            let item = TurnItem::DynamicToolCall {
+                id: item_id.into(),
+                tool_name: "mcp_silent_work".into(),
+                arguments: serde_json::json!({}),
+                status: ToolCallStatus::InProgress,
+                recovery_policy: None,
+                execution_class: pioneer_protocol::TurnItemExecutionClass::Standard,
+                output_policy: ToolOutputPolicySnapshot::for_tool_name("mcp_silent_work"),
+                display: ToolDisplayPayload::Hidden,
+                storage: ToolStoragePayload::Metadata {
+                    metadata: ToolMetadata::empty(),
+                },
+                recovery: None,
+                success: None,
+                outcome: None,
+                observation: Some(observation),
+            };
+            store
+                .materialize_item_started_with_attempt_deadlines(
+                    ItemStartedNotification {
+                        workspace_id: thread.workspace_id.clone(),
+                        thread_id: thread.id.clone(),
+                        turn_id: turn.id.clone(),
+                        item,
+                    },
+                    at,
+                    TurnItemAttemptDeadlines {
+                        lease_expires_at_unix: Some(at + 120),
+                        idle_deadline_at_unix: Some(at + 90),
+                        hard_deadline_at_unix: Some(at + 300),
+                    },
+                )
+                .await
+                .unwrap();
+            let liveness = store.get_turn_liveness(&turn.id).await.unwrap();
+            let policy = ToolMetadata::from_json(if delegated {
+                serde_json::json!({"schemaVersion":2,"kind":"delegated"})
+            } else {
+                serde_json::json!({"schemaVersion":1,"deadlineAtUnixMs":(at + 602)*1000})
+            });
+            let notification = pioneer_protocol::ItemDeltaNotification {
+                workspace_id: thread.workspace_id.clone(),
+                thread_id: thread.id.clone(),
+                turn_id: turn.id.clone(),
+                item_id: item_id.into(),
+                delta: String::new(),
+                stream: Some(pioneer_protocol::ItemDeltaStream::ToolProgress),
+                payload: Some(
+                    serde_json::json!({"kind":"progress","stage":"attempt_work_started","metadata":policy,
                 "observation":{"trace_id":"trace_work_policy","turn_id":turn.id,"tool_call_id":item_id,"attempt_id":1}}),
-            ),
-            markdown: None,
-            markdown_version: None,
-        };
-        let mut wrong = notification.clone();
-        wrong.payload.as_mut().unwrap()["observation"]["trace_id"] =
-            serde_json::json!("wrong_trace");
-        assert!(
+                ),
+                markdown: None,
+                markdown_version: None,
+            };
+            let mut wrong = notification.clone();
+            wrong.payload.as_mut().unwrap()["observation"]["trace_id"] =
+                serde_json::json!("wrong_trace");
+            assert!(
+                store
+                    .record_tool_output("wrong_owner", &wrong)
+                    .await
+                    .is_err()
+            );
+            assert!(
+                store
+                    .tool_output_page(&thread.workspace_id, &thread.id, &turn.id, item_id, 0)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                !store
+                    .has_native_tool_work_policy(&turn.id, item_id)
+                    .await
+                    .unwrap()
+            );
             store
-                .record_tool_output("wrong_owner", &wrong)
+                .record_tool_output("work_policy", &notification)
                 .await
-                .is_err()
-        );
-        assert!(
+                .unwrap();
             store
-                .tool_output_page(&thread.workspace_id, &thread.id, &turn.id, item_id, 0)
+                .record_tool_output("work_policy", &notification)
                 .await
-                .unwrap()
-                .is_empty()
-        );
-        assert!(
-            !store
-                .has_native_tool_work_policy(&turn.id, item_id)
-                .await
-                .unwrap()
-        );
-        store
-            .record_tool_output("work_policy", &notification)
-            .await
-            .unwrap();
-        store
-            .record_tool_output("work_policy", &notification)
-            .await
-            .unwrap();
-        assert!(
-            store
-                .record_tool_output("second_epoch", &notification)
-                .await
-                .is_err(),
-            "another receipt identity cannot reset this attempt's epoch"
-        );
-        let mut wrong_attempt = notification.clone();
-        wrong_attempt.payload.as_mut().unwrap()["observation"]["attempt_id"] = serde_json::json!(2);
-        assert!(
-            store
-                .record_tool_output("wrong_attempt", &wrong_attempt)
-                .await
-                .is_err()
-        );
+                .unwrap();
+            assert!(
+                store
+                    .record_tool_output("second_epoch", &notification)
+                    .await
+                    .is_err(),
+                "another receipt identity cannot reset this attempt's epoch"
+            );
+            let mut wrong_attempt = notification.clone();
+            wrong_attempt.payload.as_mut().unwrap()["observation"]["attempt_id"] =
+                serde_json::json!(2);
+            assert!(
+                store
+                    .record_tool_output("wrong_attempt", &wrong_attempt)
+                    .await
+                    .is_err()
+            );
 
-        assert!(
+            assert!(
+                store
+                    .has_native_tool_work_policy(&turn.id, item_id)
+                    .await
+                    .unwrap()
+            );
+            // A rehydrated facade reads the same durable policy; no in-process cache.
+            let restored = CrudStore::new(store.connection.clone());
+            assert!(
+                restored
+                    .has_native_tool_work_policy(&turn.id, item_id)
+                    .await
+                    .unwrap()
+            );
             store
-                .has_native_tool_work_policy(&turn.id, item_id)
+                .heartbeat_turn_item_attempt(
+                    &turn.id,
+                    item_id,
+                    TurnItemType::DynamicToolCall,
+                    at + 400,
+                    Some(at + 520),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+            let attempt = pioneer_entity::turn_item_attempt::Entity::find()
+                .filter(pioneer_entity::turn_item_attempt::Column::TurnId.eq(&turn.id))
+                .filter(pioneer_entity::turn_item_attempt::Column::ItemId.eq(item_id))
+                .one(&store.connection)
                 .await
                 .unwrap()
-        );
-        // A rehydrated facade reads the same durable policy; no in-process cache.
-        let restored = CrudStore::new(store.connection.clone());
-        assert!(
-            restored
-                .has_native_tool_work_policy(&turn.id, item_id)
-                .await
-                .unwrap()
-        );
-        store
-            .heartbeat_turn_item_attempt(
-                &turn.id,
-                item_id,
-                TurnItemType::DynamicToolCall,
-                at + 400,
-                Some(at + 520),
-                None,
-                None,
-            )
-            .await
-            .unwrap();
-        let attempt = pioneer_entity::turn_item_attempt::Entity::find()
-            .filter(pioneer_entity::turn_item_attempt::Column::TurnId.eq(&turn.id))
-            .filter(pioneer_entity::turn_item_attempt::Column::ItemId.eq(item_id))
-            .one(&store.connection)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(attempt.idle_deadline_at, Some(unix_to_datetime(at + 602)));
-        assert_eq!(attempt.hard_deadline_at, Some(unix_to_datetime(at + 602)));
-        assert_eq!(store.get_turn_liveness(&turn.id).await.unwrap(), liveness);
-        assert!(
+                .unwrap();
+            let expected_deadline = (!delegated).then(|| unix_to_datetime(at + 602));
+            assert_eq!(attempt.idle_deadline_at, expected_deadline);
+            assert_eq!(attempt.hard_deadline_at, expected_deadline);
+            assert_eq!(attempt.lease_expires_at, Some(unix_to_datetime(at + 520)));
+            assert_eq!(store.get_turn_liveness(&turn.id).await.unwrap(), liveness);
+            assert!(
+                store
+                    .list_timeout_candidates(at + 450, 10)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "declared silent work must not reach generic 90/300s horizon"
+            );
             store
-                .list_timeout_candidates(at + 450, 10)
+                .heartbeat_turn_item_attempt(
+                    &turn.id,
+                    item_id,
+                    TurnItemType::DynamicToolCall,
+                    at + 600,
+                    Some(at + 720),
+                    None,
+                    None,
+                )
                 .await
-                .unwrap()
-                .is_empty(),
-            "declared silent work must not reach generic 90/300s horizon"
-        );
-        store
-            .heartbeat_turn_item_attempt(
-                &turn.id,
-                item_id,
-                TurnItemType::DynamicToolCall,
-                at + 600,
-                Some(at + 720),
-                None,
-                None,
-            )
-            .await
-            .unwrap();
-        assert_eq!(
+                .unwrap();
+            assert_eq!(
+                store
+                    .list_timeout_candidates(at + 603, 10)
+                    .await
+                    .unwrap()
+                    .len(),
+                usize::from(!delegated),
+                "only a finite leaf owns the work cap"
+            );
+            if delegated {
+                assert_eq!(
+                    store
+                        .list_timeout_candidates(at + 721, 10)
+                        .await
+                        .unwrap()
+                        .len(),
+                    1,
+                    "delegation must retain the actor lease even without a parent work clock"
+                );
+            }
             store
-                .list_timeout_candidates(at + 603, 10)
+                .update_turn_status(
+                    &thread.id,
+                    &turn.id,
+                    TurnStatus::Failed,
+                    Some("fixture"),
+                    at + 604,
+                )
                 .await
-                .unwrap()
-                .len(),
-            1,
-            "owner renewal cannot evade declared work cap"
-        );
-        store
-            .update_turn_status(
-                &thread.id,
-                &turn.id,
-                TurnStatus::Failed,
-                Some("fixture"),
-                at + 604,
-            )
-            .await
-            .unwrap();
-        assert!(
-            store
-                .record_tool_output("late_policy", &notification)
-                .await
-                .is_err()
-        );
-        assert_eq!(
-            store
-                .tool_output_page(&thread.workspace_id, &thread.id, &turn.id, item_id, 0)
-                .await
-                .unwrap()
-                .len(),
-            1
-        );
+                .unwrap();
+            assert!(
+                store
+                    .record_tool_output("late_policy", &notification)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                store
+                    .tool_output_page(&thread.workspace_id, &thread.id, &turn.id, item_id, 0)
+                    .await
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
     }
 
     #[tokio::test]
