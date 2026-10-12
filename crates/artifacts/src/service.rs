@@ -728,11 +728,18 @@ impl ArtifactService {
             });
         }
 
+        let selected_version =
+            artifact
+                .version_id
+                .as_deref()
+                .ok_or_else(|| ArtifactError::InvalidRequest {
+                    message: "artifact immutable version is unavailable".to_owned(),
+                })?;
         let blob = self
             .read_blob_descriptor(
                 params.workspace_id.as_str(),
                 params.artifact_id.as_str(),
-                params.version_id.as_deref(),
+                Some(selected_version),
                 params.projection_kind,
             )
             .await?;

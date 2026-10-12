@@ -420,8 +420,10 @@ impl ArtifactToolHandler {
         self.emit_artifact_register_notifications(&outcome.summary)
             .await;
 
+        let progress =
+            artifact_version_progress(&outcome.summary.workspace_id, &outcome.summary.artifact);
         serde_json::to_value(&outcome.response)
-            .map(function_output)
+            .map(|payload| function_output_with_progress(payload, progress))
             .map_err(|error| {
                 ToolError::internal(format!(
                     "failed to serialize artifact_register response: {error}"
@@ -455,6 +457,7 @@ impl ArtifactToolHandler {
             .await
             .map_err(|error| ToolError::execution_failed(format!("{error:#}")))?;
 
+        let progress = artifact_version_progress(&self.context.workspace_id, &response.artifact);
         let text = artifact_read_text(
             response.artifact.kind,
             response.artifact.mime_type.as_deref(),
@@ -507,9 +510,9 @@ impl ArtifactToolHandler {
         }
 
         let rendered = artifact_read_rendered_text(&payload);
-        Ok(Box::new(FunctionToolOutput::with_payload(
-            rendered, true, payload,
-        )))
+        Ok(Box::new(
+            FunctionToolOutput::with_payload(rendered, true, payload).with_progress(progress),
+        ))
     }
 
     async fn emit_artifact_register_notifications(&self, summary: &ArtifactSummary) {
@@ -1301,9 +1304,45 @@ fn artifact_prepare_kind_to_artifact_kind(kind: ArtifactPrepareKind) -> Artifact
     }
 }
 
-fn function_output(payload: JsonValue) -> Box<dyn ToolOutput> {
+fn function_output_with_progress(
+    payload: JsonValue,
+    progress: pioneer_tools::ToolProgressEvidence,
+) -> Box<dyn ToolOutput> {
     let text = serde_json::to_string_pretty(&payload).unwrap_or_else(|_| payload.to_string());
-    Box::new(FunctionToolOutput::with_payload(text, true, payload))
+    Box::new(FunctionToolOutput::with_payload(text, true, payload).with_progress(progress))
+}
+
+fn artifact_version_progress(
+    workspace_id: &str,
+    artifact: &pioneer_protocol::ArtifactRef,
+) -> pioneer_tools::ToolProgressEvidence {
+    let (Some(version), Some(size), Some(sha)) = (
+        artifact.version_id.as_deref(),
+        artifact.size_bytes,
+        artifact.sha256.as_deref(),
+    ) else {
+        return Default::default();
+    };
+    if workspace_id.is_empty()
+        || workspace_id.len() > 512
+        || artifact.artifact_id.is_empty()
+        || artifact.artifact_id.len() > 256
+        || version.is_empty()
+        || version.len() > 256
+        || sha.len() != 64
+        || !sha.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Default::default();
+    }
+    let resource =
+        serde_json::to_vec(&("artifact-version-v1", workspace_id, &artifact.artifact_id))
+            .expect("fixed typed artifact identity");
+    let revision =
+        serde_json::to_vec(&(version, size, sha)).expect("fixed immutable artifact version");
+    pioneer_tools::ToolProgressEvidence::resource_state(
+        Sha256::digest(resource).into(),
+        Sha256::digest(revision).into(),
+    )
 }
 
 fn artifact_read_text(
@@ -1476,6 +1515,52 @@ mod tests {
     use serde_json::Value as JsonValue;
     use std::time::{SystemTime, UNIX_EPOCH};
     use tokio_util::sync::CancellationToken;
+
+    #[test]
+    fn immutable_artifact_evidence_is_independent_of_page_display_and_projection() {
+        let mut artifact = pioneer_protocol::ArtifactRef {
+            artifact_id: "artifact1".into(),
+            version_id: Some("version1".into()),
+            display_name: "display.txt".into(),
+            kind: ArtifactKind::Text,
+            mime_type: Some("text/plain".into()),
+            size_bytes: Some(1000),
+            sha256: Some("a".repeat(64)),
+            status: pioneer_protocol::ArtifactStatus::Ready,
+            preview: None,
+        };
+        let first = artifact_version_progress("workspace", &artifact);
+        assert!(matches!(
+            first.semantic,
+            pioneer_tools::ToolSemanticEvidence::ResourceState { .. }
+        ));
+        artifact.display_name = "new display name".into();
+        artifact.mime_type = Some("application/json".into());
+        assert_eq!(artifact_version_progress("workspace", &artifact), first);
+        let output = function_output_with_progress(json!({"text":"echo","offset":999}), first);
+        assert_eq!(
+            output.progress_evidence(),
+            first,
+            "model page is not the authoritative version"
+        );
+        artifact.version_id = Some("version2".into());
+        assert_ne!(artifact_version_progress("workspace", &artifact), first);
+        assert_ne!(
+            artifact_version_progress("other_workspace", &artifact),
+            artifact_version_progress("workspace", &artifact)
+        );
+        artifact.sha256 = Some("unknown".into());
+        assert_eq!(
+            artifact_version_progress("workspace", &artifact).semantic,
+            pioneer_tools::ToolSemanticEvidence::Unknown
+        );
+        artifact.sha256 = Some("a".repeat(64));
+        artifact.version_id = None;
+        assert_eq!(
+            artifact_version_progress("workspace", &artifact).semantic,
+            pioneer_tools::ToolSemanticEvidence::Unknown
+        );
+    }
 
     fn temp_output_dir(label: &str) -> PathBuf {
         let nanos = SystemTime::now()

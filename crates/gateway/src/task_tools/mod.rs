@@ -2139,6 +2139,7 @@ impl TaskToolHandler {
                 }
             };
         let anchor = self.persist_task_anchor(response.task.id.as_str()).await?;
+        let progress = task_state_progress(&response.task);
         let mut output = task_create_tool_output(&response, &anchor);
         if let Some(object) = output.as_object_mut() {
             object.insert(
@@ -2153,7 +2154,7 @@ impl TaskToolHandler {
         }
         self.cache_mutation_output(&invocation, cache_key.as_deref(), &output)
             .await?;
-        Ok(function_output(output))
+        Ok(function_output_with_progress(output, progress))
     }
 
     async fn handle_wait(
@@ -2319,11 +2320,17 @@ impl TaskToolHandler {
             }
         };
         let final_answer_allowed = self.final_answer_allowed_after_accept(&response).await;
+        let progress = task_review_progress(
+            &response.task,
+            &response.run,
+            &response.candidate.id,
+            &response.review_event.id,
+        );
         let mut output = task_accept_tool_output(&response, final_answer_allowed);
         Self::attach_agent_action_result(&mut output, action_plan.as_ref())?;
         self.cache_mutation_output(&invocation, cache_key.as_deref(), &output)
             .await?;
-        Ok(function_output(output))
+        Ok(function_output_with_progress(output, progress))
     }
 
     async fn final_answer_allowed_after_accept(&self, response: &TaskAcceptResponse) -> bool {
@@ -2407,11 +2414,17 @@ impl TaskToolHandler {
                 )));
             }
         };
+        let progress = task_review_progress(
+            &response.task,
+            &response.run,
+            &response.candidate.id,
+            &response.review_event.id,
+        );
         let mut output = task_revise_tool_output(&response);
         Self::attach_agent_action_result(&mut output, action_plan.as_ref())?;
         self.cache_mutation_output(&invocation, cache_key.as_deref(), &output)
             .await?;
-        Ok(function_output(output))
+        Ok(function_output_with_progress(output, progress))
     }
 
     async fn handle_cancel(
@@ -2460,11 +2473,12 @@ impl TaskToolHandler {
             .cancel_task(mutation_context, params)
             .await
             .map_err(task_runtime_tool_error)?;
+        let progress = task_state_progress(&response.task);
         let mut output = json!({ "task": task_summary(&response.task) });
         Self::attach_agent_action_result(&mut output, action_plan.as_ref())?;
         self.cache_mutation_output(&invocation, cache_key.as_deref(), &output)
             .await?;
-        Ok(function_output(output))
+        Ok(function_output_with_progress(output, progress))
     }
 
     async fn handle_update(
@@ -2529,11 +2543,12 @@ impl TaskToolHandler {
             .update_task(mutation_context, params)
             .await
             .map_err(task_runtime_tool_error)?;
+        let progress = task_state_progress(&response.task);
         let mut output = task_update_tool_output(&response);
         Self::attach_agent_action_result(&mut output, action_plan.as_ref())?;
         self.cache_mutation_output(&invocation, cache_key.as_deref(), &output)
             .await?;
-        Ok(function_output(output))
+        Ok(function_output_with_progress(output, progress))
     }
 
     async fn handle_detach(
@@ -2582,11 +2597,12 @@ impl TaskToolHandler {
             .detach_task(mutation_context, params)
             .await
             .map_err(task_runtime_tool_error)?;
+        let progress = task_state_progress(&response.task);
         let mut output = json!({ "task": task_summary(&response.task) });
         Self::attach_agent_action_result(&mut output, action_plan.as_ref())?;
         self.cache_mutation_output(&invocation, cache_key.as_deref(), &output)
             .await?;
-        Ok(function_output(output))
+        Ok(function_output_with_progress(output, progress))
     }
 
     async fn handle_list(
@@ -2697,13 +2713,14 @@ impl TaskToolHandler {
             .list_task_run_execution_observations(&run_ids)
             .await
             .map_err(task_runtime_tool_error)?;
+        let progress = task_observation_progress(&response);
         let payload = task_get_tool_output(
             &response,
             configuration_allowed,
             &observations,
             now_timestamp_secs(),
         )?;
-        Ok(function_output(payload))
+        Ok(function_output_with_progress(payload, progress))
     }
 
     async fn handle_result(
@@ -2801,6 +2818,7 @@ impl TaskToolHandler {
             .reschedule_task(mutation_context, params)
             .await
             .map_err(task_runtime_tool_error)?;
+        let progress = task_state_progress(&response.task);
         let mut output = json!({
             "task": task_summary(&response.task),
             "trigger": task_trigger_model_output(&response.trigger),
@@ -2808,7 +2826,7 @@ impl TaskToolHandler {
         Self::attach_agent_action_result(&mut output, action_plan.as_ref())?;
         self.cache_mutation_output(&invocation, cache_key.as_deref(), &output)
             .await?;
-        Ok(function_output(output))
+        Ok(function_output_with_progress(output, progress))
     }
 
     async fn handle_pause(
@@ -2855,6 +2873,7 @@ impl TaskToolHandler {
             .pause_task(mutation_context, params)
             .await
             .map_err(task_runtime_tool_error)?;
+        let progress = task_state_progress(&response.task);
         let mut output = json!({
             "task": task_summary(&response.task),
             "triggers": task_trigger_details_output(&response.triggers),
@@ -2862,7 +2881,7 @@ impl TaskToolHandler {
         Self::attach_agent_action_result(&mut output, action_plan.as_ref())?;
         self.cache_mutation_output(&invocation, cache_key.as_deref(), &output)
             .await?;
-        Ok(function_output(output))
+        Ok(function_output_with_progress(output, progress))
     }
 
     async fn handle_resume(
@@ -2921,6 +2940,7 @@ impl TaskToolHandler {
             .resume_task(mutation_context, params)
             .await
             .map_err(task_runtime_tool_error)?;
+        let progress = task_state_progress(&response.task);
         let mut output = json!({
             "task": task_summary(&response.task),
             "triggers": task_trigger_details_output(&response.triggers),
@@ -2928,7 +2948,7 @@ impl TaskToolHandler {
         Self::attach_agent_action_result(&mut output, action_plan.as_ref())?;
         self.cache_mutation_output(&invocation, cache_key.as_deref(), &output)
             .await?;
-        Ok(function_output(output))
+        Ok(function_output_with_progress(output, progress))
     }
 
     async fn create_params(
@@ -4634,8 +4654,84 @@ fn dedup_preserve_order(values: &mut Vec<String>) {
 }
 
 fn function_output(payload: JsonValue) -> Box<dyn ToolOutput> {
+    function_output_with_progress(payload, Default::default())
+}
+
+fn function_output_with_progress(
+    payload: JsonValue,
+    progress: pioneer_tools::ToolProgressEvidence,
+) -> Box<dyn ToolOutput> {
     let text = serde_json::to_string_pretty(&payload).unwrap_or_else(|_| payload.to_string());
-    Box::new(FunctionToolOutput::with_payload(text, true, payload))
+    Box::new(FunctionToolOutput::with_payload(text, true, payload).with_progress(progress))
+}
+
+// Only typed domain fields enter these small tokens, before output projection.
+// A refreshed lease/timestamp or cached JSON is never a semantic revision.
+fn task_state_progress(task: &Task) -> pioneer_tools::ToolProgressEvidence {
+    if task.revision < 0
+        || task.workspace_id.is_empty()
+        || task.workspace_id.len() > 512
+        || task.id.is_empty()
+        || task.id.len() > 256
+        || task
+            .parent_task_id
+            .as_ref()
+            .is_some_and(|id| id.len() > 256)
+    {
+        return Default::default();
+    }
+    let resource = serde_json::to_vec(&("task-state-v1", &task.workspace_id, &task.id))
+        .expect("fixed typed task identity");
+    let revision = serde_json::to_vec(&(task.revision, task.status, &task.parent_task_id))
+        .expect("fixed typed task domain state");
+    pioneer_tools::ToolProgressEvidence::resource_state(
+        Sha256::digest(resource).into(),
+        Sha256::digest(revision).into(),
+    )
+}
+
+fn task_review_progress(
+    task: &Task,
+    run: &TaskRun,
+    candidate_id: &str,
+    review_id: &str,
+) -> pioneer_tools::ToolProgressEvidence {
+    if task.workspace_id.is_empty()
+        || task.workspace_id.len() > 512
+        || task.id.is_empty()
+        || task.id.len() > 256
+        || run.id.is_empty()
+        || run.id.len() > 256
+        || candidate_id.is_empty()
+        || review_id.is_empty()
+        || candidate_id.len() > 256
+        || review_id.len() > 256
+        || run.task_id != task.id
+    {
+        return Default::default();
+    }
+    let resource = serde_json::to_vec(&("task-review-v1", &task.workspace_id, &task.id, &run.id))
+        .expect("fixed typed review identity");
+    let revision = serde_json::to_vec(&(candidate_id, review_id, run.status))
+        .expect("fixed typed committed review receipt");
+    pioneer_tools::ToolProgressEvidence::resource_state(
+        Sha256::digest(resource).into(),
+        Sha256::digest(revision).into(),
+    )
+}
+
+fn task_observation_progress(response: &TaskGetResponse) -> pioneer_tools::ToolProgressEvidence {
+    // An unchanged parent configuration cannot attest that a live child stalled.
+    if !response.task.status.is_terminal()
+        || response.runs.len() > MAX_TASK_OBSERVATION_TARGETS
+        || response
+            .runs
+            .iter()
+            .any(|run| !run.status.is_terminal() || run.task_id != response.task.id)
+    {
+        return Default::default();
+    }
+    task_state_progress(&response.task)
 }
 
 fn required_tool_string(value: Option<&str>, field: &str) -> Result<String, ToolError> {
@@ -6413,6 +6509,74 @@ mod tests {
         assert_eq!(
             task_wait.spec.turn_item_execution_class,
             pioneer_protocol::TurnItemExecutionClass::DurableWait
+        );
+    }
+
+    #[test]
+    fn authoritative_task_domain_evidence_excludes_liveness_and_model_projection() {
+        let mut task = sample_task(TaskStatus::Running);
+        let state = task_state_progress(&task);
+        assert!(matches!(
+            state.semantic,
+            pioneer_tools::ToolSemanticEvidence::ResourceState { .. }
+        ));
+        task.updated_at += 1000;
+        task.title = "different rendered display".into();
+        assert_eq!(task_state_progress(&task), state);
+        task.revision += 1;
+        assert_ne!(task_state_progress(&task).semantic, state.semantic);
+        task.workspace_id = "other_workspace".into();
+        assert_ne!(task_state_progress(&task).semantic, state.semantic);
+        let mut run = sample_run(TaskRunStatus::WaitingReview);
+        let review = task_review_progress(&task, &run, "candidate1", "review1");
+        run.heartbeat_at = Some(99999);
+        run.lock_expires_at = Some(199999);
+        run.updated_at += 500;
+        assert_eq!(
+            task_review_progress(&task, &run, "candidate1", "review1"),
+            review
+        );
+        assert_ne!(
+            task_review_progress(&task, &run, "candidate1", "review2"),
+            review
+        );
+        let response = sample_task_response(
+            TaskStatus::Running,
+            vec![sample_run(TaskRunStatus::Running)],
+            None,
+        );
+        assert_eq!(
+            task_observation_progress(&response).semantic,
+            pioneer_tools::ToolSemanticEvidence::Unknown
+        );
+        let mut response = sample_task_response(
+            TaskStatus::Completed,
+            vec![sample_run(TaskRunStatus::Succeeded)],
+            None,
+        );
+        let completed = task_observation_progress(&response);
+        assert!(matches!(
+            completed.semantic,
+            pioneer_tools::ToolSemanticEvidence::ResourceState { .. }
+        ));
+        response.runs[0].heartbeat_at = Some(123456);
+        assert_eq!(task_observation_progress(&response), completed);
+        response.runs[0].status = TaskRunStatus::Running;
+        assert_eq!(
+            task_observation_progress(&response).semantic,
+            pioneer_tools::ToolSemanticEvidence::Unknown
+        );
+        assert_eq!(
+            function_output(json!({"task":{"revision":999999},"progress":"advanced"}))
+                .progress_evidence()
+                .semantic,
+            pioneer_tools::ToolSemanticEvidence::Unknown,
+            "cached/projected JSON cannot inject domain facts"
+        );
+        task.id = "x".repeat(257);
+        assert_eq!(
+            task_state_progress(&task).semantic,
+            pioneer_tools::ToolSemanticEvidence::Unknown
         );
     }
 
