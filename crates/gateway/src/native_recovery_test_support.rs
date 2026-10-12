@@ -100,7 +100,7 @@ pub(crate) async fn charged_native_window(
         "instructions":instructions,"capability_diagnostics":[],
         "skill_plan":{"tools":[],"read_skill_index":{},"excluded_tools":[]},
         "tool_metadata":pioneer_hooks::HookToolBundleSet::default(),"extension_specs":[],
-        "provider_tool_calling":false,"initiating_thread_id":null,"visible_tools":[],"core_tools":[],
+        "provider_tool_calling":true,"initiating_thread_id":null,"visible_tools":[],"core_tools":[],
         "selected_optional_tools":[],"requested_tools":[],"config":config,
         "preflight_usage":{"attempts":1,"known_tokens":receipts[0].0.unwrap_or(0)+receipts[0].1.unwrap_or(0),
             "unknown":receipts[0].0.is_none() || receipts[0].1.is_none()}
@@ -137,6 +137,12 @@ pub(crate) async fn charged_native_window(
     )
     .unwrap();
     snapshot.initial_phase_json = Some(phase);
+    let contract = pioneer_provider::Provider::capture_model_contract(
+        &pioneer_provider::EchoProvider::new(),
+        "test-model",
+    )
+    .unwrap();
+    snapshot.provider_model_contract_json = Some(serde_json::to_string(&contract).unwrap());
     store.upsert_turn_runtime_snapshot(snapshot).await.unwrap();
     for (ordinal, (input, output)) in receipts.into_iter().enumerate() {
         let item = pioneer_protocol::TurnItem::SystemEvent {

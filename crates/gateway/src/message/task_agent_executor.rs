@@ -11759,13 +11759,16 @@ mod tests {
                                 receiver.acknowledge_last(Ok(()));
                             }
                         });
-                        let phase = fresh
+                        let snapshot = fresh
                             .get_turn_runtime_snapshot(turn)
                             .await
                             .unwrap()
-                            .unwrap()
-                            .initial_phase_json
                             .unwrap();
+                        let contract = serde_json::from_str(
+                            snapshot.provider_model_contract_json.as_deref().unwrap(),
+                        )
+                        .unwrap();
+                        let phase = snapshot.initial_phase_json.unwrap();
                         let initial = pioneer_agent::NativeInitialPreparation::restore(
                             &phase,
                             workspace,
@@ -11778,7 +11781,7 @@ mod tests {
                             thread,workspace,pioneer_agent::RestoredRecoveryTurnRequest {
                                 turn_id:turn.into(),execution_window_index:4,mode:ThreadMode::Agent,
                                 hook_runtime_context:pioneer_agent::AgentTurnHookRuntimeContext::task(&task.id),
-                                model:"test-model".into(),provider_name:"echo".into(),azure_connection:None,provider_model_contract:None,
+                                model:"test-model".into(),provider_name:"echo".into(),azure_connection:None,provider_model_contract:Some(contract),
                                 initial_preparation:Some(initial),reasoning:None,workspace_skill_policies:Default::default(),
                                 skill_catalog:pioneer_skills::SkillCatalogSnapshot {version:1,generated_at_unix:0,skills:vec![]},
                                 agent_skill_overlay:vec![],input:vec![],capabilities:vec![],resolved_artifacts:vec![],runtime_environment:Default::default(),
