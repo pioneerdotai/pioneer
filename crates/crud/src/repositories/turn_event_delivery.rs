@@ -90,23 +90,45 @@ pub async fn claim_due<C: ConnectionTrait>(
         .add(turn_event_delivery::Column::Consumer.eq(consumer.to_owned()))
         .add(turn_event_delivery::Column::Status.eq(DELIVERY_STATUS_DELIVERING))
         .add(turn_event_delivery::Column::ClaimExpiresAt.lte(now));
-    // Canonical append can commit before its read-model projection. An
-    // episodic consumer must not ACK an absent/old item during that crash window.
+    // Canonical append can commit before its read-model projection. The
+    // contiguous watermark is authoritative even after receipt compaction
+    // (see turn_event_projection_state::is_projected). Quarantine does not
+    // invalidate an already projected prefix.
     let projection_ready = if consumer == CONSUMER_THREAD_EPISODIC {
-        use pioneer_entity::turn_event_projection_state as projection;
+        use pioneer_entity::turn_event_projection_stream_state as stream;
         Expr::exists(
             Query::select()
                 .expr(Expr::val(1_i64))
-                .from(projection::Entity)
+                .from(stream::Entity)
                 .and_where(
-                    Expr::col((projection::Entity, projection::Column::EventId)).eq(Expr::col((
+                    Expr::col((stream::Entity, stream::Column::TurnId)).eq(Expr::col((
                         turn_event_delivery::Entity,
-                        turn_event_delivery::Column::EventId,
+                        turn_event_delivery::Column::TurnId,
                     ))),
                 )
-                .and_where(projection::Column::Status.eq(
-                    crate::repositories::turn_event_projection_state::PROJECTION_STATUS_PROJECTED,
-                ))
+                .and_where(
+                    Expr::col((stream::Entity, stream::Column::ThreadId)).eq(Expr::col((
+                        turn_event_delivery::Entity,
+                        turn_event_delivery::Column::ThreadId,
+                    ))),
+                )
+                .and_where(
+                    Expr::col((
+                        turn_event_delivery::Entity,
+                        turn_event_delivery::Column::Sequence,
+                    ))
+                    .gt(0_i64),
+                )
+                .and_where(
+                    Expr::col((
+                        turn_event_delivery::Entity,
+                        turn_event_delivery::Column::Sequence,
+                    ))
+                    .lte(Expr::col((
+                        stream::Entity,
+                        stream::Column::ProjectedThroughSequence,
+                    ))),
+                )
                 .to_owned(),
         )
     } else {
@@ -193,10 +215,11 @@ fn no_pending_predecessor() -> SimpleExpr {
                     turn_event_delivery::Column::Sequence,
                 ))),
             )
-            .and_where(
-                Expr::col(("predecessor", turn_event_delivery::Column::Status))
-                    .is_not_in([DELIVERY_STATUS_DELIVERED, DELIVERY_STATUS_EXHAUSTED]),
-            )
+            // Fixed literals must match the partial index predicate. Keep NOT
+            // IN semantics: unknown nonterminal statuses also block delivery.
+            .and_where(Expr::cust(
+                "predecessor.status NOT IN ('delivered', 'exhausted')",
+            ))
             .to_owned(),
     )
     .not()

@@ -2106,7 +2106,13 @@ mod tests {
                 .try_get("", "foreign_keys")
                 .unwrap();
             assert_eq!(pragma, 0, "production single writer uses FK OFF");
-            Migrator::up(&db, Some((Migrator::migrations().len() - 1) as u32))
+            // Seed the legacy binding before frozen lifetime installs its
+            // root verification triggers, even when later migrations exist.
+            let before_frozen_lifetime = Migrator::migrations()
+                .iter()
+                .position(|migration| migration.name() == "m20261010_000001_frozen_lifetime")
+                .expect("frozen lifetime migration must remain registered");
+            Migrator::up(&db, Some(before_frozen_lifetime as u32))
                 .await
                 .unwrap();
             db.execute_unprepared(
