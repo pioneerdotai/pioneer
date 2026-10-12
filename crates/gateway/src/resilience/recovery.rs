@@ -4004,7 +4004,6 @@ impl RecoveryCoordinator {
                     });
                 }
                 if let Some(limit) = total_budget.max_provider_tokens_per_turn
-                    && !usage.provider_token_usage_unknown
                     && usage.total_provider_tokens >= limit
                 {
                     return Ok(ExecutionWindowContinuationAdmission::Block {
@@ -8000,6 +7999,71 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.is::<super::NativeSemanticCheckpointUnavailable>());
+    }
+
+    #[tokio::test]
+    async fn continuation_token_cap_uses_known_lower_bound_with_unknown_usage_in_all_modes() {
+        for mode in [
+            pioneer_tools::ToolNoProgressMode::Disabled,
+            pioneer_tools::ToolNoProgressMode::Observe,
+            pioneer_tools::ToolNoProgressMode::Enforce,
+        ] {
+            let mut config = test_tool_loop_config();
+            config.no_progress_mode = mode;
+            config.execution_windows.total.max_provider_tokens_per_turn = Some(10);
+            let (store, _, coordinator) = setup_coordinator_with_tool_loop_config(config).await;
+            let now = chrono::Utc::now().fixed_offset();
+            for (turn, tokens, available) in [
+                ("known_below_cap", 9, true),
+                ("unknown_below_cap", 9, false),
+                ("known_at_cap", 10, true),
+                ("unknown_at_cap", 10, false),
+            ] {
+                store
+                    .create_turn_execution_window(
+                        NewTurnExecutionWindowRecord {
+                            workspace_id: "token_budget_workspace".into(),
+                            thread_id: "token_budget_thread".into(),
+                            turn_id: turn.into(),
+                            window_index: 1,
+                            status: ExecutionWindowStatus::Checkpointed,
+                            exhaustion_reason: None,
+                            agent_round_count: 2,
+                            tool_call_count: 0,
+                            provider_token_count: tokens,
+                            metadata_json: serde_json::json!({
+                                "accountingSchemaVersion":1,"providerUsageAvailable":available
+                            }),
+                            started_at: now,
+                        },
+                        now,
+                        now,
+                    )
+                    .await
+                    .unwrap();
+                let usage = store
+                    .aggregate_turn_execution_window_usage(turn)
+                    .await
+                    .unwrap();
+                assert_eq!(usage.provider_token_usage_unknown, !available);
+                let admission = coordinator
+                    .execution_window_continuation_admission_for_turn(turn, None)
+                    .await
+                    .unwrap();
+                if tokens < 10 {
+                    assert_eq!(
+                        admission,
+                        super::ExecutionWindowContinuationAdmission::Open { window_index: 2 }
+                    );
+                } else {
+                    assert!(
+                        matches!(admission, super::ExecutionWindowContinuationAdmission::Block {
+                        stop_reason:None, reason, ..
+                    } if reason.contains("max_total_provider_tokens_per_turn"))
+                    );
+                }
+            }
+        }
     }
 
     #[tokio::test]
