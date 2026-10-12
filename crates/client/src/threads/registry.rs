@@ -4724,6 +4724,123 @@ mod tests {
     }
 
     #[test]
+    fn admission_user_item_delivery_keeps_projection_starting_until_confirmation() {
+        use crate::conversation::{reducer::TurnPhase, state_machine::TurnFlowState};
+        let core = core();
+        let mut snapshot = thread("a", "ws");
+        snapshot.origin_kind = ThreadOriginKind::Collaborative;
+        core.upsert_thread(snapshot);
+        request_admission(&core, "admission", "request");
+        let item = TurnItem::UserMessage {
+            id: "user-admission".into(),
+            text: "Send through Composer".into(),
+            attachments: vec![],
+        };
+        let deliveries = [
+            GatewayNotification::ItemStarted(ItemStartedNotification {
+                workspace_id: "ws".into(),
+                thread_id: "a".into(),
+                turn_id: "admission".into(),
+                item: item.clone(),
+            }),
+            GatewayNotification::ItemCompleted(ItemCompletedNotification {
+                workspace_id: "ws".into(),
+                thread_id: "a".into(),
+                turn_id: "admission".into(),
+                item,
+            }),
+        ];
+        for delivery in std::iter::once(None).chain(
+            deliveries
+                .into_iter()
+                .flat_map(|delivery| [Some(delivery.clone()), Some(delivery)]),
+        ) {
+            if let Some(delivery) = delivery {
+                core.apply_thread_notification(delivery);
+            }
+            let snapshot = core.thread_snapshot("a").unwrap();
+            let conversation = &snapshot.coordinator.conversation;
+            assert_eq!(
+                conversation.turn_flow_state(),
+                &TurnFlowState::Starting {
+                    turn_id: "admission".into(),
+                    pending_request_id: "request".into()
+                }
+            );
+            assert_eq!(conversation.pending_request_id(), Some("request"));
+            assert!(conversation.projection().composer_locked);
+            let rendered = rendered_thread(&core);
+            for projection in [conversation.projection(), &rendered.projection] {
+                let view = projection
+                    .turns
+                    .iter()
+                    .find(|turn| turn.id == "admission")
+                    .unwrap();
+                assert_eq!(view.phase, TurnPhase::Starting);
+                assert_eq!(view.error, None);
+                assert_eq!(projection.pending_request_id.as_deref(), Some("request"));
+            }
+            assert_composer_timeline(&core, 1, 0, false);
+        }
+        core.apply_thread_notification(GatewayNotification::TurnStarted(TurnStartedNotification {
+            workspace_id: "ws".into(),
+            thread_id: "a".into(),
+            turn: composer_admission(),
+        }));
+        assert_successful_admission(&core);
+    }
+
+    #[test]
+    fn admission_principal_refusal_keeps_exact_author_in_shared_renderer() {
+        for status in [
+            TurnStatus::Failed,
+            TurnStatus::Blocked,
+            TurnStatus::Interrupted,
+        ] {
+            let core = core();
+            let mut snapshot = thread("a", "ws");
+            snapshot.origin_kind = ThreadOriginKind::Collaborative;
+            core.upsert_thread(snapshot.clone());
+            let mut terminal = composer_admission();
+            terminal.status = status;
+            terminal.error = Some("Admission refused".into());
+            core.apply_thread_notification(admission_outcome_notification(&terminal));
+            for hydrate in [false, true] {
+                if hydrate {
+                    snapshot.turns = vec![terminal.clone()];
+                    snapshot.updated_at += 1;
+                    core.apply_thread_notification(GatewayNotification::ThreadUpdated(
+                        ThreadUpdatedNotification {
+                            thread: snapshot.clone(),
+                            placement: None,
+                        },
+                    ));
+                    let mut page = admission_outcome_page(&terminal);
+                    if let TimelineBlockKind::TurnState { author, .. } = &mut page.blocks[0].kind {
+                        *author = terminal.author.clone();
+                    }
+                    core.apply_thread_timeline_page(
+                        page.clone(),
+                        crate::timeline::semantic::TopLevelPageMergeMode::Merge,
+                    );
+                    core.apply_thread_timeline_page(
+                        page,
+                        crate::timeline::semantic::TopLevelPageMergeMode::Merge,
+                    );
+                }
+                assert_admission_outcome(&core, status, "Admission refused");
+                let rendered = rendered_thread(&core);
+                let row = rendered
+                    .rows
+                    .iter()
+                    .find(|row| row.key == "turn:admission:terminal-state")
+                    .unwrap();
+                assert_eq!(row.author, terminal.author);
+            }
+        }
+    }
+
+    #[test]
     fn restored_session_resumes_only_visible_thread_subscription_and_timeline() {
         let core = ClientCore::new();
         core.upsert_thread(thread("visible", "workspace"));

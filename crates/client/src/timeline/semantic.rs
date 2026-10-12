@@ -769,9 +769,28 @@ pub fn flatten_thread_semantic_timeline(
                     },
                 });
             }
-            TimelineBlockKind::TurnState { author, .. } => {
-                let Some(author) = ready_timeline_state_author(author.as_ref()) else {
-                    continue;
+            TimelineBlockKind::TurnState { author, state, .. } => {
+                // A Composer admission's refusal belongs to its exact user author.
+                // Keep the execution-author policy for work and other Turn states.
+                let admission_principal_outcome = block
+                    .turn_id
+                    .as_deref()
+                    .is_some_and(|turn_id| thread.admission_turn_ids.contains(turn_id))
+                    && matches!(
+                        state,
+                        TurnWorkState::Failed | TurnWorkState::Blocked | TurnWorkState::Interrupted
+                    )
+                    && matches!(
+                        author.as_ref().map(|author| &author.actor),
+                        Some(pioneer_protocol::PersistedActorRef::Principal(_))
+                    );
+                let author = if admission_principal_outcome {
+                    author.as_ref()
+                } else {
+                    let Some(author) = ready_timeline_state_author(author.as_ref()) else {
+                        continue;
+                    };
+                    author
                 };
                 rows.push(SemanticTimelineRow {
                     id: SemanticTimelineRowId::TopLevelBlock {

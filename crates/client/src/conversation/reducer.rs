@@ -360,6 +360,14 @@ impl ConversationProjector {
         self.view_state.in_flight_turn_id = state_machine.in_flight_turn_id().map(str::to_owned);
         self.view_state.pending_request_id = state_machine.pending_request_id().map(str::to_owned);
         self.view_state.phase_label = state_machine.status_label().to_owned();
+        // A user item can arrive while Composer is still waiting for admission.
+        // Its item lifecycle must not project that submission as executing work.
+        if let Some(turn_id) = state_machine.in_flight_turn_id()
+            && state_machine.pending_request_id().is_some()
+            && state_machine.is_local_admission(turn_id)
+        {
+            self.upsert_turn(turn_id, TurnPhase::Starting, None, None, None);
+        }
     }
 
     pub fn upsert_turn_snapshot_metadata(&mut self, turn: &Turn) {
