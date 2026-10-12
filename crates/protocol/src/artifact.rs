@@ -756,7 +756,13 @@ pub fn compact_html_timeline_item(item: &mut crate::TurnItem) {
     } = item
     {
         if matches!(tool_name.as_str(), "html_render" | "html_preview") {
-            if let Some(partial) = arguments.as_str() {
+            // Native lifecycle parsing wraps incomplete JSON in {"raw": ...}.
+            // Treat that wrapper like a partial argument string, without
+            // changing canonical arguments or non-HTML tool projections.
+            if let Some(partial) = arguments
+                .as_str()
+                .or_else(|| arguments.get("raw").and_then(serde_json::Value::as_str))
+            {
                 *arguments = serde_json::json!({"argumentsCharacters":partial.chars().count()});
             } else {
                 compact_html_timeline_value(arguments);

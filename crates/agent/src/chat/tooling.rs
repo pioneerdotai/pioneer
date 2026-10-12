@@ -1400,22 +1400,81 @@ mod tests {
 
     #[test]
     fn html_lifecycle_items_keep_source_out_of_timeline_snapshots() {
-        for arguments in [
-            r#"{"html":"<p>exact source</p>","title":"Page"}"#,
-            r#"{"html":"<p>partial"#,
-        ] {
-            let item = build_started_tool_turn_item(
-                "call".into(),
-                "html_render".into(),
-                arguments.into(),
-                None,
-                TurnItemExecutionClass::Standard,
-                None,
-                None,
-            );
-            let json = serde_json::to_value(item).unwrap();
-            assert!(!json.to_string().contains("<p>"));
+        for tool_name in ["html_render", "html_preview"] {
+            for (arguments, expected_arguments) in [
+                (
+                    r#"{"html":"<p>точный source</p>","title":"Page"}"#,
+                    serde_json::json!({
+                        "htmlCharacters": "<p>точный source</p>".chars().count(),
+                        "title": "Page",
+                    }),
+                ),
+                (
+                    r#"{"html":"<p>частичный"#,
+                    serde_json::json!({
+                        "argumentsCharacters": r#"{"html":"<p>частичный"#.chars().count(),
+                    }),
+                ),
+                (
+                    r#""<p>частичный""#,
+                    serde_json::json!({
+                        "argumentsCharacters": "<p>частичный".chars().count(),
+                    }),
+                ),
+            ] {
+                let items = [
+                    build_started_tool_turn_item(
+                        "call".into(),
+                        tool_name.into(),
+                        arguments.into(),
+                        None,
+                        TurnItemExecutionClass::Standard,
+                        None,
+                        None,
+                    ),
+                    build_completed_tool_turn_item(
+                        "call".into(),
+                        tool_name.into(),
+                        arguments.into(),
+                        None,
+                        TurnItemExecutionClass::Standard,
+                        None,
+                        None,
+                    ),
+                    build_failed_tool_turn_item(
+                        "call".into(),
+                        tool_name.into(),
+                        arguments.into(),
+                        "invalid arguments".into(),
+                        ToolOutcome::fatal(pioneer_tools::ToolErrorClass::InvalidArguments, None),
+                        None,
+                        TurnItemExecutionClass::Standard,
+                        None,
+                        None,
+                    ),
+                ];
+                for item in items {
+                    let json = serde_json::to_value(item).unwrap();
+                    assert!(!json.to_string().contains("<p>"));
+                    assert_eq!(json["arguments"], expected_arguments);
+                }
+            }
         }
+
+        let partial_arguments = r#"{"html":"<p>частичный"#;
+        let ordinary = build_started_tool_turn_item(
+            "ordinary-call".into(),
+            "ordinary_tool".into(),
+            partial_arguments.into(),
+            None,
+            TurnItemExecutionClass::Standard,
+            None,
+            None,
+        );
+        assert_eq!(
+            serde_json::to_value(ordinary).unwrap()["arguments"]["raw"],
+            partial_arguments,
+        );
     }
     use pioneer_protocol::AgentDurableEvent;
     use pioneer_tools::{
