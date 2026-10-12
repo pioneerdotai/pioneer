@@ -117,7 +117,6 @@ fn decide_execution_window_total_budget(
     }
 
     if let Some(max_provider_tokens) = total_budget.max_provider_tokens_per_turn
-        && !usage.provider_token_usage_unknown
         && usage.total_provider_tokens >= max_provider_tokens
     {
         return ExecutionWindowTotalBudgetDecision::Block(ExecutionWindowTotalBudgetBlock {
@@ -2870,12 +2869,12 @@ mod tests {
     }
 
     #[test]
-    fn total_budget_decision_does_not_block_on_unknown_provider_tokens() {
+    fn total_budget_decision_preserves_unknown_below_known_token_cap() {
         let usage = TurnExecutionUsageCounters {
             total_windows: 1,
             total_tool_calls: 4,
             total_wall_clock_ms: 500,
-            total_provider_tokens: 10_000,
+            total_provider_tokens: 9,
             provider_token_usage_unknown: true,
             consecutive_no_progress_windows: 0,
             consecutive_unconfirmed_progress_windows: 0,
@@ -2891,6 +2890,39 @@ mod tests {
                 next_window_index: 2
             }
         );
+    }
+
+    #[test]
+    fn unknown_usage_cannot_hide_exhausted_known_token_budget_in_any_mode() {
+        let usage = TurnExecutionUsageCounters {
+            total_windows: 1,
+            total_tool_calls: 4,
+            total_wall_clock_ms: 500,
+            total_provider_tokens: 10_000,
+            provider_token_usage_unknown: true,
+            consecutive_no_progress_windows: 0,
+            consecutive_unconfirmed_progress_windows: 0,
+        };
+        for mode in [
+            pioneer_tools::ToolNoProgressMode::Disabled,
+            pioneer_tools::ToolNoProgressMode::Observe,
+            pioneer_tools::ToolNoProgressMode::Enforce,
+        ] {
+            let ExecutionWindowTotalBudgetDecision::Block(block) =
+                decide_execution_window_total_budget(
+                    &usage,
+                    &total_budget(4, 100, Some(50_000), Some(10)),
+                    mode,
+                )
+            else {
+                panic!("unknown usage must not erase the exhausted known lower bound");
+            };
+            assert_eq!(
+                block.kind,
+                ExecutionWindowTotalBudgetBlockKind::MaxProviderTokens
+            );
+            assert!(usage.provider_token_usage_unknown);
+        }
     }
 
     #[test]
