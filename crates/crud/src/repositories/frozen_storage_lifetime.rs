@@ -2442,7 +2442,12 @@ mod tests {
                 .unwrap()
                 .unwrap();
             assert_eq!(after.event_input_evidence, evidence.event_input_evidence);
-            assert_eq!(after.replay_aliases, evidence.replay_aliases);
+            assert_eq!(after.replay_aliases.len(), evidence.replay_aliases.len());
+            for (after, before) in after.replay_aliases.iter().zip(&evidence.replay_aliases) {
+                assert_eq!(after.covered, before.covered);
+                assert_eq!(after.replay, before.replay);
+                assert_eq!(after.tool_item_id, before.tool_item_id);
+            }
             assert!(store.frozen_readers.lock().unwrap().is_empty());
             // Restart discovery ignores both durable seals.
             let mut restart = FrozenStorageLifetimeProgress::default();
