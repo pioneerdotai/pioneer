@@ -111,8 +111,8 @@ fn pause_after_batch(more: bool) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use migration::{Migrator, MigratorTrait};
     use pioneer_compaction::frozen::FrozenHistoryRef;
-    use pioneer_migration::{Migrator, MigratorTrait};
     use pioneer_sqlite::{
         SqliteDatabase, SqliteReadClass, SqliteReadEvent, SqliteReadObserver, SqliteWriteClass,
         SqliteWriteEvent, SqliteWriteExecutor, SqliteWriteObserver,
