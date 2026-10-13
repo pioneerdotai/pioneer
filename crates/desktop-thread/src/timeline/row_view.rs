@@ -1651,14 +1651,21 @@ mod tests {
                     v.presentation.body.as_ref().unwrap().0.entity_id()
                 });
                 let prepared_snapshot = row.read_with(cx, |v, _| v.presentation.snapshot.clone());
-                let before = row.read_with(cx, |v, cx| v.render_counts(cx));
+                // The retained indicator owns Spinner's frame request. Fast
+                // can redraw that child while reusing its row and body.
+                let spinner = row.read_with(cx, |v, _| {
+                    v.presentation
+                        .spinner
+                        .clone()
+                        .expect("running work spinner")
+                });
+                let before = spinner.read_with(cx, |v, _| v.renders);
                 let callbacks = cx.update(|window, cx| window.simulate_next_frame(cx));
                 assert!(callbacks > 0, "stock Spinner must schedule a frame");
                 cx.update(|window, cx| window.draw(cx).clear(cx));
                 cx.run_until_parked();
-                let after = row.read_with(cx, |v, cx| v.render_counts(cx));
-                assert!(after.0 > before.0);
-                assert!(after.1 > before.1, "uncached body must render at {width:?}");
+                let after = spinner.read_with(cx, |v, _| v.renders);
+                assert!(after > before, "Spinner must render its frame at {width:?}");
                 row.read_with(cx, |v, _| {
                     assert_eq!(
                         v.presentation.body.as_ref().unwrap().0.entity_id(),

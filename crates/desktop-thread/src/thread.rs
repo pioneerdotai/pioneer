@@ -765,6 +765,9 @@ mod tests {
             window.draw(cx).clear(cx);
             timeline.update(cx, |view, cx| {
                 view.reconcile_timeline(window, cx);
+                // The fixture replaces the single-use draw payload directly;
+                // notify its retained owner so Fast renders the new generation.
+                cx.notify();
             });
         });
         cx.run_until_parked();

@@ -188,6 +188,8 @@
 "timeline.file_change.one_file" = "1 फाइल"
 "timeline.file_change.output" = "आउटपुट"
 "timeline.file_change.running" = "बदलाव लागू हो रहे हैं"
+"timeline.html.failed" = "यह पेज नहीं दिखाया जा सका"
+"timeline.html.loading" = "पेज लोड हो रहा है…"
 "timeline.message.copy_action" = "कॉपी करें"
 "timeline.message.delete_action" = "हटाएँ"
 "timeline.message.delete_conflict" = "यह संदेश बदल गया है। दोबारा हटाने से पहले वर्तमान संस्करण देखें।"
