@@ -172,6 +172,7 @@ fn serialize_block(block: &MarkdownBlock) -> String {
             "#".repeat((*level).clamp(1, 6) as usize),
             serialize_inline(content)
         ),
+        MarkdownBlock::Table(table) => table.source.clone(),
         MarkdownBlock::Rule => "---".to_owned(),
         MarkdownBlock::Quote { blocks } => serialize_blocks(blocks)
             .split('\n')

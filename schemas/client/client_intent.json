@@ -7839,22 +7839,6 @@
           "properties": {
             "kind": {
               "type": "string",
-              "const": "default_model"
-            },
-            "selection": {
-              "$ref": "#/$defs/GatewayModelSelection"
-            }
-          },
-          "required": [
-            "kind",
-            "selection"
-          ]
-        },
-        {
-          "type": "object",
-          "properties": {
-            "kind": {
-              "type": "string",
               "const": "compaction_model"
             },
             "selection": {
@@ -7864,22 +7848,6 @@
           "required": [
             "kind",
             "selection"
-          ]
-        },
-        {
-          "type": "object",
-          "properties": {
-            "enabled": {
-              "type": "boolean"
-            },
-            "kind": {
-              "type": "string",
-              "const": "context_compaction"
-            }
-          },
-          "required": [
-            "kind",
-            "enabled"
           ]
         },
         {

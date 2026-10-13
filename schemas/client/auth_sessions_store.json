@@ -1,0 +1,174 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AuthSessionsStore",
+  "type": "object",
+  "properties": {
+    "error": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "loading": {
+      "type": "boolean"
+    },
+    "owner_generation": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "revoking": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/AuthSessionId"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "sessions": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/AuthSessionListItem"
+      }
+    }
+  },
+  "required": [
+    "owner_generation",
+    "sessions",
+    "loading"
+  ],
+  "$defs": {
+    "AuthDeviceSnapshot": {
+      "type": "object",
+      "properties": {
+        "client_kind": {
+          "$ref": "#/$defs/ClientKind"
+        },
+        "display_name": {
+          "type": "string"
+        },
+        "id": {
+          "$ref": "#/$defs/DeviceId"
+        },
+        "installation_id": {
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/$defs/DeviceStatus"
+        }
+      },
+      "required": [
+        "id",
+        "installation_id",
+        "display_name",
+        "client_kind",
+        "status"
+      ]
+    },
+    "AuthSessionId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "AuthSessionListItem": {
+      "type": "object",
+      "properties": {
+        "current": {
+          "type": "boolean"
+        },
+        "device": {
+          "$ref": "#/$defs/AuthDeviceSnapshot"
+        },
+        "last_seen_at_unix": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "session": {
+          "$ref": "#/$defs/AuthSessionSnapshot"
+        }
+      },
+      "required": [
+        "device",
+        "session",
+        "current",
+        "last_seen_at_unix"
+      ]
+    },
+    "AuthSessionSnapshot": {
+      "type": "object",
+      "properties": {
+        "device_id": {
+          "$ref": "#/$defs/DeviceId"
+        },
+        "id": {
+          "$ref": "#/$defs/AuthSessionId"
+        },
+        "refresh_expires_at_unix": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "refresh_generation": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "status": {
+          "$ref": "#/$defs/AuthSessionStatus"
+        },
+        "token_family_id": {
+          "$ref": "#/$defs/TokenFamilyId"
+        }
+      },
+      "required": [
+        "id",
+        "device_id",
+        "token_family_id",
+        "status",
+        "refresh_generation",
+        "refresh_expires_at_unix"
+      ]
+    },
+    "AuthSessionStatus": {
+      "type": "string",
+      "enum": [
+        "pending",
+        "active",
+        "revoked",
+        "expired"
+      ]
+    },
+    "ClientKind": {
+      "type": "string",
+      "enum": [
+        "desktop",
+        "mobile",
+        "other"
+      ]
+    },
+    "DeviceId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "DeviceStatus": {
+      "type": "string",
+      "enum": [
+        "pending",
+        "active",
+        "revoked"
+      ]
+    },
+    "TokenFamilyId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    }
+  }
+}

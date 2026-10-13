@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ClientRevisions",
+  "type": "object",
+  "properties": {
+    "content": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "domain": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "presentation": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "scoped": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    }
+  },
+  "required": [
+    "domain",
+    "presentation",
+    "content",
+    "scoped"
+  ]
+}

@@ -16,11 +16,15 @@
     "display_name": {
       "type": "string"
     },
+    "id": {
+      "type": "string"
+    },
     "kind": {
       "$ref": "#/$defs/ParsedUserAttachmentKind"
     }
   },
   "required": [
+    "id",
     "display_name",
     "kind"
   ],

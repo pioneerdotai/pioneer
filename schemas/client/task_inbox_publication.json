@@ -1,0 +1,603 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TaskInboxPublication",
+  "type": "object",
+  "properties": {
+    "error": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "items": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/TaskInboxItem"
+      }
+    },
+    "loading": {
+      "type": "boolean"
+    },
+    "native_notifications": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/TaskNotificationEffect"
+      }
+    },
+    "next_cursor": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "opened": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/TaskNotificationPublication"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "revision": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "workspace_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "workspace_id",
+    "revision",
+    "items",
+    "native_notifications",
+    "loading"
+  ],
+  "$defs": {
+    "AgentExecutionId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "AgentIdentityId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "AgentIdentitySourceKind": {
+      "type": "string",
+      "enum": [
+        "native_agent",
+        "cli_runtime_instance",
+        "ephemeral"
+      ]
+    },
+    "AgentPresentationSnapshot": {
+      "type": "object",
+      "properties": {
+        "agent_execution_id": {
+          "$ref": "#/$defs/AgentExecutionId"
+        },
+        "agent_identity_id": {
+          "$ref": "#/$defs/AgentIdentityId"
+        },
+        "avatar_revision": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "display_name": {
+          "type": "string"
+        },
+        "identity_source_kind": {
+          "$ref": "#/$defs/AgentIdentitySourceKind"
+        },
+        "identity_source_revision": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "nickname": {
+          "type": "string"
+        },
+        "role_label": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "agent_identity_id",
+        "agent_execution_id",
+        "identity_source_kind",
+        "identity_source_revision",
+        "display_name",
+        "nickname"
+      ]
+    },
+    "ProviderErrorReason": {
+      "description": "Allowlisted OpenRouter Chat Completions metadata.error_type values.\nDiagnostic only: these values must not drive recovery policy.",
+      "type": "string",
+      "enum": [
+        "context_length_exceeded",
+        "max_tokens_exceeded",
+        "token_limit_exceeded",
+        "string_too_long",
+        "authentication",
+        "permission_denied",
+        "payment_required",
+        "rate_limit_exceeded",
+        "provider_overloaded",
+        "provider_unavailable",
+        "invalid_request",
+        "invalid_prompt",
+        "not_found",
+        "precondition_failed",
+        "payload_too_large",
+        "unprocessable",
+        "content_policy_violation",
+        "refusal",
+        "invalid_image",
+        "image_too_large",
+        "image_too_small",
+        "unsupported_image_format",
+        "image_not_found",
+        "image_download_failed",
+        "server",
+        "timeout",
+        "unmapped"
+      ]
+    },
+    "ProviderFailureClass": {
+      "type": "string",
+      "enum": [
+        "network_transient",
+        "rate_limit",
+        "provider_5xx",
+        "auth_expired",
+        "auth_or_permission",
+        "model_not_found",
+        "prompt_too_long",
+        "context_too_large",
+        "max_output_tokens",
+        "stream_stall",
+        "stream_truncated",
+        "empty_response",
+        "provider_rejected",
+        "unsupported_parameter",
+        "unsupported_capability",
+        "unsupported_image_input",
+        "unsupported_tool_calling",
+        "unsupported_streaming",
+        "malformed_provider_request",
+        "invalid_request",
+        "permission_denied",
+        "unknown"
+      ]
+    },
+    "ProviderFailureStage": {
+      "type": "string",
+      "enum": [
+        "connect",
+        "first_chunk",
+        "mid_stream",
+        "finalize"
+      ]
+    },
+    "ProviderRequestId": {
+      "type": "string",
+      "maxLength": 128,
+      "pattern": "^(gen-|req-|cmpl-|chatcmpl-)[A-Za-z0-9_-]+$"
+    },
+    "ProviderTransportKind": {
+      "type": "string",
+      "enum": [
+        "stream",
+        "non_stream",
+        "ws",
+        "sse"
+      ]
+    },
+    "PublicError": {
+      "description": "Stable, bounded failure presentation shared by RPC, voice and task\nexecution surfaces. Raw source chains are never part of this type.",
+      "type": "object",
+      "properties": {
+        "code": {
+          "$ref": "#/$defs/PublicErrorCode"
+        },
+        "correlation_id": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "retry_after_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "retryable": {
+          "type": "boolean"
+        },
+        "stage": {
+          "$ref": "#/$defs/PublicErrorStage"
+        },
+        "version": {
+          "type": "integer",
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0
+        }
+      },
+      "required": [
+        "version",
+        "code",
+        "stage",
+        "message",
+        "retryable",
+        "correlation_id"
+      ]
+    },
+    "PublicErrorCode": {
+      "type": "string",
+      "enum": [
+        "invalid_input",
+        "policy_denied",
+        "not_found",
+        "conflict",
+        "resource_exhausted",
+        "unavailable",
+        "timeout",
+        "internal"
+      ]
+    },
+    "PublicErrorStage": {
+      "type": "string",
+      "enum": [
+        "discovery",
+        "admission",
+        "preparation",
+        "execution",
+        "persistence",
+        "delivery",
+        "observation"
+      ]
+    },
+    "PublicTaskArtifact": {
+      "type": "object",
+      "properties": {
+        "artifactId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "mimeType": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "versionId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "PublicTaskFailure": {
+      "type": "object",
+      "properties": {
+        "class": {
+          "$ref": "#/$defs/TaskErrorClass"
+        },
+        "error": {
+          "$ref": "#/$defs/PublicError"
+        },
+        "recoveryDiagnostic": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RecoveryDiagnostic"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "class",
+        "error"
+      ]
+    },
+    "PublicTaskResult": {
+      "type": "object",
+      "properties": {
+        "artifacts": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/PublicTaskArtifact"
+          }
+        },
+        "summary": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "RecoveryDiagnostic": {
+      "type": "object",
+      "properties": {
+        "lastFailure": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RecoveryProviderFailure"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "stopReason": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RecoveryStopReason"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "RecoveryProviderFailure": {
+      "type": "object",
+      "properties": {
+        "class": {
+          "$ref": "#/$defs/ProviderFailureClass"
+        },
+        "errorReason": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProviderErrorReason"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "httpStatus": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "requestId": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProviderRequestId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "retryAfterMs": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "stage": {
+          "$ref": "#/$defs/ProviderFailureStage"
+        },
+        "transport": {
+          "$ref": "#/$defs/ProviderTransportKind"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "class",
+        "stage",
+        "transport"
+      ]
+    },
+    "RecoveryStopReason": {
+      "type": "string",
+      "enum": [
+        "attempts_exhausted",
+        "wall_clock_exhausted",
+        "no_progress",
+        "policy_rejected",
+        "terminal_failure"
+      ]
+    },
+    "TaskErrorClass": {
+      "type": "string",
+      "enum": [
+        "cancelled",
+        "timeout",
+        "provider",
+        "tool",
+        "validation",
+        "dependency",
+        "policy",
+        "internal",
+        "unknown"
+      ]
+    },
+    "TaskInboxItem": {
+      "type": "object",
+      "properties": {
+        "dismissing": {
+          "type": "boolean"
+        },
+        "notification": {
+          "$ref": "#/$defs/TaskUserNotification"
+        },
+        "revision": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "notification",
+        "revision",
+        "dismissing"
+      ]
+    },
+    "TaskNotificationEffect": {
+      "type": "object",
+      "properties": {
+        "notification_id": {
+          "type": "string"
+        },
+        "revision": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "task_id": {
+          "type": "string"
+        },
+        "workspace_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "workspace_id",
+        "notification_id",
+        "task_id",
+        "revision"
+      ]
+    },
+    "TaskNotificationPublication": {
+      "type": "object",
+      "properties": {
+        "notification_id": {
+          "type": "string"
+        },
+        "operation_id": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "task_id": {
+          "type": "string"
+        },
+        "task_revision": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "thread_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "operation_id",
+        "notification_id",
+        "task_id",
+        "task_revision",
+        "thread_id"
+      ]
+    },
+    "TaskUserNotification": {
+      "description": "Durable exact-recipient Task notification returned by the user inbox.\n\nThe websocket notification is only a live invalidation hint. This record is\nthe reconnect-safe source of truth and deliberately contains only the\ncollaborator-safe Task projection.",
+      "type": "object",
+      "properties": {
+        "acknowledgedAt": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "author": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AgentPresentationSnapshot"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "createdAt": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "deliveryActionReceiptId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "deliveryId": {
+          "type": "string"
+        },
+        "error": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PublicTaskFailure"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "notificationId": {
+          "type": "string"
+        },
+        "result": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PublicTaskResult"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "runId": {
+          "type": "string"
+        },
+        "taskId": {
+          "type": "string"
+        },
+        "workspaceId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "notificationId",
+        "workspaceId",
+        "taskId",
+        "runId",
+        "deliveryId",
+        "createdAt"
+      ]
+    }
+  }
+}

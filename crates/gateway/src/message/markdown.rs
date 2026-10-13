@@ -4,7 +4,7 @@ use markdown::{
 };
 use pioneer_protocol::{
     MarkdownBlock, MarkdownDocument, MarkdownInline, MarkdownList, MarkdownListItem, MarkdownMark,
-    MarkdownMarkKind,
+    MarkdownMarkKind, MarkdownTable, MarkdownTableAlignment,
 };
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::time::{Duration, Instant};
@@ -151,7 +151,9 @@ fn parse_markdown_document_inner(
         }
     };
 
-    let blocks = parse_blocks(&root.children);
+    let mut definitions = Vec::new();
+    collect_table_definitions(&root.children, 0, false, &mut definitions);
+    let blocks = parse_blocks(&root.children, normalized, &definitions);
     if blocks.is_empty() {
         (
             MarkdownDocument::from_plain_text(normalized.to_owned()),
@@ -165,17 +167,25 @@ fn parse_markdown_document_inner(
     }
 }
 
-fn parse_blocks(nodes: &[Node]) -> Vec<MarkdownBlock> {
+fn parse_blocks(
+    nodes: &[Node],
+    source: &str,
+    definitions: &[TableReferenceDefinition<'_>],
+) -> Vec<MarkdownBlock> {
     let mut blocks = Vec::new();
     for node in nodes {
-        if let Some(block) = parse_block(node) {
+        if let Some(block) = parse_block(node, source, definitions) {
             blocks.push(block);
         }
     }
     blocks
 }
 
-fn parse_block(node: &Node) -> Option<MarkdownBlock> {
+fn parse_block(
+    node: &Node,
+    source: &str,
+    definitions: &[TableReferenceDefinition<'_>],
+) -> Option<MarkdownBlock> {
     match node {
         Node::Paragraph(paragraph) => Some(MarkdownBlock::Paragraph(parse_inline_nodes(
             &paragraph.children,
@@ -184,9 +194,9 @@ fn parse_block(node: &Node) -> Option<MarkdownBlock> {
             level: heading.depth.clamp(1, 6),
             content: parse_inline_nodes(&heading.children),
         }),
-        Node::List(list) => Some(MarkdownBlock::List(parse_list(list))),
+        Node::List(list) => Some(MarkdownBlock::List(parse_list(list, source, definitions))),
         Node::Blockquote(quote) => Some(MarkdownBlock::Quote {
-            blocks: parse_blocks(&quote.children),
+            blocks: parse_blocks(&quote.children, source, definitions),
         }),
         Node::Code(code) => Some(MarkdownBlock::Code {
             language: code.lang.clone(),
@@ -197,7 +207,7 @@ fn parse_block(node: &Node) -> Option<MarkdownBlock> {
             text: math.value.clone(),
         }),
         Node::ThematicBreak(_) => Some(MarkdownBlock::Rule),
-        Node::Table(table) => Some(parse_table(table)),
+        Node::Table(table) => Some(parse_table(table, source, definitions)),
         Node::Toml(toml) => Some(MarkdownBlock::Code {
             language: Some("toml".to_owned()),
             text: toml.value.clone(),
@@ -215,7 +225,7 @@ fn parse_block(node: &Node) -> Option<MarkdownBlock> {
             text: expr.value.clone(),
         }),
         Node::FootnoteDefinition(definition) => Some(MarkdownBlock::Quote {
-            blocks: parse_blocks(&definition.children),
+            blocks: parse_blocks(&definition.children, source, definitions),
         }),
         Node::Definition(_) => None,
         _ => {
@@ -229,39 +239,204 @@ fn parse_block(node: &Node) -> Option<MarkdownBlock> {
     }
 }
 
-fn parse_table(table: &mdast::Table) -> MarkdownBlock {
-    let mut lines = Vec::new();
-    for row in &table.children {
-        let Node::TableRow(row) = row else {
-            continue;
-        };
+// Borrow parser definitions in document order: the first definition wins, as in GFM.
+struct TableReferenceDefinition<'a> {
+    node: &'a mdast::Definition,
+    quote_depth: usize,
+    indented: bool,
+}
 
-        let mut cells = Vec::new();
-        for cell in &row.children {
-            let Node::TableCell(cell) = cell else {
-                continue;
-            };
-
-            let inline = parse_inline_nodes(&cell.children);
-            cells.push(inline.text.trim().to_owned());
+fn collect_table_definitions<'a>(
+    nodes: &'a [Node],
+    quote_depth: usize,
+    indented: bool,
+    out: &mut Vec<TableReferenceDefinition<'a>>,
+) {
+    for node in nodes {
+        if let Node::Definition(definition) = node {
+            out.push(TableReferenceDefinition {
+                node: definition,
+                quote_depth,
+                indented,
+            });
         }
-        lines.push(cells.join(" | "));
-    }
-
-    MarkdownBlock::Code {
-        language: Some("table".to_owned()),
-        text: lines.join("\n"),
+        if let Some(children) = node.children() {
+            collect_table_definitions(
+                children,
+                quote_depth + usize::from(matches!(node, Node::Blockquote(_))),
+                indented || matches!(node, Node::ListItem(_) | Node::FootnoteDefinition(_)),
+                out,
+            );
+        }
     }
 }
 
-fn parse_list(list: &mdast::List) -> MarkdownList {
+fn resolve_table_references(
+    nodes: &mut [Node],
+    definitions: &[TableReferenceDefinition<'_>],
+    used: &mut Vec<usize>,
+) {
+    for node in nodes {
+        let identifier = match node {
+            Node::LinkReference(reference) => Some(reference.identifier.as_str()),
+            Node::ImageReference(reference) => Some(reference.identifier.as_str()),
+            _ => None,
+        };
+        if let Some(ix) =
+            identifier.and_then(|id| definitions.iter().position(|d| d.node.identifier == id))
+        {
+            if !used.contains(&ix) {
+                used.push(ix);
+            }
+            if let Node::LinkReference(reference) = node {
+                let definition = definitions[ix].node;
+                *node = Node::Link(mdast::Link {
+                    children: std::mem::take(&mut reference.children),
+                    position: reference.position.clone(),
+                    url: definition.url.clone(),
+                    title: definition.title.clone(),
+                });
+            }
+        }
+        if let Some(children) = node.children_mut() {
+            resolve_table_references(children, definitions, used);
+        }
+    }
+}
+
+fn table_definition_source(definition: &TableReferenceDefinition<'_>, source: &str) -> String {
+    let position = definition
+        .node
+        .position
+        .as_ref()
+        .expect("GFM definition position");
+    source[position.start.offset..position.end.offset]
+        .split('\n')
+        .enumerate()
+        .map(|(ix, mut line)| {
+            if ix == 0 {
+                return line.trim_start_matches([' ', '\t']);
+            }
+            // Positions remove the first line's containers only. Remove ancestor
+            // quote markers and list indentation on continuation lines.
+            for _ in 0..definition.quote_depth {
+                let Some(rest) = line.trim_start_matches([' ', '\t']).strip_prefix('>') else {
+                    break;
+                };
+                line = rest
+                    .strip_prefix(' ')
+                    .or_else(|| rest.strip_prefix('\t'))
+                    .unwrap_or(rest);
+            }
+            if definition.indented {
+                line = line.trim_start_matches([' ', '\t']);
+            }
+            line
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn parse_table(
+    table: &mdast::Table,
+    source: &str,
+    definitions: &[TableReferenceDefinition<'_>],
+) -> MarkdownBlock {
+    let rows: Vec<_> = table
+        .children
+        .iter()
+        .filter_map(|node| {
+            if let Node::TableRow(row) = node {
+                Some(row)
+            } else {
+                None
+            }
+        })
+        .collect();
+    let mut used = Vec::new();
+    let mut cells = |row: &mdast::TableRow| {
+        row.children
+            .iter()
+            .filter_map(|node| {
+                if let Node::TableCell(cell) = node {
+                    let mut children = cell.children.clone();
+                    resolve_table_references(&mut children, definitions, &mut used);
+                    Some(parse_inline_nodes(&children))
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+    };
+
+    // markdown-rs puts row positions after container prefixes and before EOL.
+    // A whole-table slice would retain Quote/List prefixes on subsequent lines.
+    let row_source = |row: &mdast::TableRow| {
+        let position = row.position.as_ref().expect("GFM row position");
+        // unist offsets omit markdown-rs virtual spaces inside a tab. Remove
+        // remaining line indentation so a container tab cannot become code.
+        source[position.start.offset..position.end.offset].trim_start_matches([' ', '\t'])
+    };
+    let header = rows[0];
+    let header_end = header
+        .position
+        .as_ref()
+        .expect("GFM header position")
+        .end
+        .offset;
+    let table_end = table
+        .position
+        .as_ref()
+        .expect("GFM table position")
+        .end
+        .offset;
+    // The delimiter has no mdast row. Its first syntax byte is |, : or -;
+    // whitespace and > before it belong to indentation / ancestor quotes.
+    let delimiter = source[header_end + 1..table_end]
+        .split('\n')
+        .next()
+        .expect("GFM delimiter line")
+        .trim_start_matches([' ', '\t', '>']);
+    let mut fragment = vec![row_source(header), delimiter];
+    fragment.extend(rows.iter().skip(1).map(|row| row_source(row)));
+
+    let headers = cells(header);
+    let rows = rows.iter().skip(1).map(|row| cells(row)).collect();
+    let source_context = source;
+    let mut source = fragment.join("\n");
+    for ix in used {
+        source.push_str("\n\n");
+        source.push_str(&table_definition_source(&definitions[ix], source_context));
+    }
+    MarkdownBlock::Table(MarkdownTable {
+        headers,
+        rows,
+        alignments: table
+            .align
+            .iter()
+            .map(|align| match align {
+                mdast::AlignKind::None => MarkdownTableAlignment::None,
+                mdast::AlignKind::Left => MarkdownTableAlignment::Left,
+                mdast::AlignKind::Center => MarkdownTableAlignment::Center,
+                mdast::AlignKind::Right => MarkdownTableAlignment::Right,
+            })
+            .collect(),
+        source,
+    })
+}
+
+fn parse_list(
+    list: &mdast::List,
+    source: &str,
+    definitions: &[TableReferenceDefinition<'_>],
+) -> MarkdownList {
     let mut items = Vec::new();
     for child in &list.children {
         let Node::ListItem(item) = child else {
             continue;
         };
 
-        let mut blocks = parse_blocks(&item.children);
+        let mut blocks = parse_blocks(&item.children, source, definitions);
         if blocks.is_empty() {
             blocks.push(MarkdownBlock::Paragraph(MarkdownInline::default()));
         }
@@ -394,6 +569,48 @@ mod tests {
     use super::{
         catch_markdown_unwind, parse_markdown_document, parse_streaming_markdown_document,
     };
+    use pioneer_protocol::{MarkdownBlock, MarkdownMarkKind, MarkdownTableAlignment};
+
+    #[test]
+    fn table_preserves_gfm_and_inline_cells_without_container_prefixes() {
+        let fragment = "| **Имя** | [файл][docs] |\n| :--- | ---: |\n| a\\|b | `x` |";
+        let source = format!(
+            "> 1. {}\n\n> [DOCS]: pioneer://file/example\n> [unused]: https://unused.example",
+            fragment.replace('\n', "\n>    ")
+        );
+        let document = parse_markdown_document(&source);
+        let MarkdownBlock::Quote { blocks } = &document.blocks[0] else {
+            panic!("quote")
+        };
+        let MarkdownBlock::List(list) = &blocks[0] else {
+            panic!("list")
+        };
+        let MarkdownBlock::Table(table) = &list.items[0].blocks[0] else {
+            panic!("table")
+        };
+        assert_eq!(
+            table.source,
+            format!("{fragment}\n\n[DOCS]: pioneer://file/example")
+        );
+        assert_eq!(
+            table.alignments,
+            vec![MarkdownTableAlignment::Left, MarkdownTableAlignment::Right]
+        );
+        assert_eq!(table.headers[0].text, "Имя");
+        assert!(matches!(
+            table.headers[0].marks[0].kind,
+            MarkdownMarkKind::Bold
+        ));
+        assert!(matches!(
+            table.headers[1].marks[0].kind,
+            MarkdownMarkKind::Link { ref url } if url == "pioneer://file/example"
+        ));
+        assert_eq!(table.rows[0][0].text, "a|b");
+        assert!(matches!(
+            table.rows[0][1].marks[0].kind,
+            MarkdownMarkKind::Code
+        ));
+    }
 
     #[test]
     fn profiled_streaming_parser_preserves_the_markdown_document() {

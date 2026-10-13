@@ -17,6 +17,18 @@
     {
       "type": "object",
       "properties": {
+        "status": {
+          "type": "string",
+          "const": "approved_for_session"
+        }
+      },
+      "required": [
+        "status"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
         "reason": {
           "type": [
             "string",
