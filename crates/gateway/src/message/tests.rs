@@ -16,6 +16,9 @@ mod history_continuation;
 #[path = "tests/compaction_lifecycle_poll.rs"]
 mod compaction_lifecycle_poll;
 
+#[path = "tests/turn_completion_heartbeat.rs"]
+mod turn_completion_heartbeat;
+
 #[path = "tests/task_run_occurrence_tracker.rs"]
 mod task_run_occurrence_tracker;
 
@@ -33,8 +36,9 @@ mod reconciliation_workers;
 
 use super::{
     AuthenticatedTransferOwner, CLIRuntimeMachineRequestKey, MessageFuture, MessageProcessor,
-    ProgressItemRegistry, ResilienceWorkerFailureImpact, message_future, now_timestamp_secs,
-    record_resilience_worker_error, record_resilience_worker_poll_error,
+    ProgressItemRegistry, ResilienceWorkerFailureImpact, TURN_EXECUTION_OWNER_LEASE_SECONDS,
+    message_future, now_timestamp_secs, record_resilience_worker_error,
+    record_resilience_worker_poll_error,
 };
 use crate::bootstrap::bootstrap;
 use crate::cli_runtime::continuation::{
@@ -25831,7 +25835,7 @@ async fn a_child_first_continued_by_another_provider_or_after_source_edit_transf
 fn attached_cli_task_starts_while_its_parent_provider_turn_is_active() {
     run_standard_stack_message_test(
         "attached Task uses an independent CLI conversation",
-        attached_cli_task_starts_while_its_parent_provider_turn_is_active_impl(),
+        attached_cli_task_starts_while_its_parent_provider_turn_is_active_impl(false),
     );
 }
 
@@ -27752,7 +27756,9 @@ async fn cancelling_cli_history_transfer_stops_before_provider_start_and_release
     assert_eq!(next_input.matches("CANCELLED TRANSFER SUMMARY").count(), 1);
 }
 
-async fn attached_cli_task_starts_while_its_parent_provider_turn_is_active_impl() {
+async fn attached_cli_task_starts_while_its_parent_provider_turn_is_active_impl(
+    hold_history_pass: bool,
+) {
     let (tx, mut rx) = mpsc::channel(128);
     let sessions = Arc::new(SessionManager::new());
     let connection = register_authenticated_test_connection(sessions.as_ref(), tx).await;
@@ -27927,6 +27933,38 @@ async fn attached_cli_task_starts_while_its_parent_provider_turn_is_active_impl(
             .unwrap()
             .is_some()
     );
+    if hold_history_pass {
+        let original = store
+            .get_turn_execution(&child.child_turn_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            original.lease_until.timestamp() - original.heartbeat_at.timestamp(),
+            TURN_EXECUTION_OWNER_LEASE_SECONDS
+        );
+        turn_completion_heartbeat::hold_history_pass(&processor).await;
+        // Cross the child's original SQLite wall-clock lease boundary using
+        // production heartbeat cycles and Notify probes. The other Turn keeps
+        // the common pass held throughout; no test sleep or long fixture lease.
+        loop {
+            turn_completion_heartbeat::next_heartbeat(&processor).await;
+            if chrono::Utc::now().fixed_offset() >= original.lease_until {
+                break;
+            }
+        }
+        for turn_id in [parent_turn, child.child_turn_id.as_str()] {
+            assert!(
+                store
+                    .get_turn_execution(turn_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .lease_until
+                    > chrono::Utc::now().fixed_offset()
+            );
+        }
+    }
     complete_recorded_cli_task_turn(
         &processor,
         cli.as_ref(),
@@ -27943,6 +27981,29 @@ async fn attached_cli_task_starts_while_its_parent_provider_turn_is_active_impl(
         wait_for_task_status(store.clone(), &created.task.id, TaskStatus::Completed).await,
         TaskStatus::Completed
     );
+    if hold_history_pass {
+        assert_eq!(
+            store
+                .get_turn(&child.child_thread_id, &child.child_turn_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .1
+                .status,
+            TurnStatus::Completed,
+        );
+        assert_eq!(
+            store.get_task_run(&run.id).await.unwrap().unwrap().status,
+            pioneer_protocol::TaskRunStatus::Succeeded
+        );
+        assert!(
+            store
+                .has_turn_finalization_intent(&child.child_turn_id)
+                .await
+                .unwrap()
+        );
+        processor.release_completed_history_preparation_barrier();
+    }
     complete_recorded_cli_task_turn(
         &processor,
         cli.as_ref(),
@@ -27955,6 +28016,9 @@ async fn attached_cli_task_starts_while_its_parent_provider_turn_is_active_impl(
         "PARENT COMPLETES AFTER ATTACHED CHILD",
     )
     .await;
+    if hold_history_pass {
+        processor.shutdown_resilience_workers().await;
+    }
 }
 
 async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_impl() {
