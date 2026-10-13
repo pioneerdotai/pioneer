@@ -249,12 +249,15 @@ mod tests {
             SqliteWriteExecutor::with_observer(writer, observer.clone()),
             observer.clone(),
         );
-        assert!(database.reader_query_only_enabled().await.unwrap());
-        (
-            directory,
-            CrudStore::new(database).with_maintenance_access(),
-            observer,
-        )
+        let store = CrudStore::new(database).with_maintenance_access();
+        assert!(
+            store
+                .database_connection()
+                .reader_query_only_enabled()
+                .await
+                .unwrap()
+        );
+        (directory, store, observer)
     }
 
     #[tokio::test]
