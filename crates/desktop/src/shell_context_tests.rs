@@ -567,7 +567,7 @@ fn late_capabilities_enable_real_mcp_and_skills_buttons_and_revocation_closes_ac
             .unwrap();
         assert!(!shell.read(cx).can_manage);
     });
-    cx.dispatch_action(&crate::desktop_navigation::OpenMcp);
+    cx.dispatch_action(crate::desktop_navigation::OpenMcp);
     cx.run_until_parked();
     assert_eq!(
         core.navigation_snapshot().destination(),
