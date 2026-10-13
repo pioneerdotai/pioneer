@@ -1014,16 +1014,26 @@ AND NOT EXISTS(SELECT 1 FROM compaction_frozen_span s JOIN compaction_frozen_his
 }
 
 impl FrozenStorageLifetimeProgress {
-    /// Exactly one bounded phase step. False means every discovery family has
+    /// One eligible bounded phase step; skip at most one rotation of finished
+    /// or scope-blocked phases without making the worker sleep for each skip.
+    /// False means every discovery family has
     /// completed this pass, not that one phase happened to be empty. Rotating
     /// keysets revisit previously held rows on the next pass.
     pub async fn quantum(&mut self, store: &CrudStore) -> Result<bool> {
         let store = store.with_maintenance_access();
-        let phase = self.phase;
-        self.phase = (self.phase + 1) % 6;
-        if self.pass_done[phase] || (matches!(phase, 2 | 3 | 4) && !self.scope.done) {
-            return Ok(true);
+        let mut selected = None;
+        for _ in 0..self.pass_done.len() {
+            let phase = self.phase;
+            self.phase = (phase + 1) % self.pass_done.len();
+            if !self.pass_done[phase] && (!matches!(phase, 2 | 3 | 4) || self.scope.done) {
+                selected = Some(phase);
+                break;
+            }
         }
+        // Scope itself stays eligible until its checked EOF, so a blocked
+        // cleanup phase can never turn into a busy loop or a false global EOF.
+        let phase =
+            selected.ok_or_else(|| anyhow::anyhow!("lifetime pass has no eligible phase"))?;
         let result = match phase {
             0 => self.locator_quantum(&store).await,
             1 => self.proof_quantum(&store).await,
@@ -1083,11 +1093,18 @@ impl FrozenStorageLifetimeProgress {
             }
             return Ok(true);
         }
-        let kind = self.locator_kind;
-        self.locator_kind = (kind + 1) % 4;
-        if self.locator_done[kind] {
-            return Ok(true);
+        let mut selected = None;
+        for _ in 0..self.locator_done.len() {
+            let kind = self.locator_kind;
+            self.locator_kind = (kind + 1) % self.locator_done.len();
+            if !self.locator_done[kind] {
+                selected = Some(kind);
+                break;
+            }
         }
+        let Some(kind) = selected else {
+            return Ok(false);
+        };
         let (table, key, field) = ROOTS[kind];
         if self.locator_pending[kind].is_empty() {
             // Page actual PK metadata, not a filtered LIMIT that could walk an
@@ -1217,6 +1234,66 @@ impl FrozenStorageLifetimeProgress {
             return Ok(true);
         }
         let id = self.proof_pending.pop_front().expect("proof page");
+        // The page can be stale: an earlier root traversed this ancestor, or
+        // foreground publication sealed it while it waited. Only maintenance
+        // dequeue uses this shortcut; readers/publication still validate the
+        // entire historical graph. Read scalar metadata, never summary JSON.
+        let query = Query::select()
+            .from(checkpoint::Entity)
+            .column((checkpoint::Entity, checkpoint::Column::ProofVersion))
+            .column((checkpoint::Entity, checkpoint::Column::FormatVersion))
+            .column((checkpoint::Entity, checkpoint::Column::Status))
+            .expr_as(
+                Expr::col((operation::Entity, operation::Column::Status)),
+                Alias::new("operation_status"),
+            )
+            .join(
+                JoinType::InnerJoin,
+                operation::Entity,
+                Expr::col((operation::Entity, operation::Column::Id))
+                    .eq(Expr::col((
+                        checkpoint::Entity,
+                        checkpoint::Column::OperationId,
+                    )))
+                    .and(
+                        Expr::col((operation::Entity, operation::Column::Owner))
+                            .eq(Expr::col((checkpoint::Entity, checkpoint::Column::Owner))),
+                    ),
+            )
+            .join(
+                JoinType::InnerJoin,
+                context::Entity,
+                Expr::col((context::Entity, context::Column::Owner))
+                    .eq(Expr::col((checkpoint::Entity, checkpoint::Column::Owner))),
+            )
+            .and_where(Expr::col((checkpoint::Entity, checkpoint::Column::Id)).eq(&id))
+            .and_where(Expr::col((context::Entity, context::Column::FormatVersion)).eq(1))
+            .and_where(Expr::col((context::Entity, context::Column::WorkspaceId)).ne(""))
+            .and_where(Expr::col((context::Entity, context::Column::ThreadId)).ne(""))
+            .limit(1)
+            .to_owned();
+        let row = store
+            .connection
+            .query_one(&query)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("queued checkpoint missing or scope corrupt"))?;
+        let version: i64 = row.try_get("", "proof_version")?;
+        let format: i64 = row.try_get("", "format_version")?;
+        ensure!(
+            format == 1 && matches!(version, 0 | 1),
+            "queued checkpoint format/proofs unsupported"
+        );
+        let status: String = row.try_get("", "status")?;
+        let operation_status: String = row.try_get("", "operation_status")?;
+        let public =
+            operation_status == "completed" && matches!(status.as_str(), "applied" | "retained");
+        if version == 1 && public {
+            self.pass_changed = true;
+            return Ok(true);
+        }
+        // The no-projection discovery branch can also select private raw
+        // candidates. Preserve their full preparation/availability checks,
+        // even if another caller sealed them while the page was queued.
         self.proof = Some(checkpoint_proofs::GraphPreparation::new(&id));
         Ok(true)
     }
@@ -1259,11 +1336,18 @@ impl FrozenStorageLifetimeProgress {
             }
             return Ok(true);
         }
-        let kind = self.physical_kind;
-        self.physical_kind = (kind + 1) % 2;
-        if self.physical_done[kind] {
-            return Ok(true);
+        let mut selected = None;
+        for _ in 0..self.physical_done.len() {
+            let kind = self.physical_kind;
+            self.physical_kind = (kind + 1) % self.physical_done.len();
+            if !self.physical_done[kind] {
+                selected = Some(kind);
+                break;
+            }
         }
+        let Some(kind) = selected else {
+            return Ok(false);
+        };
         let table = if kind == 0 {
             "compaction_frozen_message_data"
         } else {
@@ -1788,6 +1872,12 @@ mod tests {
     use sea_orm::Database;
     use sha2::{Digest, Sha256};
     async fn fixture(published: bool) -> (CrudStore, FrozenHistoryRef) {
+        fixture_with_checkpoint_ids(published, ["cp-0", "cp-1"]).await
+    }
+    async fn fixture_with_checkpoint_ids(
+        published: bool,
+        ids: [&str; 2],
+    ) -> (CrudStore, FrozenHistoryRef) {
         let mut options = sea_orm::ConnectOptions::new("sqlite::memory:");
         options.max_connections(1).min_connections(1);
         let db = sea_orm::Database::connect(options).await.unwrap();
@@ -1883,7 +1973,7 @@ mod tests {
             previous_checkpoint: None,
             phase: if published {
                 RunnerPhase::Applied {
-                    checkpoint: "cp-1".into(),
+                    checkpoint: ids[1].into(),
                 }
             } else {
                 RunnerPhase::Failed {
@@ -1906,10 +1996,10 @@ mod tests {
         for (i, s) in sources.iter().enumerate() {
             db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,"INSERT INTO compaction_manifest(operation_id,ordinal,unit_ordinal,reference_only,source_thread,source_scope,source_id,source_version) VALUES('op',?1,?1,0,'thread',?2,?3,?4)",[(i as i64).into(),s.scope.clone().into(),s.id.clone().into(),s.version.clone().into()])).await.unwrap();
             let cp = Checkpoint {
-                id: format!("cp-{i}"),
+                id: ids[i].into(),
                 operation_id: "op".into(),
                 owner: "owner".into(),
-                previous: (i > 0).then(|| "cp-0".into()),
+                previous: (i > 0).then(|| ids[0].into()),
                 summary: format!("summary {i}"),
                 selection: ModelSelection {
                     transport: Transport::Api,
@@ -1956,6 +2046,501 @@ mod tests {
             assert!(!p.step(store).await.unwrap());
         }
         panic!("bounded expiry preparation must finish");
+    }
+
+    async fn legacy_locator_fixture() -> (CrudStore, FrozenHistoryRef) {
+        let mut options = sea_orm::ConnectOptions::new("sqlite::memory:");
+        options.max_connections(1).min_connections(1);
+        let db = Database::connect(options).await.unwrap();
+        db.execute_unprepared("PRAGMA foreign_keys=OFF")
+            .await
+            .unwrap();
+        let before = Migrator::migrations()
+            .iter()
+            .position(|m| m.name() == "m20261010_000001_frozen_lifetime")
+            .unwrap();
+        Migrator::up(&db, Some(before as u32)).await.unwrap();
+        db.execute_unprepared(
+            "INSERT INTO workspace(id,name,is_active,is_current) VALUES('ws','fixture',1,1)",
+        )
+        .await
+        .unwrap();
+        let h = FrozenHistoryRef {
+            format: 1,
+            manifest_id: "legacy-origin".into(),
+            messages: 0,
+            identity_sha256: hex::encode(Sha256::digest([])),
+        };
+        for index in 0..128 {
+            let id = format!("root-{index:04}");
+            db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+                "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES(?1,'ws','','agent','m','p','active','user','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)", [id.clone().into()])).await.unwrap();
+            let json = if index == 127 {
+                "malformed retaining legacy receipt".into()
+            } else if index == 0 || index == 2 {
+                serde_json::json!({"provider":"claude","padding":"x".repeat(if index == 2 { 150_000 } else { 0 }),"pioneerContext":{"version":4,"nativeThreadId":"native","acceptedTurnId":"turn","acceptedTurnRevision":1,"acceptedTurnDeleted":false,"contextOwnerThreadId":"root-0000","contextManifestOwnerThreadId":"root-0000","contextHistoryJson":serde_json::to_string(&h).unwrap()}}).to_string()
+            } else {
+                "{}".into()
+            };
+            db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+                "INSERT INTO thread_cli_runtime_binding(thread_id,workspace_id,runtime_id,runtime_kind,native_thread_id,resume_cursor_json,status) VALUES(?1,'ws','runtime','claude','native',?2,'active')", [id.into(), json.into()])).await.unwrap();
+        }
+        db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+            "INSERT INTO compaction_frozen_history(id,workspace_id,owner_thread,identity_sha256,message_count,next_ordinal,import_count,next_import,imports_sha256,ready) VALUES(?1,'ws','root-0000',?2,0,0,0,0,?2,1)", [h.manifest_id.clone().into(), h.identity_sha256.clone().into()])).await.unwrap();
+        // Unknown rows are a genuine pre-cutover fixture. Guards stay installed
+        // for every reconciliation, fresh write and corrupt-state action below.
+        Migrator::up(&db, None).await.unwrap();
+        (CrudStore::new(db).with_maintenance_access(), h)
+    }
+
+    async fn locator_marker(store: &CrudStore, id: &str) -> Option<String> {
+        pioneer_entity::thread_cli_runtime_binding::Entity::find_by_id(id)
+            .select_only()
+            .column(pioneer_entity::thread_cli_runtime_binding::Column::FrozenManifestId)
+            .into_tuple::<Option<String>>()
+            .one(&store.connection)
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn locator_portion_and_restart_keep_committed_ids_nulls_and_partial_byte_bounds() {
+        let (store, h) = legacy_locator_fixture().await;
+        let mut progress = FrozenStorageLifetimeProgress::default();
+        for _ in 0..64 {
+            progress.quantum(&store).await.unwrap();
+            if progress
+                .locator
+                .as_ref()
+                .is_some_and(|read| read.id == "root-0002" && !read.bytes.is_empty())
+            {
+                break;
+            }
+        }
+        assert!(
+            progress.locators[2].as_str() < "root-0127",
+            "only bounded metadata page was loaded"
+        );
+        assert!(progress.locator_pending[2].len() <= META_ROWS as usize);
+        assert_eq!(
+            locator_marker(&store, "root-0000").await.as_deref(),
+            Some("legacy-origin")
+        );
+        assert_eq!(locator_marker(&store, "root-0001").await, None);
+        assert_eq!(
+            locator_marker(&store, "root-0126").await.as_deref(),
+            Some("")
+        );
+
+        // Restart after an unfinished fragment: no promise to keep RAM bytes.
+        let read = progress.locator.as_ref().unwrap();
+        assert_eq!(read.id, "root-0002");
+        assert_eq!(read.bytes.len(), FRAGMENT_BYTES as usize);
+        drop(progress);
+        assert!(store.frozen_readers.lock().unwrap().is_empty());
+        let mut restart = FrozenStorageLifetimeProgress::default();
+        for _ in 0..20 {
+            restart.locator_quantum(&store).await.unwrap();
+            if restart.locator.is_some() {
+                break;
+            }
+        }
+        assert_eq!(restart.locator.as_ref().unwrap().id, "root-0002");
+        assert!(restart.locator.as_ref().unwrap().bytes.is_empty());
+        assert!(
+            restart
+                .locator_pending
+                .iter()
+                .flatten()
+                .all(|(id, _, _)| id != "root-0000" && id != "root-0001")
+        );
+        for _ in 0..1000 {
+            if restart.locator_quantum(&store).await.is_err() {
+                break;
+            }
+        }
+        assert_eq!(
+            locator_marker(&store, "root-0002").await.as_deref(),
+            Some("legacy-origin")
+        );
+        assert_eq!(
+            locator_marker(&store, "root-0127").await.as_deref(),
+            Some("")
+        );
+        // Unsafe retaining unknown receipt still protects the workspace, even
+        // when all useful reconciliation ahead of it has durably completed.
+        let free = FrozenHistoryRef {
+            format: 1,
+            manifest_id: "free-in-ws".into(),
+            messages: 0,
+            identity_sha256: hex::encode(Sha256::digest([])),
+        };
+        store
+            .compaction_begin_frozen_history("ws", "root-0000", &free)
+            .await
+            .unwrap();
+        drop(
+            store
+                .compaction_finish_frozen_history_held("ws", "root-0000", &free)
+                .await
+                .unwrap(),
+        );
+        let header = history::Entity::find_by_id(&free.manifest_id)
+            .one(&store.connection)
+            .await
+            .unwrap()
+            .unwrap();
+        expire(&store, &header).await.unwrap();
+        assert_eq!(
+            history::Entity::find_by_id(&free.manifest_id)
+                .one(&store.connection)
+                .await
+                .unwrap()
+                .unwrap()
+                .expired,
+            0
+        );
+        store.connection.execute_unprepared("UPDATE thread_cli_runtime_binding SET resume_cursor_json='{}',frozen_manifest_id=NULL WHERE thread_id='root-0127'").await.unwrap();
+        expire(&store, &header).await.unwrap();
+        assert_eq!(
+            history::Entity::find_by_id(&free.manifest_id)
+                .one(&store.connection)
+                .await
+                .unwrap()
+                .unwrap()
+                .expired,
+            1
+        );
+        assert_eq!(
+            history::Entity::find_by_id(&h.manifest_id)
+                .one(&store.connection)
+                .await
+                .unwrap()
+                .unwrap()
+                .expired,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn supported_fresh_roots_do_not_reintroduce_unknown_or_invalidate_scope_cursor() {
+        let (store, h) = legacy_locator_fixture().await;
+        let mut progress = FrozenStorageLifetimeProgress::default();
+        assert!(!progress.conversion_scope(&store).await.unwrap());
+        assert_eq!(progress.scope.after, h.manifest_id);
+        for id in ["a-fresh", "z-fresh"] {
+            let descriptor = FrozenHistoryRef {
+                format: 1,
+                manifest_id: id.into(),
+                messages: 0,
+                identity_sha256: hex::encode(Sha256::digest([])),
+            };
+            store
+                .compaction_begin_frozen_history("ws", "root-0000", &descriptor)
+                .await
+                .unwrap();
+        }
+        let now = chrono::Utc::now().fixed_offset();
+        for (id, json, expected) in [
+            ("root-0000", "{}".to_owned(), None),
+            ("root-0001", serde_json::json!({"provider":"claude","pioneerContext":{"version":4,"nativeThreadId":"native","acceptedTurnId":"turn","acceptedTurnRevision":1,"acceptedTurnDeleted":false,"contextManifestOwnerThreadId":"root-0000","contextOwnerThreadId":"root-0000","contextHistoryJson":serde_json::to_string(&h).unwrap()}}).to_string(), Some(h.manifest_id.clone())),
+        ] {
+            store.upsert_cli_runtime_thread_binding(crate::NewCliRuntimeThreadBinding {
+                thread_id: id.into(), workspace_id: "ws".into(), runtime_id: "runtime".into(), runtime_kind: "claude".into(), native_thread_id: "native".into(),
+                native_session_id: None, native_root_thread_id: None, native_cwd: None, native_model: None,
+                resume_cursor_json: json, status: "active".into(), created_at: now, updated_at: now,
+            }).await.unwrap();
+            assert_eq!(locator_marker(&store, id).await, expected);
+            assert!(store.connection.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+                "UPDATE thread_cli_runtime_binding SET frozen_manifest_id='' WHERE thread_id=?1", [id.into()])).await.is_err());
+        }
+        for _ in 0..30 {
+            if progress.scope.done {
+                break;
+            }
+            progress.conversion_scope(&store).await.unwrap();
+        }
+        assert!(progress.scope.done);
+        assert_eq!(
+            locator_marker(&store, "root-0127").await.as_deref(),
+            Some("")
+        );
+        assert!(store.frozen_readers.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn bounded_startup_steps_keep_cursor_barrier_and_distinct_backing_groups() {
+        let (store, _) = fixture(true).await;
+        for index in 0..256 {
+            let descriptor = FrozenHistoryRef {
+                format: 1,
+                manifest_id: format!("scope-{index:04}"),
+                messages: 0,
+                identity_sha256: hex::encode(Sha256::digest([])),
+            };
+            store
+                .compaction_begin_frozen_history("ws", "thread", &descriptor)
+                .await
+                .unwrap();
+        }
+        let mut progress = FrozenStorageLifetimeProgress::default();
+        // A worker portion is a finite number of these existing useful steps.
+        // Proof/locator/scopes remain fair while cleanup is scope-blocked.
+        for _ in 0..64 {
+            assert!(progress.quantum(&store).await.unwrap());
+        }
+        assert!(!progress.scope.done);
+        assert_eq!(progress.scope.family, 0);
+        assert!(progress.scope.after.starts_with("scope-"));
+        assert!(progress.scope.after.as_str() < "scope-0255");
+        assert!(
+            progress.expiry.is_none() && progress.sweep.is_none() && progress.discard.is_none()
+        );
+        let after = progress.scope.after.clone();
+        assert!(progress.quantum(&store).await.unwrap());
+        assert!(progress.scope.after >= after);
+        for _ in 0..1000 {
+            if progress.scope.done {
+                break;
+            }
+            progress.conversion_scope(&store).await.unwrap();
+        }
+        assert!(progress.scope.done);
+
+        // The fixture has two physical rows in ONE backing manifest. Preserve
+        // group discovery and the independent (manifest,kind) layout cursor.
+        let mut groups = ScopeDiscovery {
+            family: 2,
+            ..Default::default()
+        };
+        groups.step(&store).await.unwrap();
+        assert_eq!(groups.after, "origin");
+        groups.step(&store).await.unwrap();
+        assert_eq!(groups.family, 3);
+        store
+            .compact_frozen_storage_quantum(&mut progress)
+            .await
+            .unwrap();
+        let mut layouts = ScopeDiscovery {
+            family: 1,
+            ..Default::default()
+        };
+        layouts.step(&store).await.unwrap();
+        assert_eq!((&*layouts.after, layouts.kind), ("origin", 0));
+        layouts.step(&store).await.unwrap();
+        assert_eq!((&*layouts.after, layouts.kind), ("origin", 1));
+
+        // Unknown legacy scope blocks even after successful earlier objects.
+        // Model FK OFF corruption without disabling any installed trigger.
+        store.connection.execute_unprepared("INSERT INTO compaction_operation(id,owner,fingerprint,status,snapshot,deadline_ms) VALUES('zz-orphan','missing','orphan','failed','{}',1)").await.unwrap();
+        let mut restart = ScopeDiscovery::default();
+        let mut refused = false;
+        for _ in 0..1000 {
+            if restart.step(&store).await.is_err() {
+                refused = true;
+                break;
+            }
+        }
+        assert!(refused && !restart.done);
+        assert!(
+            !restart.step(&store).await.is_ok(),
+            "poison never becomes EOF"
+        );
+        assert_eq!(
+            history::Entity::find_by_id("origin")
+                .one(&store.connection)
+                .await
+                .unwrap()
+                .unwrap()
+                .expired,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn skipped_families_yield_to_unfinished_paths_and_confirm_global_eof() {
+        let (store, _) = fixture(true).await;
+        let mut progress = FrozenStorageLifetimeProgress::default();
+        progress.locator_done = [true, true, true, false];
+        progress.locator_kind = 0;
+        assert!(!progress.locator_quantum(&store).await.unwrap());
+        assert!(progress.locator_done.iter().all(|done| *done));
+        progress.physical_done = [true, false];
+        progress.physical_kind = 0;
+        assert!(!progress.sweep_quantum(&store).await.unwrap());
+        assert!(progress.physical_done.iter().all(|done| *done));
+
+        progress.pass_done = [true, true, false, false, false, false];
+        progress.phase = 0;
+        assert!(progress.quantum(&store).await.unwrap());
+        assert_eq!(
+            progress.scope.after, "origin",
+            "skip reaches scope in this call"
+        );
+        assert!(progress.expiry.is_none(), "scope barrier still active");
+        while !progress.scope.done {
+            progress.scope.step(&store).await.unwrap();
+        }
+        progress.phase = 0;
+        assert!(progress.quantum(&store).await.unwrap());
+        assert!(
+            progress.expiry.is_some(),
+            "unfinished cleanup receives next eligible step"
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_proof_rechecks_seal_from_traversal_or_concurrent_preparation() {
+        for ancestor_first in [true, false] {
+            let (store, _) = fixture_with_checkpoint_ids(true, ["b-parent", "a-root"]).await;
+            store
+                .connection
+                .execute_unprepared(
+                    "UPDATE compaction_checkpoint SET status='retained' WHERE id='b-parent'",
+                )
+                .await
+                .unwrap();
+            // Real discovery selects A then B at version zero. A's previous
+            // traversal seals B before its dequeue; no artificial ready marker.
+            let mut progress = FrozenStorageLifetimeProgress::default();
+            progress.proof_quantum(&store).await.unwrap();
+            assert_eq!(
+                progress.proof_pending,
+                VecDeque::from(["a-root".to_owned(), "b-parent".to_owned()])
+            );
+            if ancestor_first {
+                progress.proof_quantum(&store).await.unwrap();
+                for _ in 0..500 {
+                    if progress.proof.is_none() {
+                        break;
+                    }
+                    progress.proof_quantum(&store).await.unwrap();
+                }
+                assert!(progress.proof.is_none());
+            } else {
+                checkpoint_proofs::prepare_graph(&store, "a-root")
+                    .await
+                    .unwrap();
+                progress.proof_quantum(&store).await.unwrap();
+                assert!(progress.proof.is_none(), "concurrently sealed A is skipped");
+            }
+            let evidence = store
+                .compaction_checkpoint_edges("b-parent")
+                .await
+                .unwrap()
+                .unwrap();
+            progress.proof_quantum(&store).await.unwrap();
+            assert!(
+                progress.proof.is_none(),
+                "sealed B must never create GraphPreparation"
+            );
+            assert!(progress.proof_pending.is_empty());
+            let after = store
+                .compaction_checkpoint_edges("b-parent")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(after.event_input_evidence, evidence.event_input_evidence);
+            assert_eq!(after.replay_aliases, evidence.replay_aliases);
+            assert!(store.frozen_readers.lock().unwrap().is_empty());
+            // Restart discovery ignores both durable seals.
+            let mut restart = FrozenStorageLifetimeProgress::default();
+            restart.proof_quantum(&store).await.unwrap();
+            assert!(restart.proof_pending.is_empty() && restart.proof.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn queued_unsealed_missing_and_corrupt_proofs_do_not_gain_readiness() {
+        for corruption in [
+            "none",
+            "private_sealed",
+            "missing",
+            "format",
+            "scope",
+            "version",
+            "ownership",
+        ] {
+            let (store, _) = fixture(true).await;
+            let mut progress = FrozenStorageLifetimeProgress::default();
+            progress.proof_pending.push_back("cp-0".into());
+            if corruption == "private_sealed" {
+                checkpoint_proofs::prepare_graph(&store, "cp-0")
+                    .await
+                    .unwrap();
+            }
+            if corruption == "version" {
+                // CHECK (proof_version IN (0,1)) rejects this before dequeue.
+                // The unchanged marker must still take the unsealed path.
+                assert!(
+                    store
+                        .connection
+                        .execute_unprepared(
+                            "UPDATE compaction_checkpoint SET proof_version=2 WHERE id='cp-0'"
+                        )
+                        .await
+                        .is_err()
+                );
+                assert_eq!(
+                    checkpoint::Entity::find_by_id("cp-0")
+                        .select_only()
+                        .column(checkpoint::Column::ProofVersion)
+                        .into_tuple::<i64>()
+                        .one(&store.connection)
+                        .await
+                        .unwrap(),
+                    Some(0)
+                );
+            }
+            let sql = match corruption {
+                "missing" => Some("DELETE FROM compaction_checkpoint WHERE id='cp-0'"),
+                "format" => {
+                    Some("UPDATE compaction_checkpoint SET format_version=2 WHERE id='cp-0'")
+                }
+                "scope" => Some("DELETE FROM compaction_context WHERE owner='owner'"),
+                "ownership" => Some("DELETE FROM compaction_manifest WHERE source_id='event-0'"),
+                _ => None,
+            };
+            if let Some(sql) = sql {
+                store.connection.execute_unprepared(sql).await.unwrap();
+            }
+            let result = progress.proof_quantum(&store).await;
+            if matches!(
+                corruption,
+                "none" | "private_sealed" | "version" | "ownership"
+            ) {
+                result.unwrap();
+                assert!(
+                    progress.proof.is_some(),
+                    "unsealed roots and private candidates retain full validation"
+                );
+                let mut refused = false;
+                for _ in 0..500 {
+                    if progress.proof_quantum(&store).await.is_err() {
+                        refused = true;
+                        break;
+                    }
+                    if progress.proof.is_none() {
+                        break;
+                    }
+                }
+                assert_eq!(refused, corruption == "ownership");
+            } else {
+                assert!(result.is_err() && progress.proof.is_none());
+            }
+            drop(progress);
+            assert!(store.frozen_readers.lock().unwrap().is_empty());
+            assert_eq!(
+                history::Entity::find_by_id("origin")
+                    .one(&store.connection)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .expired,
+                0
+            );
+        }
     }
     #[tokio::test]
     async fn empty_phase_and_completed_scope_are_not_idle_while_lifetime_work_is_pending() {
