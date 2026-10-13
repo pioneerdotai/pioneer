@@ -37,7 +37,7 @@ pub(crate) struct CompletedHistoryPreparationBarrier {
 
 #[cfg(test)]
 impl CompletedHistoryPreparationBarrier {
-    fn arm(&self, turn: &str) {
+    pub(super) fn arm(&self, turn: &str) {
         *self.turn.lock().expect("preparation barrier lock") = Some(turn.to_owned());
     }
 
@@ -60,11 +60,11 @@ impl CompletedHistoryPreparationBarrier {
         }
     }
 
-    async fn wait_until_reached(&self) {
+    pub(super) async fn wait_until_reached(&self) {
         self.reached.notified().await;
     }
 
-    fn release(&self) {
+    pub(super) fn release(&self) {
         self.release.notify_one();
     }
 }

@@ -173,6 +173,15 @@ pub struct SidebarSummaryChanged {
     pub placement: Option<pioneer_protocol::ThreadPlacement>,
 }
 
+fn confirm_admission_page(
+    conversation: &mut crate::conversation::Conversation,
+    page: &pioneer_protocol::ThreadTimelinePageResponse,
+) {
+    conversation.confirm_admission_timeline_blocks(page.blocks.iter().filter(|block| {
+        block.workspace_id == page.workspace_id && block.thread_id == page.thread_id
+    }));
+}
+
 struct ThreadDomainStore {
     coordinator: ThreadCoordinator,
     semantic: SemanticTimelineState,
@@ -189,6 +198,17 @@ struct ThreadDomainStore {
 }
 
 impl ThreadDomainStore {
+    fn set_snapshot(&mut self, thread: Thread) {
+        if self.coordinator.thread() == Some(&thread) {
+            return;
+        }
+        crate::timeline::semantic::apply_thread_context_to_semantic_timeline(
+            &mut self.semantic,
+            &thread,
+        );
+        self.coordinator.set_snapshot(thread);
+    }
+
     fn new(id: &str, workspace: &str) -> Self {
         Self {
             coordinator: ThreadCoordinator::pending(id, workspace),
@@ -284,7 +304,7 @@ impl ThreadRegistry {
         let store = self.stores.entry(id.to_owned()).or_insert_with(|| {
             let mut store = ThreadDomainStore::new(id, workspace);
             if let Some(thread) = self.directory.threads.get(id) {
-                store.coordinator.set_snapshot(thread.clone());
+                store.set_snapshot(thread.clone());
             }
             store.generation = self.clock;
             store.subscriptions = self.subscription_counts.get(id).copied().unwrap_or(0);
@@ -823,6 +843,15 @@ impl DerefMut for ResumeMutation<'_> {
     }
 }
 impl<'a> ThreadMutation<'a> {
+    /// Accept a snapshot through the shared desktop/mobile mutation boundary.
+    pub fn set_snapshot(&mut self, thread: Thread) {
+        self.registry
+            .stores
+            .get_mut(&self.id)
+            .expect("retained thread")
+            .set_snapshot(thread);
+    }
+
     pub fn conversation_mutation(self) -> ConversationMutation<'a> {
         ConversationMutation(self)
     }
@@ -1184,7 +1213,13 @@ impl ClientCore {
         else {
             return false;
         };
-        crate::timeline::semantic::apply_thread_timeline_page(&mut state, page, mode)
+        let store = state
+            .registry
+            .stores
+            .get_mut(&state.id)
+            .expect("retained thread");
+        confirm_admission_page(&mut store.coordinator.conversation, &page);
+        crate::timeline::semantic::apply_thread_timeline_page(&mut store.semantic, page, mode)
     }
     pub fn apply_turn_work_page(
         &self,
@@ -1495,11 +1530,28 @@ impl ClientCore {
                 return Default::default();
             }
         }
+        if store
+            .coordinator
+            .conversation
+            .ignores_admission_response(&event)
+        {
+            return Default::default();
+        }
         store.coordinator.conversation.apply(event.clone());
-        let patch = match mode {
-            Some(mode) => crate::timeline::semantic::apply_local_composer_event_to_semantic_timeline_with_patch(&mut store.semantic, workspace, &event, mode, crate::timeline::labels::now_unix_ms()),
-            None => crate::timeline::semantic::apply_conversation_event_to_semantic_timeline_with_patch(&mut store.semantic, workspace, &event, crate::timeline::labels::now_unix_ms()),
-        };
+        let execution_mode = store
+            .coordinator
+            .thread()
+            .map(|thread| thread.origin_kind.composer_execution_mode())
+            .or(mode)
+            .unwrap_or(pioneer_protocol::ThreadComposerExecutionMode::ForegroundTurn);
+        let patch =
+            crate::timeline::semantic::apply_local_composer_event_to_semantic_timeline_with_patch(
+                &mut store.semantic,
+                workspace,
+                &event,
+                execution_mode,
+                crate::timeline::labels::now_unix_ms(),
+            );
         let drafts = registry.publish(&id);
         self.transition_directory(
             &mut registry,
@@ -2298,6 +2350,2546 @@ mod tests {
     use crate::conversation::ConversationEvent;
     use pioneer_protocol::*;
     use std::num::NonZeroUsize;
+    fn composer_admission() -> Turn {
+        let mut turn = running_turn("admission");
+        turn.author = Some(TurnAuthorSnapshot {
+            actor: PersistedActorRef::Principal(PrincipalId::new("P".repeat(21)).unwrap()),
+            display_name: "User".into(),
+            nickname: "user".into(),
+            avatar_revision: None,
+            agent: None,
+        });
+        turn
+    }
+
+    fn composer_occurrence() -> Turn {
+        let mut turn = running_turn("run");
+        turn.turn_kind = TurnKind::TaskRun;
+        turn.origin = TurnOrigin::DetachedTask;
+        turn.author = Some(TurnAuthorSnapshot {
+            actor: PersistedActorRef::AgentExecution(
+                AgentExecutionId::new("E".repeat(21)).unwrap(),
+            ),
+            display_name: "Codex".into(),
+            nickname: "codex".into(),
+            avatar_revision: Some("avatar".into()),
+            agent: None,
+        });
+        turn
+    }
+
+    fn composer_anchor() -> TurnItem {
+        TurnItem::Task {
+            item: TaskTurnItem {
+                id: "task_run_run".into(),
+                task_id: "task".into(),
+                run_id: Some("run".into()),
+                created_by_turn_id: Some("admission".into()),
+                parent_task_id: None,
+                root_task_id: None,
+                title: "Short title".into(),
+                status: TaskStatus::Running,
+                attachment: TaskAttachmentMode::Detached,
+                trigger_kind: TaskTriggerKind::Immediate,
+                executor_kind: TaskExecutorKind::Agent,
+                child_thread_id: Some("child-thread".into()),
+                child_turn_id: Some("child-turn".into()),
+                agent_role: Some("executor".into()),
+                depth: 0,
+                max_depth: 3,
+                next_fire_at: None,
+                progress_preview: None,
+                result_preview: None,
+                error_preview: None,
+                started_at: Some(2),
+                created_at: 1,
+                updated_at: 2,
+            },
+        }
+    }
+
+    // Read the same semantic renderer used by both shells. This assertion does
+    // not mutate, hydrate, or reconcile the state under test.
+    fn assert_composer_timeline(core: &ClientCore, users: usize, cards: usize, author_known: bool) {
+        let snapshot = core.thread_snapshot("a").unwrap();
+        let semantic = snapshot.semantic.thread("a").unwrap();
+        let flattened = crate::timeline::semantic::flatten_thread_semantic_timeline(semantic);
+        let rendered = crate::timeline::semantic_render::render_semantic_timeline_rows(
+            &flattened.rows,
+            snapshot.coordinator.conversation.projection().clone(),
+        );
+        assert!(rendered.rows.iter().all(|row| !matches!(
+            row.kind,
+            crate::timeline::rows::TimelineRowKind::RunningTurn(_)
+        )));
+        let blocks = semantic
+            .top_level
+            .ordered_block_ids
+            .iter()
+            .map(|id| semantic.top_level.block(id).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            blocks
+                .iter()
+                .filter(|b| matches!(b.kind, TimelineBlockKind::UserMessage { .. }))
+                .count(),
+            users
+        );
+        let tasks = blocks
+            .iter()
+            .filter(|b| matches!(b.kind, TimelineBlockKind::DetachedTaskRun { .. }))
+            .collect::<Vec<_>>();
+        assert_eq!(tasks.len(), cards);
+        if cards == 1 {
+            let TimelineBlockKind::DetachedTaskRun { task, author } = &tasks[0].kind else {
+                unreachable!()
+            };
+            assert_eq!(task.task_id, "task");
+            assert_eq!(task.run_id.as_deref(), Some("run"));
+            assert_eq!(task.created_by_turn_id.as_deref(), Some("admission"));
+            assert_eq!(task.child_thread_id.as_deref(), Some("child-thread"));
+            assert_eq!(task.child_turn_id.as_deref(), Some("child-turn"));
+            assert_eq!(task.agent_role.as_deref(), Some("executor"));
+            if author_known {
+                assert_eq!(author.as_ref(), composer_occurrence().author.as_ref());
+                let row = rendered
+                    .rows
+                    .iter()
+                    .find(|row| row.key == tasks[0].block_id)
+                    .unwrap();
+                assert_eq!(row.author.as_ref(), composer_occurrence().author.as_ref());
+            }
+            if users == 1 {
+                assert!(matches!(
+                    blocks[0].kind,
+                    TimelineBlockKind::UserMessage { .. }
+                ));
+                assert!(matches!(
+                    blocks[1].kind,
+                    TimelineBlockKind::DetachedTaskRun { .. }
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn collaborative_timeline_sequence_is_consistent_for_local_other_client_and_restore() {
+        for local_send in [false, true] {
+            for item_first in [false, true] {
+                for restore in [false, true] {
+                    let core = core();
+                    let mut snapshot = thread("a", "ws");
+                    snapshot.origin_kind = ThreadOriginKind::Collaborative;
+                    if restore {
+                        snapshot.turns = vec![composer_admission(), composer_occurrence()];
+                    }
+                    core.upsert_thread(snapshot);
+                    if local_send {
+                        core.apply_thread_conversation_event(
+                            "ws",
+                            ConversationEvent::LocalTurnStartRequested {
+                                thread_id: "a".into(),
+                                turn_id: "admission".into(),
+                                pending_request_id: "request".into(),
+                                mode: ThreadMode::Agent,
+                                user_text: "Full message, longer than Short title".into(),
+                                attachments: vec![],
+                            },
+                            None,
+                        );
+                        assert_eq!(
+                            core.thread_snapshot("a")
+                                .unwrap()
+                                .coordinator
+                                .conversation
+                                .pending_request_id(),
+                            Some("request")
+                        );
+                        assert_composer_timeline(&core, 1, 0, false);
+                    }
+                    let message = TurnItem::UserMessage {
+                        id: "user-admission".into(),
+                        text: "Full message, longer than Short title".into(),
+                        attachments: vec![],
+                    };
+                    for notification in [
+                        GatewayNotification::ItemStarted(ItemStartedNotification {
+                            workspace_id: "ws".into(),
+                            thread_id: "a".into(),
+                            turn_id: "admission".into(),
+                            item: message.clone(),
+                        }),
+                        GatewayNotification::ItemCompleted(ItemCompletedNotification {
+                            workspace_id: "ws".into(),
+                            thread_id: "a".into(),
+                            turn_id: "admission".into(),
+                            item: message.clone(),
+                        }),
+                        GatewayNotification::TurnStarted(TurnStartedNotification {
+                            workspace_id: "ws".into(),
+                            thread_id: "a".into(),
+                            turn: composer_admission(),
+                        }),
+                    ] {
+                        core.apply_thread_notification(notification.clone());
+                        core.apply_thread_notification(notification);
+                        assert_composer_timeline(&core, 1, 0, false);
+                    }
+                    assert!(
+                        core.thread_snapshot("a")
+                            .unwrap()
+                            .coordinator
+                            .conversation
+                            .can_submit_message()
+                    );
+                    assert!(
+                        core.thread_snapshot("a")
+                            .unwrap()
+                            .coordinator
+                            .conversation
+                            .in_flight_turn_id()
+                            .is_none()
+                    );
+                    if local_send {
+                        let token = core.thread_operation_token("a").unwrap();
+                        core.apply_thread_start_send_result(
+                            token,
+                            crate::turns::start::TurnStartSendReduction::Accepted {
+                                events: vec![ConversationEvent::LocalTurnStartAccepted {
+                                    thread_id: "a".into(),
+                                    turn_id: "admission".into(),
+                                    pending_request_id: "request".into(),
+                                    mode: ThreadMode::Agent,
+                                }],
+                            },
+                        );
+                        assert_composer_timeline(&core, 1, 0, false);
+                    }
+                    let started = GatewayNotification::TurnStarted(TurnStartedNotification {
+                        workspace_id: "ws".into(),
+                        thread_id: "a".into(),
+                        turn: composer_occurrence(),
+                    });
+                    let item = GatewayNotification::ItemStarted(ItemStartedNotification {
+                        workspace_id: "ws".into(),
+                        thread_id: "a".into(),
+                        turn_id: "run".into(),
+                        item: composer_anchor(),
+                    });
+                    let notifications = if item_first {
+                        vec![item, started]
+                    } else {
+                        vec![started, item]
+                    };
+                    let mut cards = 0;
+                    let mut known = restore;
+                    for notification in notifications {
+                        match &notification {
+                            GatewayNotification::ItemStarted(_) => cards = 1,
+                            GatewayNotification::TurnStarted(_) => known = true,
+                            _ => unreachable!(),
+                        }
+                        core.apply_thread_notification(notification.clone());
+                        assert_composer_timeline(&core, 1, cards, known);
+                        core.apply_thread_notification(notification);
+                        assert_composer_timeline(&core, 1, cards, known);
+                    }
+                    let before = core.thread_snapshot("a").unwrap();
+                    let mut canonical = before
+                        .semantic
+                        .thread("a")
+                        .unwrap()
+                        .top_level
+                        .blocks_by_id
+                        .values()
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    for block in &mut canonical {
+                        match &mut block.kind {
+                            TimelineBlockKind::DetachedTaskRun { author, .. } => {
+                                *author = composer_occurrence().author;
+                                block.sort_key = "00000000000000001000:admission:100:detached-task-run:task_run_run".into();
+                            }
+                            TimelineBlockKind::UserMessage { .. } => {
+                                block.sort_key = "00000000000000001000:admission:000:user".into()
+                            }
+                            _ => unreachable!(),
+                        }
+                    }
+                    canonical.sort_by_key(|block| {
+                        matches!(block.kind, TimelineBlockKind::UserMessage { .. })
+                    });
+                    // Card-only hydration followed by the parent page must also
+                    // preserve causality while the parent still has a live key.
+                    for block in canonical {
+                        core.apply_thread_timeline_page(
+                            ThreadTimelinePageResponse {
+                                workspace_id: "ws".into(),
+                                thread_id: "a".into(),
+                                projection_version: 4,
+                                blocks: vec![block],
+                                page: Default::default(),
+                            },
+                            crate::timeline::semantic::TopLevelPageMergeMode::Merge,
+                        );
+                        assert_composer_timeline(&core, 1, 1, true);
+                    }
+                    let mut incomplete_turn = composer_occurrence();
+                    incomplete_turn.author = None;
+                    core.apply_thread_notification(GatewayNotification::TurnStarted(
+                        TurnStartedNotification {
+                            workspace_id: "ws".into(),
+                            thread_id: "a".into(),
+                            turn: incomplete_turn,
+                        },
+                    ));
+                    assert_composer_timeline(&core, 1, 1, true);
+                    core.apply_thread_notification(GatewayNotification::ItemCompleted(
+                        ItemCompletedNotification {
+                            workspace_id: "ws".into(),
+                            thread_id: "a".into(),
+                            turn_id: "run".into(),
+                            item: composer_anchor(),
+                        },
+                    ));
+                    assert_composer_timeline(&core, 1, 1, true);
+                    let mut incomplete = composer_anchor();
+                    if let TurnItem::Task { item } = &mut incomplete {
+                        item.updated_at = 3;
+                        item.created_by_turn_id = None;
+                        item.run_id = None;
+                        item.child_thread_id = None;
+                        item.child_turn_id = None;
+                        item.agent_role = None;
+                    }
+                    core.apply_thread_notification(GatewayNotification::ItemUpdated(
+                        ItemUpdatedNotification {
+                            workspace_id: "ws".into(),
+                            thread_id: "a".into(),
+                            turn_id: "run".into(),
+                            item: incomplete,
+                        },
+                    ));
+                    assert_composer_timeline(&core, 1, 1, true);
+                    let mut parent = composer_admission();
+                    parent.status = TurnStatus::Completed;
+                    core.apply_thread_notification(GatewayNotification::TurnCompleted(
+                        TurnCompletedNotification {
+                            workspace_id: "ws".into(),
+                            thread_id: "a".into(),
+                            turn: parent,
+                        },
+                    ));
+                    assert_composer_timeline(&core, 1, 1, true);
+                    core.apply_thread_notification(GatewayNotification::TurnStarted(
+                        TurnStartedNotification {
+                            workspace_id: "ws".into(),
+                            thread_id: "a".into(),
+                            turn: composer_admission(),
+                        },
+                    ));
+                    assert_composer_timeline(&core, 1, 1, true);
+                    assert!(
+                        core.thread_snapshot("a")
+                            .unwrap()
+                            .coordinator
+                            .conversation
+                            .can_submit_message()
+                    );
+                    // A terminal card cannot reopen when an older live item arrives.
+                    let mut terminal = composer_anchor();
+                    if let TurnItem::Task { item } = &mut terminal {
+                        item.status = TaskStatus::Completed;
+                        item.updated_at = 4;
+                    }
+                    for item in [terminal, composer_anchor()] {
+                        core.apply_thread_notification(GatewayNotification::ItemUpdated(
+                            ItemUpdatedNotification {
+                                workspace_id: "ws".into(),
+                                thread_id: "a".into(),
+                                turn_id: "run".into(),
+                                item,
+                            },
+                        ));
+                        assert_composer_timeline(&core, 1, 1, true);
+                        let state = core.thread_snapshot("a").unwrap();
+                        let card = state
+                            .semantic
+                            .thread("a")
+                            .unwrap()
+                            .top_level
+                            .block("turn:run:detached-task-run:task_run_run")
+                            .unwrap();
+                        assert!(
+                            matches!(&card.kind, TimelineBlockKind::DetachedTaskRun { task, .. } if task.status == TaskStatus::Completed)
+                        );
+                    }
+                    let restored = ClientCore::new();
+                    let mut snapshot = thread("a", "ws");
+                    snapshot.origin_kind = ThreadOriginKind::Collaborative;
+                    snapshot.turns = vec![composer_admission(), composer_occurrence()];
+                    restored.upsert_thread(snapshot);
+                    let current = core.thread_snapshot("a").unwrap();
+                    restored.apply_thread_timeline_page(
+                        ThreadTimelinePageResponse {
+                            workspace_id: "ws".into(),
+                            thread_id: "a".into(),
+                            projection_version: 4,
+                            blocks: current
+                                .semantic
+                                .thread("a")
+                                .unwrap()
+                                .top_level
+                                .ordered_blocks()
+                                .cloned()
+                                .collect(),
+                            page: Default::default(),
+                        },
+                        crate::timeline::semantic::TopLevelPageMergeMode::Reset,
+                    );
+                    assert_composer_timeline(&restored, 1, 1, true);
+                    assert!(
+                        restored
+                            .thread_snapshot("a")
+                            .unwrap()
+                            .coordinator
+                            .conversation
+                            .can_submit_message()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn detached_admission_acceptance_releases_composer_before_parent_terminal() {
+        let core = core();
+        let mut snapshot = thread("a", "ws");
+        snapshot.origin_kind = ThreadOriginKind::Collaborative;
+        core.upsert_thread(snapshot);
+        for turn_id in ["admission", "next"] {
+            core.apply_thread_conversation_event(
+                "ws",
+                ConversationEvent::LocalTurnStartRequested {
+                    thread_id: "a".into(),
+                    turn_id: turn_id.into(),
+                    pending_request_id: turn_id.into(),
+                    mode: ThreadMode::Agent,
+                    user_text: "User input".into(),
+                    attachments: vec![],
+                },
+                None,
+            );
+            let before = core.thread_snapshot("a").unwrap();
+            assert!(!before.coordinator.conversation.can_submit_message());
+            assert_eq!(
+                before.coordinator.conversation.pending_request_id(),
+                Some(turn_id)
+            );
+            if turn_id == "next" {
+                let mut terminal = composer_admission();
+                terminal.status = TurnStatus::Completed;
+                core.apply_thread_notification(GatewayNotification::TurnCompleted(
+                    TurnCompletedNotification {
+                        workspace_id: "ws".into(),
+                        thread_id: "a".into(),
+                        turn: terminal,
+                    },
+                ));
+                assert_eq!(
+                    core.thread_snapshot("a")
+                        .unwrap()
+                        .coordinator
+                        .conversation
+                        .pending_request_id(),
+                    Some("next")
+                );
+            }
+            let mut admitted = composer_admission();
+            admitted.id = turn_id.into();
+            core.apply_thread_start_send_result(
+                core.thread_operation_token("a").unwrap(),
+                crate::turns::start::TurnStartSendReduction::Accepted {
+                    events: vec![
+                        ConversationEvent::LocalTurnStartAccepted {
+                            thread_id: "a".into(),
+                            turn_id: turn_id.into(),
+                            pending_request_id: turn_id.into(),
+                            mode: ThreadMode::Agent,
+                        },
+                        ConversationEvent::TurnStarted {
+                            thread_id: "a".into(),
+                            turn: admitted,
+                        },
+                    ],
+                },
+            );
+            let accepted = core.thread_snapshot("a").unwrap();
+            assert!(accepted.coordinator.conversation.can_submit_message());
+            assert!(
+                accepted
+                    .coordinator
+                    .conversation
+                    .in_flight_turn_id()
+                    .is_none()
+            );
+            assert!(
+                accepted
+                    .coordinator
+                    .conversation
+                    .pending_request_id()
+                    .is_none()
+            );
+            assert!(
+                accepted
+                    .semantic
+                    .thread("a")
+                    .unwrap()
+                    .top_level
+                    .ordered_blocks()
+                    .all(|block| !matches!(block.kind, TimelineBlockKind::TurnWork { .. }))
+            );
+            if turn_id == "admission" {
+                core.apply_thread_notification(GatewayNotification::TurnStarted(
+                    TurnStartedNotification {
+                        workspace_id: "ws".into(),
+                        thread_id: "a".into(),
+                        turn: composer_occurrence(),
+                    },
+                ));
+                core.apply_thread_notification(GatewayNotification::ItemStarted(
+                    ItemStartedNotification {
+                        workspace_id: "ws".into(),
+                        thread_id: "a".into(),
+                        turn_id: "run".into(),
+                        item: composer_anchor(),
+                    },
+                ));
+                assert_composer_timeline(&core, 1, 1, true);
+            }
+        }
+    }
+
+    #[test]
+    fn foreground_and_agent_child_turns_keep_execution_ownership() {
+        for origin in [
+            ThreadOriginKind::User,
+            ThreadOriginKind::DirectMessage,
+            ThreadOriginKind::Collaborative,
+        ] {
+            for mode in [ThreadMode::Chat, ThreadMode::Agent, ThreadMode::Message] {
+                let core = core();
+                let mut snapshot = thread("a", "ws");
+                snapshot.origin_kind = origin;
+                core.upsert_thread(snapshot);
+                let mut turn = if origin == ThreadOriginKind::Collaborative {
+                    composer_occurrence()
+                } else {
+                    composer_admission()
+                };
+                turn.turn_kind = TurnKind::Conversation;
+                turn.origin = TurnOrigin::User;
+                turn.mode = mode;
+                core.apply_thread_notification(GatewayNotification::TurnStarted(
+                    TurnStartedNotification {
+                        workspace_id: "ws".into(),
+                        thread_id: "a".into(),
+                        turn: turn.clone(),
+                    },
+                ));
+                let snapshot = core.thread_snapshot("a").unwrap();
+                assert_eq!(
+                    snapshot.coordinator.conversation.in_flight_turn_id(),
+                    (mode != ThreadMode::Message).then_some(turn.id.as_str())
+                );
+                let semantic = snapshot.semantic.thread("a").unwrap();
+                let rows = crate::timeline::semantic::flatten_thread_semantic_timeline(semantic);
+                let rendered = crate::timeline::semantic_render::render_semantic_timeline_rows(
+                    &rows.rows,
+                    snapshot.coordinator.conversation.projection().clone(),
+                );
+                assert_eq!(
+                    rendered
+                        .rows
+                        .iter()
+                        .filter(|row| matches!(
+                            row.kind,
+                            crate::timeline::rows::TimelineRowKind::RunningTurn(_)
+                        ))
+                        .count(),
+                    usize::from(mode != ThreadMode::Message)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn attached_task_occurrence_keeps_foreground_work_across_snapshot_and_duplicates() {
+        for origin in [TurnOrigin::AttachedTask, TurnOrigin::ScheduledTask] {
+            let core = core();
+            let mut snapshot = thread("a", "ws");
+            snapshot.origin_kind = ThreadOriginKind::Collaborative;
+            let mut turn = composer_occurrence();
+            turn.origin = origin;
+            snapshot.turns = vec![turn.clone()];
+            core.upsert_thread(snapshot.clone());
+            let started = GatewayNotification::TurnStarted(TurnStartedNotification {
+                workspace_id: "ws".into(),
+                thread_id: "a".into(),
+                turn,
+            });
+            core.apply_thread_notification(started.clone());
+            let mut item = composer_anchor();
+            if let TurnItem::Task { item } = &mut item {
+                item.attachment = TaskAttachmentMode::Attached;
+            }
+            core.apply_thread_notification(GatewayNotification::ItemStarted(
+                ItemStartedNotification {
+                    workspace_id: "ws".into(),
+                    thread_id: "a".into(),
+                    turn_id: "run".into(),
+                    item,
+                },
+            ));
+            core.apply_thread_notification(started);
+            snapshot.updated_at += 1;
+            core.upsert_thread(snapshot);
+            let state = core.thread_snapshot("a").unwrap();
+            let semantic = state.semantic.thread("a").unwrap();
+            assert!(
+                semantic
+                    .top_level
+                    .ordered_blocks()
+                    .all(|block| !matches!(block.kind, TimelineBlockKind::DetachedTaskRun { .. }))
+            );
+            assert!(semantic.top_level.block("turn:run:work").is_some());
+            assert_eq!(semantic.work_range("run").unwrap().items_by_id.len(), 1);
+        }
+    }
+
+    #[test]
+    fn occurrence_before_user_and_context_reuses_one_causal_card() {
+        let core = core();
+        let mut snapshot = thread("a", "ws");
+        snapshot.origin_kind = ThreadOriginKind::Collaborative;
+        core.upsert_thread(snapshot);
+        core.apply_thread_notification(GatewayNotification::ItemStarted(ItemStartedNotification {
+            workspace_id: "ws".into(),
+            thread_id: "a".into(),
+            turn_id: "run".into(),
+            item: composer_anchor(),
+        }));
+        assert_composer_timeline(&core, 0, 1, false);
+        core.apply_thread_notification(GatewayNotification::TurnStarted(TurnStartedNotification {
+            workspace_id: "ws".into(),
+            thread_id: "a".into(),
+            turn: composer_occurrence(),
+        }));
+        assert_composer_timeline(&core, 0, 1, true);
+        core.apply_thread_notification(GatewayNotification::ItemCompleted(
+            ItemCompletedNotification {
+                workspace_id: "ws".into(),
+                thread_id: "a".into(),
+                turn_id: "admission".into(),
+                item: TurnItem::UserMessage {
+                    id: "user".into(),
+                    text: "Full message".into(),
+                    attachments: vec![],
+                },
+            },
+        ));
+        assert_composer_timeline(&core, 1, 1, true);
+    }
+
+    fn rendered_thread(
+        core: &ClientCore,
+    ) -> crate::timeline::semantic_render::SemanticTimelineRenderModel {
+        let source = core.thread_snapshot("a").unwrap();
+        let rows = crate::timeline::semantic::flatten_thread_semantic_timeline(
+            source.semantic.thread("a").unwrap(),
+        );
+        crate::timeline::semantic_render::render_semantic_timeline_rows(
+            &rows.rows,
+            source.coordinator.conversation.projection().clone(),
+        )
+    }
+
+    fn run_work() -> TurnWorkBlock {
+        TurnWorkBlock {
+            turn_id: "run".into(),
+            presentation: TurnWorkPresentation::ExpandedLive,
+            state: TurnWorkState::Running,
+            agent_work_graph: None,
+            author: composer_occurrence().author,
+            started_at_unix_ms: Some(1_000),
+            completed_at_unix_ms: None,
+            elapsed_ms: None,
+            work_count: 2,
+            visible_work_count: 2,
+            hidden_work_count: 0,
+            has_more_before: true,
+            has_more_after: false,
+            before_cursor: Some(TimelineCursor {
+                value: "old-anchor".into(),
+            }),
+            after_cursor: None,
+            first_work_item_id: Some("old-anchor".into()),
+            last_work_item_id: Some("action".into()),
+        }
+    }
+
+    fn run_action() -> TurnWorkItem {
+        TurnWorkItem {
+            work_item_id: "turn:run:work:action".into(),
+            item_id: "action".into(),
+            turn_id: "run".into(),
+            order_key: "00000000000000000020:action".into(),
+            source_sequence: 20,
+            source_updated_at_unix_micros: 20_000,
+            item_type: TurnItemType::CommandExecution,
+            status: TurnWorkItemStatus::Completed,
+            started_at_unix_ms: Some(1_000),
+            completed_at_unix_ms: Some(2_000),
+            item: TurnItem::CommandExecution {
+                id: "action".into(),
+                tool_name: "exec_command".into(),
+                arguments: serde_json::json!({"command":["echo", "result"]}),
+                status: ToolCallStatus::Completed,
+                recovery_policy: None,
+                output_policy: ToolOutputPolicySnapshot::for_tool_name("exec_command"),
+                display: ToolDisplayPayload::Shell {
+                    stdout: Some("result".into()),
+                    stderr: None,
+                    aggregated_output: None,
+                    exit_code: Some(0),
+                    duration_ms: Some(1),
+                    timed_out: None,
+                    truncated: false,
+                },
+                storage: ToolStoragePayload::None,
+                recovery: None,
+                command: vec!["echo".into(), "result".into()],
+                cwd: None,
+                success: Some(true),
+                outcome: None,
+                observation: None,
+            },
+            metadata: None,
+        }
+    }
+
+    fn canonical_run_block(kind: TimelineBlockKind, suffix: &str) -> TimelineBlock {
+        TimelineBlock {
+            workspace_id: "ws".into(),
+            thread_id: "a".into(),
+            block_id: format!("turn:run:{suffix}"),
+            turn_id: Some("run".into()),
+            sort_key: format!("00000000000000001000:run:100:{suffix}"),
+            started_at_unix_ms: Some(1_000),
+            updated_at_unix_ms: Some(2_000),
+            kind,
+        }
+    }
+
+    fn canonical_card() -> TimelineBlock {
+        let TurnItem::Task { item } = composer_anchor() else {
+            unreachable!()
+        };
+        canonical_run_block(
+            TimelineBlockKind::DetachedTaskRun {
+                task: item,
+                author: None,
+            },
+            "detached-task-run:task_run_run",
+        )
+    }
+
+    #[test]
+    fn scheduled_attached_partial_work_survives_snapshot_and_lifecycle_replay() {
+        use crate::timeline::semantic::{TopLevelPageMergeMode, WorkPageMergeMode};
+        for restored_snapshot in [false, true] {
+            let core = core();
+            let mut scheduled = composer_occurrence();
+            scheduled.origin = TurnOrigin::ScheduledTask;
+            let mut snapshot = thread("a", "ws");
+            snapshot.origin_kind = ThreadOriginKind::Collaborative;
+            if restored_snapshot {
+                snapshot.turns = vec![scheduled.clone()];
+            }
+            core.upsert_thread(snapshot.clone());
+            let started = GatewayNotification::TurnStarted(TurnStartedNotification {
+                workspace_id: "ws".into(),
+                thread_id: "a".into(),
+                turn: scheduled.clone(),
+            });
+            core.apply_thread_notification(started.clone());
+            let work_block =
+                canonical_run_block(TimelineBlockKind::TurnWork { work: run_work() }, "work");
+            let page = ThreadTimelinePageResponse {
+                workspace_id: "ws".into(),
+                thread_id: "a".into(),
+                projection_version: 4,
+                blocks: vec![work_block.clone()],
+                page: Default::default(),
+            };
+            core.apply_thread_timeline_page(page.clone(), TopLevelPageMergeMode::Reset);
+            let actions = TurnWorkPageResponse {
+                workspace_id: "ws".into(),
+                thread_id: "a".into(),
+                turn_id: "run".into(),
+                projection_version: 4,
+                source_high_watermark: 20,
+                projection_updated_at_unix_micros: 20_000,
+                work: Some(run_work()),
+                items: vec![run_action()],
+                page: TimelinePageInfo {
+                    has_more_before: true,
+                    ..Default::default()
+                },
+            };
+            core.apply_turn_work_page(actions.clone(), WorkPageMergeMode::Reset);
+            snapshot.turns = vec![scheduled.clone()];
+            snapshot.updated_at += 1;
+            for _ in 0..2 {
+                core.apply_thread_notification(GatewayNotification::ThreadUpdated(
+                    ThreadUpdatedNotification {
+                        thread: snapshot.clone(),
+                        placement: None,
+                    },
+                ));
+                core.apply_thread_notification(started.clone());
+                core.apply_thread_timeline_page(page.clone(), TopLevelPageMergeMode::Merge);
+                core.apply_turn_work_page(actions.clone(), WorkPageMergeMode::Merge);
+                let state = core.thread_snapshot("a").unwrap();
+                let semantic = state.semantic.thread("a").unwrap();
+                assert_eq!(semantic.top_level.block("turn:run:work"), Some(&work_block));
+                assert_eq!(semantic.work_range("run").unwrap().items_by_id.len(), 1);
+                assert_eq!(
+                    semantic
+                        .work_range("run")
+                        .unwrap()
+                        .item("turn:run:work:action"),
+                    Some(&run_action())
+                );
+                let rendered = rendered_thread(&core);
+                assert!(
+                    rendered
+                        .projection
+                        .items
+                        .iter()
+                        .any(|item| item.id == "action")
+                );
+                assert_eq!(
+                    rendered
+                        .rows
+                        .iter()
+                        .filter(|row| matches!(
+                            row.kind,
+                            crate::timeline::rows::TimelineRowKind::RunningTurn(_)
+                        ))
+                        .count(),
+                    1
+                );
+                assert!(
+                    semantic.top_level.ordered_blocks().all(|block| !matches!(
+                        block.kind,
+                        TimelineBlockKind::DetachedTaskRun { .. }
+                    ))
+                );
+            }
+            // Pagination finally reaches the old anchor; it augments this same group.
+            let mut anchor = composer_anchor();
+            if let TurnItem::Task { item } = &mut anchor {
+                item.attachment = TaskAttachmentMode::Attached;
+                item.trigger_kind = TaskTriggerKind::Cron;
+            }
+            let anchor = TurnWorkItem {
+                work_item_id: "turn:run:work:task_run_run".into(),
+                item_id: "task_run_run".into(),
+                turn_id: "run".into(),
+                order_key: "00000000000000000001:task_run_run".into(),
+                source_sequence: 1,
+                source_updated_at_unix_micros: 1_000,
+                item_type: TurnItemType::Task,
+                status: TurnWorkItemStatus::Completed,
+                started_at_unix_ms: Some(1_000),
+                completed_at_unix_ms: Some(1_000),
+                item: anchor,
+                metadata: None,
+            };
+            core.apply_turn_work_page(
+                TurnWorkPageResponse {
+                    items: vec![anchor],
+                    ..actions
+                },
+                WorkPageMergeMode::MergeBefore,
+            );
+            core.apply_thread_notification(started);
+            snapshot.updated_at += 1;
+            core.upsert_thread(snapshot);
+            let state = core.thread_snapshot("a").unwrap();
+            let semantic = state.semantic.thread("a").unwrap();
+            assert_eq!(
+                semantic
+                    .top_level
+                    .ordered_blocks()
+                    .filter(|block| matches!(block.kind, TimelineBlockKind::TurnWork { .. }))
+                    .count(),
+                1
+            );
+            assert_eq!(semantic.work_range("run").unwrap().items_by_id.len(), 2);
+            let rendered = rendered_thread(&core);
+            assert!(
+                rendered
+                    .projection
+                    .items
+                    .iter()
+                    .any(|item| item.id == "action")
+            );
+            assert_eq!(
+                rendered
+                    .rows
+                    .iter()
+                    .filter(|row| matches!(
+                        row.kind,
+                        crate::timeline::rows::TimelineRowKind::RunningTurn(_)
+                    ))
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn scheduled_detached_occurrence_does_not_create_foreground_work_while_attachment_is_pending() {
+        let core = core();
+        let mut snapshot = thread("a", "ws");
+        snapshot.origin_kind = ThreadOriginKind::Collaborative;
+        core.upsert_thread(snapshot);
+        let mut turn = composer_occurrence();
+        turn.origin = TurnOrigin::ScheduledTask;
+        core.apply_thread_notification(GatewayNotification::TurnStarted(TurnStartedNotification {
+            workspace_id: "ws".into(),
+            thread_id: "a".into(),
+            turn,
+        }));
+        assert_composer_timeline(&core, 0, 0, false);
+        core.apply_thread_notification(GatewayNotification::ItemStarted(ItemStartedNotification {
+            workspace_id: "ws".into(),
+            thread_id: "a".into(),
+            turn_id: "run".into(),
+            item: run_action().item,
+        }));
+        assert_composer_timeline(&core, 0, 0, false);
+        let mut anchor = composer_anchor();
+        if let TurnItem::Task { item } = &mut anchor {
+            item.trigger_kind = TaskTriggerKind::Cron;
+        }
+        core.apply_thread_notification(GatewayNotification::ItemStarted(ItemStartedNotification {
+            workspace_id: "ws".into(),
+            thread_id: "a".into(),
+            turn_id: "run".into(),
+            item: anchor,
+        }));
+        assert_composer_timeline(&core, 0, 1, true);
+    }
+
+    fn assert_admission_error(core: &ClientCore, state: TurnWorkState, message: &str) {
+        let source = core.thread_snapshot("a").unwrap();
+        let semantic = source.semantic.thread("a").unwrap();
+        assert!(
+            matches!(&semantic.top_level.block("turn:admission:terminal-state").unwrap().kind,
+            TimelineBlockKind::TurnState { state: actual, message: Some(text), .. } if *actual == state && text == message)
+        );
+        assert!(semantic.top_level.block("turn:admission:work").is_none());
+        assert!(source.coordinator.conversation.can_submit_message());
+        let rendered = rendered_thread(core);
+        assert!(rendered.rows.iter().all(|row| !matches!(
+            row.kind,
+            crate::timeline::rows::TimelineRowKind::RunningTurn(_)
+        )));
+        assert!(
+            rendered
+                .projection
+                .items
+                .iter()
+                .any(|item| matches!(&item.item,
+            TurnItem::SystemEvent { message: text, .. } if text == message))
+        );
+        assert!(
+            rendered
+                .projection
+                .items
+                .iter()
+                .all(|item| !matches!(item.item, TurnItem::Task { .. }))
+        );
+    }
+
+    #[test]
+    fn admission_errors_survive_live_snapshot_hydration_reconnect_and_late_events() {
+        use crate::timeline::semantic::TopLevelPageMergeMode;
+        for (status, state) in [
+            (TurnStatus::Failed, TurnWorkState::Failed),
+            (TurnStatus::Blocked, TurnWorkState::Blocked),
+            (TurnStatus::Interrupted, TurnWorkState::Interrupted),
+        ] {
+            for local_send in [false, true] {
+                let core = core();
+                let mut snapshot = thread("a", "ws");
+                snapshot.origin_kind = ThreadOriginKind::Collaborative;
+                core.upsert_thread(snapshot.clone());
+                if local_send {
+                    core.apply_thread_conversation_event(
+                        "ws",
+                        ConversationEvent::LocalTurnStartRequested {
+                            thread_id: "a".into(),
+                            turn_id: "admission".into(),
+                            pending_request_id: "request".into(),
+                            mode: ThreadMode::Agent,
+                            user_text: "Rejected submission".into(),
+                            attachments: vec![],
+                        },
+                        None,
+                    );
+                }
+                let mut terminal = composer_admission();
+                terminal.status = status;
+                terminal.error = Some("Admission refused before Task creation".into());
+                let outcome = match status {
+                    TurnStatus::Blocked => {
+                        GatewayNotification::TurnBlocked(TurnBlockedNotification {
+                            workspace_id: "ws".into(),
+                            thread_id: "a".into(),
+                            turn: terminal.clone(),
+                            resume: None,
+                        })
+                    }
+                    _ => GatewayNotification::TurnFailed(TurnFailedNotification {
+                        workspace_id: "ws".into(),
+                        thread_id: "a".into(),
+                        turn: terminal.clone(),
+                    }),
+                };
+                core.apply_thread_notification(outcome.clone());
+                assert_admission_error(&core, state, "Admission refused before Task creation");
+                let source = core.thread_snapshot("a").unwrap();
+                match source.coordinator.conversation.turn_flow_state() {
+                    crate::conversation::state_machine::TurnFlowState::Failed { .. } => {
+                        assert_eq!(status, TurnStatus::Failed)
+                    }
+                    crate::conversation::state_machine::TurnFlowState::Blocked { .. } => {
+                        assert_eq!(status, TurnStatus::Blocked)
+                    }
+                    crate::conversation::state_machine::TurnFlowState::Cancelled { .. } => {
+                        assert_eq!(status, TurnStatus::Interrupted)
+                    }
+                    other => panic!("wrong admission outcome: {other:?}"),
+                }
+                snapshot.turns = vec![terminal.clone()];
+                snapshot.updated_at += 1;
+                core.apply_thread_notification(GatewayNotification::ThreadUpdated(
+                    ThreadUpdatedNotification {
+                        thread: snapshot.clone(),
+                        placement: None,
+                    },
+                ));
+                assert_admission_error(&core, state, "Admission refused before Task creation");
+                let error = TimelineBlock {
+                    workspace_id: "ws".into(),
+                    thread_id: "a".into(),
+                    block_id: "turn:admission:terminal-state".into(),
+                    turn_id: Some("admission".into()),
+                    sort_key: "00000000000000001000:admission:300:terminal-state".into(),
+                    started_at_unix_ms: Some(1_000),
+                    updated_at_unix_ms: Some(2_000),
+                    kind: TimelineBlockKind::TurnState {
+                        state,
+                        message: Some("Canonical refusal".into()),
+                        author: terminal.author.clone(),
+                        route: None,
+                    },
+                };
+                let page = ThreadTimelinePageResponse {
+                    workspace_id: "ws".into(),
+                    thread_id: "a".into(),
+                    projection_version: 4,
+                    blocks: vec![error.clone()],
+                    page: Default::default(),
+                };
+                core.apply_thread_timeline_page(page.clone(), TopLevelPageMergeMode::Merge);
+                assert_admission_error(&core, state, "Canonical refusal");
+                // Replays, a stale success, and a work tombstone must retain the refusal.
+                for notification in [
+                    outcome.clone(),
+                    GatewayNotification::TurnStarted(TurnStartedNotification {
+                        workspace_id: "ws".into(),
+                        thread_id: "a".into(),
+                        turn: composer_admission(),
+                    }),
+                    GatewayNotification::TurnCompleted(TurnCompletedNotification {
+                        workspace_id: "ws".into(),
+                        thread_id: "a".into(),
+                        turn: Turn {
+                            status: TurnStatus::Completed,
+                            ..composer_admission()
+                        },
+                    }),
+                    GatewayNotification::ThreadUpdated(ThreadUpdatedNotification {
+                        thread: snapshot.clone(),
+                        placement: None,
+                    }),
+                ] {
+                    core.apply_thread_notification(notification);
+                    assert_admission_error(&core, state, "Canonical refusal");
+                }
+                core.apply_turn_work_page(
+                    TurnWorkPageResponse {
+                        workspace_id: "ws".into(),
+                        thread_id: "a".into(),
+                        turn_id: "admission".into(),
+                        projection_version: 4,
+                        source_high_watermark: 30,
+                        projection_updated_at_unix_micros: 30_000,
+                        work: None,
+                        items: vec![],
+                        page: Default::default(),
+                    },
+                    crate::timeline::semantic::WorkPageMergeMode::Reset,
+                );
+                assert_admission_error(&core, state, "Canonical refusal");
+                // A fresh core needs no local-send history to restore terminal admission.
+                let restored = ClientCore::new();
+                let mut restored_snapshot = snapshot.clone();
+                let historical_child = Turn {
+                    id: "old-child".into(),
+                    status: TurnStatus::Completed,
+                    turn_kind: TurnKind::Conversation,
+                    origin: TurnOrigin::User,
+                    ..composer_occurrence()
+                };
+                restored_snapshot.turns.insert(0, historical_child);
+                restored.upsert_thread(restored_snapshot);
+                assert_admission_error(&restored, state, "Admission refused before Task creation");
+                assert_eq!(
+                    restored
+                        .thread_snapshot("a")
+                        .unwrap()
+                        .coordinator
+                        .conversation
+                        .turn_flow_state(),
+                    source.coordinator.conversation.turn_flow_state()
+                );
+                restored.apply_thread_timeline_page(page.clone(), TopLevelPageMergeMode::Reset);
+                {
+                    let mut mutation = restored.existing_thread_mutation("a").unwrap();
+                    mutation.history_loading = true;
+                }
+                assert_admission_error(&restored, state, "Canonical refusal");
+                let current = restored.thread_snapshot("a").unwrap();
+                assert_eq!(
+                    current
+                        .semantic
+                        .thread("a")
+                        .unwrap()
+                        .top_level
+                        .block("turn:admission:terminal-state"),
+                    Some(&error)
+                );
+                core.apply_thread_conversation_event(
+                    "ws",
+                    ConversationEvent::LocalTurnStartRequested {
+                        thread_id: "a".into(),
+                        turn_id: "next".into(),
+                        pending_request_id: "next-request".into(),
+                        mode: ThreadMode::Agent,
+                        user_text: "Next submission".into(),
+                        attachments: vec![],
+                    },
+                    None,
+                );
+                core.apply_thread_notification(outcome);
+                snapshot.updated_at += 1;
+                core.apply_thread_notification(GatewayNotification::ThreadUpdated(
+                    ThreadUpdatedNotification {
+                        thread: snapshot,
+                        placement: None,
+                    },
+                ));
+                let next = core.thread_snapshot("a").unwrap();
+                assert_eq!(
+                    next.coordinator.conversation.pending_request_id(),
+                    Some("next-request")
+                );
+                assert_eq!(
+                    next.coordinator.conversation.in_flight_turn_id(),
+                    Some("next")
+                );
+                assert!(matches!(
+                    next.coordinator.conversation.turn_flow_state(),
+                    crate::conversation::state_machine::TurnFlowState::Starting { .. }
+                ));
+                assert!(rendered_thread(&core).rows.iter().all(|row| !matches!(
+                    row.kind,
+                    crate::timeline::rows::TimelineRowKind::RunningTurn(_)
+                )));
+            }
+        }
+    }
+
+    #[test]
+    fn first_canonical_card_uses_retained_exact_run_author_without_thread_snapshot_hydration() {
+        use crate::timeline::semantic::TopLevelPageMergeMode;
+        let core = core();
+        let mut snapshot = thread("a", "ws");
+        snapshot.origin_kind = ThreadOriginKind::Collaborative;
+        core.upsert_thread(snapshot.clone());
+        core.apply_thread_notification(GatewayNotification::TurnStarted(TurnStartedNotification {
+            workspace_id: "ws".into(),
+            thread_id: "a".into(),
+            turn: composer_occurrence(),
+        }));
+        let page = ThreadTimelinePageResponse {
+            workspace_id: "ws".into(),
+            thread_id: "a".into(),
+            projection_version: 4,
+            blocks: vec![canonical_card()],
+            page: Default::default(),
+        };
+        core.apply_thread_timeline_page(page.clone(), TopLevelPageMergeMode::Reset);
+        assert_composer_timeline(&core, 0, 1, true);
+        for _ in 0..2 {
+            core.apply_thread_timeline_page(page.clone(), TopLevelPageMergeMode::Merge);
+            assert_composer_timeline(&core, 0, 1, true);
+            assert!(
+                core.thread_snapshot("a")
+                    .unwrap()
+                    .coordinator
+                    .thread()
+                    .unwrap()
+                    .turns
+                    .is_empty()
+            );
+        }
+        let mut partial = canonical_card();
+        if let TimelineBlockKind::DetachedTaskRun { task, .. } = &mut partial.kind {
+            task.updated_at += 1;
+            task.run_id = None;
+            task.created_by_turn_id = None;
+            task.child_turn_id = None;
+            task.child_thread_id = None;
+        }
+        core.apply_thread_timeline_page(
+            ThreadTimelinePageResponse {
+                blocks: vec![partial],
+                ..page.clone()
+            },
+            TopLevelPageMergeMode::Merge,
+        );
+        assert_composer_timeline(&core, 0, 1, true);
+        let mut incomplete_turn = composer_occurrence();
+        incomplete_turn.author = None;
+        core.apply_thread_notification(GatewayNotification::TurnStarted(TurnStartedNotification {
+            workspace_id: "ws".into(),
+            thread_id: "a".into(),
+            turn: incomplete_turn,
+        }));
+        core.apply_thread_notification(GatewayNotification::ItemUpdated(ItemUpdatedNotification {
+            workspace_id: "ws".into(),
+            thread_id: "a".into(),
+            turn_id: "run".into(),
+            item: composer_anchor(),
+        }));
+        assert_composer_timeline(&core, 0, 1, true);
+        // A card with another run identity cannot borrow this occurrence's author.
+        let mut other = canonical_card();
+        other.block_id = "turn:run:detached-task-run:other".into();
+        if let TimelineBlockKind::DetachedTaskRun { task, .. } = &mut other.kind {
+            task.id = "other".into();
+            task.task_id = "other-task".into();
+            task.run_id = Some("other-run".into());
+        }
+        core.apply_thread_timeline_page(
+            ThreadTimelinePageResponse {
+                blocks: vec![other],
+                ..page
+            },
+            TopLevelPageMergeMode::Merge,
+        );
+        core.apply_thread_notification(GatewayNotification::TurnCompleted(
+            TurnCompletedNotification {
+                workspace_id: "ws".into(),
+                thread_id: "a".into(),
+                turn: Turn {
+                    status: TurnStatus::Completed,
+                    ..composer_occurrence()
+                },
+            },
+        ));
+        let rendered = rendered_thread(&core);
+        assert!(
+            rendered
+                .rows
+                .iter()
+                .find(|row| row.key == "turn:run:detached-task-run:other")
+                .unwrap()
+                .author
+                .is_none()
+        );
+        assert_eq!(
+            rendered
+                .rows
+                .iter()
+                .find(|row| row.key == "turn:run:detached-task-run:task_run_run")
+                .unwrap()
+                .author,
+            composer_occurrence().author
+        );
+    }
+
+    #[test]
+    fn snapshot_boundaries_enrich_existing_card_and_unrelated_publications_leave_semantic_state_alone()
+     {
+        let core = core();
+        let mut snapshot = thread("a", "ws");
+        snapshot.origin_kind = ThreadOriginKind::Collaborative;
+        core.upsert_thread(snapshot.clone());
+        core.apply_thread_timeline_page(
+            ThreadTimelinePageResponse {
+                workspace_id: "ws".into(),
+                thread_id: "a".into(),
+                projection_version: 4,
+                blocks: vec![canonical_card()],
+                page: Default::default(),
+            },
+            crate::timeline::semantic::TopLevelPageMergeMode::Reset,
+        );
+        let before = core.thread_snapshot("a").unwrap();
+        snapshot.turns = vec![composer_occurrence()];
+        snapshot.updated_at += 1;
+        core.apply_thread_notification(GatewayNotification::ThreadUpdated(
+            ThreadUpdatedNotification {
+                thread: snapshot.clone(),
+                placement: None,
+            },
+        ));
+        assert_composer_timeline(&core, 0, 1, true);
+        let enriched = core.thread_snapshot("a").unwrap();
+        assert!(!Arc::ptr_eq(&before.semantic, &enriched.semantic));
+        {
+            let mut mutation = core.existing_thread_mutation("a").unwrap();
+            mutation.history_loading = true;
+        }
+        let unrelated = core.thread_snapshot("a").unwrap();
+        assert!(Arc::ptr_eq(&enriched.semantic, &unrelated.semantic));
+        core.apply_thread_notification(GatewayNotification::ThreadUpdated(
+            ThreadUpdatedNotification {
+                thread: snapshot,
+                placement: None,
+            },
+        ));
+        let duplicate = core.thread_snapshot("a").unwrap();
+        assert!(Arc::ptr_eq(&unrelated.semantic, &duplicate.semantic));
+        assert_composer_timeline(&core, 0, 1, true);
+    }
+
+    fn request_admission(core: &ClientCore, turn_id: &str, request_id: &str) {
+        core.apply_thread_conversation_event(
+            "ws",
+            ConversationEvent::LocalTurnStartRequested {
+                thread_id: "a".into(),
+                turn_id: turn_id.into(),
+                pending_request_id: request_id.into(),
+                mode: ThreadMode::Agent,
+                user_text: "Send through Composer".into(),
+                attachments: vec![],
+            },
+            None,
+        );
+    }
+
+    fn reject_admission(core: &ClientCore, turn_id: &str, request_id: &str) {
+        let token = core.thread_operation_token("a").unwrap();
+        let reduction = crate::turns::start::reduce_turn_start_send_failure(
+            crate::turns::start::TurnStartSendContext {
+                thread_id: "a".into(),
+                turn_id: turn_id.into(),
+                pending_request_id: request_id.into(),
+                mode: ThreadMode::Agent,
+            },
+            "Local response timeout",
+        );
+        assert!(core.apply_thread_start_send_result(token, reduction));
+    }
+
+    fn admission_outcome_page(turn: &Turn) -> ThreadTimelinePageResponse {
+        let state = match turn.status {
+            TurnStatus::Failed => TurnWorkState::Failed,
+            TurnStatus::Blocked => TurnWorkState::Blocked,
+            TurnStatus::Interrupted => TurnWorkState::Interrupted,
+            _ => panic!("expected refusal"),
+        };
+        ThreadTimelinePageResponse {
+            workspace_id: "ws".into(),
+            thread_id: "a".into(),
+            projection_version: 4,
+            blocks: vec![TimelineBlock {
+                workspace_id: "ws".into(),
+                thread_id: "a".into(),
+                block_id: "turn:admission:terminal-state".into(),
+                turn_id: Some(turn.id.clone()),
+                sort_key: "00000000000000001000:admission:300:terminal-state".into(),
+                started_at_unix_ms: Some(1_000),
+                updated_at_unix_ms: Some(2_000),
+                kind: TimelineBlockKind::TurnState {
+                    state,
+                    message: turn.error.clone(),
+                    // Confirmation comes from canonical delivery, not from an avatar.
+                    author: None,
+                    route: None,
+                },
+            }],
+            page: Default::default(),
+        }
+    }
+
+    fn admission_outcome_notification(turn: &Turn) -> GatewayNotification {
+        if turn.status == TurnStatus::Blocked {
+            GatewayNotification::TurnBlocked(TurnBlockedNotification {
+                workspace_id: "ws".into(),
+                thread_id: "a".into(),
+                turn: turn.clone(),
+                resume: None,
+            })
+        } else {
+            GatewayNotification::TurnFailed(TurnFailedNotification {
+                workspace_id: "ws".into(),
+                thread_id: "a".into(),
+                turn: turn.clone(),
+            })
+        }
+    }
+
+    fn assert_admission_outcome(core: &ClientCore, status: TurnStatus, message: &str) {
+        use crate::conversation::{reducer::TurnPhase, state_machine::TurnFlowState};
+        let (state, phase, code) = match status {
+            TurnStatus::Failed => (TurnWorkState::Failed, TurnPhase::Failed, "turn_failed"),
+            TurnStatus::Blocked => (TurnWorkState::Blocked, TurnPhase::Blocked, "turn_blocked"),
+            TurnStatus::Interrupted => (
+                TurnWorkState::Interrupted,
+                TurnPhase::Cancelled,
+                "turn_cancelled",
+            ),
+            _ => panic!("expected refusal"),
+        };
+        assert_admission_error(core, state, message);
+        let source = core.thread_snapshot("a").unwrap();
+        let conversation = &source.coordinator.conversation;
+        match (status, conversation.turn_flow_state()) {
+            (TurnStatus::Failed, TurnFlowState::Failed { turn_id, error }) => {
+                assert_eq!(turn_id, "admission");
+                assert_eq!(error, message);
+            }
+            (TurnStatus::Blocked, TurnFlowState::Blocked { turn_id }) => {
+                assert_eq!(turn_id, "admission");
+            }
+            (TurnStatus::Interrupted, TurnFlowState::Cancelled { turn_id, error }) => {
+                assert_eq!(turn_id, "admission");
+                assert_eq!(error.as_deref(), Some(message));
+            }
+            (_, flow) => panic!("unexpected admission flow: {flow:?}"),
+        }
+        let projection = conversation.projection();
+        assert_eq!(
+            projection
+                .turns
+                .iter()
+                .filter(|turn| turn.id == "admission")
+                .count(),
+            1
+        );
+        let view = projection
+            .turns
+            .iter()
+            .find(|turn| turn.id == "admission")
+            .unwrap();
+        assert_eq!(view.phase, phase);
+        assert_eq!(view.error.as_deref(), Some(message));
+        assert_eq!(projection.last_error.as_deref(), Some(message));
+        assert_eq!(projection.pending_request_id, None);
+        let rendered = rendered_thread(core);
+        let outcomes = rendered
+            .projection
+            .items
+            .iter()
+            .filter(|item| matches!(&item.item, TurnItem::SystemEvent { .. }))
+            .collect::<Vec<_>>();
+        assert_eq!(outcomes.len(), 1);
+        assert!(matches!(&outcomes[0].item,
+            TurnItem::SystemEvent { code: Some(actual), message: actual_message, .. }
+                if actual == code && actual_message == message));
+    }
+
+    #[test]
+    fn canonical_admission_refusals_override_rpc_reject_in_either_order() {
+        use crate::timeline::semantic::TopLevelPageMergeMode;
+        for status in [
+            TurnStatus::Failed,
+            TurnStatus::Blocked,
+            TurnStatus::Interrupted,
+        ] {
+            for reject_first in [false, true] {
+                // Each entry point must reconcile the local outcome by itself.
+                for confirmation in ["lifecycle", "snapshot", "page"] {
+                    let core = core();
+                    let mut snapshot = thread("a", "ws");
+                    snapshot.origin_kind = ThreadOriginKind::Collaborative;
+                    core.upsert_thread(snapshot.clone());
+                    request_admission(&core, "admission", "request");
+                    if reject_first {
+                        reject_admission(&core, "admission", "request");
+                        assert_admission_outcome(
+                            &core,
+                            TurnStatus::Failed,
+                            "Local response timeout",
+                        );
+                    }
+                    let mut terminal = composer_admission();
+                    terminal.status = status;
+                    terminal.error = Some("Server refused this admission".into());
+                    snapshot.turns = vec![terminal.clone()];
+                    snapshot.updated_at += 1;
+                    match confirmation {
+                        "lifecycle" => {
+                            core.apply_thread_notification(admission_outcome_notification(
+                                &terminal,
+                            ));
+                        }
+                        "snapshot" => {
+                            core.apply_thread_notification(GatewayNotification::ThreadUpdated(
+                                ThreadUpdatedNotification {
+                                    thread: snapshot.clone(),
+                                    placement: None,
+                                },
+                            ));
+                        }
+                        "page" => {
+                            core.apply_thread_timeline_page(
+                                admission_outcome_page(&terminal),
+                                TopLevelPageMergeMode::Merge,
+                            );
+                        }
+                        _ => unreachable!(),
+                    }
+                    assert_admission_outcome(&core, status, "Server refused this admission");
+                    for _ in 0..2 {
+                        reject_admission(&core, "admission", "request");
+                        assert_admission_outcome(&core, status, "Server refused this admission");
+                        core.apply_thread_notification(admission_outcome_notification(&terminal));
+                        assert_admission_outcome(&core, status, "Server refused this admission");
+                        core.apply_thread_timeline_page(
+                            admission_outcome_page(&terminal),
+                            TopLevelPageMergeMode::Merge,
+                        );
+                        assert_admission_outcome(&core, status, "Server refused this admission");
+                        core.apply_thread_notification(GatewayNotification::ThreadUpdated(
+                            ThreadUpdatedNotification {
+                                thread: snapshot.clone(),
+                                placement: None,
+                            },
+                        ));
+                        assert_admission_outcome(&core, status, "Server refused this admission");
+                    }
+                    for old_status in [TurnStatus::InProgress, TurnStatus::Completed] {
+                        let old = Turn {
+                            status: old_status,
+                            error: None,
+                            ..composer_admission()
+                        };
+                        let notification = if old_status == TurnStatus::InProgress {
+                            GatewayNotification::TurnStarted(TurnStartedNotification {
+                                workspace_id: "ws".into(),
+                                thread_id: "a".into(),
+                                turn: old.clone(),
+                            })
+                        } else {
+                            GatewayNotification::TurnCompleted(TurnCompletedNotification {
+                                workspace_id: "ws".into(),
+                                thread_id: "a".into(),
+                                turn: old.clone(),
+                            })
+                        };
+                        core.apply_thread_notification(notification);
+                        assert_admission_outcome(&core, status, "Server refused this admission");
+                        let mut stale = snapshot.clone();
+                        stale.updated_at += 1;
+                        stale.turns = vec![old];
+                        core.apply_thread_notification(GatewayNotification::ThreadUpdated(
+                            ThreadUpdatedNotification {
+                                thread: stale,
+                                placement: None,
+                            },
+                        ));
+                        assert_admission_outcome(&core, status, "Server refused this admission");
+                    }
+                    for state in [TurnWorkState::Running, TurnWorkState::Completed] {
+                        let mut stale_page = admission_outcome_page(&terminal);
+                        let TimelineBlockKind::TurnState {
+                            state: incoming,
+                            message,
+                            ..
+                        } = &mut stale_page.blocks[0].kind
+                        else {
+                            unreachable!()
+                        };
+                        *incoming = state;
+                        *message = None;
+                        core.apply_thread_timeline_page(stale_page, TopLevelPageMergeMode::Merge);
+                        assert_admission_outcome(&core, status, "Server refused this admission");
+                    }
+                    let restored = ClientCore::new();
+                    restored.upsert_thread(snapshot);
+                    restored.apply_thread_timeline_page(
+                        admission_outcome_page(&terminal),
+                        TopLevelPageMergeMode::Reset,
+                    );
+                    assert_admission_outcome(&restored, status, "Server refused this admission");
+                }
+            }
+        }
+    }
+
+    fn assert_successful_admission(core: &ClientCore) {
+        use crate::conversation::{reducer::TurnPhase, state_machine::TurnFlowState};
+        let source = core.thread_snapshot("a").unwrap();
+        let conversation = &source.coordinator.conversation;
+        assert!(
+            matches!(conversation.turn_flow_state(), TurnFlowState::Completed { turn_id } if turn_id == "admission")
+        );
+        assert!(conversation.can_submit_message());
+        let projection = conversation.projection();
+        assert_eq!(projection.last_error, None);
+        assert_eq!(projection.pending_request_id, None);
+        assert_eq!(
+            projection
+                .turns
+                .iter()
+                .filter(|turn| turn.id == "admission")
+                .count(),
+            1
+        );
+        let turn = projection
+            .turns
+            .iter()
+            .find(|turn| turn.id == "admission")
+            .unwrap();
+        assert_eq!(turn.phase, TurnPhase::Completed);
+        assert_eq!(turn.error, None);
+        assert!(
+            source
+                .semantic
+                .thread("a")
+                .unwrap()
+                .top_level
+                .block("turn:admission:terminal-state")
+                .is_none()
+        );
+        let rendered = rendered_thread(core);
+        assert!(rendered.rows.iter().all(|row| !matches!(
+            row.kind,
+            crate::timeline::rows::TimelineRowKind::RunningTurn(_)
+        )));
+        assert!(
+            rendered
+                .projection
+                .items
+                .iter()
+                .all(|item| !matches!(item.item, TurnItem::SystemEvent { .. }))
+        );
+    }
+
+    #[test]
+    fn local_timeout_is_cleared_by_confirmed_successful_admission() {
+        for confirmation in ["lifecycle", "snapshot", "rpc"] {
+            let core = core();
+            let mut snapshot = thread("a", "ws");
+            snapshot.origin_kind = ThreadOriginKind::Collaborative;
+            core.upsert_thread(snapshot.clone());
+            request_admission(&core, "admission", "request");
+            reject_admission(&core, "admission", "request");
+            assert_admission_outcome(&core, TurnStatus::Failed, "Local response timeout");
+            let admission = composer_admission();
+            match confirmation {
+                "lifecycle" => {
+                    core.apply_thread_notification(GatewayNotification::TurnStarted(
+                        TurnStartedNotification {
+                            workspace_id: "ws".into(),
+                            thread_id: "a".into(),
+                            turn: admission.clone(),
+                        },
+                    ));
+                }
+                "snapshot" => {
+                    snapshot.turns = vec![admission.clone()];
+                    snapshot.updated_at += 1;
+                    core.apply_thread_notification(GatewayNotification::ThreadUpdated(
+                        ThreadUpdatedNotification {
+                            thread: snapshot.clone(),
+                            placement: None,
+                        },
+                    ));
+                }
+                "rpc" => {
+                    let token = core.thread_operation_token("a").unwrap();
+                    let reduction = crate::turns::start::reduce_turn_start_send_success(
+                        crate::turns::start::TurnStartSendContext {
+                            thread_id: "a".into(),
+                            turn_id: "admission".into(),
+                            pending_request_id: "request".into(),
+                            mode: ThreadMode::Agent,
+                        },
+                        TurnStartResponse {
+                            turn: admission.clone(),
+                        },
+                    );
+                    assert!(core.apply_thread_start_send_result(token, reduction));
+                }
+                _ => unreachable!(),
+            }
+            assert_successful_admission(&core);
+            // Subsequent Task delivery cannot resurrect the timeout or foreground work.
+            core.apply_thread_notification(GatewayNotification::TurnStarted(
+                TurnStartedNotification {
+                    workspace_id: "ws".into(),
+                    thread_id: "a".into(),
+                    turn: composer_occurrence(),
+                },
+            ));
+            core.apply_thread_conversation_event(
+                "ws",
+                ConversationEvent::ItemStarted {
+                    thread_id: "a".into(),
+                    turn_id: "run".into(),
+                    item: composer_anchor(),
+                },
+                None,
+            );
+            assert_successful_admission(&core);
+            for _ in 0..2 {
+                reject_admission(&core, "admission", "request");
+                assert_successful_admission(&core);
+                core.apply_thread_notification(GatewayNotification::TurnCompleted(
+                    TurnCompletedNotification {
+                        workspace_id: "ws".into(),
+                        thread_id: "a".into(),
+                        turn: Turn {
+                            status: TurnStatus::Completed,
+                            ..admission.clone()
+                        },
+                    },
+                ));
+                assert_successful_admission(&core);
+                core.apply_thread_timeline_page(
+                    ThreadTimelinePageResponse {
+                        workspace_id: "ws".into(),
+                        thread_id: "a".into(),
+                        projection_version: 4,
+                        blocks: vec![canonical_card()],
+                        page: Default::default(),
+                    },
+                    crate::timeline::semantic::TopLevelPageMergeMode::Merge,
+                );
+                assert_successful_admission(&core);
+                assert_composer_timeline(&core, 1, 1, true);
+            }
+        }
+    }
+
+    #[test]
+    fn unconfirmed_rpc_reject_remains_visible_and_releases_composer() {
+        let core = core();
+        let mut snapshot = thread("a", "ws");
+        snapshot.origin_kind = ThreadOriginKind::Collaborative;
+        core.upsert_thread(snapshot.clone());
+        request_admission(&core, "admission", "request");
+        for _ in 0..2 {
+            reject_admission(&core, "admission", "request");
+            assert_admission_outcome(&core, TurnStatus::Failed, "Local response timeout");
+            snapshot.updated_at += 1;
+            core.apply_thread_notification(GatewayNotification::ThreadUpdated(
+                ThreadUpdatedNotification {
+                    thread: snapshot.clone(),
+                    placement: None,
+                },
+            ));
+            assert_admission_outcome(&core, TurnStatus::Failed, "Local response timeout");
+        }
+    }
+
+    #[test]
+    fn previous_admission_rpc_reject_cannot_change_new_starting_request() {
+        use crate::conversation::{reducer::TurnPhase, state_machine::TurnFlowState};
+        for confirmed in [false, true] {
+            let core = core();
+            let mut snapshot = thread("a", "ws");
+            snapshot.origin_kind = ThreadOriginKind::Collaborative;
+            core.upsert_thread(snapshot.clone());
+            request_admission(&core, "admission", "request");
+            reject_admission(&core, "admission", "request");
+            if confirmed {
+                let terminal = Turn {
+                    status: TurnStatus::Blocked,
+                    error: Some("Canonical refusal".into()),
+                    ..composer_admission()
+                };
+                core.apply_thread_notification(admission_outcome_notification(&terminal));
+                assert_admission_outcome(&core, TurnStatus::Blocked, "Canonical refusal");
+            }
+            request_admission(&core, "next", "next-request");
+            let before = core.thread_snapshot("a").unwrap();
+            for _ in 0..2 {
+                // Both an obsolete Turn and a wrong request for the current Turn are ignored.
+                reject_admission(&core, "admission", "request");
+                reject_admission(&core, "next", "wrong-request");
+                let current = core.thread_snapshot("a").unwrap();
+                let conversation = &current.coordinator.conversation;
+                assert!(
+                    matches!(conversation.turn_flow_state(), TurnFlowState::Starting { turn_id, pending_request_id }
+                    if turn_id == "next" && pending_request_id == "next-request")
+                );
+                assert_eq!(conversation.pending_request_id(), Some("next-request"));
+                assert!(!conversation.can_submit_message());
+                let projection = conversation.projection();
+                assert_eq!(
+                    projection.pending_request_id.as_deref(),
+                    Some("next-request")
+                );
+                assert_eq!(projection.last_error, None);
+                let turn = projection
+                    .turns
+                    .iter()
+                    .find(|turn| turn.id == "next")
+                    .unwrap();
+                assert_eq!(turn.phase, TurnPhase::Starting);
+                assert_eq!(turn.error, None);
+                assert_eq!(current.semantic, before.semantic);
+                assert!(projection.same_content(before.coordinator.conversation.projection()));
+                assert!(rendered_thread(&core).rows.iter().all(|row| !matches!(
+                    row.kind,
+                    crate::timeline::rows::TimelineRowKind::RunningTurn(_)
+                )));
+            }
+            let terminal = Turn {
+                status: TurnStatus::Blocked,
+                error: Some("Canonical refusal".into()),
+                ..composer_admission()
+            };
+            snapshot.turns = vec![terminal.clone()];
+            snapshot.updated_at += 1;
+            for notification in [
+                admission_outcome_notification(&terminal),
+                GatewayNotification::ThreadUpdated(ThreadUpdatedNotification {
+                    thread: snapshot,
+                    placement: None,
+                }),
+            ] {
+                core.apply_thread_notification(notification);
+                reject_admission(&core, "admission", "request");
+                let current = core.thread_snapshot("a").unwrap();
+                let conversation = &current.coordinator.conversation;
+                assert!(
+                    matches!(conversation.turn_flow_state(), TurnFlowState::Starting { turn_id, pending_request_id }
+                    if turn_id == "next" && pending_request_id == "next-request")
+                );
+                assert_eq!(conversation.projection().last_error, None);
+                assert_eq!(
+                    conversation.projection().pending_request_id.as_deref(),
+                    Some("next-request")
+                );
+                let view = conversation
+                    .projection()
+                    .turns
+                    .iter()
+                    .find(|turn| turn.id == "next")
+                    .unwrap();
+                assert_eq!(view.phase, TurnPhase::Starting);
+                assert_eq!(view.error, None);
+                assert!(rendered_thread(&core).rows.iter().all(|row| !matches!(
+                    row.kind,
+                    crate::timeline::rows::TimelineRowKind::RunningTurn(_)
+                )));
+                assert!(rendered_thread(&core).projection.items.iter().any(|item| matches!(&item.item,
+                    TurnItem::SystemEvent { code: Some(code), message, .. } if code == "turn_blocked" && message == "Canonical refusal")));
+            }
+        }
+    }
+
+    #[test]
+    fn historical_admission_does_not_skip_current_agent_terminal_snapshot() {
+        use crate::conversation::{reducer::TurnPhase, state_machine::TurnFlowState};
+        for cancelling in [false, true] {
+            for status in [
+                TurnStatus::Completed,
+                TurnStatus::Failed,
+                TurnStatus::Blocked,
+                TurnStatus::Interrupted,
+            ] {
+                for another_running in [false, true] {
+                    let core = core();
+                    let mut snapshot = thread("a", "ws");
+                    snapshot.origin_kind = ThreadOriginKind::Collaborative;
+                    let admission = Turn {
+                        status: TurnStatus::Completed,
+                        ..composer_admission()
+                    };
+                    snapshot.turns = vec![admission];
+                    core.upsert_thread(snapshot.clone());
+                    let mut agent = Turn {
+                        id: "current-agent".into(),
+                        turn_kind: TurnKind::Conversation,
+                        origin: TurnOrigin::User,
+                        mode: ThreadMode::Agent,
+                        ..composer_occurrence()
+                    };
+                    core.apply_thread_notification(GatewayNotification::TurnStarted(
+                        TurnStartedNotification {
+                            workspace_id: "ws".into(),
+                            thread_id: "a".into(),
+                            turn: agent.clone(),
+                        },
+                    ));
+                    if cancelling {
+                        let (_, params) = core.begin_thread_turn_cancellation("a", None).unwrap();
+                        assert_eq!(params.turn_id, "current-agent");
+                    }
+                    let before = core.thread_snapshot("a").unwrap();
+                    assert_eq!(
+                        before.coordinator.conversation.in_flight_turn_id(),
+                        Some("current-agent")
+                    );
+                    assert!(before.coordinator.conversation.projection().composer_locked);
+                    assert!(
+                        matches!(
+                            before.coordinator.conversation.turn_flow_state(),
+                            TurnFlowState::Cancelling { .. }
+                        ) == cancelling
+                    );
+                    agent.status = status;
+                    agent.error =
+                        (status != TurnStatus::Completed).then(|| "Canonical agent outcome".into());
+                    agent.permission_profile =
+                        system_turn_permission_profile_snapshot(TurnPermissionMode::FullAccess);
+                    snapshot.turns.push(agent.clone());
+                    if another_running {
+                        snapshot.turns.push(Turn {
+                            id: "another-agent".into(),
+                            status: TurnStatus::InProgress,
+                            error: None,
+                            ..agent.clone()
+                        });
+                    }
+                    for _ in 0..2 {
+                        snapshot.updated_at += 1; // Reapply the snapshot boundary, not only a publication duplicate.
+                        core.apply_thread_notification(GatewayNotification::ThreadUpdated(
+                            ThreadUpdatedNotification {
+                                thread: snapshot.clone(),
+                                placement: None,
+                            },
+                        ));
+                        let source = core.thread_snapshot("a").unwrap();
+                        let conversation = &source.coordinator.conversation;
+                        let expected_phase = match status {
+                            TurnStatus::Completed => TurnPhase::Completed,
+                            TurnStatus::Failed => TurnPhase::Failed,
+                            TurnStatus::Blocked => TurnPhase::Blocked,
+                            TurnStatus::Interrupted => TurnPhase::Cancelled,
+                            _ => unreachable!(),
+                        };
+                        let view = conversation
+                            .projection()
+                            .turns
+                            .iter()
+                            .find(|turn| turn.id == "current-agent")
+                            .unwrap();
+                        assert_eq!(view.phase, expected_phase);
+                        assert_eq!(view.error, agent.error);
+                        assert_eq!(
+                            view.permission_profile.as_ref(),
+                            Some(&agent.permission_profile)
+                        );
+                        assert_eq!(
+                            conversation.in_flight_turn_id(),
+                            another_running.then_some("another-agent")
+                        );
+                        assert_eq!(
+                            conversation.projection().in_flight_turn_id.as_deref(),
+                            another_running.then_some("another-agent")
+                        );
+                        assert_eq!(conversation.projection().composer_locked, another_running);
+                        assert_eq!(conversation.can_submit_message(), !another_running);
+                        assert_eq!(conversation.pending_request_id(), None);
+                        let expected_flow = if another_running {
+                            TurnFlowState::Running {
+                                turn_id: "another-agent".into(),
+                            }
+                        } else {
+                            match status {
+                                TurnStatus::Completed => TurnFlowState::Completed {
+                                    turn_id: "current-agent".into(),
+                                },
+                                TurnStatus::Failed => TurnFlowState::Failed {
+                                    turn_id: "current-agent".into(),
+                                    error: "Canonical agent outcome".into(),
+                                },
+                                TurnStatus::Blocked => TurnFlowState::Blocked {
+                                    turn_id: "current-agent".into(),
+                                },
+                                TurnStatus::Interrupted => TurnFlowState::Cancelled {
+                                    turn_id: "current-agent".into(),
+                                    error: Some("Canonical agent outcome".into()),
+                                },
+                                _ => unreachable!(),
+                            }
+                        };
+                        assert_eq!(conversation.turn_flow_state(), &expected_flow);
+                        let rendered = rendered_thread(&core);
+                        assert_eq!(rendered.projection.composer_locked, another_running);
+                        assert_eq!(
+                            rendered.projection.in_flight_turn_id.as_deref(),
+                            another_running.then_some("another-agent")
+                        );
+                        let rendered_turn = rendered
+                            .projection
+                            .turns
+                            .iter()
+                            .find(|turn| turn.id == "current-agent")
+                            .unwrap();
+                        assert_eq!(rendered_turn.phase, expected_phase);
+                        assert_eq!(rendered_turn.error, agent.error);
+                        assert_eq!(
+                            rendered_turn.permission_profile.as_ref(),
+                            Some(&agent.permission_profile)
+                        );
+                        assert!(rendered.rows.iter().all(|row| !matches!(&row.kind,
+                            crate::timeline::rows::TimelineRowKind::RunningTurn(display) if display.turn_id == "admission")));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn historical_agent_child_cannot_release_new_starting_admission() {
+        use crate::conversation::{reducer::TurnPhase, state_machine::TurnFlowState};
+        let core = core();
+        let mut snapshot = thread("a", "ws");
+        snapshot.origin_kind = ThreadOriginKind::Collaborative;
+        snapshot.turns = vec![
+            Turn {
+                status: TurnStatus::Completed,
+                ..composer_admission()
+            },
+            Turn {
+                id: "historical-child".into(),
+                status: TurnStatus::Completed,
+                turn_kind: TurnKind::Conversation,
+                origin: TurnOrigin::User,
+                ..composer_occurrence()
+            },
+        ];
+        core.upsert_thread(snapshot.clone());
+        request_admission(&core, "next", "next-request");
+        for _ in 0..2 {
+            snapshot.updated_at += 1;
+            core.apply_thread_notification(GatewayNotification::ThreadUpdated(
+                ThreadUpdatedNotification {
+                    thread: snapshot.clone(),
+                    placement: None,
+                },
+            ));
+            let source = core.thread_snapshot("a").unwrap();
+            let conversation = &source.coordinator.conversation;
+            assert_eq!(
+                conversation.turn_flow_state(),
+                &TurnFlowState::Starting {
+                    turn_id: "next".into(),
+                    pending_request_id: "next-request".into(),
+                }
+            );
+            assert_eq!(conversation.pending_request_id(), Some("next-request"));
+            assert_eq!(conversation.in_flight_turn_id(), Some("next"));
+            assert!(conversation.projection().composer_locked);
+            let view = conversation
+                .projection()
+                .turns
+                .iter()
+                .find(|turn| turn.id == "next")
+                .unwrap();
+            assert_eq!(view.phase, TurnPhase::Starting);
+            assert_eq!(view.error, None);
+            assert_eq!(conversation.projection().last_error, None);
+            assert!(rendered_thread(&core).rows.iter().all(|row| !matches!(
+                row.kind,
+                crate::timeline::rows::TimelineRowKind::RunningTurn(_)
+            )));
+        }
+    }
+
+    #[test]
+    fn historical_admission_confirmations_cannot_take_local_terminal_flow() {
+        use crate::timeline::semantic::TopLevelPageMergeMode;
+        use crate::turns::start::{TurnStartSendContext, reduce_turn_start_send_success};
+        for status in [
+            TurnStatus::Completed,
+            TurnStatus::Failed,
+            TurnStatus::Blocked,
+            TurnStatus::Interrupted,
+        ] {
+            let core = core();
+            let mut snapshot = thread("a", "ws");
+            snapshot.origin_kind = ThreadOriginKind::Collaborative;
+            core.upsert_thread(snapshot.clone());
+            let previous = Turn {
+                id: "previous".into(),
+                status: TurnStatus::Completed,
+                ..composer_admission()
+            };
+            request_admission(&core, "previous", "previous-request");
+            let previous_response = || {
+                reduce_turn_start_send_success(
+                    TurnStartSendContext {
+                        thread_id: "a".into(),
+                        turn_id: "previous".into(),
+                        pending_request_id: "previous-request".into(),
+                        mode: ThreadMode::Agent,
+                    },
+                    TurnStartResponse {
+                        turn: previous.clone(),
+                    },
+                )
+            };
+            assert!(core.apply_thread_start_send_result(
+                core.thread_operation_token("a").unwrap(),
+                previous_response()
+            ));
+            snapshot.turns = vec![previous.clone()];
+            snapshot.updated_at += 1;
+            core.apply_thread_notification(GatewayNotification::ThreadUpdated(
+                ThreadUpdatedNotification {
+                    thread: snapshot.clone(),
+                    placement: None,
+                },
+            ));
+            request_admission(&core, "admission", "request");
+            reject_admission(&core, "admission", "request");
+            assert_admission_outcome(&core, TurnStatus::Failed, "Local response timeout");
+            let page = ThreadTimelinePageResponse {
+                workspace_id: "ws".into(),
+                thread_id: "a".into(),
+                projection_version: 4,
+                blocks: vec![TimelineBlock {
+                    workspace_id: "ws".into(),
+                    thread_id: "a".into(),
+                    turn_id: Some("previous".into()),
+                    block_id: "turn:previous:terminal-state".into(),
+                    sort_key: "00000000000000001000:previous:300:terminal-state".into(),
+                    started_at_unix_ms: Some(1_000),
+                    updated_at_unix_ms: Some(2_000),
+                    kind: TimelineBlockKind::TurnState {
+                        state: TurnWorkState::Completed,
+                        message: None,
+                        author: previous.author.clone(),
+                        route: None,
+                    },
+                }],
+                page: Default::default(),
+            };
+            for _ in 0..2 {
+                snapshot.updated_at += 1;
+                snapshot.turns[0].permission_profile =
+                    system_turn_permission_profile_snapshot(TurnPermissionMode::FullAccess);
+                core.apply_thread_notification(GatewayNotification::ThreadUpdated(
+                    ThreadUpdatedNotification {
+                        thread: snapshot.clone(),
+                        placement: None,
+                    },
+                ));
+                assert_admission_outcome(&core, TurnStatus::Failed, "Local response timeout");
+                let source = core.thread_snapshot("a").unwrap();
+                let history = source
+                    .coordinator
+                    .conversation
+                    .projection()
+                    .turns
+                    .iter()
+                    .find(|turn| turn.id == "previous")
+                    .unwrap();
+                assert_eq!(
+                    history.permission_profile.as_ref(),
+                    Some(&snapshot.turns[0].permission_profile)
+                );
+                core.apply_thread_notification(GatewayNotification::TurnCompleted(
+                    TurnCompletedNotification {
+                        workspace_id: "ws".into(),
+                        thread_id: "a".into(),
+                        turn: previous.clone(),
+                    },
+                ));
+                assert_admission_outcome(&core, TurnStatus::Failed, "Local response timeout");
+                core.apply_thread_timeline_page(page.clone(), TopLevelPageMergeMode::Merge);
+                assert_admission_outcome(&core, TurnStatus::Failed, "Local response timeout");
+                reject_admission(&core, "previous", "previous-request");
+                assert_admission_outcome(&core, TurnStatus::Failed, "Local response timeout");
+                assert!(core.apply_thread_start_send_result(
+                    core.thread_operation_token("a").unwrap(),
+                    previous_response()
+                ));
+                assert_admission_outcome(&core, TurnStatus::Failed, "Local response timeout");
+            }
+            let mut own = composer_admission();
+            own.status = status;
+            own.error =
+                (status != TurnStatus::Completed).then(|| "Canonical own admission outcome".into());
+            if status == TurnStatus::Completed {
+                core.apply_thread_notification(GatewayNotification::TurnCompleted(
+                    TurnCompletedNotification {
+                        workspace_id: "ws".into(),
+                        thread_id: "a".into(),
+                        turn: own.clone(),
+                    },
+                ));
+                assert_successful_admission(&core);
+            } else {
+                core.apply_thread_notification(admission_outcome_notification(&own));
+                assert_admission_outcome(&core, status, "Canonical own admission outcome");
+            }
+            for _ in 0..2 {
+                // Both old RPC outcomes must remain scoped to the previous submission,
+                // even though the new one has already released the composer.
+                reject_admission(&core, "previous", "previous-request");
+                assert!(core.apply_thread_start_send_result(
+                    core.thread_operation_token("a").unwrap(),
+                    previous_response()
+                ));
+                snapshot.updated_at += 1;
+                core.apply_thread_notification(GatewayNotification::ThreadUpdated(
+                    ThreadUpdatedNotification {
+                        thread: snapshot.clone(),
+                        placement: None,
+                    },
+                ));
+                core.apply_thread_timeline_page(page.clone(), TopLevelPageMergeMode::Merge);
+                if status == TurnStatus::Completed {
+                    assert_successful_admission(&core);
+                } else {
+                    assert_admission_outcome(&core, status, "Canonical own admission outcome");
+                }
+            }
+            let restored = ClientCore::new();
+            snapshot.turns.push(own);
+            restored.upsert_thread(snapshot);
+            if status == TurnStatus::Completed {
+                assert_successful_admission(&restored);
+            } else {
+                assert_admission_outcome(&restored, status, "Canonical own admission outcome");
+            }
+        }
+    }
+
+    #[test]
+    fn historical_refusal_page_enriches_its_turn_without_changing_new_timeout() {
+        use crate::conversation::{reducer::TurnPhase, state_machine::TurnFlowState};
+        let core = core();
+        let mut snapshot = thread("a", "ws");
+        snapshot.origin_kind = ThreadOriginKind::Collaborative;
+        let previous = Turn {
+            id: "previous".into(),
+            status: TurnStatus::Blocked,
+            error: Some("Historical canonical refusal".into()),
+            ..composer_admission()
+        };
+        snapshot.turns = vec![previous.clone()];
+        core.upsert_thread(snapshot.clone());
+        request_admission(&core, "admission", "request");
+        reject_admission(&core, "admission", "request");
+        let mut page = admission_outcome_page(&previous);
+        page.blocks[0].block_id = "turn:previous:terminal-state".into();
+        page.blocks[0].sort_key = "00000000000000001000:previous:300:terminal-state".into();
+        for _ in 0..2 {
+            snapshot.updated_at += 1;
+            snapshot.turns[0].permission_profile =
+                system_turn_permission_profile_snapshot(TurnPermissionMode::FullAccess);
+            core.apply_thread_notification(GatewayNotification::ThreadUpdated(
+                ThreadUpdatedNotification {
+                    thread: snapshot.clone(),
+                    placement: None,
+                },
+            ));
+            core.apply_thread_notification(admission_outcome_notification(&previous));
+            core.apply_thread_timeline_page(
+                page.clone(),
+                crate::timeline::semantic::TopLevelPageMergeMode::Merge,
+            );
+            let source = core.thread_snapshot("a").unwrap();
+            let conversation = &source.coordinator.conversation;
+            assert_eq!(
+                conversation.turn_flow_state(),
+                &TurnFlowState::Failed {
+                    turn_id: "admission".into(),
+                    error: "Local response timeout".into(),
+                }
+            );
+            assert_eq!(
+                conversation.projection().last_error.as_deref(),
+                Some("Local response timeout")
+            );
+            assert_eq!(conversation.in_flight_turn_id(), None);
+            assert_eq!(conversation.pending_request_id(), None);
+            assert!(conversation.can_submit_message());
+            assert!(!conversation.projection().composer_locked);
+            let view = conversation
+                .projection()
+                .turns
+                .iter()
+                .find(|turn| turn.id == "admission")
+                .unwrap();
+            assert_eq!(view.phase, TurnPhase::Failed);
+            assert_eq!(view.error.as_deref(), Some("Local response timeout"));
+            let historical = conversation
+                .projection()
+                .turns
+                .iter()
+                .find(|turn| turn.id == "previous")
+                .unwrap();
+            assert_eq!(historical.phase, TurnPhase::Blocked);
+            assert_eq!(
+                historical.error.as_deref(),
+                Some("Historical canonical refusal")
+            );
+            assert_admission_error(&core, TurnWorkState::Failed, "Local response timeout");
+            assert!(rendered_thread(&core).projection.items.iter().any(
+                |item| matches!(&item.item,
+                TurnItem::SystemEvent { code: Some(code), message, .. }
+                    if code == "turn_blocked" && message == "Historical canonical refusal")
+            ));
+        }
+    }
+
+    #[test]
+    fn late_unconfirmed_rpc_reject_cannot_replace_new_terminal_submission() {
+        let core = core();
+        let mut snapshot = thread("a", "ws");
+        snapshot.origin_kind = ThreadOriginKind::Collaborative;
+        core.upsert_thread(snapshot);
+        request_admission(&core, "previous", "previous-request");
+        reject_admission(&core, "previous", "previous-request");
+        request_admission(&core, "admission", "request");
+        reject_admission(&core, "admission", "request");
+        for successful in [false, true] {
+            if successful {
+                core.apply_thread_notification(GatewayNotification::TurnCompleted(
+                    TurnCompletedNotification {
+                        workspace_id: "ws".into(),
+                        thread_id: "a".into(),
+                        turn: Turn {
+                            status: TurnStatus::Completed,
+                            ..composer_admission()
+                        },
+                    },
+                ));
+            }
+            let before = core.thread_snapshot("a").unwrap();
+            for _ in 0..2 {
+                reject_admission(&core, "previous", "previous-request");
+                let source = core.thread_snapshot("a").unwrap();
+                assert_eq!(
+                    source.coordinator.conversation.turn_flow_state(),
+                    before.coordinator.conversation.turn_flow_state()
+                );
+                assert!(
+                    source
+                        .coordinator
+                        .conversation
+                        .projection()
+                        .same_content(before.coordinator.conversation.projection())
+                );
+                assert_eq!(source.semantic, before.semantic);
+                assert_eq!(source.coordinator.conversation.in_flight_turn_id(), None);
+                assert!(source.coordinator.conversation.can_submit_message());
+                assert!(rendered_thread(&core).rows.iter().all(|row| !matches!(
+                    row.kind,
+                    crate::timeline::rows::TimelineRowKind::RunningTurn(_)
+                )));
+            }
+        }
+    }
+
+    #[test]
+    fn admission_user_item_delivery_keeps_projection_starting_until_confirmation() {
+        use crate::conversation::{reducer::TurnPhase, state_machine::TurnFlowState};
+        let core = core();
+        let mut snapshot = thread("a", "ws");
+        snapshot.origin_kind = ThreadOriginKind::Collaborative;
+        core.upsert_thread(snapshot);
+        request_admission(&core, "admission", "request");
+        let item = TurnItem::UserMessage {
+            id: "user-admission".into(),
+            text: "Send through Composer".into(),
+            attachments: vec![],
+        };
+        let deliveries = [
+            GatewayNotification::ItemStarted(ItemStartedNotification {
+                workspace_id: "ws".into(),
+                thread_id: "a".into(),
+                turn_id: "admission".into(),
+                item: item.clone(),
+            }),
+            GatewayNotification::ItemCompleted(ItemCompletedNotification {
+                workspace_id: "ws".into(),
+                thread_id: "a".into(),
+                turn_id: "admission".into(),
+                item: item.clone(),
+            }),
+            GatewayNotification::ItemUpdated(ItemUpdatedNotification {
+                workspace_id: "ws".into(),
+                thread_id: "a".into(),
+                turn_id: "admission".into(),
+                item,
+            }),
+        ];
+        for delivery in std::iter::once(None).chain(
+            deliveries
+                .into_iter()
+                .flat_map(|delivery| [Some(delivery.clone()), Some(delivery)]),
+        ) {
+            if let Some(delivery) = delivery {
+                core.apply_thread_notification(delivery);
+            }
+            let snapshot = core.thread_snapshot("a").unwrap();
+            let conversation = &snapshot.coordinator.conversation;
+            assert_eq!(
+                conversation.turn_flow_state(),
+                &TurnFlowState::Starting {
+                    turn_id: "admission".into(),
+                    pending_request_id: "request".into()
+                }
+            );
+            assert_eq!(conversation.pending_request_id(), Some("request"));
+            assert!(conversation.projection().composer_locked);
+            let rendered = rendered_thread(&core);
+            for projection in [conversation.projection(), &rendered.projection] {
+                let view = projection
+                    .turns
+                    .iter()
+                    .find(|turn| turn.id == "admission")
+                    .unwrap();
+                assert_eq!(view.phase, TurnPhase::Starting);
+                assert_eq!(view.error, None);
+                assert_eq!(projection.pending_request_id.as_deref(), Some("request"));
+            }
+            assert_composer_timeline(&core, 1, 0, false);
+        }
+        core.apply_thread_notification(GatewayNotification::TurnStarted(TurnStartedNotification {
+            workspace_id: "ws".into(),
+            thread_id: "a".into(),
+            turn: composer_admission(),
+        }));
+        assert_successful_admission(&core);
+    }
+
+    #[test]
+    fn foreground_user_item_delivery_still_claims_running_flow() {
+        use crate::conversation::{reducer::TurnPhase, state_machine::TurnFlowState};
+        for origin in [ThreadOriginKind::User, ThreadOriginKind::DirectMessage] {
+            let core = core();
+            let mut snapshot = thread("a", "ws");
+            snapshot.origin_kind = origin;
+            core.upsert_thread(snapshot);
+            request_admission(&core, "foreground", "request");
+            core.apply_thread_notification(GatewayNotification::ItemStarted(
+                ItemStartedNotification {
+                    workspace_id: "ws".into(),
+                    thread_id: "a".into(),
+                    turn_id: "foreground".into(),
+                    item: TurnItem::UserMessage {
+                        id: "user-foreground".into(),
+                        text: "Send through Composer".into(),
+                        attachments: vec![],
+                    },
+                },
+            ));
+            let source = core.thread_snapshot("a").unwrap();
+            let conversation = &source.coordinator.conversation;
+            assert_eq!(
+                conversation.turn_flow_state(),
+                &TurnFlowState::Running {
+                    turn_id: "foreground".into()
+                }
+            );
+            assert_eq!(conversation.pending_request_id(), None);
+            assert_eq!(conversation.in_flight_turn_id(), Some("foreground"));
+            assert!(conversation.projection().composer_locked);
+            let rendered = rendered_thread(&core);
+            let view = rendered
+                .projection
+                .turns
+                .iter()
+                .find(|turn| turn.id == "foreground")
+                .unwrap();
+            assert_eq!(view.phase, TurnPhase::Running);
+            assert_eq!(rendered.projection.pending_request_id, None);
+        }
+    }
+
+    #[test]
+    fn admission_principal_refusal_keeps_exact_author_in_shared_renderer() {
+        for status in [
+            TurnStatus::Failed,
+            TurnStatus::Blocked,
+            TurnStatus::Interrupted,
+        ] {
+            let core = core();
+            let mut snapshot = thread("a", "ws");
+            snapshot.origin_kind = ThreadOriginKind::Collaborative;
+            core.upsert_thread(snapshot.clone());
+            let mut terminal = composer_admission();
+            terminal.status = status;
+            terminal.error = Some("Admission refused".into());
+            core.apply_thread_notification(admission_outcome_notification(&terminal));
+            for hydrate in [false, true] {
+                if hydrate {
+                    snapshot.turns = vec![terminal.clone()];
+                    snapshot.updated_at += 1;
+                    core.apply_thread_notification(GatewayNotification::ThreadUpdated(
+                        ThreadUpdatedNotification {
+                            thread: snapshot.clone(),
+                            placement: None,
+                        },
+                    ));
+                    let mut page = admission_outcome_page(&terminal);
+                    if let TimelineBlockKind::TurnState { author, .. } = &mut page.blocks[0].kind {
+                        *author = terminal.author.clone();
+                    }
+                    core.apply_thread_timeline_page(
+                        page.clone(),
+                        crate::timeline::semantic::TopLevelPageMergeMode::Merge,
+                    );
+                    core.apply_thread_timeline_page(
+                        page,
+                        crate::timeline::semantic::TopLevelPageMergeMode::Merge,
+                    );
+                }
+                assert_admission_outcome(&core, status, "Admission refused");
+                let rendered = rendered_thread(&core);
+                let row = rendered
+                    .rows
+                    .iter()
+                    .find(|row| row.key == "turn:admission:terminal-state")
+                    .unwrap();
+                assert_eq!(row.author, terminal.author);
+            }
+        }
+    }
+
     #[test]
     fn restored_session_resumes_only_visible_thread_subscription_and_timeline() {
         let core = ClientCore::new();
@@ -6339,6 +8931,7 @@ impl ClientCore {
                             .request_status
                             .clone()
                     });
+                    confirm_admission_page(&mut store.coordinator.conversation, &page);
                     apply_thread_timeline_page(&mut store.semantic, page, mode);
                     if let Some(status) = refresh_status {
                         set_request_status(&mut store.semantic, &refresh_key, status);
@@ -6585,7 +9178,13 @@ impl ClientCore {
         &self,
         action: SemanticTimelineRequestAction,
         fetch: impl FnOnce() -> anyhow::Result<T>,
-        apply: impl FnOnce(&mut SemanticTimelineState, &str, &str, &T) -> anyhow::Result<()>,
+        apply: impl FnOnce(
+            &mut SemanticTimelineState,
+            &mut crate::conversation::Conversation,
+            &str,
+            &str,
+            &T,
+        ) -> anyhow::Result<()>,
     ) -> anyhow::Result<T> {
         let request = self
             .begin_thread_semantic_request(action)
@@ -6611,6 +9210,7 @@ impl ClientCore {
         let result = result.and_then(|page| {
             apply(
                 &mut store.semantic,
+                &mut store.coordinator.conversation,
                 &store.coordinator.workspace_id,
                 &request.id,
                 &page,
@@ -6677,11 +9277,12 @@ impl ClientCore {
                 params: params.clone(),
             },
             || crate::transport::ws::command_sender::thread_timeline_page(transport, params),
-            |state, workspace, id, page| {
+            |state, conversation, workspace, id, page| {
                 anyhow::ensure!(
                     page.workspace_id == workspace && page.thread_id == id,
                     "Timeline response scope mismatch"
                 );
+                confirm_admission_page(conversation, page);
                 apply_thread_timeline_page(state, page.clone(), mode);
                 Ok(())
             },
@@ -6751,7 +9352,7 @@ impl ClientCore {
                 }
                 crate::transport::ws::command_sender::turn_work_page(transport, params)
             },
-            |state, workspace, id, page| {
+            |state, _conversation, workspace, id, page| {
                 anyhow::ensure!(
                     page.workspace_id == workspace && page.thread_id == id && page.turn_id == turn,
                     "Timeline response scope mismatch"
@@ -6783,7 +9384,7 @@ impl ClientCore {
                 params: params.clone(),
             },
             || crate::transport::ws::command_sender::turn_work_items_get(transport, params),
-            |state, workspace, id, page| {
+            |state, _conversation, workspace, id, page| {
                 anyhow::ensure!(
                     page.workspace_id == workspace && page.thread_id == id && page.turn_id == turn,
                     "Timeline response scope mismatch"
@@ -7076,7 +9677,7 @@ impl ClientCore {
             !self.is_stopped() && store.generation == generation,
             "Thread subscription cancelled"
         );
-        store.coordinator.set_snapshot(reduction.thread);
+        store.set_snapshot(reduction.thread);
         let drafts = registry.publish(id);
         self.transition_directory(
             &mut registry,
@@ -7228,7 +9829,6 @@ impl ClientCore {
             .stores
             .get_mut(&id)
             .expect("retained draft")
-            .coordinator
             .set_snapshot(reduction.thread);
         registry
             .navigation
@@ -7282,7 +9882,7 @@ impl ClientCore {
             .thread()
             .is_none_or(|previous| previous.updated_at <= thread.updated_at)
         {
-            store.coordinator.set_snapshot(thread);
+            store.set_snapshot(thread);
         }
         let token = ThreadOperationToken {
             id: id.clone(),
@@ -7518,11 +10118,24 @@ impl ClientCore {
             return false;
         }
         for event in events {
+            if store
+                .coordinator
+                .conversation
+                .ignores_admission_response(&event)
+            {
+                continue;
+            }
+
             store.coordinator.conversation.apply(event.clone());
-            crate::timeline::semantic::apply_conversation_event_to_semantic_timeline(
+            crate::timeline::semantic::apply_local_composer_event_to_semantic_timeline(
                 &mut store.semantic,
                 &store.coordinator.workspace_id,
                 &event,
+                store
+                    .coordinator
+                    .thread()
+                    .map(|thread| thread.origin_kind.composer_execution_mode())
+                    .unwrap_or(pioneer_protocol::ThreadComposerExecutionMode::ForegroundTurn),
                 crate::timeline::labels::now_unix_ms(),
             );
         }
