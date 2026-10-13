@@ -2117,7 +2117,7 @@ impl ClientCore {
                 let requests = thread_reconcile_actions(&update);
                 if self.apply_thread_semantic_live_update(update) {
                     for action in requests {
-                        self.schedule_thread_semantic_request_inner(action, None, true);
+                        self.schedule_thread_semantic_request_inner(action, None, true, false);
                     }
                 }
             }
@@ -5753,6 +5753,832 @@ mod tests {
             Ok(())
         }
     }
+
+    fn initial_work_action() -> SemanticTimelineRequestAction {
+        SemanticTimelineRequestAction::TurnWorkPage {
+            key: SemanticTimelineRequestKey::TurnWorkInitial {
+                thread_id: "a".into(),
+                turn_id: "turn".into(),
+            },
+            params: TurnWorkPageParams {
+                thread_id: "a".into(),
+                turn_id: "turn".into(),
+                anchor: TimelinePageAnchor::Newest,
+                limit: Some(50),
+            },
+        }
+    }
+
+    fn work_delta(text: &str) -> ConversationEvent {
+        ConversationEvent::ItemDelta {
+            thread_id: "a".into(),
+            turn_id: "turn".into(),
+            item_id: "comment".into(),
+            delta: text.into(),
+            stream: Some(ItemDeltaStream::AgentMessage),
+            payload: None,
+            markdown: None,
+            markdown_version: None,
+        }
+    }
+
+    fn empty_work_page(core: &ClientCore) -> TurnWorkPageResponse {
+        TurnWorkPageResponse {
+            workspace_id: "ws".into(),
+            thread_id: "a".into(),
+            turn_id: "turn".into(),
+            projection_version: 1,
+            source_high_watermark: 1,
+            projection_updated_at_unix_micros: 1,
+            work: core
+                .thread_semantic_snapshot("a")
+                .thread("a")
+                .unwrap()
+                .work_range("turn")
+                .unwrap()
+                .work
+                .clone(),
+            items: vec![],
+            page: Default::default(),
+        }
+    }
+
+    fn retry_initial_work(core: &ClientCore) -> crate::timeline::controller::TimelineEffectPlan {
+        use crate::timeline::controller::{TimelineDemand, TimelineIntent};
+        let snapshot = core.thread_presentation_snapshot("a").unwrap();
+        let demand = TimelineDemand {
+            thread_id: "a".into(),
+            consumer_id: "review-test".into(),
+            generation: 1,
+            source_revision: snapshot.timeline().source_revision(),
+            row_ids: snapshot
+                .timeline()
+                .rows()
+                .iter()
+                .map(|row| row.id().as_str().to_owned())
+                .collect(),
+            threshold: 3,
+            before: false,
+            after: false,
+            work: true,
+            presented_rows: true,
+            scroll_generation: 1,
+            latest_user_turn_id: None,
+            viewed_through_turn_id: None,
+            read_requires_unread: false,
+            prefetch_on_visibility: true,
+            boundary_request_limit: 1,
+        };
+        let first = core.plan_timeline_intent(TimelineIntent::Update { demand }, 0);
+        assert!(
+            first.pages.is_empty(),
+            "failure backoff applies to controller admission"
+        );
+        let retry = core.plan_timeline_intent(
+            TimelineIntent::Retry {
+                thread_id: "a".into(),
+                consumer_id: "review-test".into(),
+                generation: 1,
+            },
+            u64::MAX,
+        );
+        assert_eq!(retry.pages.len(), 1);
+        retry
+    }
+
+    #[test]
+    fn initial_work_page_collision_preserves_delta_and_retry_hydrates_canonical_body() {
+        #[derive(Clone, Copy)]
+        enum Scenario {
+            Unchanged,
+            Conflict,
+            Matching,
+            Superseded,
+        }
+        struct Transport<'a> {
+            core: &'a ClientCore,
+            page: TurnWorkPageResponse,
+            scenario: Scenario,
+            calls: std::cell::Cell<usize>,
+        }
+        impl crate::rpc::JsonRpcRequestTransport for Transport<'_> {
+            fn send_json_rpc_request(
+                &self,
+                _: String,
+                _: String,
+                response: crate::rpc::JsonRpcResponseSender,
+            ) -> Result<(), String> {
+                let call = self.calls.get() + 1;
+                self.calls.set(call);
+                assert!(call <= 2, "no automatic reread loop");
+                let mut prepared = self.page.clone();
+                if call == 1 && !matches!(self.scenario, Scenario::Unchanged) {
+                    if matches!(self.scenario, Scenario::Matching) {
+                        let TurnItem::AgentMessage { text, .. } = &mut prepared.items[0].item
+                        else {
+                            panic!()
+                        };
+                        *text = "AB".into();
+                    }
+                    // The response is fixed before the same Running item's delta arrives.
+                    self.core
+                        .apply_thread_conversation_event("ws", work_delta("B"), None);
+                    if matches!(self.scenario, Scenario::Superseded) {
+                        let mut newer = prepared.items[0].clone();
+                        let TurnItem::AgentMessage { text, .. } = &mut newer.item else {
+                            panic!()
+                        };
+                        *text = "prefix AB".into();
+                        newer.source_sequence = 5;
+                        newer.source_updated_at_unix_micros = 5;
+                        self.core
+                            .apply_turn_work_items_get_response(TurnWorkItemsGetResponse {
+                                workspace_id: "ws".into(),
+                                thread_id: "a".into(),
+                                turn_id: "turn".into(),
+                                projection_version: 1,
+                                source_high_watermark: 5,
+                                projection_updated_at_unix_micros: 5,
+                                items: vec![newer],
+                                removed_work_item_ids: vec![],
+                            });
+                    }
+                } else if call == 2 {
+                    let TurnItem::AgentMessage { text, .. } = &mut prepared.items[0].item else {
+                        panic!()
+                    };
+                    *text = "prefix AB".into();
+                    prepared.items[0].source_sequence = 2;
+                    prepared.source_high_watermark = 2;
+                }
+                response
+                    .send(Ok(serde_json::to_value(prepared).unwrap()))
+                    .unwrap();
+                Ok(())
+            }
+        }
+        for synchronous in [false, true] {
+            for scenario in [
+                Scenario::Unchanged,
+                Scenario::Conflict,
+                Scenario::Matching,
+                Scenario::Superseded,
+            ] {
+                let collide = matches!(scenario, Scenario::Conflict);
+                let core = core();
+                core.upsert_thread(thread("a", "ws"));
+                core.apply_thread_timeline_page(
+                    presentation_page(&[]),
+                    crate::timeline::semantic::TopLevelPageMergeMode::Reset,
+                );
+                core.apply_thread_conversation_event("ws", work_delta("A"), None);
+                let _lease = core.subscribe(
+                    ClientScope::Timeline {
+                        thread_id: "a".into(),
+                    },
+                    NonZeroUsize::new(16).unwrap(),
+                );
+                let mut page = empty_work_page(&core);
+                let mut canonical = core
+                    .thread_semantic_snapshot("a")
+                    .thread("a")
+                    .unwrap()
+                    .work_range("turn")
+                    .unwrap()
+                    .ordered_items()
+                    .next()
+                    .unwrap()
+                    .clone();
+                let TurnItem::AgentMessage { text, .. } = &mut canonical.item else {
+                    panic!()
+                };
+                *text = "prefix A".into();
+                canonical.source_sequence = 1;
+                canonical.source_updated_at_unix_micros = 1;
+                canonical.metadata = None;
+                page.items.push(canonical);
+                let (sender, receiver) = std::sync::mpsc::channel();
+                *core.thread_request_sender.lock().unwrap() = Some(sender);
+                let transport = Transport {
+                    core: &core,
+                    page,
+                    scenario,
+                    calls: Default::default(),
+                };
+                if synchronous {
+                    let SemanticTimelineRequestAction::TurnWorkPage { params, .. } =
+                        initial_work_action()
+                    else {
+                        panic!()
+                    };
+                    assert_eq!(
+                        core.fetch_turn_work_page(&transport, params).is_err(),
+                        collide
+                    );
+                } else {
+                    let request = core
+                        .begin_thread_semantic_request(initial_work_action())
+                        .unwrap();
+                    core.execute_thread_semantic_request(&transport, request);
+                }
+                core.materialize_demanded_timelines();
+                assert_eq!(transport.calls.get(), 1);
+                assert!(core.thread_semantic_in_flight("a").is_empty());
+                assert_eq!(receiver.try_iter().count(), 0);
+                if collide {
+                    let semantic = core.thread_semantic_snapshot("a");
+                    let range = semantic.thread("a").unwrap().work_range("turn").unwrap();
+                    assert!(!range.has_loaded_page);
+                    assert_eq!(range.items_by_id.len(), 1);
+                    assert_eq!(range.ordered_item_ids.len(), 1);
+                    assert!(matches!(&range.ordered_items().next().unwrap().item,
+                        TurnItem::AgentMessage { text, .. } if text == "AB"));
+                    let public = core
+                        .thread_presentation_snapshot("a")
+                        .unwrap()
+                        .timeline()
+                        .serialized_header();
+                    assert!(
+                        public["status"]["Failed"]["message"]
+                            .as_str()
+                            .unwrap()
+                            .contains("Work history changed")
+                    );
+                    let retry = retry_initial_work(&core);
+                    core.schedule_planned_timeline_request(retry.pages[0].clone());
+                    let ThreadControllerRequest::Semantic(request) = receiver.try_recv().unwrap()
+                    else {
+                        panic!()
+                    };
+                    core.execute_thread_semantic_request(&transport, request);
+                    core.materialize_demanded_timelines();
+                    assert_eq!(receiver.try_iter().count(), 0);
+                    assert_eq!(transport.calls.get(), 2);
+                }
+                let semantic = core.thread_semantic_snapshot("a");
+                let range = semantic.thread("a").unwrap().work_range("turn").unwrap();
+                assert!(range.has_loaded_page);
+                assert_eq!(
+                    range.initial_request_status,
+                    crate::timeline::semantic::TimelineRequestStatus::Ready
+                );
+                assert_eq!(range.items_by_id.len(), 1);
+                assert_eq!(range.ordered_item_ids.len(), 1);
+                assert_eq!(
+                    range.ordered_items().next().unwrap().status,
+                    TurnWorkItemStatus::Running
+                );
+                let expected = match scenario {
+                    Scenario::Unchanged => "prefix A",
+                    Scenario::Matching => "AB",
+                    Scenario::Conflict | Scenario::Superseded => "prefix AB",
+                };
+                assert!(matches!(&range.ordered_items().next().unwrap().item,
+                    TurnItem::AgentMessage { text, .. } if text == expected));
+                assert!(core.thread_semantic_in_flight("a").is_empty());
+                assert_eq!(
+                    core.thread_presentation_snapshot("a")
+                        .unwrap()
+                        .timeline()
+                        .serialized_header()["status"],
+                    "Ready"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_refresh_during_initial_work_loading_coalesces_one_follow_up() {
+        struct Transport<'a> {
+            core: &'a ClientCore,
+            page: TurnWorkPageResponse,
+            calls: std::cell::Cell<usize>,
+        }
+        impl crate::rpc::JsonRpcRequestTransport for Transport<'_> {
+            fn send_json_rpc_request(
+                &self,
+                _: String,
+                _: String,
+                response: crate::rpc::JsonRpcResponseSender,
+            ) -> Result<(), String> {
+                let call = self.calls.get() + 1;
+                self.calls.set(call);
+                assert!(call <= 2);
+                let semantic = self.core.thread_semantic_snapshot("a");
+                assert!(matches!(
+                    semantic
+                        .thread("a")
+                        .unwrap()
+                        .work_range("turn")
+                        .unwrap()
+                        .initial_request_status,
+                    crate::timeline::semantic::TimelineRequestStatus::Loading { .. }
+                ));
+                if call == 1 {
+                    for _ in 0..3 {
+                        self.core.refresh_thread_timeline("a");
+                    }
+                    let registry = self.core.thread_registry.lock().unwrap();
+                    let action = initial_work_action();
+                    let key = crate::timeline::semantic::semantic_timeline_request_key(&action);
+                    assert!(registry.timeline.in_flight.contains(key));
+                    assert!(registry.timeline.pending.contains_key(key));
+                }
+                response
+                    .send(Ok(serde_json::to_value(&self.page).unwrap()))
+                    .unwrap();
+                Ok(())
+            }
+        }
+        let core = core();
+        core.upsert_thread(thread("a", "ws"));
+        core.apply_thread_conversation_event("ws", work_delta("live"), None);
+        let page = empty_work_page(&core);
+        let request = core
+            .begin_thread_semantic_request(initial_work_action())
+            .unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        *core.thread_request_sender.lock().unwrap() = Some(sender);
+        let transport = Transport {
+            core: &core,
+            page,
+            calls: Default::default(),
+        };
+        core.execute_thread_semantic_request(&transport, request);
+        assert_eq!(transport.calls.get(), 2);
+        let action = initial_work_action();
+        let key = crate::timeline::semantic::semantic_timeline_request_key(&action);
+        assert!(!core.thread_semantic_in_flight("a").contains(key));
+        assert!(
+            !core
+                .thread_registry
+                .lock()
+                .unwrap()
+                .timeline
+                .pending
+                .contains_key(key)
+        );
+        assert!(receiver.try_iter().all(|request| !matches!(request,
+            ThreadControllerRequest::Semantic(request)
+                if crate::timeline::semantic::semantic_timeline_request_key(&request.action) == key)));
+    }
+
+    #[test]
+    fn automatic_initial_work_hydration_coalesces_and_failure_uses_existing_retry() {
+        struct Transport(Result<TurnWorkPageResponse, String>);
+        impl crate::rpc::JsonRpcRequestTransport for Transport {
+            fn send_json_rpc_request(
+                &self,
+                _: String,
+                _: String,
+                response: crate::rpc::JsonRpcResponseSender,
+            ) -> Result<(), String> {
+                match &self.0 {
+                    Ok(page) => {
+                        response
+                            .send(Ok(serde_json::to_value(page).unwrap()))
+                            .unwrap();
+                        Ok(())
+                    }
+                    Err(error) => Err(error.clone()),
+                }
+            }
+        }
+        for failed in [false, true] {
+            let core = core();
+            core.upsert_thread(thread("a", "ws"));
+            core.apply_thread_timeline_page(
+                presentation_page(&[]),
+                crate::timeline::semantic::TopLevelPageMergeMode::Reset,
+            );
+            core.apply_thread_conversation_event("ws", work_delta("fragment"), None);
+            let _lease = core.subscribe(
+                ClientScope::Timeline {
+                    thread_id: "a".into(),
+                },
+                NonZeroUsize::new(16).unwrap(),
+            );
+            let (sender, receiver) = std::sync::mpsc::channel();
+            *core.thread_request_sender.lock().unwrap() = Some(sender);
+            core.apply_thread_conversation_event("ws", work_delta(" more"), None);
+            core.materialize_demanded_timelines();
+            let ThreadControllerRequest::Semantic(request) = receiver.try_recv().unwrap() else {
+                panic!("expected initial work request");
+            };
+            assert!(matches!(
+                &request.action,
+                SemanticTimelineRequestAction::TurnWorkPage {
+                    key: SemanticTimelineRequestKey::TurnWorkInitial { .. },
+                    ..
+                }
+            ));
+            for _ in 0..3 {
+                core.apply_thread_conversation_event("ws", work_delta(" live"), None);
+                core.materialize_demanded_timelines();
+                assert_eq!(receiver.try_iter().count(), 0);
+                assert!(
+                    core.accept_timeline_request(
+                        initial_work_action(),
+                        None,
+                        Some(core.thread_operation_token("a").unwrap().generation),
+                        false,
+                        true,
+                    )
+                    .is_none()
+                );
+            }
+            let page = empty_work_page(&core);
+            core.execute_thread_semantic_request(
+                &Transport(if failed {
+                    Err("synthetic page failure".into())
+                } else {
+                    Ok(page.clone())
+                }),
+                request,
+            );
+            assert!(core.thread_semantic_in_flight("a").is_empty());
+            for _ in 0..3 {
+                core.apply_thread_conversation_event("ws", work_delta(" later"), None);
+                core.materialize_demanded_timelines();
+                assert_eq!(receiver.try_iter().count(), 0);
+            }
+            let semantic = core.thread_semantic_snapshot("a");
+            let range = semantic.thread("a").unwrap().work_range("turn").unwrap();
+            assert_eq!(range.has_loaded_page, !failed);
+            let public = core
+                .thread_presentation_snapshot("a")
+                .unwrap()
+                .timeline()
+                .serialized_header();
+            assert_eq!(public["has_loaded_page"], true);
+            if failed {
+                assert!(matches!(
+                    range.request_status,
+                    crate::timeline::semantic::TimelineRequestStatus::Failed { .. }
+                ));
+                assert!(
+                    public["status"]["Failed"]["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains("synthetic page failure")
+                );
+                core.set_thread_turn_work_expanded("a", "turn", false);
+                core.materialize_demanded_timelines();
+                assert_eq!(
+                    core.thread_presentation_snapshot("a")
+                        .unwrap()
+                        .timeline()
+                        .serialized_header()["status"],
+                    "Ready"
+                );
+                core.set_thread_turn_work_expanded("a", "turn", true);
+                core.materialize_demanded_timelines();
+                let retry = retry_initial_work(&core);
+                core.schedule_planned_timeline_request(retry.pages[0].clone());
+                let ThreadControllerRequest::Semantic(request) = receiver.try_recv().unwrap()
+                else {
+                    panic!()
+                };
+                core.execute_thread_semantic_request(&Transport(Ok(page)), request);
+                let semantic = core.thread_semantic_snapshot("a");
+                assert!(
+                    semantic
+                        .thread("a")
+                        .unwrap()
+                        .work_range("turn")
+                        .unwrap()
+                        .has_loaded_page
+                );
+                assert!(core.thread_semantic_in_flight("a").is_empty());
+                core.materialize_demanded_timelines();
+                assert_eq!(
+                    core.thread_presentation_snapshot("a")
+                        .unwrap()
+                        .timeline()
+                        .serialized_header()["status"],
+                    "Ready"
+                );
+            } else {
+                assert_eq!(public["status"], "Ready");
+            }
+        }
+    }
+
+    #[test]
+    fn initial_work_failure_survives_neighbor_updates_until_page_retry() {
+        use crate::timeline::semantic::{SemanticTimelineLiveUpdate, TimelineRequestStatus};
+        struct Transport<'a> {
+            result: Result<serde_json::Value, String>,
+            calls: &'a std::cell::Cell<usize>,
+        }
+        impl crate::rpc::JsonRpcRequestTransport for Transport<'_> {
+            fn send_json_rpc_request(
+                &self,
+                _: String,
+                _: String,
+                response: crate::rpc::JsonRpcResponseSender,
+            ) -> Result<(), String> {
+                self.calls.set(self.calls.get() + 1);
+                match &self.result {
+                    Ok(value) => {
+                        response.send(Ok(value.clone())).unwrap();
+                        Ok(())
+                    }
+                    Err(error) => Err(error.clone()),
+                }
+            }
+        }
+        for items_get in [false, true] {
+            let core = core();
+            core.upsert_thread(thread("a", "ws"));
+            core.apply_thread_timeline_page(
+                presentation_page(&[]),
+                crate::timeline::semantic::TopLevelPageMergeMode::Reset,
+            );
+            core.apply_thread_conversation_event("ws", work_delta("A"), None);
+            let mut removed = work_delta("removed");
+            let ConversationEvent::ItemDelta { item_id, .. } = &mut removed else {
+                panic!()
+            };
+            *item_id = "removed".into();
+            core.apply_thread_conversation_event("ws", removed, None);
+            let _lease = core.subscribe(
+                ClientScope::Timeline {
+                    thread_id: "a".into(),
+                },
+                NonZeroUsize::new(16).unwrap(),
+            );
+            let semantic = core.thread_semantic_snapshot("a");
+            let range = semantic.thread("a").unwrap().work_range("turn").unwrap();
+            let mut updated = range
+                .ordered_items()
+                .find(|item| item.item_id == "comment")
+                .unwrap()
+                .clone();
+            let removed_id = range
+                .ordered_items()
+                .find(|item| item.item_id == "removed")
+                .unwrap()
+                .work_item_id
+                .clone();
+            let work_item_id = updated.work_item_id.clone();
+            let TurnItem::AgentMessage { text, .. } = &mut updated.item else {
+                panic!()
+            };
+            *text = "neighbor canonical".into();
+            updated.source_sequence = 5;
+            updated.source_updated_at_unix_micros = 5;
+            updated.metadata = None;
+            let (sender, receiver) = std::sync::mpsc::channel();
+            *core.thread_request_sender.lock().unwrap() = Some(sender);
+            let calls = std::cell::Cell::new(0);
+            let request = core
+                .begin_thread_semantic_request(initial_work_action())
+                .unwrap();
+            core.execute_thread_semantic_request(
+                &Transport {
+                    result: Err("initial history unavailable".into()),
+                    calls: &calls,
+                },
+                request,
+            );
+            let failure = core
+                .thread_semantic_snapshot("a")
+                .thread("a")
+                .unwrap()
+                .work_range("turn")
+                .unwrap()
+                .initial_request_status
+                .clone();
+            assert!(
+                matches!(&failure, TimelineRequestStatus::Failed { message } if message.contains("initial history unavailable"))
+            );
+            let public_failure = serde_json::to_value(&failure).unwrap();
+            core.set_thread_turn_work_expanded("a", "turn", false);
+            core.materialize_demanded_timelines();
+            assert_eq!(
+                core.thread_presentation_snapshot("a")
+                    .unwrap()
+                    .timeline()
+                    .serialized_header()["status"],
+                "Ready"
+            );
+            let semantic = core.thread_semantic_snapshot("a");
+            let range = semantic.thread("a").unwrap().work_range("turn").unwrap();
+            assert!(!range.has_loaded_page);
+            assert_eq!(range.initial_request_status, failure);
+            core.set_thread_turn_work_expanded("a", "turn", true);
+            core.materialize_demanded_timelines();
+            assert_eq!(
+                core.thread_presentation_snapshot("a")
+                    .unwrap()
+                    .timeline()
+                    .serialized_header()["status"],
+                public_failure
+            );
+            if items_get {
+                let request = core
+                    .begin_thread_semantic_request(
+                        SemanticTimelineRequestAction::TurnWorkItemsGet {
+                            key: SemanticTimelineRequestKey::TurnWorkItems {
+                                thread_id: "a".into(),
+                                turn_id: "turn".into(),
+                            },
+                            params: TurnWorkItemsGetParams {
+                                thread_id: "a".into(),
+                                turn_id: "turn".into(),
+                                work_item_ids: vec![work_item_id.clone(), removed_id.clone()],
+                            },
+                        },
+                    )
+                    .unwrap();
+                let response = TurnWorkItemsGetResponse {
+                    workspace_id: "ws".into(),
+                    thread_id: "a".into(),
+                    turn_id: "turn".into(),
+                    projection_version: 1,
+                    source_high_watermark: 5,
+                    projection_updated_at_unix_micros: 5,
+                    items: vec![updated.clone()],
+                    removed_work_item_ids: vec![removed_id.clone()],
+                };
+                core.execute_thread_semantic_request(
+                    &Transport {
+                        result: Ok(serde_json::to_value(response).unwrap()),
+                        calls: &calls,
+                    },
+                    request,
+                );
+            } else {
+                core.apply_thread_semantic_live_update(
+                    SemanticTimelineLiveUpdate::TurnWorkItemsChanged(
+                        TurnWorkItemsChangedNotification {
+                            workspace_id: "ws".into(),
+                            thread_id: "a".into(),
+                            turn_id: "turn".into(),
+                            changed_work_item_ids: vec![work_item_id.clone()],
+                            removed_work_item_ids: vec![removed_id.clone()],
+                            before_cursor: None,
+                            after_cursor: None,
+                            reason: TimelineChangeReason::LiveEvent,
+                        },
+                    ),
+                );
+            }
+            let semantic = core.thread_semantic_snapshot("a");
+            let range = semantic.thread("a").unwrap().work_range("turn").unwrap();
+            assert!(!range.has_loaded_page);
+            assert_eq!(range.initial_request_status, failure);
+            assert_eq!(range.request_status, TimelineRequestStatus::Ready);
+            assert!(range.item(&removed_id).is_none());
+            if items_get {
+                assert_eq!(range.item(&work_item_id), Some(&updated));
+            } else {
+                assert!(range.stale_work_item_ids.contains(&work_item_id));
+            }
+            for _ in 0..3 {
+                core.apply_thread_conversation_event("ws", work_delta(" later"), None);
+                core.materialize_demanded_timelines();
+                let public = core
+                    .thread_presentation_snapshot("a")
+                    .unwrap()
+                    .timeline()
+                    .serialized_header();
+                assert_eq!(public["status"], public_failure);
+                let semantic = core.thread_semantic_snapshot("a");
+                let range = semantic.thread("a").unwrap().work_range("turn").unwrap();
+                assert!(!range.has_loaded_page);
+                assert_eq!(range.initial_request_status, failure);
+                assert_eq!(receiver.try_iter().count(), 0);
+            }
+            let retry = retry_initial_work(&core);
+            core.schedule_planned_timeline_request(retry.pages[0].clone());
+            let semantic = core.thread_semantic_snapshot("a");
+            let range = semantic.thread("a").unwrap().work_range("turn").unwrap();
+            assert!(!range.has_loaded_page);
+            assert!(matches!(
+                range.initial_request_status,
+                TimelineRequestStatus::Loading { .. }
+            ));
+            let mut page = empty_work_page(&core);
+            page.source_high_watermark = 10;
+            page.projection_updated_at_unix_micros = 10;
+            let ThreadControllerRequest::Semantic(request) = receiver.try_recv().unwrap() else {
+                panic!()
+            };
+            core.execute_thread_semantic_request(
+                &Transport {
+                    result: Ok(serde_json::to_value(page).unwrap()),
+                    calls: &calls,
+                },
+                request,
+            );
+            core.materialize_demanded_timelines();
+            let semantic = core.thread_semantic_snapshot("a");
+            let range = semantic.thread("a").unwrap().work_range("turn").unwrap();
+            assert!(range.has_loaded_page);
+            assert_eq!(range.initial_request_status, TimelineRequestStatus::Ready);
+            assert_eq!(range.items_by_id.len(), 1);
+            assert!(range.item(&removed_id).is_none());
+            let expected = if items_get {
+                "neighbor canonical later later later"
+            } else {
+                "A later later later"
+            };
+            assert!(
+                matches!(&range.item(&work_item_id).unwrap().item, TurnItem::AgentMessage { text, .. } if text == expected)
+            );
+            assert_eq!(
+                core.thread_presentation_snapshot("a")
+                    .unwrap()
+                    .timeline()
+                    .serialized_header()["status"],
+                "Ready"
+            );
+            assert_eq!(calls.get(), if items_get { 3 } else { 2 });
+            assert_eq!(receiver.try_iter().count(), 0);
+            assert!(core.thread_semantic_in_flight("a").is_empty());
+        }
+    }
+
+    #[test]
+    fn late_initial_work_page_cannot_hydrate_a_replacement_owner() {
+        struct ReplacingTransport<'a> {
+            core: &'a ClientCore,
+            page: TurnWorkPageResponse,
+        }
+        impl crate::rpc::JsonRpcRequestTransport for ReplacingTransport<'_> {
+            fn send_json_rpc_request(
+                &self,
+                _: String,
+                _: String,
+                response: crate::rpc::JsonRpcResponseSender,
+            ) -> Result<(), String> {
+                self.core.remove_thread_store("a");
+                self.core.upsert_thread(thread("a", "ws"));
+                self.core
+                    .apply_thread_conversation_event("ws", work_delta("replacement"), None);
+                response
+                    .send(Ok(serde_json::to_value(&self.page).unwrap()))
+                    .unwrap();
+                Ok(())
+            }
+        }
+        let core = core();
+        core.upsert_thread(thread("a", "ws"));
+        core.apply_thread_conversation_event("ws", work_delta("old"), None);
+        let page = empty_work_page(&core);
+        let request = core
+            .begin_thread_semantic_request(initial_work_action())
+            .unwrap();
+        let old_generation = request.generation;
+        core.execute_thread_semantic_request(&ReplacingTransport { core: &core, page }, request);
+        assert_ne!(
+            core.thread_operation_token("a").unwrap().generation,
+            old_generation
+        );
+        let semantic = core.thread_semantic_snapshot("a");
+        let range = semantic.thread("a").unwrap().work_range("turn").unwrap();
+        assert!(!range.has_loaded_page);
+        assert_eq!(
+            range.request_status,
+            crate::timeline::semantic::TimelineRequestStatus::Idle
+        );
+        assert_eq!(
+            range.initial_request_status,
+            crate::timeline::semantic::TimelineRequestStatus::Idle
+        );
+        assert!(matches!(&range.ordered_items().next().unwrap().item,
+            TurnItem::AgentMessage { text, .. } if text == "replacement"));
+        core.thread_demand_changed(
+            &ClientScope::Timeline {
+                thread_id: "a".into(),
+            },
+            ClientDemand::Visible,
+        );
+        assert!(
+            core.accept_timeline_request(
+                initial_work_action(),
+                None,
+                Some(old_generation),
+                false,
+                true
+            )
+            .is_none()
+        );
+        let owner = core.thread_operation_token("a").unwrap().generation;
+        core.set_thread_turn_work_expanded("a", "turn", false);
+        assert!(
+            core.accept_timeline_request(initial_work_action(), None, Some(owner), false, true)
+                .is_none()
+        );
+        core.set_thread_turn_work_expanded("a", "turn", true);
+        assert!(
+            core.accept_timeline_request(initial_work_action(), None, Some(owner), false, true)
+                .is_some()
+        );
+    }
+
     #[test]
     fn exact_work_refresh_batches_ids_without_changing_scope_or_reducing_in_the_shell() {
         struct Transport(std::cell::RefCell<Vec<usize>>);
@@ -5833,6 +6659,7 @@ mod tests {
                 semantic.work_ranges_by_turn["expected"].request_status,
                 before.semantic.thread("a").unwrap().work_ranges_by_turn["expected"].request_status
             );
+            assert!(!semantic.work_ranges_by_turn["expected"].has_loaded_page);
             assert_eq!(snapshot.revision(), before.revision());
             assert_eq!(core.thread_semantic_in_flight("a").len(), 1);
         }
@@ -7725,7 +8552,7 @@ impl ClientCore {
         &self,
         action: SemanticTimelineRequestAction,
     ) -> Option<ThreadSemanticRequest> {
-        self.accept_timeline_request(action, None, None, false)
+        self.accept_timeline_request(action, None, None, false, false)
     }
 
     fn accept_timeline_request(
@@ -7734,6 +8561,7 @@ impl ClientCore {
         reserved: Option<u64>,
         expected_store: Option<u64>,
         notification: bool,
+        automatic_hydration: bool,
     ) -> Option<ThreadSemanticRequest> {
         if self.is_stopped() {
             return None;
@@ -7749,6 +8577,43 @@ impl ClientCore {
         let store = registry.stores.get(&id)?;
         if expected_store.is_some_and(|generation| store.generation != generation) {
             return None;
+        }
+        if automatic_hydration {
+            let SemanticTimelineRequestKey::TurnWorkInitial { turn_id, .. } =
+                crate::timeline::semantic::semantic_timeline_request_key(&action)
+            else {
+                return None;
+            };
+            if store.presentation_blocked || store.demand == ClientDemand::Suspended {
+                return None;
+            }
+            let thread = store.semantic.thread(&id)?;
+            let work = thread.cached_turn_work_block(turn_id)?;
+            if !crate::timeline::semantic::resolve_work_expanded(work, &thread.expansion)
+                || (work.visible_work_count == 0 && !work.has_more_before && !work.has_more_after)
+            {
+                return None;
+            }
+            let range = thread.work_range(turn_id);
+            if registry.timeline.in_flight.contains(
+                crate::timeline::semantic::semantic_timeline_request_key(&action),
+            ) || range.is_some_and(|range| {
+                range.has_loaded_page
+                    || matches!(
+                        range.initial_request_status,
+                        crate::timeline::semantic::TimelineRequestStatus::Loading { .. }
+                            | crate::timeline::semantic::TimelineRequestStatus::Failed { .. }
+                    )
+                    || matches!(
+                        range.request_status,
+                        crate::timeline::semantic::TimelineRequestStatus::Loading { .. }
+                    )
+            }) || !registry.timeline.page_retry_allowed(
+                crate::timeline::semantic::semantic_timeline_request_key(&action),
+                self.timeline_now_ms(),
+            ) {
+                return None;
+            }
         }
         // Invalidation still applies, but notifications cannot restart a failed
         // refresh. Check under the same lock as begin and the status transition.
@@ -7828,7 +8693,7 @@ impl ClientCore {
         action: SemanticTimelineRequestAction,
         expected_store: Option<u64>,
     ) {
-        self.schedule_thread_semantic_request_inner(action, expected_store, false);
+        self.schedule_thread_semantic_request_inner(action, expected_store, false, false);
     }
 
     fn schedule_thread_semantic_request_inner(
@@ -7836,6 +8701,7 @@ impl ClientCore {
         action: SemanticTimelineRequestAction,
         expected_store: Option<u64>,
         notification: bool,
+        automatic_hydration: bool,
     ) {
         let sender = self
             .thread_request_sender
@@ -7845,9 +8711,13 @@ impl ClientCore {
         let Some(sender) = sender else {
             return;
         };
-        if let Some(request) =
-            self.accept_timeline_request(action, None, expected_store, notification)
-        {
+        if let Some(request) = self.accept_timeline_request(
+            action,
+            None,
+            expected_store,
+            notification,
+            automatic_hydration,
+        ) {
             let _ = sender.send(ThreadControllerRequest::Semantic(request));
         }
     }
@@ -7857,7 +8727,7 @@ impl ClientCore {
         page: crate::timeline::controller::TimelinePageRequest,
     ) {
         let Some(request) =
-            self.accept_timeline_request(page.action, Some(page.generation), None, false)
+            self.accept_timeline_request(page.action, Some(page.generation), None, false, false)
         else {
             return;
         };
@@ -7916,7 +8786,7 @@ impl ClientCore {
                 return;
             }
             let key = semantic_timeline_request_key(&request.action).clone();
-            {
+            let initial_items = {
                 let registry = self
                     .thread_registry
                     .lock()
@@ -7927,7 +8797,18 @@ impl ClientCore {
                 }) {
                     return;
                 }
-            }
+                match &request.action {
+                    SemanticTimelineRequestAction::TurnWorkPage {
+                        key: SemanticTimelineRequestKey::TurnWorkInitial { .. },
+                        params,
+                    } => initial_work_item_snapshot(
+                        &registry.stores[&request.id].semantic,
+                        &request.id,
+                        &params.turn_id,
+                    ),
+                    _ => None,
+                }
+            };
             let expected_turn = match &request.action {
                 SemanticTimelineRequestAction::ThreadTimelinePage { .. } => None,
                 SemanticTimelineRequestAction::TurnWorkPage { params, .. } => {
@@ -8083,7 +8964,21 @@ impl ClientCore {
                     if valid_scope(&page.workspace_id, &page.thread_id)
                         && expected_turn.as_deref() == Some(page.turn_id.as_str()) =>
                 {
-                    apply_turn_work_page(&mut store.semantic, page, mode);
+                    if let Err(error) = apply_requested_work_page(
+                        &mut store.semantic,
+                        page,
+                        mode,
+                        initial_items.as_ref(),
+                    ) {
+                        succeeded = false;
+                        set_request_status(
+                            &mut store.semantic,
+                            &key,
+                            TimelineRequestStatus::Failed {
+                                message: error.to_string(),
+                            },
+                        );
+                    }
                 }
                 Ok(Page::Items(pages))
                     if pages.iter().all(|page| {
@@ -8119,6 +9014,16 @@ impl ClientCore {
                 .timeline
                 .finish(&key, succeeded, self.timeline_now_ms())
                 .and_then(|action| registry.timeline.begin(action));
+            if next.is_some() && matches!(key, SemanticTimelineRequestKey::TurnWorkInitial { .. }) {
+                let store = registry.stores.get_mut(&request.id).expect("request owner");
+                set_request_status(
+                    &mut store.semantic,
+                    &key,
+                    TimelineRequestStatus::Loading {
+                        request_key: format!("{key:?}"),
+                    },
+                );
+            }
             let next_generation = registry.timeline.request_generation(&key);
             if next.is_some() && is_refresh {
                 set_request_status(
@@ -8149,6 +9054,60 @@ impl ClientCore {
         }
     }
 }
+// A request-local comparison, not a server revision: a changed Running body
+// cannot safely be replaced by a snapshot whose relation to the delta is unknown.
+fn initial_work_item_snapshot(
+    state: &SemanticTimelineState,
+    thread_id: &str,
+    turn_id: &str,
+) -> Option<HashMap<String, pioneer_protocol::TurnItem>> {
+    let range = state
+        .thread(thread_id)
+        .and_then(|thread| thread.work_range(turn_id));
+    if range.is_some_and(|range| range.has_loaded_page) {
+        return None;
+    }
+    Some(
+        range
+            .into_iter()
+            .flat_map(|range| range.ordered_items())
+            .filter(|item| item.status == pioneer_protocol::TurnWorkItemStatus::Running)
+            .map(|item| (item.item_id.clone(), item.item.clone()))
+            .collect(),
+    )
+}
+
+fn apply_requested_work_page(
+    state: &mut SemanticTimelineState,
+    page: pioneer_protocol::TurnWorkPageResponse,
+    mode: crate::timeline::semantic::WorkPageMergeMode,
+    initial_items: Option<&HashMap<String, pioneer_protocol::TurnItem>>,
+) -> anyhow::Result<()> {
+    if let Some(initial_items) = initial_items
+        && let Some(range) = state
+            .thread(&page.thread_id)
+            .and_then(|thread| thread.work_range(&page.turn_id))
+    {
+        let conflicts = page.items.iter().any(|incoming| {
+            incoming.status == pioneer_protocol::TurnWorkItemStatus::Running
+                && (mode == crate::timeline::semantic::WorkPageMergeMode::Reset
+                    || crate::timeline::semantic::should_merge_turn_work_item(range, incoming))
+                && range.ordered_items().any(|current| {
+                    current.item_id == incoming.item_id
+                        && current.status == pioneer_protocol::TurnWorkItemStatus::Running
+                        && initial_items.get(&current.item_id) != Some(&current.item)
+                        && incoming.item != current.item
+                })
+        });
+        anyhow::ensure!(
+            !conflicts,
+            "Work history changed during initial loading; retry"
+        );
+    }
+    crate::timeline::semantic::apply_turn_work_page(state, page, mode);
+    Ok(())
+}
+
 fn set_request_status(
     state: &mut SemanticTimelineState,
     key: &SemanticTimelineRequestKey,
@@ -8160,8 +9119,12 @@ fn set_request_status(
         ThreadNewest { .. } | ThreadBefore { .. } | ThreadAfter { .. } => {
             thread.top_level.request_status = status
         }
-        TurnWorkInitial { turn_id, .. }
-        | TurnWorkBefore { turn_id, .. }
+        TurnWorkInitial { turn_id, .. } => {
+            let range = thread.work_range_mut(turn_id.clone());
+            range.initial_request_status = status.clone();
+            range.request_status = status;
+        }
+        TurnWorkBefore { turn_id, .. }
         | TurnWorkAfter { turn_id, .. }
         | TurnWorkItems { turn_id, .. } => {
             thread.work_range_mut(turn_id.clone()).request_status = status
@@ -8372,22 +9335,38 @@ impl ClientCore {
                 WorkPageMergeMode::MergeAfter,
             ),
         };
+        let initial = matches!(key, SemanticTimelineRequestKey::TurnWorkInitial { .. });
+        let initial_items = std::cell::RefCell::new(None);
         self.fetch_thread_page(
             SemanticTimelineRequestAction::TurnWorkPage {
                 key,
                 params: params.clone(),
             },
-            || crate::transport::ws::command_sender::turn_work_page(transport, params),
+            || {
+                if initial {
+                    *initial_items.borrow_mut() = initial_work_item_snapshot(
+                        &self.thread_semantic_snapshot(&params.thread_id),
+                        &params.thread_id,
+                        &params.turn_id,
+                    );
+                }
+                crate::transport::ws::command_sender::turn_work_page(transport, params)
+            },
             |state, _conversation, workspace, id, page| {
                 anyhow::ensure!(
                     page.workspace_id == workspace && page.thread_id == id && page.turn_id == turn,
                     "Timeline response scope mismatch"
                 );
-                apply_turn_work_page(state, page.clone(), mode);
-                Ok(())
+                apply_requested_work_page(
+                    state,
+                    page.clone(),
+                    mode,
+                    initial_items.borrow().as_ref(),
+                )
             },
         )
     }
+
     pub fn fetch_turn_work_items(
         &self,
         transport: &impl crate::rpc::JsonRpcRequestTransport,
@@ -9370,7 +10349,7 @@ impl ClientCore {
         registry.retired_timelines.remove(id);
         drop(registry);
         for action in initial_work {
-            self.schedule_thread_semantic_request(action);
+            self.schedule_thread_semantic_request_inner(action, Some(generation), false, true);
         }
         true
     }

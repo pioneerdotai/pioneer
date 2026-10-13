@@ -179,6 +179,12 @@ impl ThreadTimelineController {
         self.requests.get(key).is_some_and(|r| r.0 == generation) && self.in_flight.contains(key)
     }
 
+    pub(crate) fn page_retry_allowed(&self, key: &PageKey, now_ms: u64) -> bool {
+        self.failures
+            .get(key)
+            .is_none_or(|(attempt, deadline)| *attempt < MAX_ATTEMPTS && now_ms >= *deadline)
+    }
+
     pub(crate) fn finish(
         &mut self,
         key: &PageKey,
@@ -269,11 +275,7 @@ impl ThreadTimelineController {
             {
                 continue;
             }
-            if self
-                .failures
-                .get(&key)
-                .is_some_and(|(attempt, deadline)| *attempt >= MAX_ATTEMPTS || now_ms < *deadline)
-            {
+            if !self.page_retry_allowed(&key, now_ms) {
                 continue;
             }
             if !self.in_flight.contains(&key) {
@@ -561,6 +563,44 @@ mod tests {
             },
         }
     }
+
+    fn initial_work_page() -> PageAction {
+        PageAction::TurnWorkPage {
+            key: PageKey::TurnWorkInitial {
+                thread_id: "a".into(),
+                turn_id: "turn".into(),
+            },
+            params: pioneer_protocol::TurnWorkPageParams {
+                thread_id: "a".into(),
+                turn_id: "turn".into(),
+                anchor: pioneer_protocol::TimelinePageAnchor::Newest,
+                limit: Some(12),
+            },
+        }
+    }
+
+    #[test]
+    fn initial_work_loading_does_not_queue_a_follow_up() {
+        let mut policy = ThreadTimelineController::default();
+        let action = initial_work_page();
+        let key = semantic::semantic_timeline_request_key(&action).clone();
+        let plan = policy.update(demand("desktop"), vec![action.clone()], 0);
+        assert_eq!(plan.pages.len(), 1);
+        for revision in 2..5 {
+            let mut input = demand("desktop");
+            input.source_revision = revision;
+            assert!(
+                policy
+                    .update(input, vec![action.clone()], 0)
+                    .pages
+                    .is_empty()
+            );
+        }
+        assert!(policy.finish(&key, true, 0).is_none());
+        assert!(policy.in_flight.is_empty());
+        assert!(policy.pending.is_empty());
+    }
+
     #[test]
     fn coalesced_consumers_exit_independently_and_late_results_are_noop() {
         let mut policy = ThreadTimelineController::default();
@@ -643,29 +683,36 @@ mod tests {
     }
     #[test]
     fn prefetch_failure_requires_changed_demand_and_is_bounded() {
-        let mut policy = ThreadTimelineController::default();
-        let mut input = demand("desktop");
-        for attempt in 0..3 {
+        for action in [page(), initial_work_page()] {
+            let mut policy = ThreadTimelineController::default();
+            let mut input = demand("desktop");
+            for attempt in 0..3 {
+                input.scroll_generation += 1;
+                let now = attempt * 10_000;
+                let plan = policy.update(input.clone(), vec![action.clone()], now);
+                assert_eq!(plan.pages.len(), 1);
+                let key = semantic::semantic_timeline_request_key(&plan.pages[0].action);
+                assert!(policy.finish(key, false, now).is_none());
+                assert!(!policy.page_retry_allowed(key, now));
+                assert!(
+                    policy
+                        .update(input.clone(), vec![action.clone()], u64::MAX)
+                        .pages
+                        .is_empty()
+                );
+            }
             input.scroll_generation += 1;
-            let plan = policy.update(input.clone(), vec![page()], attempt * 10_000);
-            assert_eq!(plan.pages.len(), 1);
-            let key = semantic::semantic_timeline_request_key(&plan.pages[0].action);
-            policy.finish(key, false, attempt * 10_000);
             assert!(
                 policy
-                    .update(input.clone(), vec![page()], u64::MAX)
+                    .update(input, vec![action.clone()], u64::MAX)
                     .pages
                     .is_empty()
             );
+            let retry = policy.retry("a", "desktop", 1).unwrap();
+            assert_eq!(policy.update(retry, vec![action], u64::MAX).pages.len(), 1);
         }
-        input.scroll_generation += 1;
-        assert!(
-            policy
-                .update(input, vec![page()], u64::MAX)
-                .pages
-                .is_empty()
-        );
     }
+
     #[test]
     fn wire_semantic_inputs_and_direct_inputs_produce_identical_plans() {
         let input = TimelineIntent::Update {
