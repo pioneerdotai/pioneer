@@ -10350,6 +10350,26 @@ impl MessageProcessor {
         input: &[pioneer_protocol::UserInput],
         capability_attachments: &[pioneer_protocol::UserMessageAttachment],
     ) -> Result<()> {
+        self.emit_user_message_item_lifecycle_with_live_delivery(
+            workspace_id,
+            thread_id,
+            turn_id,
+            input,
+            capability_attachments,
+            false,
+        )
+        .await
+    }
+
+    pub(super) async fn emit_user_message_item_lifecycle_with_live_delivery(
+        &self,
+        workspace_id: &str,
+        thread_id: &str,
+        turn_id: &str,
+        input: &[pioneer_protocol::UserInput],
+        capability_attachments: &[pioneer_protocol::UserMessageAttachment],
+        publish_live: bool,
+    ) -> Result<()> {
         let item_id = user_message_item_id(turn_id);
         let payload = self
             .user_message_payload_from_input_resolved(
@@ -10382,7 +10402,7 @@ impl MessageProcessor {
         };
 
         self.materialize_native_agent_turn_event(
-            pioneer_crud::CanonicalTurnEventPayload::ItemStarted(started),
+            pioneer_crud::CanonicalTurnEventPayload::ItemStarted(started.clone()),
             now_timestamp_secs(),
             None,
         )
@@ -10397,12 +10417,26 @@ impl MessageProcessor {
         };
 
         self.materialize_native_agent_turn_event(
-            pioneer_crud::CanonicalTurnEventPayload::ItemCompleted(completed),
+            pioneer_crud::CanonicalTurnEventPayload::ItemCompleted(completed.clone()),
             now_timestamp_secs(),
             None,
         )
         .await
         .context("failed to persist user message item/completed")?;
+        if publish_live {
+            // Both canonical lifecycle records are durable before fanout. Keep
+            // the outbox obligations: retries/reconnect use the same item IDs.
+            // This awaited delivery orders the user row before Task creation,
+            // independently of the optional background delivery backlog.
+            self.deliver_native_turn_event_live(
+                &pioneer_crud::CanonicalTurnEventPayload::ItemStarted(started),
+            )
+            .await?;
+            self.deliver_native_turn_event_live(
+                &pioneer_crud::CanonicalTurnEventPayload::ItemCompleted(completed),
+            )
+            .await?;
+        }
         Ok(())
     }
 

@@ -191,9 +191,16 @@ pub async fn find<C: ConnectionTrait>(
 pub async fn heartbeat_owner<C: ConnectionTrait>(
     db: &C,
     owner_id: &str,
-    heartbeat_at: DateTimeWithTimeZone,
-    lease_until: DateTimeWithTimeZone,
+    lease_seconds: i64,
 ) -> Result<u64> {
+    // SQLite evaluates 'now' when it steps the UPDATE, after writer admission
+    // and on every retry. Match SQLx's UTC RFC3339 encoding at second precision
+    // so existing textual lease comparisons keep the same ordering.
+    let written_at = Expr::cust("strftime('%Y-%m-%dT%H:%M:%S+00:00', 'now')");
+    let lease_until = Expr::cust_with_values(
+        "strftime('%Y-%m-%dT%H:%M:%S+00:00', 'now', ? || ' seconds')",
+        [lease_seconds],
+    );
     let result = turn_execution::Entity::update_many()
         .filter(turn_execution::Column::OwnerId.eq(owner_id.to_owned()))
         .filter(turn_execution::Column::Status.is_in([
@@ -202,12 +209,9 @@ pub async fn heartbeat_owner<C: ConnectionTrait>(
             TurnExecutionStatus::Running.as_str(),
             TurnExecutionStatus::Recovering.as_str(),
         ]))
-        .col_expr(
-            turn_execution::Column::HeartbeatAt,
-            Expr::value(heartbeat_at),
-        )
-        .col_expr(turn_execution::Column::LeaseUntil, Expr::value(lease_until))
-        .col_expr(turn_execution::Column::UpdatedAt, Expr::value(heartbeat_at))
+        .col_expr(turn_execution::Column::HeartbeatAt, written_at.clone())
+        .col_expr(turn_execution::Column::LeaseUntil, lease_until)
+        .col_expr(turn_execution::Column::UpdatedAt, written_at)
         .exec(db)
         .await
         .context("failed to heartbeat owned Turn executions")?;

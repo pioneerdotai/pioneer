@@ -52,6 +52,20 @@ pub enum ThreadComposerExecutionMode {
     ForegroundTurn,
 }
 
+impl ThreadComposerExecutionMode {
+    /// Only a user-authored Conversation is Composer admission. Agent child
+    /// Conversations and TaskRun occurrences retain their own execution.
+    pub fn is_detached_admission(self, turn: &Turn) -> bool {
+        self == Self::DetachedTask
+            && turn.turn_kind == crate::TurnKind::Conversation
+            && turn.origin == crate::TurnOrigin::User
+            && matches!(
+                turn.author.as_ref().map(|author| &author.actor),
+                Some(crate::PersistedActorRef::Principal(_))
+            )
+    }
+}
+
 impl ThreadOriginKind {
     pub const fn user() -> Self {
         Self::User

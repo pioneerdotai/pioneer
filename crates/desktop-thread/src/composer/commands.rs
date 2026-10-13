@@ -141,17 +141,68 @@ impl ComposerView {
             failure_message: t!("chat.composer.send_failed").to_string(),
         };
         self.composer_upload_error = None;
+        let identity = plan.identity.clone();
+        let mount = self.mount;
         let send = cx.background_spawn(async move {
             client.submit_composer_send(plan.identity, files.as_ref(), context)
         });
         self.send_task = Some(cx.spawn(async move |view, cx| {
-            let _ = send.await;
+            let result = send.await;
             let _ = view.update(cx, |view, cx| {
-                view.composer_input = view.client.composer_snapshot(&view.thread_id);
+                if view.mount != mount
+                    || view.thread_id != identity.thread_id
+                    || view.send_operation.as_ref() != Some(&identity)
+                {
+                    return;
+                }
+                let input = view.client.composer_snapshot(&view.thread_id);
+                if input.as_ref().is_none_or(|input| {
+                    input
+                        .operation()
+                        .is_none_or(|operation| operation.identity != identity)
+                }) {
+                    return;
+                }
+                if result.is_err()
+                    && input.as_ref().is_some_and(|input| {
+                        input.operation().is_some_and(|operation| {
+                            operation.status != ComposerOperationStatus::Cancelled
+                        })
+                    })
+                {
+                    view.composer_upload_error = Some(t!("chat.composer.send_failed").to_string());
+                }
+                view.send_task.take();
+                view.composer_input = input;
+                view.present_composer_send_outcome();
                 cx.notify();
             });
         }));
         cx.notify();
+    }
+    pub(super) fn present_composer_send_outcome(&mut self) {
+        let Some(identity) = self.send_operation.as_ref() else {
+            return;
+        };
+        let Some(operation) = self
+            .composer_input
+            .as_ref()
+            .and_then(|input| input.operation())
+            .filter(|operation| {
+                operation.identity == *identity && identity.thread_id == self.thread_id
+            })
+        else {
+            return;
+        };
+        match operation.status {
+            ComposerOperationStatus::Failed { .. } => {
+                self.composer_upload_error = Some(t!("chat.composer.send_failed").to_string());
+            }
+            ComposerOperationStatus::Completed | ComposerOperationStatus::Cancelled => {}
+            _ => return,
+        }
+        self.send_operation = None;
+        self.send_task.take();
     }
     pub(super) fn steer_active_cli_runtime_turn(&mut self, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(input) = &self.composer_input {

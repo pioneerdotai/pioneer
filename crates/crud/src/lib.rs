@@ -13948,21 +13948,17 @@ impl CrudStore {
         turn_execution::find(&self.connection, turn_id).await
     }
 
+    /// Extend active receipts using SQLite's time at the physical UPDATE,
+    /// including after writer admission and each storage retry.
     pub async fn heartbeat_turn_executions_owned_by(
         &self,
         owner_id: &str,
-        heartbeat_at_unix: i64,
-        lease_until_unix: i64,
+        lease_seconds: i64,
     ) -> Result<u64> {
         let owner_id = owner_id.to_owned();
         self.run_serialized_write(|| async {
-            turn_execution::heartbeat_owner(
-                &self.connection,
-                owner_id.as_str(),
-                unix_to_datetime(heartbeat_at_unix),
-                unix_to_datetime(lease_until_unix),
-            )
-            .await
+            turn_execution::heartbeat_owner(&self.connection, owner_id.as_str(), lease_seconds)
+                .await
         })
         .await
     }

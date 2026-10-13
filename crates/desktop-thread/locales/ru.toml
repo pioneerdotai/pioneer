@@ -130,7 +130,7 @@
 "chat.composer.model.select_label" = "Выбрать модель"
 "chat.composer.placeholder" = "Напишите сообщение"
 "chat.composer.reply.cancel" = "Отменить ответ"
-"chat.composer.send_failed" = "Сообщение не отправлено. Проверьте и повторите."
+"chat.composer.send_failed" = "Ошибка при отправке. Проверьте переписку перед повторной попыткой."
 "chat.composer.steer_cli_runtime" = "Отправить в текущий ход CLI"
 "chat.composer.stop_reason" = "Ход остановлен пользователем"
 "chat.composer.voice.desktop_hold_prompt" = "Отпустите вне круга, чтобы отменить"
