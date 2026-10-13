@@ -553,7 +553,29 @@ fn late_capabilities_enable_real_mcp_and_skills_buttons_and_revocation_closes_ac
     capabilities.authorization_revision += 1;
     capabilities.global.can_manage_capabilities = false;
     let (generation, connection) = core.current_auth_ticket();
-    core.accept_authorization_projection(generation, connection, capabilities);
+    assert_eq!(
+        core.accept_authorization_projection(generation, connection, capabilities),
+        pioneer_client::authorization::AuthorizationProjectionAcceptance::Accepted
+    );
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        let shell = root
+            .read(cx)
+            .view()
+            .clone()
+            .downcast::<super::DesktopShellView>()
+            .unwrap();
+        assert!(!shell.read(cx).can_manage);
+    });
+    cx.dispatch_action(&crate::desktop_navigation::OpenMcp);
+    cx.run_until_parked();
+    assert_eq!(
+        core.navigation_snapshot().destination(),
+        &SemanticDestination::Threads
+    );
+    // Fast copies previous debug selectors when any subtree is reused. An
+    // absence assertion needs a full frame, not that retained diagnostic map.
+    cx.update(|window, _| window.refresh());
     cx.run_until_parked();
     assert!(cx.debug_bounds("bottom-bar-open-mcp").is_none());
     let skills = cx.debug_bounds("bottom-bar-open-skills").unwrap();

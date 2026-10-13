@@ -90,8 +90,6 @@ pub(super) struct HtmlView {
     bounds: Bounds<Pixels>,
     palette: serde_json::Value,
     failed: bool,
-    mount_scheduled: bool,
-    theme_scheduled: bool,
 }
 impl Drop for HtmlView {
     fn drop(&mut self) {
@@ -133,8 +131,6 @@ impl HtmlView {
             bounds: Bounds::default(),
             palette: serde_json::Value::Null,
             failed: false,
-            mount_scheduled: false,
-            theme_scheduled: false,
         }
     }
     pub(super) fn matches(&self, publication: &HtmlPublication) -> bool {
@@ -392,73 +388,92 @@ impl HtmlView {
             }
         }
     }
-}
-impl Render for HtmlView {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    // Resolved document geometry is available after prepaint. This lifecycle
+    // update owns mount/theme effects; Render only composes retained content.
+    fn update_bounds(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let width_changed = self.bounds.size.width != bounds.size.width;
+        self.bounds = bounds;
         if self.visible
             && self.permitted
             && !self.failed
             && self.webview.is_none()
             && (self.source.is_some() || (self.can_load && self.download.is_none()))
-            && !self.mount_scheduled
         {
-            self.mount_scheduled = true;
-            let weak = cx.weak_entity();
-            window.defer(cx, move |window, cx| {
-                let _ = weak.update(cx, |view, cx| {
-                    view.mount_scheduled = false;
-                    view.build(window, cx);
-                    if view.failed {
-                        view.changed(window, cx);
-                    }
+            self.build(window, cx);
+            if self.failed {
+                self.changed(window, cx);
+            }
+            cx.notify();
+        }
+        if let Some(webview) = self.webview.clone() {
+            let next_palette = palette(cx);
+            if self.palette != next_palette {
+                let script = format!(
+                    "window.dispatchEvent(new CustomEvent('pioneer-theme',{{detail:{next_palette}}}));"
+                );
+                if webview.read(cx).evaluate_script(&script).is_err() {
+                    self.failed = true;
+                    self.close(cx);
+                    self.changed(window, cx);
                     cx.notify();
-                });
-            });
+                    return;
+                }
+                self.palette = next_palette;
+            }
+            if width_changed {
+                let _ = webview
+                    .read(cx)
+                    .evaluate_script("window.dispatchEvent(new Event('pioneer-measure'));");
+            }
         }
-        if self.webview.is_some() && self.palette != palette(cx) && !self.theme_scheduled {
-            self.theme_scheduled = true;
-            let weak = cx.weak_entity();
-            let instance = self.instance;
-            window.defer(cx, move |window, cx| {
-                let _ = weak.update(cx, |view, cx| {
-                    view.theme_scheduled = false;
-                    if view.instance != instance { return; }
-                    if let Some(webview) = &view.webview {
-                        let palette = palette(cx);
-                        if webview.read(cx).evaluate_script(&format!("window.dispatchEvent(new CustomEvent('pioneer-theme',{{detail:{palette}}}));")).is_err() {
-                            view.failed = true;
-                            view.close(cx);
-                            view.changed(window, cx);
-                            cx.notify();
-                        } else { view.palette = palette; }
-                    }
-                });
-            });
-        }
-        let content = if !self.permitted
-            || self.publication.artifact.status != ArtifactStatus::Ready
-        {
-            div()
-                .child(t!("artifacts.action.error.revoked"))
-                .into_any_element()
-        } else if self.failed {
-            div().child(t!("timeline.html.failed")).into_any_element()
-        } else if self.source.is_none() {
-            div().child(t!("timeline.html.loading")).into_any_element()
-        } else {
-            let weak = cx.weak_entity();
-            div().w_full().h(self.height).flex_shrink_0()
-                .when_some(self.webview.clone(), |this, view| this.child(view))
-                .child(canvas(move |bounds, window, cx| {
+    }
+}
+impl Render for HtmlView {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let content =
+            if !self.permitted || self.publication.artifact.status != ArtifactStatus::Ready {
+                div()
+                    .child(t!("artifacts.action.error.revoked"))
+                    .into_any_element()
+            } else if self.failed {
+                div().child(t!("timeline.html.failed")).into_any_element()
+            } else if self.source.is_none() {
+                div().child(t!("timeline.html.loading")).into_any_element()
+            } else {
+                div()
+                    .w_full()
+                    .h(self.height)
+                    .flex_shrink_0()
+                    .when_some(self.webview.clone(), |this, view| this.child(view))
+                    .into_any_element()
+            };
+        let weak = cx.weak_entity();
+        let instance = self.instance;
+        let auth_generation = self.auth_generation;
+        let content = div().relative().w_full().child(content).child(
+            canvas(
+                move |bounds, window, cx| {
                     let weak = weak.clone();
-                    window.defer(cx, move |_, cx| { let _ = weak.update(cx, |view, cx| {
-                        if view.bounds.size.width != bounds.size.width {
-                            if let Some(webview) = &view.webview { let _ = webview.read(cx).evaluate_script("window.dispatchEvent(new Event('pioneer-measure'));"); }
-                        }
-                        view.bounds = bounds;
-                    }); });
-                }, |_,_,_,_| {}).absolute().size_full()).into_any_element()
-        };
+                    window.defer(cx, move |window, cx| {
+                        let _ = weak.update(cx, |view, cx| {
+                            if view.instance != instance || view.auth_generation != auth_generation
+                            {
+                                return;
+                            }
+                            view.update_bounds(bounds, window, cx);
+                        });
+                    });
+                },
+                |_, _, _, _| {},
+            )
+            .absolute()
+            .size_full(),
+        );
         v_flex()
             .w_full()
             .gap_2()
