@@ -4,6 +4,9 @@
 //! providers continue through `pioneer-agent`, while local `CLIAgentRuntime`
 //! executions are routed through `pioneer-cli-agent-runtime`.
 
+// Gateway orchestration nests async futures beyond rustc's default query depth.
+#![recursion_limit = "256"]
+
 mod administrative_audit;
 mod artifact_delivery;
 mod artifact_prompt_refs;
