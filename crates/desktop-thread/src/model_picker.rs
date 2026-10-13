@@ -873,7 +873,7 @@ impl ComposerModelPickerView {
         };
 
         div()
-            .min_h(px(visible_height))
+            .h(px(visible_height))
             .relative()
             .overflow_hidden()
             .child(

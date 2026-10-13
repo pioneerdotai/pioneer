@@ -1166,7 +1166,7 @@ impl ModelSelectorDialog {
         let scroll_handle = state.model_scroll_handle.clone();
 
         div()
-            .min_h(px(visible_height))
+            .h(px(visible_height))
             .relative()
             .overflow_hidden()
             .child(
