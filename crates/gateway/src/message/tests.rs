@@ -13090,6 +13090,225 @@ async fn ingest_bound_assistant_test_artifact(
         .artifact
 }
 
+#[test]
+fn detached_composer_publishes_committed_message_before_task_with_delayed_outbox() {
+    run_standard_stack_message_test(
+        "detached Composer live ordering",
+        detached_composer_live_ordering_impl(),
+    );
+}
+
+async fn detached_composer_live_ordering_impl() {
+    let (tx, mut rx) = mpsc::channel(128);
+    let sessions = Arc::new(SessionManager::new());
+    let connection = register_authenticated_test_connection(sessions.as_ref(), tx).await;
+    let threads = Arc::new(ThreadManager::new("test-model", "openai"));
+    pioneer_sqlite::zstd::register_auto_extension_once().unwrap();
+    let (workspaces, store, workspace) = setup_workspace_manager().await;
+    enable_composer_history_compression(store.as_ref()).await;
+    sessions
+        .set_connection_workspace(connection, Some(workspace.clone()))
+        .await;
+    let processor = Arc::new(MessageProcessor::new(
+        threads.clone(),
+        Arc::new(pioneer_provider::ProviderRegistry::with_provider(
+            "openai",
+            Arc::new(CaptureSummaryProvider::new("detached result")),
+        )),
+        sessions,
+        workspaces,
+        store.clone(),
+        test_gateway_secrets(),
+        test_summary_config(),
+        test_tool_loop_config(),
+    ));
+    processor
+        .agent_manager
+        .set_context_controller(Some(Arc::new(
+            crate::compaction::GatewayNativeContextController::new(Arc::downgrade(&processor)),
+        )))
+        .await;
+    processor.bind_task_bridge().await;
+    processor.start_task_event_listener().await;
+    let parent = "detached-live-parent";
+    let turn_id = "detached-live-admission";
+    let started = threads
+        .thread_start_seeded(
+            connection,
+            workspace.clone(),
+            ThreadStartParams {
+                thread_id: parent.into(),
+                workspace_id: workspace.clone(),
+                name: Some("Live ordering".into()),
+                model: Some("test-model".into()),
+                model_provider: Some("openai".into()),
+                sandbox: Some(SandboxMode::FullAccess),
+                mode: Some(ThreadMode::Agent),
+                origin_kind: Some(ThreadOriginKind::Collaborative),
+                sidebar_visibility: Some(ThreadSidebarVisibility::Visible),
+                visibility: None,
+                agent_nickname: None,
+                agent_role: None,
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    store
+        .upsert_thread_model(&started.response.thread, PersistedActorRef::System)
+        .await
+        .unwrap();
+
+    // An already-owned optional outbox worker cannot deliver during admission.
+    // The controlled barrier pauses after live publication, before Task creation.
+    processor
+        .native_turn_event_delivery_kick_running
+        .store(true, Ordering::SeqCst);
+    processor.arm_completed_history_preparation_barrier("__detached_composer_before_task_create__");
+    // Keep the full message longer than the Task title without depending on
+    // whitespace that the existing UserMessage materialization normalizes.
+    let full_text = ["Full Composer message"; 12].join(" ");
+    let request_id = generate_test_request_id("composer", "live-order");
+    let request = json!({"jsonrpc":"2.0", "id":request_id, "method":"turn/start", "params":{
+        "thread_id":parent, "turn_id":turn_id, "input":[{"type":"text", "text":full_text}],
+        "model":"test-model", "model_provider":"openai", "mode":"Agent"
+    }})
+    .to_string();
+    let request_processor = processor.clone();
+    let request_task = tokio::spawn(async move {
+        request_processor
+            .process_request_for_connection(connection, &request)
+            .await;
+    });
+    timeout(
+        Duration::from_secs(5),
+        processor.wait_for_completed_history_preparation_barrier(),
+    )
+    .await
+    .expect("Composer must reach the pre-Task publication barrier");
+    let mut observed = Vec::new();
+    while let Ok(message) = rx.try_recv() {
+        let Message::Text(text) = message else {
+            continue;
+        };
+        observed.push(serde_json::from_str::<serde_json::Value>(text.as_ref()).unwrap());
+    }
+    let user_started = observed
+        .iter()
+        .position(|n| n["method"] == events::ITEM_STARTED && n["params"]["turn_id"] == turn_id);
+    let user_completed = observed
+        .iter()
+        .position(|n| n["method"] == events::ITEM_COMPLETED && n["params"]["turn_id"] == turn_id);
+    assert!(
+        user_started.is_some() && user_completed.is_some(),
+        "both user lifecycle notifications must bypass delayed optional delivery: {observed:?}"
+    );
+    assert!(user_started < user_completed);
+    let notification: ItemCompletedNotification =
+        serde_json::from_value(observed[user_completed.unwrap()]["params"].clone()).unwrap();
+    assert_eq!(notification.workspace_id, workspace);
+    assert_eq!(notification.thread_id, parent);
+    assert!(matches!(&notification.item, TurnItem::UserMessage { text, .. } if text == &full_text));
+    let persisted = store
+        .get_turn_item_events(parent, turn_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(persisted.events.iter().any(|event| matches!(&event.payload,
+        TurnItemEventPayload::ItemCompleted { item: TurnItem::UserMessage { text, .. }, .. } if text == &full_text)));
+    let deliveries = pioneer_entity::turn_event_delivery::Entity::find()
+        .filter(pioneer_entity::turn_event_delivery::Column::TurnId.eq(turn_id))
+        .filter(
+            pioneer_entity::turn_event_delivery::Column::Consumer
+                .eq(pioneer_crud::NATIVE_TURN_EVENT_LIVE_CONSUMER),
+        )
+        .all(&store.database_connection())
+        .await
+        .unwrap();
+    assert_eq!(
+        deliveries.len(),
+        2,
+        "both durable user lifecycle obligations must survive direct fanout"
+    );
+    assert!(
+        deliveries
+            .iter()
+            .all(|delivery| delivery.delivered_at.is_none())
+    );
+    assert!(
+        processor
+            .task_runtime
+            .service()
+            .list_tasks(TaskListParams {
+                workspace_id: workspace.clone(),
+                owner_kind: Some(TaskOwnerKind::Thread),
+                owner_id: Some(parent.into()),
+                limit: Some(10),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .tasks
+            .is_empty()
+    );
+    processor.release_completed_history_preparation_barrier();
+
+    // Follow the real subscriber path until both admission and the occurrence
+    // anchor arrive. No helper is called to publish or repair the user message.
+    let mut response_seen = false;
+    let mut card_seen = false;
+    while !response_seen || !card_seen {
+        let text = recv_text_timeout(&mut rx, Duration::from_secs(5)).await;
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        if value["id"] == request_id {
+            assert!(value.get("error").is_none());
+            response_seen = true;
+        }
+        if value["method"] == events::ITEM_STARTED {
+            let item: ItemStartedNotification =
+                serde_json::from_value(value["params"].clone()).unwrap();
+            if let TurnItem::Task { item: task } = item.item
+                && task.run_id.as_deref() == Some(item.turn_id.as_str())
+            {
+                assert_eq!(item.workspace_id, workspace);
+                assert_eq!(item.thread_id, parent);
+                assert_eq!(task.created_by_turn_id.as_deref(), Some(turn_id));
+                assert!(task.title.len() < full_text.len());
+                card_seen = true;
+            }
+        }
+    }
+    request_task.await.unwrap();
+    // Restore automatic delivery before normal queries/operations. Its later
+    // replay retains the same durable item identity and cannot create a second row.
+    processor
+        .native_turn_event_delivery_kick_running
+        .store(false, Ordering::SeqCst);
+    processor.kick_native_turn_event_deliveries();
+    let items = store
+        .get_turn_item_events(parent, turn_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let user_ids = items
+        .events
+        .iter()
+        .filter_map(|event| match &event.payload {
+            TurnItemEventPayload::ItemStarted {
+                item: TurnItem::UserMessage { id, .. },
+                ..
+            }
+            | TurnItemEventPayload::ItemCompleted {
+                item: TurnItem::UserMessage { id, .. },
+                ..
+            } => Some(id),
+            _ => None,
+        })
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(user_ids.len(), 1);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn turn_start_with_artifact_input_materializes_user_message_attachment_and_binding() {
     let (tx, mut rx) = mpsc::channel(16);

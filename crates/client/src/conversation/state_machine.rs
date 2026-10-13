@@ -44,11 +44,31 @@ impl Default for TurnFlowState {
 #[derive(Debug, Clone, Default)]
 pub struct TurnStateMachine {
     state: TurnFlowState,
+    detached_composer: bool,
+    admission_requests: std::collections::HashMap<String, String>,
+    confirmed_admissions: std::collections::HashMap<String, TurnStatus>,
 }
 
 impl TurnStateMachine {
+    pub(crate) fn set_composer_execution_mode(
+        &mut self,
+        mode: pioneer_protocol::ThreadComposerExecutionMode,
+    ) {
+        self.detached_composer =
+            mode == pioneer_protocol::ThreadComposerExecutionMode::DetachedTask;
+    }
+
+    pub(crate) fn is_detached_admission(&self, turn: &pioneer_protocol::Turn) -> bool {
+        self.detached_composer
+            && turn.mode != ThreadMode::Message
+            && pioneer_protocol::ThreadComposerExecutionMode::DetachedTask
+                .is_detached_admission(turn)
+    }
+
     pub fn reset(&mut self) {
         self.state = TurnFlowState::Idle;
+        self.admission_requests.clear();
+        self.confirmed_admissions.clear();
     }
 
     pub fn state(&self) -> &TurnFlowState {
@@ -124,6 +144,53 @@ impl TurnStateMachine {
     }
 
     pub fn apply(&mut self, event: &ConversationEvent) {
+        if self.ignores_admission_response(event) {
+            return;
+        }
+        if let ConversationEvent::LocalTurnStartRequested {
+            turn_id,
+            pending_request_id,
+            mode,
+            ..
+        } = event
+            && self.detached_composer
+            && *mode != ThreadMode::Message
+        {
+            self.admission_requests
+                .insert(turn_id.clone(), pending_request_id.clone());
+        }
+        // Waiting for admission is still Starting. Acceptance releases only
+        // that submission; detached Task execution never locks the Composer.
+        match event {
+            ConversationEvent::LocalTurnStartAccepted { turn_id, mode, .. }
+                if self.detached_composer && *mode != ThreadMode::Message =>
+            {
+                self.confirm_admission_outcome(turn_id, TurnStatus::Completed, None);
+                return;
+            }
+            ConversationEvent::LocalTurnStartRejected {
+                turn_id,
+                error,
+                mode,
+                ..
+            } if self.detached_composer && *mode != ThreadMode::Message => {
+                self.state = TurnFlowState::Failed {
+                    turn_id: turn_id.clone(),
+                    error: error.clone(),
+                };
+                return;
+            }
+            ConversationEvent::TurnStarted { turn, .. }
+            | ConversationEvent::TurnCompleted { turn, .. }
+            | ConversationEvent::TurnFailed { turn, .. }
+            | ConversationEvent::TurnBlocked { turn, .. }
+                if self.is_detached_admission(turn) =>
+            {
+                self.apply_detached_admission(turn);
+                return;
+            }
+            _ => {}
+        }
         match event {
             ConversationEvent::LocalTurnStartRequested {
                 turn_id,
@@ -282,7 +349,10 @@ impl TurnStateMachine {
             | ConversationEvent::TurnToolLoopBudgetExceeded { turn_id, .. }
             | ConversationEvent::ItemCompleted { turn_id, .. }
             | ConversationEvent::ItemUpdated { turn_id, .. } => {
+                // Admission items confirm message delivery, not execution ownership.
+                // Keep the exact pending request until its admission is acknowledged.
                 if self.matches_turn(turn_id.as_str())
+                    && !self.is_local_admission(turn_id)
                     && matches!(self.state, TurnFlowState::Starting { .. })
                 {
                     self.state = TurnFlowState::Running {
@@ -346,7 +416,120 @@ impl TurnStateMachine {
         }
     }
 
+    pub(crate) fn is_current_turn(&self, turn_id: &str) -> bool {
+        self.matches_turn(turn_id)
+    }
+
+    pub(crate) fn is_local_admission(&self, turn_id: &str) -> bool {
+        self.detached_composer && self.admission_requests.contains_key(turn_id)
+    }
+
+    pub(crate) fn is_known_admission(&self, turn_id: &str) -> bool {
+        self.detached_composer
+            && (self.admission_requests.contains_key(turn_id)
+                || self.confirmed_admissions.contains_key(turn_id))
+    }
+
+    pub(crate) fn ignores_admission_response(&self, event: &ConversationEvent) -> bool {
+        let (turn_id, request_id, mode, rejected) = match event {
+            ConversationEvent::LocalTurnStartRejected {
+                turn_id,
+                pending_request_id,
+                mode,
+                ..
+            } => (turn_id, pending_request_id, mode, true),
+            ConversationEvent::LocalTurnStartAccepted {
+                turn_id,
+                pending_request_id,
+                mode,
+                ..
+            } => (turn_id, pending_request_id, mode, false),
+            _ => return false,
+        };
+        if !self.detached_composer || *mode == ThreadMode::Message {
+            return false;
+        }
+        self.admission_requests.get(turn_id) != Some(request_id)
+            || !self.admission_can_control_flow(turn_id)
+            || (rejected && self.confirmed_admissions.contains_key(turn_id))
+            || (!rejected
+                && self
+                    .confirmed_admissions
+                    .get(turn_id)
+                    .is_some_and(|status| {
+                        matches!(
+                            status,
+                            TurnStatus::Failed | TurnStatus::Blocked | TurnStatus::Interrupted
+                        )
+                    }))
+    }
+
+    pub(crate) fn confirm_admission_outcome(
+        &mut self,
+        turn_id: &str,
+        status: TurnStatus,
+        error: Option<&str>,
+    ) -> bool {
+        if self.confirmed_admissions.get(turn_id).is_some_and(|known| {
+            matches!(
+                known,
+                TurnStatus::Failed | TurnStatus::Blocked | TurnStatus::Interrupted
+            )
+        }) && matches!(status, TurnStatus::InProgress | TurnStatus::Completed)
+        {
+            return false;
+        }
+        self.confirmed_admissions.insert(turn_id.to_owned(), status);
+        // Proof and metadata belong to this Turn; composer ownership also survives
+        // a local submission's terminal transition (including an unconfirmed timeout).
+        if !self.admission_can_control_flow(turn_id) {
+            return true;
+        }
+        self.state = match status {
+            TurnStatus::Failed => TurnFlowState::Failed {
+                turn_id: turn_id.to_owned(),
+                error: error.unwrap_or(DEFAULT_TURN_FAILED_ERROR).to_owned(),
+            },
+            TurnStatus::Blocked => TurnFlowState::Blocked {
+                turn_id: turn_id.to_owned(),
+            },
+            TurnStatus::Interrupted => TurnFlowState::Cancelled {
+                turn_id: turn_id.to_owned(),
+                error: error.map(str::to_owned),
+            },
+            TurnStatus::InProgress | TurnStatus::Completed => TurnFlowState::Completed {
+                turn_id: turn_id.to_owned(),
+            },
+        };
+        true
+    }
+
+    fn admission_can_control_flow(&self, turn_id: &str) -> bool {
+        if self.matches_turn(turn_id) {
+            return true;
+        }
+        match self.current_turn_id() {
+            None => true,
+            Some(current) => {
+                // A fresh client can restore successive historical admissions. A
+                // locally requested Turn or an agent Conversation retains ownership,
+                // even after it releases the composer and has no in-flight Turn.
+                self.in_flight_turn_id().is_none()
+                    && self.confirmed_admissions.contains_key(current)
+                    && !self.admission_requests.contains_key(current)
+            }
+        }
+    }
+
+    fn apply_detached_admission(&mut self, turn: &pioneer_protocol::Turn) {
+        self.confirm_admission_outcome(&turn.id, turn.status, turn.error.as_deref());
+    }
+
     pub fn sync_snapshot_turn(&mut self, turn: &pioneer_protocol::Turn) {
+        if self.is_detached_admission(turn) {
+            self.apply_detached_admission(turn);
+            return;
+        }
         if turn.turn_kind != TurnKind::Conversation || turn.mode == ThreadMode::Message {
             return;
         }
@@ -404,6 +587,10 @@ impl TurnStateMachine {
     }
 
     fn matches_turn(&self, turn_id: &str) -> bool {
+        self.current_turn_id() == Some(turn_id)
+    }
+
+    pub(crate) fn current_turn_id(&self) -> Option<&str> {
         match &self.state {
             TurnFlowState::Starting {
                 turn_id: current_turn_id,
@@ -432,8 +619,8 @@ impl TurnStateMachine {
             | TurnFlowState::Cancelled {
                 turn_id: current_turn_id,
                 ..
-            } => current_turn_id == turn_id,
-            TurnFlowState::Idle => false,
+            } => Some(current_turn_id),
+            TurnFlowState::Idle => None,
         }
     }
 }
