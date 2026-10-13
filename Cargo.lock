@@ -4967,7 +4967,7 @@ dependencies = [
 [[package]]
 name = "gpui-base"
 version = "0.7.1"
-source = "git+https://github.com/longbridge/gpui-kit?rev=369f7a8f5a6602da980f008cf726467588ad517f#369f7a8f5a6602da980f008cf726467588ad517f"
+source = "git+https://github.com/longbridge/gpui-kit#369f7a8f5a6602da980f008cf726467588ad517f"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -5008,7 +5008,7 @@ dependencies = [
 [[package]]
 name = "gpui-component"
 version = "0.7.1"
-source = "git+https://github.com/longbridge/gpui-kit?rev=369f7a8f5a6602da980f008cf726467588ad517f#369f7a8f5a6602da980f008cf726467588ad517f"
+source = "git+https://github.com/longbridge/gpui-kit#369f7a8f5a6602da980f008cf726467588ad517f"
 dependencies = [
  "anyhow",
  "chrono",
@@ -5055,7 +5055,7 @@ dependencies = [
 [[package]]
 name = "gpui-component-macros"
 version = "0.7.1"
-source = "git+https://github.com/longbridge/gpui-kit?rev=369f7a8f5a6602da980f008cf726467588ad517f#369f7a8f5a6602da980f008cf726467588ad517f"
+source = "git+https://github.com/longbridge/gpui-kit#369f7a8f5a6602da980f008cf726467588ad517f"
 dependencies = [
  "proc-macro-crate 3.5.0",
  "proc-macro2",
@@ -5378,7 +5378,7 @@ dependencies = [
 [[package]]
 name = "gpui-kit"
 version = "0.7.1"
-source = "git+https://github.com/longbridge/gpui-kit?rev=369f7a8f5a6602da980f008cf726467588ad517f#369f7a8f5a6602da980f008cf726467588ad517f"
+source = "git+https://github.com/longbridge/gpui-kit#369f7a8f5a6602da980f008cf726467588ad517f"
 dependencies = [
  "gpui-base",
  "gpui-component",
@@ -5395,7 +5395,7 @@ dependencies = [
 [[package]]
 name = "gpui-kit-assets"
 version = "0.7.1"
-source = "git+https://github.com/longbridge/gpui-kit?rev=369f7a8f5a6602da980f008cf726467588ad517f#369f7a8f5a6602da980f008cf726467588ad517f"
+source = "git+https://github.com/longbridge/gpui-kit#369f7a8f5a6602da980f008cf726467588ad517f"
 dependencies = [
  "anyhow",
  "gpui-fast",
@@ -5890,7 +5890,7 @@ checksum = "4b0d73e1bc02eef886a5947f41b8512708792e9e5d3053d181843311a487f96f"
 [[package]]
 name = "gpui-webview"
 version = "0.7.1"
-source = "git+https://github.com/longbridge/gpui-kit?rev=369f7a8f5a6602da980f008cf726467588ad517f#369f7a8f5a6602da980f008cf726467588ad517f"
+source = "git+https://github.com/longbridge/gpui-kit#369f7a8f5a6602da980f008cf726467588ad517f"
 dependencies = [
  "anyhow",
  "gpui-kit",
