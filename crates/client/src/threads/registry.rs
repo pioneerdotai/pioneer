@@ -4957,6 +4957,7 @@ mod tests {
         block.block_id = format!("result-{ix}");
         block.sort_key = format!("{ix:05}:b");
         block.kind = TimelineBlockKind::AssistantMessage {
+            html_publications: Vec::new(),
             item_id: format!("task-result-{ix}"),
             text: "child result".into(),
             status: TurnWorkItemStatus::Completed,

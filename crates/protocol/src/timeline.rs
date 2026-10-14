@@ -139,6 +139,9 @@ pub enum TimelineBlockKind {
     },
     #[serde(rename_all = "camelCase")]
     AssistantMessage {
+        /// Exact HTML content of this canonical response; source ownership is unchanged.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        html_publications: Vec<crate::HtmlPublication>,
         item_id: String,
         text: String,
         #[serde(default = "completed_turn_work_item_status")]

@@ -95,6 +95,9 @@ pub struct ThreadView {
 impl EventEmitter<ThreadNavigationEvent> for ThreadView {}
 static NEXT_MOUNT: AtomicU64 = AtomicU64::new(1);
 impl ThreadView {
+    pub fn is_visible(&self) -> bool {
+        self.visible
+    }
     pub fn set_visible(&mut self, visible: bool, window: &mut Window, cx: &mut Context<Self>) {
         if self.visible == visible {
             return;
@@ -770,7 +773,8 @@ mod tests {
                 cx.notify();
             });
         });
-        cx.run_until_parked();
+        // update flushed the stale deferred commit; keep fresh frames queued
+        // until the intervening gesture cancels the pending follow.
         timeline.read_with(cx, |view, _| {
             assert!(Rc::ptr_eq(
                 &previous_sizes,

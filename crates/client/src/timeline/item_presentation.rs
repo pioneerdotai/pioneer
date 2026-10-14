@@ -51,8 +51,8 @@ pub struct TimelineToolContent {
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TimelineItemPresentation {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub html_publication: Option<pioneer_protocol::HtmlPublication>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub html_publications: Vec<pioneer_protocol::HtmlPublication>,
     pub kind: TimelineItemKind,
     pub text: String,
     pub markdown: Option<MarkdownDocument>,
@@ -106,11 +106,7 @@ pub(crate) fn project_item(item: &ItemView) -> TimelineItemPresentation {
     }
     .to_owned();
     let mut result = TimelineItemPresentation {
-        html_publication: item
-            .opaque_meta
-            .as_ref()
-            .and_then(|m| m.get("htmlPublication"))
-            .and_then(|p| serde_json::from_value(p.clone()).ok()),
+        html_publications: item.html_publications.clone(),
         kind,
         text,
         markdown: item

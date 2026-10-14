@@ -177,12 +177,47 @@ impl DesktopTimelineController {
             std::collections::HashSet::new()
         };
         view.set_row_terminals_visible(&terminal_rows, cx);
-        let html_rows = if window.is_visible() {
-            terminal_rows.clone()
+        // Keep HTML prepared one viewport ahead/behind; native clipping still uses
+        // the exact list viewport. Other row viewability policies stay unchanged.
+        let nearby = prepared.layout_index.visible_range(
+            (offset - bounds.size.height).max(px(0.)),
+            bounds.size.height * 3. - (bounds.size.height - offset).max(px(0.)),
+        );
+        let html_rows = if view.thread_timeline_view_state.visible
+            && window.is_visible()
+            && bounds.size.height > px(0.)
+        {
+            prepared.model.rows[nearby.clone()]
+                .iter()
+                .map(|row| row.key().to_owned())
+                .collect()
         } else {
             std::collections::HashSet::new()
         };
         view.set_row_html_visible(&html_rows, cx);
+        for ix in nearby {
+            let id = prepared.model.rows[ix].key();
+            let top = view
+                .layout_store
+                .index
+                .borrow()
+                .origin(ix)
+                .unwrap_or(px(0.));
+            let on_screen =
+                top < offset + bounds.size.height && top + prepared.item_sizes[ix].height > offset;
+            if html_rows.contains(id)
+                && !on_screen
+                && let Some(row) = view
+                    .row_registry
+                    .get(prepared.slots[ix].snapshot().id())
+                    .and_then(|slot| slot.view.clone())
+            {
+                let row_origin = bounds.origin + point(px(0.), top - offset);
+                row.update(cx, |row, cx| {
+                    row.prepare_nearby_html(row_origin, bounds, window, cx)
+                });
+            }
+        }
         let visible_rows = if available {
             ids.iter().cloned().collect()
         } else {

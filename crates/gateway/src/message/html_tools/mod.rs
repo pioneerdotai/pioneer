@@ -308,6 +308,86 @@ impl MessageProcessor {
                     chrono::Utc::now().timestamp(),
                 )
                 .await;
+                let turn_items = self
+                    .crud_store
+                    .list_turn_items_by_type_for_turns(&[turn.to_owned()], "agent_message")
+                    .await;
+                if let Ok(items) = turn_items {
+                    if let Some(item) = items.get(turn).and_then(|items| {
+                        items.iter().rev().find(|item| {
+                            matches!(
+                                item,
+                                pioneer_protocol::TurnItem::AgentMessage {
+                                    phase: pioneer_protocol::AgentMessagePhase::FinalAnswer,
+                                    ..
+                                }
+                            )
+                        })
+                    }) {
+                        self.notify_semantic_timeline_item_changed(
+                            workspace,
+                            thread,
+                            turn,
+                            item,
+                            Some("completed"),
+                        )
+                        .await;
+                    }
+                }
+                if let Ok(Some(execution)) = self
+                    .crud_store
+                    .get_task_run_turn_by_turn(thread, turn)
+                    .await
+                {
+                    if let Ok(deliveries) = self
+                        .crud_store
+                        .list_task_deliveries(pioneer_protocol::TaskDeliveriesParams {
+                            workspace_id: workspace.into(),
+                            run_id: Some(execution.run_id),
+                            limit: Some(200),
+                            ..Default::default()
+                        })
+                        .await
+                    {
+                        for delivery in deliveries.deliveries {
+                            let (Some(target), Some(target_turn)) = (
+                                delivery.target_thread_id.as_deref(),
+                                delivery.delivered_turn_id.as_deref(),
+                            ) else {
+                                continue;
+                            };
+                            let item_id =
+                                pioneer_protocol::task_delivery_result_item_id(&delivery.id);
+                            if self
+                                .html_publications_for_agent_response(
+                                    workspace,
+                                    target,
+                                    target_turn,
+                                    &item_id,
+                                )
+                                .await
+                                .is_ok_and(|publications| {
+                                    publications.iter().any(|publication| {
+                                        publication.artifact.artifact_id == artifact
+                                    })
+                                })
+                            {
+                                if let Ok(Some(item)) =
+                                    self.crud_store.get_turn_item(target_turn, &item_id).await
+                                {
+                                    self.notify_semantic_timeline_item_changed(
+                                        workspace,
+                                        target,
+                                        target_turn,
+                                        &item,
+                                        Some("completed"),
+                                    )
+                                    .await;
+                                }
+                            }
+                        }
+                    }
+                }
                 self.notify_semantic_timeline_turn_state_changed(workspace, thread, turn)
                     .await;
             }
@@ -585,4 +665,242 @@ fn html_identity(context: &TurnToolContext, call: &str, index: &str) -> String {
     ]))
     .expect("identity serializes");
     hex::encode(Sha256::digest(identity))
+}
+
+impl super::MessageProcessor {
+    pub(super) async fn html_publications_for_response_turn(
+        &self,
+        workspace: &str,
+        thread: &str,
+        turn: &str,
+    ) -> anyhow::Result<Vec<pioneer_protocol::HtmlPublication>> {
+        let page = self
+            .artifact_service
+            .list_artifacts(
+                workspace,
+                pioneer_artifacts::ArtifactListFilter {
+                    thread_id: Some(thread.to_owned()),
+                    turn_id: Some(turn.to_owned()),
+                    include_deleted: true,
+                    created_by_actor_id: Some(pioneer_tools::html::HTML_RENDER.into()),
+                    limit: Some(200),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        if page.next_cursor.is_some() {
+            return Err(anyhow::anyhow!(
+                "turn artifact publication page exceeds timeline delivery budget"
+            ));
+        }
+        let mut publications = Vec::new();
+        for mut summary in page.items {
+            let exact = summary
+                .bindings
+                .iter()
+                .find(|binding| {
+                    binding.thread_id.as_deref() == Some(thread)
+                        && binding.turn_id.as_deref() == Some(turn)
+                        && binding.binding_kind == pioneer_protocol::ArtifactBindingKind::ToolOutput
+                        && binding.direction == pioneer_protocol::ArtifactBindingDirection::Output
+                        && binding.role == Some(pioneer_protocol::ArtifactRole::Tool)
+                })
+                .and_then(|binding| binding.version_id.clone());
+            if exact != summary.artifact.version_id {
+                summary = self
+                    .artifact_service
+                    .get_artifact(workspace, &summary.artifact.artifact_id, exact.as_deref())
+                    .await?;
+            }
+            let publication =
+                pioneer_protocol::HtmlPublication::from_summary(&summary, thread, turn);
+            let Some(publication) = publication else {
+                continue;
+            };
+            let order = summary
+                .bindings
+                .iter()
+                .filter(|b| {
+                    b.thread_id.as_deref() == Some(thread)
+                        && b.turn_id.as_deref() == Some(turn)
+                        && b.tool_call_id.as_deref() == Some(publication.call_id.as_str())
+                        && b.version_id == publication.artifact.version_id
+                        && b.binding_kind == pioneer_protocol::ArtifactBindingKind::ToolOutput
+                        && b.direction == pioneer_protocol::ArtifactBindingDirection::Output
+                        && b.role == Some(pioneer_protocol::ArtifactRole::Tool)
+                })
+                .filter_map(|b| b.item_index)
+                .min()
+                .unwrap_or(i64::MAX);
+            // The original binding is immutable; CLI echoes/projection rebuilds
+            // must not move documents already attached to an agent response.
+            publications.push((
+                (
+                    order,
+                    summary.created_at,
+                    publication.call_id.clone(),
+                    publication.artifact.artifact_id.clone(),
+                ),
+                publication,
+            ));
+        }
+        publications.sort_by(|(left, _), (right, _)| left.cmp(right));
+        Ok(publications
+            .into_iter()
+            .map(|(_, publication)| publication)
+            .collect())
+    }
+}
+
+impl MessageProcessor {
+    /// Called only for an existing canonical final response block. Delivery
+    /// supplies the destination; immutable source ownership is never rewritten.
+    pub(super) async fn html_publications_for_agent_response(
+        &self,
+        workspace: &str,
+        thread: &str,
+        turn: &str,
+        item: &str,
+    ) -> anyhow::Result<Vec<pioneer_protocol::HtmlPublication>> {
+        let Some(delivery_id) = pioneer_protocol::task_delivery_id_from_result_item_id(item) else {
+            return self
+                .html_publications_for_response_turn(workspace, thread, turn)
+                .await;
+        };
+        // The same committed response item that renders final text is required.
+        // Delivery preparation alone must not expose pending or cancelled content.
+        if !self
+            .crud_store
+            .get_turn_item(turn, item)
+            .await?
+            .is_some_and(|item| {
+                matches!(
+                    item,
+                    pioneer_protocol::TurnItem::AgentMessage {
+                        phase: pioneer_protocol::AgentMessagePhase::FinalAnswer,
+                        ..
+                    }
+                )
+            })
+        {
+            return Ok(Vec::new());
+        }
+        let Some(delivery) = self.crud_store.get_task_delivery(delivery_id).await? else {
+            return Ok(Vec::new());
+        };
+        if delivery.workspace_id != workspace
+            || delivery.target_thread_id.as_deref() != Some(thread)
+            || delivery.error_snapshot.is_some()
+            || delivery
+                .delivered_turn_id
+                .as_deref()
+                .is_some_and(|id| id != turn)
+        {
+            return Ok(Vec::new());
+        }
+        let Some(result) = &delivery.result_snapshot else {
+            return Ok(Vec::new());
+        };
+        let mut sources = Vec::new();
+        for artifact in &result.artifacts {
+            if let Some(pioneer_protocol::TaskValue::Object(metadata)) = &artifact.metadata {
+                if let (
+                    Some(pioneer_protocol::TaskValue::String(source_thread)),
+                    Some(pioneer_protocol::TaskValue::String(source_turn)),
+                ) = (
+                    metadata.get("htmlSourceThreadId"),
+                    metadata.get("htmlSourceTurnId"),
+                ) {
+                    sources.push((source_thread.clone(), source_turn.clone()));
+                }
+            }
+        }
+        // Durable pre-integration deliveries already pin their source item in
+        // the fallback result. Recover on bounded reads, without rewriting DB.
+        let legacy = result.artifacts.is_empty();
+        if legacy {
+            if let Some(pioneer_protocol::TaskValue::Object(data)) = &result.data {
+                if data.get("fallbackUsed") != Some(&pioneer_protocol::TaskValue::Bool(true))
+                    || data.get("schemaValid") != Some(&pioneer_protocol::TaskValue::Bool(false))
+                {
+                    return Ok(Vec::new());
+                }
+                if let (
+                    Some(pioneer_protocol::TaskValue::String(source_thread)),
+                    Some(pioneer_protocol::TaskValue::String(source_turn)),
+                    Some(pioneer_protocol::TaskValue::String(source_item)),
+                ) = (
+                    data.get("sourceThreadId"),
+                    data.get("sourceTurnId"),
+                    data.get("sourceItemId"),
+                ) {
+                    if self
+                        .crud_store
+                        .get_turn_item(source_turn, source_item)
+                        .await?
+                        .is_some_and(|item| {
+                            matches!(
+                                item,
+                                pioneer_protocol::TurnItem::AgentMessage {
+                                    phase: pioneer_protocol::AgentMessagePhase::FinalAnswer,
+                                    ..
+                                }
+                            )
+                        })
+                    {
+                        sources.push((source_thread.clone(), source_turn.clone()));
+                    }
+                }
+            }
+        }
+        sources.sort();
+        sources.dedup();
+        let mut publications = Vec::new();
+        for (source_thread, source_turn) in sources {
+            let Some(execution) = self
+                .crud_store
+                .get_task_run_turn_by_turn(&source_thread, &source_turn)
+                .await?
+            else {
+                continue;
+            };
+            if execution.run_id != delivery.run_id
+                || execution.task_id != delivery.task_id
+                || execution.kind == pioneer_protocol::TaskRunTurnKind::Review
+            {
+                continue;
+            }
+            if legacy
+                && !self
+                    .crud_store
+                    .get_task_result_candidate_by_turn(&execution.id)
+                    .await?
+                    .is_some_and(|candidate| {
+                        candidate.task_id == delivery.task_id
+                            && candidate.run_id == delivery.run_id
+                            && candidate.thread_id == source_thread
+                            && candidate.turn_id == source_turn
+                            && candidate.result.as_ref() == Some(result)
+                    })
+            {
+                continue;
+            }
+            // Approval/cancellation visibility belongs to the committed delivery
+            // response, not mutable candidate status after that response exists.
+            for publication in self
+                .html_publications_for_response_turn(workspace, &source_thread, &source_turn)
+                .await?
+            {
+                if legacy
+                    || result.artifacts.iter().any(|artifact| {
+                        artifact.artifact_id.as_ref() == Some(&publication.artifact.artifact_id)
+                            && artifact.version_id == publication.artifact.version_id
+                    })
+                {
+                    publications.push(publication);
+                }
+            }
+        }
+        Ok(publications)
+    }
 }

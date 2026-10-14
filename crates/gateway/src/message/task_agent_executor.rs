@@ -10417,6 +10417,13 @@ impl TaskAgentResultExtractor {
         result: TaskResult,
         artifact_mode: TaskAgentResultArtifactMode,
     ) -> Result<TaskAgentResultExtraction> {
+        let result = task_artifacts::include_html_response_artifacts(
+            processor,
+            task_response.task.workspace_id.as_str(),
+            task_run_turn,
+            result,
+        )
+        .await?;
         let authorization = task_artifacts::authorize_task_result_artifacts(
             processor,
             &task_response.task,
@@ -11710,6 +11717,368 @@ mod tests {
             })
             .await
             .expect("ingest artifact")
+    }
+
+    #[tokio::test]
+    async fn html_response_artifacts_enter_existing_result_binding_without_model_handles() {
+        let (processor, task, execution, lineage) = task_artifact_harness("html_response").await;
+        let mut sources = Vec::new();
+        for index in 0..2 {
+            let call = format!("html_call_{index}");
+            let source = processor.artifact_service.ingest_bytes(IngestArtifactBytesRequest {
+                workspace_id: task.workspace_id.clone(),
+                primary_thread_id: Some(execution.thread_id.clone()),
+                bytes: format!("<p>document {index}</p>").into_bytes(),
+                display_name: format!("document {index}"),
+                kind: ArtifactKind::File,
+                mime_type: Some("text/html".into()),
+                created_by_kind: ArtifactCreatedByKind::Tool,
+                created_by_actor_id: Some("html_render".into()),
+                binding: Some(ArtifactBindingTarget {
+                    thread_id: Some(execution.thread_id.clone()), turn_id: Some(execution.turn_id.clone()),
+                    message_id: None, turn_item_id: Some(call.clone()), tool_call_id: Some(call.clone()),
+                    task_id: None, task_run_id: None, binding_kind: ArtifactBindingKind::ToolOutput,
+                    direction: ArtifactBindingDirection::Output, role: Some(ArtifactRole::Tool), item_index: Some(index),
+                }),
+                metadata: std::collections::BTreeMap::from([("htmlTool".into(), serde_json::json!({"version":1,"publication":true,"turnId":execution.turn_id,"callId":call,"index":"document","title":format!("document {index}")}))]),
+            }).await.expect("HTML publication");
+            sources.push(source);
+        }
+        let db = processor.crud_store.database_connection();
+        let echo = |index| {
+            let call = format!("html_call_{index}");
+            let now = chrono::Utc::now().fixed_offset();
+            pioneer_crud::upsert_turn_work_item_projection(
+                &db,
+                pioneer_crud::TurnWorkItemProjectionRecord {
+                    work_item_id: pioneer_crud::work_item_projection_id(&execution.turn_id, &call),
+                    workspace_id: task.workspace_id.clone(),
+                    thread_id: execution.thread_id.clone(),
+                    turn_id: execution.turn_id.clone(),
+                    item_id: call,
+                    source_event_id: None,
+                    source_sequence: index,
+                    order_key: format!("echo:{index:020}"),
+                    item_type: "dynamic_tool_call".into(),
+                    visibility: "visible".into(),
+                    classification: "html_render".into(),
+                    status: "completed".into(),
+                    started_at: Some(now),
+                    completed_at: Some(now),
+                    metadata_json: "{}".into(),
+                    created_at: now,
+                    updated_at: now,
+                },
+            )
+        };
+        // A has its CLI projection; authoritative B is already saved but its echo is late.
+        echo(0).await.expect("first projection");
+        let before_echo = processor
+            .html_publications_for_response_turn(
+                &task.workspace_id,
+                &execution.thread_id,
+                &execution.turn_id,
+            )
+            .await
+            .expect("mixed projection response");
+        assert_eq!(
+            before_echo.iter().map(|p| &p.artifact).collect::<Vec<_>>(),
+            sources.iter().map(|p| &p.artifact).collect::<Vec<_>>()
+        );
+        let generic = ingest_task_test_artifact(
+            &processor,
+            &task.workspace_id,
+            Some(execution.thread_id.clone()),
+            "ordinary attachment",
+        )
+        .await;
+        let result = TaskResult {
+            summary: Some("Final text".into()),
+            data: None,
+            artifacts: Vec::new(),
+            completed_by_run_id: Some(execution.run_id.clone()),
+        };
+        let included = task_artifacts::include_html_response_artifacts(
+            &processor,
+            &task.workspace_id,
+            &execution,
+            result,
+        )
+        .await
+        .expect("collect response");
+        assert_eq!(included.artifacts.len(), 2);
+        assert_eq!(included.summary.as_deref(), Some("Final text"));
+        for (artifact, source) in included.artifacts.iter().zip(&sources) {
+            assert_eq!(
+                artifact.artifact_id.as_ref(),
+                Some(&source.artifact.artifact_id)
+            );
+            assert_eq!(artifact.version_id, source.artifact.version_id);
+            assert_ne!(
+                artifact.artifact_id.as_ref(),
+                Some(&generic.artifact.artifact_id)
+            );
+        }
+        echo(1).await.expect("late second projection");
+        for _ in 0..2 {
+            let replay = processor
+                .html_publications_for_response_turn(
+                    &task.workspace_id,
+                    &execution.thread_id,
+                    &execution.turn_id,
+                )
+                .await
+                .expect("echo/rebuild replay");
+            assert_eq!(replay, before_echo);
+        }
+        let repeated = task_artifacts::include_html_response_artifacts(
+            &processor,
+            &task.workspace_id,
+            &execution,
+            included,
+        )
+        .await
+        .expect("repeat collection");
+        assert_eq!(repeated.artifacts.len(), 2);
+        use sea_orm::{ActiveModelTrait, EntityTrait, Set};
+        pioneer_entity::thread_lineage::ActiveModel {
+            child_thread_id: Set(lineage.child_thread_id.clone()),
+            parent_thread_id: Set(lineage.parent_thread_id.clone()),
+            root_thread_id: Set(lineage.root_thread_id.clone()),
+            depth: Set(i64::from(lineage.depth)),
+            created_at: Set(chrono::Utc::now().fixed_offset()),
+            origin_kind: Set(lineage.origin_kind.clone()),
+            created_by_thread_id: Set(lineage.created_by_thread_id.clone()),
+            created_by_turn_id: Set(lineage.created_by_turn_id.clone()),
+        }
+        .insert(&db)
+        .await
+        .expect("source collaboration lineage");
+        let normalized = task_artifacts::normalize_task_result_artifacts(
+            &processor,
+            &task,
+            &execution,
+            &lineage,
+            &task_artifacts::TaskResultArtifactAuthorization::structural_test_proof(),
+            repeated,
+        )
+        .await
+        .expect("normalize")
+        .expect("valid exact handles");
+        assert_eq!(normalized.artifacts.len(), 2);
+        // Recover both new and legacy deliveries through the real reader path.
+        processor
+            .crud_store
+            .upsert_task_run_turn(execution.clone())
+            .await
+            .expect("source execution provenance");
+        let final_source = pioneer_protocol::TurnItem::AgentMessage {
+            id: "source-final".into(),
+            text: "Final text".into(),
+            markdown: None,
+            markdown_version: None,
+            phase: pioneer_protocol::AgentMessagePhase::FinalAnswer,
+        };
+        for (turn, item) in [
+            (&execution.turn_id, final_source.clone()),
+            (
+                &execution.run_id,
+                pioneer_protocol::TurnItem::AgentMessage {
+                    id: pioneer_protocol::task_delivery_result_item_id("html-delivery"),
+                    text: "Final text".into(),
+                    markdown: None,
+                    markdown_version: None,
+                    phase: pioneer_protocol::AgentMessagePhase::FinalAnswer,
+                },
+            ),
+        ] {
+            let now = chrono::Utc::now().fixed_offset();
+            pioneer_entity::turn_item::Entity::insert(pioneer_entity::turn_item::ActiveModel {
+                id: Set(format!("{turn}_{}", item.item_id())),
+                turn_id: Set(turn.clone()),
+                item_id: Set(item.item_id().into()),
+                item_type: Set("agent_message".into()),
+                payload: Set(serde_json::to_string(&item).expect("item payload")),
+                active_attempt_number: Set(0),
+                created_at: Set(now),
+                updated_at: Set(now),
+                ..Default::default()
+            })
+            .exec_without_returning(&db)
+            .await
+            .expect("canonical response fixture");
+        }
+        let now = chrono::Utc::now().fixed_offset();
+        let mut legacy_result = normalized.clone();
+        legacy_result.artifacts.clear();
+        legacy_result.data = Some(TaskValue::Object(BTreeMap::from([
+            ("fallbackUsed".into(), TaskValue::Bool(true)),
+            ("schemaValid".into(), TaskValue::Bool(false)),
+            (
+                "sourceThreadId".into(),
+                TaskValue::String(execution.thread_id.clone()),
+            ),
+            (
+                "sourceTurnId".into(),
+                TaskValue::String(execution.turn_id.clone()),
+            ),
+            (
+                "sourceItemId".into(),
+                TaskValue::String("source-final".into()),
+            ),
+        ])));
+        processor
+            .crud_store
+            .upsert_task_result_candidate(TaskResultCandidate {
+                id: "html-candidate".into(),
+                task_id: task.id.clone(),
+                run_id: execution.run_id.clone(),
+                task_run_turn_id: execution.id.clone(),
+                thread_id: execution.thread_id.clone(),
+                turn_id: execution.turn_id.clone(),
+                round: 0,
+                status: TaskResultCandidateStatus::Accepted,
+                result: Some(legacy_result.clone()),
+                extraction_error: None,
+                summary: Some("Final text".into()),
+                diagnostics: Vec::new(),
+                final_review_event_id: None,
+                created_at: 1,
+                updated_at: 2,
+                resolved_at: Some(2),
+            })
+            .await
+            .expect("durable accepted source result");
+        let delivery = pioneer_entity::task_delivery::ActiveModel {
+            id: Set("html-delivery".into()),
+            workspace_id: Set(task.workspace_id.clone()),
+            task_id: Set(task.id.clone()),
+            run_id: Set(execution.run_id.clone()),
+            delivery_key: Set("html-delivery".into()),
+            mode: Set("thread".into()),
+            target_thread_id: Set(task.created_by_thread_id.clone()),
+            status: Set("delivered".into()),
+            attempt_count: Set(1),
+            max_attempts: Set(3),
+            result_snapshot_json: Set(Some(serde_json::to_string(&legacy_result).unwrap())),
+            delivered_turn_id: Set(Some(execution.run_id.clone())),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(&db)
+        .await
+        .expect("legacy approved delivery");
+        let item_id = pioneer_protocol::task_delivery_result_item_id("html-delivery");
+        let parent = task.created_by_thread_id.as_deref().unwrap();
+        let restored = processor
+            .html_publications_for_agent_response(
+                &task.workspace_id,
+                parent,
+                &execution.run_id,
+                &item_id,
+            )
+            .await
+            .expect("legacy replay");
+        assert_eq!(restored.len(), 2);
+        assert!(
+            restored
+                .iter()
+                .all(|publication| publication.thread_id == execution.thread_id
+                    && publication.turn_id == execution.turn_id)
+        );
+        assert_eq!(restored[0].artifact, sources[0].artifact);
+        assert_eq!(restored[1].artifact, sources[1].artifact);
+        assert_eq!(
+            restored,
+            processor
+                .html_publications_for_agent_response(
+                    &task.workspace_id,
+                    parent,
+                    &execution.run_id,
+                    &item_id
+                )
+                .await
+                .unwrap()
+        );
+        assert!(
+            processor
+                .html_publications_for_agent_response(
+                    &task.workspace_id,
+                    "unrelated-target",
+                    &execution.run_id,
+                    &item_id
+                )
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            processor
+                .html_publications_for_agent_response(
+                    &task.workspace_id,
+                    parent,
+                    "not-committed-pending-review-turn",
+                    &item_id
+                )
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let mut delivery: pioneer_entity::task_delivery::ActiveModel = delivery.into();
+        delivery.result_snapshot_json = Set(Some(serde_json::to_string(&normalized).unwrap()));
+        let delivered = delivery.update(&db).await.expect("fresh result snapshot");
+        assert_eq!(
+            restored,
+            processor
+                .html_publications_for_agent_response(
+                    &task.workspace_id,
+                    parent,
+                    &execution.run_id,
+                    &item_id
+                )
+                .await
+                .unwrap()
+        );
+        let mut failed: pioneer_entity::task_delivery::ActiveModel = delivered.into();
+        failed.error_snapshot_json = Set(Some(
+            serde_json::to_string(&TaskError {
+                recovery_diagnostic: None,
+                code: "failed_execution".into(),
+                message: "Execution failed".into(),
+                class: TaskErrorClass::Validation,
+                details: None,
+                failed_run_id: Some(execution.run_id.clone()),
+            })
+            .unwrap(),
+        ));
+        failed.update(&db).await.expect("failed delivery fixture");
+        assert!(
+            processor
+                .html_publications_for_agent_response(
+                    &task.workspace_id,
+                    parent,
+                    &execution.run_id,
+                    &item_id
+                )
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        for source in sources {
+            let exact = processor
+                .artifact_service
+                .get_artifact(
+                    &task.workspace_id,
+                    &source.artifact.artifact_id,
+                    source.artifact.version_id.as_deref(),
+                )
+                .await
+                .expect("exact result source");
+            assert!(exact.bindings.iter().any(|binding| binding.binding_kind
+                == ArtifactBindingKind::TaskResult
+                && binding.task_run_id.as_deref() == Some(execution.run_id.as_str())));
+        }
     }
 
     fn json_answer_contract() -> TaskAgentResultContract {

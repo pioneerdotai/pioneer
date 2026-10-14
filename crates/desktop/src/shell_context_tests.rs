@@ -278,6 +278,76 @@ fn thread_footer_shares_the_existing_bottom_bar_allocation_and_receives_pointer_
 }
 
 #[gpui_kit::test]
+fn replacing_thread_or_route_hides_the_previous_root_even_if_a_frame_retains_it(
+    cx: &mut TestAppContext,
+) {
+    use super::DesktopShellView;
+    use pioneer_client::navigation::{NavigationIntent, SemanticDestination, SettingsRoute};
+    cx.update(gpui_kit::init);
+    cx.update(crate::client_runtime::DesktopRuntimeCoordinator::install_for_test);
+    let core = cx.update(|cx| {
+        cx.global::<crate::client_runtime::DesktopRuntimeCoordinator>()
+            .core()
+    });
+    for id in ["parent", "child"] {
+        core.upsert_thread(serde_json::from_value(serde_json::json!({
+            "created_at":1,"id":id,"mode":"Chat","model":"synthetic-model","model_provider":"synthetic-provider","origin_kind":"user","preview":"","sidebar_visibility":"visible","status":"Idle","turns":[],"updated_at":2,"workspace_id":"workspace"
+        })).unwrap());
+    }
+    core.activate_thread(Some("parent"), Some("workspace"));
+    let (root, cx) = cx.add_window_view(|window, cx| {
+        let registrar = cx
+            .global::<crate::client_runtime::DesktopRuntimeCoordinator>()
+            .registrar();
+        let navigation = crate::desktop_navigation::DesktopNavigationStore::new(registrar.as_ref());
+        let layout = cx.new(|cx| crate::shell_state::ShellStateStore::new(window, cx));
+        let shell = cx.new(|cx| DesktopShellView::new(navigation, layout, window, cx));
+        Root::new(shell, window, cx)
+    });
+    cx.run_until_parked();
+    let shell = root.read_with(cx, |root, _| {
+        root.view().clone().downcast::<DesktopShellView>().unwrap()
+    });
+    let mut retained = Vec::new();
+    for id in [Some("child"), Some("parent"), None] {
+        let previous = shell.read_with(cx, |shell, _| shell.thread.as_ref().unwrap().1.clone());
+        assert!(previous.read_with(cx, |thread, _| thread.is_visible()));
+        core.activate_thread(id, Some("workspace"));
+        cx.run_until_parked();
+        assert!(
+            !previous.read_with(cx, |thread, _| thread.is_visible()),
+            "retained page must hide before selecting a child, parent or new draft"
+        );
+        retained.push(previous);
+    }
+    let previous = shell.read_with(cx, |shell, _| shell.thread.as_ref().unwrap().1.clone());
+    core.navigate(
+        NavigationIntent::Navigate {
+            destination: SemanticDestination::Settings {
+                route: SettingsRoute::Account,
+            },
+        },
+        None,
+    );
+    cx.run_until_parked();
+    assert!(!previous.read_with(cx, |thread, _| thread.is_visible()));
+    retained.push(previous);
+    assert!(
+        retained
+            .iter()
+            .all(|thread| thread.read_with(cx, |thread, _| !thread.is_visible()))
+    );
+    core.activate_thread(Some("parent"), Some("workspace"));
+    cx.run_until_parked();
+    let previous = shell.read_with(cx, |shell, _| shell.thread.as_ref().unwrap().1.clone());
+    cx.update(|window, cx| shell.update(cx, |shell, cx| shell.close(window, cx)));
+    assert!(
+        !previous.read_with(cx, |thread, _| thread.is_visible()),
+        "window close retires native pages before dropping the feature"
+    );
+}
+
+#[gpui_kit::test]
 fn every_production_route_retains_its_feature_and_window_close_releases_it(
     cx: &mut TestAppContext,
 ) {

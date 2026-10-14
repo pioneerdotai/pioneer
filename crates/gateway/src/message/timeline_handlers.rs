@@ -93,6 +93,7 @@ struct UserMessageTimelineBatch {
 #[derive(Default)]
 struct AssistantMessageTimelineBatch {
     items: HashMap<(String, String), TurnItem>,
+    html: HashMap<(String, String), Vec<pioneer_protocol::HtmlPublication>>,
     authors: HashMap<String, pioneer_protocol::TurnAuthorSnapshot>,
 }
 
@@ -1756,6 +1757,7 @@ impl MessageProcessor {
                 .await?
         };
         let mut items = HashMap::new();
+        let mut html = HashMap::new();
         for (turn_id, item_id) in &item_targets {
             let item = turn_items
                 .get(turn_id.as_str())
@@ -1766,13 +1768,42 @@ impl MessageProcessor {
             if !matches!(item, TurnItem::AgentMessage { .. }) {
                 bail!("assistant message timeline target is not an Agent message");
             }
+            let is_final = turn_items
+                .get(turn_id)
+                .and_then(|items| {
+                    items.iter().rev().find(|item| {
+                        matches!(
+                            item,
+                            TurnItem::AgentMessage {
+                                phase: pioneer_protocol::AgentMessagePhase::FinalAnswer,
+                                ..
+                            }
+                        )
+                    })
+                })
+                .is_some_and(|final_item| final_item.item_id() == item_id);
+            if is_final {
+                let publications = self
+                    .html_publications_for_agent_response(
+                        &rows[0].workspace_id,
+                        thread_id,
+                        turn_id,
+                        item_id,
+                    )
+                    .await?;
+                html.insert((turn_id.clone(), item_id.clone()), publications);
+            }
             items.insert((turn_id.clone(), item_id.clone()), item.clone());
         }
 
         let authors = self
             .timeline_row_authors(&turns, turn_ids.as_slice())
             .await?;
-        Ok(AssistantMessageTimelineBatch { items, authors })
+        Ok(AssistantMessageTimelineBatch {
+            items,
+            authors,
+            html,
+        })
     }
 
     async fn timeline_row_authors(
@@ -2153,6 +2184,11 @@ impl MessageProcessor {
         let markdown = markdown.or_else(|| Some(markdown::parse_markdown_document(text.as_str())));
 
         Ok(TimelineBlockKind::AssistantMessage {
+            html_publications: batch
+                .html
+                .get(&(turn_id.to_owned(), item_id.to_owned()))
+                .cloned()
+                .unwrap_or_default(),
             item_id: id,
             text,
             status: TurnWorkItemStatus::Completed,
@@ -2277,55 +2313,8 @@ impl MessageProcessor {
             .crud_store
             .get_agent_work_graph_projection_for_turn(projection.turn_id.as_str())
             .await?;
-        let page = self
-            .artifact_service
-            .list_artifacts(
-                &projection.workspace_id,
-                pioneer_artifacts::ArtifactListFilter {
-                    thread_id: Some(projection.thread_id.clone()),
-                    turn_id: Some(projection.turn_id.clone()),
-                    include_deleted: true,
-                    created_by_actor_id: Some(pioneer_tools::html::HTML_RENDER.into()),
-                    limit: Some(200),
-                    ..Default::default()
-                },
-            )
-            .await?;
-        if page.next_cursor.is_some() {
-            return Err(anyhow!(
-                "turn artifact publication page exceeds timeline delivery budget"
-            ));
-        }
-        let mut publications = page
-            .items
-            .into_iter()
-            .filter_map(|summary| {
-                let publication = pioneer_protocol::HtmlPublication::from_summary(
-                    &summary,
-                    &projection.thread_id,
-                    &projection.turn_id,
-                )?;
-                let order = summary
-                    .bindings
-                    .iter()
-                    .filter(|b| {
-                        b.thread_id.as_deref() == Some(projection.thread_id.as_str())
-                            && b.turn_id.as_deref() == Some(projection.turn_id.as_str())
-                            && b.tool_call_id.as_deref() == Some(publication.call_id.as_str())
-                            && b.version_id == publication.artifact.version_id
-                            && b.binding_kind == pioneer_protocol::ArtifactBindingKind::ToolOutput
-                            && b.direction == pioneer_protocol::ArtifactBindingDirection::Output
-                            && b.role == Some(pioneer_protocol::ArtifactRole::Tool)
-                    })
-                    .filter_map(|b| b.item_index)
-                    .min()
-                    .unwrap_or_default();
-                Some((order, publication))
-            })
-            .collect::<Vec<_>>();
-        publications.sort_by_key(|(order, _)| *order);
         Ok(TurnWorkBlock {
-            html_publications: publications.into_iter().map(|(_, p)| p).collect(),
+            html_publications: Vec::new(),
             turn_id: projection.turn_id,
             presentation: parse_turn_work_presentation(projection.presentation.as_str()),
             state: parse_turn_work_state(projection.state.as_str()),

@@ -2,11 +2,7 @@
 //! this view owns exact source, visibility, ephemeral instance and DOM height.
 use super::{controller::DesktopTimelineController, layout_store::RowMeasurementKey};
 use crate::screen::TimelineView;
-use gpui_kit::{
-    component::{theme::ActiveTheme, v_flex},
-    prelude::*,
-    *,
-};
+use gpui_kit::{component::theme::ActiveTheme, prelude::*, *};
 use gpui_webview::WebView;
 use pioneer_client::{
     artifacts::{
@@ -26,6 +22,19 @@ use std::{
 };
 use tokio::sync::watch;
 
+fn html_download_operation_id(identity: &ArtifactActionIdentity) -> String {
+    format!("html-{}", identity.generation)
+}
+
+// Visibility never changes the full document bounds or DOM layout dimensions.
+fn document_intersects_viewport(document: Bounds<Pixels>, viewport: Bounds<Pixels>) -> bool {
+    document.size.width > px(0.)
+        && document.size.height > px(0.)
+        && viewport.size.width > px(0.)
+        && viewport.size.height > px(0.)
+        && document.intersects(&viewport)
+}
+
 static INSTANCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Deserialize)]
@@ -34,6 +43,8 @@ struct Layout {
     instance: u64,
     width: f64,
     height: f64,
+    #[serde(default, rename = "wheelY")]
+    wheel_y: f64,
 }
 fn layout(raw: &str, instance: u64, width: f64) -> Option<f32> {
     if raw.len() > 1024 || width <= 0. {
@@ -43,6 +54,8 @@ fn layout(raw: &str, instance: u64, width: f64) -> Option<f32> {
     (value.instance == instance
         && value.width.is_finite()
         && (value.width - width).abs() <= 1.
+        && value.wheel_y.is_finite()
+        && value.wheel_y.abs() <= 9_007_199_254_740_991.
         && value.height.is_finite()
         && value.height >= 1.
         && value.height.ceil() <= 9_007_199_254_740_991.)
@@ -66,12 +79,13 @@ fn palette(cx: &App) -> serde_json::Value {
 }
 fn script(instance: u64, palette: &serde_json::Value) -> String {
     format!(
-        r#"(()=>{{if(window.top!==window)return;const instance={instance};let scheduled=false,last='';const measure=()=>{{scheduled=false;const b=document.body;if(!b)return;const r=b.getBoundingClientRect();let bottom=Math.max(1,r.bottom+scrollY,r.top+scrollY+b.scrollHeight);for(const e of b.children)bottom=Math.max(bottom,e.getBoundingClientRect().bottom+scrollY);const payload=JSON.stringify({{instance,width:innerWidth,height:Math.ceil(bottom)}});if(payload!==last){{last=payload;window.ipc.postMessage(payload)}}}};const schedule=()=>{{if(!scheduled){{scheduled=true;requestAnimationFrame(measure)}}}};const apply=p=>{{const r=document.documentElement;if(!r)return;r.style.colorScheme=p.appearance;for(const k of ['background','foreground','muted','border','accent'])r.style.setProperty('--pioneer-'+k,p[k]);schedule()}};window.addEventListener('pioneer-theme',e=>apply(e.detail));window.addEventListener('resize',schedule);window.addEventListener('pioneer-measure',()=>{{last='';schedule()}});window.addEventListener('load',schedule);document.addEventListener('DOMContentLoaded',()=>{{const resize=new ResizeObserver(schedule);resize.observe(document.body);resize.observe(document.documentElement);new MutationObserver(schedule).observe(document.documentElement,{{subtree:true,childList:true,attributes:true,characterData:true}});document.fonts.ready.then(schedule);document.fonts.addEventListener('loadingdone',schedule);apply({palette});schedule()}});apply({palette});}})();"#
+        r#"(()=>{{if(window.top!==window)return;const instance={instance};let scheduled=false,last='',wheelY=0;const measure=()=>{{scheduled=false;const b=document.body;if(!b)return;const r=b.getBoundingClientRect();let bottom=Math.max(1,r.bottom+scrollY,r.top+scrollY+b.scrollHeight);for(const e of b.children)bottom=Math.max(bottom,e.getBoundingClientRect().bottom+scrollY);const payload=JSON.stringify({{instance,width:innerWidth,height:Math.ceil(bottom),wheelY}});if(payload!==last){{last=payload;window.ipc.postMessage(payload)}}}};const schedule=()=>{{if(!scheduled){{scheduled=true;requestAnimationFrame(measure)}}}};const apply=p=>{{const r=document.documentElement;if(!r)return;r.style.colorScheme=p.appearance;for(const k of ['background','foreground','muted','border','accent'])r.style.setProperty('--pioneer-'+k,p[k]);schedule()}};window.addEventListener('pioneer-theme',e=>apply(e.detail));window.addEventListener('resize',schedule);window.addEventListener('pioneer-measure',()=>{{last='';schedule()}});window.addEventListener('load',schedule);window.addEventListener('wheel',e=>{{if(e.ctrlKey||e.defaultPrevented||!Number.isFinite(e.deltaY)||e.deltaY===0)return;for(const node of e.composedPath()){{if(!(node instanceof Element)||node===document.body||node===document.documentElement)continue;const style=getComputedStyle(node);if(/^(auto|scroll|overlay)$/.test(style.overflowY)&&node.scrollHeight>node.clientHeight+1&&((e.deltaY>0&&node.scrollTop+node.clientHeight<node.scrollHeight-1)||(e.deltaY<0&&node.scrollTop>0)))return;}}const delta=e.deltaY*(e.deltaMode===1?16:e.deltaMode===2?innerHeight:1);if(!Number.isFinite(delta))return;e.preventDefault();wheelY+=Math.max(-10000,Math.min(10000,delta));schedule()}},{{passive:false}});document.addEventListener('DOMContentLoaded',()=>{{const resize=new ResizeObserver(schedule);resize.observe(document.body);resize.observe(document.documentElement);new MutationObserver(schedule).observe(document.documentElement,{{subtree:true,childList:true,attributes:true,characterData:true}});document.fonts.ready.then(schedule);document.fonts.addEventListener('loadingdone',schedule);apply({palette});measure()}});apply({palette});}})();"#
     )
 }
 
 pub(super) struct HtmlView {
     publication: HtmlPublication,
+    response_thread: String,
     client: Arc<ClientCore>,
     runtime: PathBuf,
     owner: WeakEntity<TimelineView>,
@@ -88,6 +102,8 @@ pub(super) struct HtmlView {
     instance: u64,
     height: Pixels,
     bounds: Bounds<Pixels>,
+    row_offset: Option<Point<Pixels>>,
+    nearby: bool,
     palette: serde_json::Value,
     failed: bool,
 }
@@ -103,6 +119,7 @@ impl Drop for HtmlView {
 impl HtmlView {
     pub(super) fn new(
         publication: HtmlPublication,
+        response_thread: String,
         client: Arc<ClientCore>,
         runtime: PathBuf,
         owner: WeakEntity<TimelineView>,
@@ -113,6 +130,7 @@ impl HtmlView {
         let auth_generation = client.authorization_connection_generation();
         Self {
             publication,
+            response_thread,
             client,
             runtime,
             owner,
@@ -129,6 +147,8 @@ impl HtmlView {
             instance: 0,
             height: px(1.),
             bounds: Bounds::default(),
+            row_offset: None,
+            nearby: true,
             palette: serde_json::Value::Null,
             failed: false,
         }
@@ -159,6 +179,9 @@ impl HtmlView {
         }
         self.can_load = can_load;
         self.publication = publication;
+        if self.publication.artifact.status != ArtifactStatus::Ready {
+            self.close(cx);
+        }
         self.key = key;
         if self.permitted != permitted || self.auth_generation != generation {
             self.close(cx);
@@ -180,9 +203,81 @@ impl HtmlView {
         }
         cx.notify();
     }
+    pub(super) fn prepare_nearby(
+        &mut self,
+        width: Pixels,
+        row_origin: Point<Pixels>,
+        viewport: Bounds<Pixels>,
+        first: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.visible
+            || !self.permitted
+            || self.failed
+            || self.publication.artifact.status != ArtifactStatus::Ready
+        {
+            return;
+        }
+        // Measured siblings follow their own location as the row scrolls. Before
+        // first layout only its first document can be prepared from the row origin.
+        let offset = match self.row_offset {
+            Some(offset) => offset,
+            None if first => Point::default(),
+            None => return,
+        };
+        self.bounds = Bounds::new(row_origin + offset, size(width, self.height));
+        if !self.retain_nearby(self.bounds, viewport, cx) {
+            return;
+        }
+        // Offscreen preparation keeps full DOM dimensions and an empty native clip.
+        if let Some(webview) = &self.webview {
+            if webview
+                .read(cx)
+                .set_geometry(self.bounds, Bounds::default())
+                .is_err()
+            {
+                self.failed = true;
+                self.close(cx);
+            }
+        } else {
+            self.build(Bounds::default(), window, cx);
+        }
+        if self.failed {
+            self.changed(window, cx);
+            cx.notify();
+        }
+    }
+    fn retain_nearby(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        viewport: Bounds<Pixels>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let preparation = Bounds::new(
+            viewport.origin - point(px(0.), viewport.size.height),
+            size(viewport.size.width, viewport.size.height * 3.),
+        );
+        self.nearby = document_intersects_viewport(bounds, preparation);
+        if !self.nearby {
+            let live = self.webview.is_some()
+                || self.messages.is_some()
+                || self.download.is_some()
+                || self.action.is_some()
+                || self.instance != 0;
+            self.close(cx);
+            if live {
+                cx.notify();
+            }
+        }
+        self.nearby
+    }
+
     fn close(&mut self, cx: &mut Context<Self>) {
         if let Some(view) = self.webview.take() {
-            let _ = view.read(cx).set_visible(false);
+            if let Err(error) = view.read(cx).set_visible(false) {
+                tracing::warn!(%error, "HTML WebView visibility cleanup reported an error");
+            }
         }
         self.messages = None;
         self.instance = 0;
@@ -199,7 +294,7 @@ impl HtmlView {
         if self
             .client
             .begin_artifact_action(
-                publication.thread_id.clone(),
+                self.response_thread.clone(),
                 publication.artifact.artifact_id.clone(),
                 publication.artifact.version_id.clone(),
                 ArtifactActionKind::Share,
@@ -212,7 +307,7 @@ impl HtmlView {
         }
         let identity = self
             .client
-            .artifact_snapshot(&publication.thread_id)
+            .artifact_snapshot(&self.response_thread)
             .and_then(|p| {
                 p.actions
                     .iter()
@@ -234,9 +329,11 @@ impl HtmlView {
             let worker = client.clone();
             let result = cx
                 .background_spawn(async move {
+                    // Shared action admission waits for a free slot and is cancelled
+                    // by close() retiring this exact identity; capacity is not failure.
                     let (_, result) = worker.download_artifact_action(
                         &operation,
-                        format!("html:{}", operation.generation),
+                        html_download_operation_id(&operation),
                         runtime,
                     )?;
                     anyhow::ensure!(
@@ -280,6 +377,10 @@ impl HtmlView {
                     view.failed = true;
                 }
                 view.action = None;
+                // Finish preparing a nearby page without waiting until it enters the list.
+                if !view.failed && view.bounds.size.width > px(0.) {
+                    view.build(Bounds::default(), window, cx);
+                }
                 view.changed(window, cx);
                 cx.notify();
             });
@@ -301,8 +402,9 @@ impl HtmlView {
             });
         });
     }
-    fn build(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.webview.is_some() || !self.visible || !self.permitted || self.failed {
+    fn build(&mut self, clip: Bounds<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+        if self.webview.is_some() || !self.visible || !self.nearby || !self.permitted || self.failed
+        {
             return;
         }
         let Some(source) = self.source.as_ref() else {
@@ -335,19 +437,11 @@ impl HtmlView {
         match WebView::build(builder, window, cx) {
             Ok(view) => {
                 let bounds = self.bounds;
-                let rect = wry::Rect {
-                    position: wry::dpi::LogicalPosition::new(
-                        f64::from(bounds.origin.x),
-                        f64::from(bounds.origin.y),
-                    )
-                    .into(),
-                    size: wry::dpi::LogicalSize::new(
-                        f64::from(bounds.size.width.max(px(1.))),
-                        f64::from(self.height),
-                    )
-                    .into(),
-                };
-                if view.set_bounds(rect).is_err() || view.set_visible(true).is_err() {
+                let document = Bounds::new(
+                    bounds.origin,
+                    size(bounds.size.width.max(px(1.)), self.height),
+                );
+                if view.set_visible(true).is_err() || view.set_geometry(document, clip).is_err() {
                     self.failed = true;
                     self.changed(window, cx);
                     return;
@@ -355,6 +449,7 @@ impl HtmlView {
                 self.webview = Some(cx.new(|_| view));
                 self.palette = palette;
                 self.messages = Some(cx.spawn_in(window, async move |view, cx| {
+                    let mut last_wheel_y = 0.;
                     while receiver.changed().await.is_ok() {
                         let raw = receiver.borrow_and_update().clone();
                         let Some(raw) = raw else {
@@ -368,6 +463,32 @@ impl HtmlView {
                                 if let Some(height) =
                                     layout(&raw, instance, f64::from(view.bounds.size.width))
                                 {
+                                    if let Ok(message) = serde_json::from_str::<Layout>(&raw) {
+                                        let delta = message.wheel_y - last_wheel_y;
+                                        last_wheel_y = message.wheel_y;
+                                        if delta != 0. {
+                                            let owner = view.owner.clone();
+                                            let _ = owner.update(cx, |owner, cx| {
+                                                if !owner.thread_timeline_view_state.visible {
+                                                    return;
+                                                }
+                                                let scroll = owner
+                                                    .thread_timeline_view_state
+                                                    .scroll_handle
+                                                    .clone();
+                                                let mut offset = scroll.offset();
+                                                let delta = px(delta.clamp(-10000., 10000.) as f32);
+                                                owner.on_timeline_scroll_delta(-delta, cx);
+                                                offset.y = (offset.y - delta)
+                                                    .clamp(-scroll.max_offset().y, px(0.));
+                                                scroll.set_offset(offset);
+                                                DesktopTimelineController::schedule(
+                                                    owner, window, cx,
+                                                );
+                                                cx.notify();
+                                            });
+                                        }
+                                    }
                                     if view.height != px(height) {
                                         view.height = px(height);
                                         view.changed(window, cx);
@@ -398,13 +519,48 @@ impl HtmlView {
     ) {
         let width_changed = self.bounds.size.width != bounds.size.width;
         self.bounds = bounds;
+        // The old screen and its painted rows can survive through frame clones.
+        // A stale geometry callback must never mount a page in another route.
+        let position = self.owner.upgrade().and_then(|owner| {
+            let owner = owner.read(cx);
+            if !owner.thread_timeline_view_state.visible
+                || !owner
+                    .row_registry
+                    .get(&self.key.id)
+                    .and_then(|slot| slot.view.as_ref())
+                    .is_some_and(|row| row.read(cx).owns_html(cx.entity_id()))
+            {
+                return None;
+            }
+            let scroll = &owner.thread_timeline_view_state.scroll_handle;
+            let viewport = scroll.bounds();
+            let index = owner.layout_store.index.borrow();
+            let top = index.origin(index.rank(&self.key.id)?)?;
+            Some((
+                viewport,
+                viewport.origin + point(px(0.), top + scroll.offset().y),
+            ))
+        });
+        let Some((viewport, row_origin)) = position else {
+            let had_instance = self.webview.is_some() || self.download.is_some();
+            self.close(cx);
+            if had_instance {
+                cx.notify();
+            }
+            return;
+        };
+        self.row_offset = Some(bounds.origin - row_origin);
+        if !self.retain_nearby(bounds, viewport, cx) {
+            return;
+        }
         if self.visible
+            && self.publication.artifact.status == ArtifactStatus::Ready
             && self.permitted
             && !self.failed
             && self.webview.is_none()
             && (self.source.is_some() || (self.can_load && self.download.is_none()))
         {
-            self.build(window, cx);
+            self.build(viewport, window, cx);
             if self.failed {
                 self.changed(window, cx);
             }
@@ -474,22 +630,262 @@ impl Render for HtmlView {
             .absolute()
             .size_full(),
         );
-        v_flex()
-            .w_full()
-            .gap_2()
-            .child(
-                div()
-                    .text_sm()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(self.publication.title.clone()),
-            )
-            .child(content)
+        content
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::layout;
+    #[::core::prelude::v1::test]
+    fn real_html_operation_id_reaches_shared_download_and_keeps_exact_target() {
+        use pioneer_client::artifacts::operations::ArtifactDownloadTarget;
+        use pioneer_client::core::ClientCore;
+        use std::sync::Arc;
+        let client = Arc::new(ClientCore::new());
+        let target = ArtifactDownloadTarget {
+            thread_id: Some("response-thread".into()),
+            workspace_id: "workspace".into(),
+            artifact_id: "document".into(),
+            version_id: Some("immutable-version".into()),
+        };
+        let identity = super::ArtifactActionIdentity {
+            thread_id: "response-thread".into(),
+            artifact_id: "document".into(),
+            version_id: Some("immutable-version".into()),
+            generation: 42,
+        };
+        let operation_id = super::html_download_operation_id(&identity);
+        let operation = client
+            .begin_artifact_download(operation_id.clone(), target.clone())
+            .expect("HTML caller's ID must pass the actual shared boundary");
+        assert_eq!(
+            client
+                .artifact_download_snapshot(&operation_id)
+                .unwrap()
+                .target,
+            target
+        );
+        assert_eq!(
+            client
+                .artifact_download_snapshot(&operation_id)
+                .unwrap()
+                .target
+                .version_id,
+            identity.version_id
+        );
+        drop(operation);
+    }
+
+    #[gpui_kit::test]
+    fn hiding_thread_retires_html_retained_only_by_the_previous_painted_frame(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use crate::{
+            test_support::{ThreadPorts, binding_router, install_thread_timeline},
+            thread::{ThreadView, ThreadViewConfig},
+        };
+        use gpui_kit::{component::Root, prelude::*, *};
+        use pioneer_client::{core::ClientCore, timeline::semantic::TopLevelPageMergeMode};
+        use std::sync::Arc;
+        cx.update(gpui_kit::init);
+        let client = Arc::new(ClientCore::new());
+        install_thread_timeline(&client, "html-owner", "initial");
+        client.apply_thread_timeline_page(serde_json::from_value(serde_json::json!({
+            "workspaceId":"workspace", "threadId":"html-owner", "projectionVersion":1,
+            "blocks":[{"workspaceId":"workspace","threadId":"html-owner","blockId":"answer","turnId":"turn","sortKey":"1","kind":{
+                "kind":"assistant_message","itemId":"answer","text":"Final response","htmlPublications":[{
+                    "workspaceId":"workspace","threadId":"html-owner","turnId":"turn","callId":"html-call","title":"Document",
+                    "artifact":{"artifact_id":"document","version_id":"version","display_name":"Document","kind":"file","mime_type":"text/html","size_bytes":10,"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","status":"ready"}
+                },{
+                    "workspaceId":"workspace","threadId":"html-owner","turnId":"turn","callId":"html-call-b","title":"Document B",
+                    "artifact":{"artifact_id":"document-b","version_id":"version-b","display_name":"Document B","kind":"file","mime_type":"text/html","size_bytes":10,"sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","status":"ready"}
+                }]
+            }}], "page":{"hasMoreBefore":false,"hasMoreAfter":false}
+        })).unwrap(), TopLevelPageMergeMode::Reset);
+        let (registrar, deliver) = binding_router(client.clone());
+        let (root, cx) = cx.add_window_view(|window, cx| {
+            let thread = ThreadView::new(
+                ThreadViewConfig::new(
+                    client,
+                    "html-owner".into(),
+                    registrar,
+                    Arc::new(ThreadPorts),
+                    Arc::new(ThreadPorts),
+                    Arc::new(ThreadPorts),
+                ),
+                window,
+                cx,
+            );
+            Root::new(thread, window, cx)
+        });
+        deliver();
+        cx.run_until_parked();
+        for _ in 0..3 {
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            cx.run_until_parked();
+        }
+        let thread = root.read_with(cx, |root, _| {
+            root.view().clone().downcast::<ThreadView>().unwrap()
+        });
+        let timeline = thread.read_with(cx, |thread, _| thread.timeline_for_test());
+        let (row, html) = cx.update(|window, cx| {
+            timeline.update(cx, |timeline, cx| {
+                let prepared = timeline
+                    .thread_timeline_view_state
+                    .prepared
+                    .as_ref()
+                    .unwrap();
+                let slot = prepared.slots[0].clone();
+                let key = prepared.row_inputs[0].0.clone();
+                let row = slot.view.as_ref().unwrap().clone();
+                let presentation =
+                    super::super::row_view::RowPresentation::new(slot, key, None, timeline, cx);
+                let html = presentation.html[0].clone();
+                let sibling = presentation.html[1].clone();
+                row.update(cx, |row, cx| row.set_html_visible(true, cx));
+                // No native browser is constructed: this fixture has no artifact capability.
+                assert!(html.read(cx).visible);
+                assert!(html.read(cx).webview.is_none());
+                let viewport = Bounds::new(point(px(100.), px(0.)), size(px(768.), px(700.)));
+                let row_origin = point(px(100.), px(-7000.));
+                // Two documents belong to the same still-visible response. At B,
+                // A is several viewports away; lifecycle Tasks model owned work
+                // without constructing a native browser in this isolated fixture.
+                for (view, offset, height, instance) in [
+                    (&html, px(0.), px(4000.), 77),
+                    (&sibling, px(4000.), px(5000.), 88),
+                ] {
+                    view.update(cx, |view, cx| {
+                        view.source = Some("<p>verified source</p>".into());
+                        view.height = height;
+                        view.row_offset = Some(point(px(0.), offset));
+                        view.bounds =
+                            Bounds::new(row_origin + point(px(0.), offset), size(px(768.), height));
+                        view.instance = instance;
+                        view.messages = Some(
+                            cx.spawn_in(window, async |_, _| std::future::pending::<()>().await),
+                        );
+                        view.download = Some(
+                            cx.spawn_in(window, async |_, _| std::future::pending::<()>().await),
+                        );
+                    });
+                }
+                let identity = html.read(cx).publication.clone();
+                let key = html.read(cx).key.clone();
+                html.update(cx, |html, cx| {
+                    assert!(!html.retain_nearby(html.bounds, viewport, cx));
+                    html.permitted = true;
+                    // Offscreen row preparation must not resurrect this far sibling.
+                    html.prepare_nearby(px(768.), row_origin, viewport, true, window, cx);
+                    assert_eq!(html.instance, 0);
+                    assert!(
+                        html.messages.is_none()
+                            && html.download.is_none()
+                            && html.webview.is_none()
+                    );
+                    assert_eq!(html.height, px(4000.));
+                    assert_eq!(html.source.as_deref(), Some("<p>verified source</p>"));
+                    assert_eq!(html.publication, identity);
+                    assert_eq!(html.key, key);
+                    assert!(
+                        layout(
+                            r#"{"instance":77,"width":768,"height":1}"#,
+                            html.instance,
+                            768.
+                        )
+                        .is_none()
+                    );
+                });
+                sibling.update(cx, |sibling, cx| {
+                    assert!(sibling.retain_nearby(sibling.bounds, viewport, cx));
+                    assert_eq!(sibling.instance, 88);
+                    assert!(sibling.messages.is_some() && sibling.download.is_some());
+                    assert_eq!(sibling.height, px(5000.));
+                });
+                assert!(html.read(cx).visible && sibling.read(cx).visible);
+                assert!(row.read(cx).owns_html(sibling.entity_id()));
+                // Exercise geometry on the retained owner, not a copied Bounds.
+                let sibling_identity = sibling.read(cx).publication.clone();
+                let sibling_key = sibling.read(cx).key.clone();
+                sibling.update(cx, |sibling, cx| {
+                    for (top, height) in [
+                        (540., 260.),         // 160px visible, 100px below the viewport.
+                        (700., 260.),         // Below the viewport, still in the preparation zone.
+                        (-260., 260.),        // Above the viewport, also still prepared.
+                        (-50_000., 100_000.), // Only 700px of the full document visible.
+                        (-99_999., 100_000.), // Only its last pixel visible.
+                    ] {
+                        sibling.height = px(height);
+                        sibling.bounds =
+                            Bounds::new(point(px(100.), px(top)), size(px(768.), sibling.height));
+                        assert!(sibling.retain_nearby(sibling.bounds, viewport, cx));
+                        assert_eq!(sibling.instance, 88);
+                        assert!(sibling.messages.is_some() && sibling.download.is_some());
+                        assert_eq!(sibling.height, px(height));
+                        assert_eq!(sibling.bounds.size.height, px(height));
+                        assert_eq!(sibling.source.as_deref(), Some("<p>verified source</p>"));
+                    }
+                    // The entire document is now above the preparation zone (-700px).
+                    sibling.bounds.origin.y = px(-100_701.);
+                    assert!(!sibling.retain_nearby(sibling.bounds, viewport, cx));
+                    assert_eq!(sibling.instance, 0);
+                    assert!(sibling.messages.is_none() && sibling.download.is_none());
+                    assert!(sibling.webview.is_none());
+                    assert_eq!(sibling.height, px(100_000.));
+                    assert_eq!(sibling.source.as_deref(), Some("<p>verified source</p>"));
+                    assert_eq!(sibling.publication, sibling_identity);
+                    assert_eq!(sibling.key, sibling_key);
+                    assert!(
+                        layout(
+                            r#"{"instance":88,"width":768,"height":1}"#,
+                            sibling.instance,
+                            768.
+                        )
+                        .is_none()
+                    );
+                });
+                // Returning A's full bounds to the zone re-admits it, without
+                // losing verified source or changing the canonical response.
+                html.update(cx, |html, cx| {
+                    assert!(html.retain_nearby(
+                        Bounds::new(viewport.origin, size(px(768.), html.height)),
+                        viewport,
+                        cx
+                    ));
+                    assert_eq!(html.height, px(4000.));
+                    assert_eq!(html.publication, identity);
+                });
+                // A refreshed registry can omit an owner still held by the painted snapshot.
+                timeline.row_registry = Default::default();
+                (row, html)
+            })
+        });
+        cx.update(|window, cx| {
+            thread.update(cx, |thread, cx| thread.set_visible(false, window, cx));
+            assert!(!html.read(cx).visible);
+            assert!(
+                timeline
+                    .read(cx)
+                    .thread_timeline_view_state
+                    .prepared
+                    .is_none()
+            );
+            // Late prepaint work from the retained row cannot resurrect a retired page.
+            html.update(cx, |html, cx| {
+                html.update_bounds(
+                    Bounds::new(point(px(100.), px(80.)), size(px(768.), px(260.))),
+                    window,
+                    cx,
+                )
+            });
+            assert_eq!(html.read(cx).instance, 0);
+            assert!(html.read(cx).webview.is_none());
+            assert!(html.read(cx).download.is_none());
+            assert!(row.read(cx).owns_html(html.entity_id()));
+        });
+    }
+
     #[::core::prelude::v1::test]
     fn natural_height_and_instance_width_fencing() {
         assert_eq!(

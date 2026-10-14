@@ -210,13 +210,6 @@ impl RowPresentation {
         terminal: Option<Entity<terminal::TerminalView>>,
         cx: &mut App,
     ) -> AnyElement {
-        if content.html_publication.is_some() {
-            return self
-                .html
-                .as_ref()
-                .map(|html| html.clone().into_any_element())
-                .unwrap_or_else(|| div().child(t!("timeline.html.loading")).into_any_element());
-        }
         match item {
             TurnItem::UserMessage { .. } => self.render_item_user_message(
                 entry,

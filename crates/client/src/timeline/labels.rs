@@ -1665,6 +1665,7 @@ mod tests {
 
     fn item_view_with_origin(timeline_origin: Option<TimelineOrigin>) -> ItemView {
         ItemView {
+            html_publications: Vec::new(),
             id: "item_1".to_owned(),
             turn_id: "turn_1".to_owned(),
             item_type: "agentMessage".to_owned(),
@@ -2296,6 +2297,7 @@ mod tests {
                 resume: None,
             }],
             items: vec![ItemView {
+                html_publications: Vec::new(),
                 id: "agent_1".to_owned(),
                 turn_id: "turn_1".to_owned(),
                 item_type: "agent_message".to_owned(),

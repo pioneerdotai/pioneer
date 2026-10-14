@@ -63,6 +63,11 @@ impl RowPresentation {
                     cx,
                 )
             };
+            let body_element = v_flex()
+                .w_full()
+                .children(self.html_body())
+                .child(body_element)
+                .into_any_element();
             let open = expanded;
             let entry_id = entry.id.clone();
 
@@ -181,9 +186,10 @@ impl RowPresentation {
                     menu
                 })
                 .child(
-                    div()
+                    v_flex()
                         .w_full()
                         .overflow_hidden()
+                        .children(self.html_body())
                         .child(if let Some(document) = markdown {
                             self.render_markdown_document(
                                 item_view.id.as_str(),

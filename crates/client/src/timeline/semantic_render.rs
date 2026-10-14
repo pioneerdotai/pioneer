@@ -79,80 +79,6 @@ pub fn render_semantic_timeline_rows(
         }
     }
 
-    // Publications are independent of collapsed work ranges. Insert after all work
-    // rows of their owning turn and before its final assistant text. The artifact
-    // identity survives completion loss, retries, reconnect and history replay.
-    let mut seen = std::collections::HashSet::new();
-    for semantic in semantic_rows {
-        let SemanticTimelineRowKind::WorkHeader { work, .. } = &semantic.kind else {
-            continue;
-        };
-        let mut next_position = None;
-        for publication in &work.html_publications {
-            if !seen.insert(publication.artifact.artifact_id.clone()) {
-                continue;
-            }
-            let mut added = Vec::new();
-            let id = format!("html-publication::{}", publication.artifact.artifact_id);
-            push_item_row(
-                &mut projection,
-                &mut added,
-                ItemRowInput {
-                    entry_id: id.clone(),
-                    item_id: id.clone(),
-                    turn_id: publication.turn_id.clone(),
-                    item_type: "agent_message".into(),
-                    status: TimelineEntryStatus::Completed,
-                    started_at_unix_ms: None,
-                    updated_at_unix_ms: None,
-                    completed_at_unix_ms: None,
-                    partial_text: String::new(),
-                    final_text: Some(publication.title.clone()),
-                    partial_markdown: None,
-                    final_markdown: None,
-                    item: TurnItem::AgentMessage {
-                        id: id.clone(),
-                        text: publication.title.clone(),
-                        phase: AgentMessagePhase::Commentary,
-                        markdown: None,
-                        markdown_version: None,
-                    },
-                    author: semantic.author.clone(),
-                    route: None,
-                    opaque_meta: Some(serde_json::json!({"htmlPublication":publication})),
-                },
-            );
-            let position = rows
-                .iter()
-                .position(|row| match &row.kind {
-                    TimelineRowKind::Item { timeline_index } => projection
-                        .timeline
-                        .get(*timeline_index)
-                        .and_then(|entry| projection.item_for_timeline_entry(entry))
-                        .is_some_and(|item| {
-                            item.turn_id == publication.turn_id
-                                && matches!(
-                                    item.item,
-                                    TurnItem::AgentMessage {
-                                        phase: AgentMessagePhase::FinalAnswer,
-                                        ..
-                                    }
-                                )
-                        }),
-                    _ => false,
-                })
-                .unwrap_or_else(|| {
-                    rows.iter()
-                        .rposition(|row| semantic_row_ids.get(&row.key) == Some(&semantic.id))
-                        .map_or(rows.len(), |index| index + 1)
-                });
-            let position = next_position.unwrap_or(position);
-            next_position = Some(position + added.len());
-            rows.splice(position..position, added);
-            semantic_row_ids.insert(id, semantic.id.clone());
-        }
-    }
-
     for row in &mut rows {
         let TimelineRowKind::RunningTurn(display) = &mut row.kind else {
             continue;
@@ -238,6 +164,7 @@ fn push_user_block(
         projection,
         rows,
         ItemRowInput {
+            html_publications: Vec::new(),
             entry_id: block.block_id.clone(),
             item_id: item_id.to_owned(),
             turn_id: turn_id.to_owned(),
@@ -298,6 +225,7 @@ fn push_assistant_block(
     author: Option<pioneer_protocol::TurnAuthorSnapshot>,
 ) {
     let TimelineBlockKind::AssistantMessage {
+        html_publications,
         item_id,
         text,
         status,
@@ -320,6 +248,7 @@ fn push_assistant_block(
         projection,
         rows,
         ItemRowInput {
+            html_publications: html_publications.clone(),
             entry_id: block.block_id.clone(),
             item_id: item_id.clone(),
             turn_id: turn_id.to_owned(),
@@ -381,6 +310,7 @@ fn push_work_item(
         projection,
         rows,
         ItemRowInput {
+            html_publications: Vec::new(),
             entry_id: item.work_item_id.clone(),
             item_id: item.item_id.clone(),
             turn_id: item.turn_id.clone(),
@@ -419,6 +349,7 @@ fn push_detached_task_run(
         projection,
         rows,
         ItemRowInput {
+            html_publications: Vec::new(),
             entry_id: block.block_id.clone(),
             item_id: task.id.clone(),
             turn_id: turn_id.to_owned(),
@@ -508,6 +439,7 @@ fn push_turn_state(
         projection,
         rows,
         ItemRowInput {
+            html_publications: Vec::new(),
             entry_id: block.block_id.clone(),
             item_id,
             turn_id: turn_id.to_owned(),
@@ -565,6 +497,7 @@ fn running_turn_display_for_projection(
 }
 
 struct ItemRowInput {
+    html_publications: Vec<pioneer_protocol::HtmlPublication>,
     entry_id: String,
     item_id: String,
     turn_id: String,
@@ -591,6 +524,7 @@ fn push_item_row(
     let item_index = projection.items.len();
     let timeline_index = projection.timeline.len();
     projection.items.push(ItemView {
+        html_publications: input.html_publications,
         id: input.item_id.clone(),
         turn_id: input.turn_id.clone(),
         item_type: input.item_type,
@@ -781,50 +715,38 @@ mod tests {
                 preview: None,
             },
         };
-        let mut work = work_payload(TurnWorkPresentation::CollapsedAfterFinal, 1);
-        work.html_publications = vec![
-            publication("first"),
-            publication("second"),
-            publication("first"),
-        ];
-        let header = semantic_row(SemanticTimelineRowKind::WorkHeader {
-            block: work_block(TurnWorkPresentation::CollapsedAfterFinal, 1),
-            work,
-            expanded: false,
-            loaded_range: None,
-        });
-        for final_reply in [false, true] {
-            let mut rows = vec![header.clone()];
-            if final_reply {
-                rows.push(semantic_row(SemanticTimelineRowKind::AssistantMessage {
-                    block: assistant_block(None),
-                }));
+        let mut answer = assistant_block(None);
+        if let TimelineBlockKind::AssistantMessage {
+            html_publications, ..
+        } = &mut answer.kind
+        {
+            *html_publications = vec![publication("first"), publication("second")];
+        }
+        let semantic = semantic_row(SemanticTimelineRowKind::AssistantMessage { block: answer });
+        let model =
+            render_semantic_timeline_rows(&[semantic.clone()], ConversationViewState::default());
+        let replay = render_semantic_timeline_rows(&[semantic], ConversationViewState::default());
+        assert_eq!(model.rows.len(), 1);
+        assert_eq!(model.projection.items.len(), 1);
+        let item = &model.projection.items[0];
+        assert!(matches!(
+            item.item,
+            TurnItem::AgentMessage {
+                phase: AgentMessagePhase::FinalAnswer,
+                ..
             }
-            let model = render_semantic_timeline_rows(&rows, ConversationViewState::default());
-            let keys = model
+        ));
+        assert_eq!(
+            item.html_publications,
+            vec![publication("first"), publication("second")]
+        );
+        assert_eq!(model.projection, replay.projection);
+        assert!(
+            model
                 .rows
                 .iter()
-                .map(|row| row.key.as_str())
-                .collect::<Vec<_>>();
-            let first = keys
-                .iter()
-                .position(|k| *k == "html-publication::first")
-                .unwrap();
-            let second = keys
-                .iter()
-                .position(|k| *k == "html-publication::second")
-                .unwrap();
-            assert!(first < second);
-            assert_eq!(
-                keys.iter()
-                    .filter(|k| **k == "html-publication::first")
-                    .count(),
-                1
-            );
-            if final_reply {
-                assert!(second < keys.len() - 1);
-            }
-        }
+                .all(|row| !row.key.starts_with("html-publication::"))
+        );
     }
 
     #[test]
@@ -1243,6 +1165,7 @@ mod tests {
             started_at_unix_ms: Some(3),
             updated_at_unix_ms: Some(3),
             kind: TimelineBlockKind::AssistantMessage {
+                html_publications: Vec::new(),
                 item_id: "assistant_final".to_owned(),
                 text: "final **markdown**".to_owned(),
                 status: TurnWorkItemStatus::Completed,

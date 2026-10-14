@@ -1116,7 +1116,7 @@ dependencies = [
  "hmac 0.13.0",
  "http",
  "percent-encoding",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "time",
  "tracing",
 ]
@@ -3064,9 +3064,9 @@ dependencies = [
 
 [[package]]
 name = "deranged"
-version = "0.5.8"
+version = "0.5.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7cd812cc2bc1d69d4764bd80df88b4317eaef9e773c75226407d9bc0876b211c"
+checksum = "9e9de72ce2ad1f90dc62fa25f0f430ef85eb4b0d8fa0be4f30373bc40a21d28e"
 dependencies = [
  "serde_core",
 ]
@@ -4966,8 +4966,8 @@ dependencies = [
 
 [[package]]
 name = "gpui-base"
-version = "0.7.1"
-source = "git+https://github.com/longbridge/gpui-kit#369f7a8f5a6602da980f008cf726467588ad517f"
+version = "0.7.3"
+source = "git+https://github.com/pioneerdotai/gpui-kit?branch=fix%2Fwebview-clipping#ca192cebf44c1d1af18a2ae9c6ccb3364108840b"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -4993,7 +4993,7 @@ dependencies = [
  "raw-window-handle",
  "regex",
  "ropey 2.0.0-beta.1",
- "schemars 1.2.2",
+ "schemars 1.2.3",
  "serde",
  "serde_json",
  "smallvec",
@@ -5007,8 +5007,8 @@ dependencies = [
 
 [[package]]
 name = "gpui-component"
-version = "0.7.1"
-source = "git+https://github.com/longbridge/gpui-kit#369f7a8f5a6602da980f008cf726467588ad517f"
+version = "0.7.3"
+source = "git+https://github.com/pioneerdotai/gpui-kit?branch=fix%2Fwebview-clipping#ca192cebf44c1d1af18a2ae9c6ccb3364108840b"
 dependencies = [
  "anyhow",
  "chrono",
@@ -5038,7 +5038,7 @@ dependencies = [
  "resvg 0.45.1",
  "ropey 2.0.0-beta.1",
  "rust-i18n",
- "schemars 1.2.2",
+ "schemars 1.2.3",
  "serde",
  "serde_json",
  "serde_repr",
@@ -5054,8 +5054,8 @@ dependencies = [
 
 [[package]]
 name = "gpui-component-macros"
-version = "0.7.1"
-source = "git+https://github.com/longbridge/gpui-kit#369f7a8f5a6602da980f008cf726467588ad517f"
+version = "0.7.3"
+source = "git+https://github.com/pioneerdotai/gpui-kit?branch=fix%2Fwebview-clipping#ca192cebf44c1d1af18a2ae9c6ccb3364108840b"
 dependencies = [
  "proc-macro-crate 3.5.0",
  "proc-macro2",
@@ -5066,8 +5066,7 @@ dependencies = [
 [[package]]
 name = "gpui-fast"
 version = "0.1.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "35cb4c01c92462871c34d560b4ef21b7287a355036afa1a1cafede9c13ce55a0"
+source = "git+https://github.com/pioneerdotai/gpui-fast?branch=cargo%2Fcomposition-input#912dc54fe650b0bd7aae9ae24b00f6e162ced552"
 dependencies = [
  "accesskit",
  "anyhow",
@@ -5112,7 +5111,7 @@ dependencies = [
  "raw-window-handle",
  "regex",
  "resvg 0.46.0",
- "schemars 1.2.2",
+ "schemars 1.2.3",
  "seahash",
  "serde",
  "serde_json",
@@ -5177,8 +5176,7 @@ dependencies = [
 [[package]]
 name = "gpui-fast-linux"
 version = "0.1.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "43717a4d762a5d576ec70666d6908457711c70414472d875d2177ea632de577f"
+source = "git+https://github.com/pioneerdotai/gpui-fast?branch=cargo%2Fcomposition-input#912dc54fe650b0bd7aae9ae24b00f6e162ced552"
 dependencies = [
  "accesskit",
  "accesskit_unix",
@@ -5222,8 +5220,7 @@ dependencies = [
 [[package]]
 name = "gpui-fast-macos"
 version = "0.1.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6ade501d3f4f6d5e0fa546bf60d441fcf0965379a2cb93e1db953e3ce023db63"
+source = "git+https://github.com/pioneerdotai/gpui-fast?branch=cargo%2Fcomposition-input#912dc54fe650b0bd7aae9ae24b00f6e162ced552"
 dependencies = [
  "accesskit",
  "accesskit_macos",
@@ -5377,8 +5374,8 @@ dependencies = [
 
 [[package]]
 name = "gpui-kit"
-version = "0.7.1"
-source = "git+https://github.com/longbridge/gpui-kit#369f7a8f5a6602da980f008cf726467588ad517f"
+version = "0.7.3"
+source = "git+https://github.com/pioneerdotai/gpui-kit?branch=fix%2Fwebview-clipping#ca192cebf44c1d1af18a2ae9c6ccb3364108840b"
 dependencies = [
  "gpui-base",
  "gpui-component",
@@ -5394,8 +5391,8 @@ dependencies = [
 
 [[package]]
 name = "gpui-kit-assets"
-version = "0.7.1"
-source = "git+https://github.com/longbridge/gpui-kit#369f7a8f5a6602da980f008cf726467588ad517f"
+version = "0.7.3"
+source = "git+https://github.com/pioneerdotai/gpui-kit?branch=fix%2Fwebview-clipping#ca192cebf44c1d1af18a2ae9c6ccb3364108840b"
 dependencies = [
  "anyhow",
  "gpui-fast",
@@ -5456,7 +5453,7 @@ dependencies = [
  "raw-window-handle",
  "regex",
  "resvg 0.46.0",
- "schemars 1.2.2",
+ "schemars 1.2.3",
  "seahash",
  "serde",
  "serde_json",
@@ -5755,7 +5752,7 @@ version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "71f488bf4780735f6b2dad24f8db1e3d9e2593de0ec298e3574c788f571b81c4"
 dependencies = [
- "schemars 1.2.2",
+ "schemars 1.2.3",
  "serde",
  "smol_str",
 ]
@@ -5889,8 +5886,8 @@ checksum = "4b0d73e1bc02eef886a5947f41b8512708792e9e5d3053d181843311a487f96f"
 
 [[package]]
 name = "gpui-webview"
-version = "0.7.1"
-source = "git+https://github.com/longbridge/gpui-kit#369f7a8f5a6602da980f008cf726467588ad517f"
+version = "0.7.3"
+source = "git+https://github.com/pioneerdotai/gpui-kit?branch=fix%2Fwebview-clipping#ca192cebf44c1d1af18a2ae9c6ccb3364108840b"
 dependencies = [
  "anyhow",
  "gpui-kit",
@@ -7231,9 +7228,9 @@ dependencies = [
 
 [[package]]
 name = "keyring-core"
-version = "1.0.0"
+version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fb1e621458ca9c51aa110bd0339d4751a056b9576bf1253aee1aa560dda0fc9d"
+checksum = "29fbf4b551298c67925f38cf341a1ada797a75f1837bdf8ae1fc8e2ebc6efb59"
 dependencies = [
  "log",
 ]
@@ -7747,7 +7744,7 @@ dependencies = [
  "nom 8.0.0",
  "rand 0.10.3",
  "rangemap",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "stringprep",
  "thiserror 2.0.21",
  "weezl 0.2.1",
@@ -8545,7 +8542,7 @@ dependencies = [
  "regress",
  "serde",
  "serde_json",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "sigstore-trust-root",
  "sigstore-verify",
  "syn 2.0.119",
@@ -10199,7 +10196,7 @@ dependencies = [
  "sentry",
  "serde",
  "serde_json",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "tempfile",
  "tokio",
  "tokio-util",
@@ -10216,7 +10213,7 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "tempfile",
  "windows-sys 0.61.2",
  "zip 8.6.0",
@@ -10238,11 +10235,11 @@ dependencies = [
  "pioneer-provider",
  "pioneer-sqlite",
  "pioneer-tools",
- "schemars 1.2.2",
+ "schemars 1.2.3",
  "sea-orm",
  "serde",
  "serde_json",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "tempfile",
  "tokio",
  "tokio-util",
@@ -10265,7 +10262,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "tempfile",
  "tokio",
  "tracing",
@@ -10287,7 +10284,7 @@ dependencies = [
  "process-wrap",
  "serde",
  "serde_json",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "tempfile",
  "tokio",
  "toml 1.1.8+spec-1.1.0",
@@ -10326,10 +10323,10 @@ dependencies = [
  "pioneer-skills",
  "qrcode",
  "reqwest",
- "schemars 1.2.2",
+ "schemars 1.2.3",
  "serde",
  "serde_json",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "shell-words",
  "tar",
  "tempfile",
@@ -10352,7 +10349,7 @@ dependencies = [
  "pioneer-observability",
  "pioneer-protocol",
  "rustls",
- "schemars 1.2.2",
+ "schemars 1.2.3",
  "serde",
  "serde_json",
  "tokio",
@@ -10370,7 +10367,7 @@ dependencies = [
  "hex",
  "serde",
  "serde_json",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "tiktoken-rs",
 ]
 
@@ -10402,7 +10399,7 @@ dependencies = [
  "sea-orm",
  "serde",
  "serde_json",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "tempfile",
  "tokio",
  "tokio-util",
@@ -10584,7 +10581,7 @@ dependencies = [
  "rust-i18n",
  "serde",
  "serde_json",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "syntect",
  "terminal",
  "tokio",
@@ -10606,7 +10603,7 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "tempfile",
  "url",
 ]
@@ -10686,12 +10683,12 @@ dependencies = [
  "rand 0.10.3",
  "reqwest",
  "same-file",
- "schemars 1.2.2",
+ "schemars 1.2.3",
  "sea-orm",
  "sentry",
  "serde",
  "serde_json",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "subtle",
  "tar",
  "tempfile",
@@ -10722,7 +10719,7 @@ dependencies = [
  "sentry",
  "serde",
  "serde_json",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -10754,10 +10751,10 @@ dependencies = [
  "process-wrap",
  "reqwest",
  "rmcp",
- "schemars 1.2.2",
+ "schemars 1.2.3",
  "serde",
  "serde_json",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "sse-stream",
  "tokio",
  "tokio-util",
@@ -10780,7 +10777,7 @@ dependencies = [
  "rmcp",
  "serde",
  "serde_json",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "tokio",
  "tokio-util",
  "tracing",
@@ -10806,7 +10803,7 @@ dependencies = [
  "sea-orm",
  "serde",
  "serde_json",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "tempfile",
  "tokio",
  "tracing",
@@ -10821,7 +10818,7 @@ dependencies = [
  "pioneer-entity",
  "sea-orm-migration",
  "serde_json",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "tokio",
  "tracing",
 ]
@@ -10858,7 +10855,7 @@ dependencies = [
  "pretty_assertions",
  "serde",
  "serde_json",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "tokio",
 ]
 
@@ -10869,10 +10866,10 @@ dependencies = [
  "base64 0.23.1",
  "hex",
  "nanoid",
- "schemars 1.2.2",
+ "schemars 1.2.3",
  "serde",
  "serde_json",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "url",
  "zeroize",
 ]
@@ -10900,7 +10897,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "symphonia",
  "tempfile",
  "tiktoken-rs",
@@ -10934,7 +10931,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "tempfile",
  "toml 1.1.8+spec-1.1.0",
  "tracing",
@@ -10985,7 +10982,7 @@ dependencies = [
  "sea-orm",
  "serde",
  "serde_json",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "tempfile",
  "tokio",
  "tracing",
@@ -11021,7 +11018,7 @@ dependencies = [
  "sea-orm",
  "serde",
  "serde_json",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "tempfile",
  "tokio",
  "tokio-util",
@@ -11046,7 +11043,7 @@ dependencies = [
  "sentry",
  "serde",
  "serde_json",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "tempfile",
  "tokio",
  "toml 1.1.8+spec-1.1.0",
@@ -12430,7 +12427,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0d84e8ba78bd384263e5922f084cbe1b081c3b7e69add59c8fb097b879ba968a"
 dependencies = [
  "globset",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "walkdir",
 ]
 
@@ -12624,9 +12621,9 @@ dependencies = [
 
 [[package]]
 name = "rustls-native-certs"
-version = "0.8.4"
+version = "0.8.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dab5152771c58876a2146916e53e35057e1a4dfa2b9df0f0305b07f611fdea4d"
+checksum = "4a073f5dc7469f984c52ad2752b63b0807745133b6de880b7b64c1ac4c48aec4"
 dependencies = [
  "openssl-probe",
  "rustls-pki-types",
@@ -12781,14 +12778,14 @@ dependencies = [
 
 [[package]]
 name = "schemars"
-version = "1.2.2"
+version = "1.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "687274d293b6cdc6e73e0fee520bf2049650090d7164f87672d212a3c530cf4a"
+checksum = "ab508826f74a77ca9d5aba6ff19b522583ee3eaf28a19384ff3d0e5835fadf6e"
 dependencies = [
  "dyn-clone",
  "indexmap 2.14.2",
  "ref-cast",
- "schemars_derive 1.2.2",
+ "schemars_derive 1.2.3",
  "serde",
  "serde_json",
 ]
@@ -12807,9 +12804,9 @@ dependencies = [
 
 [[package]]
 name = "schemars_derive"
-version = "1.2.2"
+version = "1.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d98c67716b46af2f0b8cf752abc930f6f9aecfbf671ecfb531db8a31dbe4e2ba"
+checksum = "e1c3a92094fa7d61aa124645844facb6b554dfc797136d0f5fd1f890e2bffc69"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -13547,9 +13544,9 @@ dependencies = [
 
 [[package]]
 name = "sha2"
-version = "0.11.0"
+version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "446ba717509524cb3f22f17ecc096f10f4822d76ab5c0b9822c5f9c284e825f4"
+checksum = "47d7069beb7d6ac7b9acd1039986e73443f24234f41074da099d6f994ac9ad19"
 dependencies = [
  "cfg-if",
  "cpufeatures 0.3.1",
@@ -14245,7 +14242,7 @@ dependencies = [
  "rust_decimal",
  "serde",
  "sha1 0.11.0",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "sqlx-core",
  "thiserror 2.0.21",
  "time",
@@ -14281,7 +14278,7 @@ dependencies = [
  "rust_decimal",
  "serde",
  "serde_json",
- "sha2 0.11.0",
+ "sha2 0.11.1",
  "smallvec",
  "sqlx-core",
  "stringprep",

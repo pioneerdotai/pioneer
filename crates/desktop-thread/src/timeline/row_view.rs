@@ -55,10 +55,11 @@ pub(crate) struct RowPresentation {
     projection: pioneer_client::conversation::ConversationViewState,
     content: super::TimelineItemPresentations,
     terminal: Option<super::terminal_registry::TerminalPresentation>,
-    pub(super) html: Option<Entity<super::html::HtmlView>>,
+    pub(super) html: Vec<Entity<super::html::HtmlView>>,
     html_client: Arc<pioneer_client::core::ClientCore>,
     html_runtime: PathBuf,
     html_permitted: bool,
+    html_artifacts: Vec<pioneer_client::artifacts::ArtifactRef>,
     html_auth_generation: u64,
     pub(super) body_only: bool,
     body: Option<(Entity<WorkItemBodyView>, Pixels)>,
@@ -66,6 +67,17 @@ pub(crate) struct RowPresentation {
     group_author: Option<TurnAuthorSnapshot>,
 }
 impl RowPresentation {
+    fn html_permitted_for(&self, publication: &pioneer_client::artifacts::HtmlPublication) -> bool {
+        self.html_permitted
+            && self
+                .html_artifacts
+                .iter()
+                .find(|artifact| artifact.artifact_id == publication.artifact.artifact_id)
+                .is_none_or(|artifact| {
+                    artifact.status == pioneer_client::artifacts::ArtifactStatus::Ready
+                        && artifact.version_id == publication.artifact.version_id
+                })
+    }
     pub(super) fn new(
         slot: Arc<TimelineRowSlotView>,
         key: RowMeasurementKey,
@@ -173,33 +185,34 @@ impl RowPresentation {
             projection: slot.projection.clone(),
             content: slot.content.clone(),
             terminal: None,
-            html: slot.view.as_ref().and_then(|row| row.read(cx).presentation.html.clone()).filter(|html| {
-                slot.snapshot().content().and_then(|c| c.html_publication.as_ref()).is_some_and(|publication| html.read(cx).matches(publication))
-            }),
+            html: slot.view.as_ref().map(|row| row.read(cx).presentation.html.clone()).unwrap_or_default(),
             html_client: screen.client.clone(),
             html_runtime: screen.files.runtime_root().as_path().into(),
-            html_permitted: screen.thread_presentation_capabilities(&screen.thread_id).is_some_and(|capability|capability.can_read_artifacts) && slot.snapshot().content().and_then(|c| c.html_publication.as_ref()).is_none_or(|publication| {
-                publication.artifact.status == pioneer_client::artifacts::ArtifactStatus::Ready
-                    && screen.artifact_input.as_ref().and_then(|input| input.items.iter().find(|summary| summary.artifact.artifact_id == publication.artifact.artifact_id))
-                        .is_none_or(|summary| summary.artifact.status == pioneer_client::artifacts::ArtifactStatus::Ready && summary.artifact.version_id == publication.artifact.version_id)
-            }),
+            html_permitted: screen.thread_presentation_capabilities(&screen.thread_id).is_some_and(|capability| capability.can_read_artifacts),
+            html_artifacts: screen.artifact_input.as_ref().map(|input| input.items.iter().map(|summary| summary.artifact.clone()).collect()).unwrap_or_default(),
             html_auth_generation: screen.client.authorization_connection_generation(),
             body_only: false,
             body: None,
             key,
             group_author,
         };
-        if let Some(html) = &presentation.html {
+        for html in &presentation.html {
             if let Some(publication) = presentation
                 .snapshot
                 .content()
-                .and_then(|c| c.html_publication.clone())
+                .and_then(|content| {
+                    content
+                        .html_publications
+                        .iter()
+                        .find(|publication| html.read(cx).matches(publication))
+                })
+                .cloned()
             {
                 html.update(cx, |html, cx| {
                     html.synchronize(
-                        publication,
+                        publication.clone(),
                         presentation.key.clone(),
-                        presentation.html_permitted,
+                        presentation.html_permitted_for(&publication),
                         presentation.artifact_policy.can_share,
                         cx,
                     )
@@ -232,6 +245,7 @@ impl RowPresentation {
             && self.highlights == other.highlights
             && self.artifact_policy == other.artifact_policy
             && self.html_permitted == other.html_permitted
+            && self.html_artifacts == other.html_artifacts
             && self.html_auth_generation == other.html_auth_generation
     }
     pub(super) fn tool_content(
@@ -330,46 +344,68 @@ impl TimelineRowView {
         owner
     }
     fn prepare_html(&mut self, cx: &mut Context<Self>) {
-        let Some(publication) = self
+        let publications = self
             .presentation
             .snapshot
             .content()
-            .and_then(|c| c.html_publication.clone())
-        else {
-            self.presentation.html = None;
-            return;
-        };
-        let html = self
-            .presentation
-            .html
-            .take()
-            .filter(|html| html.read(cx).matches(&publication));
-        let view = if let Some(view) = html {
+            .map(|content| content.html_publications.clone())
+            .unwrap_or_default();
+        let previous = std::mem::take(&mut self.presentation.html);
+        for publication in publications {
+            let view = if let Some(view) = previous
+                .iter()
+                .find(|view| view.read(cx).matches(&publication))
+                .cloned()
+            {
+                view.update(cx, |view, cx| {
+                    view.synchronize(
+                        publication.clone(),
+                        self.presentation.key.clone(),
+                        self.presentation.html_permitted_for(&publication),
+                        self.presentation.artifact_policy.can_share,
+                        cx,
+                    )
+                });
+                view
+            } else {
+                cx.new(|_| {
+                    super::html::HtmlView::new(
+                        publication.clone(),
+                        self.presentation.thread_id.clone(),
+                        self.presentation.html_client.clone(),
+                        self.presentation.html_runtime.clone(),
+                        self.presentation.actions.owner.clone(),
+                        self.presentation.key.clone(),
+                        self.presentation.html_permitted_for(&publication),
+                        self.presentation.artifact_policy.can_share,
+                    )
+                })
+            };
             view.update(cx, |view, cx| {
-                view.synchronize(
-                    publication,
-                    self.presentation.key.clone(),
-                    self.presentation.html_permitted,
-                    self.presentation.artifact_policy.can_share,
+                view.set_visible(
+                    self.html_visible
+                        && (!self
+                            .presentation
+                            .snapshot
+                            .content()
+                            .is_some_and(|content| content.task_timeline)
+                            || self.presentation.is_expanded()),
                     cx,
                 )
             });
-            view
-        } else {
-            cx.new(|_| {
-                super::html::HtmlView::new(
-                    publication,
-                    self.presentation.html_client.clone(),
-                    self.presentation.html_runtime.clone(),
-                    self.presentation.actions.owner.clone(),
-                    self.presentation.key.clone(),
-                    self.presentation.html_permitted,
-                    self.presentation.artifact_policy.can_share,
-                )
-            })
-        };
-        view.update(cx, |view, cx| view.set_visible(self.html_visible, cx));
-        self.presentation.html = Some(view);
+            self.presentation.html.push(view);
+        }
+        for view in previous {
+            if !self.owns_html(view.entity_id()) {
+                view.update(cx, |view, cx| view.set_visible(false, cx));
+            }
+        }
+    }
+    pub(super) fn owns_html(&self, entity: EntityId) -> bool {
+        self.presentation
+            .html
+            .iter()
+            .any(|view| view.entity_id() == entity)
     }
     fn prepare_body(&mut self, height: Option<Pixels>, cx: &mut Context<Self>) {
         if !self.presentation.supports_body() {
@@ -414,7 +450,7 @@ impl TimelineRowView {
         if self.presentation.same_input(&presentation) {
             return;
         }
-        presentation.html = self.presentation.html.take();
+        presentation.html = std::mem::take(&mut self.presentation.html);
         presentation.body = self.presentation.body.take();
         presentation.terminal = self.presentation.terminal.take();
         if self.presentation.activity_input() == presentation.activity_input() {
@@ -455,6 +491,27 @@ impl Render for TimelineRowView {
 }
 
 impl RowPresentation {
+    pub(super) fn html_body(&self) -> Vec<AnyElement> {
+        if !self.html.is_empty() {
+            return self
+                .html
+                .iter()
+                .cloned()
+                .map(IntoElement::into_any_element)
+                .collect();
+        }
+        self.snapshot
+            .content()
+            .into_iter()
+            .flat_map(|content| &content.html_publications)
+            .map(|_| {
+                div()
+                    .w_full()
+                    .child(t!("timeline.html.loading"))
+                    .into_any_element()
+            })
+            .collect()
+    }
     pub(super) fn is_expanded(&self) -> bool {
         self.key.expanded
     }
@@ -688,10 +745,45 @@ impl TimelineRowView {
             cx.notify();
         }
     }
+    pub(super) fn prepare_nearby_html(
+        &self,
+        row_origin: Point<Pixels>,
+        viewport: Bounds<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Match the message body: px_6 on both sides, plus the existing avatar rail.
+        let width = (self.presentation.key.content_width
+            - window.rem_size() * 3.
+            - if self.presentation.key.grouping.avatar_group_kind
+                == Some(TimelineAvatarGroupKind::Agent)
+            {
+                layout::TIMELINE_AVATAR_RAIL_WIDTH
+            } else {
+                px(0.)
+            })
+        .max(px(1.));
+        for (index, html) in self.presentation.html.iter().enumerate() {
+            html.update(cx, |html, cx| {
+                html.prepare_nearby(width, row_origin, viewport, index == 0, window, cx)
+            });
+        }
+    }
     pub(super) fn set_html_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
         self.html_visible = visible;
-        if let Some(view) = &self.presentation.html {
-            view.update(cx, |view, cx| view.set_visible(visible, cx));
+        for view in &self.presentation.html {
+            view.update(cx, |view, cx| {
+                view.set_visible(
+                    visible
+                        && (!self
+                            .presentation
+                            .snapshot
+                            .content()
+                            .is_some_and(|content| content.task_timeline)
+                            || self.presentation.is_expanded()),
+                    cx,
+                )
+            });
         }
     }
     pub(super) fn set_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
@@ -714,9 +806,24 @@ impl TimelineView {
         visible: &std::collections::HashSet<String>,
         cx: &mut Context<Self>,
     ) {
-        for slot in self.row_registry.slots() {
+        let slots = self.row_registry.slots();
+        let painted = self
+            .thread_timeline_view_state
+            .prepared
+            .as_ref()
+            .map(|prepared| prepared.slots.as_slice())
+            .unwrap_or_default();
+        let mut seen = std::collections::HashSet::new();
+        for slot in slots.iter().chain(painted) {
             if let Some(view) = &slot.view {
-                let shown = visible.contains(slot.snapshot().id().as_str());
+                if !seen.insert(view.entity_id()) {
+                    continue;
+                }
+                let current = self
+                    .row_registry
+                    .get(slot.snapshot().id())
+                    .is_some_and(|next| next.view.as_ref() == Some(view));
+                let shown = current && visible.contains(slot.snapshot().id().as_str());
                 if view.read(cx).html_visible != shown {
                     view.update(cx, |view, cx| view.set_html_visible(shown, cx));
                 }
@@ -831,7 +938,7 @@ pub(super) fn row_dependency_revision(
     }
     if row
         .content()
-        .is_some_and(|content| content.html_publication.is_some())
+        .is_some_and(|content| !content.html_publications.is_empty())
     {
         ptr(&screen.artifact_input).hash(&mut hash);
         ptr(&screen.thread_capability_input).hash(&mut hash);
