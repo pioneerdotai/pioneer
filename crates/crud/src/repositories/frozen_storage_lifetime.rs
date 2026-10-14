@@ -2466,7 +2466,7 @@ mod tests {
             let sql = if kind == 0 {
                 "INSERT INTO compaction_frozen_message_data(manifest_id,ordinal,reference_json,bytes) VALUES('batch-physical',?1,?2,5000)"
             } else {
-                "INSERT INTO compaction_frozen_import_data(manifest_id,ordinal,message_ordinal,source_scope,source_id,source_version,source_thread,proof_json,bytes) VALUES('batch-physical',?1,0,'event','event','v','thread',?2,5000)"
+                "INSERT INTO compaction_frozen_import_data(manifest_id,ordinal,message_ordinal,source_scope,source_id,source_version,source_thread,proof_json,bytes) VALUES('batch-physical',?1,0,'event','event-'||?1,'v','thread',?2,5000)"
             };
             store
                 .connection
@@ -2542,20 +2542,28 @@ mod tests {
                 .await;
             }
             let (data, _) = physical_table(kind);
-            store
-                .connection
-                .execute_unprepared(&format!(
-                    "UPDATE {data} SET bytes=5001 WHERE manifest_id='batch-physical' AND ordinal=70"
-                ))
+            // Seed legacy corruption on one pinned fixture connection, then
+            // restore CHECK enforcement before exercising production cleanup.
+            let tx = store.connection.begin().await.unwrap();
+            tx.execute_unprepared("PRAGMA ignore_check_constraints=ON")
                 .await
                 .unwrap();
+            tx.execute_unprepared(&format!(
+                "UPDATE {data} SET bytes=5001 WHERE manifest_id='batch-physical' AND ordinal=70"
+            ))
+            .await
+            .unwrap();
+            tx.execute_unprepared("PRAGMA ignore_check_constraints=OFF")
+                .await
+                .unwrap();
+            tx.commit().await.unwrap();
             let mut sweep = prepare_batch(&store, kind, 600).await;
             let prepared = sweep.prepared.clone();
             // A new physical tail must not extend this visit indefinitely.
             let sql = if kind == 0 {
                 "INSERT INTO compaction_frozen_message_data(manifest_id,ordinal,reference_json,bytes) SELECT manifest_id,601,reference_json,bytes FROM compaction_frozen_message_data WHERE manifest_id='batch-physical' AND ordinal=600"
             } else {
-                "INSERT INTO compaction_frozen_import_data(manifest_id,ordinal,message_ordinal,source_scope,source_id,source_version,source_thread,proof_json,bytes) SELECT manifest_id,601,message_ordinal,source_scope,source_id,source_version,source_thread,proof_json,bytes FROM compaction_frozen_import_data WHERE manifest_id='batch-physical' AND ordinal=600"
+                "INSERT INTO compaction_frozen_import_data(manifest_id,ordinal,message_ordinal,source_scope,source_id,source_version,source_thread,proof_json,bytes) SELECT manifest_id,601,message_ordinal,source_scope,source_id||'-tail',source_version,source_thread,proof_json,bytes FROM compaction_frozen_import_data WHERE manifest_id='batch-physical' AND ordinal=600"
             };
             store.connection.execute_unprepared(sql).await.unwrap();
             let mut accounting = SweepAccounting::default();
@@ -2701,24 +2709,44 @@ mod tests {
                 .exec(&duplicate.connection)
                 .await
                 .unwrap();
-            duplicate
-                .connection
-                .execute_unprepared(&format!(
-                    "UPDATE {data} SET bytes=5001 WHERE manifest_id='batch-physical' AND ordinal=0"
-                ))
+            let resized_rows =
+                [(1_i64, 256 * 1024 + 1), (2, 256 * 1024 - 5000)].map(|(ordinal, size)| {
+                    (
+                        ordinal,
+                        size,
+                        format!("{{}}{}", " ".repeat(size as usize - 2)),
+                    )
+                });
+            // These deliberately invalid/legacy-sized physical rows cannot
+            // be written through the normal schema constraints.
+            let tx = duplicate.connection.begin().await.unwrap();
+            tx.execute_unprepared("PRAGMA ignore_check_constraints=ON")
                 .await
                 .unwrap();
-            for (ordinal, size) in [(1_i64, 256 * 1024 + 1), (2, 256 * 1024 - 5000)] {
-                duplicate.connection.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+            tx.execute_unprepared(&format!(
+                "UPDATE {data} SET bytes=5001 WHERE manifest_id='batch-physical' AND ordinal=0"
+            ))
+            .await
+            .unwrap();
+            for (ordinal, size, text) in resized_rows {
+                tx.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
                     format!("UPDATE {data} SET {payload}=?1,bytes=?2 WHERE manifest_id='batch-physical' AND ordinal=?3"),
-                    [format!("{{}}{}", " ".repeat(size as usize - 2)).into(), size.into(), ordinal.into()])).await.unwrap();
+                    [text.into(), size.into(), ordinal.into()])).await.unwrap();
             }
             let bad_field = if kind == 0 {
                 "bytes"
             } else {
                 "message_ordinal"
             };
-            duplicate.connection.execute_unprepared(&format!("UPDATE {data} SET {bad_field}=-1 WHERE manifest_id='batch-physical' AND ordinal=5")).await.unwrap();
+            tx.execute_unprepared(&format!(
+                "UPDATE {data} SET {bad_field}=-1 WHERE manifest_id='batch-physical' AND ordinal=5"
+            ))
+            .await
+            .unwrap();
+            tx.execute_unprepared("PRAGMA ignore_check_constraints=OFF")
+                .await
+                .unwrap();
+            tx.commit().await.unwrap();
             let mut progress = FrozenStorageLifetimeProgress::default();
             while !progress.scope.done {
                 progress.scope.step(&duplicate).await.unwrap();
