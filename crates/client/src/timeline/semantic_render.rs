@@ -740,7 +740,8 @@ mod tests {
             item.html_publications,
             vec![publication("first"), publication("second")]
         );
-        assert_eq!(model.projection, replay.projection);
+        assert!(model.projection.same_content(&replay.projection));
+        assert_eq!(model.projection.revision, replay.projection.revision);
         assert!(
             model
                 .rows
