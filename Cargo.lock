@@ -4967,7 +4967,7 @@ dependencies = [
 [[package]]
 name = "gpui-base"
 version = "0.7.3"
-source = "git+https://github.com/pioneerdotai/gpui-kit?branch=fix%2Fwebview-clipping#ca192cebf44c1d1af18a2ae9c6ccb3364108840b"
+source = "git+https://github.com/longbridge/gpui-kit#1188c11003b5cb5b83bc07d3fb9112e7674fbfa7"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -5008,7 +5008,7 @@ dependencies = [
 [[package]]
 name = "gpui-component"
 version = "0.7.3"
-source = "git+https://github.com/pioneerdotai/gpui-kit?branch=fix%2Fwebview-clipping#ca192cebf44c1d1af18a2ae9c6ccb3364108840b"
+source = "git+https://github.com/longbridge/gpui-kit#1188c11003b5cb5b83bc07d3fb9112e7674fbfa7"
 dependencies = [
  "anyhow",
  "chrono",
@@ -5055,7 +5055,7 @@ dependencies = [
 [[package]]
 name = "gpui-component-macros"
 version = "0.7.3"
-source = "git+https://github.com/pioneerdotai/gpui-kit?branch=fix%2Fwebview-clipping#ca192cebf44c1d1af18a2ae9c6ccb3364108840b"
+source = "git+https://github.com/longbridge/gpui-kit#1188c11003b5cb5b83bc07d3fb9112e7674fbfa7"
 dependencies = [
  "proc-macro-crate 3.5.0",
  "proc-macro2",
@@ -5066,7 +5066,7 @@ dependencies = [
 [[package]]
 name = "gpui-fast"
 version = "0.1.7"
-source = "git+https://github.com/pioneerdotai/gpui-fast?branch=cargo%2Fcomposition-input#912dc54fe650b0bd7aae9ae24b00f6e162ced552"
+source = "git+https://github.com/pioneerdotai/gpui-fast?branch=cargo%2Fcomposition-input#2a80c5d5f56ae9d64b608a42f5ee9bbb393f5b6d"
 dependencies = [
  "accesskit",
  "anyhow",
@@ -5176,7 +5176,7 @@ dependencies = [
 [[package]]
 name = "gpui-fast-linux"
 version = "0.1.7"
-source = "git+https://github.com/pioneerdotai/gpui-fast?branch=cargo%2Fcomposition-input#912dc54fe650b0bd7aae9ae24b00f6e162ced552"
+source = "git+https://github.com/pioneerdotai/gpui-fast?branch=cargo%2Fcomposition-input#2a80c5d5f56ae9d64b608a42f5ee9bbb393f5b6d"
 dependencies = [
  "accesskit",
  "accesskit_unix",
@@ -5220,7 +5220,7 @@ dependencies = [
 [[package]]
 name = "gpui-fast-macos"
 version = "0.1.7"
-source = "git+https://github.com/pioneerdotai/gpui-fast?branch=cargo%2Fcomposition-input#912dc54fe650b0bd7aae9ae24b00f6e162ced552"
+source = "git+https://github.com/pioneerdotai/gpui-fast?branch=cargo%2Fcomposition-input#2a80c5d5f56ae9d64b608a42f5ee9bbb393f5b6d"
 dependencies = [
  "accesskit",
  "accesskit_macos",
@@ -5375,7 +5375,7 @@ dependencies = [
 [[package]]
 name = "gpui-kit"
 version = "0.7.3"
-source = "git+https://github.com/pioneerdotai/gpui-kit?branch=fix%2Fwebview-clipping#ca192cebf44c1d1af18a2ae9c6ccb3364108840b"
+source = "git+https://github.com/longbridge/gpui-kit#1188c11003b5cb5b83bc07d3fb9112e7674fbfa7"
 dependencies = [
  "gpui-base",
  "gpui-component",
@@ -5392,7 +5392,7 @@ dependencies = [
 [[package]]
 name = "gpui-kit-assets"
 version = "0.7.3"
-source = "git+https://github.com/pioneerdotai/gpui-kit?branch=fix%2Fwebview-clipping#ca192cebf44c1d1af18a2ae9c6ccb3364108840b"
+source = "git+https://github.com/longbridge/gpui-kit#1188c11003b5cb5b83bc07d3fb9112e7674fbfa7"
 dependencies = [
  "anyhow",
  "gpui-fast",
@@ -5887,7 +5887,7 @@ checksum = "4b0d73e1bc02eef886a5947f41b8512708792e9e5d3053d181843311a487f96f"
 [[package]]
 name = "gpui-webview"
 version = "0.7.3"
-source = "git+https://github.com/pioneerdotai/gpui-kit?branch=fix%2Fwebview-clipping#ca192cebf44c1d1af18a2ae9c6ccb3364108840b"
+source = "git+https://github.com/longbridge/gpui-kit#1188c11003b5cb5b83bc07d3fb9112e7674fbfa7"
 dependencies = [
  "anyhow",
  "gpui-kit",
