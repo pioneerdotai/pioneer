@@ -1896,7 +1896,7 @@ impl ClientCore {
                         }
                         let delay = [
                             core.next_thread_resume_delay(),
-                            core.next_timeline_read_delay(),
+                            core.next_timeline_request_delay(),
                         ]
                         .into_iter()
                         .flatten()
@@ -1948,7 +1948,7 @@ impl ClientCore {
                             _ => {}
                         }
                         core.drive_due_thread_resumes();
-                        core.drive_timeline_reads();
+                        core.drive_timeline_requests();
                     }
                 })
                 .expect("Client thread request task could not start"),
