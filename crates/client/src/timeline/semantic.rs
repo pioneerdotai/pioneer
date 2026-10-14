@@ -1238,6 +1238,7 @@ pub fn apply_thread_timeline_blocks_changed(
     }
     let mut tombstoned_block_ids = HashSet::new();
     for tombstone in notification.turn_work_tombstones {
+        tombstoned_block_ids.insert(tombstone.block_id.clone());
         let incoming_revision = (
             tombstone.source_high_watermark,
             tombstone.projection_updated_at_unix_micros,
@@ -1249,7 +1250,6 @@ pub fn apply_thread_timeline_blocks_changed(
         {
             continue;
         }
-        tombstoned_block_ids.insert(tombstone.block_id);
         thread
             .turn_work_tombstone_revisions
             .insert(tombstone.turn_id.clone(), incoming_revision);
@@ -2667,6 +2667,13 @@ pub fn apply_turn_work_items_changed(
     notification: TurnWorkItemsChangedNotification,
 ) -> bool {
     let thread = state.thread_mut(notification.thread_id);
+    if thread
+        .turn_work_tombstone_revisions
+        .contains_key(&notification.turn_id)
+        || thread.admission_turn_ids.contains(&notification.turn_id)
+    {
+        return false;
+    }
     let range = thread.work_range_mut(notification.turn_id);
     let mut changed = false;
     let mut removed_item = false;
