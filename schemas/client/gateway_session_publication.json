@@ -1,0 +1,915 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "GatewaySessionPublication",
+  "type": "object",
+  "properties": {
+    "access_expiries": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "integer",
+        "format": "uint64",
+        "minimum": 0
+      }
+    },
+    "connections": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/GatewaySessionConnectionProjection"
+      }
+    },
+    "gateway_error": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "sessions": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/SessionLifecycleState"
+      }
+    },
+    "startup": {
+      "$ref": "#/$defs/StartupCoordinator"
+    },
+    "status": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/GatewayStatusProjection"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "required": [
+    "connections",
+    "startup",
+    "sessions",
+    "access_expiries"
+  ],
+  "$defs": {
+    "AuthSessionId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "DeviceId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "GatewayConnectionState": {
+      "type": "string",
+      "enum": [
+        "Idle",
+        "Connecting",
+        "Connected",
+        "Reconnecting",
+        "Disconnected"
+      ]
+    },
+    "GatewayId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "GatewaySessionConnectionFailure": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "terminal"
+            },
+            "reason": {
+              "$ref": "#/$defs/SessionTerminalReason"
+            }
+          },
+          "required": [
+            "kind",
+            "reason"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "suspended"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "code": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "const": "unavailable"
+            }
+          },
+          "required": [
+            "kind",
+            "code"
+          ]
+        }
+      ]
+    },
+    "GatewaySessionConnectionProjection": {
+      "type": "object",
+      "properties": {
+        "connected": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GatewaySessionConnectionResult"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "epoch": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "failure": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GatewaySessionConnectionFailure"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "pending": {
+          "type": "boolean"
+        },
+        "presentation_connection_id": {
+          "description": "Stable accepted session identity across background suspension and token renewal.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "refresh_requested": {
+          "type": "boolean"
+        },
+        "retry_delay_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "epoch",
+        "pending",
+        "refresh_requested"
+      ]
+    },
+    "GatewaySessionConnectionResult": {
+      "type": "object",
+      "properties": {
+        "access_expires_at_unix": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "connection_generation": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "connection_id": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "metadata": {
+          "$ref": "#/$defs/GatewaySessionMetadata"
+        }
+      },
+      "required": [
+        "connection_id",
+        "connection_generation",
+        "metadata",
+        "access_expires_at_unix"
+      ]
+    },
+    "GatewaySessionMetadata": {
+      "type": "object",
+      "properties": {
+        "device_id": {
+          "$ref": "#/$defs/DeviceId"
+        },
+        "gateway_id": {
+          "$ref": "#/$defs/GatewayId"
+        },
+        "refresh_expires_at_unix": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "refresh_generation": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "session_id": {
+          "$ref": "#/$defs/AuthSessionId"
+        }
+      },
+      "required": [
+        "gateway_id",
+        "device_id",
+        "session_id",
+        "refresh_generation",
+        "refresh_expires_at_unix"
+      ]
+    },
+    "GatewayStatusLevel": {
+      "type": "string",
+      "enum": [
+        "Neutral",
+        "Connected",
+        "Degraded",
+        "Failed"
+      ]
+    },
+    "GatewayStatusMessage": {
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "Connecting",
+            "StartingLocal",
+            "Connected",
+            "NotConfigured",
+            "Unavailable",
+            "LocalConflict",
+            "SubsystemNotReady"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "ConnectingNamed": {
+              "type": "object",
+              "properties": {
+                "endpoint_name": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "endpoint_name"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "ConnectingNamed"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "Reconnecting": {
+              "type": "object",
+              "properties": {
+                "attempt": {
+                  "type": "integer",
+                  "format": "uint32",
+                  "minimum": 0
+                },
+                "delay_ms": {
+                  "type": "integer",
+                  "format": "uint64",
+                  "minimum": 0
+                },
+                "endpoint_name": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "endpoint_name",
+                "attempt",
+                "delay_ms"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "Reconnecting"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "ConnectedEndpoint": {
+              "type": "object",
+              "properties": {
+                "endpoint_name": {
+                  "type": "string"
+                },
+                "gateway_base_url": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "endpoint_name",
+                "gateway_base_url"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "ConnectedEndpoint"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "LocalStopped": {
+              "type": "object",
+              "properties": {
+                "gateway_base_url": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "gateway_base_url"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "LocalStopped"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "RemoteUnavailable": {
+              "type": "object",
+              "properties": {
+                "endpoint_name": {
+                  "type": "string"
+                },
+                "gateway_base_url": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "endpoint_name",
+                "gateway_base_url"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "RemoteUnavailable"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "LocalConflictAt": {
+              "type": "object",
+              "properties": {
+                "gateway_base_url": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "gateway_base_url"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "LocalConflictAt"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "FailedCheck": {
+              "type": "object",
+              "properties": {
+                "error": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "error"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "FailedCheck"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "SubsystemFailed": {
+              "type": "object",
+              "properties": {
+                "error": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "error"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "SubsystemFailed"
+          ]
+        }
+      ]
+    },
+    "GatewayStatusProjection": {
+      "type": "object",
+      "properties": {
+        "clear_gateway_error": {
+          "type": "boolean"
+        },
+        "connection_state": {
+          "$ref": "#/$defs/GatewayConnectionState"
+        },
+        "status": {
+          "$ref": "#/$defs/GatewayStatusTextUpdate"
+        },
+        "status_level": {
+          "$ref": "#/$defs/GatewayStatusLevel"
+        }
+      },
+      "required": [
+        "status",
+        "status_level",
+        "connection_state",
+        "clear_gateway_error"
+      ]
+    },
+    "GatewayStatusTextUpdate": {
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "KeepExisting"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "Set": {
+              "$ref": "#/$defs/GatewayStatusMessage"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "Set"
+          ]
+        }
+      ]
+    },
+    "SessionDiagnosticTiming": {
+      "type": "object",
+      "properties": {
+        "duration_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "endpoint_id": {
+          "type": "string"
+        },
+        "started_at_unix_ms": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "state": {
+          "$ref": "#/$defs/StartupStageState"
+        }
+      },
+      "required": [
+        "endpoint_id",
+        "started_at_unix_ms",
+        "state"
+      ]
+    },
+    "SessionLifecycleState": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "data": {
+              "type": "object",
+              "properties": {
+                "metadata": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/$defs/GatewaySessionMetadata"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              }
+            },
+            "kind": {
+              "type": "string",
+              "const": "suspended"
+            }
+          },
+          "required": [
+            "kind",
+            "data"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "no_session"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "needs_device_activation"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "data": {
+              "type": "object",
+              "properties": {
+                "intent_id": {
+                  "type": "integer",
+                  "format": "uint64",
+                  "minimum": 0
+                },
+                "metadata": {
+                  "$ref": "#/$defs/GatewaySessionMetadata"
+                },
+                "previous_connection_generation": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ],
+                  "format": "uint64",
+                  "minimum": 0
+                }
+              },
+              "required": [
+                "metadata",
+                "intent_id"
+              ]
+            },
+            "kind": {
+              "type": "string",
+              "const": "refreshing"
+            }
+          },
+          "required": [
+            "kind",
+            "data"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "data": {
+              "type": "object",
+              "properties": {
+                "access_expires_at_unix": {
+                  "type": "integer",
+                  "format": "uint64",
+                  "minimum": 0
+                },
+                "candidate_connection_generation": {
+                  "type": "integer",
+                  "format": "uint64",
+                  "minimum": 0
+                },
+                "intent_id": {
+                  "type": "integer",
+                  "format": "uint64",
+                  "minimum": 0
+                },
+                "metadata": {
+                  "$ref": "#/$defs/GatewaySessionMetadata"
+                },
+                "previous_connection_generation": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ],
+                  "format": "uint64",
+                  "minimum": 0
+                }
+              },
+              "required": [
+                "metadata",
+                "intent_id",
+                "candidate_connection_generation",
+                "access_expires_at_unix"
+              ]
+            },
+            "kind": {
+              "type": "string",
+              "const": "awaiting_secure_storage"
+            }
+          },
+          "required": [
+            "kind",
+            "data"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "data": {
+              "type": "object",
+              "properties": {
+                "access_expires_at_unix": {
+                  "type": "integer",
+                  "format": "uint64",
+                  "minimum": 0
+                },
+                "connection_generation": {
+                  "type": "integer",
+                  "format": "uint64",
+                  "minimum": 0
+                },
+                "metadata": {
+                  "$ref": "#/$defs/GatewaySessionMetadata"
+                },
+                "previous_connection_generation": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ],
+                  "format": "uint64",
+                  "minimum": 0
+                }
+              },
+              "required": [
+                "metadata",
+                "connection_generation",
+                "access_expires_at_unix"
+              ]
+            },
+            "kind": {
+              "type": "string",
+              "const": "connecting"
+            }
+          },
+          "required": [
+            "kind",
+            "data"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "data": {
+              "type": "object",
+              "properties": {
+                "access_expires_at_unix": {
+                  "type": "integer",
+                  "format": "uint64",
+                  "minimum": 0
+                },
+                "connection_generation": {
+                  "type": "integer",
+                  "format": "uint64",
+                  "minimum": 0
+                },
+                "metadata": {
+                  "$ref": "#/$defs/GatewaySessionMetadata"
+                }
+              },
+              "required": [
+                "metadata",
+                "connection_generation",
+                "access_expires_at_unix"
+              ]
+            },
+            "kind": {
+              "type": "string",
+              "const": "active"
+            }
+          },
+          "required": [
+            "kind",
+            "data"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "data": {
+              "type": "object",
+              "properties": {
+                "metadata": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/$defs/GatewaySessionMetadata"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "reason": {
+                  "$ref": "#/$defs/SessionTerminalReason"
+                }
+              },
+              "required": [
+                "reason"
+              ]
+            },
+            "kind": {
+              "type": "string",
+              "const": "terminal"
+            }
+          },
+          "required": [
+            "kind",
+            "data"
+          ]
+        }
+      ]
+    },
+    "SessionTerminalReason": {
+      "type": "string",
+      "enum": [
+        "authentication_required",
+        "session_revoked",
+        "session_expired",
+        "session_compromised",
+        "principal_suspended",
+        "principal_removed",
+        "gateway_identity_mismatch",
+        "secure_storage_failed",
+        "refresh_outcome_unknown",
+        "refresh_credential_invalid"
+      ]
+    },
+    "StartupCoordinator": {
+      "type": "object",
+      "properties": {
+        "connection_id": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "endpoint_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "identity_pending": {
+          "type": "boolean"
+        },
+        "retry_attempt": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "retry_delay_ms": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "session_diagnostics": {
+          "type": "object",
+          "properties": {
+            "connect_attempt": {
+              "$ref": "#/$defs/SessionDiagnosticTiming"
+            },
+            "credentials_load": {
+              "$ref": "#/$defs/SessionDiagnosticTiming"
+            },
+            "credentials_persist": {
+              "$ref": "#/$defs/SessionDiagnosticTiming"
+            },
+            "identity_verify": {
+              "$ref": "#/$defs/SessionDiagnosticTiming"
+            },
+            "refresh_intent_persist": {
+              "$ref": "#/$defs/SessionDiagnosticTiming"
+            },
+            "refresh_request": {
+              "$ref": "#/$defs/SessionDiagnosticTiming"
+            }
+          },
+          "additionalProperties": false
+        },
+        "stages": {
+          "type": "object",
+          "properties": {
+            "active_thread_bootstrap": {
+              "$ref": "#/$defs/StartupStageState"
+            },
+            "active_thread_subscription": {
+              "$ref": "#/$defs/StartupStageState"
+            },
+            "authorization": {
+              "$ref": "#/$defs/StartupStageState"
+            },
+            "gateway_runtime": {
+              "$ref": "#/$defs/StartupStageState"
+            },
+            "gateway_session": {
+              "$ref": "#/$defs/StartupStageState"
+            },
+            "provider": {
+              "$ref": "#/$defs/StartupStageState"
+            },
+            "thread_capabilities": {
+              "$ref": "#/$defs/StartupStageState"
+            },
+            "thread_tree": {
+              "$ref": "#/$defs/StartupStageState"
+            },
+            "workspace": {
+              "$ref": "#/$defs/StartupStageState"
+            }
+          },
+          "additionalProperties": false
+        },
+        "transport_ready": {
+          "type": "boolean"
+        },
+        "transport_revision": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "stages",
+        "session_diagnostics",
+        "transport_revision",
+        "retry_attempt",
+        "retry_delay_ms",
+        "transport_ready",
+        "identity_pending"
+      ]
+    },
+    "StartupStageState": {
+      "type": "string",
+      "enum": [
+        "pending",
+        "succeeded",
+        "failed",
+        "cancelled"
+      ]
+    }
+  }
+}

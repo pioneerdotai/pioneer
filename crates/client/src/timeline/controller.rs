@@ -113,6 +113,17 @@ impl ThreadTimelineController {
         self.failed_refreshes.contains_key(thread_id)
     }
 
+    pub(crate) fn has_active_refresh(&self, thread_id: &str) -> bool {
+        let key = PageKey::ThreadNewest {
+            thread_id: thread_id.to_owned(),
+        };
+        self.in_flight.contains(&key)
+            && self
+                .requests
+                .get(&key)
+                .is_some_and(|(_, action)| is_newest_refresh(action))
+    }
+
     pub(crate) fn retain_domain_request(&mut self, key: &PageKey) {
         self.durable_pages.insert(key.clone());
     }
@@ -179,45 +190,130 @@ impl ThreadTimelineController {
         self.requests.get(key).is_some_and(|r| r.0 == generation) && self.in_flight.contains(key)
     }
 
+    pub(crate) fn page_retry_allowed(&self, key: &PageKey, now_ms: u64) -> bool {
+        self.failures
+            .get(key)
+            .is_none_or(|(attempt, deadline)| *attempt < MAX_ATTEMPTS && now_ms >= *deadline)
+    }
+
     pub(crate) fn finish(
         &mut self,
         key: &PageKey,
         succeeded: bool,
         now_ms: u64,
     ) -> Option<PageAction> {
+        self.finish_with_retry(key, succeeded, true, now_ms)
+    }
+
+    pub(crate) fn finish_with_retry(
+        &mut self,
+        key: &PageKey,
+        succeeded: bool,
+        retryable: bool,
+        now_ms: u64,
+    ) -> Option<PageAction> {
         let (_, action) = self.requests.remove(key)?;
-        if let PageAction::ThreadTimelinePage {
-            key: PageKey::ThreadNewest { thread_id },
-            params,
-        } = &action
-        {
-            if params.anchor == pioneer_protocol::TimelinePageAnchor::Newest {
-                if succeeded {
-                    self.failed_refreshes.remove(thread_id);
+        let is_refresh = is_newest_refresh(&action);
+        // Around/Oldest share the key, but do not own the failed Newest walk.
+        let preserves_recovery = matches!(key, PageKey::ThreadNewest { .. })
+            && !is_refresh
+            && self.has_failed_refresh(request_thread_id(key));
+        if !preserves_recovery {
+            if succeeded {
+                self.failures.remove(key);
+                if is_refresh {
+                    self.failed_refreshes.remove(request_thread_id(key));
+                }
+            } else {
+                let failure = self.failures.entry(key.clone()).or_default();
+                failure.0 = if retryable {
+                    failure.0.saturating_add(1)
                 } else {
+                    MAX_ATTEMPTS
+                };
+                failure.1 = now_ms.saturating_add(backoff(failure.0));
+                if is_refresh {
+                    // The retry obligation owns its exact action, independently
+                    // of another anchor waiting in the ordinary pending slot.
                     self.failed_refreshes
-                        .insert(thread_id.clone(), action.clone());
-                    // A failed walk is retried explicitly, not by a queued notification.
-                    self.pending.remove(key);
+                        .insert(request_thread_id(key).to_owned(), action);
                 }
             }
         }
-        if succeeded {
-            self.failures.remove(key);
-        } else {
-            let failure = self.failures.entry(key.clone()).or_default();
-            failure.0 = failure.0.saturating_add(1);
-            failure.1 = now_ms.saturating_add(backoff(failure.0));
-        }
-        if !succeeded && self.scoped_pages.contains(key) && !self.durable_pages.contains(key) {
+        if !succeeded
+            && !is_refresh
+            && (!retryable
+                || (self.scoped_pages.contains(key) && !self.durable_pages.contains(key)))
+        {
             self.pending.remove(key);
         }
-        let next =
+        let mut next =
             semantic::finish_semantic_timeline_request(&mut self.in_flight, &mut self.pending, key);
-        if next.is_none() {
+        if is_refresh && !succeeded && next.as_ref().is_some_and(is_newest_refresh) {
+            // A notification follow-up is covered by bounded recovery; it must
+            // not turn a failure into an immediate request or reset the budget.
+            next = None;
+        }
+        if next.is_none() && self.refresh_deadline(key).is_none() {
             self.durable_pages.remove(key);
         }
         next
+    }
+
+    fn refresh_deadline(&self, key: &PageKey) -> Option<u64> {
+        if !matches!(key, PageKey::ThreadNewest { .. })
+            || !self.has_failed_refresh(request_thread_id(key))
+        {
+            return None;
+        }
+        self.failures
+            .get(key)
+            .filter(|(attempts, _)| *attempts < MAX_ATTEMPTS)
+            .map(|(_, deadline)| *deadline)
+    }
+
+    pub(crate) fn reset_page_retry(&mut self, key: &PageKey) {
+        self.failures.remove(key);
+    }
+
+    pub(crate) fn next_refresh_deadline(&self) -> Option<u64> {
+        self.failed_refreshes
+            .values()
+            .map(semantic::semantic_timeline_request_key)
+            .filter(|key| !self.in_flight.contains(*key))
+            .filter_map(|key| self.refresh_deadline(key))
+            .min()
+    }
+
+    pub(crate) fn due_refreshes(&mut self, now_ms: u64) -> Vec<TimelinePageRequest> {
+        let mut actions = self
+            .failed_refreshes
+            .values()
+            .filter(|action| {
+                let key = semantic::semantic_timeline_request_key(action);
+                !self.in_flight.contains(key)
+                    && self
+                        .refresh_deadline(key)
+                        .is_some_and(|deadline| deadline <= now_ms)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        actions.sort_by(|a, b| {
+            request_thread_id(semantic::semantic_timeline_request_key(a)).cmp(request_thread_id(
+                semantic::semantic_timeline_request_key(b),
+            ))
+        });
+        actions
+            .into_iter()
+            .filter_map(|action| {
+                let key = semantic::semantic_timeline_request_key(&action).clone();
+                let action = self.begin(action)?;
+                Some(TimelinePageRequest {
+                    action,
+                    generation: self.request_generation(&key),
+                })
+            })
+            .collect()
     }
 
     pub(crate) fn update(
@@ -269,11 +365,7 @@ impl ThreadTimelineController {
             {
                 continue;
             }
-            if self
-                .failures
-                .get(&key)
-                .is_some_and(|(attempt, deadline)| *attempt >= MAX_ATTEMPTS || now_ms < *deadline)
-            {
+            if !self.page_retry_allowed(&key, now_ms) {
                 continue;
             }
             if !self.in_flight.contains(&key) {
@@ -383,6 +475,10 @@ impl ThreadTimelineController {
             self.requests.remove(key);
             self.durable_pages.remove(key);
             self.scoped_pages.remove(key);
+            if matches!(key, PageKey::ThreadNewest { .. }) {
+                self.failed_refreshes.remove(request_thread_id(key));
+                self.failures.remove(key);
+            }
         }
         self.reads.retain(|(thread, turn), _| {
             self.demands
@@ -404,6 +500,16 @@ impl ThreadTimelineController {
         succeeded: bool,
         now_ms: u64,
     ) -> bool {
+        self.finish_read_with_retry(request, succeeded, true, now_ms)
+    }
+
+    fn finish_read_with_retry(
+        &mut self,
+        request: &TimelineReadRequest,
+        succeeded: bool,
+        retryable: bool,
+        now_ms: u64,
+    ) -> bool {
         if !self.accepts_read(request) {
             return false;
         }
@@ -413,7 +519,7 @@ impl ThreadTimelineController {
             .unwrap();
         read.state = if succeeded {
             RetryState::Ready
-        } else if read.attempts >= MAX_ATTEMPTS {
+        } else if !retryable || read.attempts >= MAX_ATTEMPTS {
             RetryState::Terminal
         } else {
             RetryState::Backoff {
@@ -438,6 +544,13 @@ impl ThreadTimelineController {
             }
         }
         requests
+    }
+
+    fn next_request_deadline(&self) -> Option<u64> {
+        [self.next_read_deadline(), self.next_refresh_deadline()]
+            .into_iter()
+            .flatten()
+            .min()
     }
 
     pub(crate) fn next_read_deadline(&self) -> Option<u64> {
@@ -489,6 +602,10 @@ impl ThreadTimelineController {
             self.requests.remove(key);
             self.durable_pages.remove(key);
         }
+        self.pending
+            .retain(|key, _| thread.is_some_and(|id| request_thread_id(key) != id));
+        self.durable_pages
+            .retain(|key| thread.is_some_and(|id| request_thread_id(key) != id));
         let ids = self
             .demands
             .keys()
@@ -509,6 +626,12 @@ impl ThreadTimelineController {
             .retain(|id, _| thread.is_some_and(|thread| id != thread));
         keys
     }
+}
+
+pub(crate) fn is_newest_refresh(action: &PageAction) -> bool {
+    matches!(action,
+        PageAction::ThreadTimelinePage { key: PageKey::ThreadNewest { .. }, params }
+            if params.anchor == pioneer_protocol::TimelinePageAnchor::Newest)
 }
 
 pub(crate) fn request_thread_id(key: &PageKey) -> &str {
@@ -561,6 +684,44 @@ mod tests {
             },
         }
     }
+
+    fn initial_work_page() -> PageAction {
+        PageAction::TurnWorkPage {
+            key: PageKey::TurnWorkInitial {
+                thread_id: "a".into(),
+                turn_id: "turn".into(),
+            },
+            params: pioneer_protocol::TurnWorkPageParams {
+                thread_id: "a".into(),
+                turn_id: "turn".into(),
+                anchor: pioneer_protocol::TimelinePageAnchor::Newest,
+                limit: Some(12),
+            },
+        }
+    }
+
+    #[test]
+    fn initial_work_loading_does_not_queue_a_follow_up() {
+        let mut policy = ThreadTimelineController::default();
+        let action = initial_work_page();
+        let key = semantic::semantic_timeline_request_key(&action).clone();
+        let plan = policy.update(demand("desktop"), vec![action.clone()], 0);
+        assert_eq!(plan.pages.len(), 1);
+        for revision in 2..5 {
+            let mut input = demand("desktop");
+            input.source_revision = revision;
+            assert!(
+                policy
+                    .update(input, vec![action.clone()], 0)
+                    .pages
+                    .is_empty()
+            );
+        }
+        assert!(policy.finish(&key, true, 0).is_none());
+        assert!(policy.in_flight.is_empty());
+        assert!(policy.pending.is_empty());
+    }
+
     #[test]
     fn coalesced_consumers_exit_independently_and_late_results_are_noop() {
         let mut policy = ThreadTimelineController::default();
@@ -643,29 +804,36 @@ mod tests {
     }
     #[test]
     fn prefetch_failure_requires_changed_demand_and_is_bounded() {
-        let mut policy = ThreadTimelineController::default();
-        let mut input = demand("desktop");
-        for attempt in 0..3 {
+        for action in [page(), initial_work_page()] {
+            let mut policy = ThreadTimelineController::default();
+            let mut input = demand("desktop");
+            for attempt in 0..3 {
+                input.scroll_generation += 1;
+                let now = attempt * 10_000;
+                let plan = policy.update(input.clone(), vec![action.clone()], now);
+                assert_eq!(plan.pages.len(), 1);
+                let key = semantic::semantic_timeline_request_key(&plan.pages[0].action);
+                assert!(policy.finish(key, false, now).is_none());
+                assert!(!policy.page_retry_allowed(key, now));
+                assert!(
+                    policy
+                        .update(input.clone(), vec![action.clone()], u64::MAX)
+                        .pages
+                        .is_empty()
+                );
+            }
             input.scroll_generation += 1;
-            let plan = policy.update(input.clone(), vec![page()], attempt * 10_000);
-            assert_eq!(plan.pages.len(), 1);
-            let key = semantic::semantic_timeline_request_key(&plan.pages[0].action);
-            policy.finish(key, false, attempt * 10_000);
             assert!(
                 policy
-                    .update(input.clone(), vec![page()], u64::MAX)
+                    .update(input, vec![action.clone()], u64::MAX)
                     .pages
                     .is_empty()
             );
+            let retry = policy.retry("a", "desktop", 1).unwrap();
+            assert_eq!(policy.update(retry, vec![action], u64::MAX).pages.len(), 1);
         }
-        input.scroll_generation += 1;
-        assert!(
-            policy
-                .update(input, vec![page()], u64::MAX)
-                .pages
-                .is_empty()
-        );
     }
+
     #[test]
     fn wire_semantic_inputs_and_direct_inputs_produce_identical_plans() {
         let input = TimelineIntent::Update {
@@ -692,7 +860,12 @@ mod tests {
         let mut b = demand("viewport");
         b.thread_id = "b".into();
         let b = policy.update(b, vec![], 0);
+        let key = semantic::semantic_timeline_request_key(&a.pages[0].action);
+        policy.finish(key, false, 0);
+        assert_eq!(policy.next_refresh_deadline(), Some(1_000));
         policy.invalidate(Some("a"));
+        assert!(policy.due_refreshes(u64::MAX).is_empty());
+        assert_eq!(policy.next_refresh_deadline(), None);
         assert!(!policy.accepts_read(&a.reads[0]));
         assert!(policy.accepts_read(&b.reads[0]));
         policy.invalidate(None);
@@ -757,7 +930,7 @@ impl crate::core::ClientCore {
                         .lock()
                         .expect("thread registry poisoned")
                         .timeline
-                        .finish_read(read, false, self.timeline_now_ms());
+                        .finish_read_with_retry(read, false, false, self.timeline_now_ms());
                 }
             }
         } else {
@@ -766,13 +939,12 @@ impl crate::core::ClientCore {
                     .thread_registry
                     .lock()
                     .expect("thread registry poisoned");
-                if let Some(state) = registry
-                    .timeline
-                    .reads
-                    .get_mut(&(read.thread_id.clone(), read.through_turn_id.clone()))
-                {
-                    state.state = RetryState::Terminal;
-                }
+                registry.timeline.finish_read_with_retry(
+                    read,
+                    false,
+                    false,
+                    self.timeline_now_ms(),
+                );
             }
         }
         plan
@@ -871,6 +1043,7 @@ impl crate::core::ClientCore {
         let mut plan = registry.timeline.update(demand, actions, now_ms);
         if let Some(action) = retry_refresh {
             let key = semantic::semantic_timeline_request_key(&action).clone();
+            registry.timeline.reset_page_retry(&key);
             registry.timeline.retain_domain_request(&key);
             if let Some(action) = registry.timeline.begin(action) {
                 plan.pages.push(TimelinePageRequest {
@@ -882,24 +1055,40 @@ impl crate::core::ClientCore {
         plan
     }
 
-    pub(crate) fn next_timeline_read_delay(&self) -> Option<std::time::Duration> {
+    pub(crate) fn next_timeline_request_delay(&self) -> Option<std::time::Duration> {
         self.thread_registry
             .lock()
             .expect("thread registry poisoned")
             .timeline
-            .next_read_deadline()
+            .next_request_deadline()
             .map(|deadline| {
                 std::time::Duration::from_millis(deadline.saturating_sub(self.timeline_now_ms()))
             })
     }
 
-    pub(crate) fn drive_timeline_reads(&self) {
+    pub(crate) fn drive_timeline_requests(&self) {
+        self.drive_timeline_requests_at(self.timeline_now_ms());
+    }
+
+    pub(crate) fn drive_timeline_requests_at(&self, now_ms: u64) {
+        if self.is_stopped() {
+            return;
+        }
+        let pages = self
+            .thread_registry
+            .lock()
+            .expect("thread registry poisoned")
+            .timeline
+            .due_refreshes(now_ms);
+        for page in pages {
+            self.schedule_planned_timeline_request(page);
+        }
         let reads = self
             .thread_registry
             .lock()
             .expect("thread registry poisoned")
             .timeline
-            .due_reads(self.timeline_now_ms());
+            .due_reads(now_ms);
         for read in reads {
             self.execute_timeline_read(read);
         }
@@ -928,6 +1117,12 @@ impl crate::core::ClientCore {
             if response.thread_id != request.thread_id
                 || !registry.timeline_workspace_matches(&request.thread_id, &response.workspace_id)
             {
+                registry.timeline.finish_read_with_retry(
+                    &request,
+                    false,
+                    false,
+                    self.timeline_now_ms(),
+                );
                 return;
             }
         }

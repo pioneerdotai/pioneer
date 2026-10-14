@@ -841,17 +841,28 @@
     "ToolPermissionPolicySnapshot": {
       "type": "object",
       "properties": {
+        "agent_action": {
+          "$ref": "#/$defs/PermissionBehavior"
+        },
         "allowed_paths": {
           "type": "array",
           "items": {
             "type": "string"
           }
         },
+        "allowed_paths_restricted": {
+          "description": "See `allowed_tools_restricted`.  A restricted empty path set is a\ndurable deny-all result, while an unrestricted empty set is the legacy\nwildcard.",
+          "type": "boolean"
+        },
         "allowed_tools": {
           "type": "array",
           "items": {
             "type": "string"
           }
+        },
+        "allowed_tools_restricted": {
+          "description": "`allowed_tools = []` historically means \"no allow-list\".  This bit\npreserves the distinct result of intersecting two disjoint allow-lists:\na restricted empty set must deny every tool rather than reopen all of\nthem.",
+          "type": "boolean"
         },
         "computer_use": {
           "$ref": "#/$defs/PermissionBehavior"
@@ -880,6 +891,9 @@
         "mcp_write_or_unknown": {
           "$ref": "#/$defs/PermissionBehavior"
         },
+        "memory_write": {
+          "$ref": "#/$defs/PermissionBehavior"
+        },
         "network": {
           "$ref": "#/$defs/PermissionBehavior"
         },
@@ -900,7 +914,9 @@
         "mcp_write_or_unknown",
         "dynamic_skill_tool",
         "computer_use",
-        "task_subagent"
+        "task_subagent",
+        "memory_write",
+        "agent_action"
       ]
     },
     "TurnAuthorSnapshot": {

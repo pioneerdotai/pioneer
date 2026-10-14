@@ -1,0 +1,148 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TaskNotificationIntent",
+  "oneOf": [
+    {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "refresh"
+        },
+        "workspace_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "workspace_id"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "dismiss"
+        },
+        "notification_id": {
+          "type": "string"
+        },
+        "revision": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "workspace_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "workspace_id",
+        "notification_id",
+        "revision"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "retry"
+        },
+        "workspace_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "workspace_id"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "open"
+        },
+        "notification_id": {
+          "type": "string"
+        },
+        "revision": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "workspace_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "workspace_id",
+        "notification_id",
+        "revision"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "completion": {
+          "$ref": "#/$defs/TaskNotificationCompletion"
+        },
+        "effect": {
+          "$ref": "#/$defs/TaskNotificationEffect"
+        },
+        "kind": {
+          "type": "string",
+          "const": "native_completion"
+        },
+        "workspace_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "workspace_id",
+        "effect",
+        "completion"
+      ]
+    }
+  ],
+  "$defs": {
+    "TaskNotificationCompletion": {
+      "type": "string",
+      "enum": [
+        "activated",
+        "dismissed"
+      ]
+    },
+    "TaskNotificationEffect": {
+      "type": "object",
+      "properties": {
+        "notification_id": {
+          "type": "string"
+        },
+        "revision": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "task_id": {
+          "type": "string"
+        },
+        "workspace_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "workspace_id",
+        "notification_id",
+        "task_id",
+        "revision"
+      ]
+    }
+  }
+}

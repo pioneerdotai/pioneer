@@ -1,7 +1,7 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-pub const MARKDOWN_AST_VERSION: u16 = 1;
+pub const MARKDOWN_AST_VERSION: u16 = 2;
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Default, PartialEq, Eq)]
 pub struct MarkdownDocument {
@@ -37,7 +37,28 @@ pub enum MarkdownBlock {
         language: Option<String>,
         text: String,
     },
+    Table(MarkdownTable),
     Rule,
+}
+
+/// Structured cells and the original GFM fragment with its used reference
+/// definitions, without Quote/List prefixes.
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+#[schemars(inline)]
+pub struct MarkdownTable {
+    pub headers: Vec<MarkdownInline>,
+    pub rows: Vec<Vec<MarkdownInline>>,
+    pub alignments: Vec<MarkdownTableAlignment>,
+    pub source: String,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum MarkdownTableAlignment {
+    None,
+    Left,
+    Center,
+    Right,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]

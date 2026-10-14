@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SkillsActionPublication",
+  "type": "object",
+  "properties": {
+    "kind": {
+      "$ref": "#/$defs/SkillsActionKind"
+    },
+    "operation_id": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "revision": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "state": {
+      "$ref": "#/$defs/SkillsActionState"
+    }
+  },
+  "required": [
+    "operation_id",
+    "revision",
+    "state",
+    "kind"
+  ],
+  "$defs": {
+    "SkillsActionKind": {
+      "type": "string",
+      "enum": [
+        "policy",
+        "remove",
+        "remove_pack"
+      ]
+    },
+    "SkillsActionState": {
+      "type": "string",
+      "enum": [
+        "pending",
+        "succeeded",
+        "failed",
+        "cancelled"
+      ]
+    }
+  }
+}

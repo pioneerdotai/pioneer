@@ -1,0 +1,290 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AgentsDocumentPublication",
+  "type": "object",
+  "properties": {
+    "access": {
+      "type": "boolean"
+    },
+    "close_ready": {
+      "type": "boolean"
+    },
+    "content": {
+      "type": "string"
+    },
+    "edit_revision": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "load": {
+      "$ref": "#/$defs/AgentsDocEditorLoadState"
+    },
+    "owner_generation": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "revision": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "save": {
+      "$ref": "#/$defs/AgentsDocEditorSaveState"
+    },
+    "scope": {
+      "$ref": "#/$defs/AgentsDocEditorScope"
+    }
+  },
+  "required": [
+    "scope",
+    "revision",
+    "edit_revision",
+    "owner_generation",
+    "content",
+    "load",
+    "save",
+    "access",
+    "close_ready"
+  ],
+  "$defs": {
+    "AgentsDocEditorLoadState": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "loading"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "loaded"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "failed"
+            },
+            "value": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "value"
+          ]
+        }
+      ]
+    },
+    "AgentsDocEditorSaveState": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "clean"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "dirty"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "saving"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "saved"
+            },
+            "saved_at": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          "required": [
+            "kind",
+            "saved_at"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "error"
+            },
+            "message": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "message"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "conflict"
+            },
+            "local_content": {
+              "type": "string"
+            },
+            "remote_doc": {
+              "$ref": "#/$defs/ThreadAgentsDocPayload"
+            }
+          },
+          "required": [
+            "kind",
+            "local_content",
+            "remote_doc"
+          ]
+        }
+      ]
+    },
+    "AgentsDocEditorScope": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "root"
+            },
+            "workspace_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "workspace_id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "folder_id": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "const": "folder"
+            },
+            "workspace_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "workspace_id",
+            "folder_id"
+          ]
+        }
+      ]
+    },
+    "ThreadAgentsDocPayload": {
+      "type": "object",
+      "properties": {
+        "content": {
+          "type": "string"
+        },
+        "content_sha256": {
+          "type": "string"
+        },
+        "created_at": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "folder_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/$defs/ThreadAgentsDocStatus"
+        },
+        "title": {
+          "type": "string"
+        },
+        "updated_at": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "version": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "workspace_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "workspace_id",
+        "status",
+        "title",
+        "content",
+        "content_sha256",
+        "version",
+        "created_at",
+        "updated_at"
+      ]
+    },
+    "ThreadAgentsDocStatus": {
+      "type": "string",
+      "enum": [
+        "draft",
+        "active",
+        "archived"
+      ]
+    }
+  }
+}

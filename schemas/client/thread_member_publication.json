@@ -1,0 +1,583 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ThreadMemberPublication",
+  "type": "object",
+  "properties": {
+    "directory_request": {
+      "$ref": "#/$defs/ThreadMemberReadState"
+    },
+    "generation": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "member_directory": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/MemberSummary"
+      }
+    },
+    "mention_candidates": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/ComposerMentionCandidate"
+      }
+    },
+    "participants": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/ThreadParticipantSummary"
+      }
+    },
+    "participants_request": {
+      "$ref": "#/$defs/ThreadMemberReadState"
+    },
+    "presentation": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ThreadScopePresentation"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "request": {
+      "$ref": "#/$defs/ThreadMemberRequestState"
+    },
+    "revision": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "thread_id": {
+      "type": "string"
+    },
+    "workspace_id": {
+      "type": "string"
+    },
+    "workspace_members": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/MemberSummary"
+      }
+    },
+    "workspace_request": {
+      "$ref": "#/$defs/ThreadMemberReadState"
+    }
+  },
+  "required": [
+    "thread_id",
+    "workspace_id",
+    "revision",
+    "generation",
+    "workspace_members",
+    "member_directory",
+    "participants",
+    "mention_candidates",
+    "workspace_request",
+    "directory_request",
+    "participants_request",
+    "request"
+  ],
+  "$defs": {
+    "AuthorizationRolePresentation": {
+      "description": "Server-owned presentation metadata for the authenticated role. The key is\ndeliberately open-ended: clients display this object but never derive\nauthorization decisions from it.",
+      "type": "object",
+      "properties": {
+        "built_in": {
+          "type": "boolean"
+        },
+        "description": {
+          "type": "string"
+        },
+        "display_name": {
+          "type": "string"
+        },
+        "key": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "key",
+        "display_name",
+        "description",
+        "built_in"
+      ]
+    },
+    "ComposerMentionCandidate": {
+      "type": "object",
+      "properties": {
+        "avatar_revision": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "display_name": {
+          "type": "string"
+        },
+        "nickname": {
+          "type": "string"
+        },
+        "principal_id": {
+          "$ref": "#/$defs/PrincipalId"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "principal_id",
+        "display_name",
+        "nickname"
+      ]
+    },
+    "MemberSummary": {
+      "type": "object",
+      "properties": {
+        "avatar_revision": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "display_name": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/PrincipalKind"
+        },
+        "lifecycle_managed": {
+          "description": "Server-owned target trait. Clients may combine it with caller\ncapabilities for presentation, but never infer it from identity kind\nor a well-known role key.",
+          "type": "boolean"
+        },
+        "nickname": {
+          "type": "string"
+        },
+        "principal_id": {
+          "$ref": "#/$defs/PrincipalId"
+        },
+        "role": {
+          "description": "Server-owned role label. Clients display it verbatim and never infer\nrole semantics from `kind` or a well-known key.",
+          "$ref": "#/$defs/AuthorizationRolePresentation"
+        },
+        "role_key": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RoleKey"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "status": {
+          "$ref": "#/$defs/PrincipalStatus"
+        }
+      },
+      "required": [
+        "principal_id",
+        "kind",
+        "display_name",
+        "nickname",
+        "role",
+        "lifecycle_managed",
+        "status"
+      ]
+    },
+    "PrincipalId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "PrincipalKind": {
+      "type": "string",
+      "enum": [
+        "superuser",
+        "user"
+      ]
+    },
+    "PrincipalStatus": {
+      "type": "string",
+      "enum": [
+        "active",
+        "suspended",
+        "removed"
+      ]
+    },
+    "RoleKey": {
+      "type": "string",
+      "maxLength": 32,
+      "minLength": 1,
+      "pattern": "^[a-z][a-z0-9_-]{0,31}$"
+    },
+    "ThreadMemberReadState": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "idle"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "loading"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "ready"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "failed"
+            },
+            "message": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "message"
+          ]
+        }
+      ]
+    },
+    "ThreadMemberRequestState": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "action": {
+              "$ref": "#/$defs/ThreadScopeAction"
+            },
+            "kind": {
+              "type": "string",
+              "const": "loading"
+            }
+          },
+          "required": [
+            "kind",
+            "action"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "ready"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "action": {
+              "$ref": "#/$defs/ThreadScopeAction"
+            },
+            "kind": {
+              "type": "string",
+              "const": "failed"
+            },
+            "message": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "action",
+            "message"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "cancelled"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        }
+      ]
+    },
+    "ThreadParticipantRow": {
+      "type": "object",
+      "properties": {
+        "avatar_revision": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "can_remove": {
+          "type": "boolean"
+        },
+        "display_name": {
+          "type": "string"
+        },
+        "is_current_principal": {
+          "type": "boolean"
+        },
+        "nickname": {
+          "type": "string"
+        },
+        "principal_id": {
+          "$ref": "#/$defs/PrincipalId"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "principal_id",
+        "display_name",
+        "nickname",
+        "is_current_principal",
+        "can_remove"
+      ]
+    },
+    "ThreadParticipantSummary": {
+      "type": "object",
+      "properties": {
+        "principal_id": {
+          "$ref": "#/$defs/PrincipalId"
+        }
+      },
+      "required": [
+        "principal_id"
+      ]
+    },
+    "ThreadPresentationCapabilities": {
+      "type": "object",
+      "properties": {
+        "can_bind_artifacts": {
+          "type": "boolean"
+        },
+        "can_cancel_agent_execution": {
+          "type": "boolean"
+        },
+        "can_cancel_tasks": {
+          "type": "boolean"
+        },
+        "can_control_cli_runtime": {
+          "type": "boolean"
+        },
+        "can_create_task": {
+          "type": "boolean"
+        },
+        "can_manage_private_participants": {
+          "type": "boolean"
+        },
+        "can_manage_thread": {
+          "type": "boolean"
+        },
+        "can_move": {
+          "type": "boolean"
+        },
+        "can_observe_agent_execution": {
+          "type": "boolean"
+        },
+        "can_read": {
+          "type": "boolean"
+        },
+        "can_read_artifacts": {
+          "type": "boolean"
+        },
+        "can_respond_to_agent_requests": {
+          "type": "boolean"
+        },
+        "can_resume_agent_execution": {
+          "type": "boolean"
+        },
+        "can_review_tasks": {
+          "type": "boolean"
+        },
+        "can_start_turn": {
+          "type": "boolean"
+        },
+        "can_steer_agent_execution": {
+          "type": "boolean"
+        },
+        "can_write": {
+          "type": "boolean"
+        },
+        "can_write_artifacts": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "can_read",
+        "can_write",
+        "can_start_turn",
+        "can_observe_agent_execution",
+        "can_cancel_agent_execution",
+        "can_resume_agent_execution",
+        "can_steer_agent_execution",
+        "can_respond_to_agent_requests",
+        "can_control_cli_runtime",
+        "can_create_task",
+        "can_review_tasks",
+        "can_cancel_tasks",
+        "can_read_artifacts",
+        "can_write_artifacts",
+        "can_bind_artifacts",
+        "can_manage_thread",
+        "can_manage_private_participants",
+        "can_move"
+      ]
+    },
+    "ThreadScopeAction": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "list_participants"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "add_participant"
+            },
+            "principal_id": {
+              "$ref": "#/$defs/PrincipalId"
+            }
+          },
+          "required": [
+            "kind",
+            "principal_id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "remove_participant"
+            },
+            "principal_id": {
+              "$ref": "#/$defs/PrincipalId"
+            }
+          },
+          "required": [
+            "kind",
+            "principal_id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "update_visibility"
+            },
+            "visibility": {
+              "$ref": "#/$defs/ThreadVisibility"
+            }
+          },
+          "required": [
+            "kind",
+            "visibility"
+          ]
+        }
+      ]
+    },
+    "ThreadScopePresentation": {
+      "type": "object",
+      "properties": {
+        "candidate_members": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ThreadParticipantRow"
+          }
+        },
+        "capabilities": {
+          "$ref": "#/$defs/ThreadPresentationCapabilities"
+        },
+        "is_closed": {
+          "type": "boolean"
+        },
+        "is_user_thread": {
+          "type": "boolean"
+        },
+        "participants": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ThreadParticipantRow"
+          }
+        },
+        "show_workspace_explanation": {
+          "type": "boolean"
+        },
+        "visibility": {
+          "$ref": "#/$defs/ThreadVisibilityPresentation"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "visibility",
+        "is_user_thread",
+        "is_closed",
+        "capabilities",
+        "participants",
+        "candidate_members",
+        "show_workspace_explanation"
+      ]
+    },
+    "ThreadVisibility": {
+      "description": "User-selectable visibility for ordinary user threads.\n\nInternal task/system threads deliberately have no public selectable value.",
+      "type": "string",
+      "enum": [
+        "private",
+        "workspace"
+      ]
+    },
+    "ThreadVisibilityPresentation": {
+      "type": "string",
+      "enum": [
+        "private",
+        "workspace",
+        "unknown"
+      ]
+    }
+  }
+}
