@@ -655,11 +655,31 @@ pub(crate) async fn maintain(
             Ok(false) => return Ok(true),
             Ok(true) => {
                 let check = progress.conversion.take().expect("copy validation");
-                maintain_layout(store, &check.layout, true).await?;
+                let deleted = maintain_layout(store, &check.layout, true).await?;
+                progress
+                    .acknowledge_physical(check.layout.kind, deleted)
+                    .await;
                 return Ok(true);
             }
             Err(error) => {
+                // Resource/DB errors are retryable, never durable corruption.
+                if error.downcast_ref::<sea_orm::DbErr>().is_some() {
+                    return Err(error);
+                }
                 let check = progress.conversion.take().expect("copy validation");
+                let current = layout::Entity::find_by_id((
+                    check.layout.manifest_id.clone(),
+                    check.layout.kind,
+                ))
+                .one(&store.connection)
+                .await?;
+                let header = history::Entity::find_by_id(&check.header.id)
+                    .one(&store.connection)
+                    .await?;
+                if current.as_ref() != Some(&check.layout) || header.as_ref() != Some(&check.header)
+                {
+                    return Ok(true);
+                }
                 layout::Entity::update_many()
                     .col_expr(layout::Column::Failed, Expr::val(1))
                     .col_expr(layout::Column::Pending, Expr::val(0))
@@ -712,19 +732,23 @@ pub(crate) async fn maintain(
                 progress.conversion = Some(StagedCopyCheck::new(h, l)?);
                 return Ok(true);
             }
-            if let Err(error) = maintain_layout(store, &l, false).await {
-                if error.downcast_ref::<sea_orm::DbErr>().is_some() {
+            let deleted = match maintain_layout(store, &l, false).await {
+                Ok(deleted) => deleted,
+                Err(error) => {
+                    if error.downcast_ref::<sea_orm::DbErr>().is_some() {
+                        return Err(error);
+                    }
+                    layout::Entity::update_many()
+                        .col_expr(layout::Column::Failed, Expr::val(1))
+                        .col_expr(layout::Column::Pending, Expr::val(0))
+                        .filter(layout::Column::ManifestId.eq(&l.manifest_id))
+                        .filter(layout::Column::Kind.eq(kind))
+                        .exec(&store.connection)
+                        .await?;
                     return Err(error);
                 }
-                layout::Entity::update_many()
-                    .col_expr(layout::Column::Failed, Expr::val(1))
-                    .col_expr(layout::Column::Pending, Expr::val(0))
-                    .filter(layout::Column::ManifestId.eq(&l.manifest_id))
-                    .filter(layout::Column::Kind.eq(kind))
-                    .exec(&store.connection)
-                    .await?;
-                return Err(error);
-            }
+            };
+            progress.acknowledge_physical(kind, deleted).await;
             return Ok(true);
         }
     }
@@ -763,7 +787,11 @@ pub(crate) async fn maintain(
     Ok(false)
 }
 
-async fn maintain_layout(store: &CrudStore, l: &layout::Model, verified: bool) -> Result<()> {
+async fn maintain_layout(
+    store: &CrudStore,
+    l: &layout::Model,
+    verified: bool,
+) -> Result<Option<super::frozen_storage_lifetime::PhysicalDeleteResult>> {
     let h = history::Entity::find_by_id(&l.manifest_id)
         .one(&store.connection)
         .await?
@@ -771,7 +799,7 @@ async fn maintain_layout(store: &CrudStore, l: &layout::Model, verified: bool) -
     if l.active == 0 {
         if let Some(prefix) = l.copy_to {
             publish(store, &h, l, prefix, verified).await?;
-            return Ok(());
+            return Ok(None);
         }
         let mut matched = l.compared;
         let count = if l.kind == 0 {
@@ -860,8 +888,13 @@ async fn maintain_layout(store: &CrudStore, l: &layout::Model, verified: bool) -
         let mut bytes = 0;
         let mut keys = Vec::new();
         for (ordinal, size, actual) in sizes {
-            ensure!(size == actual, "duplicate row declared bytes mismatch");
-            ensure!((0..=BYTES).contains(&size), "invalid duplicate row size");
+            if size != actual || !(0..=BYTES).contains(&size) {
+                // Bad redundant payload is not evidence of a bad logical
+                // layout. Keep it and advance this finite cleanup visit;
+                // healthy rows above this local cap belong to lifetime sweep.
+                end = ordinal + 1;
+                continue;
+            }
             if bytes + size > BYTES {
                 break;
             }
@@ -869,6 +902,8 @@ async fn maintain_layout(store: &CrudStore, l: &layout::Model, verified: bool) -
             end = ordinal + 1;
             keys.push((ordinal, size));
         }
+        let statements =
+            super::frozen_storage_lifetime::duplicate_cleanup_statements(&h, l, &keys)?;
         let tx = store.connection.begin().await?;
         let current = layout::Entity::find_by_id((h.id.clone(), l.kind))
             .one(&tx)
@@ -876,7 +911,7 @@ async fn maintain_layout(store: &CrudStore, l: &layout::Model, verified: bool) -
             .ok_or_else(|| anyhow::anyhow!("cleanup layout removed"))?;
         if current.cleanup_next != l.cleanup_next {
             tx.commit().await?;
-            return Ok(());
+            return Ok(None);
         }
         // The generic lifetime sweep separately validates all reverse layouts
         // in paged progress. Duplicate cleanup never guesses the health of a
@@ -889,11 +924,14 @@ async fn maintain_layout(store: &CrudStore, l: &layout::Model, verified: bool) -
             .one(&tx)
             .await?
             .is_some();
-        if !foreign {
-            for (ordinal, size) in keys {
-                super::frozen_storage_lifetime::delete_free_key(&tx, &h.id, l.kind, ordinal, size)
-                    .await?;
-            }
+        let mut deleted = None;
+        if let Some((guard, delete)) = statements {
+            deleted = Some(if !foreign && tx.query_one_raw(guard).await?.is_some() {
+                let rows = tx.query_all_raw(delete).await?;
+                super::frozen_storage_lifetime::PhysicalDeleteResult::from_rows(&rows)?
+            } else {
+                super::frozen_storage_lifetime::PhysicalDeleteResult::refused()
+            });
         }
         layout::Entity::update_many()
             .col_expr(layout::Column::CleanupNext, Expr::val(end))
@@ -906,8 +944,9 @@ async fn maintain_layout(store: &CrudStore, l: &layout::Model, verified: bool) -
             .exec(&tx)
             .await?;
         tx.commit().await?;
+        return Ok(deleted);
     }
-    Ok(())
+    Ok(None)
 }
 
 /// Private existing-worker progress for restart verification. Pending layout
@@ -943,15 +982,17 @@ impl StagedCopyCheck {
     async fn step(&mut self, store: &CrudStore) -> Result<bool> {
         checked_copy_dependencies(&store.connection, &self.header, &self.layout).await?;
         if !self.base_started {
-            self.base_started = true;
             if let Some(base) = &self.layout.candidate {
                 let header = history::Entity::find_by_id(base)
                     .one(&store.connection)
                     .await?
                     .ok_or_else(|| anyhow::anyhow!("copy base removed"))?;
                 self.base_layout = Some(crate::frozen_lifetime::LayoutScan::new(header, 0, 2)?);
-                return Ok(false);
             }
+            // Publish this stage only after every fallible base read/setup.
+            // No candidate is a separate completed (empty) base stage.
+            self.base_started = true;
+            return Ok(false);
         }
         if let Some(scan) = self.base_layout.as_mut() {
             scan.step(store).await?;
