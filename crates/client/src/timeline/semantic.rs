@@ -4529,7 +4529,10 @@ mod tests {
             {
                 *html_publications = vec![publication.clone()];
             }
-            let blocks = vec![turn_work_block("thread_a", "block_work", "002"), answer];
+            let blocks = vec![
+                turn_work_block("thread_a", &work_block_id("turn_a"), "002"),
+                answer,
+            ];
             let mut state = SemanticTimelineState::default();
             apply_thread_timeline_page(
                 &mut state,
