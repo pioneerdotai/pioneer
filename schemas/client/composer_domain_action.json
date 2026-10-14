@@ -101,6 +101,26 @@
     {
       "type": "object",
       "properties": {
+        "RemoveAttachment": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "RemoveAttachment"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
         "MarkAttachmentsFailed": {
           "type": "object",
           "properties": {
@@ -189,6 +209,83 @@
       "additionalProperties": false,
       "required": [
         "AddCapability"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "AddCapabilities": {
+          "type": "object",
+          "properties": {
+            "capabilities": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/ComposerCapability"
+              }
+            }
+          },
+          "required": [
+            "capabilities"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "AddCapabilities"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "ToggleMcpSelection": {
+          "type": "object",
+          "properties": {
+            "key": {
+              "type": "string"
+            },
+            "server_rows": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/SelectableMcpCapability"
+              }
+            },
+            "tool_rows": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/SelectableMcpCapability"
+              }
+            }
+          },
+          "required": [
+            "server_rows",
+            "tool_rows",
+            "key"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "ToggleMcpSelection"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "RemoveSkillSelection": {
+          "type": "object",
+          "properties": {
+            "selection": {
+              "$ref": "#/$defs/ComposerSkillSelection"
+            }
+          },
+          "required": [
+            "selection"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "RemoveSkillSelection"
       ]
     },
     {
@@ -1202,6 +1299,15 @@
         }
       ]
     },
+    "McpCapabilityUnavailableReason": {
+      "type": "string",
+      "enum": [
+        "DisabledByPolicy",
+        "RuntimeUnavailable",
+        "RuntimeNotReady",
+        "NoToolCatalog"
+      ]
+    },
     "McpScopeKind": {
       "type": "string",
       "enum": [
@@ -1214,6 +1320,65 @@
       "maxLength": 21,
       "minLength": 21,
       "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "SelectableMcpCapability": {
+      "type": "object",
+      "properties": {
+        "description": {
+          "type": "string"
+        },
+        "key": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        },
+        "raw_tool_name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "scope_kind": {
+          "$ref": "#/$defs/McpScopeKind"
+        },
+        "selectable": {
+          "type": "boolean"
+        },
+        "server_id": {
+          "type": "string"
+        },
+        "server_name": {
+          "type": "string"
+        },
+        "tools_count": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
+        },
+        "unavailable_reason": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/McpCapabilityUnavailableReason"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "key",
+        "label",
+        "description",
+        "server_id",
+        "server_name",
+        "scope_kind",
+        "selectable"
+      ]
     },
     "SelectablePackedSkillCapability": {
       "type": "object",

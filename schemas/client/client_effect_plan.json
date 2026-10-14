@@ -1,0 +1,488 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ClientEffectPlan",
+  "type": "object",
+  "properties": {
+    "effect": {
+      "$ref": "#/$defs/ClientPlannedEffect"
+    },
+    "generation": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "operation_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "operation_id",
+    "generation",
+    "effect"
+  ],
+  "$defs": {
+    "AdministrationPresentationEffect": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "copy_administration_activation"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        }
+      ]
+    },
+    "AuthSessionId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "ClientEffect": {
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "RefreshWorkspaceList",
+            "RefreshGatewaySettings",
+            "RefreshProviderLists",
+            "QueueSkillsRefresh",
+            "EnqueueInFlightTurnsForResume"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "UnsubscribeThreads": {
+              "type": "object",
+              "properties": {
+                "thread_ids": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              },
+              "required": [
+                "thread_ids"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "UnsubscribeThreads"
+          ]
+        }
+      ]
+    },
+    "ClientPlannedEffect": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ClientEffect"
+        },
+        {
+          "$ref": "#/$defs/AdministrationPresentationEffect"
+        },
+        {
+          "$ref": "#/$defs/ProviderPresentationEffect"
+        },
+        {
+          "$ref": "#/$defs/GatewaySessionStorageEffect"
+        },
+        {
+          "$ref": "#/$defs/OnboardingPlatformEffect"
+        }
+      ]
+    },
+    "DeviceId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "GatewayEndpoint": {
+      "type": "object",
+      "properties": {
+        "gateway_base_url": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/GatewayEndpointKind"
+        },
+        "name": {
+          "type": "string"
+        },
+        "server_gateway_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GatewayId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "service_name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "session_ref": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "workspace_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "name",
+        "gateway_base_url",
+        "kind"
+      ]
+    },
+    "GatewayEndpointKind": {
+      "type": "string",
+      "enum": [
+        "local",
+        "remote"
+      ]
+    },
+    "GatewayId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "GatewayRegistry": {
+      "type": "object",
+      "properties": {
+        "active_gateway_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "installation_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "local": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GatewayEndpoint"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "remotes": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/GatewayEndpoint"
+          }
+        },
+        "version": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "version"
+      ]
+    },
+    "GatewaySessionEnvelope": {
+      "type": "object",
+      "properties": {
+        "device_id": {
+          "$ref": "#/$defs/DeviceId"
+        },
+        "gateway_id": {
+          "$ref": "#/$defs/GatewayId"
+        },
+        "installation_id": {
+          "type": "string"
+        },
+        "pending_refresh_request_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "principal_id": {
+          "$ref": "#/$defs/PrincipalId"
+        },
+        "refresh_expires_at_unix": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "refresh_generation": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "refresh_token": {
+          "type": "string"
+        },
+        "schema_version": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "session_id": {
+          "$ref": "#/$defs/AuthSessionId"
+        },
+        "token_family_id": {
+          "$ref": "#/$defs/TokenFamilyId"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "gateway_id",
+        "principal_id",
+        "device_id",
+        "session_id",
+        "token_family_id",
+        "installation_id",
+        "refresh_generation",
+        "refresh_expires_at_unix",
+        "refresh_token"
+      ]
+    },
+    "GatewaySessionStorageEffect": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "DeleteGatewaySession": {
+              "type": "object",
+              "properties": {
+                "endpoint": {
+                  "$ref": "#/$defs/GatewayEndpoint"
+                }
+              },
+              "required": [
+                "endpoint"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "DeleteGatewaySession"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "ReadGatewaySession": {
+              "type": "object",
+              "properties": {
+                "endpoint": {
+                  "$ref": "#/$defs/GatewayEndpoint"
+                }
+              },
+              "required": [
+                "endpoint"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "ReadGatewaySession"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "PersistGatewaySession": {
+              "type": "object",
+              "properties": {
+                "endpoint": {
+                  "$ref": "#/$defs/GatewayEndpoint"
+                },
+                "envelope": {
+                  "$ref": "#/$defs/GatewaySessionEnvelope"
+                }
+              },
+              "required": [
+                "endpoint",
+                "envelope"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "PersistGatewaySession"
+          ]
+        }
+      ]
+    },
+    "OnboardingPlatformEffect": {
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "LoadGatewayEnvironment"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "RemoveGatewayBindingJournal": {
+              "type": "object",
+              "properties": {
+                "gateway_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "gateway_id"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "RemoveGatewayBindingJournal"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "PersistGatewayRegistry": {
+              "type": "object",
+              "properties": {
+                "registry": {
+                  "$ref": "#/$defs/GatewayRegistry"
+                }
+              },
+              "required": [
+                "registry"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "PersistGatewayRegistry"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "PrepareLocalGateway": {
+              "type": "object",
+              "properties": {
+                "endpoint": {
+                  "$ref": "#/$defs/GatewayEndpoint"
+                },
+                "recover": {
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "endpoint",
+                "recover"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "PrepareLocalGateway"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "CreateLocalDeviceActivation": {
+              "type": "object",
+              "properties": {
+                "endpoint_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "endpoint_id"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "CreateLocalDeviceActivation"
+          ]
+        }
+      ]
+    },
+    "PrincipalId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "ProviderPresentationEffect": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "copy_provider_diagnostics"
+            },
+            "value": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "value"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "open_provider_path"
+            },
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "path"
+          ]
+        }
+      ]
+    },
+    "TokenFamilyId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    }
+  }
+}

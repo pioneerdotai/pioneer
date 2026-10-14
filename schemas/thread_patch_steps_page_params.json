@@ -32,10 +32,23 @@
     "PatchThreadHistoryCursor": {
       "type": "object",
       "properties": {
+        "committedAtUnixMs": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
         "ordinal": {
           "type": "integer",
           "format": "uint64",
           "minimum": 0
+        },
+        "sourceThreadId": {
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "turnId": {
           "type": "string"

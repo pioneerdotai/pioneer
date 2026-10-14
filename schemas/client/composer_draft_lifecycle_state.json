@@ -390,7 +390,7 @@
       ]
     },
     "ComposerDomainDraft": {
-      "description": "Complete, shell-neutral draft payload used by desktop and mobile.\n\nHot editor state (cursor, IME composition, focus, keyboard, sheets) is not\npart of this value. A shell snapshots its text only at lifecycle boundaries\nsuch as switching threads.",
+      "description": "Complete, shell-neutral draft payload used by desktop and mobile.\n\nHot editor state (cursor, IME composition, focus, keyboard, sheets) is not\npart of this value. Client owns the text; shells publish user edits and\napply controlled publications without moving cursor or IME state into Client.",
       "type": "object",
       "properties": {
         "domain": {

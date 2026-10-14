@@ -1,0 +1,435 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SkillsDetailsPublication",
+  "type": "object",
+  "properties": {
+    "health": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/SkillHealthItem"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "request": {
+      "$ref": "#/$defs/SkillsLoadState"
+    },
+    "revision": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "skill": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/SkillListItem"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "skill_id": {
+      "$ref": "#/$defs/SkillId"
+    },
+    "workspace_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "workspace_id",
+    "skill_id",
+    "revision",
+    "request"
+  ],
+  "$defs": {
+    "SkillAuditTimelineItem": {
+      "type": "object",
+      "properties": {
+        "action": {
+          "type": "string"
+        },
+        "created_at": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "decision": {
+          "type": "string"
+        },
+        "details_json": {
+          "type": "string"
+        },
+        "reason_code": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "action",
+        "decision",
+        "created_at",
+        "details_json"
+      ]
+    },
+    "SkillDependencyDiagnostic": {
+      "type": "object",
+      "properties": {
+        "hint": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "name",
+        "status",
+        "hint"
+      ]
+    },
+    "SkillHealthItem": {
+      "type": "object",
+      "properties": {
+        "dependency_diagnostics": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/SkillDependencyDiagnostic"
+          }
+        },
+        "owner": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "recent_audit": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/SkillAuditTimelineItem"
+          }
+        },
+        "security_findings": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/SkillSecurityFinding"
+          }
+        },
+        "skill_id": {
+          "$ref": "#/$defs/SkillId"
+        },
+        "slug": {
+          "type": "string"
+        },
+        "source_kind": {
+          "type": "string"
+        },
+        "trust_gate": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/SkillTrustGateStatus"
+          }
+        },
+        "trust_level": {
+          "type": "string"
+        },
+        "validation_issues": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/SkillValidationDiagnostic"
+          }
+        }
+      },
+      "required": [
+        "skill_id",
+        "slug",
+        "source_kind",
+        "trust_level"
+      ]
+    },
+    "SkillHealthSummary": {
+      "type": "object",
+      "properties": {
+        "dependency_failures": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/SkillDependencyDiagnostic"
+          }
+        },
+        "security_blocks": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/SkillSecurityFinding"
+          }
+        },
+        "status": {
+          "type": "string"
+        },
+        "validation_issues": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/SkillValidationDiagnostic"
+          }
+        }
+      },
+      "required": [
+        "status"
+      ]
+    },
+    "SkillId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "SkillInstallState": {
+      "type": "object",
+      "properties": {
+        "install_path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "installed": {
+          "type": "boolean"
+        },
+        "lifecycle_editable": {
+          "type": "boolean",
+          "default": true
+        },
+        "managed": {
+          "type": "boolean"
+        },
+        "updated_at": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        }
+      },
+      "required": [
+        "managed",
+        "installed"
+      ]
+    },
+    "SkillListItem": {
+      "type": "object",
+      "properties": {
+        "description": {
+          "type": "string"
+        },
+        "display_name": {
+          "type": "string"
+        },
+        "fingerprint": {
+          "type": "string"
+        },
+        "health": {
+          "$ref": "#/$defs/SkillHealthSummary"
+        },
+        "install": {
+          "$ref": "#/$defs/SkillInstallState"
+        },
+        "owner": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pack": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SkillPackMembership"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "policy": {
+          "$ref": "#/$defs/SkillPolicyState"
+        },
+        "skill_id": {
+          "$ref": "#/$defs/SkillId"
+        },
+        "slug": {
+          "type": "string"
+        },
+        "source_kind": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string"
+        },
+        "status_reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "trust_level": {
+          "type": "string"
+        },
+        "version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "skill_id",
+        "slug",
+        "source_kind",
+        "display_name",
+        "description",
+        "fingerprint",
+        "trust_level",
+        "install",
+        "policy",
+        "health",
+        "status"
+      ]
+    },
+    "SkillPackId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "SkillPackMembership": {
+      "type": "object",
+      "properties": {
+        "member_key": {
+          "type": "string"
+        },
+        "pack_id": {
+          "$ref": "#/$defs/SkillPackId"
+        }
+      },
+      "required": [
+        "pack_id",
+        "member_key"
+      ]
+    },
+    "SkillPolicyState": {
+      "type": "object",
+      "properties": {
+        "allow_implicit_invocation": {
+          "type": "boolean"
+        },
+        "allow_implicit_invocation_editable": {
+          "type": "boolean",
+          "default": true
+        },
+        "enabled": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "enabled",
+        "allow_implicit_invocation"
+      ]
+    },
+    "SkillSecurityFinding": {
+      "type": "object",
+      "properties": {
+        "message": {
+          "type": "string"
+        },
+        "path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "rule_id": {
+          "type": "string"
+        },
+        "severity": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "rule_id",
+        "severity",
+        "message"
+      ]
+    },
+    "SkillTrustGateStatus": {
+      "type": "object",
+      "properties": {
+        "allowed": {
+          "type": "boolean"
+        },
+        "minimum_trust": {
+          "type": "string"
+        },
+        "tool_kind": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "tool_kind",
+        "minimum_trust",
+        "allowed"
+      ]
+    },
+    "SkillValidationDiagnostic": {
+      "type": "object",
+      "properties": {
+        "code": {
+          "type": "string"
+        },
+        "field_path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "level": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "code",
+        "level",
+        "message"
+      ]
+    },
+    "SkillsLoadState": {
+      "type": "string",
+      "enum": [
+        "idle",
+        "loading",
+        "ready",
+        "failed",
+        "cancelled",
+        "forbidden"
+      ]
+    }
+  }
+}

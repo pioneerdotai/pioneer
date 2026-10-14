@@ -30,6 +30,13 @@
         "null"
       ]
     },
+    "visible_thread_ids": {
+      "description": "Additional ancestor Thread capsules in which this child execution\nrequest is intentionally visible and actionable.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
     "workspace_id": {
       "type": "string"
     }
@@ -76,6 +83,7 @@
       "enum": [
         "command_approval",
         "file_change_approval",
+        "permission_approval",
         "user_input",
         "other"
       ]

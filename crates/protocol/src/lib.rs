@@ -228,7 +228,7 @@ pub use jsonrpc::{
 };
 pub use markdown::{
     MARKDOWN_AST_VERSION, MarkdownBlock, MarkdownDocument, MarkdownInline, MarkdownList,
-    MarkdownListItem, MarkdownMark, MarkdownMarkKind,
+    MarkdownListItem, MarkdownMark, MarkdownMarkKind, MarkdownTable, MarkdownTableAlignment,
 };
 pub use mcp::{
     McpAuditEventSummary, McpChangedAction, McpChangedItem, McpChangedNotification,

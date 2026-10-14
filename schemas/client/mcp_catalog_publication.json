@@ -1,0 +1,182 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "McpCatalogPublication",
+  "type": "object",
+  "properties": {
+    "request": {
+      "$ref": "#/$defs/McpLoadState"
+    },
+    "revision": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "servers": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/McpListItem"
+      }
+    },
+    "workspace_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "workspace_id",
+    "revision",
+    "servers",
+    "request"
+  ],
+  "$defs": {
+    "McpListItem": {
+      "type": "object",
+      "properties": {
+        "display_name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "policy": {
+          "$ref": "#/$defs/McpPolicyState"
+        },
+        "prompts_count": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "required": {
+          "type": "boolean"
+        },
+        "resource_templates_count": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "resources_count": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "runtime": {
+          "$ref": "#/$defs/McpRuntimeStatus"
+        },
+        "scope": {
+          "$ref": "#/$defs/McpScopeKind"
+        },
+        "status": {
+          "$ref": "#/$defs/McpServerStatus"
+        },
+        "tools_count": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "scope",
+        "policy",
+        "required",
+        "runtime",
+        "tools_count",
+        "resources_count",
+        "resource_templates_count",
+        "prompts_count",
+        "status"
+      ]
+    },
+    "McpLoadState": {
+      "type": "string",
+      "enum": [
+        "idle",
+        "loading",
+        "ready",
+        "failed",
+        "cancelled",
+        "forbidden"
+      ]
+    },
+    "McpPolicyState": {
+      "type": "object",
+      "properties": {
+        "allow_implicit_invocation": {
+          "type": "boolean"
+        },
+        "enabled": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "enabled",
+        "allow_implicit_invocation"
+      ]
+    },
+    "McpRuntimeState": {
+      "type": "string",
+      "enum": [
+        "not_started",
+        "disabled",
+        "starting",
+        "ready",
+        "degraded",
+        "auth_required",
+        "failed",
+        "stopping",
+        "stopped",
+        "restarting"
+      ]
+    },
+    "McpRuntimeStatus": {
+      "type": "object",
+      "properties": {
+        "last_seen_at": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "live": {
+          "type": "boolean"
+        },
+        "state": {
+          "$ref": "#/$defs/McpRuntimeState"
+        }
+      },
+      "required": [
+        "state",
+        "live"
+      ]
+    },
+    "McpScopeKind": {
+      "type": "string",
+      "enum": [
+        "workspace",
+        "user"
+      ]
+    },
+    "McpServerStatus": {
+      "type": "string",
+      "enum": [
+        "not_started",
+        "disabled",
+        "starting",
+        "ready",
+        "degraded",
+        "auth_required",
+        "failed",
+        "stopping",
+        "stopped",
+        "restarting"
+      ]
+    }
+  }
+}

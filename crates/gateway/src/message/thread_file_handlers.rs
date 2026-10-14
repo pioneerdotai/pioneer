@@ -309,6 +309,11 @@ fn markdown_block_contains_exact_link(block: &MarkdownBlock, href: &str) -> bool
         MarkdownBlock::Quote { blocks } => blocks
             .iter()
             .any(|block| markdown_block_contains_exact_link(block, href)),
+        MarkdownBlock::Table(table) => table
+            .headers
+            .iter()
+            .chain(table.rows.iter().flatten())
+            .any(|inline| markdown_inline_contains_exact_link(inline, href)),
         MarkdownBlock::Code { .. } | MarkdownBlock::Rule => false,
     }
 }
