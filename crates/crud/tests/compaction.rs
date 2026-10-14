@@ -7844,7 +7844,7 @@ async fn old_layout_sizes_and_new_shared_payload_keep_exact_logical_stream() {
 }
 
 #[tokio::test]
-async fn duplicate_cleanup_rejects_understated_physical_bytes_after_layout_switch() {
+async fn duplicate_cleanup_keeps_understated_physical_bytes_and_advances_after_layout_switch() {
     let store = store().await;
     let refs = shared_refs(2);
     shared_capture(&store, "base", &refs, true).await;
@@ -7873,11 +7873,12 @@ async fn duplicate_cleanup_rejects_understated_physical_bytes_after_layout_switc
     );
     // Seed legacy corruption only; tested cleanup runs with CHECKs restored.
     let oversized = serde_json::json!({"padding":"x".repeat(300_000)}).to_string();
+    let corrupted_payload = oversized.clone();
     let tx = store.database_connection().begin().await.unwrap();
     tx.execute_unprepared("PRAGMA ignore_check_constraints=ON")
         .await
         .unwrap();
-    tx.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,"UPDATE compaction_frozen_message_data SET reference_json=?1,bytes=2 WHERE manifest_id='legacy' AND ordinal=0",[oversized.into()])).await.unwrap();
+    tx.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,"UPDATE compaction_frozen_message_data SET reference_json=?1,bytes=2 WHERE manifest_id='legacy' AND ordinal=0",[corrupted_payload.into()])).await.unwrap();
     tx.execute_unprepared("PRAGMA ignore_check_constraints=OFF")
         .await
         .unwrap();
@@ -7886,13 +7887,51 @@ async fn duplicate_cleanup_rejects_understated_physical_bytes_after_layout_switc
         store
             .compact_frozen_storage_quantum(&mut progress)
             .await
-            .is_err()
+            .unwrap()
+    );
+    let state = store.database_connection().query_one_raw(Statement::from_string(DbBackend::Sqlite,
+        "SELECT active,failed,pending,cleanup_next,cleanup_to FROM compaction_frozen_layout WHERE manifest_id='legacy' AND kind=0")).await.unwrap().unwrap();
+    assert_eq!(
+        (
+            state.try_get::<i64>("", "active").unwrap(),
+            state.try_get::<i64>("", "failed").unwrap(),
+            state.try_get::<i64>("", "pending").unwrap(),
+            state.try_get::<i64>("", "cleanup_next").unwrap(),
+            state.try_get::<i64>("", "cleanup_to").unwrap(),
+        ),
+        (1, 0, 0, 2, 2),
+        "a bad redundant row must not quarantine the published layout"
+    );
+    let mut finished = false;
+    for _ in 0..128 {
+        if !store
+            .compact_frozen_storage_quantum(&mut progress)
+            .await
+            .unwrap()
+        {
+            finished = true;
+            break;
+        }
+    }
+    assert!(finished, "the poison row must not cause endless retries");
+    let remaining = store.database_connection().query_all_raw(Statement::from_string(DbBackend::Sqlite,
+        "SELECT ordinal,reference_json,bytes FROM compaction_frozen_message_data WHERE manifest_id='legacy' ORDER BY ordinal")).await.unwrap();
+    assert_eq!(remaining.len(), 1, "the healthy duplicate must be deleted");
+    assert_eq!(remaining[0].try_get::<i64>("", "ordinal").unwrap(), 0);
+    assert_eq!(remaining[0].try_get::<i64>("", "bytes").unwrap(), 2);
+    assert_eq!(
+        remaining[0]
+            .try_get::<String>("", "reference_json")
+            .unwrap(),
+        oversized,
+        "cleanup must preserve the unsuitable physical row exactly"
     );
     assert_eq!(
         frozen_count(&store, "compaction_frozen_message_data").await,
-        4
+        3
     );
     assert_eq!(shared_read(&store, "base").await, refs);
+    assert_eq!(shared_read(&store, "legacy").await, refs);
 }
 
 #[tokio::test]
