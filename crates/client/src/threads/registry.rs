@@ -6581,6 +6581,13 @@ mod tests {
                 },
                 NonZeroUsize::new(16).unwrap(),
             );
+            let semantic = core.thread_semantic_snapshot("a");
+            let range = semantic.thread("a").unwrap().work_range("turn").unwrap();
+            assert_eq!(
+                range.initial_request_status,
+                crate::timeline::semantic::TimelineRequestStatus::Idle
+            );
+            assert!(core.thread_semantic_in_flight("a").is_empty());
             let (sender, receiver) = std::sync::mpsc::channel();
             *core.thread_request_sender.lock().unwrap() = Some(sender);
             core.apply_thread_conversation_event("ws", work_delta(" more"), None);
@@ -9161,6 +9168,17 @@ impl ClientCore {
         notification: bool,
         automatic_hydration: bool,
     ) {
+        // Presentation hints can arrive before the request worker is installed.
+        // Defer admission so they do not become terminal hydration failures.
+        if automatic_hydration
+            && self
+                .thread_request_sender
+                .lock()
+                .expect("thread request sender poisoned")
+                .is_none()
+        {
+            return;
+        }
         if let Some(request) = self.accept_timeline_request(
             action,
             None,
