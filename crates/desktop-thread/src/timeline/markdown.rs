@@ -303,8 +303,7 @@ impl Element for MarkdownLinkText {
                         let hovered_index = state.hovered_index.clone();
                         let hover_rows = rows.clone();
                         let hover_hitbox = hitbox.clone();
-                        let current_view = window.current_view();
-                        window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
+                        window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, _| {
                             if phase == DispatchPhase::Bubble {
                                 let index = hover_hitbox
                                     .is_hovered(window)
@@ -317,7 +316,7 @@ impl Element for MarkdownLinkText {
                                     })
                                     .flatten();
                                 if hovered_index.replace(index) != index {
-                                    cx.notify(current_view);
+                                    window.refresh();
                                 }
                             }
                         });
