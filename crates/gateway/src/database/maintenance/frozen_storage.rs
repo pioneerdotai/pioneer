@@ -14,7 +14,7 @@ const BATCH_STEPS: usize = 64;
 // lifetime metadata/fragments use the other bounded slots without extra timers.
 const BATCH_CONVERSION_STEPS: usize = 1;
 const BATCH_TIME: Duration = Duration::from_millis(50);
-const BATCH_PAUSE: Duration = Duration::from_millis(100);
+const BATCH_PAUSE: Duration = Duration::from_millis(1);
 
 pub(crate) async fn run(store: Arc<CrudStore>, cancellation: CancellationToken) {
     let store = store.with_maintenance_access();
@@ -51,6 +51,7 @@ async fn batch(
     step_limit: usize,
     time_limit: Duration,
 ) -> anyhow::Result<bool> {
+    progress.revisit_completed_cleanup();
     let started = Instant::now();
     // Poll an empty path at most once per batch, but reconsider it in the next
     // batch: new conversion work must not wait for a long proof traversal's EOF.
@@ -461,7 +462,7 @@ mod tests {
         assert!(!admits(1, BATCH_TIME));
         assert!(!admits(1, Duration::from_secs(30)));
         // A DB queue wait ends this batch, but cannot multiply the next pause.
-        assert_eq!(pause_after_batch(true), Duration::from_millis(100));
+        assert_eq!(pause_after_batch(true), Duration::from_millis(1));
         assert_eq!(pause_after_batch(false), Duration::from_secs(60));
     }
 }
