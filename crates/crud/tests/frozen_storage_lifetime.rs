@@ -625,10 +625,25 @@ async fn pending_failed_candidate_holds_known_backing_and_does_not_block_another
     header(&store, "free", "other", "other-thread", 1, 0).await;
     sql(&store,"INSERT INTO compaction_frozen_layout(manifest_id,kind,active,pending,candidate,failed) VALUES('pending',0,0,1,'base',1)",vec![]).await;
     let mut p = FrozenStorageLifetimeProgress::default();
-    assert!(drive(&store, &mut p, 2500).await > 0);
+    assert_eq!(
+        drive(&store, &mut p, 2500).await,
+        0,
+        "a retained failed dependency must not trigger worker backoff"
+    );
     assert_eq!(expired(&store, "pending").await, 0);
     assert_eq!(expired(&store, "base").await, 0);
     assert_eq!(physical(&store, "base").await, 3);
+    assert_eq!(physical(&store, "pending").await, 3);
+    assert_eq!(
+        n(
+            &store,
+            "SELECT failed AS n FROM compaction_frozen_layout WHERE manifest_id=?1 AND kind=0",
+            "pending"
+        )
+        .await,
+        1,
+        "maintenance must preserve existing failed markers"
+    );
     assert_eq!(expired(&store, "free").await, 1);
     assert_eq!(physical(&store, "free").await, 0);
 }
@@ -740,8 +755,21 @@ async fn malformed_physical_keys_are_not_delete_permission() {
     let store = fixture().await;
     header(&store, "p", "ws", "thread", 1, 0).await;
     sql(&store,"INSERT INTO compaction_frozen_import_data(manifest_id,ordinal,message_ordinal,source_scope,source_id,source_version,source_thread,proof_json,bytes) VALUES('p',0,-1,'event:turn','e','event-revision:1','thread','{}',2)",vec![]).await;
+    // A valid physical tail after the poison key must still be swept.
+    sql(&store,"INSERT INTO compaction_frozen_import_data(manifest_id,ordinal,message_ordinal,source_scope,source_id,source_version,source_thread,proof_json,bytes) VALUES('p',1,0,'event:turn','healthy','event-revision:1','thread','{}',2)",vec![]).await;
     let mut p = FrozenStorageLifetimeProgress::default();
-    assert!(drive(&store, &mut p, 2000).await > 0);
+    assert_eq!(
+        drive(&store, &mut p, 2000).await,
+        0,
+        "a poison physical key must not trigger worker backoff"
+    );
+    assert_eq!(expired(&store, "p").await, 1);
+    assert_eq!(physical(&store, "p").await, 1);
+    assert_eq!(
+        n(&store, "SELECT message_ordinal AS n FROM compaction_frozen_import_data WHERE manifest_id=?1 AND ordinal=0", "p").await,
+        -1,
+        "the malformed key must stay intact while healthy rows are deleted"
+    );
     assert_eq!(
         n(
             &store,
@@ -832,15 +860,22 @@ async fn malformed_legacy_locator_is_scoped_and_reconciliation_continues_after_r
     header(&store, "blocked", "ws", "thread", 1, 0).await;
     header(&store, "free", "other", "other-thread", 1, 0).await;
     let mut p = FrozenStorageLifetimeProgress::default();
-    assert!(drive(&store, &mut p, 2500).await > 0);
+    assert_eq!(
+        drive(&store, &mut p, 2500).await,
+        0,
+        "an unresolved locator must hold its scope without worker backoff"
+    );
     assert_eq!(expired(&store, "blocked").await, 0);
+    assert_eq!(physical(&store, "blocked").await, 1);
     assert_eq!(expired(&store, "free").await, 1);
+    assert_eq!(physical(&store, "free").await, 0);
     store
         .upsert_cli_runtime_thread_binding(binding("{}".into()))
         .await
         .unwrap();
     drive(&store, &mut p, 2000).await;
     assert_eq!(expired(&store, "blocked").await, 1);
+    assert_eq!(physical(&store, "blocked").await, 0);
 }
 
 #[tokio::test]
@@ -854,7 +889,11 @@ async fn oversized_legacy_locator_keeps_unknown_scope_without_starving_other_wor
     header(&store, "blocked", "ws", "thread", 1, 0).await;
     header(&store, "free", "other", "other-thread", 1, 0).await;
     let mut progress = FrozenStorageLifetimeProgress::default();
-    assert!(drive(&store, &mut progress, 2500).await > 0);
+    assert_eq!(
+        drive(&store, &mut progress, 2500).await,
+        0,
+        "an oversized locator must hold its scope without worker backoff"
+    );
     assert_eq!(n(&store, "SELECT count(*) AS n FROM thread_cli_runtime_binding WHERE thread_id=?1 AND frozen_manifest_id='';", "thread").await, 1);
     assert_eq!(expired(&store, "blocked").await, 0);
     assert_eq!(physical(&store, "blocked").await, 1);
