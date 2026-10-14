@@ -1741,6 +1741,7 @@ pub(crate) fn html_preview_fixture(
     };
     let models = json!({key:{"html-vision":{
         "id":"html-vision","name":"HTML vision fixture","provider":key,"api":endpoint,
+        "baseUrl":"https://html-preview.invalid",
         "contextWindow":1000000,"maxTokens":16000,"reasoning":false,"input":["text","image"],
         "cost":{},"inputOrigin":{"kind":"source","expression":"HTML preview contract fixture"},"output":["text"],
         "inputConstraints":{"image":{"roles":["user"]}}

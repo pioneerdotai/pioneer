@@ -11722,10 +11722,36 @@ mod tests {
     #[tokio::test]
     async fn html_response_artifacts_enter_existing_result_binding_without_model_handles() {
         let (processor, task, execution, lineage) = task_artifact_harness("html_response").await;
+        let db = processor.crud_store.database_connection();
+        use sea_orm::{DbBackend, Statement};
+        // Real task sources are internal children of the visible collaboration root.
+        for (thread_id, access_class) in [
+            (&lineage.root_thread_id, "workspace"),
+            (&execution.thread_id, "internal"),
+        ] {
+            db.execute_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES (?,?,'','agent','model','provider','active','user',?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+                [thread_id.clone().into(), task.workspace_id.clone().into(), access_class.into()],
+            ))
+            .await
+            .expect("HTML response collaboration thread");
+        }
+        db.execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES (?,?,'in_progress','conversation','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+            [execution.turn_id.clone().into(), execution.thread_id.clone().into()],
+        ))
+        .await
+        .expect("live HTML publication turn");
+        let generation = pioneer_crud::current_policy_generation(&db)
+            .await
+            .expect("HTML publication policy")
+            .get();
         let mut sources = Vec::new();
         for index in 0..2 {
             let call = format!("html_call_{index}");
-            let source = processor.artifact_service.ingest_bytes(IngestArtifactBytesRequest {
+            let source = processor.artifact_service.ingest_tool_bytes(IngestArtifactBytesRequest {
                 workspace_id: task.workspace_id.clone(),
                 primary_thread_id: Some(execution.thread_id.clone()),
                 bytes: format!("<p>document {index}</p>").into_bytes(),
@@ -11741,10 +11767,9 @@ mod tests {
                     direction: ArtifactBindingDirection::Output, role: Some(ArtifactRole::Tool), item_index: Some(index),
                 }),
                 metadata: std::collections::BTreeMap::from([("htmlTool".into(), serde_json::json!({"version":1,"publication":true,"turnId":execution.turn_id,"callId":call,"index":"document","title":format!("document {index}")}))]),
-            }).await.expect("HTML publication");
+            }, format!("html-response-{index}"), generation, tokio_util::sync::CancellationToken::new()).await.expect("HTML publication");
             sources.push(source);
         }
-        let db = processor.crud_store.database_connection();
         let echo = |index| {
             let call = format!("html_call_{index}");
             let now = chrono::Utc::now().fixed_offset();

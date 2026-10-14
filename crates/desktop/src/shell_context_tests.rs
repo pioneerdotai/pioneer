@@ -337,7 +337,7 @@ fn replacing_thread_or_route_hides_the_previous_root_even_if_a_frame_retains_it(
             .iter()
             .all(|thread| thread.read_with(cx, |thread, _| !thread.is_visible()))
     );
-    core.activate_thread(Some("parent"), Some("workspace"));
+    core.open_workspace_thread("workspace".to_owned(), Some("parent".to_owned()), None);
     cx.run_until_parked();
     let previous = shell.read_with(cx, |shell, _| shell.thread.as_ref().unwrap().1.clone());
     cx.update(|window, cx| shell.update(cx, |shell, cx| shell.close(window, cx)));

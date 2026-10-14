@@ -772,42 +772,42 @@ mod tests {
                 // notify its retained owner so Fast renders the new generation.
                 cx.notify();
             });
-        });
-        // update flushed the stale deferred commit; keep fresh frames queued
-        // until the intervening gesture cancels the pending follow.
-        timeline.read_with(cx, |view, _| {
-            assert!(Rc::ptr_eq(
-                &previous_sizes,
-                &view
-                    .thread_timeline_view_state
-                    .prepared
-                    .as_ref()
-                    .unwrap()
-                    .item_sizes
-            ));
-            assert!(view.measurement_coordinator.draw.is_some());
-            assert!(
-                view.thread_timeline_view_state
-                    .borrow()
-                    .pending_follow_bottom
-            );
-        });
-        // A gesture between measure and commit wins over the earlier follow.
-        cx.update(|window, cx| {
-            timeline.update(cx, |view, cx| {
-                crate::timeline::controller::DesktopTimelineController::dispatch(
-                    view,
-                    &crate::timeline::controller::TimelineAction::Scroll { delta_y: px(12.) },
-                    window,
-                    cx,
-                );
-                assert!(
-                    !view
-                        .thread_timeline_view_state
-                        .borrow()
-                        .pending_follow_bottom
-                );
-            })
+            let timeline = timeline.clone();
+            let previous_sizes = previous_sizes.clone();
+            window.defer(cx, move |window, cx| {
+                timeline.update(cx, |view, cx| {
+                    // The stale commit has run, but Test mode has not yet drawn
+                    // the notified replacement generation.
+                    assert!(Rc::ptr_eq(
+                        &previous_sizes,
+                        &view
+                            .thread_timeline_view_state
+                            .prepared
+                            .as_ref()
+                            .unwrap()
+                            .item_sizes
+                    ));
+                    assert!(view.measurement_coordinator.draw.is_some());
+                    assert!(
+                        view.thread_timeline_view_state
+                            .borrow()
+                            .pending_follow_bottom
+                    );
+                    // A gesture between measure and commit wins over the follow.
+                    crate::timeline::controller::DesktopTimelineController::dispatch(
+                        view,
+                        &crate::timeline::controller::TimelineAction::Scroll { delta_y: px(12.) },
+                        window,
+                        cx,
+                    );
+                    assert!(
+                        !view
+                            .thread_timeline_view_state
+                            .borrow()
+                            .pending_follow_bottom
+                    );
+                });
+            });
         });
         cx.update(|window, cx| window.draw(cx).clear(cx));
         cx.run_until_parked();

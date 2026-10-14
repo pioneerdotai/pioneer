@@ -160,7 +160,13 @@ pub(crate) async fn restore_cli_mcp_session_launch(
             raw_tool_name: current.raw_tool_name,
             description: current.description,
             input_schema: current.canonical_schema,
-            annotations: Some(annotations),
+            // HTML declares no canonical annotations; its durable binding stores
+            // effective {} hints. Preserve absence after frozen identity validation.
+            annotations: if binding.server_installation_id == pioneer_tools::html::HTML_SERVER_ID {
+                None
+            } else {
+                Some(annotations)
+            },
             timeout_ms: current.effective_timeout_ms,
             catalog_version: current.catalog_version,
             installation_fingerprint: current.installation_fingerprint,
