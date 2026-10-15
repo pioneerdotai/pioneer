@@ -261,6 +261,21 @@ pub struct AuthRefreshParams {
     pub client_version: Option<String>,
 }
 
+/// Renews admission on an already authenticated WebSocket. Refresh issuance
+/// remains a separate restricted exchange; only persisted access is presented here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AuthAccessRenewParams {
+    pub access_token: AuthSecretString,
+    pub refresh_generation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AuthAccessRenewResponse {
+    pub access_expires_at_unix: u64,
+}
+
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(transparent)]
 pub struct AuthSecretString(String);

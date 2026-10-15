@@ -258,7 +258,12 @@ impl crate::core::ClientCore {
         &self,
         mut operation: impl FnMut() -> Result<T, ArtifactAccessError>,
     ) -> Result<T, ArtifactAccessError> {
-        let generation = self.gateway_http_generation();
+        let access = self
+            .transport_runtime()
+            .ws_command_sender()
+            .current_gateway_http_access()
+            .ok();
+        let generation = access.as_ref().map(|access| access.generation);
         let endpoint = self
             .gateway_registry()
             .and_then(|registry| registry.active_gateway_id.clone());
@@ -269,9 +274,19 @@ impl crate::core::ClientCore {
             };
             !self.is_stopped()
                 && self.authorization_connection_generation() == authorization
-                && self
-                    .refresh_configured_gateway_session_after_unauthorized(endpoint, generation)
-                    .is_ok()
+                && (self
+                    .transport_runtime()
+                    .ws_command_sender()
+                    .current_gateway_http_access()
+                    .ok()
+                    .zip(access.as_ref())
+                    .is_some_and(|(current, previous)| {
+                        current.generation != previous.generation
+                            || current.access_token != previous.access_token
+                    })
+                    || self
+                        .refresh_configured_gateway_session_after_unauthorized(endpoint, generation)
+                        .is_ok())
                 && self.authorization_connection_generation() == authorization
         })
     }

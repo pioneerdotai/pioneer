@@ -11,6 +11,7 @@ pub mod methods {
     pub const AUTH_SESSION_REVOKE: &str = "auth/session/revoke";
     pub const AUTH_LOGOUT: &str = "auth/logout";
     pub const AUTH_DEVICE_CREATE: &str = "auth/device/create";
+    pub const AUTH_ACCESS_RENEW: &str = "auth/access_renew";
     pub const AUTH_REFRESH: &str = "auth/refresh";
     pub const AUTH_DEVICE_ACTIVATE: &str = "auth/device/activate";
     pub const INVITE_CREATE: &str = "invite/create";
@@ -163,9 +164,13 @@ pub mod methods {
     pub const ARTIFACT_UPLOAD_FINISH: &str = "artifact/upload/finish";
     pub const ARTIFACT_UPLOAD_ABORT: &str = "artifact/upload/abort";
 
-    /// Authenticated JSON-RPC methods accepted by the normal Gateway
-    /// transport. Restricted credential exchange methods are deliberately
-    /// excluded and listed in `RESTRICTED_AUTH_METHODS`.
+    /// Authenticated transport control, handled before domain dispatch.
+    /// This renews an existing admission and never issues refresh credentials.
+    pub const AUTHENTICATED_TRANSPORT_METHODS: &[&str] = &[AUTH_ACCESS_RENEW];
+
+    /// Authenticated domain JSON-RPC methods accepted by the normal Gateway
+    /// dispatcher. Transport control and restricted credential exchanges are
+    /// listed separately.
     pub const NORMAL_METHODS: &[&str] = &[
         AUTH_ME,
         AUTHORIZATION_CAPABILITIES,

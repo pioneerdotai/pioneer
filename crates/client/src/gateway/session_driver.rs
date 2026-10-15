@@ -348,25 +348,6 @@ impl ClientCore {
             owner.next_attempt = Some(Instant::now() + Duration::from_millis(delay.max(1)));
         } else {
             owner.next_attempt = None;
-            let restored = self
-                .gateway_session()
-                .connections
-                .get(id)
-                .and_then(|state| {
-                    state
-                        .connected
-                        .as_ref()
-                        .map(|session| session.connection_id)
-                });
-            let previous = connection.and_then(|state| {
-                state
-                    .connected
-                    .as_ref()
-                    .map(|session| session.connection_id)
-            });
-            if restored.is_some() && restored != previous {
-                self.resume_visible_thread_delivery();
-            }
         }
     }
 }
