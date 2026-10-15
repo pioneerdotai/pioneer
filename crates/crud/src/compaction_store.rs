@@ -205,6 +205,20 @@ impl CrudStore {
         )
         .await
     }
+    pub async fn compaction_invalid_completion_progress(
+        &self,
+        workspace: &str,
+        thread: &str,
+        owner: &str,
+    ) -> Result<Option<OperationRecord>> {
+        repositories::compaction::compaction_invalid_completion_progress(
+            &self.connection,
+            workspace,
+            thread,
+            owner,
+        )
+        .await
+    }
     pub async fn compaction_operation(&self, id: &str) -> Result<Option<OperationRecord>> {
         repositories::compaction::compaction_operation(&self.connection, id).await
     }
@@ -1237,6 +1251,41 @@ impl CrudStore {
             operation,
             execution_turn,
             deadline_ms,
+        )
+        .await
+    }
+
+    /// Called only by foreground admission for a distinct user execution.
+    pub async fn compaction_resume_invalid_completion(
+        &self,
+        operation: &str,
+        execution_turn: &str,
+        deadline_ms: u64,
+    ) -> Result<bool> {
+        repositories::compaction::runner::compaction_resume_invalid_completion(
+            self,
+            operation,
+            execution_turn,
+            deadline_ms,
+        )
+        .await
+    }
+
+    pub async fn compaction_finish_execution(
+        &self,
+        operation: &str,
+        execution_turn: Option<&str>,
+        deadline_ms: u64,
+        status: &str,
+        outcome: &str,
+    ) -> Result<()> {
+        repositories::compaction::runner::compaction_finish_execution(
+            &self.connection,
+            operation,
+            execution_turn,
+            deadline_ms,
+            status,
+            outcome,
         )
         .await
     }
