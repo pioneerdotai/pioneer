@@ -176,6 +176,18 @@ async fn html_preview_lists_filter_before_identity_pagination_and_preserve_publi
         .await
         .unwrap();
     preview_maintenance(&harness.service).await;
+    // The adopted image shares its call with the retired previews. A new
+    // worker pass must skip their tombstones while preserving the adopted file.
+    preview_maintenance(&harness.service).await;
+    for id in all_ids.iter().filter(|id| !visible.contains(*id)) {
+        assert!(
+            harness
+                .store
+                .get_artifact_version_blob("ws_a", id, None)
+                .await
+                .is_err()
+        );
+    }
     assert!(
         harness
             .store
@@ -752,6 +764,8 @@ async fn html_preview_shared_blob_concurrent_ingestion_and_failed_deletion_resta
 
     // A cancelled first-party HTML registration leaves a durable staged orphan.
     // The same-age ordinary orphan is outside automatic preview cleanup policy.
+    // Missing temporary metadata is ordinary provenance, not a nullable
+    // cleanup decision. Keep this blob unmarked at the real repository boundary.
     let ordinary = storage
         .local
         .put_bytes(

@@ -530,6 +530,10 @@ async fn release(store: &CrudStore, candidate: artifact::Model) -> Result<()> {
     }
     let artifacts = artifact::Entity::find().filter(artifact::Column::WorkspaceId.eq(&candidate.workspace_id))
         .filter(artifact::Column::PrimaryThreadId.eq(thread))
+        // An adopted sibling can revisit this call after the other files retire.
+        // Skip only completed retirements; unknown missing-version rows still
+        // fail the provenance checks below and preserve their remaining owners.
+        .filter(sea_orm::sea_query::Expr::cust("NOT (artifact.current_version_id IS NULL AND artifact.status='deleted' AND json_extract(CASE WHEN json_valid(artifact.metadata_json) THEN artifact.metadata_json ELSE '{}' END,'$.htmlTool.retention') IS 'released')"))
         .filter(sea_orm::sea_query::Expr::cust(temporary_preview_predicate("artifact")))
         .filter(sea_orm::sea_query::Expr::cust_with_values("json_extract(CASE WHEN json_valid(metadata_json) THEN metadata_json ELSE '{}' END,'$.htmlTool.turnId')=? AND json_extract(CASE WHEN json_valid(metadata_json) THEN metadata_json ELSE '{}' END,'$.htmlTool.callId')=?",[turn,call]))
         .limit(5).all(&store.connection).await?;
@@ -706,7 +710,7 @@ impl CrudStore {
     )> {
         // Page the source rows first, even if every blob still has owners.
         // This bounds work independently of the number of GC candidates.
-        let rows=self.connection.query_all_raw(statement("SELECT b.workspace_id,b.id,b.storage_key,b.size_bytes,b.created_at<=?2 AND CASE WHEN json_valid(b.metadata_json) THEN json_extract(b.metadata_json,'$.htmlToolTemporary')=1 ELSE 0 END AND NOT EXISTS(SELECT 1 FROM artifact_version v WHERE v.blob_id=b.id) AND NOT EXISTS(SELECT 1 FROM artifact_projection p WHERE p.blob_id=b.id) AS orphan FROM artifact_blob b WHERE b.id>?1 ORDER BY b.id LIMIT 16",vec![after.into(),chrono::DateTime::from_timestamp_millis(cutoff_ms).ok_or_else(||anyhow::anyhow!("invalid artifact GC cutoff"))?.fixed_offset().into()])).await?;
+        let rows=self.connection.query_all_raw(statement("SELECT b.workspace_id,b.id,b.storage_key,b.size_bytes,b.created_at<=?2 AND CASE WHEN json_valid(b.metadata_json) THEN COALESCE(json_extract(b.metadata_json,'$.htmlToolTemporary')=1,0) ELSE 0 END AND NOT EXISTS(SELECT 1 FROM artifact_version v WHERE v.blob_id=b.id) AND NOT EXISTS(SELECT 1 FROM artifact_projection p WHERE p.blob_id=b.id) AS orphan FROM artifact_blob b WHERE b.id>?1 ORDER BY b.id LIMIT 16",vec![after.into(),chrono::DateTime::from_timestamp_millis(cutoff_ms).ok_or_else(||anyhow::anyhow!("invalid artifact GC cutoff"))?.fixed_offset().into()])).await?;
         let mut next = String::new();
         let mut candidates = Vec::new();
         for row in rows {
