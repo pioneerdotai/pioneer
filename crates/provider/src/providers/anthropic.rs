@@ -2532,10 +2532,21 @@ mod tests {
         )
         .get_or_create("anthropic")
         .unwrap();
-        let mut stream = provider
-            .stream_chat(request(vec![ChatMessage::user("start")]))
-            .await
-            .unwrap();
+        let mut request = request(vec![ChatMessage::user("start")]);
+        request.tools = Some(
+            ["first", "second"]
+                .into_iter()
+                .map(|name| crate::types::ToolDefinition {
+                    name: name.into(),
+                    description: "history fixture".into(),
+                    parameters: serde_json::json!({
+                        "type": "object",
+                        "properties": {"x": {"type": "integer"}},
+                    }),
+                })
+                .collect(),
+        );
+        let mut stream = provider.stream_chat(request).await.unwrap();
         let mut calls = Vec::new();
         let mut state = None;
         while let Some(chunk) = stream.next().await {

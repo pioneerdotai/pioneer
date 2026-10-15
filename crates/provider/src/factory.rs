@@ -107,6 +107,17 @@ pub(crate) fn create_provider_with_timeout_policy_and_proxy_and_base_url_and_aut
     base_url: Option<&str>,
     authority_fingerprint: &str,
 ) -> Result<Box<dyn Provider>> {
+    let azure = provider_definition(provider_name)
+        .is_some_and(|definition| definition.name == "azure-openai")
+        .then(|| {
+            crate::AzureResolvedConnection::from_values(
+                "fixture-resource".into(),
+                "fixture-deployment".into(),
+                crate::providers::AZURE_DEFAULT_API_VERSION.into(),
+                base_url.map(str::to_owned),
+            )
+        })
+        .transpose()?;
     create_provider_with_timeout_policy_and_proxy_and_base_url_and_resolved_azure(
         provider_name,
         api_key,
@@ -114,7 +125,7 @@ pub(crate) fn create_provider_with_timeout_policy_and_proxy_and_base_url_and_aut
         proxy_url,
         base_url,
         authority_fingerprint,
-        None,
+        azure.as_ref(),
     )
 }
 
@@ -601,7 +612,21 @@ mod tests {
         };
 
         for name in providers {
-            let provider = create_provider(name, "test-key").expect("provider should initialize");
+            let provider = if provider_definition(name)
+                .is_some_and(|definition| definition.name == "azure-openai")
+            {
+                create_provider_with_timeout_policy_and_proxy_and_base_url_and_authority(
+                    name,
+                    "test-key",
+                    ProviderTimeoutPolicy::default(),
+                    None,
+                    None,
+                    "fixture-authority",
+                )
+            } else {
+                create_provider(name, "test-key")
+            }
+            .expect("provider should initialize");
             let caps = provider.capabilities();
 
             for (part_type, support) in [

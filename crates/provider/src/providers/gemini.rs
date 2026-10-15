@@ -1764,10 +1764,21 @@ mod tests {
             )
             .get_or_create("gemini")
             .unwrap();
-            let mut stream = provider
-                .stream_chat(request(history.clone()))
-                .await
-                .unwrap();
+            let mut request = request(history.clone());
+            request.tools = Some(
+                ["first", "second"]
+                    .into_iter()
+                    .map(|name| crate::types::ToolDefinition {
+                        name: name.into(),
+                        description: "history fixture".into(),
+                        parameters: serde_json::json!({
+                            "type": "object",
+                            "properties": {"x": {"type": "integer"}},
+                        }),
+                    })
+                    .collect(),
+            );
+            let mut stream = provider.stream_chat(request).await.unwrap();
             let mut calls = Vec::new();
             let mut state = None;
             let mut final_count = 0;

@@ -1477,7 +1477,13 @@ mod tests {
 
     #[tokio::test]
     async fn actual_azure_entrypoints_reject_responses_only_tools_before_http() {
-        let provider = AzureOpenAiProvider::new("unused", "unused", "opaque-deployment");
+        let provider = AzureOpenAiProvider::with_base_url_and_timeout_policy(
+            "unused",
+            "unused",
+            "opaque-deployment",
+            "http://127.0.0.1:9",
+            Default::default(),
+        );
         for model in ["gpt-6-astra", "gpt-6.1-sol-2026-09-01"] {
             for parallel in [None, Some(true), Some(false)] {
                 for choice in [
@@ -1499,7 +1505,7 @@ mod tests {
                             .err()
                             .unwrap()
                             .to_string()
-                            .contains("Responses API")
+                            .contains("model does not support tool definitions/history")
                     );
                     assert!(
                         provider
@@ -1508,7 +1514,7 @@ mod tests {
                             .err()
                             .unwrap()
                             .to_string()
-                            .contains("Responses API")
+                            .contains("model does not support tool definitions/history")
                     );
                 }
             }

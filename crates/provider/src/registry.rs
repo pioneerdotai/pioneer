@@ -3704,7 +3704,7 @@ mod tests {
                     })
                 );
                 let classification = provider.classify_failure(&error).unwrap();
-                assert_eq!(classification.class, ProviderFailureClass::StreamStall);
+                assert_eq!(classification.class, ProviderFailureClass::StreamTruncated);
                 assert_eq!(classification.http_status, None);
                 assert_eq!(classification.error_reason, None);
                 assert_eq!(
