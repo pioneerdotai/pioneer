@@ -1232,7 +1232,7 @@ async fn resume_failed_operation(
                     deadline_ms=?2,snapshot=?3,execution_turn=?6
                WHERE id=?1 AND status='failed' AND outcome IS ?9 AND snapshot=?4
                AND (NOT ?10 OR (execution_turn IS ?11 AND execution_turn<>?6
-                   AND EXISTS (SELECT 1 FROM turn old WHERE old.id=compaction_operation.execution_turn AND old.status IN ('failed','completed'))
+                   AND EXISTS (SELECT 1 FROM turn old WHERE old.id=compaction_operation.execution_turn AND old.status IN ('failed','completed','blocked'))
                    AND EXISTS (SELECT 1 FROM turn new WHERE new.id=?6 AND new.status='in_progress' AND new.origin='user')))
                AND (EXISTS (SELECT 1 FROM compaction_operation_projection p
                    JOIN compaction_frozen_history h ON h.id=p.manifest_id

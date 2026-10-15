@@ -2,9 +2,7 @@
 use super::*;
 use pioneer_compaction::runner::{AttemptPurpose, SourceCursor};
 
-async fn failed_progress(
-    correction: bool,
-) -> (Fixture, PreparedOperation, OperationSnapshot, RunnerState) {
+async fn progress_fixture(correction: bool) -> (Fixture, PreparedOperation) {
     let text = if correction {
         "small".into()
     } else {
@@ -58,6 +56,20 @@ async fn failed_progress(
         target_identity: "resume-target".into(),
         target_tokens: 500,
     };
+    (f, prepared)
+}
+
+async fn failed_progress(
+    correction: bool,
+) -> (Fixture, PreparedOperation, OperationSnapshot, RunnerState) {
+    failed_progress_with_status(correction, "failed").await
+}
+
+async fn failed_progress_with_status(
+    correction: bool,
+    old_status: &str,
+) -> (Fixture, PreparedOperation, OperationSnapshot, RunnerState) {
+    let (f, prepared) = progress_fixture(correction).await;
     let snapshot = admit(&f, prepared.clone(), 10).await.unwrap();
     let runner = runner(&f, snapshot.clone(), !correction, "turn");
     assert_eq!(
@@ -74,9 +86,17 @@ async fn failed_progress(
     assert!(state.cursor > SourceCursor::default());
     assert!(state.previous_checkpoint.is_some());
     assert_eq!(state.attempts, if correction { 2 } else { 3 });
+    f.store
+        .database_connection()
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE turn SET status=? WHERE id='turn'",
+            [old_status.into()],
+        ))
+        .await
+        .unwrap();
     f.store.database_connection().execute_unprepared(
-        "UPDATE turn SET status='failed' WHERE id='turn';
-         INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at)
+        "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at)
          VALUES ('new-turn','thread','in_progress','conversation','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
     ).await.unwrap();
     (f, prepared, snapshot, state)
@@ -113,21 +133,16 @@ fn runner(f: &Fixture, snapshot: OperationSnapshot, fits: bool, turn: &str) -> C
 
 #[tokio::test]
 async fn new_user_admission_resumes_only_unfinished_portion_and_preserves_chain() {
-    for (correction, same_deadline, completed_turn) in [
-        (false, false, false),
-        (true, false, false),
-        (false, true, true),
+    for (correction, same_deadline, old_status) in [
+        (false, false, "failed"),
+        (true, false, "failed"),
+        (false, true, "completed"),
+        // CLI delivery-plan compilation leaves the old turn Blocked.
+        (false, false, "blocked"),
+        (true, false, "blocked"),
     ] {
-        let (f, mut prepared, snapshot, before) = failed_progress(correction).await;
-        if completed_turn {
-            // A failed background operation may be attached to a completed turn.
-            // Only the later foreground execution may resume it.
-            f.store
-                .database_connection()
-                .execute_unprepared("UPDATE turn SET status='completed' WHERE id='turn'")
-                .await
-                .unwrap();
-        }
+        let (f, mut prepared, snapshot, before) =
+            failed_progress_with_status(correction, old_status).await;
         let checkpoint = f
             .store
             .compaction_checkpoint(before.previous_checkpoint.as_deref().unwrap())
@@ -264,20 +279,13 @@ async fn new_user_admission_resumes_only_unfinished_portion_and_preserves_chain(
             .unwrap()
             .unwrap();
         assert_eq!(next.previous, before.previous_checkpoint);
-        let old_status = pioneer_entity::turn::Entity::find_by_id("turn")
+        let saved_status = pioneer_entity::turn::Entity::find_by_id("turn")
             .one(&f.store.database_connection())
             .await
             .unwrap()
             .unwrap()
             .status;
-        assert_eq!(
-            old_status,
-            if completed_turn {
-                "completed"
-            } else {
-                "failed"
-            }
-        );
+        assert_eq!(saved_status, old_status);
         let observations = f.store.database_connection().query_all_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
             "SELECT observation FROM compaction_attempt_observation WHERE operation_id=? ORDER BY attempt", [snapshot.id.into()])).await.unwrap();
         assert!(observations.len() > before.attempts as usize);
@@ -308,6 +316,9 @@ async fn invalid_completion_resume_refuses_incompatible_or_missing_evidence_with
         "stop",
         "head",
         "old-active",
+        "old-interrupted",
+        "blocked-stop",
+        "blocked-deleted",
         "system-turn",
         "finished-turn",
     ] {
@@ -363,6 +374,22 @@ async fn invalid_completion_resume_refuses_incompatible_or_missing_evidence_with
             ),
             "old-active" => (
                 Some("UPDATE turn SET status='in_progress' WHERE id='turn'"),
+                "fence changed",
+            ),
+            "old-interrupted" => (
+                Some("UPDATE turn SET status='interrupted' WHERE id='turn'"),
+                "fence changed",
+            ),
+            "blocked-stop" => (
+                Some(
+                    "UPDATE turn SET status='blocked' WHERE id='turn'; INSERT INTO compaction_execution_stop(owner,turn_id) VALUES ('resume-owner','turn')",
+                ),
+                "fence changed",
+            ),
+            "blocked-deleted" => (
+                Some(
+                    "UPDATE turn SET status='blocked',message_deleted_at=CURRENT_TIMESTAMP WHERE id='turn'",
+                ),
                 "fence changed",
             ),
             "system-turn" => (
@@ -630,4 +657,227 @@ async fn refreshed_source_plan_cannot_silently_recompute_saved_progress() {
         .try_get("", "n")
         .unwrap();
     assert_eq!(operations, 1);
+}
+
+#[tokio::test]
+async fn historical_invalid_completion_does_not_block_admission_after_head_advances() {
+    let (f, prepared_a) = progress_fixture(false).await;
+    let a = admit(&f, prepared_a.clone(), 10).await.unwrap();
+    // B is independently admitted on the same head while A is still running.
+    // Its raw plan also lets this test expire A's frozen input independently.
+    let mut prepared_b = prepared_a.clone();
+    prepared_b.target_identity = "already-admitted-B".into();
+    prepared_b.source_projection = None;
+    let b = admit(&f, prepared_b, 11).await.unwrap();
+    assert_ne!(a.id, b.id);
+    assert_eq!(
+        runner(&f, a.clone(), true, "turn")
+            .run(CancellationToken::new())
+            .await
+            .unwrap(),
+        CompactionExit::Failed(FailureKind::InvalidCompletion)
+    );
+    let state_a = f
+        .store
+        .compaction_runner_state(&a.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(state_a.cursor > SourceCursor::default());
+    assert_eq!(f.store.compaction_head(&a.owner).await.unwrap(), None);
+
+    // Apply B through the real runner, including its normal atomic head CAS.
+    let CompactionExit::Applied(head) = runner(&f, b.clone(), true, "turn")
+        .run(CancellationToken::new())
+        .await
+        .unwrap()
+    else {
+        panic!("B did not apply");
+    };
+    assert_eq!(
+        f.store.compaction_head(&a.owner).await.unwrap().as_deref(),
+        Some(head.as_str())
+    );
+    assert_eq!(
+        f.store
+            .compaction_operation(&b.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        "completed"
+    );
+    f.store.database_connection().execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+        "UPDATE compaction_frozen_history SET expired=1 WHERE id=(SELECT manifest_id FROM compaction_operation_projection WHERE operation_id=?)",
+        [a.id.clone().into()],
+    )).await.unwrap();
+    assert!(
+        f.store
+            .compaction_bound_source_projection(&a.id)
+            .await
+            .is_err()
+    );
+
+    // C uses B as its previous summary and selects only newly appended material.
+    f.store.database_connection().execute_unprepared(
+        "UPDATE turn SET status='completed' WHERE id='turn';
+         INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at)
+         VALUES ('new-turn','thread','in_progress','conversation','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+    ).await.unwrap();
+    let event = pioneer_crud::CanonicalTurnEventPayload::ItemCompleted(
+        pioneer_protocol::ItemCompletedNotification {
+            workspace_id: "ws".into(),
+            thread_id: "thread".into(),
+            turn_id: "new-turn".into(),
+            item: pioneer_protocol::TurnItem::AgentMessage {
+                id: "next-source".into(),
+                text: "漢字🌍".repeat(4_000),
+                phase: Default::default(),
+                markdown: None,
+                markdown_version: None,
+            },
+        },
+    );
+    let payload = serde_json::to_string(&event).unwrap();
+    f.store
+        .database_connection()
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "INSERT INTO turn_event(id,thread_id,turn_id,sequence,event_type,payload,created_at)
+         VALUES ('next-source','thread','new-turn',1,?,?,CURRENT_TIMESTAMP)",
+            [event.event_type().into(), payload.into()],
+        ))
+        .await
+        .unwrap();
+    let sources = f
+        .store
+        .compaction_source_page("ws", "thread", "new-turn", PagedSource::Event, 0)
+        .await
+        .unwrap();
+    let source = sources.entries[0].reference.clone();
+    let mut prepared_c = prepared_a;
+    prepared_c.execution_turn = "new-turn".into();
+    prepared_c.expected_checkpoint = Some(head.clone());
+    prepared_c.summary_basis = Some(head.clone());
+    prepared_c.source_projection = None;
+    prepared_c.target_identity = "new-plan-C".into();
+    prepared_c.plan.coverage = vec![source.clone()];
+    prepared_c.manifest = vec![ManifestEntry {
+        ordinal: 0,
+        unit: 0,
+        reference_only: false,
+        thread_id: "thread".into(),
+        source,
+    }];
+    prepared_c.projection_version = f
+        .store
+        .compaction_projection_version("ws", "thread")
+        .await
+        .unwrap();
+    prepared_c
+        .source_epochs
+        .insert("thread".into(), prepared_c.projection_version);
+    let calls_before_c = *f.provider.count.borrow();
+    let c = admit(&f, prepared_c.clone(), 20).await.unwrap();
+    assert_ne!(c.id, a.id);
+    assert_ne!(c.id, b.id);
+    assert_eq!(c.expected_checkpoint.as_deref(), Some(head.as_str()));
+    assert_eq!(
+        f.store
+            .compaction_operation(&c.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        "running"
+    );
+    let state_c = f
+        .store
+        .compaction_runner_state(&c.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(state_c.cursor, SourceCursor::default());
+    assert_eq!(state_c.attempts, 0);
+    assert_eq!(state_c.previous_checkpoint.as_deref(), Some(head.as_str()));
+    assert_eq!(*f.provider.count.borrow(), calls_before_c);
+    assert_eq!(
+        f.store
+            .compaction_operation(&a.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        "failed"
+    );
+    assert_eq!(
+        f.store
+            .compaction_runner_state(&a.id)
+            .await
+            .unwrap()
+            .unwrap(),
+        state_a
+    );
+    assert_eq!(
+        f.store.compaction_head(&a.owner).await.unwrap().as_deref(),
+        Some(head.as_str())
+    );
+
+    // Progress on B's current head must still fail fast for an incompatible plan.
+    f.provider.replies.lock().unwrap().extend([
+        Reply::Success,
+        Reply::Success,
+        Reply::InvalidCompletion,
+    ]);
+    assert_eq!(
+        runner(&f, c.clone(), true, "new-turn")
+            .run(CancellationToken::new())
+            .await
+            .unwrap(),
+        CompactionExit::Failed(FailureKind::InvalidCompletion)
+    );
+    let failed_c = f
+        .store
+        .compaction_runner_state(&c.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(failed_c.cursor > SourceCursor::default());
+    f.store.database_connection().execute_unprepared(
+        "UPDATE turn SET status='blocked' WHERE id='new-turn';
+         INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at)
+         VALUES ('next-turn','thread','in_progress','conversation','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+    ).await.unwrap();
+    prepared_c.execution_turn = "next-turn".into();
+    prepared_c.target_identity = "incompatible-current-plan".into();
+    let calls_after_c = *f.provider.count.borrow();
+    assert!(
+        admit(&f, prepared_c, 30)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("plan changed")
+    );
+    assert_eq!(*f.provider.count.borrow(), calls_after_c);
+    assert_eq!(
+        f.store
+            .compaction_runner_state(&c.id)
+            .await
+            .unwrap()
+            .unwrap(),
+        failed_c
+    );
+    let operations: i64 = f
+        .store
+        .database_connection()
+        .query_one_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT count(*) AS n FROM compaction_operation WHERE owner='resume-owner'",
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "n")
+        .unwrap();
+    assert_eq!(operations, 3);
 }

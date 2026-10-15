@@ -1043,7 +1043,9 @@ pub(crate) async fn compaction_operation_for_plan<C: ConnectionTrait>(
         .map(OperationRecord::from))
 }
 
-/// One bounded diagnostic lookup. Never supplies a cursor to a different plan.
+/// One bounded diagnostic lookup for progress on the current context head.
+/// Historical failures cannot obstruct new plans after the head advances.
+/// Never supplies a cursor to a different plan.
 pub(crate) async fn compaction_invalid_completion_progress<C: ConnectionTrait>(
     db: &C,
     workspace: &str,
@@ -1056,6 +1058,16 @@ pub(crate) async fn compaction_invalid_completion_progress<C: ConnectionTrait>(
         .filter(compaction_context::Column::ThreadId.eq(thread))
         .filter(compaction_operation::Column::Owner.eq(owner))
         .filter(compaction_operation::Column::Status.eq("failed"))
+        .filter(
+            Expr::col((
+                compaction_operation::Entity,
+                compaction_operation::Column::ExpectedHead,
+            ))
+            .binary(
+                BinOper::Is,
+                Expr::col((compaction_context::Entity, compaction_context::Column::Head)),
+            ),
+        )
         .filter(Expr::cust(
             r#"EXISTS (SELECT 1 FROM compaction_runner_state s
             WHERE s.operation_id=compaction_operation.id
