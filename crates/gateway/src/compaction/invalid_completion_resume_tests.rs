@@ -8,11 +8,12 @@ async fn progress_fixture(correction: bool) -> (Fixture, PreparedOperation) {
     } else {
         "漢字🌍".repeat(4_000)
     };
-    let replies = if correction {
-        vec![Reply::Success, Reply::InvalidCompletion]
+    let mut replies = if correction {
+        vec![Reply::Success]
     } else {
-        vec![Reply::Success, Reply::Success, Reply::InvalidCompletion]
+        vec![Reply::Success, Reply::Success]
     };
+    replies.extend([Reply::Invalid; 3]);
     let f = fixture(&text, replies, !correction, false).await;
     let manifest = f
         .store
@@ -71,9 +72,8 @@ async fn failed_progress_with_status(
 ) -> (Fixture, PreparedOperation, OperationSnapshot, RunnerState) {
     let (f, prepared) = progress_fixture(correction).await;
     let snapshot = admit(&f, prepared.clone(), 10).await.unwrap();
-    let runner = runner(&f, snapshot.clone(), !correction, "turn");
     assert_eq!(
-        runner.run(CancellationToken::new()).await.unwrap(),
+        run_until_invalid_completion(&f, snapshot.clone(), !correction, "turn").await,
         CompactionExit::Failed(FailureKind::InvalidCompletion)
     );
     assert_eq!(f.provider.active.load(Ordering::SeqCst), 0);
@@ -85,7 +85,8 @@ async fn failed_progress_with_status(
         .unwrap();
     assert!(state.cursor > SourceCursor::default());
     assert!(state.previous_checkpoint.is_some());
-    assert_eq!(state.attempts, if correction { 2 } else { 3 });
+    assert_eq!(state.attempts, if correction { 4 } else { 5 });
+    assert_eq!(state.portion_attempts, 3);
     f.store
         .database_connection()
         .execute_raw(Statement::from_sql_and_values(
@@ -129,6 +130,42 @@ fn runner(f: &Fixture, snapshot: OperationSnapshot, fits: bool, turn: &str) -> C
         f.clock.clone(),
     )
     .with_execution_turn(turn.into())
+}
+
+// Drive the two persisted backoffs with the fixture clock, without granting
+// another admission or resetting the current portion's three-call budget.
+async fn run_until_invalid_completion(
+    f: &Fixture,
+    snapshot: OperationSnapshot,
+    fits: bool,
+    turn: &str,
+) -> CompactionExit {
+    let operation = snapshot.id.clone();
+    let runner = runner(f, snapshot, fits, turn);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let (exit, ()) = tokio::join!(runner.run(CancellationToken::new()), async {
+            for attempt in 1..=2 {
+                loop {
+                    let state = f
+                        .store
+                        .compaction_runner_state(&operation)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    if let RunnerPhase::Backoff { not_before_ms, .. } = state.phase
+                        && state.portion_attempts == attempt
+                    {
+                        f.clock.advance(not_before_ms);
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            }
+        });
+        exit.unwrap()
+    })
+    .await
+    .expect("invalid completion attempts did not finish")
 }
 
 #[tokio::test]
@@ -216,6 +253,7 @@ async fn new_user_admission_resumes_only_unfinished_portion_and_preserves_chain(
         assert_eq!(after.cursor, before.cursor);
         assert_eq!(after.previous_checkpoint, before.previous_checkpoint);
         assert_eq!(after.deadline_ms, expected_deadline);
+        assert_eq!(after.portion_attempts, 0);
         assert_eq!(
             (
                 after.attempts,
@@ -513,6 +551,7 @@ async fn invalid_completion_resume_is_atomic_and_has_only_one_winner() {
     assert_eq!(after.generation, before.generation + 1);
     assert_eq!(after.previous_checkpoint, before.previous_checkpoint);
     assert_eq!(after.cursor, before.cursor);
+    assert_eq!(after.portion_attempts, 0);
 }
 
 #[tokio::test]
@@ -670,6 +709,7 @@ async fn legacy_portion_resumes_but_other_terminal_kinds_do_not() {
     }
     let mut legacy = serde_json::to_value(&before).unwrap();
     legacy.as_object_mut().unwrap().remove("resume_phase");
+    legacy.as_object_mut().unwrap().remove("portion_attempts");
     f.store
         .database_connection()
         .execute_raw(Statement::from_sql_and_values(
@@ -696,6 +736,7 @@ async fn legacy_portion_resumes_but_other_terminal_kinds_do_not() {
     );
     assert_eq!(after.cursor, before.cursor);
     assert_eq!(after.previous_checkpoint, before.previous_checkpoint);
+    assert_eq!(after.portion_attempts, 0);
 }
 
 #[tokio::test]
@@ -789,10 +830,7 @@ async fn historical_invalid_completion_does_not_block_admission_after_head_advan
     let b = admit(&f, prepared_b, 11).await.unwrap();
     assert_ne!(a.id, b.id);
     assert_eq!(
-        runner(&f, a.clone(), true, "turn")
-            .run(CancellationToken::new())
-            .await
-            .unwrap(),
+        run_until_invalid_completion(&f, a.clone(), true, "turn").await,
         CompactionExit::Failed(FailureKind::InvalidCompletion)
     );
     let state_a = f
@@ -945,13 +983,12 @@ async fn historical_invalid_completion_does_not_block_admission_after_head_advan
     f.provider.replies.lock().unwrap().extend([
         Reply::Success,
         Reply::Success,
-        Reply::InvalidCompletion,
+        Reply::Invalid,
+        Reply::Invalid,
+        Reply::Invalid,
     ]);
     assert_eq!(
-        runner(&f, c.clone(), true, "new-turn")
-            .run(CancellationToken::new())
-            .await
-            .unwrap(),
+        run_until_invalid_completion(&f, c.clone(), true, "new-turn").await,
         CompactionExit::Failed(FailureKind::InvalidCompletion)
     );
     let failed_c = f
