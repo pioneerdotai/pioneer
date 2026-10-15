@@ -1,6 +1,8 @@
 use super::*;
 #[path = "checkpoint_input_alias_tests.rs"]
 mod checkpoint_input_alias_tests;
+#[path = "invalid_completion_tests.rs"]
+mod invalid_completion_tests;
 use migration::{Migrator, MigratorTrait};
 use pioneer_agent::compaction::composition::ScopedHistorySource;
 use pioneer_compaction::summary::{HEADINGS, SummaryInput};
@@ -1958,6 +1960,7 @@ async fn turn_started_and_edited_payload_projection_matches_history_without_even
 
 #[derive(Clone, Copy)]
 enum Reply {
+    Invalid,
     Success,
     Transient,
     Hang,
@@ -2028,13 +2031,18 @@ impl Provider for ProviderFixture {
             .unwrap()
             .pop_front()
             .unwrap_or(Reply::Success);
+        let invalid = matches!(reply, Reply::Invalid);
         match reply {
             Reply::Transient => anyhow::bail!("synthetic rate limit"),
             Reply::Hang => std::future::pending::<()>().await,
-            Reply::Success => {}
+            Reply::Success | Reply::Invalid => {}
         }
         Ok(ChatResponse {
-            text: HEADINGS.iter().map(|h| format!("{h}\nState.\n")).collect(),
+            text: if invalid {
+                "private invalid model response".into()
+            } else {
+                HEADINGS.iter().map(|h| format!("{h}\nState.\n")).collect()
+            },
             usage: None,
             termination: ProviderTermination::Complete,
             reasoning_content: None,
@@ -16860,11 +16868,13 @@ impl Summarizer for CleanupGateSummarizer {
 
 #[tokio::test]
 async fn service_cleanup_precedes_publication_backoff_and_stop_reconciliation() {
-    for scenario in 0..3 {
+    for scenario in 0..4 {
         let mut f = fixture(
             "completed history",
             vec![if scenario == 2 {
                 Reply::Hang
+            } else if scenario == 3 {
+                Reply::Invalid
             } else {
                 Reply::Success
             }],
@@ -16909,7 +16919,7 @@ async fn service_cleanup_precedes_publication_backoff_and_stop_reconciliation() 
         assert_eq!(*f.provider.count.borrow(), 1);
         assert!(!work.is_finished());
         cleanup.release.add_permits(1);
-        if scenario == 2 {
+        if scenario == 2 || scenario == 3 {
             wait_backoff(&f.store).await;
             cancel.cancel();
         }

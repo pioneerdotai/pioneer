@@ -99,6 +99,10 @@ pub struct RunnerState {
     pub deadline_ms: u64,
     pub attempts: u64,
     pub retries: u8,
+    /// Claims for the current portion (or correction), persisted before I/O.
+    /// Accepted candidates reset this independently of operation-wide retries.
+    #[serde(default)]
+    pub portion_attempts: u8,
     pub corrections: u8,
     pub target_tokens: u64,
     /// Text representation used by persisted character cursors. Version zero
@@ -147,6 +151,7 @@ impl RunnerState {
             deadline_ms,
             attempts: 0,
             retries: 0,
+            portion_attempts: 0,
             corrections: 0,
             target_tokens,
             source_text_projection_version: COMMENTARY_SOURCE_TEXT_PROJECTION_VERSION,
@@ -192,7 +197,17 @@ impl RunnerState {
         let RunnerAction::Prepare(purpose) = self.action(now_ms) else {
             anyhow::bail!("attempt is not admitted")
         };
+        // Legacy Backoff records lack the new counter. Their scheduled
+        // transient retries conservatively bound calls already consumed.
+        let consumed =
+            if self.portion_attempts == 0 && matches!(self.phase, RunnerPhase::Backoff { .. }) {
+                self.retries
+            } else {
+                self.portion_attempts
+            };
+        anyhow::ensure!(consumed < 3, "portion attempt limit exhausted");
         let mut next = self.next()?;
+        next.portion_attempts = consumed + 1;
         next.attempts = next
             .attempts
             .checked_add(1)
@@ -220,19 +235,36 @@ impl RunnerState {
             observation.finished_ms = Some(now_ms);
             observation.failure = Some(kind.clone());
         }
+        // Legacy Attempt records include their current call plus the already
+        // scheduled transient retries. Never grant extra calls on upgrade.
+        next.portion_attempts = if self.portion_attempts == 0 {
+            self.retries.saturating_add(1)
+        } else {
+            self.portion_attempts
+        };
         if now_ms >= self.deadline_ms {
             next.phase = RunnerPhase::Failed {
                 kind: FailureKind::Deadline,
             };
-        } else if kind == FailureKind::Transient && self.retries < 2 {
-            let delay = [2_000_u64, 8_000][self.retries as usize].max(retry_after_ms.unwrap_or(0));
+        } else if next.portion_attempts < 3
+            && (kind == FailureKind::InvalidCompletion
+                || (kind == FailureKind::Transient && self.retries < 2))
+        {
+            let retry = if kind == FailureKind::Transient {
+                self.retries
+            } else {
+                next.portion_attempts - 1
+            };
+            let delay = [2_000_u64, 8_000][retry as usize].max(retry_after_ms.unwrap_or(0));
             let not_before_ms = now_ms.saturating_add(delay);
             if not_before_ms >= self.deadline_ms {
                 next.phase = RunnerPhase::Failed {
                     kind: FailureKind::Deadline,
                 };
             } else {
-                next.retries += 1;
+                if kind == FailureKind::Transient {
+                    next.retries += 1;
+                }
                 next.phase = RunnerPhase::Backoff {
                     purpose,
                     not_before_ms,
@@ -275,6 +307,7 @@ impl RunnerState {
             "correction changed source coverage"
         );
         let mut next = self.next()?;
+        next.portion_attempts = 0;
         next.cursor = cursor;
         next.previous_checkpoint = Some(checkpoint.clone());
         next.phase = RunnerPhase::Candidate {
@@ -459,6 +492,251 @@ mod tests {
     fn restart(s: &RunnerState) -> RunnerState {
         serde_json::from_str(&serde_json::to_string(s).unwrap()).unwrap()
     }
+    fn fail_and_retry(state: RunnerState, kind: FailureKind, now: u64) -> RunnerState {
+        let failed = restart(&state).attempt_failed(kind, now, None).unwrap();
+        let RunnerPhase::Backoff { not_before_ms, .. } = failed.phase else {
+            panic!("expected retry, got {:?}", failed.phase);
+        };
+        restart(&failed).claim(not_before_ms).unwrap()
+    }
+
+    #[test]
+    fn invalid_completions_preserve_progress_and_third_can_succeed() {
+        let cursor = SourceCursor {
+            unit: 1,
+            ..Default::default()
+        };
+        let saved = state()
+            .claim(0)
+            .unwrap()
+            .candidate(1, "accepted".into(), cursor, false, 1)
+            .unwrap()
+            .candidate_checked(false)
+            .unwrap();
+        let first = saved.claim(2).unwrap();
+        let second = fail_and_retry(first, FailureKind::InvalidCompletion, 3);
+        let third = fail_and_retry(second, FailureKind::InvalidCompletion, 2_004);
+        assert_eq!(third.portion_attempts, 3);
+        assert_eq!(third.previous_checkpoint.as_deref(), Some("accepted"));
+        assert_eq!(third.cursor, cursor);
+        assert_eq!(third.retries, 0);
+        assert_eq!(third.deadline_ms, saved.deadline_ms);
+        let accepted = third
+            .candidate(
+                third.attempts,
+                "next".into(),
+                SourceCursor {
+                    unit: 2,
+                    ..Default::default()
+                },
+                false,
+                10_005,
+            )
+            .unwrap();
+        let next = restart(&accepted)
+            .candidate_checked(false)
+            .unwrap()
+            .claim(10_006)
+            .unwrap();
+        assert_eq!(next.portion_attempts, 1);
+        let next = fail_and_retry(next, FailureKind::InvalidCompletion, 10_007);
+        let next = fail_and_retry(next, FailureKind::InvalidCompletion, 12_008);
+        assert_eq!(next.portion_attempts, 3);
+        assert_eq!(next.previous_checkpoint.as_deref(), Some("next"));
+    }
+
+    #[test]
+    fn every_mixture_of_retryable_failures_stops_after_three_claims() {
+        for mask in 0..8 {
+            let mut current = state().claim(0).unwrap();
+            for attempt in 0..3 {
+                let kind = if mask & (1 << attempt) == 0 {
+                    FailureKind::InvalidCompletion
+                } else {
+                    FailureKind::Transient
+                };
+                let now = match current.phase {
+                    RunnerPhase::Attempt { deadline_ms, .. } => deadline_ms - 1,
+                    _ => unreachable!(),
+                };
+                // Keep all attempts within the end-to-end deadline.
+                let now = now.min(20_000 * (attempt + 1));
+                let failed = restart(&current)
+                    .attempt_failed(kind.clone(), now, None)
+                    .unwrap();
+                assert_eq!(failed.attempts, attempt + 1);
+                assert_eq!(failed.portion_attempts as u64, attempt + 1);
+                assert_eq!(failed.cursor, SourceCursor::default());
+                assert_eq!(failed.previous_checkpoint, None);
+                if attempt == 2 {
+                    assert_eq!(failed.phase, RunnerPhase::Failed { kind });
+                    assert_eq!(restart(&failed).action(now + 1), RunnerAction::Terminal);
+                    assert!(failed.claim(now + 1).is_err());
+                } else {
+                    let RunnerPhase::Backoff { not_before_ms, .. } = failed.phase else {
+                        panic!("retry not admitted");
+                    };
+                    current = restart(&failed).claim(not_before_ms).unwrap();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn transient_limit_remains_operation_wide_after_a_valid_checkpoint() {
+        let second = fail_and_retry(state().claim(0).unwrap(), FailureKind::Transient, 1);
+        let third = fail_and_retry(second, FailureKind::Transient, 2_002);
+        let next = third
+            .candidate(
+                3,
+                "accepted".into(),
+                SourceCursor {
+                    unit: 1,
+                    ..Default::default()
+                },
+                false,
+                10_003,
+            )
+            .unwrap()
+            .candidate_checked(false)
+            .unwrap()
+            .claim(10_004)
+            .unwrap();
+        assert_eq!(next.portion_attempts, 1);
+        assert_eq!(next.retries, 2);
+        assert_eq!(
+            next.attempt_failed(FailureKind::Transient, 10_005, None)
+                .unwrap()
+                .phase,
+            RunnerPhase::Failed {
+                kind: FailureKind::Transient
+            }
+        );
+        assert!(matches!(
+            next.attempt_failed(FailureKind::InvalidCompletion, 10_005, None)
+                .unwrap()
+                .phase,
+            RunnerPhase::Backoff { .. }
+        ));
+    }
+
+    #[test]
+    fn invalid_retry_wait_obeys_deadline_and_stop_and_cannot_reclaim_spent_budget() {
+        let first = state().claim(899_000).unwrap();
+        let expired = first
+            .attempt_failed(FailureKind::InvalidCompletion, 899_001, None)
+            .unwrap();
+        assert_eq!(
+            expired.phase,
+            RunnerPhase::Failed {
+                kind: FailureKind::Deadline
+            }
+        );
+        let waiting = state()
+            .claim(0)
+            .unwrap()
+            .attempt_failed(FailureKind::InvalidCompletion, 1, None)
+            .unwrap();
+        assert_eq!(waiting.action(waiting.deadline_ms), RunnerAction::Expired);
+        let stopped = restart(&waiting).terminate(FailureKind::Cancelled).unwrap();
+        assert_eq!(stopped.action(2_001), RunnerAction::Terminal);
+        assert!(stopped.claim(2_001).is_err());
+        let mut exhausted = state();
+        exhausted.portion_attempts = 3;
+        assert!(restart(&exhausted).claim(0).is_err());
+    }
+
+    #[test]
+    fn invalid_completion_retries_do_not_allow_a_second_correction() {
+        let final_candidate = state()
+            .claim(0)
+            .unwrap()
+            .candidate(
+                1,
+                "final".into(),
+                SourceCursor {
+                    unit: 1,
+                    ..Default::default()
+                },
+                true,
+                1,
+            )
+            .unwrap();
+        let correction = final_candidate.candidate_checked(false).unwrap();
+        let cap = correction.target_tokens;
+        assert_eq!(correction.corrections, 1);
+        let second = fail_and_retry(
+            correction.claim(2).unwrap(),
+            FailureKind::InvalidCompletion,
+            3,
+        );
+        let third = fail_and_retry(second, FailureKind::InvalidCompletion, 2_004);
+        assert_eq!(third.target_tokens, cap);
+        assert_eq!(third.corrections, 1);
+        let corrected = third
+            .candidate(
+                third.attempts,
+                "corrected".into(),
+                third.cursor,
+                true,
+                10_005,
+            )
+            .unwrap();
+        assert_eq!(
+            corrected.candidate_checked(false).unwrap().phase,
+            RunnerPhase::Failed {
+                kind: FailureKind::InsufficientEffect
+            }
+        );
+    }
+
+    #[test]
+    fn legacy_json_without_portion_counter_is_readable_and_interrupted_call_is_counted() {
+        for original in [state(), state().claim(0).unwrap()] {
+            let mut json = serde_json::to_value(&original).unwrap();
+            json.as_object_mut().unwrap().remove("portion_attempts");
+            let restored: RunnerState = serde_json::from_value(json).unwrap();
+            assert_eq!(restored.portion_attempts, 0);
+            if matches!(restored.phase, RunnerPhase::Attempt { .. }) {
+                let next = fail_and_retry(restored, FailureKind::Transient, 1);
+                assert_eq!(next.portion_attempts, 2);
+            } else {
+                assert_eq!(restored.claim(0).unwrap().portion_attempts, 1);
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_inflight_and_backoff_records_do_not_gain_calls_on_upgrade() {
+        let second = fail_and_retry(state().claim(0).unwrap(), FailureKind::Transient, 1);
+        let waiting = second
+            .attempt_failed(FailureKind::Transient, 2_002, None)
+            .unwrap();
+        let RunnerPhase::Backoff { not_before_ms, .. } = waiting.phase else {
+            unreachable!()
+        };
+        for original in [waiting.clone(), waiting.claim(not_before_ms).unwrap()] {
+            let mut json = serde_json::to_value(&original).unwrap();
+            json.as_object_mut().unwrap().remove("portion_attempts");
+            let restored: RunnerState = serde_json::from_value(json).unwrap();
+            let third = if matches!(restored.phase, RunnerPhase::Backoff { .. }) {
+                restored.claim(not_before_ms).unwrap()
+            } else {
+                restored
+            };
+            let failed = third
+                .attempt_failed(FailureKind::InvalidCompletion, not_before_ms + 1, None)
+                .unwrap();
+            assert_eq!(failed.portion_attempts, 3);
+            assert_eq!(
+                failed.phase,
+                RunnerPhase::Failed {
+                    kind: FailureKind::InvalidCompletion
+                }
+            );
+        }
+    }
+
     #[test]
     fn retries_and_retry_after_survive_restart_and_do_not_reset_deadline() {
         let first = state().claim(0).unwrap();
