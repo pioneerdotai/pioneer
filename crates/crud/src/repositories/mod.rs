@@ -5,6 +5,7 @@ pub mod agent_memory;
 pub mod agent_memory_candidate;
 pub mod agent_memory_capsule;
 pub mod agent_memory_event;
+pub(crate) mod agent_memory_identity;
 pub mod agent_memory_policy_decision;
 pub mod agent_memory_quality_decision;
 pub mod agent_memory_quarantine;
@@ -15,7 +16,20 @@ pub(crate) mod auth_session;
 pub(crate) mod authorization_persistence;
 pub(crate) mod authorization_scope;
 pub(crate) mod canonical_turn_event;
+pub(crate) mod checkpoint_proofs;
 pub mod cli_runtime_binding;
+pub mod compaction;
+pub(crate) mod compaction_background;
+pub(crate) mod compaction_frozen;
+pub(crate) mod compaction_frozen_import;
+mod compaction_frozen_views;
+pub(crate) mod compaction_history;
+pub(crate) mod compaction_lifecycle;
+pub(crate) mod compaction_lifecycle_pending;
+pub(crate) mod compaction_preparation;
+pub(crate) mod compaction_runner;
+pub(crate) mod compaction_source_projection;
+pub(crate) mod compaction_task_output;
 pub mod execution_admission_lease;
 pub mod hook_run;
 pub(crate) mod identity;
@@ -24,12 +38,22 @@ pub mod mcp_audit_event;
 pub mod mcp_server_catalog_snapshot;
 pub mod mcp_server_installation;
 pub(crate) mod membership;
+pub(crate) mod native_cancellation_context;
+pub(crate) mod native_event_cleanup;
+#[cfg(test)]
+pub(crate) mod native_event_cleanup_baseline;
+pub mod native_terminal_effect_outbox;
+pub mod patch_history;
 pub mod policy;
 pub(crate) mod policy_generation;
 pub(crate) mod principal_avatar;
+pub(crate) mod projection_receipt_cleanup;
+pub mod provider_usage;
+pub(crate) mod read_model_repair;
 pub mod recovery_job;
 pub mod recovery_terminalization_outbox;
 pub(crate) mod self_improvement_finalization;
+pub(crate) mod self_improvement_history;
 pub(crate) mod self_improvement_run;
 pub(crate) mod self_improvement_source_turn;
 pub(crate) mod self_improvement_workspace_state;
@@ -43,6 +67,7 @@ pub mod task;
 pub mod task_actor_contract;
 pub mod task_agent_spec;
 pub mod task_delivery;
+pub(crate) mod task_delivery_recovery;
 pub mod task_dependency;
 pub mod task_event;
 pub(crate) mod task_execution_admission;
@@ -88,3 +113,18 @@ pub enum ProjectionWriteOutcome {
     NoopDuplicateTerminal,
     InvariantViolation { reason: String },
 }
+
+mod compaction_live_sources;
+
+pub(crate) mod tool_output;
+
+pub(crate) mod compaction_frozen_storage;
+
+mod compaction_check_result;
+
+pub(crate) mod task_event_fanout;
+pub(crate) mod task_run_occurrence_reconcile;
+
+pub(crate) mod task_occurrence_reconcile;
+
+pub(crate) mod frozen_storage_lifetime;

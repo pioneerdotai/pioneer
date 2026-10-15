@@ -1,0 +1,5 @@
+[env]
+BINDGEN_EXTRA_CLANG_ARGS_aarch64_apple_darwin = "--target=arm64-apple-darwin"
+# Keep Cargo-launched test threads aligned with the production Gateway runtime.
+# Explicit Builder::stack_size calls, including the 2 MiB canary, still override this.
+RUST_MIN_STACK = { value = "8388608", force = true }

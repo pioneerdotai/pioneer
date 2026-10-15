@@ -1,7 +1,9 @@
 use std::io;
 use std::path::{Component, Path, PathBuf};
 
+use pioneer_tools::apply_patch::file_mutation::open_regular_file;
 use tokio::fs;
+use tokio::io::AsyncReadExt;
 
 use crate::error::{ArtifactError, ArtifactLocalPathRejectionKind, ArtifactResult};
 use crate::mime::{detect_mime_from_bytes, is_safe_visible_name, sanitize_display_name};
@@ -78,18 +80,31 @@ pub async fn read_validated_local_file(
         ));
     }
 
-    let metadata = fs::metadata(&canonical_path).await.map_err(|source| {
-        ArtifactError::LocalPathReadFailed {
+    // Canonicalization establishes that the observed target is inside an
+    // allowed root, but it is not the read primitive: a parent can be swapped
+    // after that check. Open the original no-follow path component-by-
+    // component and consume bytes only from the pinned descriptor. When the
+    // caller explicitly permits symlinks, the already-authorized canonical
+    // path is the descriptor target instead.
+    let open_path = if policy.follow_symlinks {
+        canonical_path.clone()
+    } else {
+        requested_path.to_path_buf()
+    };
+    let diagnostic_path = requested_path.to_path_buf();
+    let file = tokio::task::spawn_blocking(move || open_regular_file(open_path.as_path()))
+        .await
+        .map_err(|error| ArtifactError::LocalPathReadFailed {
+            path: diagnostic_path.clone(),
+            source: io::Error::other(format!("secure artifact open worker failed: {error}")),
+        })?
+        .map_err(|source| secure_local_path_open_error(diagnostic_path.as_path(), source))?;
+    let metadata = file
+        .metadata()
+        .map_err(|source| ArtifactError::LocalPathReadFailed {
             path: canonical_path.clone(),
             source,
-        }
-    })?;
-    if !metadata.is_file() {
-        return Err(ArtifactError::local_path_rejected(
-            ArtifactLocalPathRejectionKind::NotRegularFile,
-            format!("path is not a regular file: {}", requested_path.display()),
-        ));
-    }
+        })?;
     if metadata.len() > policy.max_file_bytes {
         return Err(ArtifactError::local_path_rejected(
             ArtifactLocalPathRejectionKind::FileTooLarge,
@@ -101,13 +116,15 @@ pub async fn read_validated_local_file(
         ));
     }
 
-    let bytes =
-        fs::read(&canonical_path)
-            .await
-            .map_err(|source| ArtifactError::LocalPathReadFailed {
-                path: canonical_path.clone(),
-                source,
-            })?;
+    let mut bytes = Vec::new();
+    let mut bounded = tokio::fs::File::from_std(file).take(policy.max_file_bytes.saturating_add(1));
+    bounded
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(|source| ArtifactError::LocalPathReadFailed {
+            path: canonical_path.clone(),
+            source,
+        })?;
     if bytes.len() as u64 > policy.max_file_bytes {
         return Err(ArtifactError::local_path_rejected(
             ArtifactLocalPathRejectionKind::FileTooLarge,
@@ -225,6 +242,34 @@ fn local_path_open_error(path: &Path, source: io::Error) -> ArtifactError {
     }
 }
 
+fn secure_local_path_open_error(path: &Path, source: io::Error) -> ArtifactError {
+    if source.kind() == io::ErrorKind::NotFound {
+        return local_path_open_error(path, source);
+    }
+    if source.kind() == io::ErrorKind::InvalidInput {
+        return ArtifactError::local_path_rejected(
+            ArtifactLocalPathRejectionKind::NotRegularFile,
+            format!("path is not a regular file: {}", path.display()),
+        );
+    }
+    if matches!(
+        source.kind(),
+        io::ErrorKind::PermissionDenied | io::ErrorKind::NotADirectory
+    ) {
+        return ArtifactError::local_path_rejected(
+            ArtifactLocalPathRejectionKind::SymlinkNotAllowed,
+            format!(
+                "path changed or contains a symlink component: {}",
+                path.display()
+            ),
+        );
+    }
+    ArtifactError::LocalPathReadFailed {
+        path: path.to_path_buf(),
+        source,
+    }
+}
+
 fn invalid_allowed_root_error(path: &Path, source: io::Error) -> ArtifactError {
     if source.kind() == io::ErrorKind::NotFound {
         return ArtifactError::local_path_rejected(
@@ -331,6 +376,36 @@ mod tests {
             read_validated_local_file(link.as_path(), &ArtifactLocalPathPolicy::new(vec![root]))
                 .await
                 .expect_err("symlink should be rejected");
+
+        assert_eq!(
+            rejection_kind(error),
+            ArtifactLocalPathRejectionKind::SymlinkNotAllowed
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn safe_path_rejects_parent_symlink_even_when_it_points_inside_root() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("allowed");
+        let real = root.join("real");
+        tokio::fs::create_dir_all(real.as_path())
+            .await
+            .expect("create real parent");
+        tokio::fs::write(real.join("report.txt"), b"inside")
+            .await
+            .expect("write report");
+        let linked_parent = root.join("linked-parent");
+        symlink(real.as_path(), linked_parent.as_path()).expect("create parent symlink");
+
+        let error = read_validated_local_file(
+            linked_parent.join("report.txt").as_path(),
+            &ArtifactLocalPathPolicy::new(vec![root]),
+        )
+        .await
+        .expect_err("no-follow policy must reject parent symlinks");
 
         assert_eq!(
             rejection_kind(error),

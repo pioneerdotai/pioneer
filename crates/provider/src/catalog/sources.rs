@@ -1,0 +1,1016 @@
+//! Source-specific transforms and provider routing. No I/O and no generated
+//! catalog lookups: new source entries follow the same rules as saved fixtures.
+use super::compatibility::{effort_map, together};
+use super::rules::*;
+use super::*;
+use std::collections::BTreeSet;
+const WORKERS: &str = "https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/ai/v1";
+const CF_PREFIX: &str =
+    "https://gateway.ai.cloudflare.com/v1/{CLOUDFLARE_ACCOUNT_ID}/{CLOUDFLARE_GATEWAY_ID}";
+fn entries<'a>(data: &'a Value, provider: &str) -> impl Iterator<Item = (&'a String, &'a Value)> {
+    data[provider]["models"]
+        .as_object()
+        .into_iter()
+        .flat_map(|m| m.iter())
+}
+fn constrained_compat() -> Value {
+    json!({"supportsStore":false,"supportsDeveloperRole":false,"supportsReasoningEffort":false,"maxTokensField":"max_tokens","supportsStrictMode":false,"supportsLongCacheRetention":false})
+}
+
+pub(super) fn models_dev(
+    data: &Value,
+    nvidia: &Value,
+    strict: bool,
+) -> Result<(Vec<Candidate>, BTreeSet<&'static str>)> {
+    let mut result = Vec::new();
+    let mut specialized = BTreeSet::new();
+    let specs = [
+        (
+            "amazon-bedrock",
+            "amazon-bedrock",
+            "bedrock-converse-stream",
+            "https://bedrock-runtime.us-east-1.amazonaws.com",
+        ),
+        (
+            "anthropic",
+            "anthropic",
+            "anthropic-messages",
+            "https://api.anthropic.com",
+        ),
+        (
+            "google",
+            "google",
+            "google-generative-ai",
+            "https://generativelanguage.googleapis.com/v1beta",
+        ),
+        (
+            "google-vertex",
+            "google-vertex",
+            "google-vertex",
+            "https://{location}-aiplatform.googleapis.com",
+        ),
+        (
+            "openai",
+            "openai",
+            "openai-responses",
+            "https://api.openai.com/v1",
+        ),
+        (
+            "deepseek",
+            "deepseek",
+            "openai-completions",
+            "https://api.deepseek.com",
+        ),
+        (
+            "groq",
+            "groq",
+            "openai-completions",
+            "https://api.groq.com/openai/v1",
+        ),
+        // Keep standard API metadata separate from the coding subscription
+        // sources below. Source data remains the owner of limits and pricing.
+        (
+            "zai",
+            "zai-standard",
+            "openai-completions",
+            "https://api.z.ai/api/paas/v4",
+        ),
+        (
+            "zhipuai",
+            "glm",
+            "openai-completions",
+            "https://open.bigmodel.cn/api/paas/v4",
+        ),
+        (
+            "cerebras",
+            "cerebras",
+            "openai-completions",
+            "https://api.cerebras.ai/v1",
+        ),
+        (
+            "cloudflare-workers-ai",
+            "cloudflare-workers-ai",
+            "openai-completions",
+            WORKERS,
+        ),
+        ("xai", "xai", "openai-responses", "https://api.x.ai/v1"),
+        (
+            "mistral",
+            "mistral",
+            "mistral-conversations",
+            "https://api.mistral.ai",
+        ),
+        (
+            "huggingface",
+            "huggingface",
+            "openai-completions",
+            "https://router.huggingface.co/v1",
+        ),
+        (
+            "minimax",
+            "minimax",
+            "anthropic-messages",
+            "https://api.minimax.io/anthropic",
+        ),
+        (
+            "minimax-cn",
+            "minimax-cn",
+            "anthropic-messages",
+            "https://api.minimaxi.com/anthropic",
+        ),
+        (
+            "xiaomi",
+            "xiaomi",
+            "openai-completions",
+            "https://api.xiaomimimo.com/v1",
+        ),
+        (
+            "xiaomi-token-plan-cn",
+            "xiaomi-token-plan-cn",
+            "openai-completions",
+            "https://token-plan-cn.xiaomimimo.com/v1",
+        ),
+        (
+            "xiaomi-token-plan-ams",
+            "xiaomi-token-plan-ams",
+            "openai-completions",
+            "https://token-plan-ams.xiaomimimo.com/v1",
+        ),
+        (
+            "xiaomi-token-plan-sgp",
+            "xiaomi-token-plan-sgp",
+            "openai-completions",
+            "https://token-plan-sgp.xiaomimimo.com/v1",
+        ),
+    ];
+    for (source, provider, api, url) in specs {
+        specialized.insert(provider);
+        for (id, m) in entries(data, source) {
+            if m["tool_call"] != true {
+                continue;
+            }
+            if provider == "amazon-bedrock"
+                && (BEDROCK_INFERENCE_PROFILE_ONLY_MODEL_IDS.contains(&id.as_str())
+                    || id.starts_with("ai21.jamba")
+                    || id.starts_with("mistral.mistral-7b-instruct-v0"))
+            {
+                continue;
+            }
+            if provider == "openai"
+                && MODELS_DEV_OPENAI_UNSUPPORTED_MODEL_IDS.contains(&id.as_str())
+            {
+                continue;
+            }
+            if provider == "google-vertex"
+                && (!id.starts_with("gemini-") || id == "gemini-3.1-flash-lite-preview")
+            {
+                continue;
+            }
+            if provider.starts_with("xiaomi") && m["status"] == "deprecated" {
+                continue;
+            }
+            let alias = match id.as_str() {
+                "gemini-flash-latest" => Some("gemini-3.5-flash"),
+                "gemini-flash-lite-latest" => Some("gemini-3.1-flash-lite"),
+                _ => None,
+            };
+            let effective = if matches!(provider, "google" | "google-vertex") {
+                alias
+                    .and_then(|a| data[source]["models"].get(a))
+                    .unwrap_or(m)
+            } else {
+                m
+            };
+            let mut candidate = base(provider, id, api, url, effective, (4096, 4096));
+            if matches!(provider, "google" | "google-vertex")
+                && let Some(resolved) = alias.filter(|a| data[source]["models"].get(*a).is_some())
+            {
+                // Retain the identity of the existing source alias resolution;
+                // effort names alone do not identify a budget/level protocol.
+                candidate.model["sourceGeneration"]["resolvedModelId"] = json!(resolved);
+            }
+            candidate.model["name"] =
+                json!(m["name"].as_str().filter(|s| !s.is_empty()).unwrap_or(id));
+            if matches!(provider, "glm" | "zai-standard") {
+                // These are native CN/global GLM endpoints, not hosted relays.
+                // Use the same documented controls as the coding profiles,
+                // with each profile's own updateable source options and limits.
+                // https://docs.z.ai/guides/llm/glm-5.3
+                candidate.compat(json!({"supportsDeveloperRole":false,"thinkingFormat":"zai"}));
+                if let Some(mut map) = effort_map(&m["reasoning_options"]) {
+                    if matches!(id.as_str(), "glm-5.2" | "glm-5.2-highspeed") {
+                        map["off"] = json!("none");
+                    }
+                    candidate.thinking(map);
+                    candidate.compat(json!({"supportsReasoningEffort":true}));
+                }
+            }
+            match provider {
+                "amazon-bedrock"=>{if id.starts_with("eu."){candidate.model["baseUrl"]=json!("https://bedrock-runtime.eu-central-1.amazonaws.com");}
+if m["structured_output"]==true {candidate.compat(json!({"supportsStrictMode":true}));}},
+                "google-vertex"=>{candidate.model["cost"]["cacheWrite"]=json!(0);if id=="gemini-2.5-flash"{candidate.model["cost"]["cacheRead"]=json!(0.03);}},
+                "cloudflare-workers-ai"=>candidate.compat(json!({"sendSessionAffinityHeaders":true})),
+                "xai"=>candidate.compat(json!({"supportsLongCacheRetention":false})),
+                "mistral"=>{if m["cost"]["cache_read"].is_null(){candidate.model["cost"]["cacheRead"]=m["cost"]["input"].as_f64().map(|v|json!(round(v*0.1))).unwrap_or(Value::Null);}},
+                "huggingface"=>candidate.compat(json!({"supportsDeveloperRole":false})),
+                p if p.starts_with("xiaomi")=>candidate.compat(json!({"requiresReasoningContentOnAssistantMessages":true,"thinkingFormat":"deepseek"})),
+                _=>{}
+            }
+            result.push(candidate);
+        }
+    }
+    specialized.insert("cloudflare-ai-gateway");
+    let mut cloudflare_ids = BTreeSet::new();
+    for (prefixed, m) in entries(data, "cloudflare-ai-gateway") {
+        if m["tool_call"] != true {
+            continue;
+        }
+        let Some((upstream, native)) = prefixed.split_once('/') else {
+            continue;
+        };
+        let (id, api, path) = match upstream {
+            "openai" => (native, "openai-responses", "openai"),
+            "anthropic" => (native, "anthropic-messages", "anthropic"),
+            "workers-ai" => (prefixed.as_str(), "openai-completions", "compat"),
+            _ => continue,
+        };
+        let mut c = base(
+            "cloudflare-ai-gateway",
+            id,
+            api,
+            &format!("{CF_PREFIX}/{path}"),
+            m,
+            (4096, 4096),
+        );
+        if upstream != "openai" {
+            c.compat(json!({"sendSessionAffinityHeaders":true}));
+        }
+        cloudflare_ids.insert(id.to_owned());
+        result.push(c);
+    }
+    for (id, m) in entries(data, "cloudflare-workers-ai") {
+        let id = format!("workers-ai/{id}");
+        if m["tool_call"] != true || !cloudflare_ids.insert(id.clone()) {
+            continue;
+        }
+        let mut c = base(
+            "cloudflare-ai-gateway",
+            &id,
+            "openai-completions",
+            &format!("{CF_PREFIX}/compat"),
+            m,
+            (4096, 4096),
+        );
+        c.compat(json!({"sendSessionAffinityHeaders":true}));
+        result.push(c);
+    }
+    specialized.insert("nvidia");
+    let mut live = BTreeMap::new();
+    for m in nvidia["data"].as_array().into_iter().flatten() {
+        let id = text(&m["id"]);
+        live.insert(id.to_owned(), id);
+        live.insert(id.to_lowercase().replace('_', "."), id);
+    }
+    for (id, m) in entries(data, "nvidia") {
+        if m["tool_call"] != true
+            || !has(&m["modalities"]["input"], "text")
+            || !has(&m["modalities"]["output"], "text")
+        {
+            continue;
+        }
+        let Some(id) = live
+            .get(id)
+            .or_else(|| live.get(&id.to_lowercase().replace('_', ".")))
+        else {
+            continue;
+        };
+        if NVIDIA_NIM_UNSUPPORTED_MODELS.contains(id) {
+            continue;
+        }
+        let mut c = base(
+            "nvidia",
+            id,
+            "openai-completions",
+            "https://integrate.api.nvidia.com/v1",
+            m,
+            (4096, 4096),
+        );
+        c.compat(constrained_compat());
+        c.model["headers"] = json!({"NVCF-POLL-SECONDS":"3600"});
+        result.push(c);
+    }
+    for (source, provider, url) in [
+        (
+            "zai-coding-plan",
+            "zai",
+            "https://api.z.ai/api/coding/paas/v4",
+        ),
+        (
+            "zhipuai-coding-plan",
+            "zai-coding-cn",
+            "https://open.bigmodel.cn/api/coding/paas/v4",
+        ),
+    ] {
+        specialized.insert(provider);
+        for (id, m) in entries(data, source) {
+            if m["tool_call"] != true {
+                continue;
+            }
+            let mut c = base(provider, id, "openai-completions", url, m, (4096, 4096));
+            c.model["cost"] = cost(data["zai"]["models"][id].get("cost").unwrap_or(&m["cost"]));
+            c.compat(json!({"supportsDeveloperRole":false,"thinkingFormat":"zai"}));
+            if let Some(mut map) = effort_map(&m["reasoning_options"]) {
+                if matches!(id.as_str(), "glm-5.2" | "glm-5.2-highspeed") {
+                    map["off"] = json!("none");
+                }
+                c.thinking(map);
+                c.compat(json!({"supportsReasoningEffort":true}));
+            }
+            if !ZAI_TOOL_STREAM_UNSUPPORTED_MODELS.contains(&id.as_str()) {
+                c.compat(json!({"zaiToolStream":true}));
+            }
+            result.push(c);
+        }
+    }
+    specialized.insert("together");
+    let together_source = ["together", "togetherai", "together-ai"]
+        .into_iter()
+        .find(|p| !data[*p].is_null())
+        .unwrap_or("together");
+    for (id, m) in entries(data, together_source) {
+        if m["tool_call"] != true || m["status"] == "deprecated" {
+            continue;
+        }
+        let mut c = base(
+            "together",
+            id,
+            "openai-completions",
+            "https://api.together.ai/v1",
+            m,
+            (4096, 4096),
+        );
+        together(&mut c);
+        result.push(c);
+    }
+    specialized.insert("baseten");
+    for (id, m) in entries(data, "baseten") {
+        if m["status"] == "deprecated" {
+            continue;
+        }
+        let glm = matches!(id.as_str(), "zai-org/GLM-5.2" | "zai-org/GLM-5.2-Fast");
+        let options = m["reasoning_options"].as_array();
+        let toggle = glm || options.is_some_and(|v| v.iter().any(|o| o["type"] == "toggle"));
+        let effort = glm || options.is_some_and(|v| v.iter().any(|o| o["type"] == "effort"));
+        let mut c = base(
+            "baseten",
+            id,
+            "openai-completions",
+            "https://inference.baseten.co/v1",
+            m,
+            (4096, 4096),
+        );
+        c.reasoning_options = Value::Null;
+        c.compat(constrained_compat());
+        c.compat(json!({"supportsUsageInStreaming":true,"supportsStrictMode":true}));
+        if effort {
+            c.compat(json!({"supportsReasoningEffort":true,"thinkingFormat":"openai"}));
+        }
+        if toggle {
+            c.compat(json!({"thinkingFormat":"baseten","chatTemplateArgs":{"enable_thinking":{"$var":"thinking.enabled"}}}));
+        }
+        if glm {
+            c.model["input"] = json!(["text"]);
+            c.model["inputOrigin"] = json!({"kind":"override","expression":"existing Pi Baseten GLM compatibility projection; raw modalities retained in sourceMetadata"});
+            c.thinking(json!({"off":"none","minimal":null,"low":null,"medium":null,"high":"high","xhigh":null,"max":"max"}));
+        } else if toggle {
+            c.thinking(json!({"off":"off","minimal":null,"low":null,"medium":null,"high":"high","xhigh":null,"max":null}));
+        } else if let Some(map) = effort_map(&m["reasoning_options"]) {
+            c.thinking(map);
+        }
+        result.push(c);
+    }
+    specialized.insert("fireworks");
+    for (id, m) in entries(data, "fireworks-ai") {
+        if m["tool_call"] != true {
+            continue;
+        }
+        let openai = id.contains("glm-") || id.contains("kimi-k3");
+        let mut c = base(
+            "fireworks",
+            id,
+            if openai {
+                "openai-completions"
+            } else {
+                "anthropic-messages"
+            },
+            if openai {
+                "https://api.fireworks.ai/inference/v1"
+            } else {
+                "https://api.fireworks.ai/inference"
+            },
+            m,
+            (4096, 4096),
+        );
+        c.compat(json!({"sendSessionAffinityHeaders":true,"supportsLongCacheRetention":false}));
+        if openai {
+            c.compat(json!({"supportsStore":false,"supportsDeveloperRole":false}));
+        } else {
+            c.compat(json!({"supportsEagerToolInputStreaming":false,"supportsCacheControlOnTools":false}));
+        }
+        if id.contains("kimi-k3") {
+            c.compat(json!({"requiresReasoningContentOnAssistantMessages":true,"thinkingFormat":"openai","deferredToolsMode":"kimi"}));
+        }
+        result.push(c);
+    }
+    for provider in ["opencode", "opencode-go"] {
+        let url = if provider == "opencode" {
+            "https://opencode.ai/zen"
+        } else {
+            "https://opencode.ai/zen/go"
+        };
+        specialized.insert(provider);
+        for (id, m) in entries(data, provider) {
+            if m["tool_call"] != true || m["status"] == "deprecated" {
+                continue;
+            }
+            let api = match text(&m["provider"]["npm"]) {
+                "@ai-sdk/openai" => "openai-responses",
+                "@ai-sdk/anthropic" => "anthropic-messages",
+                "@ai-sdk/google" => "google-generative-ai",
+                _ => "openai-completions",
+            };
+            let mut c = base(
+                provider,
+                id,
+                api,
+                &if api == "anthropic-messages" {
+                    url.into()
+                } else {
+                    format!("{url}/v1")
+                },
+                m,
+                (4096, 4096),
+            );
+            if api == "openai-responses" {
+                c.compat(json!({"sessionAffinityFormat":"openai-nosession"}));
+            }
+            if m["provider"]["npm"] == "@ai-sdk/alibaba" {
+                c.compat(json!({"cacheControlFormat":"anthropic"}));
+            }
+            if provider == "opencode" && id == "grok-build-0.1" {
+                c.compat(json!({"supportsReasoningEffort":false}));
+            }
+            if id == "kimi-k2.6" {
+                c.compat(json!({"thinkingFormat":"deepseek","supportsReasoningEffort":false}));
+            }
+            if provider == "opencode-go"
+                && matches!(
+                    id.as_str(),
+                    "minimax-m2.7" | "qwen3.5-plus" | "qwen3.6-plus"
+                )
+            {
+                c.model["api"] = json!("openai-completions");
+                c.model["baseUrl"] = json!(format!("{url}/v1"));
+                if id.starts_with("qwen") {
+                    c.compat(json!({"thinkingFormat":"qwen"}));
+                }
+            }
+            if c.api() == "openai-completions" {
+                c.compat(json!({"maxTokensField":"max_tokens"}));
+                if OPENCODE_OPENAI_COMPLETIONS_LONG_CACHE_RETENTION_UNSUPPORTED_MODELS
+                    .contains(&format!("{provider}:{id}").as_str())
+                {
+                    c.compat(json!({"supportsLongCacheRetention":false}));
+                }
+            }
+            result.push(c);
+        }
+    }
+    specialized.insert("github-copilot");
+    for (id, m) in entries(data, "github-copilot") {
+        if m["tool_call"] != true || m["status"] == "deprecated" {
+            continue;
+        }
+        let claude = ["haiku", "sonnet", "opus", "fable"].iter().any(|family| {
+            ["4", "5"].iter().any(|v| {
+                let prefix = format!("claude-{family}-{v}");
+                id == &prefix
+                    || id.starts_with(&format!("{prefix}."))
+                    || id.starts_with(&format!("{prefix}-"))
+            })
+        });
+        let api = if claude {
+            "anthropic-messages"
+        } else if ["grok-", "gpt-5", "oswe", "mai-"]
+            .iter()
+            .any(|prefix| id.starts_with(prefix))
+        {
+            "openai-responses"
+        } else {
+            "openai-completions"
+        };
+        let mut c = base(
+            "github-copilot",
+            id,
+            api,
+            "https://api.individual.githubcopilot.com",
+            m,
+            (128000, 8192),
+        );
+        c.model["headers"] = json!({"User-Agent":"GitHubCopilotChat/0.35.0","Editor-Version":"vscode/1.107.0","Editor-Plugin-Version":"copilot-chat/0.35.0","Copilot-Integration-Id":"vscode-chat"});
+        let tiers: Vec<_> = m["cost"]["tiers"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|t| t["tier"]["type"] == "context" && !t["tier"]["size"].is_null())
+            .map(|t| {
+                let mut v = cost(t);
+                v["inputTokensAbove"] = t["tier"]["size"].clone();
+                v
+            })
+            .collect();
+        if !tiers.is_empty() {
+            c.model["cost"]["tiers"] = json!(tiers);
+        }
+        if api == "openai-completions" {
+            c.compat(json!({"supportsStore":false,"supportsDeveloperRole":false,"supportsReasoningEffort":false}));
+        }
+        result.push(c);
+    }
+    specialized.insert("kimi-coding");
+    for (id, m) in entries(data, "kimi-for-coding") {
+        if m["tool_call"] != true {
+            continue;
+        }
+        let alias = matches!(id.as_str(), "k2p5" | "k2p6" | "k2p7");
+        if alias
+            && data["kimi-for-coding"]["models"]
+                .get("kimi-for-coding")
+                .is_some()
+        {
+            continue;
+        }
+        let id = if alias { "kimi-for-coding" } else { id };
+        let mut c = base(
+            "kimi-coding",
+            id,
+            "anthropic-messages",
+            "https://api.kimi.com/coding",
+            m,
+            (4096, 4096),
+        );
+        if alias {
+            c.model["name"] = json!("Kimi For Coding");
+        }
+        c.compat(json!({"forceAdaptiveThinking":true}));
+        if matches!(id, "k3" | "kimi-for-coding") {
+            c.compat(json!({"allowEmptySignature":true}));
+        }
+        if id == "k3" {
+            c.model["reasoning"] = json!(true);
+        }
+        let rates = match id {
+            "k3" => [3., 15., 0.3, 0.],
+            "kimi-for-coding" => [0.95, 4., 0.19, 0.],
+            "kimi-for-coding-highspeed" => [1.9, 8., 0.38, 0.],
+            "kimi-k2-thinking" => [0.6, 2.5, 0.15, 0.],
+            _ => [0.; 4],
+        };
+        for (key, rate) in ["input", "output", "cacheRead", "cacheWrite"]
+            .into_iter()
+            .zip(rates)
+        {
+            if number(&c.model["cost"][key]) == 0. {
+                c.model["cost"][key] = json!(rate);
+            }
+        }
+        result.push(c);
+    }
+    for (provider, url) in [
+        ("moonshotai", "https://api.moonshot.ai/v1"),
+        ("moonshotai-cn", "https://api.moonshot.cn/v1"),
+    ] {
+        specialized.insert(provider);
+        for (id, m) in entries(data, provider) {
+            if m["tool_call"] != true {
+                continue;
+            }
+            let mut c = base(provider, id, "openai-completions", url, m, (4096, 4096));
+            c.compat(json!({"supportsStore":false,"supportsDeveloperRole":false,"supportsReasoningEffort":false,"maxTokensField":"max_tokens","supportsStrictMode":false,"thinkingFormat":"deepseek"}));
+            if id == "kimi-k3" {
+                c.model["reasoning"] = json!(true);
+                c.compat(json!({"requiresReasoningContentOnAssistantMessages":true,"deferredToolsMode":"kimi","thinkingFormat":"openai","supportsReasoningEffort":true}));
+                for (key, rate) in ["input", "output", "cacheRead", "cacheWrite"]
+                    .into_iter()
+                    .zip([3., 15., 0.3, 0.])
+                {
+                    if number(&c.model["cost"][key]) == 0. {
+                        c.model["cost"][key] = json!(rate);
+                    }
+                }
+            }
+            result.push(c);
+        }
+    }
+    for (source, provider, region, individual) in [
+        (
+            "alibaba-token-plan",
+            "qwen-token-plan",
+            "ap-southeast-1",
+            false,
+        ),
+        (
+            "alibaba-token-plan",
+            "qwen-token-plan-individual",
+            "ap-southeast-1",
+            true,
+        ),
+        (
+            "alibaba-token-plan-cn",
+            "qwen-token-plan-cn",
+            "cn-beijing",
+            false,
+        ),
+    ] {
+        let mut emitted = BTreeSet::new();
+        specialized.insert(provider);
+        for (id, m) in entries(data, source) {
+            if m["tool_call"] != true
+                || QWEN_TOKEN_PLAN_EXCLUDED_MODEL_IDS.contains(&id.as_str())
+                || individual && !QWEN_TOKEN_PLAN_INDIVIDUAL_MODEL_IDS.contains(&id.as_str())
+            {
+                continue;
+            }
+            let map=effort_map(&m["reasoning_options"]).or_else(||QWEN_TOKEN_PLAN_REASONING_EFFORT_FALLBACK_MODEL_IDS.contains(&id.as_str()).then(||json!({"minimal":null,"low":null,"medium":null,"high":"high","xhigh":null,"max":"max"})));
+            let mut c = base(
+                provider,
+                id,
+                "openai-completions",
+                &format!("https://token-plan.{region}.maas.aliyuncs.com/compatible-mode/v1"),
+                m,
+                (4096, 4096),
+            );
+            c.reasoning_options = Value::Null;
+            c.compat(json!({"thinkingFormat":"qwen","supportsDeveloperRole":false,"supportsStore":false,"supportsReasoningEffort":map.is_some()}));
+            if let Some(map) = map {
+                c.thinking(map);
+            }
+            emitted.insert(id.as_str());
+            result.push(c);
+        }
+        if individual && strict {
+            ensure!(
+                emitted
+                    == QWEN_TOKEN_PLAN_INDIVIDUAL_MODEL_IDS
+                        .iter()
+                        .copied()
+                        .collect(),
+                "incomplete Qwen individual model allowlist"
+            );
+        }
+    }
+    Ok((result, specialized))
+}
+
+/// Supplemental registered brands have lower precedence than specialized
+/// routes and existing explicit corrections, even when a route emits zero rows.
+pub(super) fn registered_supplements(
+    data: &Value,
+    specialized: &BTreeSet<&str>,
+    existing: &[Candidate],
+) -> Vec<Candidate> {
+    let mut result: Vec<Candidate> = Vec::new();
+    // Extend the existing dynamic source path to registered compatible brands.
+    // Specialized transforms above retain precedence. Missing named data does
+    // not inherit the modalities of a similarly named upstream model.
+    for definition in crate::definition::provider_definitions() {
+        let provider = definition.name;
+        if matches!(
+            provider,
+            "openai"
+                | "anthropic"
+                | "gemini"
+                | "bedrock"
+                | "copilot"
+                | "azure-openai"
+                | "ollama"
+                // The native /models route below owns this gateway's identities
+                // and filters. models.dev must not refill rejected native rows.
+                | "openrouter"
+                | "local"
+                | "telnyx"
+                | "glm"
+                | "custom"
+        ) {
+            continue;
+        }
+        // Never refill entries intentionally filtered by specialized routing
+        // (notably NVIDIA's live model list and provider-specific exclusions).
+        if specialized.contains(crate::catalog::catalog_provider(provider).as_str())
+            || specialized.iter().any(|route| {
+                crate::definition::provider_definition(route)
+                    .map_or(*route == provider, |d| d.name == provider)
+            })
+        {
+            continue;
+        }
+        let Some(url) = definition.default_base_url else {
+            continue;
+        };
+        // Reuse canonical aliases and source-declared endpoint identity rather
+        // than a second provider-name table. Ambiguous identities stay unknown.
+        let source = if data[provider]["models"].is_object() {
+            provider
+        } else {
+            let matches = data
+                .as_object()
+                .into_iter()
+                .flat_map(|providers| providers.iter())
+                .filter(|(name, value)| {
+                    value["models"].is_object()
+                        && (crate::definition::provider_definition(name)
+                            .is_some_and(|d| d.name == provider)
+                            || value["api"].as_str() == Some(url))
+                })
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>();
+            let [source] = matches.as_slice() else {
+                continue;
+            };
+            *source
+        };
+        for (id, model) in entries(data, source) {
+            if model["tool_call"] != true
+                || model["status"] == "deprecated"
+                || result
+                    .iter()
+                    .chain(existing.iter())
+                    .any(|c| c.provider() == provider && c.id() == id)
+            {
+                continue;
+            }
+            let mut candidate = base(provider, id, "openai-completions", url, model, (4096, 4096));
+            // A list of effort names alone does not establish a wire format.
+            // These profiles document the standard Chat effort field.
+            // Sources: each vendor's Chat schema, recorded in G04 coverage.
+            if !matches!(
+                provider,
+                "deepinfra" | "friendli" | "venice" | "synthetic" | "nebius" | "cohere"
+            ) {
+                candidate.compat(json!({"supportsReasoningEffort":false}));
+            }
+            candidate.compat(json!({"maxTokensField":"max_tokens"}));
+            if provider == "cohere" && model["reasoning"] == true {
+                // Compatibility API documents only none/high, corresponding
+                // to off/on, including toggle-only source entries.
+                candidate.thinking(json!({"off":"none","minimal":null,"low":null,
+                    "medium":null,"high":"high","xhigh":null,"max":null}));
+                candidate.compat(
+                    json!({"generationSource":"https://docs.cohere.com/docs/compatibility-api"}),
+                );
+            }
+            if provider == "novita" {
+                // Official Chat schema documents the switch for these families;
+                // a generic toggle in source metadata does not prove this field.
+                let supports_off = matches!(
+                    id.as_str(),
+                    "zai-org/glm-4.5"
+                        | "deepseek/deepseek-v3.1"
+                        | "deepseek/deepseek-v3.1-terminus"
+                        | "deepseek/deepseek-v3.2-exp"
+                );
+                candidate.compat(json!({"thinkingFormat":"novita","supportsThinkingToggle":supports_off,
+                    "generationSource":"https://docs.novita.ai/api-reference/model-apis-llm-create-chat-completion"}));
+            }
+            if provider == "siliconflow" {
+                candidate.compat(json!({"thinkingFormat":"siliconflow",
+                    "supportsThinkingToggle":model["reasoning_options"].as_array().is_some_and(|o| o.iter().any(|o| o["type"] == "toggle")),
+                    "generationCapIncludesThinking":false,
+                    "generationSource":"https://docs.siliconflow.cn/docs/api/chat-completions-post"}));
+            }
+            result.push(candidate);
+        }
+    }
+    result
+}
+
+// Shared source-unit conversion, not a tariff table. Invalid known values
+// remain invalid through validation instead of overflow serializing as null.
+fn per_token_rate(value: &Value) -> Value {
+    let converted = value
+        .as_str()
+        .and_then(|s| s.parse::<f64>().ok())
+        .or_else(|| value.as_f64())
+        .filter(|v| v.is_finite() && *v >= 0.)
+        .map(|v| round(v * 1_000_000.));
+    match converted {
+        Some(v) if v.is_finite() => json!(v),
+        Some(_) => json!("invalid_scaled_source_rate"),
+        None => value.clone(),
+    }
+}
+
+pub(super) fn openrouter(data: &Value) -> Vec<Candidate> {
+    data["data"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|m| has(&m["supported_parameters"], "tools"))
+        .map(|m| {
+            let id = text(&m["id"]);
+            let anthropic = id.starts_with("anthropic/") && !id.ends_with(":batch");
+            let mut c = base(
+                "openrouter",
+                id,
+                if anthropic {
+                    "anthropic-messages"
+                } else {
+                    "openai-completions"
+                },
+                if anthropic {
+                    "https://openrouter.ai/api"
+                } else {
+                    "https://openrouter.ai/api/v1"
+                },
+                &json!({}),
+                (4096, 4096),
+            );
+            c.model["name"] = m["name"].clone();
+            // This source's candidates were filtered by supported_parameters.
+            c.tool_calling = Some(has(&m["supported_parameters"], "tools"));
+            c.model["reasoning"] = json!(has(&m["supported_parameters"], "reasoning"));
+            // Explicit arrays preserve audio/video/file. Legacy modality strings
+            // describe the same contract; absent metadata stays unknown.
+            let input = m["architecture"]["input_modalities"].as_array().cloned()
+                .or_else(|| m["architecture"]["modality"].as_str()
+                    .and_then(|v| v.split_once("->"))
+                    .map(|(input, _)| input.split('+').map(|v| json!(v)).collect()));
+            c.model["input"] = json!(input.clone().unwrap_or_default());
+            c.model["inputOrigin"] = json!({"kind":if input.is_some(){"source"}else{"fallback"},"expression":"openrouter.architecture.input_modalities or modality"});
+            c.model["sourceMetadata"] = json!({"architecture":m["architecture"]});
+            c.model["output"] = m["architecture"]["output_modalities"].clone();
+            let context = if number(&m["top_provider"]["context_length"]) != 0. {
+                &m["top_provider"]["context_length"]
+            } else {
+                &m["context_length"]
+            };
+            (c.model["contextWindow"], c.context_origin) =
+                limit(context, 4096, "openrouter.context_length");
+            (c.model["maxTokens"], c.output_origin) = limit(
+                &m["top_provider"]["max_completion_tokens"],
+                4096,
+                "openrouter.max_completion_tokens",
+            );
+            for (key, source) in [
+                ("input", "prompt"),
+                ("output", "completion"),
+                ("cacheRead", "input_cache_read"),
+                ("cacheWrite", "input_cache_write"),
+            ] {
+                c.model["cost"][key] = match &m["pricing"][source] {
+                    Value::Null => Value::Null,
+                    // The pinned Models API snapshot uses -1 for Auto Router's
+                    // dynamic selected-model tariff, not a negative/free rate.
+                    // Contract: https://openrouter.ai/docs/guides/routing/routers/auto-router
+                    // Scope this exception to documented auto slugs and token
+                    // input/output fields; other negative/malformed rates fail validation.
+                    value
+                        if matches!(id, "openrouter/auto" | "openrouter/auto-beta")
+                            && matches!(source, "prompt" | "completion")
+                            && (value.as_str() == Some("-1") || value.as_f64() == Some(-1.)) =>
+                    {
+                        Value::Null
+                    }
+                    value => per_token_rate(value),
+                };
+            }
+            c.model["pricingSource"] =
+                json!({"url":SOURCE_URLS[1],"units":"USD_per_token","raw":m["pricing"]});
+            if matches!(id, "openrouter/auto" | "openrouter/auto-beta")
+                && ["prompt", "completion"].iter().any(|key| {
+                    m["pricing"][key].as_str() == Some("-1")
+                        || m["pricing"][key].as_f64() == Some(-1.)
+                })
+            {
+                c.model["pricingSource"]["unknownRateContract"] = json!({
+                    "reason":"dynamic_selected_model_tariff", "sentinel":-1,
+                    "url":"https://openrouter.ai/docs/guides/routing/routers/auto-router"
+                });
+            }
+            let reasoning = &m["reasoning"];
+            let mandatory = reasoning["mandatory"] == true;
+            if let Some(mut map) =
+                effort_map(&json!([{"type":"effort","values":reasoning["supported_efforts"]}]))
+            {
+                map["off"] = if mandatory {
+                    Value::Null
+                } else {
+                    json!("none")
+                };
+                c.thinking(map);
+            } else if mandatory {
+                c.thinking(json!({"off":null}));
+            }
+            c
+        })
+        .collect()
+}
+pub(super) fn vercel(data: &Value) -> Vec<Candidate> {
+    data["data"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|m| has(&m["tags"], "tool-use"))
+        .map(|m| {
+            let id = text(&m["id"]);
+            let mut c = base(
+                "vercel-ai-gateway",
+                id,
+                "anthropic-messages",
+                "https://ai-gateway.vercel.sh",
+                m,
+                (4096, 4096),
+            );
+            c.model["pricingSource"] =
+                json!({"url":SOURCE_URLS[2],"units":"USD_per_token","raw":m["pricing"]});
+            c.model["reasoning"] = json!(has(&m["tags"], "reasoning"));
+            c.tool_calling = Some(has(&m["tags"], "tool-use"));
+            c.model["input"] = m["input_modalities"].as_array().map(|v| json!(v))
+                .unwrap_or_else(|| if has(&m["tags"], "vision") {json!(["text", "image"])} else {json!([])});
+            c.model["inputOrigin"] = json!({"kind":if m["input_modalities"].is_array(){"source"}else if has(&m["tags"], "vision"){"partial"}else{"fallback"},"expression":"vercel.input_modalities or positive vision tag"});
+            c.model["sourceMetadata"] = json!({"tags":m["tags"],"input_modalities":m["input_modalities"]});
+            c.model["output"] = m["output_modalities"].clone();
+            (c.model["contextWindow"], c.context_origin) =
+                limit(&m["context_window"], 4096, "vercel.context_window");
+            (c.model["maxTokens"], c.output_origin) =
+                limit(&m["max_tokens"], 4096, "vercel.max_tokens");
+            for (key, source) in [
+                ("input", "input"),
+                ("output", "output"),
+                ("cacheRead", "input_cache_read"),
+                ("cacheWrite", "input_cache_write"),
+            ] {
+                c.model["cost"][key] = match &m["pricing"][source] {
+                    Value::Null => Value::Null,
+                    value => per_token_rate(value),
+                };
+            }
+            c
+        })
+        .collect()
+}
+
+/// Capability-only supplement collected before tool-capable list filtering.
+/// No limits/pricing/routes are generated for negative or unknown entries.
+/// Dedicated endpoint listings override models.dev only with explicit evidence.
+pub(super) fn tool_capabilities(snapshot: &SourceSnapshot) -> super::super::ToolCapabilities {
+    let mut result = super::super::ToolCapabilities::new();
+    for (provider, data) in snapshot
+        .source_body(SOURCE_URLS[0])
+        .unwrap_or(&Value::Null)
+        .as_object()
+        .into_iter()
+        .flatten()
+    {
+        let provider = super::super::catalog_provider(provider);
+        for (id, model) in data["models"].as_object().into_iter().flatten() {
+            if let Some(supported) = model["tool_call"].as_bool() {
+                result
+                    .entry(provider.clone())
+                    .or_default()
+                    .insert(id.clone(), supported);
+            }
+        }
+    }
+    for (url, provider, field, marker) in [
+        (
+            SOURCE_URLS[1],
+            "openrouter",
+            "supported_parameters",
+            "tools",
+        ),
+        (SOURCE_URLS[2], "vercel-ai-gateway", "tags", "tool-use"),
+    ] {
+        for model in snapshot.source_body(url).unwrap_or(&Value::Null)["data"]
+            .as_array()
+            .into_iter()
+            .flatten()
+        {
+            let Some(id) = model["id"].as_str().filter(|id| !id.is_empty()) else {
+                continue;
+            };
+            // Missing/null/malformed metadata is unknown, an explicit valid
+            // list without the capability is negative (including an empty list).
+            let Some(supported) =
+                crate::catalog::tool_support_from_marker_list(&model[field], marker)
+            else {
+                continue;
+            };
+            result
+                .entry(provider.into())
+                .or_default()
+                .insert(id.into(), supported);
+        }
+    }
+    result
+}

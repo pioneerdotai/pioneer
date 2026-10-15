@@ -62,6 +62,10 @@ impl MessageProcessor {
             McpScopeKind::User => "default".to_owned(),
         };
 
+        let lifecycle = self
+            .mcp_service
+            .installation_lifecycle_guard(scope_kind.as_str(), &scope_key, &name)
+            .await;
         let row = match self
             .crud_store
             .find_mcp_server_installation(scope_kind.as_str(), scope_key.as_str(), name.as_str())
@@ -162,6 +166,10 @@ impl MessageProcessor {
             return;
         }
 
+        if let Err(error) = self.mcp_service.oauth().disconnect(&server_id).await {
+            warn!(reason=%error.message,"MCP OAuth cleanup deferred");
+        }
+        drop(lifecycle);
         let response_payload = McpUninstallResponse {
             removed: true,
             server_id,

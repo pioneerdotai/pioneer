@@ -6,10 +6,13 @@ license.workspace = true
 authors.workspace = true
 
 [features]
+# Compile only deterministic native OAuth audit fixtures.
+oauth-test-support = ["pioneer-mcp-oauth/test-support"]
 default = []
 computer-use = ["pioneer-tools/computer-use"]
 
 [dependencies]
+pioneer-compaction.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 axum.workspace = true
@@ -24,6 +27,7 @@ pioneer-hooks.workspace = true
 pioneer-keystore.workspace = true
 pioneer-migration.workspace = true
 pioneer-mcp.workspace = true
+pioneer-mcp-oauth.workspace = true
 pioneer-memory.workspace = true
 pioneer-observability.workspace = true
 pioneer-entity.workspace = true
@@ -38,9 +42,13 @@ pioneer-tasks.workspace = true
 pioneer-tools.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
+notify.workspace = true
+same-file.workspace = true
+async-stream.workspace = true
 futures-util.workspace = true
 keepawake.workspace = true
 libc.workspace = true
+process-wrap.workspace = true
 log.workspace = true
 memvid-core.workspace = true
 tracing.workspace = true
@@ -55,11 +63,14 @@ markdown.workspace = true
 chrono.workspace = true
 schemars.workspace = true
 mime_guess.workspace = true
+url.workspace = true
 sea-orm = { workspace = true, features = ["sqlx-sqlite", "runtime-tokio-rustls"] }
 tiktoken-rs.workspace = true
+tokenizers.workspace = true
 flate2.workspace = true
 tar.workspace = true
 sha2.workspace = true
+zstd.workspace = true
 subtle.workspace = true
 hex.workspace = true
 hmac.workspace = true
@@ -69,6 +80,7 @@ transcribe-rs.workspace = true
 uuid.workspace = true
 zeroize.workspace = true
 tempfile.workspace = true
+tokio-tungstenite.workspace = true
 
 [build-dependencies]
 pioneer-protocol.workspace = true
@@ -76,7 +88,11 @@ serde.workspace = true
 toml.workspace = true
 
 [dev-dependencies]
+sentry = { workspace = true, features = ["test"] }
+pioneer-sqlite = { workspace = true, features = ["test-support"] }
 pioneer-client.workspace = true
 pioneer-client-ffi.workspace = true
+pioneer-crud = { workspace = true, features = ["test-support"] }
+pioneer-mcp-oauth = { workspace = true, features = ["test-support"] }
 tokio = { workspace = true, features = ["test-util"] }
 tower = { version = "0.5", features = ["util"] }

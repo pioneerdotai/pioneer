@@ -6,6 +6,16 @@ use rusqlite::functions::Context;
 use rusqlite::params;
 use rusqlite::types::{Value, ValueRef};
 
+/// Trains a dictionary from an already bounded in-memory sample.
+///
+/// This pure entry point lets maintenance perform the CPU-heavy training
+/// outside every SQLite reader, writer, and transaction. The SQL aggregate
+/// below uses the same implementation so both paths retain identical format
+/// semantics.
+pub fn train_dictionary(samples: &[Vec<u8>], wanted_size: usize) -> anyhow::Result<Vec<u8>> {
+    zstd::dict::from_samples(samples, wanted_size).context("Training dictionary failed")
+}
+
 pub struct ZstdTrainDictAggregate {
     /// if None, return trained dict, otherwise insert into _zstd_dicts table with chooser_key given as fourth arg and return id
     /// if false expects 3 args, if true expects 4 args
@@ -79,9 +89,7 @@ impl rusqlite::functions::Aggregate<ZstdTrainDictState, Value> for ZstdTrainDict
             state.reservoir.iter().map(|x| x.len()).sum::<usize>() / 1000,
             state.total_count
         );
-        let dict = zstd::dict::from_samples(&state.reservoir, state.wanted_dict_size)
-            .context("Training dictionary failed")
-            .map_err(ah)?;
+        let dict = train_dictionary(&state.reservoir, state.wanted_dict_size).map_err(ah)?;
         log::debug!(
             "resulting dict has size {}",
             pretty_bytes(dict.len() as i64)

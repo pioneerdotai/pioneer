@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ThreadToolResultCursor",
+  "type": "object",
+  "properties": {
+    "offset": {
+      "description": "Unicode scalar offset in the source, not a UTF-8 byte offset.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "version": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "version",
+    "offset"
+  ]
+}

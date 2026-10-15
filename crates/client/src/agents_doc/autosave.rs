@@ -6,14 +6,18 @@ use std::time::Duration;
 
 pub const AGENTS_DOC_AUTOSAVE_DELAY: Duration = Duration::from_millis(700);
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum AgentsDocEditorLoadState {
     Loading,
     Loaded,
     Failed(String),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AgentsDocEditorSaveState {
     Clean,
     Dirty,

@@ -198,6 +198,8 @@ fn permission_request_details(
         ("network_mode", "Network mode", false),
         ("network_host", "Network host", true),
         ("network_hosts", "Network hosts", true),
+        ("network_origin", "Network origin", true),
+        ("network_origins", "Network origins", true),
         ("operations", "Patch operations", false),
         ("method", "Method", false),
         ("domain", "Domain", true),
@@ -205,6 +207,10 @@ fn permission_request_details(
         ("url_path", "URL path", true),
         ("destination_hint", "Destination", false),
         ("destination", "Download destination", true),
+        ("overwrite", "Overwrite existing file", false),
+        ("create_dirs", "Create directories", false),
+        ("follow_redirects", "Follow redirects", false),
+        ("max_bytes", "Maximum download bytes", false),
         ("server", "MCP server", true),
         ("tool", "MCP tool", true),
         ("mcp_safety", "MCP safety", false),
@@ -216,6 +222,29 @@ fn permission_request_details(
         ("target_tool", "Target tool", true),
         ("action", "Action", false),
         ("session_id", "Session", false),
+        ("target_type", "Desktop target type", false),
+        ("target_name", "Desktop target", true),
+        ("target_pid", "Desktop target PID", false),
+        ("target_identity_key", "Desktop target identity", true),
+        ("target_bundle_id", "Desktop bundle ID", true),
+        ("target_executable_path", "Desktop executable", true),
+        ("display_id", "Display", false),
+        ("launch_if_missing", "Launch if missing", false),
+        ("launch_command", "Launch command", true),
+        ("screenshot_path", "Screenshot path", true),
+        ("act_type", "Desktop operation", false),
+        ("act_app", "Application", true),
+        ("act_path", "Desktop path", true),
+        ("act_action_name", "Action name", true),
+        ("act_condition", "Condition", false),
+        ("act_title", "Window title", true),
+        ("act_keys", "Keys", true),
+        ("act_target", "Input target", true),
+        ("act_from", "Input source", true),
+        ("act_to", "Input destination", true),
+        ("act_menu_path", "Menu path", true),
+        ("input_text_present", "Types text", false),
+        ("input_text_bytes", "Text bytes", false),
         ("stdin_chars_present", "Stdin chars present", false),
         ("stdin_bytes", "Stdin bytes", false),
     ];
@@ -259,4 +288,48 @@ fn push_permission_request_detail(
         value: value.to_owned(),
         monospace,
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pioneer_tools::PermissionRequestScope;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn computer_use_request_details_show_effect_without_exposing_payload_hash() {
+        let intent = PermissionIntent {
+            action: pioneer_tools::PermissionActionKind::ComputerUse,
+            scope: PermissionRequestScope {
+                entries: BTreeMap::from([
+                    ("operation".to_owned(), "computer use".to_owned()),
+                    ("action".to_owned(), "start".to_owned()),
+                    (
+                        "target_bundle_id".to_owned(),
+                        "com.example.Editor".to_owned(),
+                    ),
+                    (
+                        "launch_command".to_owned(),
+                        "open -b com.example.Editor".to_owned(),
+                    ),
+                    ("payload_hash".to_owned(), "secret-binding-hash".to_owned()),
+                ]),
+            },
+            summary: Some("computer_use start".to_owned()),
+        };
+
+        let details = permission_request_details(&intent);
+
+        assert!(details.iter().any(|detail| {
+            detail.label == "Desktop bundle ID" && detail.value == "com.example.Editor"
+        }));
+        assert!(details.iter().any(|detail| {
+            detail.label == "Launch command" && detail.value == "open -b com.example.Editor"
+        }));
+        assert!(
+            !details
+                .iter()
+                .any(|detail| detail.value == "secret-binding-hash")
+        );
+    }
 }

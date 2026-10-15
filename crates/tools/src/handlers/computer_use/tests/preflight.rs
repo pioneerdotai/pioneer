@@ -150,6 +150,7 @@ fn xa11y_api_compile_reference() {
             Error::NoElementBounds => "no_element_bounds",
             Error::Unsupported { .. } => "unsupported",
             Error::Platform { .. } => "platform",
+            _ => "unknown",
         }
     }
 
@@ -181,12 +182,11 @@ fn xa11y_api_compile_reference() {
         sim.mouse()
             .click_with(
                 ClickTarget::Point(Point::new(1, 1)),
-                ClickOptions {
-                    button: MouseButton::Left,
-                    count: 1,
-                    held: vec![Key::Meta],
-                    anchor: xa11y::Anchor::Center,
-                },
+                ClickOptions::new()
+                    .button(MouseButton::Left)
+                    .count(1)
+                    .held([Key::Meta])
+                    .anchor(xa11y::Anchor::Center),
             )
             .unwrap();
         sim.mouse()

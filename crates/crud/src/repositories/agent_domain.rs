@@ -7,6 +7,7 @@
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Duration, Utc};
+use futures_util::FutureExt;
 use pioneer_entity::{
     actor_nickname_index, agent_action, agent_action_outbox, agent_action_receipt,
     agent_action_timeline_target, agent_delegation_route, agent_delegation_route_event,
@@ -24,15 +25,18 @@ use pioneer_protocol::{
     AgentWorkNodeProjection, AgentWorkNodeState, PersistedActorRef, SafeRouteProvenance,
     TaskActorContract, TaskOccurrenceContract, TaskOccurrenceStatus, Thread,
 };
+#[cfg(test)]
+use sea_orm::DatabaseConnection;
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::sea_query::{OnConflict, Query};
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, DatabaseConnection,
-    DatabaseTransaction, EntityTrait, ExprTrait, PaginatorTrait, QueryFilter, QueryOrder,
-    QuerySelect, Set, Statement, TransactionTrait, TryGetable,
+    ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, DatabaseTransaction, EntityTrait,
+    ExprTrait, FromQueryResult, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set,
+    Statement, TransactionSession, TransactionTrait, TryGetable,
 };
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+use std::panic::AssertUnwindSafe;
 
 pub const SOURCE_NATIVE_AGENT: &str = "native_agent";
 pub const SOURCE_CLI_RUNTIME_INSTANCE: &str = "cli_runtime_instance";
@@ -43,7 +47,14 @@ pub const NICKNAME_OWNER_AGENT: &str = "agent";
 pub const NICKNAME_OWNER_RESERVED: &str = "reserved";
 pub const NICKNAME_ACTIVE: &str = "active";
 pub const NICKNAME_TOMBSTONED: &str = "tombstoned";
+// The two partial-index predicates pin this policy to 8. Changing the retry
+// budget requires a migration replacing their predicates, plus the queries below.
 pub const AGENT_ACTION_OUTBOX_MAX_ATTEMPTS: i64 = 8;
+const _: () = assert!(AGENT_ACTION_OUTBOX_MAX_ATTEMPTS == 8);
+const AGENT_ACTION_OUTBOX_BATCH_LIMIT: u64 = 64;
+const AGENT_ACTION_OUTBOX_RANGE_LIMIT: u64 = 32;
+const AGENT_ACTION_OUTBOX_IMMEDIATE_SQL: &str = "SELECT id FROM agent_action_outbox WHERE next_attempt_at IS NULL AND status IN ('pending','failed') AND attempts<8 ORDER BY created_at,id LIMIT ?";
+const AGENT_ACTION_OUTBOX_TIMED_SQL: &str = "SELECT id FROM agent_action_outbox WHERE next_attempt_at IS NOT NULL AND (status='pending' OR (status='failed' AND attempts<8)) AND next_attempt_at<=? ORDER BY next_attempt_at,created_at,id LIMIT ?";
 const AGENT_ACTION_OUTBOX_FAILURE_CLASS: &str = "outbox_delivery_failed";
 pub const AGENT_ACTION_LEDGER_PAYLOAD_RETENTION_DAYS: i64 = 30;
 pub const AGENT_ROUTE_GRAPH_MAX_EDGES: usize = 2_048;
@@ -60,12 +71,34 @@ const AGENT_ROUTE_EXPIRY_BATCH_SIZE: u64 = 512;
 const AGENT_ACTION_OUTBOX_LEASE_SECONDS: i64 = 30;
 const AGENT_ACTION_OUTBOX_MAX_RETRY_SECONDS: i64 = 30 * 60;
 const AGENT_ACTION_OUTBOX_PERMIT_WAIT_CLASS: &str = "waiting_for_durable_permit";
+const AGENT_ACTION_OUTBOX_RUNTIME_WAIT_CLASS: &str = "waiting_for_native_thread_runtime";
 pub(super) const AGENT_ACTION_COMPACTION_FORMAT: &str = "agent_action_response_v1";
 pub(super) const AGENT_ACTION_RECEIPT_COMPACTION_FORMAT: &str = "agent_action_receipt_response_v1";
 pub(super) const AGENT_ACTION_OUTBOX_COMPACTION_FORMAT: &str = "agent_action_outbox_payload_v1";
 
 const ACTION_TIMELINE_TARGET_TURN_INPUT: &str = "turn_input";
 const ACTION_TIMELINE_TARGET_TURN_ITEM: &str = "turn_item";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalTaskDeliveryCommitError {
+    OccurrenceActorMismatch,
+    OccurrenceTerminalStatusMismatch,
+}
+
+impl std::fmt::Display for TerminalTaskDeliveryCommitError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::OccurrenceActorMismatch => {
+                formatter.write_str("terminal Task delivery occurrence actor mismatch")
+            }
+            Self::OccurrenceTerminalStatusMismatch => {
+                formatter.write_str("terminal Task delivery occurrence status mismatch")
+            }
+        }
+    }
+}
+
+impl std::error::Error for TerminalTaskDeliveryCommitError {}
 
 fn agent_work_resource_limits_are_bounded(
     max_concurrency: i64,
@@ -1969,13 +2002,29 @@ pub async fn revoke_agent_delegation_route(
     Ok(true)
 }
 
-pub async fn expire_agent_delegation_routes(
-    db: &DatabaseTransaction,
+#[derive(Debug, Clone)]
+pub(crate) struct PreparedAgentDelegationRouteExpiryBatch {
+    routes: Vec<PreparedAgentDelegationRouteExpiry>,
+}
+
+#[derive(Debug, Clone)]
+struct PreparedAgentDelegationRouteExpiry {
+    expected: agent_delegation_route::Model,
+    event_id: String,
+    next_generation: i64,
+    authority_actor_json: String,
+    authority_fingerprint: String,
+    occurred_at: DateTimeWithTimeZone,
+}
+
+pub(crate) async fn prepare_agent_delegation_route_expiry_batch<C: ConnectionTrait>(
+    db: &C,
     now: DateTimeWithTimeZone,
-) -> Result<u64> {
+) -> Result<PreparedAgentDelegationRouteExpiryBatch> {
     let candidates = agent_delegation_route::Entity::find()
         .filter(agent_delegation_route::Column::Status.is_in(["prepared", "active"]))
         .filter(agent_delegation_route::Column::ExpiresAt.lte(now))
+        .filter(agent_delegation_route::Column::RouteGeneration.lt(i64::MAX))
         .order_by_asc(agent_delegation_route::Column::ExpiresAt)
         .order_by_asc(agent_delegation_route::Column::Id)
         .limit(AGENT_ROUTE_EXPIRY_BATCH_SIZE)
@@ -1984,58 +2033,148 @@ pub async fn expire_agent_delegation_routes(
         .context("failed to load expiring agent delegation routes")?;
     let authority_actor_json = serde_json::to_string(&PersistedActorRef::System)
         .context("failed to serialize System actor for route expiry")?;
-    let authority_fingerprint = "agent-route-expiry";
-    let mut expired = 0u64;
-    for route in candidates {
-        let result = agent_delegation_route::Entity::update_many()
-            .col_expr(
-                agent_delegation_route::Column::Status,
-                sea_orm::sea_query::Expr::value("expired"),
-            )
-            .col_expr(
-                agent_delegation_route::Column::RouteGeneration,
-                sea_orm::sea_query::Expr::cust("route_generation + 1"),
-            )
-            .col_expr(
-                agent_delegation_route::Column::UpdatedAt,
-                sea_orm::sea_query::Expr::value(now.clone()),
-            )
-            .col_expr(
-                agent_delegation_route::Column::AuthorityActorJson,
-                sea_orm::sea_query::Expr::value(Some(authority_actor_json.clone())),
-            )
-            .col_expr(
-                agent_delegation_route::Column::AuthorityFingerprint,
-                sea_orm::sea_query::Expr::value(Some(authority_fingerprint.to_owned())),
-            )
-            .filter(agent_delegation_route::Column::Id.eq(route.id.clone()))
-            .filter(agent_delegation_route::Column::RouteGeneration.eq(route.route_generation))
-            .filter(agent_delegation_route::Column::RouteGeneration.lt(i64::MAX))
-            .filter(agent_delegation_route::Column::Status.is_in(["prepared", "active"]))
-            .filter(agent_delegation_route::Column::ExpiresAt.lte(now.clone()))
-            .exec(db)
-            .await
-            .context("failed to expire agent delegation route")?;
-        if result.rows_affected == 0 {
-            continue;
-        }
-        let next_generation = route
-            .route_generation
-            .checked_add(1)
-            .context("route generation overflow")?;
-        append_agent_route_event(
-            db,
-            route.id.as_str(),
-            "expired",
-            next_generation,
-            authority_actor_json.as_str(),
-            authority_fingerprint,
-            now.clone(),
-        )
-        .await?;
-        expired = expired.saturating_add(1);
+    let authority_fingerprint = "agent-route-expiry".to_owned();
+    let routes = candidates
+        .into_iter()
+        .map(|expected| {
+            let next_generation = expected
+                .route_generation
+                .checked_add(1)
+                .context("route generation overflow")?;
+            Ok(PreparedAgentDelegationRouteExpiry {
+                event_id: canonical_agent_id(
+                    'V',
+                    &format!("route-event\0{}\0{next_generation}", expected.id),
+                ),
+                expected,
+                next_generation,
+                authority_actor_json: authority_actor_json.clone(),
+                authority_fingerprint: authority_fingerprint.clone(),
+                occurred_at: now,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(PreparedAgentDelegationRouteExpiryBatch { routes })
+}
+
+pub(crate) async fn apply_prepared_agent_delegation_route_expiry_batch(
+    db: &DatabaseTransaction,
+    prepared: &PreparedAgentDelegationRouteExpiryBatch,
+    now: DateTimeWithTimeZone,
+) -> Result<u64> {
+    if prepared.routes.is_empty() {
+        return Ok(0);
     }
-    Ok(expired)
+
+    let route_ids = prepared
+        .routes
+        .iter()
+        .map(|route| route.expected.id.clone())
+        .collect::<Vec<_>>();
+    let current = agent_delegation_route::Entity::find()
+        .filter(agent_delegation_route::Column::Id.is_in(route_ids))
+        .all(db)
+        .await
+        .context("failed to revalidate expiring agent delegation routes")?
+        .into_iter()
+        .map(|route| (route.id.clone(), route))
+        .collect::<BTreeMap<_, _>>();
+    let eligible = prepared
+        .routes
+        .iter()
+        .filter(|route| current.get(route.expected.id.as_str()) == Some(&route.expected))
+        .collect::<Vec<_>>();
+    if eligible.is_empty() {
+        return Ok(0);
+    }
+
+    let eligible_ids = eligible
+        .iter()
+        .map(|route| route.expected.id.clone())
+        .collect::<Vec<_>>();
+    let updated = agent_delegation_route::Entity::update_many()
+        .col_expr(
+            agent_delegation_route::Column::Status,
+            sea_orm::sea_query::Expr::value("expired"),
+        )
+        .col_expr(
+            agent_delegation_route::Column::RouteGeneration,
+            sea_orm::sea_query::Expr::cust("route_generation + 1"),
+        )
+        .col_expr(
+            agent_delegation_route::Column::UpdatedAt,
+            sea_orm::sea_query::Expr::value(now),
+        )
+        .col_expr(
+            agent_delegation_route::Column::AuthorityActorJson,
+            sea_orm::sea_query::Expr::value(Some(eligible[0].authority_actor_json.clone())),
+        )
+        .col_expr(
+            agent_delegation_route::Column::AuthorityFingerprint,
+            sea_orm::sea_query::Expr::value(Some(eligible[0].authority_fingerprint.clone())),
+        )
+        .filter(agent_delegation_route::Column::Id.is_in(eligible_ids))
+        .filter(agent_delegation_route::Column::Status.is_in(["prepared", "active"]))
+        .filter(agent_delegation_route::Column::ExpiresAt.lte(now))
+        .filter(agent_delegation_route::Column::RouteGeneration.lt(i64::MAX))
+        .exec(db)
+        .await
+        .context("failed to bulk-expire agent delegation routes")?;
+    let expected_updated = u64::try_from(eligible.len()).unwrap_or(u64::MAX);
+    if updated.rows_affected != expected_updated {
+        bail!("agent delegation routes changed while the expiry batch was committing");
+    }
+
+    let event_models = eligible
+        .iter()
+        .map(|route| agent_delegation_route_event::ActiveModel {
+            id: Set(route.event_id.clone()),
+            route_id: Set(route.expected.id.clone()),
+            event_kind: Set("expired".to_owned()),
+            route_generation: Set(route.next_generation),
+            authority_actor_json: Set(route.authority_actor_json.clone()),
+            authority_fingerprint: Set(route.authority_fingerprint.clone()),
+            occurred_at: Set(route.occurred_at),
+        })
+        .collect::<Vec<_>>();
+    agent_delegation_route_event::Entity::insert_many(event_models)
+        .on_conflict(
+            OnConflict::column(agent_delegation_route_event::Column::Id)
+                .do_nothing()
+                .to_owned(),
+        )
+        .exec_without_returning(db)
+        .await
+        .context("failed to append bulk Agent route expiry events")?;
+
+    let event_ids = eligible
+        .iter()
+        .map(|route| route.event_id.clone())
+        .collect::<Vec<_>>();
+    let persisted_events = agent_delegation_route_event::Entity::find()
+        .filter(agent_delegation_route_event::Column::Id.is_in(event_ids))
+        .all(db)
+        .await
+        .context("failed to verify bulk Agent route expiry events")?
+        .into_iter()
+        .map(|event| (event.id.clone(), event))
+        .collect::<BTreeMap<_, _>>();
+    for route in &eligible {
+        let event = persisted_events
+            .get(route.event_id.as_str())
+            .context("Agent route expiry event disappeared after append")?;
+        if event.route_id != route.expected.id
+            || event.event_kind != "expired"
+            || event.route_generation != route.next_generation
+            || event.authority_actor_json != route.authority_actor_json
+            || event.authority_fingerprint != route.authority_fingerprint
+            || event.occurred_at != route.occurred_at
+        {
+            bail!("Agent route expiry event id was reused with different facts");
+        }
+    }
+
+    Ok(expected_updated)
 }
 
 /// Atomically materialize a server-resolved thread and its execution-scoped
@@ -2135,15 +2274,12 @@ pub async fn insert_agent_execution_grant<C: ConnectionTrait>(
     let (identity, profile, child_launch_grant) =
         parse_agent_execution_launch_grant(input.grant_json.as_str())?;
     if input.grant_fingerprint != agent_execution_grant_fingerprint(input.grant_json.as_str())?
-        || identity.id.as_str() != input.child_identity_id
-        || !child_launch_grant
-            .identities
-            .iter()
-            .any(|candidate| candidate == &identity)
-        || !child_launch_grant
-            .profiles
-            .iter()
-            .any(|candidate| candidate == &profile)
+        || !agent_execution_launch_grant_matches_child_identity(
+            &identity,
+            &profile,
+            &child_launch_grant,
+            input.child_identity_id.as_str(),
+        )
     {
         bail!("agent execution grant identity/profile is outside its child launch ceiling");
     }
@@ -2169,6 +2305,8 @@ pub async fn insert_agent_execution_grant<C: ConnectionTrait>(
         .await
         .context("failed to reload agent execution grant")?
         .context("agent execution grant disappeared after idempotent insert")?;
+    let grant = upgrade_agent_execution_grant_model_to_current(grant)
+        .context("failed to upcast reloaded agent execution grant")?;
     if grant.execution_id != input.execution_id
         || grant.parent_execution_id != input.parent_execution_id
         || grant.child_identity_id != input.child_identity_id
@@ -2189,6 +2327,62 @@ pub fn agent_execution_grant_fingerprint(grant_json: &str) -> Result<String> {
     digest.update(b"pioneer:agent-runtime:execution-grant:v1\0");
     digest.update(canonical);
     Ok(hex::encode(digest.finalize()))
+}
+
+/// Verifies an immutable AgentExecution grant in its stored representation,
+/// then upcasts only its embedded child-launch ceiling for current readers.
+/// The returned model is an in-memory projection; background maintenance owns
+/// durable rewrites so ordinary reads never acquire a write dependency.
+pub fn upgrade_agent_execution_grant_model_to_current(
+    mut grant: agent_execution_grant::Model,
+) -> Result<agent_execution_grant::Model> {
+    let stored_fingerprint = agent_execution_grant_fingerprint(grant.grant_json.as_str())?;
+    if grant.grant_fingerprint != stored_fingerprint {
+        bail!("agent execution grant fingerprint does not match its stored JSON");
+    }
+
+    let migrated = pioneer_protocol::migrate_embedded_child_launch_grant_json_to_current(
+        grant.grant_json.as_str(),
+    )
+    .context("failed to upcast agent execution child launch ceiling")?;
+    let (identity, profile, child_launch_grant) =
+        parse_agent_execution_launch_grant(migrated.as_str())?;
+    if !agent_execution_launch_grant_matches_child_identity(
+        &identity,
+        &profile,
+        &child_launch_grant,
+        grant.child_identity_id.as_str(),
+    ) {
+        bail!("agent execution grant identity/profile is outside its child launch ceiling");
+    }
+
+    if migrated != grant.grant_json {
+        grant.grant_fingerprint = agent_execution_grant_fingerprint(migrated.as_str())?;
+        grant.grant_json = migrated;
+    }
+    Ok(grant)
+}
+
+fn agent_execution_launch_grant_matches_child_identity(
+    identity: &pioneer_protocol::AgentIdentityProjection,
+    profile: &pioneer_protocol::AgentExecutionProfileProjection,
+    child_launch_grant: &pioneer_protocol::ChildAgentLaunchGrantSet,
+    child_identity_id: &str,
+) -> bool {
+    identity.id.as_str() == child_identity_id
+        && child_launch_grant
+            .identities
+            .iter()
+            .any(|candidate| candidate == identity)
+        && child_launch_grant
+            .profiles
+            .iter()
+            .any(|candidate| candidate == profile)
+        && (identity.source_kind == pioneer_protocol::AgentIdentitySourceKind::Ephemeral
+            || profile
+                .compatible_agent_identity_ids
+                .iter()
+                .any(|candidate| candidate == &identity.id))
 }
 
 fn parse_agent_execution_launch_grant(
@@ -2235,7 +2429,10 @@ pub async fn load_agent_execution_grant<C: ConnectionTrait>(
         .filter(agent_execution_grant::Column::ExecutionId.eq(execution_id.to_owned()))
         .one(db)
         .await
-        .context("failed to load agent execution grant")
+        .context("failed to load agent execution grant")?
+        .map(upgrade_agent_execution_grant_model_to_current)
+        .transpose()
+        .context("failed to upcast loaded agent execution grant")
 }
 
 pub async fn insert_agent_turn_response<C: ConnectionTrait>(
@@ -3932,9 +4129,11 @@ async fn revalidate_terminal_task_delivery_action(
         .context("terminal Task delivery has no occurrence contract")?;
     if occurrence.task_id != parent_task_id
         || occurrence.agent_execution_id.as_deref() != Some(execution.id.as_str())
-        || occurrence.status != "delivered"
     {
-        bail!("terminal Task delivery differs from its exact occurrence actor");
+        return Err(TerminalTaskDeliveryCommitError::OccurrenceActorMismatch.into());
+    }
+    if occurrence.status != "delivered" {
+        return Err(TerminalTaskDeliveryCommitError::OccurrenceTerminalStatusMismatch.into());
     }
     let task_execution = task_run_execution::Entity::find_by_id(execution.id.clone())
         .one(db)
@@ -3986,6 +4185,11 @@ async fn revalidate_agent_receipt_authority(
         .all(db)
         .await
         .context("failed to revalidate Agent action execution grant")?;
+    let grants = grants
+        .into_iter()
+        .map(upgrade_agent_execution_grant_model_to_current)
+        .collect::<Result<Vec<_>>>()
+        .context("failed to upcast Agent action execution grant")?;
     if grants.len() != 1 {
         bail!("Agent action execution must own one exact immutable grant");
     }
@@ -4461,11 +4665,14 @@ pub async fn commit_native_agent_config_mutation(
 /// window and only for a terminal, complete action tuple. Immutable action,
 /// receipt and outbox ownership facts remain queryable; exact payload hashes
 /// still fence a late direct replay without retaining provider-sized blobs.
-pub async fn compact_terminal_agent_action_ledger(
-    db: &DatabaseConnection,
+pub async fn compact_terminal_agent_action_ledger<C>(
+    db: &C,
     now: DateTimeWithTimeZone,
     limit: u64,
-) -> Result<AgentActionLedgerCompactionSummary> {
+) -> Result<AgentActionLedgerCompactionSummary>
+where
+    C: ConnectionTrait + TransactionTrait,
+{
     if limit == 0 {
         return Ok(AgentActionLedgerCompactionSummary::default());
     }
@@ -4500,18 +4707,14 @@ pub async fn compact_terminal_agent_action_ledger(
         ..Default::default()
     };
     for candidate in candidates {
-        let transaction = db
-            .begin()
-            .await
-            .context("failed to begin agent domain action ledger compaction")?;
         let action = agent_action::Entity::find_by_id(candidate.action_id.clone())
-            .one(&transaction)
+            .one(db)
             .await
             .context("failed to load compactable agent domain action")?
             .context("compactable agent domain outbox has no action")?;
         let receipt = agent_action_receipt::Entity::find()
             .filter(agent_action_receipt::Column::ActionId.eq(candidate.action_id.clone()))
-            .one(&transaction)
+            .one(db)
             .await
             .context("failed to load compactable agent domain action receipt")?
             .context("compactable agent domain outbox has no receipt")?;
@@ -4530,54 +4733,76 @@ pub async fn compact_terminal_agent_action_ledger(
 
         let compacted_outbox = compacted_agent_action_outbox_payload(&candidate, &action)?;
         let mut released = compacted_bytes(candidate.payload_json.as_str(), &compacted_outbox);
+        let compacted_action_response = action
+            .response_json
+            .as_deref()
+            .filter(|original| {
+                !is_agent_action_compaction_marker(original, AGENT_ACTION_COMPACTION_FORMAT)
+            })
+            .map(|original| {
+                let compacted = agent_action_compaction_marker(
+                    AGENT_ACTION_COMPACTION_FORMAT,
+                    original,
+                    serde_json::Map::new(),
+                );
+                released = released.saturating_add(compacted_bytes(original, &compacted));
+                (original.to_owned(), compacted)
+            });
+        let compacted_receipt_response = receipt
+            .response_json
+            .as_deref()
+            .filter(|original| {
+                !is_agent_action_compaction_marker(original, AGENT_ACTION_RECEIPT_COMPACTION_FORMAT)
+            })
+            .map(|original| {
+                let compacted = agent_action_compaction_marker(
+                    AGENT_ACTION_RECEIPT_COMPACTION_FORMAT,
+                    original,
+                    serde_json::Map::new(),
+                );
+                released = released.saturating_add(compacted_bytes(original, &compacted));
+                (original.to_owned(), compacted)
+            });
 
-        if let Some(original) = action.response_json.as_deref()
-            && !is_agent_action_compaction_marker(original, AGENT_ACTION_COMPACTION_FORMAT)
-        {
-            let compacted = agent_action_compaction_marker(
-                AGENT_ACTION_COMPACTION_FORMAT,
-                original,
-                serde_json::Map::new(),
-            );
+        let transaction = db
+            .begin()
+            .await
+            .context("failed to begin agent domain action ledger compaction")?;
+        if let Some((original, compacted)) = compacted_action_response {
             let updated = agent_action::Entity::update_many()
                 .col_expr(
                     agent_action::Column::ResponseJson,
-                    sea_orm::sea_query::Expr::value(Some(compacted.clone())),
+                    sea_orm::sea_query::Expr::value(Some(compacted)),
                 )
                 .filter(agent_action::Column::Id.eq(action.id.clone()))
                 .filter(agent_action::Column::Status.eq("committed"))
-                .filter(agent_action::Column::ResponseJson.eq(Some(original.to_owned())))
+                .filter(agent_action::Column::ExecutionId.eq(action.execution_id.clone()))
+                .filter(agent_action::Column::ResponseJson.eq(Some(original)))
                 .exec(&transaction)
                 .await
                 .context("failed to compact agent domain action response")?;
             if updated.rows_affected != 1 {
                 bail!("agent domain action response changed during compaction");
             }
-            released = released.saturating_add(compacted_bytes(original, &compacted));
         }
-        if let Some(original) = receipt.response_json.as_deref()
-            && !is_agent_action_compaction_marker(original, AGENT_ACTION_RECEIPT_COMPACTION_FORMAT)
-        {
-            let compacted = agent_action_compaction_marker(
-                AGENT_ACTION_RECEIPT_COMPACTION_FORMAT,
-                original,
-                serde_json::Map::new(),
-            );
+        if let Some((original, compacted)) = compacted_receipt_response {
             let updated = agent_action_receipt::Entity::update_many()
                 .col_expr(
                     agent_action_receipt::Column::ResponseJson,
-                    sea_orm::sea_query::Expr::value(Some(compacted.clone())),
+                    sea_orm::sea_query::Expr::value(Some(compacted)),
                 )
                 .filter(agent_action_receipt::Column::Id.eq(receipt.id.clone()))
+                .filter(agent_action_receipt::Column::ActionId.eq(action.id.clone()))
                 .filter(agent_action_receipt::Column::Decision.eq("allowed"))
-                .filter(agent_action_receipt::Column::ResponseJson.eq(Some(original.to_owned())))
+                .filter(agent_action_receipt::Column::ActorKind.eq("agent_execution"))
+                .filter(agent_action_receipt::Column::ActorId.eq(Some(action.execution_id.clone())))
+                .filter(agent_action_receipt::Column::ResponseJson.eq(Some(original)))
                 .exec(&transaction)
                 .await
                 .context("failed to compact agent domain receipt response")?;
             if updated.rows_affected != 1 {
                 bail!("agent domain receipt response changed during compaction");
             }
-            released = released.saturating_add(compacted_bytes(original, &compacted));
         }
         let updated = agent_action_outbox::Entity::update_many()
             .col_expr(
@@ -4588,6 +4813,7 @@ pub async fn compact_terminal_agent_action_ledger(
             .filter(agent_action_outbox::Column::PayloadJson.eq(candidate.payload_json.clone()))
             .filter(agent_action_outbox::Column::Status.eq(candidate.status.clone()))
             .filter(agent_action_outbox::Column::Attempts.eq(candidate.attempts))
+            .filter(agent_action_outbox::Column::OwnerExecutionId.eq(action.execution_id.clone()))
             .exec(&transaction)
             .await
             .context("failed to compact agent domain action outbox payload")?;
@@ -4720,101 +4946,276 @@ fn is_sha256_hex(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
-/// Claim a bounded batch of post-commit action outbox rows.  The schema keeps
-/// the public status set intentionally small; `next_attempt_at` is the
-/// lease/fencing field that prevents two workers from processing the same row
-/// concurrently without introducing a second state machine.
-pub async fn claim_agent_action_outbox<C: ConnectionTrait>(
+#[derive(FromQueryResult)]
+struct AgentActionOutboxId {
+    id: String,
+}
+
+// Keep these predicates literally aligned with the partial indexes in
+// m20261008_000002_background_access_indexes. Only clocks and limits are binds.
+async fn discover_agent_action_outbox<C: ConnectionTrait>(
     db: &C,
     now: DateTimeWithTimeZone,
     limit: u64,
-) -> Result<Vec<agent_action_outbox::Model>> {
+) -> Result<Vec<AgentActionOutboxId>> {
+    let immediate_limit = std::cmp::min(limit.div_ceil(2), AGENT_ACTION_OUTBOX_RANGE_LIMIT);
+    let timed_limit = std::cmp::min(limit / 2, AGENT_ACTION_OUTBOX_RANGE_LIMIT);
+    let mut ids = AgentActionOutboxId::find_by_statement(Statement::from_sql_and_values(
+        db.get_database_backend(),
+        AGENT_ACTION_OUTBOX_IMMEDIATE_SQL,
+        [immediate_limit.into()],
+    ))
+    .all(db)
+    .await
+    .context("failed to list immediate agent action outbox IDs")?;
+    ids.extend(
+        AgentActionOutboxId::find_by_statement(Statement::from_sql_and_values(
+            db.get_database_backend(),
+            AGENT_ACTION_OUTBOX_TIMED_SQL,
+            [now.into(), timed_limit.into()],
+        ))
+        .all(db)
+        .await
+        .context("failed to list timed agent action outbox IDs")?,
+    );
+    // A concurrent source transition can move an ID between these two reads.
+    // Retain range order but never transition the same input twice per quantum.
+    let mut seen = std::collections::BTreeSet::new();
+    ids.retain(|row| seen.insert(row.id.clone()));
+    Ok(ids)
+}
+
+/// Known-committed claims and independent candidate failures from one input quantum.
+#[derive(Debug, Default)]
+pub struct AgentActionOutboxClaimBatch {
+    pub rows: Vec<agent_action_outbox::Model>,
+    pub errors: Vec<anyhow::Error>,
+}
+
+/// Claim at most 32 immediate and 32 timed inputs. Expired final leases share
+/// this budget with delivery work. Nonzero limits must be 2..=64 so both ranges
+/// receive a share. Dispatch only `rows`, whose commits are known to have succeeded.
+pub async fn claim_agent_action_outbox<C: ConnectionTrait + TransactionTrait>(
+    db: &C,
+    limit: u64,
+) -> Result<AgentActionOutboxClaimBatch> {
+    claim_agent_action_outbox_with_clock(db, limit, &utc_now).await
+}
+
+// An immediate clock callback makes writer-admission timing testable without
+// sleeps. It performs no preparation or I/O while the transaction is open.
+async fn claim_agent_action_outbox_with_clock<C: ConnectionTrait + TransactionTrait>(
+    db: &C,
+    limit: u64,
+    clock: &(impl Fn() -> DateTimeWithTimeZone + Sync),
+) -> Result<AgentActionOutboxClaimBatch> {
     if limit == 0 {
-        return Ok(Vec::new());
+        return Ok(AgentActionOutboxClaimBatch::default());
     }
-    if limit > AGENT_BACKGROUND_BATCH_LIMIT {
-        bail!("Agent action outbox batch exceeds its bounded limit");
+    if !(2..=AGENT_ACTION_OUTBOX_BATCH_LIMIT).contains(&limit) {
+        bail!("Agent action outbox nonzero batch limit must be 2..=64");
     }
-    // A worker can disappear after taking its final lease. Once that lease
-    // expires there is no acknowledgement from which to derive an external
-    // error, so close the row with a bounded diagnostic instead of leaving a
-    // permanently pending, unclaimable outbox entry.
-    agent_action_outbox::Entity::update_many()
-        .col_expr(
-            agent_action_outbox::Column::Status,
-            sea_orm::sea_query::Expr::value("failed"),
-        )
+    let ids = discover_agent_action_outbox(db, clock(), limit).await?;
+    let mut batch = AgentActionOutboxClaimBatch::default();
+    for id in ids {
+        // The entire point operation is inside the boundary, including future
+        // creation and polling. Dropping it releases transactions/reservations;
+        // cancellation still drops the owning future rather than becoming Err.
+        let outcome = AssertUnwindSafe(async {
+            let transaction =
+                match db.begin().await {
+                    Ok(transaction) => transaction,
+                    Err(error) => {
+                        batch.errors.push(anyhow::Error::new(error).context(
+                            "failed to begin outbox claim; no snapshot for durable deferral",
+                        ));
+                        return;
+                    }
+                };
+            let now = clock(); // after serialized writer admission, for each row
+            // Original source payload is authoritative. Do not decode it under capacity.
+            let mut candidate =
+                match agent_action_outbox::Entity::find_by_id(id.id)
+                    .one(&transaction)
+                    .await
+                {
+                    Ok(Some(candidate)) => candidate,
+                    Ok(None) => {
+                        if let Err(error) = transaction.rollback().await {
+                            batch.errors.push(error.into());
+                        }
+                        return;
+                    }
+                    Err(error) => {
+                        batch.errors.push(anyhow::Error::new(error).context(
+                            "failed to load outbox input; no snapshot for durable deferral",
+                        ));
+                        if let Err(error) = transaction.rollback().await {
+                            batch.errors.push(error.into());
+                        }
+                        return;
+                    }
+                };
+            let row = match transition_agent_action_outbox(&transaction, &mut candidate, now).await
+            {
+                Ok(row) => row,
+                Err(error) => {
+                    batch.errors.push(error);
+                    // Only a known rollback permits a separate snapshot-fenced delay.
+                    match transaction.rollback().await {
+                        Ok(()) => {
+                            match defer_unclaimed_agent_action_outbox(db, &candidate, clock).await {
+                                Ok(true) => {}
+                                Ok(false) => batch.errors.push(anyhow::anyhow!(
+                                    "outbox claim deferral skipped: source snapshot changed"
+                                )),
+                                Err(error) => batch.errors.push(error.context(
+                                    "outbox claim deferral not confirmed; durability unavailable",
+                                )),
+                            }
+                        }
+                        Err(error) => batch.errors.push(
+                            anyhow::Error::new(error)
+                                .context("outbox rollback not confirmed; no claim repair allowed"),
+                        ),
+                    }
+                    return;
+                }
+            };
+            // Unknown commit excludes only this row. Never repair, rediscover or
+            // claim it again here; previously confirmed rows still reach dispatch.
+            match transaction.commit().await {
+                Ok(()) => {
+                    if row {
+                        batch.rows.push(candidate);
+                    }
+                }
+                Err(error) => batch.errors.push(
+                    anyhow::Error::new(error)
+                        .context("agent action outbox claim commit outcome unknown"),
+                ),
+            }
+        })
+        .catch_unwind()
+        .await;
+        if outcome.is_err() {
+            // Unwind is not a commit/rollback acknowledgement. No repair or
+            // same-quantum retry; only prior known commits are dispatchable.
+            batch
+                .errors
+                .push(anyhow!("outbox_claim_panic_outcome_unknown"));
+        }
+    }
+    Ok(batch)
+}
+
+// A failed, rolled-back claim consumes no execution attempt. Preserve status
+// and attempt budget, using the existing 30s lease as a retry delay. The exact
+// original nullable lease fences any new ownership acquired after rollback.
+async fn defer_unclaimed_agent_action_outbox<C: ConnectionTrait + TransactionTrait>(
+    db: &C,
+    snapshot: &agent_action_outbox::Model,
+    clock: &(impl Fn() -> DateTimeWithTimeZone + Sync),
+) -> Result<bool> {
+    let transaction = db.begin().await?;
+    let now = clock();
+    let lease_guard = match snapshot.next_attempt_at {
+        Some(lease) => agent_action_outbox::Column::NextAttemptAt.eq(lease),
+        None => agent_action_outbox::Column::NextAttemptAt.is_null(),
+    };
+    let result = agent_action_outbox::Entity::update_many()
         .col_expr(
             agent_action_outbox::Column::NextAttemptAt,
-            sea_orm::sea_query::Expr::value::<Option<DateTimeWithTimeZone>>(None),
+            sea_orm::sea_query::Expr::value(Some(
+                now + Duration::seconds(AGENT_ACTION_OUTBOX_LEASE_SECONDS),
+            )),
         )
         .col_expr(
             agent_action_outbox::Column::LastError,
-            sea_orm::sea_query::Expr::value(Some(
-                "outbox delivery lease expired after the retry limit".to_owned(),
-            )),
+            sea_orm::sea_query::Expr::value(Some(AGENT_ACTION_OUTBOX_FAILURE_CLASS.to_owned())),
         )
-        .filter(agent_action_outbox::Column::Status.eq("pending"))
-        .filter(agent_action_outbox::Column::Attempts.gte(AGENT_ACTION_OUTBOX_MAX_ATTEMPTS))
-        .filter(agent_action_outbox::Column::NextAttemptAt.lte(now.clone()))
+        .filter(agent_action_outbox::Column::Id.eq(&snapshot.id))
+        .filter(agent_action_outbox::Column::Status.eq(&snapshot.status))
+        .filter(agent_action_outbox::Column::Attempts.eq(snapshot.attempts))
+        .filter(lease_guard)
+        .exec(&transaction)
+        .await?;
+    transaction.commit().await?;
+    Ok(result.rows_affected == 1)
+}
+
+// One bounded point transition. Exact snapshot guards also fence a replaced
+// lease with the same attempt count (e.g. after permit/runtime budget return).
+async fn transition_agent_action_outbox<C: ConnectionTrait>(
+    db: &C,
+    candidate: &mut agent_action_outbox::Model,
+    now: DateTimeWithTimeZone,
+) -> Result<bool> {
+    if !matches!(candidate.status.as_str(), "pending" | "failed")
+        || candidate
+            .next_attempt_at
+            .as_ref()
+            .is_some_and(|due| due > &now)
+    {
+        return Ok(false);
+    }
+    let exhausted = candidate.attempts >= AGENT_ACTION_OUTBOX_MAX_ATTEMPTS;
+    if exhausted && (candidate.status != "pending" || candidate.next_attempt_at.is_none()) {
+        // Final attempt with a NULL lease was never supported closure eligibility.
+        return Ok(false);
+    }
+    let lease_guard = match candidate.next_attempt_at.clone() {
+        Some(lease) => agent_action_outbox::Column::NextAttemptAt.eq(lease),
+        None => agent_action_outbox::Column::NextAttemptAt.is_null(),
+    };
+    let update = agent_action_outbox::Entity::update_many()
+        .filter(agent_action_outbox::Column::Id.eq(candidate.id.clone()))
+        .filter(agent_action_outbox::Column::Status.eq(candidate.status.clone()))
+        .filter(agent_action_outbox::Column::Attempts.eq(candidate.attempts))
+        .filter(lease_guard);
+    let (status, attempts, next_attempt_at, last_error) = if exhausted {
+        (
+            "failed",
+            candidate.attempts,
+            None,
+            Some("outbox delivery lease expired after the retry limit".to_owned()),
+        )
+    } else {
+        (
+            "pending",
+            candidate.attempts + 1,
+            Some(now + Duration::seconds(AGENT_ACTION_OUTBOX_LEASE_SECONDS)),
+            None,
+        )
+    };
+    let result = update
+        .col_expr(
+            agent_action_outbox::Column::Status,
+            sea_orm::sea_query::Expr::value(status),
+        )
+        .col_expr(
+            agent_action_outbox::Column::Attempts,
+            sea_orm::sea_query::Expr::value(attempts),
+        )
+        .col_expr(
+            agent_action_outbox::Column::NextAttemptAt,
+            sea_orm::sea_query::Expr::value(next_attempt_at.clone()),
+        )
+        .col_expr(
+            agent_action_outbox::Column::LastError,
+            sea_orm::sea_query::Expr::value(last_error.clone()),
+        )
         .exec(db)
         .await
-        .context("failed to dead-letter expired agent domain outbox leases")?;
-
-    let candidates = agent_action_outbox::Entity::find()
-        .filter(agent_action_outbox::Column::Status.is_in(["pending", "failed"]))
-        .filter(agent_action_outbox::Column::Attempts.lt(AGENT_ACTION_OUTBOX_MAX_ATTEMPTS))
-        .filter(
-            agent_action_outbox::Column::NextAttemptAt
-                .is_null()
-                .or(agent_action_outbox::Column::NextAttemptAt.lte(now.clone())),
-        )
-        .order_by_asc(agent_action_outbox::Column::CreatedAt)
-        .limit(limit)
-        .all(db)
-        .await
-        .context("failed to list agent domain action outbox rows")?;
-    let lease_until = now.clone() + Duration::seconds(AGENT_ACTION_OUTBOX_LEASE_SECONDS);
-    let mut claimed = Vec::with_capacity(candidates.len());
-    for candidate in candidates {
-        let result = agent_action_outbox::Entity::update_many()
-            .col_expr(
-                agent_action_outbox::Column::Attempts,
-                sea_orm::sea_query::Expr::cust("attempts + 1"),
-            )
-            .col_expr(
-                agent_action_outbox::Column::Status,
-                sea_orm::sea_query::Expr::value("pending"),
-            )
-            .col_expr(
-                agent_action_outbox::Column::NextAttemptAt,
-                sea_orm::sea_query::Expr::value(lease_until.clone()),
-            )
-            .col_expr(
-                agent_action_outbox::Column::LastError,
-                sea_orm::sea_query::Expr::value::<Option<String>>(None),
-            )
-            .filter(agent_action_outbox::Column::Id.eq(candidate.id.clone()))
-            .filter(agent_action_outbox::Column::Status.is_in(["pending", "failed"]))
-            .filter(agent_action_outbox::Column::Attempts.lt(AGENT_ACTION_OUTBOX_MAX_ATTEMPTS))
-            .filter(
-                agent_action_outbox::Column::NextAttemptAt
-                    .is_null()
-                    .or(agent_action_outbox::Column::NextAttemptAt.lte(now.clone())),
-            )
-            .exec(db)
-            .await
-            .context("failed to claim agent domain action outbox row")?;
-        if result.rows_affected == 1
-            && let Some(row) = agent_action_outbox::Entity::find_by_id(candidate.id)
-                .one(db)
-                .await
-                .context("failed to reload claimed agent domain outbox row")?
-        {
-            claimed.push(row);
-        }
+        .context("failed to transition agent action outbox input")?;
+    if result.rows_affected != 1 || exhausted {
+        return Ok(false);
     }
-    Ok(claimed)
+    candidate.status = status.to_owned();
+    candidate.attempts = attempts;
+    candidate.next_attempt_at = next_attempt_at;
+    candidate.last_error = last_error;
+    Ok(true)
 }
 
 pub async fn mark_agent_action_outbox_delivered<C: ConnectionTrait>(
@@ -4914,6 +5315,48 @@ pub async fn defer_agent_action_outbox_for_permit<C: ConnectionTrait>(
         .exec(db)
         .await
         .context("failed to defer agent domain outbox for a durable permit")?;
+    Ok(result.rows_affected == 1)
+}
+
+/// Release a StartAgent outbox claim while another native Turn still owns the
+/// target thread runtime. This is ordinary serialization, not a delivery
+/// failure, so it restores the attempt counter and retries promptly after the
+/// parent Turn can finish.
+pub async fn defer_agent_action_outbox_for_runtime<C: ConnectionTrait>(
+    db: &C,
+    outbox_id: &str,
+    expected_attempts: i64,
+    deferred_at: DateTimeWithTimeZone,
+) -> Result<bool> {
+    let restored_attempts = expected_attempts
+        .checked_sub(1)
+        .filter(|attempts| *attempts >= 0)
+        .context("outbox runtime deferral has an invalid attempt fence")?;
+    let result = agent_action_outbox::Entity::update_many()
+        .col_expr(
+            agent_action_outbox::Column::Status,
+            sea_orm::sea_query::Expr::value("failed"),
+        )
+        .col_expr(
+            agent_action_outbox::Column::Attempts,
+            sea_orm::sea_query::Expr::value(restored_attempts),
+        )
+        .col_expr(
+            agent_action_outbox::Column::LastError,
+            sea_orm::sea_query::Expr::value(Some(
+                AGENT_ACTION_OUTBOX_RUNTIME_WAIT_CLASS.to_owned(),
+            )),
+        )
+        .col_expr(
+            agent_action_outbox::Column::NextAttemptAt,
+            sea_orm::sea_query::Expr::value(Some(deferred_at + Duration::milliseconds(100))),
+        )
+        .filter(agent_action_outbox::Column::Id.eq(outbox_id.to_owned()))
+        .filter(agent_action_outbox::Column::Status.eq("pending"))
+        .filter(agent_action_outbox::Column::Attempts.eq(expected_attempts))
+        .exec(db)
+        .await
+        .context("failed to defer agent domain outbox for a busy native thread runtime")?;
     Ok(result.rows_affected == 1)
 }
 
@@ -6659,6 +7102,101 @@ mod tests {
     use migration::{Migrator, MigratorTrait};
     use sea_orm::{Database, DatabaseBackend, TransactionTrait};
 
+    fn version_one_child_launch_grant() -> serde_json::Value {
+        serde_json::json!({
+            "version": 1,
+            "identities": [{
+                "id": "A00000000000000000001",
+                "source_kind": "native_agent",
+                "display_name": "Pioneer",
+                "nickname": "pioneer",
+                "source_revision": 3,
+                "source_fingerprint": "generation-a"
+            }],
+            "allowInheritParentIdentity": false,
+            "allowServerDerivedEphemeral": false,
+            "profiles": [{
+                "id": "P00000000000000000003",
+                "compatibleAgentIdentityIds": ["A00000000000000000001"],
+                "backend": "api_provider",
+                "providerId": "provider-opaque",
+                "modelId": "model-opaque",
+                "providerDisplayName": "Provider",
+                "modelDisplayName": "Model",
+                "allowedReasoning": [{ "effort": "medium" }],
+                "allowedPermissionProfiles": ["full_access"],
+                "catalogGeneration": 4,
+                "policyGeneration": 5,
+                "fingerprint": "profile-fingerprint"
+            }],
+            "allowInheritParentProfile": false,
+            "skillIds": [],
+            "mcpServerIds": [],
+            "maxPermissionProfile": {
+                "mode": "supervised",
+                "effective_policy": {
+                    "default_behavior": "ask",
+                    "file_read": "allow",
+                    "file_write": "ask",
+                    "shell_command": "ask",
+                    "network": "ask",
+                    "mcp_read": "allow",
+                    "mcp_write_or_unknown": "ask",
+                    "dynamic_skill_tool": "ask",
+                    "computer_use": "ask",
+                    "task_subagent": "ask"
+                }
+            },
+            "maxReasoning": { "allowed": [{ "effort": "medium" }] },
+            "fingerprint": "fc747ed91c91bd27b7ed9378961fedb2c57de5eba831ae5bfd5e3745e29e0af3"
+        })
+    }
+
+    #[test]
+    fn execution_grant_read_projection_verifies_v1_before_upcasting_and_rehashing_outer_json() {
+        let child = version_one_child_launch_grant();
+        let grant_json = serde_json::json!({
+            "kind": "test",
+            "identity": child["identities"][0].clone(),
+            "profile": child["profiles"][0].clone(),
+            "child_launch_grant": child
+        })
+        .to_string();
+        let stored_fingerprint =
+            agent_execution_grant_fingerprint(grant_json.as_str()).expect("stored fingerprint");
+        let model = agent_execution_grant::Model {
+            id: "G00000000000000000001".to_owned(),
+            execution_id: "E00000000000000000001".to_owned(),
+            parent_execution_id: None,
+            child_identity_id: "A00000000000000000001".to_owned(),
+            grant_fingerprint: stored_fingerprint.clone(),
+            grant_json,
+            created_at: utc_now(),
+        };
+
+        let upgraded = upgrade_agent_execution_grant_model_to_current(model.clone())
+            .expect("valid version 1 grant should upcast");
+        let upgraded_json: serde_json::Value =
+            serde_json::from_str(upgraded.grant_json.as_str()).expect("upgraded grant JSON");
+        assert_eq!(
+            upgraded_json["child_launch_grant"]["version"],
+            serde_json::json!(2)
+        );
+        assert_ne!(upgraded.grant_json, model.grant_json);
+        assert_ne!(upgraded.grant_fingerprint, stored_fingerprint);
+        assert_eq!(
+            upgraded.grant_fingerprint,
+            agent_execution_grant_fingerprint(upgraded.grant_json.as_str())
+                .expect("upgraded outer fingerprint")
+        );
+
+        let mut tampered = model;
+        tampered.grant_json = tampered
+            .grant_json
+            .replace("model-opaque", "tampered-model");
+        assert!(upgrade_agent_execution_grant_model_to_current(tampered).is_err());
+    }
+
     #[test]
     fn nickname_rules_are_explicit_and_lowercase() {
         assert!(
@@ -7279,9 +7817,10 @@ mod tests {
         .await
         .unwrap();
 
-        let claimed = claim_agent_action_outbox(&db, now.clone(), 1)
+        let claimed = claim_agent_action_outbox_with_clock(&db, 2, &|| now.clone())
             .await
-            .unwrap();
+            .unwrap()
+            .rows;
         assert_eq!(claimed.len(), 1);
         assert_eq!(claimed[0].attempts, 1);
         assert!(
@@ -7325,6 +7864,67 @@ mod tests {
             .unwrap();
         assert_eq!(woken.attempts, 0);
         assert_eq!(woken.next_attempt_at, Some(now));
+    }
+
+    #[tokio::test]
+    async fn busy_native_runtime_wait_does_not_consume_outbox_retry_budget() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        Migrator::up(&db, None).await.unwrap();
+        db.execute_raw(Statement::from_string(
+            DatabaseBackend::Sqlite,
+            "PRAGMA foreign_keys = OFF".to_owned(),
+        ))
+        .await
+        .unwrap();
+        let now = utc_now();
+        insert_compaction_test_tuple(
+            &db,
+            "runtime-wait",
+            "pending",
+            0,
+            now.clone(),
+            None,
+            "response".to_owned(),
+            serde_json::json!({
+                "kind": "start_agent",
+                "spawned_execution_id": "Eruntimewait123456789",
+            })
+            .to_string(),
+        )
+        .await;
+
+        let claimed = claim_agent_action_outbox_with_clock(&db, 2, &|| now.clone())
+            .await
+            .unwrap()
+            .rows;
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].attempts, 1);
+        assert!(
+            defer_agent_action_outbox_for_runtime(
+                &db,
+                claimed[0].id.as_str(),
+                claimed[0].attempts,
+                now.clone(),
+            )
+            .await
+            .unwrap()
+        );
+        let deferred = agent_action_outbox::Entity::find_by_id("outbox-runtime-wait")
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(deferred.status, "failed");
+        assert_eq!(deferred.attempts, 0);
+        assert_eq!(
+            deferred.last_error.as_deref(),
+            Some(AGENT_ACTION_OUTBOX_RUNTIME_WAIT_CLASS)
+        );
+        let retry_at = deferred
+            .next_attempt_at
+            .expect("runtime wait should have a retry deadline");
+        assert!(retry_at > now.clone());
+        assert!(retry_at <= now + Duration::seconds(1));
     }
 
     #[tokio::test]
@@ -7644,3 +8244,7 @@ mod tests {
         ));
     }
 }
+
+#[cfg(test)]
+#[path = "agent_domain/action_outbox_tests.rs"]
+mod action_outbox_tests;

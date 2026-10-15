@@ -1,10 +1,12 @@
-use crate::{plan::DesktopUpdatePlan, platform::PlatformApplyOutcome};
+use crate::{
+    plan::DesktopUpdatePlan,
+    platform::{PlatformApplyOutcome, PlatformRelaunch},
+};
 use anyhow::{Context as _, Result, anyhow, bail};
 use std::{
     fs::{self, OpenOptions},
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
-    process::Command,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -39,11 +41,10 @@ pub fn apply(plan: &DesktopUpdatePlan, _plan_path: &Path) -> Result<PlatformAppl
     })?;
     set_executable(target.as_path())?;
 
-    Command::new(target.as_path())
-        .spawn()
-        .with_context(|| format!("failed to launch updated AppImage `{}`", target.display()))?;
-
-    Ok(PlatformApplyOutcome::default())
+    Ok(PlatformApplyOutcome {
+        result_details: None,
+        relaunch: Some(PlatformRelaunch::new(target, [])),
+    })
 }
 
 fn require_linux_plan(plan: &DesktopUpdatePlan) -> Result<()> {
@@ -187,6 +188,8 @@ mod tests {
         DesktopUpdatePlan {
             schema_version: PLAN_SCHEMA_VERSION,
             product: PLAN_PRODUCT.to_owned(),
+            attempt_id: "A1b2C3d4E5f6G7h8I9j0K".to_owned(),
+            relaunch_requested_at_unix_ms: 1_789_100_000_000,
             target_version: "0.26.0".to_owned(),
             current_version: "0.25.0".to_owned(),
             tag: "v0.26.0".to_owned(),

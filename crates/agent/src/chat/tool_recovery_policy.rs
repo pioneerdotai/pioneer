@@ -204,7 +204,7 @@ mod tests {
     }
 
     #[test]
-    fn file_change_argument_retry_metadata_matches_write_file_recovery_policy() {
+    fn file_change_argument_retry_metadata_matches_apply_patch_recovery_policy() {
         let snapshot = snapshot_for_tool_metadata(
             TurnItemType::FileChange,
             ToolRecoveryMetadata {

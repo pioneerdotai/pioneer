@@ -193,6 +193,44 @@ impl MessageProcessor {
         skills_runtime_context_from_config(&self.tool_loop_config, workspace_id)
     }
 
+    /// Returns application-owned skill roots that a native agent in this
+    /// workspace may read. User and registry roots are workspace-scoped; the
+    /// only shared roots are immutable bundled system-skill packages.
+    pub(crate) fn turn_security_app_read_roots(&self, workspace_id: &str) -> Result<Vec<PathBuf>> {
+        let context = self.skills_runtime_context(workspace_id)?;
+        let mut candidates = context
+            .catalog_params
+            .bundled
+            .iter()
+            .map(|entry| entry.install_path.clone())
+            .collect::<Vec<_>>();
+        candidates.push(context.user_root);
+        candidates.push(context.registry_root);
+
+        let mut roots = Vec::with_capacity(candidates.len());
+        for candidate in candidates {
+            if !candidate.exists() {
+                continue;
+            }
+            let canonical = std::fs::canonicalize(candidate.as_path()).with_context(|| {
+                format!(
+                    "failed to canonicalize skill runtime root `{}`",
+                    candidate.display()
+                )
+            })?;
+            if !canonical.is_dir() {
+                bail!(
+                    "skill runtime root `{}` is not a directory",
+                    canonical.display()
+                );
+            }
+            roots.push(canonical);
+        }
+        roots.sort();
+        roots.dedup();
+        Ok(roots)
+    }
+
     pub(crate) async fn load_skills_catalog(
         &self,
         workspace_id: &str,
@@ -354,7 +392,7 @@ impl MessageProcessor {
             .collect()
     }
 
-    pub(super) async fn notify_skills_changed(
+    pub(in crate::message) async fn notify_skills_changed(
         &self,
         workspace_id: &str,
         reason: &str,
@@ -373,7 +411,8 @@ impl MessageProcessor {
         pack_changes: Vec<SkillPackChangedItem>,
         created_at: i64,
     ) {
-        self.publish_resource_selector_change(workspace_id).await;
+        // Catalog availability changes do not change role/ACL grants. The
+        // domain event refreshes consumers without fencing all client screens.
         let notification = skill_projection_changed_notification(
             workspace_id,
             self.next_skills_snapshot_version(),

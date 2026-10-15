@@ -2,22 +2,34 @@ use crate::message::MessageProcessor;
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use pioneer_crud::workspace_agent_memory_scope_key;
+use pioneer_hooks::{
+    HookDiagnosticCode, HookDiagnosticMessage, HookError, HookErrorMetadata, HookMetadataKey,
+    HookResult,
+};
 use pioneer_memory::hooks::{
     AgentMemoryPostTurnExtractorProvider, AgentMemoryProvider, AgentMemoryWriteProvider,
     MemoryManifest, MemoryManifestActiveItem, MemoryManifestCandidateItem, MemoryManifestRequest,
     MemoryPostTurnExtractorContext, MemoryPostTurnExtractorRequest,
-    MemoryRecallItem as AgentMemoryRecallItem, MemoryRecallRequest, MemoryRecallSnapshot,
-    MemoryToolMaterialization, MemoryTurnContext,
+    MemoryPostTurnResponseFormatError, MemoryRecallItem as AgentMemoryRecallItem,
+    MemoryRecallRequest, MemoryRecallSnapshot, MemoryToolMaterialization, MemoryTurnContext,
+    validate_memory_post_turn_response_format,
 };
-use pioneer_memory::{MemoryModeRecallParams, MemoryOperationContext, MemoryRecallParams};
+use pioneer_memory::{
+    MemoryManifestFailure, MemoryManifestFailureClass, MemoryManifestFailureStage,
+    MemoryModeRecallParams, MemoryOperationContext, MemoryRecallParams,
+};
 use pioneer_protocol::{
     MemoryActor, MemoryActorKind, MemoryCandidateStatus, MemoryCandidatesListParams,
     MemoryCategory, MemoryForgetParams, MemoryForgetTarget, MemoryGetParams, MemoryListParams,
     MemoryProvenance, MemoryRecord, MemoryRememberParams, MemoryScope, MemoryScopeKind,
     MemorySearchHit, MemorySearchParams, MemorySemanticWriteParams, MemorySemanticWriteResponse,
-    MemorySensitivity, MemorySourceContextKind, MemoryStatus,
+    MemorySensitivity, MemorySourceContextKind, MemoryStatus, ProviderFailureClass,
+    ProviderFailureStage,
 };
-use pioneer_provider::{ChatMessage, ChatRequest, Provider, StreamChunk};
+use pioneer_provider::{
+    ChatMessage, ChatRequest, Provider, ProviderFailureClassification, ProviderTermination,
+    StreamChunk,
+};
 use pioneer_tools::{
     ConfiguredToolSpec, ExecutionClass, FunctionToolOutput, PayloadKind, ToolError,
     ToolExtensionBundle, ToolHandler, ToolIdempotencyMode, ToolInvocation, ToolOutput, ToolPayload,
@@ -33,6 +45,66 @@ const MEMORY_SEARCH_TOOL: &str = "memory_search";
 const MEMORY_LIST_TOOL: &str = "memory_list";
 const MEMORY_GET_TOOL: &str = "memory_get";
 const MEMORY_REMEMBER_TOOL: &str = "memory_remember";
+const MAX_POST_TURN_EXTRACTOR_RAW_BYTES: usize = 64 * 1024;
+const MAX_POST_TURN_EXTRACTOR_CHECKPOINT_BYTES: usize = 128 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DurableMemoryPostTurnExtractorCheckpoint {
+    schema_version: u8,
+    raw_json: String,
+    model: String,
+    model_provider: String,
+}
+
+fn decode_memory_post_turn_extractor_checkpoint(
+    checkpoint_json: &str,
+    model: &str,
+    model_provider: &str,
+) -> Result<String, String> {
+    if checkpoint_json.len() > MAX_POST_TURN_EXTRACTOR_CHECKPOINT_BYTES {
+        return Err(
+            "memory post-turn extraction checkpoint exceeds its durable byte limit".to_owned(),
+        );
+    }
+    let checkpoint: DurableMemoryPostTurnExtractorCheckpoint =
+        serde_json::from_str(checkpoint_json)
+            .map_err(|_| "memory post-turn extraction checkpoint is invalid".to_owned())?;
+    if checkpoint.schema_version != 1
+        || checkpoint.raw_json.len() > MAX_POST_TURN_EXTRACTOR_RAW_BYTES
+        || checkpoint.model.trim().is_empty()
+        || checkpoint.model_provider.trim().is_empty()
+    {
+        return Err("memory post-turn extraction checkpoint is unsupported".to_owned());
+    }
+    if checkpoint.model != model || checkpoint.model_provider != model_provider {
+        return Err("memory post-turn extraction checkpoint provider identity mismatch".to_owned());
+    }
+    Ok(checkpoint.raw_json)
+}
+
+fn encode_memory_post_turn_extractor_checkpoint(
+    raw_json: &str,
+    model: &str,
+    model_provider: &str,
+) -> Result<String, String> {
+    if raw_json.len() > MAX_POST_TURN_EXTRACTOR_RAW_BYTES {
+        return Err("memory post-turn extractor response exceeds its byte limit".to_owned());
+    }
+    let checkpoint_json = serde_json::to_string(&DurableMemoryPostTurnExtractorCheckpoint {
+        schema_version: 1,
+        raw_json: raw_json.to_owned(),
+        model: model.to_owned(),
+        model_provider: model_provider.to_owned(),
+    })
+    .map_err(|_| "failed to encode memory post-turn extraction checkpoint".to_owned())?;
+    if checkpoint_json.len() > MAX_POST_TURN_EXTRACTOR_CHECKPOINT_BYTES {
+        return Err(
+            "memory post-turn extraction checkpoint exceeds its durable byte limit".to_owned(),
+        );
+    }
+    Ok(checkpoint_json)
+}
 const MEMORY_FORGET_TOOL: &str = "memory_forget";
 const DEFAULT_SEARCH_LIMIT: u32 = 8;
 const MAX_SEARCH_LIMIT: u32 = 20;
@@ -146,8 +218,11 @@ async fn authorize_memory_execution(
                 current.authorization().decision(),
             );
             Ok(MemoryExecutionBoundary {
-                scoped_collaboration: current.resource_boundary()
-                    == crate::authorization::ExecutionResourceBoundary::RootThreadCapsule,
+                scoped_collaboration: current
+                    .memory_runtime_principal_policy(processor.crud_store.as_ref())
+                    .await
+                    .map_err(|_| "memory principal policy is unavailable".to_owned())?
+                    == crate::authorization::RuntimePrincipalPolicy::ScopedCollaboration,
             })
         }
         Err(_) => {
@@ -168,7 +243,7 @@ async fn authorize_post_turn_memory_execution(
     turn_id: &str,
     scoped_principal_hint: Option<&str>,
     access: MemoryExecutionAccess,
-) -> Result<MemoryExecutionBoundary, String> {
+) -> Result<MemoryExecutionBoundary, pioneer_memory::MemoryWriteFailure> {
     match processor
         .revalidate_post_turn_execution_authorization(
             workspace_id,
@@ -186,17 +261,71 @@ async fn authorize_post_turn_memory_execution(
                 current.authorization().decision(),
             );
             Ok(MemoryExecutionBoundary {
-                scoped_collaboration: current.resource_boundary()
-                    == crate::authorization::ExecutionResourceBoundary::RootThreadCapsule,
+                scoped_collaboration: current
+                    .memory_runtime_principal_policy(processor.crud_store.as_ref())
+                    .await
+                    .map_err(classify_memory_write_failure)?
+                    == crate::authorization::RuntimePrincipalPolicy::ScopedCollaboration,
             })
         }
-        Err(_) => {
+        Err(error) => {
             crate::authorization::record_authorization_unavailable(
                 access.action().safe_name(),
                 "memory.post_turn",
                 "hook",
             );
-            Err("post-turn memory is unavailable for the current execution".to_owned())
+            Err(classify_memory_write_failure(error))
+        }
+    }
+}
+
+async fn authorize_manifest_memory_execution(
+    processor: &MessageProcessor,
+    workspace_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+    scoped_principal_hint: Option<&str>,
+    access: MemoryExecutionAccess,
+) -> Result<MemoryExecutionBoundary, MemoryManifestFailure> {
+    match processor
+        .revalidate_post_turn_execution_authorization(
+            workspace_id,
+            thread_id,
+            turn_id,
+            scoped_principal_hint,
+            access.action(),
+        )
+        .await
+    {
+        Ok(current) => {
+            crate::authorization::record_tool_decision(
+                access.action(),
+                "memory.post_turn",
+                current.authorization().decision(),
+            );
+            Ok(MemoryExecutionBoundary {
+                scoped_collaboration: current
+                    .memory_runtime_principal_policy(processor.crud_store.as_ref())
+                    .await
+                    .map_err(|error| {
+                        classify_memory_manifest_failure(
+                            error,
+                            MemoryManifestFailureStage::Authorization,
+                        )
+                    })?
+                    == crate::authorization::RuntimePrincipalPolicy::ScopedCollaboration,
+            })
+        }
+        Err(error) => {
+            crate::authorization::record_authorization_unavailable(
+                access.action().safe_name(),
+                "memory.post_turn",
+                "hook",
+            );
+            Err(classify_memory_manifest_failure(
+                error,
+                MemoryManifestFailureStage::Authorization,
+            ))
         }
     }
 }
@@ -238,7 +367,7 @@ async fn authorize_post_turn_memory_upsert_execution(
     thread_id: &str,
     turn_id: &str,
     scoped_principal_hint: Option<&str>,
-) -> Result<MemoryExecutionBoundary, String> {
+) -> Result<MemoryExecutionBoundary, pioneer_memory::MemoryWriteFailure> {
     let create = authorize_post_turn_memory_execution(
         processor,
         workspace_id,
@@ -258,9 +387,7 @@ async fn authorize_post_turn_memory_upsert_execution(
     )
     .await?;
     if create != update {
-        return Err(
-            "post-turn memory upsert authority has inconsistent collaboration scope".to_owned(),
-        );
+        return Err(pioneer_memory::MemoryWriteFailure::AuthorizationOrDomain);
     }
     Ok(create)
 }
@@ -356,7 +483,7 @@ impl AgentMemoryProvider for GatewayMemoryProvider {
                 diagnostics: vec![format!("memory runtime unavailable: {error:#}")],
             });
         }
-        let can_read = authorize_memory_execution(
+        let read_boundary = authorize_memory_execution(
             processor.as_ref(),
             context.workspace_id.as_str(),
             context.thread_id.as_str(),
@@ -364,18 +491,16 @@ impl AgentMemoryProvider for GatewayMemoryProvider {
             context.principal_id.as_deref(),
             MemoryExecutionAccess::Read,
         )
-        .await
-        .is_ok();
-        let can_upsert = authorize_memory_upsert_execution(
+        .await;
+        let upsert_boundary = authorize_memory_upsert_execution(
             processor.as_ref(),
             context.workspace_id.as_str(),
             context.thread_id.as_str(),
             context.turn_id.as_str(),
             context.principal_id.as_deref(),
         )
-        .await
-        .is_ok();
-        let can_forget = authorize_memory_execution(
+        .await;
+        let forget_boundary = authorize_memory_execution(
             processor.as_ref(),
             context.workspace_id.as_str(),
             context.thread_id.as_str(),
@@ -383,22 +508,34 @@ impl AgentMemoryProvider for GatewayMemoryProvider {
             context.principal_id.as_deref(),
             MemoryExecutionAccess::Forget,
         )
-        .await
-        .is_ok();
+        .await;
 
         let handler = Arc::new(MemoryToolHandler { processor, context });
         let mut bundle = ToolExtensionBundle::default();
-        for configured in memory_tool_specs() {
+        for mut configured in memory_tool_specs() {
             let name = configured.spec.name.clone();
-            let allowed = match name.as_str() {
-                MEMORY_SEARCH_TOOL | MEMORY_LIST_TOOL | MEMORY_GET_TOOL => can_read,
-                MEMORY_REMEMBER_TOOL => can_upsert,
-                MEMORY_FORGET_TOOL => can_forget,
-                _ => false,
+            let boundary = match name.as_str() {
+                MEMORY_SEARCH_TOOL | MEMORY_LIST_TOOL | MEMORY_GET_TOOL => {
+                    read_boundary.as_ref().ok()
+                }
+                MEMORY_REMEMBER_TOOL => upsert_boundary.as_ref().ok(),
+                MEMORY_FORGET_TOOL => forget_boundary.as_ref().ok(),
+                _ => None,
             };
-            if !allowed {
+            let Some(boundary) = boundary else {
                 continue;
-            }
+            };
+            let operation = handler
+                .operation_context(None, boundary.scoped_collaboration)
+                .map_err(|error| error.to_string())?;
+            configured.spec.description.push(' ');
+            configured
+                .spec
+                .description
+                .push_str(&operation.tool_scope_contract(matches!(
+                    name.as_str(),
+                    MEMORY_REMEMBER_TOOL | MEMORY_FORGET_TOOL
+                )));
             bundle.specs.push(configured);
             bundle.handlers.push((name, handler.clone()));
         }
@@ -482,8 +619,15 @@ impl AgentMemoryPostTurnExtractorProvider for GatewayMemoryProvider {
         &self,
         context: MemoryPostTurnExtractorContext,
         request: MemoryPostTurnExtractorRequest,
-    ) -> Result<String, String> {
-        let processor = self.processor()?;
+    ) -> HookResult<String> {
+        let processor = self.processor().map_err(|_| {
+            memory_extractor_hook_error(
+                "memory.post_turn_extractor.runtime_unavailable",
+                "memory post-turn extractor runtime is unavailable",
+                true,
+                HookErrorMetadata::default(),
+            )
+        })?;
         let config = processor.memory_loop_config().post_turn_extractor;
         if !config.enabled || !config.provider_enabled || !config.proactive_writes_enabled {
             return Ok(r#"{"facts":[]}"#.to_owned());
@@ -496,19 +640,121 @@ impl AgentMemoryPostTurnExtractorProvider for GatewayMemoryProvider {
             None,
             MemoryExecutionAccess::Read,
         )
-        .await?;
+        .await
+        .map_err(|_| {
+            memory_extractor_hook_error(
+                "memory.post_turn_extractor.authorization_unavailable",
+                "memory post-turn extractor authorization is unavailable",
+                false,
+                HookErrorMetadata::default(),
+            )
+        })?;
         let (provider_name, model) = self.resolve_internal_model(
             processor.as_ref(),
             MemoryInternalModelPurpose::PostTurnExtractor,
             context.model_provider.as_deref(),
             context.model.as_deref(),
         );
-        let provider_name = provider_name
-            .as_deref()
-            .ok_or_else(|| "missing model provider for memory post-turn extractor".to_owned())?;
-        let model = model
-            .as_deref()
-            .ok_or_else(|| "missing model for memory post-turn extractor".to_owned())?;
+        let provider_name = provider_name.as_deref().ok_or_else(|| {
+            memory_extractor_hook_error(
+                "memory.post_turn_extractor.provider_not_configured",
+                "memory post-turn extractor provider is not configured",
+                false,
+                HookErrorMetadata::default(),
+            )
+        })?;
+        let model = model.as_deref().ok_or_else(|| {
+            memory_extractor_hook_error(
+                "memory.post_turn_extractor.model_not_configured",
+                "memory post-turn extractor model is not configured",
+                false,
+                provider_model_metadata(provider_name, "", "configuration"),
+            )
+        })?;
+        if let Some(claim) = context.durable_terminal_effect.as_ref()
+            && let Some(checkpoint_json) = processor
+                .crud_store
+                .native_terminal_effect_handler_checkpoint(
+                    claim.effect_id.as_str(),
+                    claim.claim_token.as_str(),
+                )
+                .await
+                .map_err(|error| {
+                    if let Some(invalid) =
+                        error.downcast_ref::<pioneer_crud::HandlerCheckpointInvalid>()
+                    {
+                        return memory_extractor_hook_error(
+                            "memory.post_turn_extractor.checkpoint_invalid",
+                            "memory post-turn extractor checkpoint is invalid",
+                            false,
+                            response_failure_metadata(
+                                provider_name,
+                                model,
+                                "checkpoint_load",
+                                invalid.class,
+                            ),
+                        );
+                    }
+                    tracing::warn!(
+                        target: "pioneer::memory_post_turn_extractor",
+                        stage = "checkpoint_load",
+                        provider = provider_name,
+                        model,
+                        durable = true,
+                        "memory post-turn extractor checkpoint load failed"
+                    );
+                    memory_extractor_hook_error(
+                        "memory.post_turn_extractor.checkpoint_load_failed",
+                        "memory post-turn extractor checkpoint loading failed",
+                        true,
+                        response_failure_metadata(
+                            provider_name,
+                            model,
+                            "checkpoint_load",
+                            "checkpoint_load_failed",
+                        ),
+                    )
+                })?
+        {
+            return decode_memory_post_turn_extractor_checkpoint(
+                checkpoint_json.as_str(),
+                model,
+                provider_name,
+            )
+            .map_err(|_error| {
+                tracing::warn!(
+                    target: "pioneer::memory_post_turn_extractor",
+                    stage = "checkpoint_decode",
+                    provider = provider_name,
+                    model,
+                    durable = true,
+                    "memory post-turn extractor checkpoint decode failed"
+                );
+                memory_extractor_hook_error(
+                    "memory.post_turn_extractor.checkpoint_invalid",
+                    "memory post-turn extractor checkpoint is invalid",
+                    false,
+                    response_failure_metadata(
+                        provider_name,
+                        model,
+                        "checkpoint_decode",
+                        "checkpoint_invalid",
+                    ),
+                )
+            })
+            .and_then(|raw_json| {
+                validate_memory_post_turn_response_format(&raw_json).map_err(|error| {
+                    memory_response_format_error(
+                        provider_name,
+                        model,
+                        ResponseOrigin::Checkpoint,
+                        raw_json.len(),
+                        error,
+                    )
+                })?;
+                Ok(raw_json)
+            });
+        }
         let provider_authorization = processor
             .revalidate_post_turn_execution_authorization(
                 context.workspace_id.as_str(),
@@ -519,8 +765,20 @@ impl AgentMemoryPostTurnExtractorProvider for GatewayMemoryProvider {
             )
             .await
             .map_err(|_| {
-                "memory post-turn extractor provider is unavailable for the current execution"
-                    .to_owned()
+                tracing::warn!(
+                    target: "pioneer::memory_post_turn_extractor",
+                    stage = "authorization_revalidation",
+                    provider = provider_name,
+                    model,
+                    durable = context.durable_terminal_effect.is_some(),
+                    "memory post-turn extractor authorization revalidation failed"
+                );
+                memory_extractor_hook_error(
+                    "memory.post_turn_extractor.authorization_rejected",
+                    "memory post-turn extractor provider authorization was rejected",
+                    false,
+                    provider_model_metadata(provider_name, model, "authorization_revalidation"),
+                )
             })?;
         if !crate::authorization::AuthorizationService::new().provider_model_allowed(
             provider_authorization.principal().kind,
@@ -528,17 +786,132 @@ impl AgentMemoryPostTurnExtractorProvider for GatewayMemoryProvider {
             provider_name,
             model,
         ) {
-            return Err(
-                "memory post-turn extractor provider is outside the role projection".to_owned(),
+            tracing::warn!(
+                target: "pioneer::memory_post_turn_extractor",
+                stage = "authorization_projection",
+                provider = provider_name,
+                model,
+                durable = context.durable_terminal_effect.is_some(),
+                "memory post-turn extractor authorization projection failed"
             );
+            return Err(memory_extractor_hook_error(
+                "memory.post_turn_extractor.permission_denied",
+                "memory post-turn extractor provider is outside the role projection",
+                false,
+                provider_model_metadata(provider_name, model, "authorization_projection"),
+            ));
         }
         let provider = processor
             .provider_registry()
             .get_or_create_for_workspace(context.workspace_id.as_str(), provider_name)
             .map_err(|error| {
-                format!("failed to create memory post-turn extractor provider: {error}")
+                let class = pioneer_agent::classify_provider_failure_message(
+                    error.to_string().as_str(),
+                    ProviderFailureStage::Connect,
+                );
+                tracing::warn!(
+                    target: "pioneer::memory_post_turn_extractor",
+                    stage = "provider_resolution",
+                    provider = provider_name,
+                    model,
+                    durable = context.durable_terminal_effect.is_some(),
+                    failure_class = memory_provider_failure_class_name(class),
+                    "memory post-turn extractor provider resolution failed"
+                );
+                classified_memory_provider_error(
+                    provider_name,
+                    model,
+                    "provider_resolution",
+                    ProviderFailureStage::Connect,
+                    ProviderFailureClassification::new(class),
+                )
             })?;
-        request_post_turn_extractor_json(provider.as_ref(), model, request.render_prompt()).await
+        // Extraction is post-turn work: never inherit an interactive handle.
+        let usage_store = processor.crud_store.with_maintenance_access();
+        let provider = crate::usage_journal::observe(
+            provider,
+            &usage_store,
+            context.workspace_id.as_str(),
+            "memory_extraction",
+            context.workspace_id.as_str(),
+        );
+        let raw_json =
+            request_post_turn_extractor_json(provider.as_ref(), model, request.render_prompt())
+                .await?;
+        validate_memory_post_turn_response_format(&raw_json).map_err(|error| {
+            memory_response_format_error(
+                provider_name,
+                model,
+                ResponseOrigin::Fresh,
+                raw_json.len(),
+                error,
+            )
+        })?;
+        if let Some(claim) = context.durable_terminal_effect.as_ref() {
+            let checkpoint_json = encode_memory_post_turn_extractor_checkpoint(
+                raw_json.as_str(),
+                model,
+                provider_name,
+            )
+            .map_err(|_error| {
+                tracing::warn!(
+                    target: "pioneer::memory_post_turn_extractor",
+                    stage = "checkpoint_encode",
+                    provider = provider_name,
+                    model,
+                    durable = true,
+                    response_bytes = raw_json.len(),
+                    response_sha256 = %post_turn_extractor_response_sha256(raw_json.as_str()),
+                    "memory post-turn extractor checkpoint encode failed"
+                );
+                memory_extractor_hook_error(
+                    "memory.post_turn_extractor.checkpoint_encode_failed",
+                    "memory post-turn extractor checkpoint encoding failed",
+                    false,
+                    validated_fresh_response_metadata(
+                        provider_name,
+                        model,
+                        "checkpoint_encode",
+                        "checkpoint_encode_failed",
+                        raw_json.len(),
+                    ),
+                )
+            })?;
+            processor
+                .crud_store
+                .store_native_terminal_effect_handler_checkpoint(
+                    claim.effect_id.as_str(),
+                    claim.claim_token.as_str(),
+                    checkpoint_json.as_str(),
+                    chrono::Utc::now().timestamp(),
+                )
+                .await
+                .map_err(|_error| {
+                    tracing::warn!(
+                        target: "pioneer::memory_post_turn_extractor",
+                        stage = "checkpoint_store",
+                        provider = provider_name,
+                        model,
+                        durable = true,
+                        response_bytes = raw_json.len(),
+                        response_sha256 = %post_turn_extractor_response_sha256(raw_json.as_str()),
+                        "memory post-turn extractor checkpoint store failed"
+                    );
+                    memory_extractor_hook_error(
+                        "memory.post_turn_extractor.checkpoint_store_failed",
+                        "memory post-turn extractor checkpoint persistence failed",
+                        true,
+                        validated_fresh_response_metadata(
+                            provider_name,
+                            model,
+                            "checkpoint_store",
+                            "checkpoint_store_failed",
+                            raw_json.len(),
+                        ),
+                    )
+                })?;
+        }
+        Ok(raw_json)
     }
 }
 
@@ -546,26 +919,8 @@ async fn request_post_turn_extractor_json(
     provider: &dyn Provider,
     model: &str,
     prompt: String,
-) -> Result<String, String> {
-    match request_post_turn_extractor_json_once(provider, model, prompt.clone(), None).await {
-        Ok(json) => Ok(json),
-        Err(primary_error) => {
-            if !should_retry_internal_memory_request_without_optional_params(primary_error.as_str())
-            {
-                return Err(format!(
-                    "memory post-turn extractor request failed: {primary_error}"
-                ));
-            }
-
-            request_post_turn_extractor_json_once(provider, model, prompt, None)
-                .await
-                .map_err(|fallback_error| {
-                    format!(
-                        "memory post-turn extractor request failed: {primary_error}; compatibility fallback failed: {fallback_error}"
-                    )
-                })
-        }
-    }
+) -> HookResult<String> {
+    request_post_turn_extractor_json_once(provider, model, prompt, None, "primary").await
 }
 
 async fn request_post_turn_extractor_json_once(
@@ -573,37 +928,384 @@ async fn request_post_turn_extractor_json_once(
     model: &str,
     prompt: String,
     temperature: Option<f32>,
-) -> Result<String, String> {
+    request_attempt: &'static str,
+) -> HookResult<String> {
     let request = post_turn_extractor_chat_request(model, prompt, temperature);
     if provider.capabilities().streaming {
-        let stream = provider
-            .stream_chat(request)
-            .await
-            .map_err(|error| format!("{error:#}"))?;
-        return collect_post_turn_extractor_stream(stream).await;
+        let stream = provider.stream_chat(request).await.map_err(|error| {
+            let classified = memory_provider_request_error(
+                provider,
+                model,
+                "provider_stream_start",
+                ProviderFailureStage::Connect,
+                &error,
+            );
+            tracing::warn!(
+                target: "pioneer::memory_post_turn_extractor",
+                stage = "provider_stream_start",
+                provider = provider.name(),
+                model,
+                request_attempt,
+                error_code = %classified.code,
+                retryable = classified.retryable,
+                "memory post-turn extractor provider stream start failed"
+            );
+            classified
+        })?;
+        return collect_post_turn_extractor_stream(stream, provider, model, request_attempt).await;
     }
 
     provider
         .chat(request)
         .await
-        .map(|response| response.text)
-        .map_err(|error| format!("{error:#}"))
+        .map_err(|error| {
+            let classified = memory_provider_request_error(
+                provider,
+                model,
+                "provider_non_stream_response",
+                ProviderFailureStage::Connect,
+                &error,
+            );
+            tracing::warn!(
+                target: "pioneer::memory_post_turn_extractor",
+                stage = "provider_non_stream_response",
+                provider = provider.name(),
+                model,
+                request_attempt,
+                error_code = %classified.code,
+                retryable = classified.retryable,
+                "memory post-turn extractor non-stream provider request failed"
+            );
+            classified
+        })
+        .and_then(|response| {
+            validate_extractor_completion(
+                provider.name(),
+                model,
+                Some(&response.termination),
+                !response.tool_calls.is_empty(),
+            )?;
+            validate_extractor_response_size(
+                provider.name(),
+                model,
+                response.text.len(),
+                Some(&response.termination),
+            )?;
+            Ok(response.text)
+        })
 }
 
 async fn collect_post_turn_extractor_stream(
     mut stream: futures_util::stream::BoxStream<'static, anyhow::Result<StreamChunk>>,
-) -> Result<String, String> {
+    provider: &dyn Provider,
+    model: &str,
+    request_attempt: &'static str,
+) -> HookResult<String> {
     let mut text = String::new();
+    let mut completed = false;
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|error| format!("{error:#}"))?;
-        if !chunk.delta.is_empty() {
-            text.push_str(chunk.delta.as_str());
+        let chunk = chunk.map_err(|error| {
+            if pioneer_provider::failure::provider_stream_incomplete(&error).is_some() {
+                return extractor_completion_error(
+                    provider.name(),
+                    model,
+                    ExtractorCompletionFailure::StreamEof,
+                    None,
+                );
+            }
+            let (stage_name, stage) = if text.is_empty() {
+                (
+                    "provider_stream_first_chunk",
+                    ProviderFailureStage::FirstChunk,
+                )
+            } else {
+                ("provider_stream_item", ProviderFailureStage::MidStream)
+            };
+            let classified =
+                memory_provider_request_error(provider, model, stage_name, stage, &error);
+            tracing::warn!(
+                target: "pioneer::memory_post_turn_extractor",
+                stage = stage_name,
+                provider = provider.name(),
+                model,
+                request_attempt,
+                collected_response_bytes = text.len(),
+                collected_response_sha256 = %post_turn_extractor_response_sha256(text.as_str()),
+                error_code = %classified.code,
+                retryable = classified.retryable,
+                "memory post-turn extractor provider stream item failed"
+            );
+            classified
+        })?;
+        if completed {
+            // Drain usage and transport completion so the auxiliary journal
+            // can finalize the physical attempt. Completion cannot admit more
+            // generated content or change the accepted termination.
+            if !chunk.delta.is_empty()
+                || chunk
+                    .reasoning_delta
+                    .as_ref()
+                    .is_some_and(|value| !value.is_empty())
+                || !chunk.tool_calls.is_empty()
+                || chunk.provider_replay_state.is_some()
+                || chunk
+                    .termination
+                    .as_ref()
+                    .is_some_and(|value| *value != ProviderTermination::Complete)
+            {
+                return Err(extractor_completion_error(
+                    provider.name(),
+                    model,
+                    ExtractorCompletionFailure::AfterCompletion,
+                    chunk.termination.as_ref(),
+                ));
+            }
+            continue;
+        }
+        if !chunk.tool_calls.is_empty() {
+            return Err(extractor_completion_error(
+                provider.name(),
+                model,
+                ExtractorCompletionFailure::UnexpectedToolCalls,
+                chunk.termination.as_ref(),
+            ));
         }
         if chunk.is_final {
-            break;
+            validate_extractor_completion(
+                provider.name(),
+                model,
+                chunk.termination.as_ref(),
+                false,
+            )?;
+        }
+        validate_extractor_response_size(
+            provider.name(),
+            model,
+            text.len().saturating_add(chunk.delta.len()),
+            chunk.termination.as_ref(),
+        )?;
+        text.push_str(&chunk.delta);
+        if chunk.is_final {
+            completed = true;
         }
     }
-    Ok(text)
+    if completed {
+        return Ok(text);
+    }
+    Err(extractor_completion_error(
+        provider.name(),
+        model,
+        ExtractorCompletionFailure::StreamEof,
+        None,
+    ))
+}
+
+#[derive(Clone, Copy)]
+enum ResponseOrigin {
+    Fresh,
+    Checkpoint,
+}
+
+fn response_failure_metadata(
+    provider: &str,
+    model: &str,
+    stage: &str,
+    class: &str,
+) -> HookErrorMetadata {
+    let mut metadata = provider_model_metadata(provider, model, stage);
+    insert_hook_text_metadata(&mut metadata, "failure_class", class);
+    metadata
+}
+
+fn validated_fresh_response_metadata(
+    provider: &str,
+    model: &str,
+    stage: &str,
+    class: &str,
+    bytes: usize,
+) -> HookErrorMetadata {
+    let mut metadata = response_failure_metadata(provider, model, stage, class);
+    insert_hook_text_metadata(&mut metadata, "termination", "complete");
+    insert_hook_text_metadata(&mut metadata, "response_bytes", bytes.to_string());
+    metadata
+}
+
+fn memory_response_format_error(
+    provider: &str,
+    model: &str,
+    origin: ResponseOrigin,
+    bytes: usize,
+    error: MemoryPostTurnResponseFormatError,
+) -> HookError {
+    let (code, stage, retryable) = match origin {
+        ResponseOrigin::Fresh => (
+            "memory.post_turn_extractor.fresh_response_invalid",
+            "fresh_response_validation",
+            true,
+        ),
+        ResponseOrigin::Checkpoint => (
+            "memory.post_turn_extractor.checkpoint_invalid",
+            "checkpoint_validation",
+            false,
+        ),
+    };
+    let class = error.category.as_str();
+    let mut metadata = response_failure_metadata(provider, model, stage, class);
+    for (key, value) in [
+        ("response_bytes", bytes),
+        ("parse_line", error.line),
+        ("parse_column", error.column),
+    ] {
+        insert_hook_text_metadata(&mut metadata, key, value.to_string());
+    }
+    insert_hook_text_metadata(&mut metadata, "parse_category", class);
+    if matches!(origin, ResponseOrigin::Fresh) {
+        insert_hook_text_metadata(&mut metadata, "termination", "complete");
+    }
+    memory_extractor_hook_error(
+        code,
+        format!("memory extractor response rejected ({error}; bytes={bytes})"),
+        retryable,
+        metadata,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum ExtractorCompletionFailure {
+    AfterCompletion,
+    StreamEof,
+    Length,
+    ContentFiltered,
+    Safety,
+    Cancelled,
+    ProviderError,
+    Unknown,
+    Missing,
+    ToolCalls,
+    UnexpectedToolCalls,
+}
+
+impl ExtractorCompletionFailure {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::AfterCompletion => "payload_after_completion",
+            Self::StreamEof => "stream_truncated",
+            Self::Length => "length",
+            Self::ContentFiltered => "content_filtered",
+            Self::Safety => "safety",
+            Self::Cancelled => "cancelled",
+            Self::ProviderError => "provider_error",
+            Self::Unknown => "unknown_termination",
+            Self::Missing => "missing_termination",
+            Self::ToolCalls => "tool_calls",
+            Self::UnexpectedToolCalls => "unexpected_tool_calls",
+        }
+    }
+}
+
+fn extractor_termination_name(termination: Option<&ProviderTermination>) -> &'static str {
+    match termination {
+        Some(ProviderTermination::Complete) => "complete",
+        Some(ProviderTermination::ToolCalls) => "tool_calls",
+        Some(ProviderTermination::Length) => "length",
+        Some(ProviderTermination::ContentFiltered) => "content_filtered",
+        Some(ProviderTermination::Safety) => "safety",
+        Some(ProviderTermination::Cancelled) => "cancelled",
+        Some(ProviderTermination::ProviderError) => "provider_error",
+        Some(ProviderTermination::Unknown(_)) => "unknown",
+        None => "missing",
+    }
+}
+
+fn extractor_completion_error(
+    provider: &str,
+    model: &str,
+    failure: ExtractorCompletionFailure,
+    termination: Option<&ProviderTermination>,
+) -> HookError {
+    // EOF is a confirmed transport truncation. Other termination failures have no
+    // proven transient cause (including an unclassified ProviderError).
+    let retryable = matches!(failure, ExtractorCompletionFailure::StreamEof);
+    let mut metadata =
+        response_failure_metadata(provider, model, "transport_completion", failure.as_str());
+    insert_hook_text_metadata(
+        &mut metadata,
+        "termination",
+        extractor_termination_name(termination),
+    );
+    insert_hook_text_metadata(&mut metadata, "provider_stage", "finalize");
+    memory_extractor_hook_error(
+        format!("memory.post_turn_extractor.completion_{}", failure.as_str()),
+        "memory extractor generation did not complete normally",
+        retryable,
+        metadata,
+    )
+}
+
+fn validate_extractor_completion(
+    provider: &str,
+    model: &str,
+    termination: Option<&ProviderTermination>,
+    has_tools: bool,
+) -> HookResult<()> {
+    let failure = if has_tools {
+        ExtractorCompletionFailure::UnexpectedToolCalls
+    } else {
+        match termination {
+            Some(ProviderTermination::Complete) => return Ok(()),
+            Some(ProviderTermination::ToolCalls) => ExtractorCompletionFailure::ToolCalls,
+            Some(ProviderTermination::Length) => ExtractorCompletionFailure::Length,
+            Some(ProviderTermination::ContentFiltered) => {
+                ExtractorCompletionFailure::ContentFiltered
+            }
+            Some(ProviderTermination::Safety) => ExtractorCompletionFailure::Safety,
+            Some(ProviderTermination::Cancelled) => ExtractorCompletionFailure::Cancelled,
+            Some(ProviderTermination::ProviderError) => ExtractorCompletionFailure::ProviderError,
+            Some(ProviderTermination::Unknown(_)) => ExtractorCompletionFailure::Unknown,
+            None => ExtractorCompletionFailure::Missing,
+        }
+    };
+    Err(extractor_completion_error(
+        provider,
+        model,
+        failure,
+        termination,
+    ))
+}
+
+fn validate_extractor_response_size(
+    provider: &str,
+    model: &str,
+    bytes: usize,
+    termination: Option<&ProviderTermination>,
+) -> HookResult<()> {
+    if bytes <= MAX_POST_TURN_EXTRACTOR_RAW_BYTES {
+        return Ok(());
+    }
+    let mut metadata = response_failure_metadata(
+        provider,
+        model,
+        "response_size_validation",
+        "response_too_large",
+    );
+    insert_hook_text_metadata(&mut metadata, "response_bytes", bytes.to_string());
+    if termination.is_some() {
+        insert_hook_text_metadata(
+            &mut metadata,
+            "termination",
+            extractor_termination_name(termination),
+        );
+    }
+    Err(memory_extractor_hook_error(
+        "memory.post_turn_extractor.response_too_large",
+        "memory extractor response exceeds its byte limit",
+        false,
+        metadata,
+    ))
+}
+
+fn post_turn_extractor_response_sha256(response: &str) -> String {
+    hex::encode(Sha256::digest(response.as_bytes()))
 }
 
 fn post_turn_extractor_chat_request(
@@ -624,15 +1326,155 @@ fn post_turn_extractor_chat_request(
     }
 }
 
-fn should_retry_internal_memory_request_without_optional_params(error: &str) -> bool {
-    let error = error.to_ascii_lowercase();
-    error.contains("400")
-        || error.contains("bad request")
-        || error.contains("invalid request")
-        || error.contains("invalid parameter")
-        || error.contains("unsupported")
-        || error.contains("temperature")
-        || error.contains("reasoning")
+fn memory_provider_request_error(
+    provider: &dyn Provider,
+    model: &str,
+    stage_name: &'static str,
+    stage: ProviderFailureStage,
+    error: &anyhow::Error,
+) -> HookError {
+    let classification = provider.classify_failure(error).unwrap_or_else(|| {
+        ProviderFailureClassification::new(pioneer_agent::classify_provider_failure_message(
+            pioneer_provider::usage::classification_source(error)
+                .to_string()
+                .as_str(),
+            stage,
+        ))
+    });
+    classified_memory_provider_error(provider.name(), model, stage_name, stage, classification)
+}
+
+fn classified_memory_provider_error(
+    provider: &str,
+    model: &str,
+    stage_name: &'static str,
+    stage: ProviderFailureStage,
+    classification: ProviderFailureClassification,
+) -> HookError {
+    let class_name = memory_provider_failure_class_name(classification.class);
+    let retryable = memory_provider_failure_is_retryable(classification.class);
+    let mut metadata = provider_model_metadata(provider, model, stage_name);
+    insert_hook_text_metadata(&mut metadata, "failure_class", class_name);
+    insert_hook_text_metadata(
+        &mut metadata,
+        "provider_stage",
+        provider_failure_stage_name(stage),
+    );
+    if let Some(status) = classification.http_status {
+        insert_hook_text_metadata(&mut metadata, "http_status", status.to_string());
+    }
+    if let Some(code) = classification.provider_code.as_deref() {
+        insert_hook_text_metadata(&mut metadata, "provider_code", bounded_diagnostic(code, 96));
+    }
+    if let Some(retry_after_ms) = classification.retry_after_ms {
+        insert_hook_text_metadata(
+            &mut metadata,
+            "retry_after_ms",
+            i64::try_from(retry_after_ms)
+                .unwrap_or(i64::MAX)
+                .to_string(),
+        );
+    }
+    memory_extractor_hook_error(
+        format!(
+            "memory.post_turn_extractor.provider_{}",
+            if classification.class == ProviderFailureClass::Provider5xx {
+                "5xx"
+            } else {
+                class_name
+            }
+        ),
+        format!("memory post-turn extractor provider request failed ({class_name})"),
+        retryable,
+        metadata,
+    )
+}
+
+fn provider_model_metadata(provider: &str, model: &str, stage: &str) -> HookErrorMetadata {
+    let mut metadata = HookErrorMetadata::default();
+    insert_hook_text_metadata(&mut metadata, "provider", bounded_diagnostic(provider, 80));
+    if !model.trim().is_empty() {
+        insert_hook_text_metadata(&mut metadata, "model", bounded_diagnostic(model, 160));
+    }
+    insert_hook_text_metadata(&mut metadata, "failure_stage", stage);
+    metadata
+}
+
+fn insert_hook_text_metadata(
+    metadata: &mut HookErrorMetadata,
+    key: &'static str,
+    value: impl Into<String>,
+) {
+    metadata.insert(
+        HookMetadataKey::new(key).expect("static metadata key is valid"),
+        value.into(),
+    );
+}
+
+fn memory_extractor_hook_error(
+    code: impl Into<String>,
+    message: impl Into<String>,
+    retryable: bool,
+    metadata: HookErrorMetadata,
+) -> HookError {
+    HookError::new(
+        HookDiagnosticCode::new(code.into()).expect("memory extractor error code is valid"),
+        HookDiagnosticMessage::new(message.into()).expect("memory extractor message is valid"),
+    )
+    .with_retryable(retryable)
+    .with_safe_for_user(true)
+    .with_metadata(metadata)
+}
+
+fn bounded_diagnostic(value: &str, max_chars: usize) -> String {
+    value.trim().chars().take(max_chars).collect()
+}
+
+fn memory_provider_failure_is_retryable(class: ProviderFailureClass) -> bool {
+    matches!(
+        class,
+        ProviderFailureClass::NetworkTransient
+            | ProviderFailureClass::RateLimit
+            | ProviderFailureClass::Provider5xx
+            | ProviderFailureClass::StreamStall
+            | ProviderFailureClass::StreamTruncated
+    )
+}
+
+fn memory_provider_failure_class_name(class: ProviderFailureClass) -> &'static str {
+    match class {
+        ProviderFailureClass::NetworkTransient => "network_transient",
+        ProviderFailureClass::RateLimit => "rate_limited",
+        ProviderFailureClass::Provider5xx => "provider_5xx",
+        ProviderFailureClass::AuthExpired => "auth_expired",
+        ProviderFailureClass::AuthOrPermission => "auth_or_permission",
+        ProviderFailureClass::ModelNotFound => "model_not_found",
+        ProviderFailureClass::PromptTooLong => "prompt_too_long",
+        ProviderFailureClass::ContextTooLarge => "context_too_large",
+        ProviderFailureClass::MaxOutputTokens => "max_output_tokens",
+        ProviderFailureClass::StreamStall => "stream_stall",
+        ProviderFailureClass::StreamTruncated => "stream_truncated",
+        ProviderFailureClass::EmptyResponse => "empty_response",
+        ProviderFailureClass::ProviderRejected => "provider_rejected",
+        ProviderFailureClass::UnsupportedParameter => "unsupported_parameter",
+        ProviderFailureClass::UnsupportedCapability => "unsupported_capability",
+        ProviderFailureClass::UnsupportedImageInput => "unsupported_image_input",
+        ProviderFailureClass::UnsupportedToolCalling => "unsupported_tool_calling",
+        ProviderFailureClass::UnsupportedStreaming => "unsupported_streaming",
+        ProviderFailureClass::MalformedProviderRequest => "malformed_provider_request",
+        ProviderFailureClass::InvalidRequest => "invalid_request",
+        ProviderFailureClass::PermissionDenied => "permission_denied",
+        ProviderFailureClass::Unknown => "unknown",
+    }
+}
+
+fn provider_failure_stage_name(stage: ProviderFailureStage) -> &'static str {
+    match stage {
+        ProviderFailureStage::Connect => "connect",
+        ProviderFailureStage::FirstChunk => "first_chunk",
+        ProviderFailureStage::MidStream => "mid_stream",
+        ProviderFailureStage::Finalize => "finalize",
+    }
 }
 
 #[async_trait]
@@ -641,16 +1483,21 @@ impl AgentMemoryWriteProvider for GatewayMemoryProvider {
         &self,
         context: MemoryTurnContext,
         request: MemoryManifestRequest,
-    ) -> Result<MemoryManifest, String> {
-        let processor = self.processor()?;
+    ) -> Result<MemoryManifest, MemoryManifestFailure> {
+        let processor = self.processor().map_err(|_| {
+            MemoryManifestFailure::new(
+                MemoryManifestFailureClass::Unclassified,
+                MemoryManifestFailureStage::Runtime,
+            )
+        })?;
         let runtime = processor.memory_runtime();
-        if let Err(error) = runtime.ensure_enabled() {
+        if runtime.ensure_enabled().is_err() {
             return Ok(MemoryManifest {
-                diagnostics: vec![format!("memory runtime unavailable: {error:#}")],
+                diagnostics: vec!["memory runtime unavailable".to_owned()],
                 ..MemoryManifest::default()
             });
         }
-        let boundary = authorize_post_turn_memory_execution(
+        let boundary = authorize_manifest_memory_execution(
             processor.as_ref(),
             context.workspace_id.as_str(),
             context.thread_id.as_str(),
@@ -676,7 +1523,9 @@ impl AgentMemoryWriteProvider for GatewayMemoryProvider {
                 },
             )
             .await
-            .map_err(|error| format!("{error:#}"))?;
+            .map_err(|error| {
+                classify_memory_manifest_failure(error, MemoryManifestFailureStage::Active)
+            })?;
         let candidates = runtime
             .service()
             .list_candidates(
@@ -697,7 +1546,9 @@ impl AgentMemoryWriteProvider for GatewayMemoryProvider {
                 },
             )
             .await
-            .map_err(|error| format!("{error:#}"))?;
+            .map_err(|error| {
+                classify_memory_manifest_failure(error, MemoryManifestFailureStage::Candidates)
+            })?;
 
         let active_count = active.records.len();
         let candidate_count = candidates.candidates.len();
@@ -745,12 +1596,14 @@ impl AgentMemoryWriteProvider for GatewayMemoryProvider {
         &self,
         context: MemoryTurnContext,
         mut params: MemorySemanticWriteParams,
-    ) -> Result<MemorySemanticWriteResponse, String> {
-        let processor = self.processor()?;
+    ) -> Result<MemorySemanticWriteResponse, pioneer_memory::MemoryWriteFailure> {
+        let processor = self
+            .processor()
+            .map_err(|_| pioneer_memory::MemoryWriteFailure::Unclassified)?;
         let runtime = processor.memory_runtime();
         runtime
             .ensure_enabled()
-            .map_err(|error| format!("{error:#}"))?;
+            .map_err(classify_memory_write_failure)?;
         let boundary = authorize_post_turn_memory_upsert_execution(
             processor.as_ref(),
             context.workspace_id.as_str(),
@@ -789,12 +1642,111 @@ impl AgentMemoryWriteProvider for GatewayMemoryProvider {
             .service()
             .write_semantic_memory(operation_context.clone(), params)
             .await
-            .map_err(|error| format!("{error:#}"))?;
+            .map_err(classify_memory_write_failure)?;
         processor
             .send_memory_changed_after_semantic_write(&operation_context, &response)
             .await;
         Ok(response)
     }
+}
+
+/// Classify while typed causes are available, after service/DB resources are released.
+pub(super) fn classify_memory_manifest_failure(
+    error: anyhow::Error,
+    stage: MemoryManifestFailureStage,
+) -> MemoryManifestFailure {
+    use sea_orm::{ConnAcquireErr, DbErr, RuntimeErr, SqlxError};
+    let mut failure = MemoryManifestFailure::new(MemoryManifestFailureClass::Unclassified, stage);
+    // Walk sources as well as anyhow contexts; never inspect Display or Debug.
+    for cause in error.chain() {
+        let sqlx = if let Some(db) = cause.downcast_ref::<DbErr>() {
+            match db {
+                DbErr::ConnectionAcquire(ConnAcquireErr::Timeout) => {
+                    failure.class = MemoryManifestFailureClass::StorageTransient;
+                    return failure;
+                }
+                DbErr::Conn(RuntimeErr::SqlxError(sqlx))
+                | DbErr::Exec(RuntimeErr::SqlxError(sqlx))
+                | DbErr::Query(RuntimeErr::SqlxError(sqlx)) => Some(sqlx.as_ref()),
+                _ => None,
+            }
+        } else {
+            cause.downcast_ref::<SqlxError>()
+        };
+        match sqlx {
+            Some(SqlxError::PoolTimedOut) => {
+                failure.class = MemoryManifestFailureClass::StorageTransient;
+                return failure;
+            }
+            Some(SqlxError::Database(database)) => {
+                // A numeric code from another backend cannot establish SQLite origin.
+                if let Some(sqlite) =
+                    database.try_downcast_ref::<sea_orm::sqlx::sqlite::SqliteError>()
+                {
+                    use sea_orm::sqlx::error::DatabaseError;
+                    if let Some(code) = sqlite.code().and_then(|code| code.parse::<i32>().ok()) {
+                        failure.sqlite_primary_code = Some(code & 0xff);
+                        failure.sqlite_extended_code = Some(code);
+                        if matches!(code & 0xff, 5 | 6) {
+                            failure.class = MemoryManifestFailureClass::StorageTransient;
+                        }
+                        return failure;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if pioneer_memory::is_invalid_stored_memory_data(&error) {
+        failure.class = MemoryManifestFailureClass::InvalidStoredData;
+    } else if matches!(
+        error.downcast_ref::<pioneer_memory::MemoryWriteFailure>(),
+        Some(pioneer_memory::MemoryWriteFailure::AuthorizationOrDomain)
+    ) {
+        failure.class = MemoryManifestFailureClass::AuthorizationOrDomain;
+    }
+    failure
+}
+
+/// Use typed causes and SQLite result codes, never raw error text.
+fn classify_memory_write_failure(error: anyhow::Error) -> pioneer_memory::MemoryWriteFailure {
+    use pioneer_memory::MemoryWriteFailure;
+    use sea_orm::{ConnAcquireErr, DbErr, RuntimeErr, SqlxError};
+
+    if let Some(failure) = error.downcast_ref::<MemoryWriteFailure>() {
+        return *failure;
+    }
+    if let Some(db_error) = error.downcast_ref::<DbErr>() {
+        if matches!(db_error, DbErr::ConnectionAcquire(ConnAcquireErr::Timeout)) {
+            return MemoryWriteFailure::StorageTransient;
+        }
+        if let DbErr::Conn(RuntimeErr::SqlxError(cause))
+        | DbErr::Exec(RuntimeErr::SqlxError(cause))
+        | DbErr::Query(RuntimeErr::SqlxError(cause)) = db_error
+        {
+            match cause.as_ref() {
+                SqlxError::PoolTimedOut => {
+                    return MemoryWriteFailure::StorageTransient;
+                }
+                SqlxError::Database(database) => {
+                    // Extended SQLite codes retain BUSY=5 / LOCKED=6 in the low byte.
+                    if database
+                        .code()
+                        .and_then(|code| code.parse::<i32>().ok())
+                        .is_some_and(sqlite_write_failure_code_is_transient)
+                    {
+                        return MemoryWriteFailure::StorageTransient;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    MemoryWriteFailure::Unclassified
+}
+
+fn sqlite_write_failure_code_is_transient(code: i32) -> bool {
+    matches!(code & 0xff, 5 | 6)
 }
 
 #[derive(Clone)]
@@ -876,6 +1828,8 @@ impl MemoryToolHandler {
         let scopes = self.scopes_for_kinds(&input.scopes)?;
         let context = self.operation_context(None, scoped_collaboration)?;
 
+        validate_read_scopes(&context, &scopes)?;
+
         let response = self
             .processor
             .memory_runtime()
@@ -914,6 +1868,7 @@ impl MemoryToolHandler {
             .clamp(1, MAX_LIST_LIMIT);
         let scopes = self.scopes_for_kinds(&input.scopes)?;
         let context = self.operation_context(None, scoped_collaboration)?;
+        validate_read_scopes(&context, &scopes)?;
 
         let response = self
             .processor
@@ -956,6 +1911,11 @@ impl MemoryToolHandler {
 
         let context = self.operation_context(None, scoped_collaboration)?;
         let response = if let Some(memory_id) = memory_id {
+            if input.namespace.is_some() || input.scope.is_some() {
+                return Err(ToolError::invalid_arguments(
+                    "scope and namespace apply only to key lookup",
+                ));
+            }
             self.processor
                 .memory_runtime()
                 .service()
@@ -973,10 +1933,11 @@ impl MemoryToolHandler {
                 ToolError::invalid_arguments("scope is required for key lookup in Phase 09")
             })?;
             let scope = self.scope_for_kind(scope_kind)?;
+            validate_read_scopes(&context, std::slice::from_ref(&scope))?;
             self.processor
                 .memory_runtime()
                 .service()
-                .get_by_key(context, scope, None, key)
+                .get_by_key(context, scope, input.namespace, key)
                 .await
         }
         .map_err(|error| ToolError::execution_failed(format!("{error:#}")))?;
@@ -994,16 +1955,67 @@ impl MemoryToolHandler {
         let idempotency_key = invocation.idempotency_key.clone();
         let input: MemoryRememberToolInput = decode_tool_args(invocation)?;
         let content = required_string(Some(input.content.as_str()), "content")?;
-        let scope = match input.scope {
+        let mut scope = match input.scope {
             Some(kind) => self.mutation_scope_for_kind(kind, scoped_collaboration)?,
             None => {
                 self.default_mutation_scope_for_category(input.category, scoped_collaboration)?
             }
         };
-        let key = optional_trimmed(input.key)
+        let mut key = optional_trimmed(input.key.clone())
             .or_else(|| Some(stable_memory_key(input.category, content.as_str())));
         let actor = assistant_actor(&self.context);
         let context = self.operation_context(Some(actor.clone()), scoped_collaboration)?;
+        let mut namespace = input.namespace.clone();
+        if let Some(memory_id) = input.memory_id.as_deref() {
+            let target = self
+                .processor
+                .memory_runtime()
+                .service()
+                .get(
+                    context.clone(),
+                    MemoryGetParams {
+                        memory_id: memory_id.to_owned(),
+                        include_deleted: false,
+                    },
+                )
+                .await
+                .map_err(|error| ToolError::execution_failed(format!("{error:#}")))?
+                .record
+                .ok_or_else(|| {
+                    ToolError::invalid_arguments("memory correction target is unavailable")
+                })?;
+            if input.scope.is_some_and(|kind| kind != target.scope.kind)
+                || input.namespace.as_ref().is_some_and(|namespace| {
+                    let namespace = namespace.trim();
+                    let namespace = if namespace.is_empty() {
+                        "default"
+                    } else {
+                        namespace
+                    };
+                    namespace != target.namespace.as_deref().unwrap_or("default")
+                })
+                || input
+                    .key
+                    .as_ref()
+                    .is_some_and(|key| Some(key.trim()) != target.key.as_deref())
+            {
+                return Err(ToolError::invalid_arguments(
+                    "memoryId correction must preserve the target scope, namespace and key",
+                ));
+            }
+            // Reading a record does not grant mutation authority. Resolve the
+            // target against the same mutation policy used for keyed writes.
+            let permitted =
+                self.mutation_scope_for_kind(target.scope.kind, scoped_collaboration)?;
+            if permitted != target.scope {
+                return Err(ToolError::invalid_arguments(
+                    "memory correction target is outside the current mutation scope",
+                ));
+            }
+            scope = target.scope;
+            key = target.key;
+            namespace = target.namespace;
+        }
         let source_context_kind = input
             .source_context
             .unwrap_or(MemoryToolSourceContext::DirectUserConversation)
@@ -1024,7 +2036,7 @@ impl MemoryToolHandler {
                 MemoryRememberParams {
                     scope,
                     category: input.category,
-                    namespace: None,
+                    namespace,
                     key,
                     content,
                     sensitivity: input.sensitivity,
@@ -1033,7 +2045,7 @@ impl MemoryToolHandler {
                     provenance: Some(provenance),
                     source_context_kind: Some(source_context_kind),
                     idempotency_key,
-                    supersedes: None,
+                    supersedes: input.memory_id,
                     metadata: BTreeMap::new(),
                 },
             )
@@ -1066,6 +2078,11 @@ impl MemoryToolHandler {
         }
 
         let target = if let Some(memory_id) = memory_id {
+            if input.namespace.is_some() || input.scope.is_some() {
+                return Err(ToolError::invalid_arguments(
+                    "scope and namespace apply only to key forget",
+                ));
+            }
             MemoryForgetTarget::Id { memory_id }
         } else {
             let key = key.expect("checked above");
@@ -1074,7 +2091,7 @@ impl MemoryToolHandler {
             })?;
             MemoryForgetTarget::ScopedKey {
                 scope: self.mutation_scope_for_kind(scope_kind, scoped_collaboration)?,
-                namespace: None,
+                namespace: input.namespace,
                 key,
             }
         };
@@ -1292,6 +2309,8 @@ struct MemoryListToolInput {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct MemoryGetToolInput {
     #[serde(default)]
+    namespace: Option<String>,
+    #[serde(default)]
     memory_id: Option<String>,
     #[serde(default)]
     key: Option<String>,
@@ -1302,6 +2321,10 @@ struct MemoryGetToolInput {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct MemoryRememberToolInput {
+    #[serde(default)]
+    namespace: Option<String>,
+    #[serde(default)]
+    memory_id: Option<String>,
     content: String,
     category: MemoryCategory,
     #[serde(default)]
@@ -1323,6 +2346,8 @@ struct MemoryRememberToolInput {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct MemoryForgetToolInput {
+    #[serde(default)]
+    namespace: Option<String>,
     #[serde(default)]
     memory_id: Option<String>,
     #[serde(default)]
@@ -1375,7 +2400,7 @@ fn memory_tool_specs() -> Vec<ConfiguredToolSpec> {
         ),
         memory_tool_spec(
             MEMORY_REMEMBER_TOOL,
-            "Store durable memory only when the user explicitly asks or when memory policy allows. Do not use for one-off commands, temporary debugging state, raw logs or secrets unless explicitly requested and policy allows.",
+            "Store durable memory only when the user explicitly asks or when memory policy allows. Every call requires both content and category, including updates by key and corrections by memoryId; neither address supplies these fields. Do not use for one-off commands, temporary debugging state, raw logs or secrets unless explicitly requested and policy allows.",
             memory_remember_schema(),
             safe_mutation_recovery(),
         ),
@@ -1420,6 +2445,20 @@ fn safe_mutation_recovery() -> ToolRecoveryMetadata {
         can_resume: false,
         max_wall_clock_secs: None,
     }
+}
+
+fn validate_read_scopes(
+    context: &MemoryOperationContext,
+    scopes: &[MemoryScope],
+) -> Result<(), ToolError> {
+    for scope in scopes {
+        if let Some(reason) = context.scope_read_denial(scope) {
+            return Err(ToolError::invalid_arguments(format!(
+                "scope_not_authorized: {reason}; this describes execution policy, not whether a record exists"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn memory_search_schema() -> JsonValue {
@@ -1471,6 +2510,7 @@ fn memory_get_schema() -> JsonValue {
     json!({
         "type": "object",
         "properties": {
+            "namespace": { "type": "string", "description": "Exact key namespace; defaults to default. Use with scope and key, not memoryId." },
             "memoryId": { "type": "string" },
             "key": { "type": "string" },
             "scope": { "type": "string", "enum": scope_kind_values() }
@@ -1483,8 +2523,10 @@ fn memory_remember_schema() -> JsonValue {
     json!({
         "type": "object",
         "properties": {
-            "content": { "type": "string", "minLength": 1 },
-            "category": { "type": "string", "enum": category_values() },
+            "namespace": { "type": "string", "description": "Exact key namespace; defaults to default. With memoryId, must match the target namespace." },
+            "memoryId": { "type": "string", "description": "Existing active record to correct. Preserves its namespace and key; scope/namespace/key, if provided, must match. Read the record first." },
+            "content": { "type": "string", "minLength": 1, "description": "Required full content to save, including on updates and corrections." },
+            "category": { "type": "string", "enum": category_values(), "description": "Required on every call, including updates by key and corrections by memoryId. Not inferred from the address or existing record." },
             "key": { "type": "string" },
             "scope": { "type": "string", "enum": scope_kind_values() },
             "sensitivity": { "type": "string", "enum": sensitivity_values() },
@@ -1502,6 +2544,7 @@ fn memory_forget_schema() -> JsonValue {
     json!({
         "type": "object",
         "properties": {
+            "namespace": { "type": "string", "description": "Exact key namespace; defaults to default. Use with scope and key, not memoryId." },
             "memoryId": { "type": "string" },
             "key": { "type": "string" },
             "scope": { "type": "string", "enum": scope_kind_values() },
@@ -1630,6 +2673,10 @@ fn search_hit_output(hit: &MemorySearchHit, include_provenance: bool) -> JsonVal
     let mut object = JsonMap::new();
     object.insert("memoryId".to_owned(), JsonValue::String(record.id.clone()));
     object.insert("scope".to_owned(), to_json_value(&record.scope));
+    object.insert(
+        "namespace".to_owned(),
+        json!(record.namespace.as_deref().unwrap_or("default")),
+    );
     object.insert("category".to_owned(), to_json_value(&record.category));
     object.insert(
         "key".to_owned(),
@@ -1645,6 +2692,10 @@ fn search_hit_output(hit: &MemorySearchHit, include_provenance: bool) -> JsonVal
     );
     object.insert("score".to_owned(), to_json_value(&hit.score));
     object.insert("matchedTerms".to_owned(), to_json_value(&hit.matched_terms));
+    object.insert(
+        "recallEligibility".to_owned(),
+        to_json_value(&record.recall_eligibility),
+    );
     object.insert("updatedAt".to_owned(), JsonValue::from(record.updated_at));
     object.insert(
         "sourceContextKind".to_owned(),
@@ -1691,6 +2742,10 @@ fn record_output(
     let mut object = JsonMap::new();
     object.insert("memoryId".to_owned(), JsonValue::String(record.id.clone()));
     object.insert("scope".to_owned(), to_json_value(&record.scope));
+    object.insert(
+        "namespace".to_owned(),
+        json!(record.namespace.as_deref().unwrap_or("default")),
+    );
     object.insert("category".to_owned(), to_json_value(&record.category));
     object.insert(
         "key".to_owned(),
@@ -1703,6 +2758,10 @@ fn record_output(
         );
     }
     object.insert("status".to_owned(), to_json_value(&record.status));
+    object.insert(
+        "recallEligibility".to_owned(),
+        to_json_value(&record.recall_eligibility),
+    );
     object.insert("confidence".to_owned(), json!(record.confidence));
     object.insert("importance".to_owned(), json!(record.importance));
     object.insert("sensitivity".to_owned(), to_json_value(&record.sensitivity));
@@ -1747,14 +2806,298 @@ fn truncate_chars(value: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn post_turn_provider_failure_policy_retries_only_transient_classes() {
+        for class in [
+            ProviderFailureClass::NetworkTransient,
+            ProviderFailureClass::RateLimit,
+            ProviderFailureClass::Provider5xx,
+            ProviderFailureClass::StreamStall,
+            ProviderFailureClass::StreamTruncated,
+        ] {
+            let error = classified_memory_provider_error(
+                "openrouter",
+                "test-model",
+                "provider_stream_item",
+                ProviderFailureStage::MidStream,
+                ProviderFailureClassification::new(class),
+            );
+            assert!(error.retryable, "{class:?} should retry");
+            assert_eq!(
+                error
+                    .metadata
+                    .iter()
+                    .find(|(key, _)| key.as_str() == "provider")
+                    .map(|(_, value)| value.as_str()),
+                Some("openrouter")
+            );
+        }
+        for class in [
+            ProviderFailureClass::AuthExpired,
+            ProviderFailureClass::AuthOrPermission,
+            ProviderFailureClass::ModelNotFound,
+            ProviderFailureClass::ProviderRejected,
+            ProviderFailureClass::MalformedProviderRequest,
+            ProviderFailureClass::InvalidRequest,
+            ProviderFailureClass::Unknown,
+        ] {
+            let error = classified_memory_provider_error(
+                "openrouter",
+                "test-model",
+                "provider_stream_start",
+                ProviderFailureStage::Connect,
+                ProviderFailureClassification::new(class),
+            );
+            assert!(!error.retryable, "{class:?} must be terminal");
+        }
+    }
+
+    #[test]
+    fn memory_remember_requires_content_and_category_for_all_write_addresses() {
+        let spec = memory_tool_specs()
+            .into_iter()
+            .find(|s| s.spec.name == MEMORY_REMEMBER_TOOL)
+            .unwrap()
+            .spec;
+        assert_eq!(spec.parameters["required"], json!(["content", "category"]));
+        for address in [
+            json!({}),
+            json!({"key":"name","scope":"user"}),
+            json!({"memoryId":"existing"}),
+        ] {
+            let mut payload = address;
+            payload["content"] = json!("User is Alexander.");
+            payload["category"] = json!("identity");
+            assert!(serde_json::from_value::<MemoryRememberToolInput>(payload.clone()).is_ok());
+            for field in ["content", "category"] {
+                let mut missing = payload.clone();
+                missing.as_object_mut().unwrap().remove(field);
+                let error = serde_json::from_value::<MemoryRememberToolInput>(missing).unwrap_err();
+                assert!(
+                    error
+                        .to_string()
+                        .contains(&format!("missing field `{field}`"))
+                );
+            }
+        }
+    }
+    #[test]
+    fn memory_scope_diagnostics_are_policy_only_and_schemas_keep_namespace() {
+        let context = MemoryOperationContext {
+            workspace_id: Some("workspace".into()),
+            allow_global_user: false,
+            ..Default::default()
+        };
+        let error = validate_read_scopes(
+            &context,
+            &[MemoryScope {
+                kind: MemoryScopeKind::User,
+                key: "default".into(),
+            }],
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("scope_not_authorized: global_user_memory_unavailable")
+        );
+        assert!(validate_read_scopes(&context, &[]).is_ok());
+        let mut owner = context;
+        owner.allow_global_user = true;
+        assert!(
+            validate_read_scopes(
+                &owner,
+                &[MemoryScope {
+                    kind: MemoryScopeKind::User,
+                    key: "default".into(),
+                }]
+            )
+            .is_ok()
+        );
+        for schema in [
+            memory_get_schema(),
+            memory_remember_schema(),
+            memory_forget_schema(),
+        ] {
+            assert_eq!(schema["properties"]["namespace"]["type"], "string");
+        }
+    }
+
+    #[test]
+    fn memory_record_output_preserves_audit_only_eligibility() {
+        let record: MemoryRecord = serde_json::from_value(json!({
+            "id":"record", "scope":{"kind":"user","key":"default"},
+            "namespace":"audit", "category":"identity", "key":"name",
+            "content":"Unverified claim", "status":"active", "confidence":0.5,
+            "importance":0.5, "sensitivity":"normal", "provenance":{},
+            "created_at":1, "updated_at":1,
+            "recall_eligibility":{"eligible":false,"reason":"suppress_quarantined_or_audit_only"}
+        }))
+        .unwrap();
+        let output = record_output(&record, true, true);
+        assert_eq!(output["status"], "active");
+        assert_eq!(output["namespace"], "audit");
+        assert_eq!(output["recallEligibility"]["eligible"], false);
+        assert_eq!(
+            output["recallEligibility"]["reason"],
+            "suppress_quarantined_or_audit_only"
+        );
+        let inventory = list_output(&[record], None, false);
+        assert_eq!(
+            inventory["records"][0]["recallEligibility"],
+            output["recallEligibility"]
+        );
+        // The public record protocol also accepts older responses with no assessment.
+        let legacy = json!({
+            "id":"legacy", "scope":{"kind":"user","key":"default"},
+            "category":"identity", "content":"Legacy claim", "status":"active",
+            "confidence":0.5, "importance":0.5, "sensitivity":"normal",
+            "provenance":{}, "created_at":1, "updated_at":1
+        });
+        let record: MemoryRecord = serde_json::from_value(legacy).unwrap();
+        assert!(record.recall_eligibility.is_none());
+        assert!(record_output(&record, true, false)["recallEligibility"].is_null());
+    }
     use anyhow::{Result, anyhow};
     use async_trait::async_trait;
     use futures_util::stream::{self, BoxStream};
     use pioneer_provider::{ChatResponse, ProviderCapabilities, StreamChunk};
     use std::sync::{Arc, Mutex};
 
+    #[test]
+    fn semantic_write_classification_preserves_typed_causes_without_error_text_matching() {
+        use pioneer_memory::MemoryWriteFailure;
+        for failure in [
+            MemoryWriteFailure::InvalidInput,
+            MemoryWriteFailure::AuthorizationOrDomain,
+            MemoryWriteFailure::StorageTransient,
+            MemoryWriteFailure::Unclassified,
+        ] {
+            assert_eq!(
+                classify_memory_write_failure(anyhow::Error::new(failure).context("outer context")),
+                failure
+            );
+        }
+        assert_eq!(
+            classify_memory_write_failure(anyhow::anyhow!("database is locked SQLITE_BUSY")),
+            MemoryWriteFailure::Unclassified
+        );
+        assert_eq!(
+            classify_memory_write_failure(anyhow::Error::new(sea_orm::DbErr::ConnectionAcquire(
+                sea_orm::ConnAcquireErr::Timeout
+            ))),
+            MemoryWriteFailure::StorageTransient
+        );
+        let pool_error = sea_orm::DbErr::Query(sea_orm::RuntimeErr::SqlxError(Arc::new(
+            sea_orm::SqlxError::PoolTimedOut,
+        )));
+        assert_eq!(
+            classify_memory_write_failure(anyhow::Error::new(pool_error).context("query failed")),
+            MemoryWriteFailure::StorageTransient,
+        );
+        assert_eq!(
+            classify_memory_write_failure(anyhow::Error::new(sea_orm::DbErr::Custom(
+                "SQLITE_BUSY".into()
+            ))),
+            MemoryWriteFailure::Unclassified
+        );
+    }
+
+    #[test]
+    fn durable_memory_post_turn_checkpoint_is_bounded_and_authority_fenced() {
+        let raw_json = r#"{"facts":[]}"#;
+        let encoded = encode_memory_post_turn_extractor_checkpoint(
+            raw_json,
+            "memory-model",
+            "memory-provider",
+        )
+        .expect("bounded checkpoint should encode");
+        assert_eq!(
+            decode_memory_post_turn_extractor_checkpoint(
+                encoded.as_str(),
+                "memory-model",
+                "memory-provider",
+            )
+            .expect("matching provider identity should replay"),
+            raw_json
+        );
+        assert!(
+            decode_memory_post_turn_extractor_checkpoint(
+                encoded.as_str(),
+                "replacement-model",
+                "memory-provider",
+            )
+            .is_err(),
+            "a checkpoint must not cross provider/model authority"
+        );
+        assert!(
+            encode_memory_post_turn_extractor_checkpoint(
+                "x".repeat(MAX_POST_TURN_EXTRACTOR_RAW_BYTES + 1).as_str(),
+                "memory-model",
+                "memory-provider",
+            )
+            .is_err(),
+            "raw provider output must remain bounded before persistence"
+        );
+    }
+
     struct CompatibilityFallbackProvider {
         requests: Arc<Mutex<Vec<ChatRequest>>>,
+    }
+
+    #[tokio::test]
+    async fn memory_extractor_drains_terminal_usage_and_rejects_late_failure() {
+        let provider = CompatibilityFallbackProvider::new();
+        let make_prefix = || -> Vec<anyhow::Result<StreamChunk>> {
+            vec![
+                Ok(StreamChunk::delta("{\"facts\":[]}")),
+                Ok(StreamChunk::final_chunk_with(ProviderTermination::Complete)),
+            ]
+        };
+        let mut chunks = make_prefix();
+        let mut usage = StreamChunk::delta(String::new());
+        usage.usage = Some(pioneer_provider::TokenUsage {
+            input_tokens: Some(10),
+            output_tokens: Some(2),
+            ..Default::default()
+        });
+        chunks.push(Ok(usage));
+        assert_eq!(
+            collect_post_turn_extractor_stream(
+                Box::pin(stream::iter(chunks)),
+                &provider,
+                "memory-model",
+                "initial"
+            )
+            .await
+            .unwrap(),
+            "{\"facts\":[]}"
+        );
+        let mut chunks = make_prefix();
+        chunks.push(Err(anyhow!("provider stream failed after terminal")));
+        assert!(
+            collect_post_turn_extractor_stream(
+                Box::pin(stream::iter(chunks)),
+                &provider,
+                "memory-model",
+                "initial"
+            )
+            .await
+            .is_err()
+        );
+        let mut chunks = make_prefix();
+        chunks.push(Ok(StreamChunk::delta("late content")));
+        assert!(
+            collect_post_turn_extractor_stream(
+                Box::pin(stream::iter(chunks)),
+                &provider,
+                "memory-model",
+                "initial"
+            )
+            .await
+            .is_err()
+        );
     }
 
     impl CompatibilityFallbackProvider {
@@ -1882,7 +3225,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn post_turn_extractor_does_not_retry_non_compatibility_errors() {
+    async fn post_turn_extractor_sanitizes_unknown_failure_without_inline_retry() {
         struct FailingProvider {
             requests: Arc<Mutex<usize>>,
         }
@@ -1915,7 +3258,41 @@ mod tests {
                 .await
                 .expect_err("network errors should be returned to hook runtime");
 
-        assert!(error.contains("network unavailable"));
+        assert_eq!(
+            error.code.as_str(),
+            "memory.post_turn_extractor.provider_unknown"
+        );
+        assert!(!error.retryable);
+        assert!(error.safe_for_user);
+        assert_eq!(
+            error
+                .metadata
+                .iter()
+                .find(|(key, _)| key.as_str() == "failure_class")
+                .map(|(_, value)| value.as_str()),
+            Some("unknown")
+        );
+        assert_eq!(
+            error
+                .metadata
+                .iter()
+                .find(|(key, _)| key.as_str() == "failure_stage")
+                .map(|(_, value)| value.as_str()),
+            Some("provider_non_stream_response")
+        );
+        assert!(!error.to_string().contains("network unavailable"));
         assert_eq!(*provider.requests.lock().expect("request lock poisoned"), 1);
     }
 }
+
+#[cfg(test)]
+#[path = "memory_tools_response_tests.rs"]
+mod response_validation_tests;
+
+#[cfg(test)]
+#[path = "memory_tools/sqlite_write_failure_tests.rs"]
+mod sqlite_write_failure_tests;
+
+#[cfg(test)]
+#[path = "memory_manifest_failure_tests.rs"]
+mod manifest_failure_tests;

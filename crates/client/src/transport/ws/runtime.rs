@@ -48,23 +48,24 @@ use pioneer_protocol::{
     TaskUserNotificationListParams, TaskUserNotificationListResponse, ThreadAgentsDocArchiveParams,
     ThreadAgentsDocArchiveResponse, ThreadAgentsDocGetParams, ThreadAgentsDocGetResponse,
     ThreadAgentsDocResolveForThreadParams, ThreadAgentsDocResolveForThreadResponse,
-    ThreadAgentsDocSaveParams, ThreadAgentsDocSaveResponse, ThreadFolderCreateParams,
-    ThreadFolderCreateResponse, ThreadFolderDeleteParams, ThreadFolderDeleteResponse,
-    ThreadFolderMoveParams, ThreadFolderMoveResponse, ThreadGetParams, ThreadGetResponse,
-    ThreadMoveParams, ThreadMoveResponse, ThreadParticipantMutationParams,
-    ThreadParticipantsListParams, ThreadParticipantsResponse, ThreadStartParams,
-    ThreadStartResponse, ThreadTimelinePageParams, ThreadTimelinePageResponse, ThreadTreeParams,
-    ThreadTreeResponse, ThreadUnsubscribeResponse, ThreadUpdateParams, ThreadUpdateResponse,
-    TurnCancelParams, TurnCancelResponse, TurnGetParams, TurnGetResponse, TurnItemsParams,
-    TurnItemsResponse, TurnPermissionRequestRespondParams, TurnPermissionRequestRespondResponse,
-    TurnStartParams, TurnStartResponse, TurnWorkItemsGetParams, TurnWorkItemsGetResponse,
-    TurnWorkPageParams, TurnWorkPageResponse, VoiceAudioFormat, VoiceSessionCancelParams,
-    VoiceSessionCancelResponse, VoiceSessionFinalizeParams, VoiceSessionFinalizeResponse,
-    VoiceSessionStartParams, VoiceSessionStartResponse, VoiceStatusParams, VoiceStatusResponse,
-    WorkspaceCreateParams, WorkspaceCreateResponse, WorkspaceDefaultResponse,
-    WorkspaceListResponse, WorkspaceMemberAddParams, WorkspaceMemberListParams,
-    WorkspaceMemberListResponse, WorkspaceMemberMutationResponse, WorkspaceMemberRemoveParams,
-    WorkspaceSelectParams, WorkspaceSelectResponse, WorkspaceUpdateParams, WorkspaceUpdateResponse,
+    ThreadAgentsDocSaveParams, ThreadAgentsDocSaveResponse, ThreadFileViewGrantCreateParams,
+    ThreadFileViewGrantCreateResponse, ThreadFolderCreateParams, ThreadFolderCreateResponse,
+    ThreadFolderDeleteParams, ThreadFolderDeleteResponse, ThreadFolderMoveParams,
+    ThreadFolderMoveResponse, ThreadGetParams, ThreadGetResponse, ThreadMoveParams,
+    ThreadMoveResponse, ThreadParticipantMutationParams, ThreadParticipantsListParams,
+    ThreadParticipantsResponse, ThreadStartParams, ThreadStartResponse, ThreadTimelinePageParams,
+    ThreadTimelinePageResponse, ThreadTreeParams, ThreadTreeResponse, ThreadUnsubscribeResponse,
+    ThreadUpdateParams, ThreadUpdateResponse, TurnCancelParams, TurnCancelResponse, TurnGetParams,
+    TurnGetResponse, TurnItemsParams, TurnItemsResponse, TurnPermissionRequestRespondParams,
+    TurnPermissionRequestRespondResponse, TurnStartParams, TurnStartResponse,
+    TurnWorkItemsGetParams, TurnWorkItemsGetResponse, TurnWorkPageParams, TurnWorkPageResponse,
+    VoiceAudioFormat, VoiceSessionCancelParams, VoiceSessionCancelResponse,
+    VoiceSessionFinalizeParams, VoiceSessionFinalizeResponse, VoiceSessionStartParams,
+    VoiceSessionStartResponse, VoiceStatusParams, VoiceStatusResponse, WorkspaceCreateParams,
+    WorkspaceCreateResponse, WorkspaceDefaultResponse, WorkspaceListResponse,
+    WorkspaceMemberAddParams, WorkspaceMemberListParams, WorkspaceMemberListResponse,
+    WorkspaceMemberMutationResponse, WorkspaceMemberRemoveParams, WorkspaceSelectParams,
+    WorkspaceSelectResponse, WorkspaceUpdateParams, WorkspaceUpdateResponse,
 };
 use serde::de::DeserializeOwned;
 use serde_json::Value as JsonValue;
@@ -84,10 +85,55 @@ pub struct GatewayWsCommandSender {
     command_tx: UnboundedSender<GatewayWsCommand>,
     next_connection_id: Arc<AtomicU64>,
     session_access: Arc<Mutex<Option<GatewayHttpAccess>>>,
+    connection_generations: Arc<Mutex<GatewayConnectionGenerations>>,
+    #[cfg(test)]
+    pub(crate) test_requests:
+        Arc<Mutex<Option<Arc<dyn crate::rpc::JsonRpcRequestTransport + Send + Sync>>>>,
 }
 
 #[derive(Clone)]
 pub struct GatewayWsClient {
     command_sender: GatewayWsCommandSender,
     event_rx: Arc<Mutex<Receiver<GatewayWsEvent>>>,
+    #[cfg(test)]
+    test_event_tx: Arc<Mutex<Option<std::sync::mpsc::Sender<GatewayWsEvent>>>>,
+}
+
+#[derive(Default)]
+struct GatewayConnectionGenerations {
+    active: Option<u64>,
+    pending: Option<u64>,
+    retiring: Option<u64>,
+}
+
+struct GatewayConnectionAttempt<'a> {
+    sender: &'a GatewayWsCommandSender,
+    id: u64,
+}
+
+impl GatewayConnectionAttempt<'_> {
+    fn complete(self, access: Option<GatewayHttpAccess>) -> Result<u64> {
+        let mut generations = self
+            .sender
+            .connection_generations
+            .lock()
+            .map_err(|_| anyhow!("Gateway connection owner poisoned"))?;
+        if generations.pending != Some(self.id) {
+            return Err(anyhow!("Gateway connection operation superseded"));
+        }
+        self.sender.replace_http_session_access(access)?;
+        generations.active = Some(self.id);
+        generations.pending = None;
+        Ok(self.id)
+    }
+}
+
+impl Drop for GatewayConnectionAttempt<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut generations) = self.sender.connection_generations.lock() {
+            if generations.pending == Some(self.id) {
+                generations.pending = None;
+            }
+        }
+    }
 }

@@ -83,6 +83,7 @@ fn continuation_checkpoint_payload() -> ExecutionCheckpointPayload {
             }],
         },
         tool_no_progress: Default::default(),
+        requested_tool_names: Vec::new(),
         strict_obligations: Vec::new(),
     }
 }
@@ -94,6 +95,7 @@ fn execution_continuation_runtime_section(
     let section = execution_continuation_section_with_runtime_facts(
         &ExecutionContinuationRuntimeFactsInput {
             checkpoint,
+            initiating_thread_id: Some("initiating_thread_snapshot"),
             prior_visible_assistant_text,
         },
     );
@@ -172,8 +174,9 @@ fn assert_continuation_prompt_contract(compiled: &CompiledPromptBundle) {
             .contains("## Execution Continuation")
     );
     assert!(compiled.full_system_text.contains("## Tool Usage"));
-    assert!(compiled.full_system_text.contains("write_file"));
-    assert!(compiled.full_system_text.contains("edit_file"));
+    assert!(compiled.full_system_text.contains("apply_patch"));
+    assert!(!compiled.full_system_text.contains("write_file"));
+    assert!(!compiled.full_system_text.contains("edit_file"));
     assert!(compiled.full_system_text.contains("call request_tools"));
     assert!(
         !compiled
@@ -347,7 +350,9 @@ section_ids:
 ## Execution Continuation
 This is the same user turn continuing in a new execution window. Continue from the saved execution-window state without restarting the request. Do not replay prior failed tool calls verbatim; use the available prior results and choose the next necessary action.
 
-Checkpoint: schema_version=2, workspace_id=workspace_snapshot, thread_id=thread_snapshot, turn_id=turn_snapshot
+Initiating thread: initiating_thread_snapshot
+Execution thread: thread_snapshot (internal child)
+Checkpoint: schema_version=2, workspace_id=workspace_snapshot, turn_id=turn_snapshot
 Original request preview: Create report from checked files.
 Completed window: index=1, agent_rounds=4, tool_calls=9, provider_tokens=456
 Window exhaustion reason: max_tool_calls_per_window
@@ -359,10 +364,12 @@ Prior visible assistant text: I drafted the outline and verified two files.
 
 ## Hidden Tool Domains
 Some tool domains and their tools are hidden until requested. If you need a hidden domain and its tools are not currently visible, call request_tools.
+A tool listed in more than one domain becomes visible when any of those domains is opened.
 
 Domains:
+- threads: threads_tools_result_read, threads_start_options, thread_message_send, thread_create, threads_turn_start.
 - memory: memory_search, memory_list, memory_get, memory_remember, memory_forget.
-- task: task_create, task_wait, task_accept, task_revise, task_cancel, task_update, task_detach, task_list, task_get, task_reschedule, task_pause, task_resume.
+- task: threads_start_options, task_create, task_wait, task_result, task_accept, task_revise, task_cancel, task_update, task_detach, task_list, task_get, task_reschedule, task_pause, task_resume.
 - artifact: artifact_prepare, artifact_register, artifact_read.
 - computer_use: computer_use.
 
@@ -394,7 +401,9 @@ section_ids:
 ## Execution Continuation
 This is the same user turn continuing in a new execution window. Continue from the saved execution-window state without restarting the request. Do not replay prior failed tool calls verbatim; use the available prior results and choose the next necessary action.
 
-Checkpoint: schema_version=2, workspace_id=workspace_snapshot, thread_id=thread_snapshot, turn_id=turn_snapshot
+Initiating thread: initiating_thread_snapshot
+Execution thread: thread_snapshot (internal child)
+Checkpoint: schema_version=2, workspace_id=workspace_snapshot, turn_id=turn_snapshot
 Original request preview: Create report from checked files.
 Completed window: index=1, agent_rounds=4, tool_calls=9, provider_tokens=456
 Window exhaustion reason: max_tool_calls_per_window
@@ -406,10 +415,12 @@ Prior visible assistant text: I drafted the outline and verified two files.
 
 ## Hidden Tool Domains
 Some tool domains and their tools are hidden until requested. If you need a hidden domain and its tools are not currently visible, call request_tools.
+A tool listed in more than one domain becomes visible when any of those domains is opened.
 
 Domains:
+- threads: threads_tools_result_read, threads_start_options, thread_message_send, thread_create, threads_turn_start.
 - memory: memory_search, memory_list, memory_get, memory_remember, memory_forget.
-- task: task_create, task_wait, task_accept, task_revise, task_cancel, task_update, task_detach, task_list, task_get, task_reschedule, task_pause, task_resume.
+- task: threads_start_options, task_create, task_wait, task_result, task_accept, task_revise, task_cancel, task_update, task_detach, task_list, task_get, task_reschedule, task_pause, task_resume.
 - artifact: artifact_prepare, artifact_register, artifact_read.
 - computer_use: computer_use.
 

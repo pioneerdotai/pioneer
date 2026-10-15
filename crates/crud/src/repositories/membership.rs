@@ -138,6 +138,23 @@ pub async fn list_workspace_memberships_for_workspace<C: ConnectionTrait>(
         })
 }
 
+/// Internal maintenance snapshot, bounded by the active/id keyset index.
+pub async fn list_active_workspace_page<C: ConnectionTrait>(
+    db: &C,
+    after: Option<&str>,
+) -> Result<Vec<workspace::Model>> {
+    let mut query = workspace::Entity::find().filter(workspace::Column::IsActive.eq(true));
+    if let Some(after) = after {
+        query = query.filter(workspace::Column::Id.gt(after.to_owned()));
+    }
+    query
+        .order_by_asc(workspace::Column::Id)
+        .limit(64)
+        .all(db)
+        .await
+        .context("failed to page active workspaces")
+}
+
 /// Returns only active workspaces granted to the exact ordinary principal.
 ///
 /// The membership predicate is part of the SQL query so callers never load an
@@ -919,7 +936,10 @@ mod tests {
         ThreadStatus, ThreadVisibility, Turn, TurnPermissionAuditEvent,
         TurnPermissionAuditEventKind, TurnStatus, generate_id,
     };
-    use sea_orm::{ActiveModelTrait, Database, DatabaseConnection, Set, TransactionTrait};
+    use sea_orm::{
+        ActiveModelTrait, Database, DatabaseBackend, DatabaseConnection, Set, Statement,
+        TransactionTrait,
+    };
 
     struct Fixture {
         database: DatabaseConnection,
@@ -1751,8 +1771,32 @@ mod tests {
                 )
                 .await
                 .expect("creator publish and archive"),
-            Some(true)
+            Some(crate::ThreadManagementChange {
+                changed: true,
+                access_changed: true
+            })
         );
+        // Supplying the current visibility alongside another changed field is
+        // a data update, not an ACL mutation. Comparison stays in the transaction.
+        for (name, changed) in [("Renamed again", true), ("Renamed again", false)] {
+            assert_eq!(
+                store
+                    .update_user_thread_management(
+                        fixture.red_workspace_id.as_str(),
+                        thread_id.as_str(),
+                        Some(&fixture.member_id),
+                        Some(name),
+                        Some(PersistedThreadAccessClass::Workspace),
+                        Some(true),
+                    )
+                    .await
+                    .unwrap(),
+                Some(crate::ThreadManagementChange {
+                    changed,
+                    access_changed: false
+                }),
+            );
+        }
         let published = thread::Entity::find_by_id(thread_id.clone())
             .one(&fixture.database)
             .await
@@ -1760,7 +1804,7 @@ mod tests {
             .expect("published thread exists");
         assert_eq!(published.access_class, "workspace");
         assert_eq!(published.status, "closed");
-        assert_eq!(published.name.as_deref(), Some("Renamed"));
+        assert_eq!(published.name.as_deref(), Some("Renamed again"));
 
         assert_eq!(
             store
@@ -1774,7 +1818,10 @@ mod tests {
                 )
                 .await
                 .expect("Superuser private restore"),
-            Some(true)
+            Some(crate::ThreadManagementChange {
+                changed: true,
+                access_changed: true
+            })
         );
         let restored = thread::Entity::find_by_id(thread_id.clone())
             .one(&fixture.database)
@@ -2039,7 +2086,7 @@ mod tests {
 
     #[tokio::test]
     async fn member_thread_collection_filters_private_workspace_and_internal_rows_in_sql() {
-        let fixture = fixture().await;
+        let mut fixture = fixture().await;
         let member_b_id =
             PrincipalId::new(generate_id(PRINCIPAL_ID_LEN)).expect("second member id");
         let now = chrono::Utc::now().fixed_offset();
@@ -2281,6 +2328,150 @@ mod tests {
         .map(|thread| thread.id)
         .collect::<BTreeSet<_>>();
         assert!(member_b_blue.is_empty());
+
+        // Exercise the CrudStore attachment path with the same ACL matrix.
+        // Turns on excluded rows must never enter the selected-ID batches.
+        for id in [
+            &fixture.private_thread_id,
+            &workspace_thread_id,
+            &internal_thread_id,
+            &peer_private_thread_id,
+            &blue_workspace_thread_id,
+        ] {
+            fixture
+                .database
+                .execute_raw(Statement::from_sql_and_values(
+                    DatabaseBackend::Sqlite,
+                    "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) \
+                 VALUES (?,?,'in_progress','task_run','scheduled_task',?,?)",
+                    vec![
+                        generate_id(AUTH_DOMAIN_ID_LEN).into(),
+                        id.clone().into(),
+                        now.into(),
+                        now.into(),
+                    ],
+                ))
+                .await
+                .unwrap();
+        }
+        let statements = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Statement>::new()));
+        fixture.database.set_metric_callback({
+            let statements = statements.clone();
+            move |info| statements.lock().unwrap().push(info.statement.clone())
+        });
+        let store = crate::CrudStore::new(fixture.database.clone());
+        for (principal, workspace, expected) in [
+            (&fixture.member_id, &fixture.red_workspace_id, &member_a_red),
+            (&member_b_id, &fixture.red_workspace_id, &member_b_red),
+            (
+                &fixture.member_id,
+                &fixture.blue_workspace_id,
+                &member_a_blue,
+            ),
+            (&member_b_id, &fixture.blue_workspace_id, &member_b_blue),
+        ] {
+            statements.lock().unwrap().clear();
+            let listed = store
+                .list_accessible_threads_for_principal(principal, workspace, 100)
+                .await
+                .unwrap();
+            assert_eq!(
+                listed
+                    .iter()
+                    .map(|thread| thread.id.clone())
+                    .collect::<BTreeSet<_>>(),
+                *expected
+            );
+            crate::tests::assert_thread_turn_snapshot_statements(
+                &statements.lock().unwrap(),
+                &listed,
+            );
+            for thread in listed {
+                assert_eq!(thread.turns.len(), 1);
+                assert_eq!(
+                    thread.turns[0].turn_kind,
+                    pioneer_protocol::TurnKind::TaskRun
+                );
+                assert!(thread.reasoning_effort.is_none());
+            }
+        }
+
+        // 229 public rows plus the two original authorized rows = 231. Equal
+        // updated_at values also exercise the membership selector's ID ASC tie.
+        for index in 0..229 {
+            let id = format!("B{index:020}");
+            fixture.database.execute_raw(Statement::from_sql_and_values(
+                DatabaseBackend::Sqlite,
+                "INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,access_class,created_at,updated_at) \
+                 VALUES (?,?,'','chat','test','test','idle','workspace',?,?)",
+                vec![id.clone().into(), fixture.red_workspace_id.clone().into(), now.into(),
+                     (now + chrono::Duration::seconds(1)).into()],
+            )).await.unwrap();
+            fixture
+                .database
+                .execute_raw(Statement::from_sql_and_values(
+                    DatabaseBackend::Sqlite,
+                    "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) \
+                 VALUES (?,?,'in_progress','task_run','scheduled_task',?,?)",
+                    vec![
+                        format!("C{index:020}").into(),
+                        id.into(),
+                        now.into(),
+                        now.into(),
+                    ],
+                ))
+                .await
+                .unwrap();
+        }
+        for (limit, turn_queries) in [(0, 0), (128, 2), (129, 4), (231, 4)] {
+            let expected = list_accessible_threads_for_principal(
+                &fixture.database,
+                &fixture.member_id,
+                &fixture.red_workspace_id,
+                limit,
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|model| model.id)
+            .collect::<Vec<_>>();
+            statements.lock().unwrap().clear();
+            let listed = store
+                .list_accessible_threads_for_principal(
+                    &fixture.member_id,
+                    &fixture.red_workspace_id,
+                    limit,
+                )
+                .await
+                .unwrap();
+            assert_eq!(listed.len(), limit as usize);
+            assert_eq!(
+                listed
+                    .iter()
+                    .map(|thread| thread.id.clone())
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            let recorded = statements.lock().unwrap().clone();
+            assert_eq!(recorded.len(), 1 + turn_queries);
+            crate::tests::assert_thread_turn_snapshot_statements(&recorded, &listed);
+            assert!(
+                listed
+                    .iter()
+                    .all(|thread| thread.workspace_id == fixture.red_workspace_id)
+            );
+            assert!(listed.iter().all(
+                |thread| thread.id != peer_private_thread_id && thread.id != internal_thread_id
+            ));
+            if limit == 231 {
+                assert!(
+                    listed
+                        .iter()
+                        .any(|thread| thread.id == fixture.private_thread_id)
+                );
+                assert!(listed.iter().any(|thread| thread.id == workspace_thread_id));
+            }
+        }
     }
 
     #[tokio::test]

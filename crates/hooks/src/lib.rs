@@ -33,7 +33,7 @@ pub use contribution::{
 pub use diagnostic::{
     HookDiagnostic, HookDiagnosticPreview, HookDiagnosticRedactionPolicy, HookDiagnosticSeverity,
 };
-pub use error::{HookError, HookRegistryError, HookResult};
+pub use error::{HookError, HookErrorMetadata, HookRegistryError, HookResult};
 pub use handler::{HookCapabilities, HookHandler, HookHandlerDescriptor};
 pub use id::{
     HookActorId, HookAgentId, HookAuditEventKind, HookBackgroundJobId, HookCapability,
@@ -86,9 +86,9 @@ pub use store::{
     HOOK_RUN_RESUME_SCHEMA_VERSION, HookAuditEventStoreRecord, HookRecoverableRunRecord,
     HookRecoveryScan, HookRetrySchedule, HookRunAttemptStoreCompletion, HookRunAttemptStoreRecord,
     HookRunInputSnapshot, HookRunResumePayload, HookRunResumeReference, HookRunResumeState,
-    HookRunScope, HookRunScopeKind, HookRunStore, HookRunStoreCompletion, HookRunStoreError,
-    HookRunStoreRecord, HookRunStoreResult, NewHookAuditEventStoreRecord,
-    NewHookRunAttemptStoreRecord, NewHookRunStoreRecord,
+    HookRunScope, HookRunScopeKind, HookRunStore, HookRunStoreCauseClass, HookRunStoreCompletion,
+    HookRunStoreDiagnostic, HookRunStoreError, HookRunStoreRecord, HookRunStoreResult,
+    NewHookAuditEventStoreRecord, NewHookRunAttemptStoreRecord, NewHookRunStoreRecord,
 };
 pub use subscription::{
     HookFilterSet, HookSubscription, HookSubscriptionDependencies, HookSubscriptionVisibility,

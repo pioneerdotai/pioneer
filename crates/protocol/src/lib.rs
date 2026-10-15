@@ -1,3 +1,7 @@
+mod thread_tool_result;
+pub use thread_tool_result::{
+    ThreadToolResultCursor, ThreadToolResultReadParams, ThreadToolResultReadResponse,
+};
 pub mod constants;
 
 mod access;
@@ -24,8 +28,14 @@ mod mcp;
 mod member;
 mod memory;
 mod notification;
+mod patch_history;
 mod provider;
 mod public_error;
+mod recovery_diagnostic;
+pub use recovery_diagnostic::{
+    ProviderErrorReason, ProviderRequestId, RecoveryDiagnostic, RecoveryProviderFailure,
+    RecoveryStopReason,
+};
 mod schema;
 mod settings;
 mod skills;
@@ -35,9 +45,11 @@ mod task_actor;
 mod thread;
 mod thread_agents_doc;
 mod thread_episodic;
+mod thread_file;
 mod timeline;
 mod turn;
 mod turn_permissions;
+mod versioned_contract;
 mod voice;
 pub mod voice_contract;
 mod workspace;
@@ -57,18 +69,21 @@ pub use agent_authorship::{
 };
 pub use agent_event::{
     AgentDurableEvent, AgentProgressEvent, DurableEventCausalityKey, ItemHeartbeatSource,
-    ProgressCoalescingKey, ProtocolEventClass, RecoveryAttemptContext, SkillAuditEvent,
-    ToolResultView, TurnAcceptedCapability, TurnCapabilityAcceptedReason,
-    TurnCapabilityRejectedReason, TurnPermissionAuditDecision, TurnPermissionAuditEvent,
-    TurnPermissionAuditEventKind, TurnPermissionAuditRequestKey, TurnRejectedCapability,
-    TurnSkillBinding,
+    NativeDurableCancellationReceipt, NativeTerminalEffectGate, NativeTerminalEffectKind,
+    NativeTerminalEffectPayload, NativeTerminalEffectPreparation,
+    NativeTerminalEffectPreparationFailure, NativeTerminalEffectSpec, ProgressCoalescingKey,
+    ProtocolEventClass, RecoveryAttemptContext, SkillAuditEvent, ToolResultView,
+    TurnAcceptedCapability, TurnCapabilityAcceptedReason, TurnCapabilityRejectedReason,
+    TurnPermissionAuditDecision, TurnPermissionAuditEvent, TurnPermissionAuditEventKind,
+    TurnPermissionAuditRequestKey, TurnRejectedCapability, TurnSkillBinding,
 };
 pub use agent_launch::{
     AgentAuthoredInput, AgentAuthoredInputError, AgentExecutionProfileBackend,
     AgentExecutionProfileProjection, AgentExecutionProfileSelection, AgentExecutionSelection,
     AgentIdentitySelection, AgentLaunchSelection, AgentLaunchSelectionError,
-    AgentStartOptionsProjection, AgentStartTarget, ChildAgentLaunchGrantSet,
-    ChildAgentLaunchGrantSetError, ReasoningCeiling, StartAgentIntent,
+    AgentStartOptionsProjection, AgentStartTarget, ChildAgentLaunchGrantMigrationError,
+    ChildAgentLaunchGrantSet, ChildAgentLaunchGrantSetError, ReasoningCeiling, StartAgentIntent,
+    migrate_embedded_child_launch_grant_json_to_current,
 };
 pub use agent_route::{
     AgentDelegationRouteCreateParams, AgentDelegationRouteListParams,
@@ -156,19 +171,22 @@ pub use cli_runtime::{
     CLIRuntimeThreadBindingManagement, CLIRuntimeThreadCompactParams,
     CLIRuntimeThreadCompactResponse, CLIRuntimeThreadForkParams, CLIRuntimeThreadForkResponse,
     CLIRuntimeTurnSteerParams, CLIRuntimeTurnSteerResponse, CliMcpAdapterReadiness,
-    CliMcpInjectionKind, CliMcpProjectionUpdateKind, RUNTIME_DIAGNOSTIC_LINE_MAX_CHARS,
-    RUNTIME_DIAGNOSTIC_MAX_LINES, RuntimeAccountSnapshot, RuntimeAppInfo, RuntimeCapabilities,
-    RuntimeDiagnostic, RuntimeDiagnosticLevel, RuntimeModelInfo, RuntimeStatus, RuntimeSummary,
-    sanitize_runtime_diagnostic_line, sanitize_runtime_diagnostic_lines,
+    CliMcpInjectionKind, CliMcpProjectionUpdateKind, CliRuntimeBlockedTurnGuard,
+    RUNTIME_DIAGNOSTIC_LINE_MAX_CHARS, RUNTIME_DIAGNOSTIC_MAX_LINES, RuntimeAccountSnapshot,
+    RuntimeAppInfo, RuntimeCapabilities, RuntimeDiagnostic, RuntimeDiagnosticLevel,
+    RuntimeModelInfo, RuntimeStatus, RuntimeSummary, sanitize_runtime_diagnostic_line,
+    sanitize_runtime_diagnostic_lines,
 };
 pub use client_projection::{
     AgentWorkGraphProjection, AgentWorkNodeProjection, AgentWorkNodeState,
     CrossThreadSourceVisibility, SafeExecutionProfileMetadata, SafeRouteProvenance,
 };
 pub use gateway_endpoint::{
-    DEFAULT_GATEWAY_PORT, GatewayBaseUrl, GatewayBaseUrlError, GatewayTransportSecurity,
-    PIONEER_PROTOCOL_VERSION, PIONEER_PROTOCOL_VERSION_HEADER, PIONEER_PROTOCOL_VERSION_NUMBER,
-    canonical_storage_path,
+    DEFAULT_GATEWAY_PORT, GatewayBaseUrl, GatewayBaseUrlError,
+    GatewayNativeLifecycleReadinessReport, GatewayReadinessComponent,
+    GatewayReadinessComponentSnapshot, GatewayReadinessComponentState, GatewayReadinessSnapshot,
+    GatewayReadinessStatus, GatewayTransportSecurity, PIONEER_PROTOCOL_VERSION,
+    PIONEER_PROTOCOL_VERSION_HEADER, PIONEER_PROTOCOL_VERSION_NUMBER, canonical_storage_path,
 };
 pub use id::{
     ADMINISTRATION_DOMAIN_ID_LEN, AUTH_DOMAIN_ID_LEN, AdministrationDomainIdError, AuditEventId,
@@ -210,18 +228,19 @@ pub use jsonrpc::{
 };
 pub use markdown::{
     MARKDOWN_AST_VERSION, MarkdownBlock, MarkdownDocument, MarkdownInline, MarkdownList,
-    MarkdownListItem, MarkdownMark, MarkdownMarkKind,
+    MarkdownListItem, MarkdownMark, MarkdownMarkKind, MarkdownTable, MarkdownTableAlignment,
 };
 pub use mcp::{
     McpAuditEventSummary, McpChangedAction, McpChangedItem, McpChangedNotification,
     McpDiagnosticLevel, McpInstallParams, McpInstallResponse, McpInstallResult,
     McpInstallResultStatus, McpInstallStatus, McpLifecycleAuditSummary, McpListItem, McpListParams,
-    McpListResponse, McpManagementDetails, McpPolicySetParams, McpPolicySetResponse,
-    McpPolicyState, McpPromptCatalogItem, McpResourceCatalogItem, McpResourceTemplateCatalogItem,
-    McpRuntimeState, McpRuntimeStatus, McpScopeKind, McpServerCatalogChangedNotification,
-    McpServerCatalogDetails, McpServerDetailsParams, McpServerDetailsResponse,
-    McpServerHealthDetails, McpServerPolicy, McpServerRestartParams, McpServerRestartResponse,
-    McpServerStatus, McpServerStatusChangedNotification, McpServerStatusItem, McpSourceKind,
+    McpListResponse, McpManagementDetails, McpOAuthAction, McpOAuthNotification, McpOAuthParams,
+    McpOAuthResponse, McpOAuthState, McpPolicySetParams, McpPolicySetResponse, McpPolicyState,
+    McpPromptCatalogItem, McpResourceCatalogItem, McpResourceTemplateCatalogItem, McpRuntimeState,
+    McpRuntimeStatus, McpScopeKind, McpServerCatalogChangedNotification, McpServerCatalogDetails,
+    McpServerDetailsParams, McpServerDetailsResponse, McpServerHealthDetails, McpServerPolicy,
+    McpServerRestartParams, McpServerRestartResponse, McpServerStatus,
+    McpServerStatusChangedNotification, McpServerStatusItem, McpSourceKind,
     McpToolAnnotationSummary, McpToolCatalogItem, McpTransportSummary, McpTurnBindingSummary,
     McpUninstallParams, McpUninstallResponse, McpValidationDiagnostic,
 };
@@ -255,33 +274,51 @@ pub use memory::{
     MemoryIntent, MemoryLifecycleActor, MemoryLifecycleActorKind, MemoryLifecycleReasonCode,
     MemoryLifecycleTransitionKind, MemoryLifetimeClass, MemoryListParams, MemoryListResponse,
     MemoryOwnershipClass, MemoryProvenance, MemoryQualityAction, MemoryQualityDecision,
-    MemoryQualityReasonCode, MemoryRecord, MemoryRememberParams, MemoryRememberResponse,
-    MemoryScope, MemoryScopeClarity, MemoryScopeHint, MemoryScopeKind, MemorySearchHit,
-    MemorySearchParams, MemorySearchResponse, MemorySemanticFields, MemorySemanticWriteDisposition,
-    MemorySemanticWriteParams, MemorySemanticWriteResponse, MemorySemanticWriteRoute,
-    MemorySemanticWriteRouteInfo, MemorySensitivity, MemorySensitivityHint,
-    MemorySourceContextKind, MemoryStatus, MemorySubject, MemoryWriteEvidence, MemoryWriteRelation,
+    MemoryQualityReasonCode, MemoryRecallEligibility, MemoryRecord, MemoryRememberParams,
+    MemoryRememberResponse, MemoryScope, MemoryScopeClarity, MemoryScopeHint, MemoryScopeKind,
+    MemorySearchHit, MemorySearchParams, MemorySearchResponse, MemorySemanticFields,
+    MemorySemanticWriteDisposition, MemorySemanticWriteParams, MemorySemanticWriteResponse,
+    MemorySemanticWriteRoute, MemorySemanticWriteRouteInfo, MemorySensitivity,
+    MemorySensitivityHint, MemorySourceContextKind, MemoryStatus, MemorySubject,
+    MemoryWriteEvidence, MemoryWriteRelation,
 };
 pub use notification::{GatewayNotification, UnknownGatewayNotification};
+pub use patch_history::{
+    PatchAppliedStep, PatchDiffSelection, PatchFileHistoryCursor, PatchFileHistoryEntry,
+    PatchFilesystemMutationSourceView, PatchHistoryAuthorityView, PatchHistoryChange,
+    PatchHistoryChangeKind, PatchHistoryCoverageView, PatchHistoryErrorCode,
+    PatchHistoryExecutionContext, PatchHistoryLineEnding, PatchHistoryLineEndingMetadata,
+    PatchHistoryPathView, PatchHistoryProvenanceView, PatchHistoryQueryCoverage,
+    PatchHistoryRecord, PatchHistoryRecordOutcome, PatchHistorySideEffects,
+    PatchHistorySnapshotRef, PatchHistoryStage, PatchHistoryTextEncoding, PatchHistoryViewKind,
+    PatchRecordExactnessView, PatchRecordSelector, PatchThreadHistoryCursor,
+    ThreadFilePatchHistoryPageParams, ThreadFilePatchHistoryPageResponse,
+    ThreadPatchStepsPageParams, ThreadPatchStepsPageResponse, TurnDiffExactnessView,
+    TurnFilesystemCoverageView, TurnPatchDiffGetParams, TurnPatchDiffGetResponse,
+    TurnPatchRecordGetParams, TurnPatchRecordGetResponse, TurnPatchStepsPageParams,
+    TurnPatchStepsPageResponse,
+};
 pub use provider::{
-    ProviderConfigureParams, ProviderConfigureResponse, ProviderDeleteApiKeyParams,
-    ProviderDeleteApiKeyResponse, ProviderListModelsParams, ProviderListModelsResponse,
-    ProviderListParams, ProviderListResponse, ProviderModelCapabilities, ProviderModelInfo,
-    ProviderModelLimits, ProviderModelPricing, ProviderModelReasoningCapabilities,
-    ProviderSetApiKeyParams, ProviderSetApiKeyResponse, ProviderSummary,
-    ProviderSummaryCapabilities, ProviderTranscriptionModelMetadata, ReasoningCapabilitySource,
+    ObservedProviderUsageTotals, ProviderConfigureParams, ProviderConfigureResponse,
+    ProviderDefinition, ProviderDeleteApiKeyParams, ProviderDeleteApiKeyResponse,
+    ProviderListModelsParams, ProviderListModelsResponse, ProviderListParams, ProviderListResponse,
+    ProviderModelCapabilities, ProviderModelInfo, ProviderModelLimits, ProviderModelPricing,
+    ProviderModelReasoningCapabilities, ProviderSetApiKeyParams, ProviderSetApiKeyResponse,
+    ProviderSummary, ProviderSummaryCapabilities, ProviderTranscriptionModelMetadata,
+    ReasoningCapabilitySource, observed_provider_usage_totals,
 };
 pub use public_error::{PUBLIC_ERROR_VERSION, PublicError, PublicErrorCode, PublicErrorStage};
 pub use settings::{
     GatewayCliRuntimeInstanceSettings, GatewayCliRuntimeSettings, GatewayGeneralSettings,
     GatewayGeneralSettingsUpdate, GatewayMemoryModelSelection, GatewayMemoryModelSelectionSource,
-    GatewayMemorySettings, GatewayNativeAgentConfig, GatewayRemoteAccessErrorKind,
-    GatewayRemoteAccessSettings, GatewayRemoteAccessSettingsUpdate, GatewayRemoteAccessState,
+    GatewayMemorySettings, GatewayModelCatalogProxyUpdate, GatewayModelCatalogSettings,
+    GatewayNativeAgentConfig, GatewayRemoteAccessErrorKind, GatewayRemoteAccessSettings,
+    GatewayRemoteAccessSettingsUpdate, GatewayRemoteAccessState,
     GatewayRemoteAccessStatusChangedNotification, GatewayRemoteAccessStatusSnapshot,
     GatewayRemoteAccessTransport, GatewaySelfImprovementModelSelection,
-    GatewaySelfImprovementSettings, GatewaySettingsGetParams, GatewaySettingsGetResponse,
-    GatewaySettingsSnapshot, GatewaySettingsUpdate, GatewaySettingsUpdateParams,
-    GatewaySettingsUpdateResponse, GatewayThreadEpisodicSettings,
+    GatewaySelfImprovementSettings, GatewaySelfImprovementStatus, GatewaySettingsGetParams,
+    GatewaySettingsGetResponse, GatewaySettingsSnapshot, GatewaySettingsUpdate,
+    GatewaySettingsUpdateParams, GatewaySettingsUpdateResponse, GatewayThreadEpisodicSettings,
     GatewayThreadEpisodicSettingsUpdate, GatewayThreadEpisodicVectorLocalModelStatus,
     GatewayThreadEpisodicVectorProvider, GatewayThreadEpisodicVectorProviderKeyStatus,
     GatewayThreadEpisodicVectorRefillStatus,
@@ -289,7 +326,8 @@ pub use settings::{
     GatewayThreadEpisodicVectorSearchSettings, GatewayThreadEpisodicVectorSearchSettingsUpdate,
     GatewayVoiceInputProvider, GatewayVoiceInputRuntimePhase, GatewayVoiceInputRuntimeSnapshot,
     GatewayVoiceInputSettings, GatewayVoiceInputSettingsUpdate,
-    GatewayVoiceInputStatusChangedNotification,
+    GatewayVoiceInputStatusChangedNotification, SelfImprovementPhase, SelfImprovementProgress,
+    SelfImprovementStatusReason,
 };
 pub use skills::{
     SkillArchiveFormat, SkillAuditTimelineItem, SkillChangedItem, SkillDependencyDiagnostic,
@@ -318,8 +356,8 @@ pub use task::{
     PublicTaskEventsResponse, PublicTaskFailure, PublicTaskGetResponse, PublicTaskListResponse,
     PublicTaskResult, PublicTaskResultCandidate, PublicTaskResultContractConfiguration,
     PublicTaskResultReadResponse, PublicTaskReviewContent, PublicTaskReviewContentFormat,
-    PublicTaskRun, PublicTaskTree, PublicTaskTreeResponse, PublicTaskTrigger,
-    PublicTaskTriggerConfiguration, PublicTaskTriggerSpec, PublicTaskWaitItem,
+    PublicTaskRun, PublicTaskRunExecutionObservation, PublicTaskTree, PublicTaskTreeResponse,
+    PublicTaskTrigger, PublicTaskTriggerConfiguration, PublicTaskTriggerSpec, PublicTaskWaitItem,
     PublicTaskWaitNonWaitableItem, PublicTaskWaitResponse, PublicTaskWaitReviewItem,
     TASK_COMPOSER_WORK_VERSION, Task, TaskAcceptParams, TaskAcceptResponse, TaskAgendaItem,
     TaskAgendaParams, TaskAgendaResponse, TaskAgentContext, TaskAgentContextMode,
@@ -367,7 +405,9 @@ pub use task::{
 };
 pub use task_actor::{
     TaskActorContract, TaskActorContractError, TaskDeliveryActorContract,
-    TaskDerivedChildLaunchGrant, TaskOccurrenceContract, TaskOccurrenceStatus, TaskReviewerIntent,
+    TaskDerivedChildLaunchGrant, TaskDerivedChildLaunchGrantMigrationError, TaskOccurrenceContract,
+    TaskOccurrenceDeliveryPlan, TaskOccurrenceStatus, TaskReviewerIntent,
+    migrate_task_derived_child_launch_grant_json_to_current,
 };
 pub use thread::{
     SandboxMode, SandboxPolicy, Thread, ThreadClosedNotification, ThreadComposerExecutionMode,
@@ -400,13 +440,16 @@ pub use thread_episodic::{
     ThreadEpisodicSourceProvenance, ThreadEpisodicThreadId, ThreadEpisodicTurnId,
     ThreadEpisodicVisibility, ThreadEpisodicWorkspaceId,
 };
+pub use thread_file::{
+    THREAD_FILE_VIEW_MAX_BYTES, ThreadFileViewGrantCreateParams, ThreadFileViewGrantCreateResponse,
+};
 pub use timeline::{
     ThreadTimelineBlocksChangedNotification, ThreadTimelinePageParams, ThreadTimelinePageResponse,
     TimelineBlock, TimelineBlockKind, TimelineChangeReason, TimelineCursor, TimelinePageAnchor,
     TimelinePageInfo, TimelineReplySummary, TurnWorkBlock, TurnWorkItem, TurnWorkItemStatus,
     TurnWorkItemsChangedNotification, TurnWorkItemsGetParams, TurnWorkItemsGetResponse,
     TurnWorkPageParams, TurnWorkPageResponse, TurnWorkPresentation, TurnWorkState,
-    TurnWorkStateChangedNotification,
+    TurnWorkStateChangedNotification, TurnWorkTombstone,
 };
 pub use turn::{
     AgentExecutionBackend, AgentMessagePhase, BackendSecurityCapabilities, ByteRange,
@@ -419,21 +462,23 @@ pub use turn::{
     ExecutionCheckpointToolCallSummary, ExecutionCheckpointToolNoProgressExactVariant,
     ExecutionCheckpointToolNoProgressState, ExecutionCheckpointToolNoProgressStrategy,
     ExecutionCheckpointToolSummary, ExecutionCheckpointWindowSummary,
-    ExecutionWindowExhaustionReason, ExecutionWindowStatus, ItemCompletedNotification,
-    ItemDeltaNotification, ItemDeltaStream, ItemRecoveryAttachedNotification,
-    ItemRecoveryExhaustedNotification, ItemRecoveryOpenedNotification,
-    ItemRecoverySucceededNotification, ItemRetryAttemptStartedNotification,
-    ItemRetryScheduledNotification, ItemStartedNotification, ItemTimeoutDetectedNotification,
-    ItemToolRetryExhaustedNotification, ItemToolRetryResolvedNotification,
-    ItemToolRetryScheduledNotification, ItemUpdatedNotification, LlmOutputPolicy,
-    LlmRetentionPolicy, PermissionBehavior, PromptManifest, PromptManifestDiagnostic,
-    PromptManifestDiagnosticCode, PromptManifestHookContributionKind, PromptManifestHookPhase,
-    PromptManifestHookSource, PromptManifestHookSourceEntry, PromptManifestHookTruncation,
-    PromptManifestProfile, ProviderFailureClass, ProviderFailureDetails, ProviderFailureStage,
-    ProviderTransportKind, ReasoningEffort, RecoveryAction, RecoveryJobStatus,
-    RecoveryOutputPolicy, RecoveryTrigger, SandboxBackendKind, SandboxBackendRequirement,
-    StaticStrictObligationCollector, StorageOutputPolicy, StrictObligationCollector,
-    SystemEventLevel, TURN_EXECUTION_ATTACHMENT_REFERENCE_MAX_COUNT,
+    ExecutionWindowExhaustionReason, ExecutionWindowStatus,
+    HISTORICAL_COMMAND_LLM_PROJECTION_VERSION, HistoricalCommandLlmProjection,
+    HistoricalCommandOutput, HistoricalCommandOutputSource, HistoricalCommandRepresentation,
+    HistoricalCommandResult, ItemCompletedNotification, ItemDeltaNotification, ItemDeltaStream,
+    ItemRecoveryAttachedNotification, ItemRecoveryExhaustedNotification,
+    ItemRecoveryOpenedNotification, ItemRecoverySucceededNotification,
+    ItemRetryAttemptStartedNotification, ItemRetryScheduledNotification, ItemStartedNotification,
+    ItemTimeoutDetectedNotification, ItemToolRetryExhaustedNotification,
+    ItemToolRetryResolvedNotification, ItemToolRetryScheduledNotification, ItemUpdatedNotification,
+    LlmOutputPolicy, LlmRetentionPolicy, PermissionBehavior, PromptManifest,
+    PromptManifestDiagnostic, PromptManifestDiagnosticCode, PromptManifestHookContributionKind,
+    PromptManifestHookPhase, PromptManifestHookSource, PromptManifestHookSourceEntry,
+    PromptManifestHookTruncation, PromptManifestProfile, ProviderFailureClass,
+    ProviderFailureDetails, ProviderFailureStage, ProviderTransportKind, ReasoningEffort,
+    RecoveryAction, RecoveryJobStatus, RecoveryOutputPolicy, RecoveryTrigger, SandboxBackendKind,
+    SandboxBackendRequirement, StaticStrictObligationCollector, StorageOutputPolicy,
+    StrictObligationCollector, SystemEventLevel, TURN_EXECUTION_ATTACHMENT_REFERENCE_MAX_COUNT,
     TURN_EXECUTION_CAPABILITY_MAX_COUNT, TURN_EXECUTION_INPUT_MAX_BYTES,
     TURN_EXECUTION_INPUT_MAX_ITEMS, TURN_EXECUTION_MENTION_MAX_COUNT,
     TURN_EXECUTION_REQUEST_MAX_BYTES, TURN_EXECUTION_SECURITY_SNAPSHOT_SCHEMA_VERSION,
@@ -482,9 +527,10 @@ pub use turn::{
     WebSearchResultItem, build_execution_checkpoint_original_request_summary,
     build_execution_checkpoint_payload, build_execution_checkpoint_provider_budget_summary,
     build_execution_checkpoint_tool_summary, collect_execution_checkpoint_strict_obligations,
-    mcp_server_capability_key, mcp_tool_capability_key, normalize_metadata_reasoning_effort,
-    reasoning_effort_comparison_key, resolve_turn_permission_profile, skill_capability_key,
-    skill_pack_capability_key, validate_turn_execution_envelope, validate_turn_message_content,
+    context_compaction_status, mcp_server_capability_key, mcp_tool_capability_key,
+    normalize_metadata_reasoning_effort, reasoning_effort_comparison_key,
+    resolve_turn_permission_profile, skill_capability_key, skill_pack_capability_key,
+    validate_turn_execution_envelope, validate_turn_message_content,
 };
 pub use turn_permissions::{
     compile_turn_permission_profile, composer_turn_permission_profile_snapshot,
@@ -517,3 +563,8 @@ pub use workspace::{
 };
 
 pub use schema::{protocol_schema_documents, write_protocol_schemas};
+
+mod model_selection;
+pub use model_selection::{GatewayModelSelection, ModelSelectionTransport};
+
+pub use artifact::{HtmlPublication, compact_html_timeline_item, compact_html_timeline_value};

@@ -27,6 +27,16 @@ Only call tools visible in the current turn. If a needed task tool is hidden and
 
 If the tool remains unavailable, do not fake the operation.
 
+`threads_start_options` is available through the `task` domain when permitted. Call it with `{}` only when you need to select an identity, execution profile, or destination explicitly:
+
+- Use `identities[].id` in `task_create.launch.identity` as `{"kind":"exact","id":"IDENTITY_ID"}`.
+- Use a compatible `profiles[].id` in `launch.profile` as `{"kind":"exact","id":"PROFILE_ID"}`.
+- If setting `launch.reasoning` or `launch.permissionProfile`, stay within the selected profile's `allowedReasoning` and `allowedPermissionProfiles` and the response's `maxPermissionProfile`.
+- If setting `launch.skillIds` or `launch.mcpServerIds`, choose from `allowedSkillIds` or `allowedMcpServerIds`.
+- Use `targetOptions[].id` as `task_create.targetOptionId` for a permitted destination.
+
+`inheritParentIdentityAvailable` and `inheritParentProfileAvailable` indicate whether inheritance can be selected. `defaultPioneerIdentityAvailable` and `derivedEphemeralIdentityAvailable` indicate whether `launch.identity.kind` can be `default_pioneer` or `server_derived_ephemeral`. For normal attached tasks, omit both `launch` and `targetOptionId`; no options lookup is required. The server rechecks authorization when `task_create` runs.
+
 ## task_create For Attached Subagents
 
 Use `task_create` without `trigger` for immediate attached subagents.
@@ -91,6 +101,7 @@ Rules:
 - Prefer `runIds` when `task_create` returned run ids.
 - Do not use singular `taskId` or `runId`.
 - A timeout does not cancel child work.
+- `timedOut:true` means this wait window expired. Active `taskIds` or `runIds` can be waited on again even when no counts changed. A run timeout appears separately in its run status and error.
 - Authorized reviewers receive `reviewContent` for each `reviewRequired` candidate. `summary` alone is not the full result.
 
 ## task_result
@@ -188,3 +199,5 @@ Use `task_list` or `task_get` when attached work must be inspected, recovered, o
   "taskId": "TASK_ID"
 }
 ```
+
+Each `task_get.runs[]` includes `execution` with `status`, `heartbeatAt`, `lastActivityAt`, and `observedAt` (Unix seconds). `status:null` means no execution row was observed. `heartbeatAt` is periodic liveness, not proof of meaningful progress. `lastActivityAt` is present only when the runtime recorded task activity for the current execution attempt; `null` means activity is unknown. `updatedAt` on a task or run is not a substitute for either timestamp.

@@ -1,46 +1,88 @@
-mod agent_diff_event_compaction;
-mod agent_domain_upgrade;
-mod authorization_legacy_backfill;
-mod cli_runtime_native_event_compaction;
+mod authorization_integrity_audit;
+mod child_launch_grant_backfill;
 mod execution_authority_integrity;
-mod stable_skill_id_backfill;
-mod task_anchor_backfill;
-mod task_event_fanout_cursor_backfill;
 pub(crate) mod thread_episodic_workspace_capsule_refill;
-mod timeline_pagination_backfill;
 mod turn_event_projection_stream_state_backfill;
-mod turn_item_attempt_payload_compaction;
-mod turn_item_execution_class_backfill;
 mod turn_permission_profile_backfill;
 mod zstd_payload_compression;
 
-use pioneer_config::{
-    GatewayContextCompactionTimeoutConfig, GatewayThreadEpisodicVectorSearchConfig,
-};
+use crate::thread_episodic::ThreadEpisodicIndexExecutorConfig;
+use pioneer_config::GatewayThreadEpisodicVectorSearchConfig;
 use pioneer_crud::CrudStore;
 use pioneer_provider::ProviderRegistry;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use thread_episodic_workspace_capsule_refill::ThreadEpisodicWorkspaceCapsuleRefillStatusSender;
 use tokio::sync::{Mutex, watch};
 use tokio_util::sync::CancellationToken;
 
+tokio::task_local! {
+    static STARTUP_MAINTENANCE_CANCELLATION: CancellationToken;
+}
+
+const BACKGROUND_BATCH_PAUSE: std::time::Duration = std::time::Duration::from_millis(25);
+
+#[derive(Debug)]
+struct StartupMaintenanceCancelled;
+
+impl std::fmt::Display for StartupMaintenanceCancelled {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Gateway startup maintenance was cancelled")
+    }
+}
+
+impl std::error::Error for StartupMaintenanceCancelled {}
+
+pub(super) async fn maintenance_checkpoint() -> anyhow::Result<()> {
+    let cancellation = maintenance_cancellation();
+    tokio::select! {
+        _ = cancellation.cancelled() => Err(StartupMaintenanceCancelled.into()),
+        _ = tokio::time::sleep(BACKGROUND_BATCH_PAUSE) => Ok(()),
+    }
+}
+
+fn maintenance_cancellation() -> CancellationToken {
+    STARTUP_MAINTENANCE_CANCELLATION
+        .try_with(Clone::clone)
+        .unwrap_or_default()
+}
+
+fn is_maintenance_cancelled(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<StartupMaintenanceCancelled>()
+        .is_some()
+}
+
 #[derive(Default)]
 pub(crate) struct ThreadEpisodicWorkspaceRefillSupervisor {
     operation: Mutex<()>,
+    runtime_slot: Arc<Mutex<()>>,
+    global_operation: Mutex<()>,
     active: Mutex<HashMap<String, ActiveWorkspaceRefill>>,
+    active_global_settings_refill: Mutex<Option<ActiveWorkspaceRefill>>,
     settings_owned_workspaces: Mutex<HashSet<String>>,
+    shutting_down: AtomicBool,
 }
 
+#[derive(Clone)]
 struct ActiveWorkspaceRefill {
     cancellation: CancellationToken,
     completed: watch::Receiver<bool>,
 }
 
+#[derive(Clone, Copy)]
+enum RefillOwner {
+    Startup,
+    Settings,
+}
+
 pub(crate) struct ThreadEpisodicWorkspaceRefillLease {
     cancellation: CancellationToken,
     completed: Option<watch::Sender<bool>>,
+    runtime_slot: Option<tokio::sync::OwnedMutexGuard<()>>,
 }
 
 /// Completes the mandatory execution-authority integrity gate before any
@@ -49,21 +91,104 @@ pub(crate) struct ThreadEpisodicWorkspaceRefillLease {
 pub(crate) async fn enforce_execution_authority_integrity(
     crud_store: &CrudStore,
 ) -> anyhow::Result<()> {
-    execution_authority_integrity::run(crud_store).await
+    let crud_store = crud_store.with_maintenance_access();
+    execution_authority_integrity::run(&crud_store).await
 }
 
-/// Converts all pre-Agent-domain Task data before the Gateway listener or any
-/// task worker can observe the database. The runtime only supports the final
-/// representation produced by this upgrade.
-pub(crate) async fn upgrade_agent_domain_data(
-    message_processor: &crate::message::MessageProcessor,
-) -> anyhow::Result<()> {
-    agent_domain_upgrade::apply(message_processor).await
+/// Startup admission boundary: call only before constructing the runtime that
+/// can claim episodic work. Late maintenance must never perform this recovery.
+/// Cancellation drops the current bounded DB quantum; a later startup can
+/// finish the remaining running jobs before admitting any new claims.
+pub(crate) async fn recover_inherited_thread_episodic_jobs(
+    crud_store: &CrudStore,
+    max_attempts: i64,
+) -> anyhow::Result<u64> {
+    let crud_store = crud_store.with_maintenance_access();
+    let mut recovered = 0_u64;
+    for workspace_id in crud_store
+        .list_thread_episodic_refill_workspace_ids()
+        .await?
+    {
+        recovered = recovered.saturating_add(
+            crud_store
+                .requeue_running_thread_episodic_index_jobs_for_workspace(
+                    &workspace_id,
+                    chrono::Utc::now().timestamp(),
+                    max_attempts,
+                )
+                .await?,
+        );
+    }
+    Ok(recovered)
 }
 
 impl ThreadEpisodicWorkspaceRefillSupervisor {
-    pub(crate) async fn begin(&self, workspace_id: &str) -> ThreadEpisodicWorkspaceRefillLease {
+    // Executor recovery uses the current resolver selection, not an old startup
+    // snapshot. Do not supersede an active refill; newer settings can cancel and
+    // join this lease through the existing generation protocol.
+    pub(crate) async fn begin_runtime(
+        &self,
+        workspace_id: &str,
+    ) -> Option<ThreadEpisodicWorkspaceRefillLease> {
+        let slot = self.runtime_slot.clone().try_lock_owned().ok()?;
+        let Ok(_operation) = self.operation.try_lock() else {
+            return None;
+        };
+        if self.shutting_down.load(Ordering::Acquire) {
+            return None;
+        }
+        if self
+            .active
+            .lock()
+            .await
+            .get(workspace_id)
+            .is_some_and(|active| !*active.completed.borrow())
+        {
+            return None;
+        }
+        let mut lease = self.insert_active(workspace_id).await;
+        lease.runtime_slot = Some(slot);
+        Some(lease)
+    }
+
+    // Owned by this supervisor's generation lease and joined by settings/shutdown.
+    // At most one ordinary-runtime transition is admitted; settings/startup keep
+    // their existing ownership. This is not a task per source or per wake.
+    pub(crate) async fn spawn_runtime<F, Fut>(self: &Arc<Self>, workspace: &str, run: F) -> bool
+    where
+        F: FnOnce(CancellationToken) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let Some(lease) = self.begin_runtime(workspace).await else {
+            return false;
+        };
+        tokio::spawn(async move {
+            run(lease.cancellation()).await;
+            drop(lease);
+        });
+        true
+    }
+
+    // Keep the retiring generation visible until its actual FS completion.
+    // Ordinary candidates check this under workspace ownership.
+    pub(crate) async fn workspace_refill_is_active(&self, workspace: &str) -> bool {
+        self.shutting_down.load(Ordering::Acquire)
+            || self
+                .active
+                .lock()
+                .await
+                .get(workspace)
+                .is_some_and(|active| !*active.completed.borrow())
+    }
+
+    pub(crate) async fn begin_settings(
+        &self,
+        workspace_id: &str,
+    ) -> ThreadEpisodicWorkspaceRefillLease {
         let _operation = self.operation.lock().await;
+        if self.shutting_down.load(Ordering::Acquire) {
+            return cancelled_refill_lease();
+        }
         self.settings_owned_workspaces
             .lock()
             .await
@@ -78,6 +203,9 @@ impl ThreadEpisodicWorkspaceRefillSupervisor {
         workspace_id: &str,
     ) -> Option<ThreadEpisodicWorkspaceRefillLease> {
         let _operation = self.operation.lock().await;
+        if self.shutting_down.load(Ordering::Acquire) {
+            return None;
+        }
         if self
             .settings_owned_workspaces
             .lock()
@@ -88,6 +216,20 @@ impl ThreadEpisodicWorkspaceRefillSupervisor {
         }
         self.cancel_and_wait_locked(workspace_id).await;
         Some(self.insert_active(workspace_id).await)
+    }
+
+    async fn reserve_settings_workspaces(&self, workspace_ids: &[String]) {
+        let _operation = self.operation.lock().await;
+        if self.shutting_down.load(Ordering::Acquire) {
+            return;
+        }
+        self.settings_owned_workspaces
+            .lock()
+            .await
+            .extend(workspace_ids.iter().cloned());
+        for workspace_id in workspace_ids {
+            self.cancel_and_wait_locked(workspace_id.as_str()).await;
+        }
     }
 
     async fn insert_active(&self, workspace_id: &str) -> ThreadEpisodicWorkspaceRefillLease {
@@ -103,6 +245,7 @@ impl ThreadEpisodicWorkspaceRefillSupervisor {
         ThreadEpisodicWorkspaceRefillLease {
             cancellation,
             completed: Some(completed_tx),
+            runtime_slot: None,
         }
     }
 
@@ -115,8 +258,69 @@ impl ThreadEpisodicWorkspaceRefillSupervisor {
         self.cancel_and_wait_locked(workspace_id).await;
     }
 
+    pub(crate) async fn shutdown(&self) {
+        self.shutting_down.store(true, Ordering::Release);
+
+        // A global settings refill can still be between listing workspaces and
+        // acquiring its first workspace lease. Cancel and join that outer task
+        // before draining per-workspace leases so no task can escape shutdown.
+        let _global_operation = self.global_operation.lock().await;
+        if let Some(active) = self.active_global_settings_refill.lock().await.take() {
+            cancel_and_wait_active_refill(active).await;
+        }
+
+        let _operation = self.operation.lock().await;
+        let active = self
+            .active
+            .lock()
+            .await
+            .drain()
+            .map(|(_, active)| active)
+            .collect::<Vec<_>>();
+        for mut active in active {
+            active.cancellation.cancel();
+            while !*active.completed.borrow() {
+                if active.completed.changed().await.is_err() {
+                    break;
+                }
+            }
+        }
+    }
+
+    async fn spawn_global_settings_refill<F, Fut>(self: &Arc<Self>, run: F)
+    where
+        F: FnOnce(CancellationToken) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let _global_operation = self.global_operation.lock().await;
+        if self.shutting_down.load(Ordering::Acquire) {
+            return;
+        }
+
+        // Replacement is the generation fence: the next settings snapshot is
+        // not allowed to start until the task carrying the older snapshot has
+        // observed cancellation and fully stopped.
+        if let Some(active) = self.active_global_settings_refill.lock().await.take() {
+            cancel_and_wait_active_refill(active).await;
+        }
+        if self.shutting_down.load(Ordering::Acquire) {
+            return;
+        }
+
+        let cancellation = CancellationToken::new();
+        let (completed_tx, completed_rx) = watch::channel(false);
+        *self.active_global_settings_refill.lock().await = Some(ActiveWorkspaceRefill {
+            cancellation: cancellation.clone(),
+            completed: completed_rx,
+        });
+        tokio::spawn(async move {
+            run(cancellation).await;
+            let _ = completed_tx.send(true);
+        });
+    }
+
     async fn cancel_and_wait_locked(&self, workspace_id: &str) {
-        let active = self.active.lock().await.remove(workspace_id);
+        let active = self.active.lock().await.get(workspace_id).cloned();
         let Some(mut active) = active else {
             return;
         };
@@ -127,6 +331,26 @@ impl ThreadEpisodicWorkspaceRefillSupervisor {
                 break;
             }
         }
+        self.active.lock().await.remove(workspace_id);
+    }
+}
+
+async fn cancel_and_wait_active_refill(mut active: ActiveWorkspaceRefill) {
+    active.cancellation.cancel();
+    while !*active.completed.borrow() {
+        if active.completed.changed().await.is_err() {
+            break;
+        }
+    }
+}
+
+fn cancelled_refill_lease() -> ThreadEpisodicWorkspaceRefillLease {
+    let cancellation = CancellationToken::new();
+    cancellation.cancel();
+    ThreadEpisodicWorkspaceRefillLease {
+        cancellation,
+        completed: None,
+        runtime_slot: None,
     }
 }
 
@@ -144,9 +368,10 @@ impl Drop for ThreadEpisodicWorkspaceRefillLease {
     }
 }
 
-pub(crate) fn spawn(
-    message_processor: Arc<crate::message::MessageProcessor>,
+pub(crate) async fn run(
     crud_store: Arc<CrudStore>,
+    thread_episodic_indexing_enabled: bool,
+    executor_config: ThreadEpisodicIndexExecutorConfig,
     thread_episodic_storage_root: PathBuf,
     thread_episodic_vector_search_config: GatewayThreadEpisodicVectorSearchConfig,
     thread_episodic_workspace_vector_search_configs: BTreeMap<
@@ -157,43 +382,131 @@ pub(crate) fn spawn(
     runtime_home: PathBuf,
     refill_status_sender: Option<ThreadEpisodicWorkspaceCapsuleRefillStatusSender>,
     refill_supervisor: Arc<ThreadEpisodicWorkspaceRefillSupervisor>,
-    context_compaction_timeout_config: GatewayContextCompactionTimeoutConfig,
-) {
-    let interrupted_before_unix = chrono::Utc::now().timestamp();
-    let _handle = tokio::spawn(async move {
-        turn_item_execution_class_backfill::run(
-            crud_store.as_ref(),
-            context_compaction_timeout_config,
+    cancellation: CancellationToken,
+) -> anyhow::Result<()> {
+    STARTUP_MAINTENANCE_CANCELLATION
+        .scope(
+            cancellation,
+            run_inner(
+                crud_store,
+                thread_episodic_indexing_enabled,
+                executor_config,
+                thread_episodic_storage_root,
+                thread_episodic_vector_search_config,
+                thread_episodic_workspace_vector_search_configs,
+                provider_registry,
+                runtime_home,
+                refill_status_sender,
+                refill_supervisor,
+            ),
         )
-        .await;
-        turn_event_projection_stream_state_backfill::run(crud_store.as_ref()).await;
-        task_event_fanout_cursor_backfill::run(crud_store.as_ref()).await;
-        authorization_legacy_backfill::run(crud_store.as_ref()).await;
-        stable_skill_id_backfill::run(crud_store.as_ref(), message_processor.as_ref()).await;
-        task_anchor_backfill::run(crud_store.as_ref()).await;
-        turn_permission_profile_backfill::run(crud_store.as_ref(), runtime_home.as_path()).await;
-        timeline_pagination_backfill::run(crud_store.as_ref()).await;
-        agent_diff_event_compaction::run(crud_store.as_ref()).await;
-        cli_runtime_native_event_compaction::run(crud_store.as_ref()).await;
-        turn_item_attempt_payload_compaction::run(crud_store.as_ref()).await;
-        zstd_payload_compression::run(crud_store.as_ref()).await;
-        run_thread_episodic_workspace_capsule_refill(
-            crud_store,
-            thread_episodic_storage_root,
-            thread_episodic_vector_search_config,
-            thread_episodic_workspace_vector_search_configs,
-            provider_registry,
-            runtime_home,
-            refill_status_sender,
-            refill_supervisor,
-            Some(interrupted_before_unix),
-        )
-        .await;
-    });
+        .await
 }
 
-pub(crate) fn spawn_thread_episodic_workspace_capsule_refill(
+async fn run_inner(
     crud_store: Arc<CrudStore>,
+    thread_episodic_indexing_enabled: bool,
+    executor_config: ThreadEpisodicIndexExecutorConfig,
+    thread_episodic_storage_root: PathBuf,
+    thread_episodic_vector_search_config: GatewayThreadEpisodicVectorSearchConfig,
+    thread_episodic_workspace_vector_search_configs: BTreeMap<
+        String,
+        GatewayThreadEpisodicVectorSearchConfig,
+    >,
+    provider_registry: Arc<ProviderRegistry>,
+    runtime_home: PathBuf,
+    refill_status_sender: Option<ThreadEpisodicWorkspaceCapsuleRefillStatusSender>,
+    refill_supervisor: Arc<ThreadEpisodicWorkspaceRefillSupervisor>,
+) -> anyhow::Result<()> {
+    let crud_store = Arc::new(crud_store.with_maintenance_access());
+    let trace = pioneer_observability::GatewayOperationTrace::start(
+        pioneer_observability::GatewayOperation::DatabaseStartupMaintenance,
+    );
+    let mut failed = false;
+    macro_rules! run_stage {
+        ($stage:expr, $future:expr) => {{
+            if let Err(error) = maintenance_checkpoint().await {
+                trace.finish_cancelled();
+                return Err(error);
+            }
+            let stage = trace.stage($stage);
+            let cancellation = maintenance_cancellation();
+            let result = tokio::select! { biased;
+                _ = cancellation.cancelled() => Err(StartupMaintenanceCancelled.into()),
+                result = $future => result,
+            };
+            if let Err(error) = result {
+                if is_maintenance_cancelled(&error) {
+                    stage.cancel();
+                    trace.finish_cancelled();
+                    return Err(error);
+                } else {
+                    drop(stage);
+                    failed = true;
+                    tracing::warn!(error = %format!("{error:#}"), "Gateway startup maintenance stage failed");
+                }
+            } else {
+                stage.succeed();
+            }
+        }};
+    }
+    run_stage!(
+        pioneer_observability::GatewayOperationStage::DatabaseTurnEventProjectionBackfill,
+        turn_event_projection_stream_state_backfill::run(crud_store.as_ref())
+    );
+    run_stage!(
+        pioneer_observability::GatewayOperationStage::DatabaseChildLaunchGrantBackfill,
+        child_launch_grant_backfill::run(crud_store.as_ref())
+    );
+    run_stage!(
+        pioneer_observability::GatewayOperationStage::DatabaseAuthorizationIntegrityAudit,
+        authorization_integrity_audit::run(crud_store.as_ref())
+    );
+    run_stage!(
+        pioneer_observability::GatewayOperationStage::DatabaseTurnPermissionProfileBackfill,
+        turn_permission_profile_backfill::run(crud_store.as_ref(), runtime_home.as_path())
+    );
+    run_stage!(
+        pioneer_observability::GatewayOperationStage::DatabasePayloadCompression,
+        zstd_payload_compression::run(crud_store.as_ref())
+    );
+    let refill_stage =
+        trace.stage(pioneer_observability::GatewayOperationStage::DatabaseThreadEpisodicRefill);
+    let refill_cancellation = maintenance_cancellation();
+    run_thread_episodic_workspace_capsule_refill(
+        crud_store,
+        thread_episodic_indexing_enabled,
+        executor_config,
+        thread_episodic_storage_root,
+        thread_episodic_vector_search_config,
+        thread_episodic_workspace_vector_search_configs,
+        provider_registry,
+        runtime_home,
+        refill_status_sender,
+        refill_supervisor,
+        RefillOwner::Startup,
+        refill_cancellation.clone(),
+    )
+    .await;
+    if refill_cancellation.is_cancelled() {
+        refill_stage.cancel();
+        trace.finish_cancelled();
+        return Err(StartupMaintenanceCancelled.into());
+    }
+    refill_stage.succeed();
+    if failed {
+        trace.finish_failure();
+        anyhow::bail!("one or more Gateway startup maintenance stages failed");
+    } else {
+        trace.finish_success();
+    }
+    Ok(())
+}
+
+pub(crate) async fn spawn_thread_episodic_workspace_capsule_refill(
+    crud_store: Arc<CrudStore>,
+    thread_episodic_indexing_enabled: bool,
+    executor_config: ThreadEpisodicIndexExecutorConfig,
     thread_episodic_storage_root: PathBuf,
     thread_episodic_vector_search_config: GatewayThreadEpisodicVectorSearchConfig,
     thread_episodic_workspace_vector_search_configs: BTreeMap<
@@ -205,24 +518,32 @@ pub(crate) fn spawn_thread_episodic_workspace_capsule_refill(
     refill_status_sender: Option<ThreadEpisodicWorkspaceCapsuleRefillStatusSender>,
     refill_supervisor: Arc<ThreadEpisodicWorkspaceRefillSupervisor>,
 ) {
-    let _handle = tokio::spawn(async move {
-        run_thread_episodic_workspace_capsule_refill(
-            crud_store,
-            thread_episodic_storage_root,
-            thread_episodic_vector_search_config,
-            thread_episodic_workspace_vector_search_configs,
-            provider_registry,
-            runtime_home,
-            refill_status_sender,
-            refill_supervisor,
-            None,
-        )
+    let task_refill_supervisor = refill_supervisor.clone();
+    refill_supervisor
+        .spawn_global_settings_refill(move |cancellation| async move {
+            run_thread_episodic_workspace_capsule_refill(
+                crud_store,
+                thread_episodic_indexing_enabled,
+                executor_config,
+                thread_episodic_storage_root,
+                thread_episodic_vector_search_config,
+                thread_episodic_workspace_vector_search_configs,
+                provider_registry,
+                runtime_home,
+                refill_status_sender,
+                task_refill_supervisor,
+                RefillOwner::Settings,
+                cancellation,
+            )
+            .await;
+        })
         .await;
-    });
 }
 
 pub(crate) async fn spawn_thread_episodic_workspace_capsule_refill_for_workspace(
     crud_store: Arc<CrudStore>,
+    thread_episodic_indexing_enabled: bool,
+    executor_config: ThreadEpisodicIndexExecutorConfig,
     thread_episodic_storage_root: PathBuf,
     workspace_id: String,
     workspace_vector_search_config: GatewayThreadEpisodicVectorSearchConfig,
@@ -236,12 +557,19 @@ pub(crate) async fn spawn_thread_episodic_workspace_capsule_refill_for_workspace
     refill_status_sender: Option<ThreadEpisodicWorkspaceCapsuleRefillStatusSender>,
     refill_supervisor: Arc<ThreadEpisodicWorkspaceRefillSupervisor>,
 ) {
-    let refill_lease = refill_supervisor.begin(workspace_id.as_str()).await;
+    let refill_lease = refill_supervisor
+        .begin_settings(workspace_id.as_str())
+        .await;
     let cancellation = refill_lease.cancellation();
+    if cancellation.is_cancelled() {
+        return;
+    }
     let _handle = tokio::spawn(async move {
         let _refill_lease = refill_lease;
         run_thread_episodic_workspace_capsule_refill_for_workspace(
             crud_store,
+            thread_episodic_indexing_enabled,
+            executor_config,
             thread_episodic_storage_root,
             workspace_id,
             workspace_vector_search_config,
@@ -258,6 +586,8 @@ pub(crate) async fn spawn_thread_episodic_workspace_capsule_refill_for_workspace
 
 async fn run_thread_episodic_workspace_capsule_refill(
     crud_store: Arc<CrudStore>,
+    thread_episodic_indexing_enabled: bool,
+    executor_config: ThreadEpisodicIndexExecutorConfig,
     thread_episodic_storage_root: PathBuf,
     thread_episodic_vector_search_config: GatewayThreadEpisodicVectorSearchConfig,
     thread_episodic_workspace_vector_search_configs: BTreeMap<
@@ -268,10 +598,13 @@ async fn run_thread_episodic_workspace_capsule_refill(
     runtime_home: PathBuf,
     refill_status_sender: Option<ThreadEpisodicWorkspaceCapsuleRefillStatusSender>,
     refill_supervisor: Arc<ThreadEpisodicWorkspaceRefillSupervisor>,
-    interrupted_before_unix: Option<i64>,
+    owner: RefillOwner,
+    cancellation: CancellationToken,
 ) {
     thread_episodic_workspace_capsule_refill::run(
         crud_store,
+        thread_episodic_indexing_enabled,
+        executor_config,
         thread_episodic_storage_root,
         thread_episodic_vector_search_config,
         thread_episodic_workspace_vector_search_configs,
@@ -279,13 +612,16 @@ async fn run_thread_episodic_workspace_capsule_refill(
         runtime_home,
         refill_status_sender,
         refill_supervisor,
-        interrupted_before_unix,
+        owner,
+        cancellation,
     )
     .await;
 }
 
 async fn run_thread_episodic_workspace_capsule_refill_for_workspace(
     crud_store: Arc<CrudStore>,
+    thread_episodic_indexing_enabled: bool,
+    executor_config: ThreadEpisodicIndexExecutorConfig,
     thread_episodic_storage_root: PathBuf,
     workspace_id: String,
     workspace_vector_search_config: GatewayThreadEpisodicVectorSearchConfig,
@@ -301,6 +637,8 @@ async fn run_thread_episodic_workspace_capsule_refill_for_workspace(
 ) {
     thread_episodic_workspace_capsule_refill::run_workspace(
         crud_store,
+        thread_episodic_indexing_enabled,
+        executor_config,
         thread_episodic_storage_root,
         workspace_id,
         workspace_vector_search_config,
@@ -309,16 +647,10 @@ async fn run_thread_episodic_workspace_capsule_refill_for_workspace(
         provider_registry,
         runtime_home,
         refill_status_sender,
-        None,
         cancellation,
     )
     .await;
 }
-
-#[cfg(test)]
-pub(crate) use task_event_fanout_cursor_backfill::backfill_once as backfill_task_event_fanout_cursors_once;
-#[cfg(test)]
-pub(crate) use timeline_pagination_backfill::backfill_once as backfill_timeline_pagination_once;
 
 #[cfg(test)]
 mod tests {
@@ -327,7 +659,7 @@ mod tests {
     #[tokio::test]
     async fn workspace_refill_supervisor_cancels_and_waits_for_active_lease() {
         let supervisor = Arc::new(ThreadEpisodicWorkspaceRefillSupervisor::default());
-        let lease = supervisor.begin("workspace-a").await;
+        let lease = supervisor.begin_settings("workspace-a").await;
         let cancellation = lease.cancellation();
         let task = tokio::spawn(async move {
             cancellation.cancelled().await;
@@ -343,14 +675,14 @@ mod tests {
     #[tokio::test]
     async fn beginning_replacement_waits_for_previous_refill_to_stop() {
         let supervisor = Arc::new(ThreadEpisodicWorkspaceRefillSupervisor::default());
-        let previous = supervisor.begin("workspace-a").await;
+        let previous = supervisor.begin_settings("workspace-a").await;
         let previous_cancellation = previous.cancellation();
         let previous_task = tokio::spawn(async move {
             previous_cancellation.cancelled().await;
             drop(previous);
         });
 
-        let replacement = supervisor.begin("workspace-a").await;
+        let replacement = supervisor.begin_settings("workspace-a").await;
 
         previous_task.await.expect("previous refill task");
         assert!(!replacement.cancellation().is_cancelled());
@@ -366,5 +698,41 @@ mod tests {
 
         assert!(supervisor.begin_startup("workspace-a").await.is_none());
         assert!(supervisor.begin_startup("workspace-b").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn global_settings_reservation_fences_all_startup_workspaces_at_once() {
+        let supervisor = ThreadEpisodicWorkspaceRefillSupervisor::default();
+        supervisor
+            .reserve_settings_workspaces(&["workspace-a".to_owned(), "workspace-b".to_owned()])
+            .await;
+
+        assert!(supervisor.begin_startup("workspace-a").await.is_none());
+        assert!(supervisor.begin_startup("workspace-b").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn newer_global_settings_refill_cancels_and_joins_older_generation() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::sync::Notify;
+
+        let supervisor = Arc::new(ThreadEpisodicWorkspaceRefillSupervisor::default());
+        let first_started = Arc::new(Notify::new());
+        let first_stopped = Arc::new(AtomicBool::new(false));
+        let started = first_started.clone();
+        let stopped = first_stopped.clone();
+        supervisor
+            .spawn_global_settings_refill(move |cancellation| async move {
+                started.notify_one();
+                cancellation.cancelled().await;
+                stopped.store(true, Ordering::Release);
+            })
+            .await;
+        first_started.notified().await;
+
+        supervisor.spawn_global_settings_refill(|_| async {}).await;
+
+        assert!(first_stopped.load(Ordering::Acquire));
+        supervisor.shutdown().await;
     }
 }

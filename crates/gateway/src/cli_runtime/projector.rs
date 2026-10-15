@@ -159,6 +159,21 @@ fn project_item_started(
         started.metadata.as_ref(),
     );
 
+    if context.recovery.is_none()
+        && matches!(
+            &item,
+            TurnItem::CommandExecution { .. }
+                | TurnItem::FileChange { .. }
+                | TurnItem::DynamicToolCall { .. }
+                | TurnItem::WebSearch { .. }
+        )
+    {
+        pioneer_observability::turn_startup::runtime_output(
+            &context.turn_id,
+            pioneer_observability::turn_startup::Output::ToolCall,
+        );
+    }
+
     CLIRuntimeProjectedEvents::durable(AgentDurableEvent::ItemStarted {
         notification: ItemStartedNotification {
             workspace_id: context.workspace_id.clone(),
@@ -199,17 +214,30 @@ fn project_item_delta(
     context: &CLIRuntimeProjectorContext,
     delta: &RuntimeItemDelta,
 ) -> CLIRuntimeProjectedEvents {
+    if !delta.delta.is_empty() && context.recovery.is_none() {
+        use pioneer_observability::turn_startup::{self, Output};
+        let output = match delta.delta_kind {
+            RuntimeItemDeltaKind::AgentMessage => Some(Output::Text),
+            RuntimeItemDeltaKind::ReasoningText | RuntimeItemDeltaKind::ReasoningSummary => {
+                Some(Output::Reasoning)
+            }
+            _ => None,
+        };
+        if let Some(output) = output {
+            turn_startup::runtime_output(&context.turn_id, output);
+        }
+    }
     let (stream, runtime_delta_kind) = match delta.delta_kind {
         RuntimeItemDeltaKind::AgentMessage => (ItemDeltaStream::AgentMessage, "agent_message"),
         RuntimeItemDeltaKind::ReasoningText => (ItemDeltaStream::Generic, "reasoning_text"),
         RuntimeItemDeltaKind::ReasoningSummary => (ItemDeltaStream::Generic, "reasoning_summary"),
         RuntimeItemDeltaKind::Plan => (ItemDeltaStream::Generic, "plan"),
         RuntimeItemDeltaKind::Generic => (ItemDeltaStream::Generic, "generic"),
-        RuntimeItemDeltaKind::FileChange => (ItemDeltaStream::FileChange, "file_change"),
+        RuntimeItemDeltaKind::FileChange => return project_tool_output_delta(context, delta),
         RuntimeItemDeltaKind::Stdout | RuntimeItemDeltaKind::Stderr => {
             return project_tool_output_delta(context, delta);
         }
-        RuntimeItemDeltaKind::ToolProgress => (ItemDeltaStream::ToolProgress, "tool_progress"),
+        RuntimeItemDeltaKind::ToolProgress => return project_tool_output_delta(context, delta),
     };
 
     CLIRuntimeProjectedEvents::progress(AgentProgressEvent::ItemDelta {
@@ -233,16 +261,36 @@ fn project_tool_output_delta(
 ) -> CLIRuntimeProjectedEvents {
     let stream = match delta.delta_kind {
         RuntimeItemDeltaKind::Stderr => ItemDeltaStream::Stderr,
+        RuntimeItemDeltaKind::FileChange => ItemDeltaStream::FileChange,
+        RuntimeItemDeltaKind::ToolProgress => ItemDeltaStream::ToolProgress,
         _ => ItemDeltaStream::Stdout,
     };
-    CLIRuntimeProjectedEvents::progress(AgentProgressEvent::ToolOutputDelta {
-        workspace_id: context.workspace_id.clone(),
-        thread_id: context.thread_id.clone(),
-        turn_id: context.turn_id.clone(),
-        item_id: delta.native_item_id.clone(),
-        stream,
-        delta: delta.delta.clone(),
-        payload: Some(item_delta_metadata(delta, "command_output")),
+    let runtime_kind = match delta.delta_kind {
+        RuntimeItemDeltaKind::FileChange => "file_change",
+        RuntimeItemDeltaKind::ToolProgress => "tool_progress",
+        _ => "command_output",
+    };
+    let source_id = delta
+        .metadata
+        .as_ref()
+        .and_then(|m| m.get("uuid").or_else(|| m.get("eventId")))
+        .and_then(JsonValue::as_str);
+    let id = source_id
+        .map(|id| format!("{}:{}:{id}", context.turn_id, delta.native_item_id))
+        .unwrap_or_else(|| pioneer_protocol::generate_id(21));
+    CLIRuntimeProjectedEvents::durable(AgentDurableEvent::ToolOutputRecorded {
+        id,
+        notification: ItemDeltaNotification {
+            workspace_id: context.workspace_id.clone(),
+            thread_id: context.thread_id.clone(),
+            turn_id: context.turn_id.clone(),
+            item_id: delta.native_item_id.clone(),
+            stream: Some(stream),
+            delta: delta.delta.clone(),
+            payload: Some(item_delta_metadata(delta, runtime_kind)),
+            markdown: None,
+            markdown_version: None,
+        },
     })
 }
 
@@ -255,6 +303,31 @@ fn project_item_completed(
     }
 
     let item = completed_turn_item(completed);
+
+    if context.recovery.is_none() {
+        if let TurnItem::AgentMessage { text, .. } = &item {
+            if !text.is_empty() {
+                pioneer_observability::turn_startup::runtime_output(
+                    &context.turn_id,
+                    pioneer_observability::turn_startup::Output::BufferedText,
+                );
+            }
+        }
+    }
+
+    if context.recovery.is_none() {
+        if let TurnItem::Reasoning {
+            summary, content, ..
+        } = &item
+        {
+            if summary.iter().chain(content).any(|s| !s.is_empty()) {
+                pioneer_observability::turn_startup::runtime_output(
+                    &context.turn_id,
+                    pioneer_observability::turn_startup::Output::BufferedReasoning,
+                );
+            }
+        }
+    }
 
     CLIRuntimeProjectedEvents::durable(AgentDurableEvent::ItemCompleted {
         notification: ItemCompletedNotification {
@@ -625,7 +698,7 @@ fn completed_turn_item(completed: &RuntimeItemCompleted) -> TurnItem {
     )
 }
 
-fn context_compaction_item(
+pub(crate) fn context_compaction_item(
     item_id: &str,
     level: SystemEventLevel,
     message: &str,
@@ -663,26 +736,37 @@ fn command_execution_item(
     let cwd = metadata_string(metadata, "cwd");
     let stdout = metadata_string(metadata, "stdout");
     let stderr = metadata_string(metadata, "stderr");
-    let aggregated_output = aggregate_shell_output(stdout.as_deref(), stderr.as_deref());
+    let aggregated_output = metadata_string(metadata, "aggregatedOutput")
+        .or_else(|| aggregate_shell_output(stdout.as_deref(), stderr.as_deref()));
     let exit_code = metadata_i32(metadata, "exitCode");
     let success = metadata_success(metadata);
+    let duration_ms = metadata
+        .and_then(|m| m.get("durationMs"))
+        .and_then(JsonValue::as_u64);
+    let timed_out = metadata
+        .and_then(|m| m.get("timedOut"))
+        .and_then(JsonValue::as_bool);
+    let truncated = metadata
+        .and_then(|m| m.get("truncated"))
+        .and_then(JsonValue::as_bool)
+        .unwrap_or(false);
     let display = ToolDisplayPayload::Shell {
         stdout: stdout.clone(),
         stderr: stderr.clone(),
         aggregated_output: aggregated_output.clone(),
         exit_code,
-        duration_ms: None,
-        timed_out: None,
-        truncated: false,
+        duration_ms,
+        timed_out,
+        truncated,
     };
     let storage = ToolStoragePayload::Shell {
         stdout,
         stderr,
         aggregated_output,
         exit_code,
-        duration_ms: None,
-        timed_out: None,
-        truncated: false,
+        duration_ms,
+        timed_out,
+        truncated,
     };
 
     TurnItem::CommandExecution {
@@ -700,11 +784,29 @@ fn command_execution_item(
         output_policy: ToolOutputPolicySnapshot::for_tool_name(tool_name.as_str()),
         display,
         storage,
-        recovery: None,
+        recovery: metadata
+            .and_then(|m| m.get("error"))
+            .filter(|e| !e.is_null())
+            .map(|error| pioneer_protocol::ToolRecoveryView {
+                error_class: Some("execution_failed".into()),
+                retry_hint: None,
+                incomplete_reason: None,
+                diagnostic_summary: Some(
+                    error
+                        .as_str()
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| error.to_string()),
+                ),
+                diagnostic_excerpt: None,
+                output_fingerprint: None,
+                content_fingerprint: None,
+                was_truncated: truncated,
+                continuation: None,
+            }),
         command,
         cwd,
         success,
-        outcome: None,
+        outcome: cli_interrupted_tool_outcome(metadata),
         observation: None,
     }
 }
@@ -724,7 +826,7 @@ fn file_change_item(
         title: file_change_title(changed_files.len()),
         lines: changed_files.clone(),
         metadata: ToolMetadata::from_json(metadata_json.clone()),
-        truncated: false,
+        truncated: metadata_bool(metadata, "truncated").unwrap_or(false),
     };
     let output_policy = ToolOutputPolicySnapshot::for_tool_name(tool_name.as_str());
     let (display, storage) = summary_payloads_for_policy(&output_policy, &summary);
@@ -840,9 +942,12 @@ fn dynamic_tool_item(
 }
 
 fn mcp_tool_item(item_id: &str, metadata: Option<&JsonValue>, status: ToolCallStatus) -> TurnItem {
-    let metadata_json = metadata.cloned().unwrap_or_else(|| json!({}));
+    let mut metadata_json = metadata.cloned().unwrap_or_else(|| json!({}));
     let tool_name = metadata_string(metadata, "canonicalCallableName")
         .unwrap_or_else(|| "mcp_tool_call".to_owned());
+    if matches!(tool_name.as_str(), "html_render" | "html_preview") {
+        pioneer_protocol::compact_html_timeline_value(&mut metadata_json);
+    }
     let server_name = metadata_string(metadata, "serverName").unwrap_or_else(|| "MCP".to_owned());
     let raw_tool_name =
         metadata_string(metadata, "rawToolName").unwrap_or_else(|| tool_name.clone());
@@ -1055,6 +1160,29 @@ fn aggregate_shell_output(stdout: Option<&str>, stderr: Option<&str>) -> Option<
         output.push_str(stderr);
     }
     (!output.is_empty()).then_some(output)
+}
+
+fn cli_interrupted_tool_outcome(
+    metadata: Option<&JsonValue>,
+) -> Option<pioneer_protocol::ToolOutcome> {
+    let status = metadata_string(metadata, "status")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let error_class = if matches!(status.as_str(), "cancelled" | "canceled" | "interrupted") {
+        pioneer_protocol::ToolErrorClass::Cancelled
+    } else if metadata_bool(metadata, "timedOut") == Some(true) {
+        pioneer_protocol::ToolErrorClass::Timeout
+    } else {
+        return None;
+    };
+    Some(pioneer_protocol::ToolOutcome {
+        status: pioneer_protocol::ToolOutcomeStatus::FatalError,
+        error_class: Some(error_class),
+        should_retry: false,
+        retry_hint: None,
+        incomplete: true,
+        incomplete_reason: Some("CLI command did not finish normally".into()),
+    })
 }
 
 fn terminal_tool_status(metadata: Option<&JsonValue>) -> ToolCallStatus {
@@ -1938,6 +2066,81 @@ mod tests {
     }
 
     #[test]
+    fn codex_actual_aggregated_output_survives_projection() {
+        let projected = project_codex_notification(
+            "item/completed",
+            json!({
+                "threadId":"native_thread_1","turnId":"native_turn_1",
+                "item":{"id":"cmd","type":"commandExecution","command":"cargo test --workspace",
+                "status":"failed","exitCode":101,"aggregatedOutput":"compiler error\n","durationMs":123,"truncated":true}
+            }),
+        );
+        let AgentDurableEvent::ItemCompleted { notification } = &projected.durable[0] else {
+            panic!("missing completion")
+        };
+        let TurnItem::CommandExecution {
+            command,
+            status,
+            storage,
+            ..
+        } = &notification.item
+        else {
+            panic!("not shell")
+        };
+        assert_eq!(command, &["cargo test --workspace"]);
+        assert_eq!(*status, pioneer_protocol::ToolCallStatus::Failed);
+        let ToolStoragePayload::Shell {
+            aggregated_output,
+            exit_code,
+            duration_ms,
+            truncated,
+            ..
+        } = storage
+        else {
+            panic!("not shell storage")
+        };
+        assert_eq!(aggregated_output.as_deref(), Some("compiler error\n"));
+        assert_eq!(*exit_code, Some(101));
+        assert_eq!(*duration_ms, Some(123));
+        assert!(*truncated);
+    }
+
+    #[test]
+    fn codex_command_transport_error_is_saved_without_inventing_stderr() {
+        let projected = project_codex_notification(
+            "item/completed",
+            json!({
+                "threadId":"native_thread_1","turnId":"native_turn_1",
+                "item":{"id":"failed-command","type":"commandExecution","command":"missing-command", "status":"failed", "error":{"code":"spawn_failed","message":"executable not found"}}
+            }),
+        );
+        let AgentDurableEvent::ItemCompleted { notification } = &projected.durable[0] else {
+            panic!("missing completion")
+        };
+        let TurnItem::CommandExecution {
+            status,
+            recovery: Some(recovery),
+            storage: ToolStoragePayload::Shell {
+                stderr, exit_code, ..
+            },
+            ..
+        } = &notification.item
+        else {
+            panic!("missing error")
+        };
+        assert_eq!(*status, pioneer_protocol::ToolCallStatus::Failed);
+        assert!(
+            recovery
+                .diagnostic_summary
+                .as_ref()
+                .unwrap()
+                .contains("executable not found")
+        );
+        assert!(stderr.is_none());
+        assert!(exit_code.is_none());
+    }
+
+    #[test]
     fn codex_tool_projection_command_output_projects_tool_item_and_stdout_stderr() {
         let started = project_codex_notification(
             "item/started",
@@ -2009,32 +2212,23 @@ mod tests {
         assert_eq!(command, &vec!["cargo".to_owned(), "test".to_owned()]);
         assert_eq!(cwd.as_deref(), Some("/repo"));
 
-        let AgentProgressEvent::ToolOutputDelta {
-            item_id,
-            stream,
-            delta,
-            payload,
-            ..
-        } = &stdout.progress[0]
+        let AgentDurableEvent::ToolOutputRecorded {
+            notification: out, ..
+        } = &stdout.durable[0]
         else {
-            panic!("expected stdout tool output delta");
+            panic!("expected persisted stdout")
         };
-        assert_eq!(item_id, "native_cmd_1");
-        assert_eq!(*stream, ItemDeltaStream::Stdout);
-        assert_eq!(delta, "ok\n");
-        assert_eq!(
-            payload
-                .as_ref()
-                .and_then(|payload| payload.get("nativeItemId")),
-            Some(&json!("native_cmd_1"))
-        );
-
-        let AgentProgressEvent::ToolOutputDelta { stream, delta, .. } = &stderr.progress[0] else {
-            panic!("expected stderr tool output delta");
+        assert_eq!(out.item_id, "native_cmd_1");
+        assert_eq!(out.stream, Some(ItemDeltaStream::Stdout));
+        assert_eq!(out.delta, "ok\n");
+        let AgentDurableEvent::ToolOutputRecorded {
+            notification: err, ..
+        } = &stderr.durable[0]
+        else {
+            panic!("expected persisted stderr")
         };
-        assert_eq!(*stream, ItemDeltaStream::Stderr);
-        assert_eq!(delta, "warn\n");
-
+        assert_eq!(err.stream, Some(ItemDeltaStream::Stderr));
+        assert_eq!(err.delta, "warn\n");
         let AgentDurableEvent::ItemCompleted { notification } = &completed.durable[0] else {
             panic!("expected command item completed");
         };
@@ -2108,7 +2302,7 @@ mod tests {
         assert_eq!(*status, pioneer_protocol::ToolCallStatus::InProgress);
         assert_eq!(changed_files, &vec!["src/lib.rs".to_owned()]);
 
-        let AgentProgressEvent::ItemDelta { notification } = &patch.progress[0] else {
+        let AgentDurableEvent::ToolOutputRecorded { notification, .. } = &patch.durable[0] else {
             panic!("expected file change item delta");
         };
         assert_eq!(notification.item_id, "native_file_1");

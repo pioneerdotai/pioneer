@@ -6,6 +6,19 @@
     "api_key_configured": {
       "type": "boolean"
     },
+    "available": {
+      "description": "The gateway can construct this provider in the selected workspace.",
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "base_url": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "capabilities": {
       "$ref": "#/$defs/ProviderSummaryCapabilities",
       "default": {

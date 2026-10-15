@@ -3,7 +3,8 @@ use pioneer_entity::turn_finalization;
 use pioneer_protocol::{ItemCompletedNotification, TurnItem};
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QuerySelect, Set,
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder,
+    QuerySelect, Set,
 };
 use sha2::{Digest, Sha256};
 
@@ -115,10 +116,23 @@ pub async fn list_prepared<C: ConnectionTrait>(
 ) -> Result<Vec<turn_finalization::Model>> {
     turn_finalization::Entity::find()
         .filter(turn_finalization::Column::Status.eq(STATUS_PREPARED))
+        .order_by_asc(turn_finalization::Column::PreparedAt)
+        .order_by_asc(turn_finalization::Column::TurnId)
         .limit(limit)
         .all(db)
         .await
         .context("failed to list prepared turn finalizations")
+}
+
+pub async fn delete_prepared_by_turn_id<C: ConnectionTrait>(db: &C, turn_id: &str) -> Result<bool> {
+    let affected = turn_finalization::Entity::delete_many()
+        .filter(turn_finalization::Column::TurnId.eq(turn_id.to_owned()))
+        .filter(turn_finalization::Column::Status.eq(STATUS_PREPARED))
+        .exec(db)
+        .await
+        .context("failed to delete superseded prepared turn finalization")?
+        .rows_affected;
+    Ok(affected == 1)
 }
 
 pub async fn mark_committed<C: ConnectionTrait>(

@@ -1,5 +1,5 @@
 use super::agent_runtime::TurnFailureRecoveryKind;
-use super::turn_handlers::CliRuntimeLaunchSpecRestore;
+use super::turn_handlers::{CliRuntimeLaunchSpecRestore, CliRuntimeRecoveryStartFailure};
 use super::*;
 use crate::authorization::{
     AuthorizationExternalError, AuthorizationResolver, AuthorizationService, ProofResolution,
@@ -36,11 +36,12 @@ use pioneer_cli_agent_runtime::codex::{
     CodexCommandApprovalDecision, CodexCommandApprovalRequest, CodexFileChangeApprovalDecision,
     CodexFileChangeApprovalRequest, CodexJsonlRpcServerRequest, CodexLoginStartResponse,
     CodexLoginStartSnapshot, CodexLoginStartStatus, CodexModelListProbeSnapshot,
-    CodexModelListProbeStatus, CodexModelSnapshot, CodexProbe, CodexProbeDiagnostic,
-    CodexProbeDiagnosticLevel, CodexUserInputRequest, codex_command_approval_response,
-    codex_file_change_approval_response, codex_user_input_response,
+    CodexModelListProbeStatus, CodexModelSnapshot, CodexPermissionApprovalRequest, CodexProbe,
+    CodexProbeDiagnostic, CodexProbeDiagnosticLevel, CodexUserInputRequest,
+    codex_command_approval_response, codex_file_change_approval_response,
+    codex_permission_approval_response, codex_user_input_response,
     decode_codex_command_approval_request, decode_codex_file_change_approval_request,
-    decode_codex_user_input_request,
+    decode_codex_permission_approval_request, decode_codex_user_input_request,
 };
 use pioneer_cli_agent_runtime::event::{
     RuntimeEvent, RuntimeEventMappingOptions, RuntimeRequestResolved, RuntimeTurnCompleted,
@@ -53,23 +54,39 @@ use pioneer_config::{
 };
 use pioneer_crud::NewCliRuntimeNativeEvent;
 use pioneer_observability::{
-    GatewayCliRuntimeKind, GatewayCliRuntimeRefreshStage, GatewayCliRuntimeRefreshTrace,
+    GatewayCliRuntimeKind, GatewayProviderWarmupStage, GatewayProviderWarmupTrace,
+};
+use pioneer_tools::apply_patch::history::{
+    CODEX_TURN_DIFF_PROTOCOL_REVISION, CodexAggregateEventContext, SqliteCodexAggregateStore,
+    normalize_codex_diff_updated,
 };
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::panic::AssertUnwindSafe;
+use std::path::Path;
 use std::sync::Arc;
 
 const CLI_RUNTIME_FILE_CHANGE_DIFF_PREVIEW_MAX_BYTES: usize = 4 * 1024;
 const CLI_RUNTIME_PENDING_TURN_EVENT_MAX_KEYS: usize = 128;
 const CLI_RUNTIME_PENDING_TURN_EVENT_MAX_PER_TURN: usize = 512;
-const CLI_RUNTIME_STALE_TURN_SCAN_LIMIT: u64 = 128;
+/// Fairness for the current persistent active set only. Restart begins a new
+/// round; this is not a durable checkpoint for auditing terminal history.
+#[derive(Default)]
+pub(super) struct CliRuntimeStaleTurnScan {
+    after: [Option<(chrono::DateTime<chrono::FixedOffset>, String)>; 2],
+}
+
+#[derive(Debug, Default)]
+pub(super) struct CliRuntimeStaleTurnScanSummary {
+    pub selected: usize,
+    /// Successful validator returns, including healthy/no-op results.
+    pub processed: usize,
+}
 const CLI_RUNTIME_SILENT_TURN_STALE_AFTER_MS: i64 = 150_000;
 const CLI_RUNTIME_EVENTED_TURN_STALE_AFTER_MS: i64 = 15 * 60 * 1_000;
 const CLI_RUNTIME_PENDING_UNBOUND_EVENT_TTL_MS: i64 = 30_000;
 const CLI_RUNTIME_HUMAN_RESPONSE_TIMEOUT_MS: i64 =
     crate::human_interaction::HUMAN_INTERACTION_RESPONSE_TIMEOUT_MS;
-const CLI_RUNTIME_TERMINAL_NATIVE_EVENT_CLEANUP_BATCH_SIZE: u64 = 16_384;
 const CLI_RUNTIME_MAX_PENDING_MACHINE_REQUESTS: usize = 4096;
 const CLI_RUNTIME_MACHINE_REQUEST_UNAVAILABLE_CODE: i64 = -32000;
 const CLI_RUNTIME_MACHINE_REQUEST_TIMEOUT_CODE: i64 = -32001;
@@ -131,14 +148,16 @@ enum CLIRuntimeSuccessFinalizationPreparation {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum CLIRuntimeAuthoritativeTurnState {
+pub(crate) enum CLIRuntimeAuthoritativeTurnState {
     Active(CLIRuntimeActivityEvidence),
     Terminal,
+    Superseded,
+    Deferred,
     Unavailable,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum CLIRuntimeActivityEvidence {
+pub(crate) enum CLIRuntimeActivityEvidence {
     LivenessProbe,
     ObservedInProgress,
 }
@@ -171,7 +190,7 @@ impl CLIRuntimeActivityEvidence {
 /// account identity and raw process output belong to Gateway management.
 /// Keep the capability/model metadata used by composers while returning a
 /// deliberately non-secret presentation of failures.
-fn collaborator_safe_runtime_summary(mut runtime: RuntimeSummary) -> RuntimeSummary {
+pub(super) fn collaborator_safe_runtime_summary(mut runtime: RuntimeSummary) -> RuntimeSummary {
     runtime.account = None;
     runtime.binary_path = None;
     runtime.home_path = None;
@@ -209,12 +228,41 @@ fn collaborator_safe_runtime_diagnostics(
         .collect()
 }
 
+fn cli_runtime_ready_for_model_discovery(runtime: &RuntimeSummary) -> bool {
+    runtime.enabled && matches!(runtime.status, RuntimeStatus::Ready)
+}
+
 impl MessageProcessor {
     fn uses_collaborator_cli_disclosure(request_context: &RequestContext) -> bool {
         crate::authorization::AuthorizationService::new().role_disclosure_policy(
             request_context.principal().kind,
             request_context.principal().role_key.as_ref(),
         ) == Some(crate::authorization::RoleDisclosurePolicy::Collaborator)
+    }
+
+    async fn ensure_cli_runtime_discovery_target_allowed(
+        &self,
+        request_context: &RequestContext,
+        request_id: &RequestId,
+        runtime_id: &str,
+    ) -> bool {
+        if AuthorizationService::new().cli_runtime_allowed(
+            request_context.principal().kind,
+            request_context.principal().role_key.as_ref(),
+            runtime_id,
+        ) {
+            return true;
+        }
+
+        // Use the same response as an unknown runtime so discovery endpoints
+        // cannot be used as an identifier oracle across role boundaries.
+        self.send_unknown_cli_runtime_error(
+            request_context.connection_id(),
+            request_id.clone(),
+            runtime_id,
+        )
+        .await;
+        false
     }
 
     async fn cli_binding_operator_details_allowed(
@@ -293,8 +341,11 @@ impl MessageProcessor {
             return;
         };
 
-        let mut runtimes = match self.load_cli_runtime_summaries(workspace_id.as_str()).await {
-            Ok(runtimes) => runtimes,
+        let snapshot = match self
+            .cli_runtime_readiness_snapshot_or_seed(workspace_id.as_str())
+            .await
+        {
+            Ok(snapshot) => snapshot,
             Err(error) => {
                 self.send_error(
                     connection_id,
@@ -308,6 +359,8 @@ impl MessageProcessor {
                 return;
             }
         };
+        let revision = snapshot.revision;
+        let mut runtimes = snapshot.runtimes;
         runtimes.retain(|runtime| {
             crate::authorization::AuthorizationService::new().cli_runtime_allowed(
                 request_context.principal().kind,
@@ -326,7 +379,7 @@ impl MessageProcessor {
             connection_id,
             request_id,
             methods::CLI_RUNTIME_LIST,
-            &CLIRuntimeListResponse { runtimes },
+            &CLIRuntimeListResponse { revision, runtimes },
         )
         .await;
     }
@@ -349,9 +402,19 @@ impl MessageProcessor {
         else {
             return;
         };
+        if !self
+            .ensure_cli_runtime_discovery_target_allowed(
+                request_context,
+                &request_id,
+                params.runtime_id.as_str(),
+            )
+            .await
+        {
+            return;
+        }
 
         let Some(mut runtime) = self
-            .load_cli_runtime_live_summary_by_id(
+            .load_cli_runtime_summary_by_id(
                 connection_id,
                 request_id.clone(),
                 workspace_id.as_str(),
@@ -392,6 +455,16 @@ impl MessageProcessor {
         else {
             return;
         };
+        if !self
+            .ensure_cli_runtime_discovery_target_allowed(
+                request_context,
+                &request_id,
+                params.runtime_id.as_str(),
+            )
+            .await
+        {
+            return;
+        }
 
         let Some(mut runtime) = self
             .load_cli_runtime_summary_by_id(
@@ -423,9 +496,10 @@ impl MessageProcessor {
         request_id: RequestId,
         params: CLIRuntimeRefreshParams,
     ) {
-        let refresh_trace = GatewayCliRuntimeRefreshTrace::start();
+        // Protocol-v1 compatibility alias. Readiness is owned exclusively by
+        // the Gateway supervisor; this request only returns its current
+        // authoritative snapshot and must never schedule a provider probe.
         let connection_id = request_context.connection_id();
-        let workspace_stage = refresh_trace.stage(GatewayCliRuntimeRefreshStage::WorkspaceValidate);
         let Some(workspace_id) = self
             .validate_cli_runtime_workspace(
                 connection_id,
@@ -437,83 +511,63 @@ impl MessageProcessor {
         else {
             return;
         };
-        workspace_stage.succeed();
-
-        let catalog_stage = refresh_trace.stage(GatewayCliRuntimeRefreshStage::CatalogLoad);
-        let instances = match self.load_cli_runtime_instances() {
-            Ok(instances) => {
-                catalog_stage.succeed();
-                instances
-            }
+        let snapshot = match self
+            .cli_runtime_readiness_snapshot_or_seed(workspace_id.as_str())
+            .await
+        {
+            Ok(snapshot) => snapshot,
             Err(error) => {
                 self.send_error(
                     connection_id,
                     cli_runtime_discovery_error(
                         Some(request_id),
                         INVALID_REQUEST_CODE,
-                        format!("failed to load CLI runtime catalog: {error:#}"),
+                        format!("failed to load CLI runtime snapshot: {error:#}"),
                     ),
                 )
                 .await;
                 return;
             }
         };
+        let revision = snapshot.revision;
+        let mut runtimes = snapshot.runtimes;
 
-        let instances_stage = refresh_trace.stage(GatewayCliRuntimeRefreshStage::InstancesSelect);
-        let instances = if let Some(runtime_id) = params.runtime_id {
-            match find_cli_runtime_instance(instances, runtime_id.as_str()) {
-                Some(instance) => vec![instance],
-                None => {
-                    self.send_unknown_cli_runtime_error(connection_id, request_id, &runtime_id)
-                        .await;
-                    return;
-                }
-            }
-        } else {
-            instances
-        }
-        .into_iter()
-        .filter(|instance| {
+        // `revision` describes the complete workspace snapshot. Always return
+        // that complete snapshot even when a legacy caller supplies
+        // `runtime_id`; otherwise a partial payload could incorrectly advance
+        // a client's global revision and leave sibling runtimes stale.
+        runtimes.retain(|runtime| {
             crate::authorization::AuthorizationService::new().cli_runtime_allowed(
                 request_context.principal().kind,
                 request_context.principal().role_key.as_ref(),
-                instance.id.as_str(),
+                runtime.runtime_id.as_str(),
             )
-        })
-        .collect::<Vec<_>>();
-        instances_stage.succeed();
-        let mut runtimes = Vec::with_capacity(instances.len());
-        for instance in instances {
-            runtimes.push(
-                self.cli_runtime_live_summary_from_instance_with_trace(
-                    workspace_id.as_str(),
-                    instance,
-                    Some(&refresh_trace),
-                )
-                .await,
-            );
+        });
+        // Validate the legacy target only against the caller-visible catalog.
+        // Checking the unfiltered cache would turn this endpoint into an ACL
+        // oracle for runtime identifiers the principal is not allowed to see.
+        if let Some(runtime_id) = params.runtime_id.as_deref()
+            && !runtimes
+                .iter()
+                .any(|runtime| runtime.runtime_id == runtime_id)
+        {
+            self.send_unknown_cli_runtime_error(connection_id, request_id, runtime_id)
+                .await;
+            return;
         }
-        let disclosure_stage = refresh_trace.stage(GatewayCliRuntimeRefreshStage::DisclosureApply);
         if Self::uses_collaborator_cli_disclosure(request_context) {
             runtimes = runtimes
                 .into_iter()
                 .map(collaborator_safe_runtime_summary)
                 .collect();
         }
-        disclosure_stage.succeed();
-        let response_stage = refresh_trace.stage(GatewayCliRuntimeRefreshStage::ResponseSend);
-        let response_sent = self
-            .send_cli_runtime_response(
-                connection_id,
-                request_id,
-                methods::CLI_RUNTIME_REFRESH,
-                &CLIRuntimeRefreshResponse { runtimes },
-            )
-            .await;
-        if response_sent {
-            response_stage.succeed();
-            refresh_trace.finish_success();
-        }
+        self.send_cli_runtime_response(
+            connection_id,
+            request_id,
+            methods::CLI_RUNTIME_REFRESH,
+            &CLIRuntimeRefreshResponse { revision, runtimes },
+        )
+        .await;
     }
 
     pub(super) async fn cli_runtime_list_models(
@@ -534,63 +588,79 @@ impl MessageProcessor {
         else {
             return;
         };
-
-        let Some(instance) = self
-            .load_cli_runtime_instance_by_id(connection_id, request_id.clone(), &params.runtime_id)
+        if !self
+            .ensure_cli_runtime_discovery_target_allowed(
+                request_context,
+                &request_id,
+                params.runtime_id.as_str(),
+            )
             .await
-        else {
+        {
+            return;
+        }
+
+        let runtime_snapshot = match self
+            .cli_runtime_probe_snapshot(workspace_id.as_str(), params.runtime_id.as_str())
+            .await
+        {
+            Ok(Some(snapshot)) => snapshot,
+            Ok(None) => {
+                self.send_unknown_cli_runtime_error(
+                    connection_id,
+                    request_id,
+                    params.runtime_id.as_str(),
+                )
+                .await;
+                return;
+            }
+            Err(error) => {
+                self.send_error(
+                    connection_id,
+                    cli_runtime_discovery_error(
+                        Some(request_id),
+                        INVALID_REQUEST_CODE,
+                        format!("failed to load CLI runtime readiness: {error:#}"),
+                    ),
+                )
+                .await;
+                return;
+            }
+        };
+        if !cli_runtime_ready_for_model_discovery(&runtime_snapshot.summary) {
+            self.send_error(
+                connection_id,
+                cli_runtime_discovery_error(
+                    Some(request_id),
+                    INVALID_REQUEST_CODE,
+                    format!(
+                        "CLI runtime `{}` is not ready to list models",
+                        params.runtime_id
+                    ),
+                ),
+            )
+            .await;
+            return;
+        }
+
+        // Model discovery is part of the Gateway-owned readiness probe. This
+        // endpoint must remain a cache read so any number of clients share the
+        // same bounded process/network work.
+        let Some(model_snapshot) = runtime_snapshot.models else {
+            self.send_error(
+                connection_id,
+                cli_runtime_discovery_error(
+                    Some(request_id),
+                    INVALID_REQUEST_CODE,
+                    format!(
+                        "CLI runtime `{}` model catalog is not ready",
+                        params.runtime_id
+                    ),
+                ),
+            )
+            .await;
             return;
         };
-
-        let mut model_list = if instance.enabled {
-            match instance.kind {
-                GatewayCliAgentRuntimeKindConfig::Codex => {
-                    let proxy_url = self
-                        .cli_runtime_proxy_url(workspace_id.as_str(), instance.id.as_str())
-                        .await;
-                    let probe = CodexProbe::model_list(
-                        codex_account_probe_config_from_instance_with_proxy(
-                            &instance,
-                            proxy_url.as_deref(),
-                        ),
-                    )
-                    .await;
-                    runtime_model_list_from_codex_probe(probe, &instance.custom_models)
-                }
-                GatewayCliAgentRuntimeKindConfig::Claude => runtime_model_list_from_claude_probe(
-                    ClaudeProbe::model_list(
-                        claude_account_probe_config_from_instance_with_proxy(
-                            &instance,
-                            self.cli_runtime_proxy_url(workspace_id.as_str(), instance.id.as_str())
-                                .await
-                                .as_deref(),
-                        ),
-                        &instance.custom_models,
-                    )
-                    .await,
-                ),
-                GatewayCliAgentRuntimeKindConfig::OpenCode => {
-                    let proxy_url = self
-                        .cli_runtime_proxy_url(workspace_id.as_str(), instance.id.as_str())
-                        .await;
-                    runtime_model_list_from_opencode_probe(
-                        probe_opencode_instance(
-                            &instance,
-                            self.artifact_runtime_home.as_path(),
-                            &crate::cli_runtime::config::proxy_env(proxy_url.as_deref()),
-                        )
-                        .await,
-                        &instance.custom_models,
-                    )
-                }
-            }
-        } else {
-            RuntimeModelListResult {
-                models: runtime_models_with_custom_models(Vec::new(), &instance.custom_models),
-                diagnostics: Vec::new(),
-                error_message: Some(format!("CLI runtime `{}` is disabled", instance.id)),
-            }
-        };
+        let mut model_list = model_snapshot.result;
         if Self::uses_collaborator_cli_disclosure(request_context) {
             model_list.diagnostics = collaborator_safe_runtime_diagnostics(model_list.diagnostics);
             if model_list.error_message.is_some() {
@@ -632,7 +702,7 @@ impl MessageProcessor {
                 runtime_id: params.runtime_id,
                 models: model_list.models,
                 diagnostics: model_list.diagnostics,
-                refreshed_at_unix_ms: Some(current_unix_ms()),
+                refreshed_at_unix_ms: Some(model_snapshot.refreshed_at_unix_ms),
             },
         )
         .await;
@@ -1175,6 +1245,7 @@ impl MessageProcessor {
                 .existing_or_start_management(
                     key,
                     crate::cli_runtime::manager::CLIAgentRuntimeSessionStartOptions {
+                        cwd: binding.native_cwd.as_ref().map(std::path::PathBuf::from),
                         env: crate::cli_runtime::config::proxy_env(proxy_url.as_deref()),
                         ..Default::default()
                     },
@@ -1198,7 +1269,10 @@ impl MessageProcessor {
             let fork = match handle
                 .session()
                 .fork_thread(CLIAgentRuntimeThreadForkRequest {
+                    source_logical_thread_id: params.source_thread_id.clone(),
                     native_thread_id: binding.native_thread_id.clone(),
+                    last_turn_id: None,
+                    thread_source: None,
                 })
                 .await
             {
@@ -1821,6 +1895,8 @@ impl MessageProcessor {
             }
         };
 
+        self.invalidate_and_request_cli_runtime_warmup(workspace_id)
+            .await;
         self.send_cli_runtime_response(
             connection_id,
             request_id,
@@ -1894,6 +1970,8 @@ impl MessageProcessor {
             false
         };
 
+        self.invalidate_and_request_cli_runtime_warmup(workspace_id)
+            .await;
         self.send_cli_runtime_response(
             connection_id,
             request_id,
@@ -1978,6 +2056,8 @@ impl MessageProcessor {
             Some(proxy_url.clone()),
         )
         .await;
+        self.invalidate_and_request_cli_runtime_warmup(workspace_id.clone())
+            .await;
 
         self.send_cli_runtime_response(
             connection_id,
@@ -2037,6 +2117,8 @@ impl MessageProcessor {
             }
         };
         self.cache_cli_runtime_proxy_url(workspace_id.as_str(), runtime_id.as_str(), None)
+            .await;
+        self.invalidate_and_request_cli_runtime_warmup(workspace_id.clone())
             .await;
 
         self.send_cli_runtime_response(
@@ -2104,6 +2186,29 @@ impl MessageProcessor {
                 return;
             }
         };
+
+        // Native tool permissions share the durable pending-request table, but
+        // they have their own response protocol and in-process delivery lane.
+        // Treating one as a CLI runtime request can expire the durable row
+        // without waking the native tool call.
+        if pending.runtime_id == NATIVE_HUMAN_INTERACTION_RUNTIME_ID
+            && pending.request_kind == NATIVE_HUMAN_INTERACTION_REQUEST_KIND
+        {
+            self.send_error(
+                connection_id,
+                cli_runtime_public_error(
+                    Some(request_id),
+                    INVALID_PARAMS_CODE,
+                    format!(
+                        "native permission request `{}` must be answered with `{}`",
+                        pending.request_id,
+                        methods::TURN_PERMISSION_REQUEST_RESPOND
+                    ),
+                ),
+            )
+            .await;
+            return;
+        }
 
         if pending.workspace_id != workspace_id {
             self.send_error(
@@ -2394,9 +2499,27 @@ impl MessageProcessor {
             .await;
             return;
         }
+        if let Err(error) = self
+            .revalidate_codex_session_approval_authority(&pending, &resolution)
+            .await
+        {
+            self.send_error(
+                connection_id,
+                cli_runtime_public_error(
+                    Some(request_id),
+                    INVALID_PARAMS_CODE,
+                    format!(
+                        "CLI runtime request `{}` cannot install a provider session approval: {error:#}",
+                        pending.request_id
+                    ),
+                ),
+            )
+            .await;
+            return;
+        }
         if let Some(permission_profile) = current_permission_profile.as_ref()
-            && let Err(error) = validate_cli_runtime_resolution_against_permission_profile(
-                cli_runtime_request_kind_from_stored(pending.request_kind.as_str()),
+            && let Err(error) = validate_cli_runtime_pending_resolution_against_permission_profile(
+                &pending,
                 &resolution,
                 permission_profile,
             )
@@ -2880,7 +3003,11 @@ impl MessageProcessor {
         turn_id: Option<String>,
         request: CodexCommandApprovalRequest,
     ) -> anyhow::Result<CliRuntimePendingRequestRecord> {
-        let payload = cli_runtime_command_approval_pending_request(&request);
+        let supports_session_approval = self
+            .codex_session_approval_supported_for_turn(turn_id.as_deref())
+            .await?;
+        let payload =
+            cli_runtime_command_approval_pending_request(&request, supports_session_approval);
         let payload_json = pioneer_crud::serialize_cli_runtime_json(&payload)
             .context("failed to serialize Codex command approval pending request")?;
         let now = cli_runtime_request_timestamp();
@@ -2901,6 +3028,105 @@ impl MessageProcessor {
             updated_at: now,
         })
         .await
+    }
+
+    async fn open_codex_permission_approval_request_for_turn(
+        &self,
+        workspace_id: &str,
+        runtime_id: &str,
+        runtime_kind: &str,
+        thread_id: &str,
+        turn_id: String,
+        request: CodexPermissionApprovalRequest,
+    ) -> anyhow::Result<CliRuntimePendingRequestRecord> {
+        let payload = cli_runtime_permission_approval_pending_request(&request);
+        let payload_json = pioneer_crud::serialize_cli_runtime_json(&payload)
+            .context("failed to serialize Codex permission approval pending request")?;
+        let now = cli_runtime_request_timestamp();
+        self.open_cli_runtime_pending_request(NewCliRuntimePendingRequest {
+            request_id: format!("cli_req_{}", generate_id(21)),
+            runtime_id: runtime_id.to_owned(),
+            runtime_kind: runtime_kind.to_owned(),
+            workspace_id: workspace_id.to_owned(),
+            thread_id: thread_id.to_owned(),
+            turn_id: Some(turn_id),
+            native_thread_id: request.native_thread_id.clone(),
+            native_turn_id: request.native_turn_id.clone(),
+            native_item_id: request.native_item_id.clone(),
+            request_kind: cli_runtime_request_kind_as_str(
+                CLIRuntimeRequestKind::PermissionApproval,
+            )
+            .to_owned(),
+            payload_json,
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+    }
+
+    fn validate_codex_permission_request(
+        request: &CodexPermissionApprovalRequest,
+    ) -> anyhow::Result<()> {
+        let cwd = request
+            .cwd
+            .as_deref()
+            .context("Codex permission request has no cwd")?;
+        if !Path::new(cwd).is_absolute() {
+            anyhow::bail!("Codex permission request cwd is not absolute");
+        }
+        validate_codex_permission_profile_shape(&request.requested_permissions)
+    }
+
+    async fn codex_session_approval_supported_for_turn(
+        &self,
+        turn_id: Option<&str>,
+    ) -> anyhow::Result<bool> {
+        let Some(turn_id) = turn_id else {
+            return Ok(false);
+        };
+        let security = self
+            .crud_store
+            .get_turn_execution_security_snapshot(turn_id)
+            .await?
+            .context("Codex approval turn has no execution security snapshot")?
+            .snapshot;
+        Ok(security.backend.execution_backend
+            == pioneer_protocol::TurnSecurityExecutionBackendKind::CodexCli
+            && security
+                .backend
+                .capabilities
+                .supports_session_scope_approval
+            && security.approval.allow_for_session
+            && security.authority_cap.approval.allow_for_session)
+    }
+
+    async fn revalidate_codex_session_approval_authority(
+        &self,
+        request: &CliRuntimePendingRequestRecord,
+        resolution: &CLIRuntimeRequestResolution,
+    ) -> anyhow::Result<()> {
+        if request.runtime_kind != "codex"
+            || !matches!(resolution, CLIRuntimeRequestResolution::ApprovedForSession)
+        {
+            return Ok(());
+        }
+        if !matches!(
+            cli_runtime_request_kind_from_stored(request.request_kind.as_str()),
+            CLIRuntimeRequestKind::CommandApproval | CLIRuntimeRequestKind::FileChangeApproval
+        ) {
+            anyhow::bail!("session approval is not supported for this Codex request kind");
+        }
+        let turn_id = request
+            .turn_id
+            .as_deref()
+            .context("Codex session approval request has no Pioneer turn binding")?;
+        if !self
+            .codex_session_approval_supported_for_turn(Some(turn_id))
+            .await?
+        {
+            anyhow::bail!("current Codex turn authority does not allow session approval");
+        }
+        Ok(())
     }
 
     #[allow(dead_code)]
@@ -2944,7 +3170,11 @@ impl MessageProcessor {
         turn_id: Option<String>,
         request: CodexFileChangeApprovalRequest,
     ) -> anyhow::Result<CliRuntimePendingRequestRecord> {
-        let payload = cli_runtime_file_change_approval_pending_request(&request);
+        let supports_session_approval = self
+            .codex_session_approval_supported_for_turn(turn_id.as_deref())
+            .await?;
+        let payload =
+            cli_runtime_file_change_approval_pending_request(&request, supports_session_approval);
         let payload_json = pioneer_crud::serialize_cli_runtime_json(&payload)
             .context("failed to serialize Codex file change approval pending request")?;
         let now = cli_runtime_request_timestamp();
@@ -3272,17 +3502,24 @@ impl MessageProcessor {
                         durable = durable_receiver.recv(), if durable_open => {
                             match durable {
                                 Some(event) => {
-                                    let committed = if listener_processor
+                                    // Retained CLI ownership scopes the narrow correctness
+                                    // commit independently of how this hub was opened.
+                                    let commit_processor = if durable_receiver.owns_turn_transition() {
+                                        listener_processor.scoped_for_background_reconciliation()
+                                    } else {
+                                        listener_processor.clone()
+                                    };
+                                    let commit_result = if listener_processor
                                         .cli_runtime_instance_is_current(&listener_instance)
                                         .await
                                     {
                                         match AssertUnwindSafe(
-                                            listener_processor.handle_durable_agent_event(event),
+                                            commit_processor.commit_durable_agent_event_with_cli_blocked_guard(event, durable_receiver.cli_blocked_guard().cloned(), durable_receiver.turn_transition().cloned()),
                                         )
                                         .catch_unwind()
                                         .await
                                         {
-                                            Ok(committed) => committed,
+                                            Ok(commit_result) => commit_result,
                                             Err(_) => {
                                                 warn!(
                                                     workspace_id = key.workspace_id.as_str(),
@@ -3290,7 +3527,10 @@ impl MessageProcessor {
                                                     thread_id = key.thread_id.as_str(),
                                                     "contained panic while projecting CLI runtime durable event"
                                                 );
-                                                false
+                                                Err(pioneer_runtime_events::DurableCommitRejection::retryable(
+                                                    "listener_panicked",
+                                                    "gateway CLI durable event listener panicked",
+                                                ))
                                             }
                                         }
                                     } else {
@@ -3298,13 +3538,9 @@ impl MessageProcessor {
                                             &listener_instance,
                                             "durable_projection",
                                         );
-                                        true
-                                    };
-                                    durable_receiver.acknowledge_last(if committed {
                                         Ok(())
-                                    } else {
-                                        Err("gateway failed to commit durable CLI runtime event".to_owned())
-                                    });
+                                    };
+                                    durable_receiver.acknowledge_last(commit_result);
                                 }
                                 None => durable_open = false,
                             }
@@ -3358,9 +3594,30 @@ impl MessageProcessor {
         instance: &CliSessionInstanceId,
         event: AgentDurableEvent,
     ) -> Result<(), pioneer_runtime_events::ExecutionEventHubError> {
+        self.publish_cli_runtime_durable_and_wait_inner(instance, event, None)
+            .await
+    }
+
+    async fn publish_cli_runtime_durable_and_wait_inner(
+        &self,
+        instance: &CliSessionInstanceId,
+        event: AgentDurableEvent,
+        turn_transition: Option<&Arc<tokio::sync::OwnedMutexGuard<()>>>,
+    ) -> Result<(), pioneer_runtime_events::ExecutionEventHubError> {
+        self.publish_cli_runtime_durable_guarded(instance, event, turn_transition, None)
+            .await
+    }
+
+    async fn publish_cli_runtime_durable_guarded(
+        &self,
+        instance: &CliSessionInstanceId,
+        event: AgentDurableEvent,
+        turn_transition: Option<&Arc<tokio::sync::OwnedMutexGuard<()>>>,
+        cli_blocked_guard: Option<pioneer_protocol::CliRuntimeBlockedTurnGuard>,
+    ) -> Result<(), pioneer_runtime_events::ExecutionEventHubError> {
         for attempt in 0..2 {
             let hub = self.ensure_cli_runtime_execution_event_hub(instance).await;
-            match hub.publish_durable_and_wait(event.clone()).await {
+            match hub.publish_cli_runtime_blocked_and_wait(event.clone(), turn_transition.cloned(), cli_blocked_guard.clone()).await {
                 Ok(()) => return Ok(()),
                 Err(
                     error @ (pioneer_runtime_events::ExecutionEventHubError::DurableLaneClosed
@@ -3880,7 +4137,7 @@ impl MessageProcessor {
         }
     }
 
-    async fn persist_cli_runtime_canonical_event(
+    pub(crate) async fn persist_cli_runtime_canonical_event(
         &self,
         instance: &CliSessionInstanceId,
         runtime_kind: &str,
@@ -3902,6 +4159,22 @@ impl MessageProcessor {
                 native_turn_id.as_deref(),
             )
             .await;
+        let event_thread_id = if runtime_kind == "claude"
+            && matches!(event, RuntimeEvent::TurnCompleted(_))
+            && let Some(turn_id) = turn_id.as_deref()
+        {
+            match self.crud_store.get_cli_runtime_turn_binding(turn_id).await {
+                Ok(Some(binding)) => binding.thread_id,
+                Ok(None) => key.thread_id.clone(),
+                Err(error) => {
+                    warn!(turn_id, error = %error,
+                        "failed to identify canonical CLI event execution thread");
+                    return;
+                }
+            }
+        } else {
+            key.thread_id.clone()
+        };
         let payload = if include_payload {
             let mut payload = serde_json::to_value(event)
                 .unwrap_or_else(|_| json!({ "event": "unserializable" }));
@@ -3910,10 +4183,20 @@ impl MessageProcessor {
             }
             payload
         } else {
+            let assistant_record_uuid = match event {
+                RuntimeEvent::TurnCompleted(completed) if runtime_kind == "claude" => completed
+                    .native
+                    .as_ref()
+                    .and_then(|native| native.payload_redacted.as_ref())
+                    .and_then(|payload| payload.get("assistantRecordUuid"))
+                    .and_then(serde_json::Value::as_str),
+                _ => None,
+            };
             json!({
                 "sessionGeneration": instance.generation(),
                 "event": cli_runtime_event_log_label(event),
                 "nativeItemId": native_item_id,
+                "assistantRecordUuid": assistant_record_uuid,
             })
         };
         let payload_redacted_json = match serde_json::to_string(&payload) {
@@ -3936,7 +4219,7 @@ impl MessageProcessor {
                 runtime_id: key.runtime_id.clone(),
                 runtime_kind: runtime_kind.to_owned(),
                 workspace_id: Some(key.workspace_id.clone()),
-                thread_id: Some(key.thread_id.clone()),
+                thread_id: Some(event_thread_id),
                 turn_id,
                 native_thread_id,
                 native_turn_id,
@@ -4190,9 +4473,48 @@ impl MessageProcessor {
                 return None;
             }
         };
+        // Early turn/started is buffered until activation. Do not wait for the
+        // admission-owned gate while that admission still awaits start_turn.
         if binding.status != crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_RUNNING {
             return None;
         }
+        let selected = match self
+            .crud_store
+            .cli_runtime_turn_terminal_guard_by_id(&binding.turn_id)
+            .await
+        {
+            Ok(Some(selected)) => selected,
+            Ok(None) => return None,
+            Err(error) => {
+                warn!(error = %error, "Codex segment source lookup failed");
+                return None;
+            }
+        };
+        let _transition = self
+            .cli_runtime_session_transition_mutex(key)
+            .await
+            .lock_owned()
+            .await;
+        let current = match self
+            .crud_store
+            .cli_runtime_turn_terminal_guard_by_id(&binding.turn_id)
+            .await
+        {
+            Ok(Some(current)) => current,
+            Ok(None) => return None,
+            Err(error) => {
+                warn!(error = %error, "Codex segment source refresh failed");
+                return None;
+            }
+        };
+        if !selected.same_execution_after_admission(&current)
+            || !self.cli_runtime_instance_is_current(instance).await
+            || current.binding.status
+                != crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_RUNNING
+        {
+            return None;
+        }
+        let binding = current.binding;
         let (binding, _, _) = match self
             .crud_store
             .register_cli_runtime_execution_segment(
@@ -4314,6 +4636,48 @@ impl MessageProcessor {
         else {
             return;
         };
+        let selected = match self
+            .crud_store
+            .cli_runtime_turn_terminal_guard_by_id(&binding.turn_id)
+            .await
+        {
+            Ok(Some(selected)) => selected,
+            Ok(None) => return,
+            Err(error) => {
+                warn!(error = %error, "Codex Goal source lookup failed");
+                return;
+            }
+        };
+        #[cfg(test)]
+        self.completed_history_preparation_barrier
+            .wait_if_armed(
+                "__cli_goal_before_gate__",
+                &tokio_util::sync::CancellationToken::new(),
+            )
+            .await;
+        let transition = self
+            .cli_runtime_session_transition_mutex(instance.key())
+            .await
+            .lock_owned()
+            .await;
+        let current = match self
+            .crud_store
+            .cli_runtime_turn_terminal_guard_by_id(&binding.turn_id)
+            .await
+        {
+            Ok(Some(current)) => current,
+            Ok(None) => return,
+            Err(error) => {
+                warn!(error = %error, "Codex Goal source refresh failed");
+                return;
+            }
+        };
+        if !selected.same_execution_after_admission(&current)
+            || !self.cli_runtime_instance_is_current(instance).await
+        {
+            return;
+        }
+        let binding = current.binding.clone();
         let binding = match self
             .crud_store
             .set_cli_runtime_turn_native_goal_state(
@@ -4321,10 +4685,13 @@ impl MessageProcessor {
                 status,
                 native_goal_turn_id,
                 chrono::Utc::now().fixed_offset(),
+                Some(current),
+                self.turn_execution_owner_id.as_ref(),
             )
             .await
         {
-            Ok(binding) => binding,
+            Ok(Some(binding)) => binding,
+            Ok(None) => return,
             Err(error) => {
                 warn!(
                     turn_id = binding.turn_id.as_str(),
@@ -4335,6 +4702,7 @@ impl MessageProcessor {
                 return;
             }
         };
+        drop(transition);
         self.reconcile_codex_goal_terminal(instance, binding).await;
     }
 
@@ -4405,6 +4773,21 @@ impl MessageProcessor {
         let instance = origin.to_session_instance();
         let instance = &instance;
         match event {
+            RuntimeEvent::AccountUpdated(_) | RuntimeEvent::AppListUpdated(_) => {
+                if !self.cli_runtime_instance_is_current(instance).await {
+                    self.audit_stale_cli_runtime_process_activity(
+                        instance,
+                        cli_runtime_event_log_label(&event).as_str(),
+                    );
+                    return;
+                }
+                // External login or app/MCP state changed. Fail closed
+                // immediately and let the single Gateway supervisor perform
+                // one coalesced authoritative account/MCP/model probe for
+                // every connected client.
+                self.invalidate_and_request_cli_runtime_warmup(instance.key().workspace_id.clone())
+                    .await;
+            }
             RuntimeEvent::RequestOpened(request) => {
                 self.handle_cli_runtime_request_opened_event(instance, request)
                     .await;
@@ -4959,8 +5342,319 @@ impl MessageProcessor {
     async fn process_bound_cli_runtime_event(
         &self,
         instance: &CliSessionInstanceId,
+        turn_binding: pioneer_crud::CliRuntimeTurnBindingRecord,
+        event: RuntimeEvent,
+    ) -> bool {
+        self.process_bound_cli_runtime_event_with_transition(instance, turn_binding, event, None)
+            .await
+    }
+
+    async fn process_bound_cli_runtime_event_with_transition(
+        &self,
+        instance: &CliSessionInstanceId,
+        turn_binding: pioneer_crud::CliRuntimeTurnBindingRecord,
+        event: RuntimeEvent,
+        retained: Option<&Arc<tokio::sync::OwnedMutexGuard<()>>>,
+    ) -> bool {
+        if cli_runtime_turn_status_for_terminal_event(&event).is_none() {
+            return self
+                .process_bound_cli_runtime_event_inner(instance, turn_binding, event, None, None)
+                .await;
+        }
+        let result = async {
+            let native_turn_id = match cli_runtime_native_turn_id_for_event(&event) {
+                Some(native) => native.to_owned(),
+                None => match self
+                    .cli_runtime_running_native_turn_id(&turn_binding)
+                    .await?
+                {
+                    Some(native) => native,
+                    None => return Ok(false),
+                },
+            };
+            // The lookup cache locates a Turn; its Goal/activity metadata may
+            // precede a legitimate update of the same native execution. Capture
+            // provenance from the durable native owner before preparing/enqueueing.
+            let Some(owner) = self
+                .crud_store
+                .resolve_cli_runtime_native_turn_owner(&turn_binding.runtime_id, &native_turn_id)
+                .await?
+            else {
+                return Ok(false);
+            };
+            if owner.binding.turn_id != turn_binding.turn_id
+                || owner.binding.thread_id != turn_binding.thread_id
+                || owner.binding.workspace_id != turn_binding.workspace_id
+                || owner.binding.continuation_thread_id != turn_binding.continuation_thread_id
+                || owner.binding.native_thread_id != turn_binding.native_thread_id
+                || owner.binding.runtime_kind != turn_binding.runtime_kind
+            {
+                return Ok(false);
+            }
+            let Some(source) = self
+                .crud_store
+                .cli_runtime_terminal_event_source(&owner.binding, &native_turn_id)
+                .await?
+            else {
+                return Ok(false);
+            };
+            #[cfg(test)]
+            self.completed_history_preparation_barrier
+                .wait_if_armed(
+                    "__cli_native_terminal_before_gate__",
+                    &tokio_util::sync::CancellationToken::new(),
+                )
+                .await;
+            let payload = serde_json::to_string(&(source.clone(), event.clone()))?;
+            let record = cli_runtime_terminal_event_record(&source, payload);
+            if !self
+                .crud_store
+                .with_maintenance_access()
+                .persist_cli_runtime_terminal_event(
+                    record.clone(),
+                    &source,
+                    self.turn_execution_owner_id.as_ref(),
+                )
+                .await?
+            {
+                return Ok(false);
+            }
+            #[cfg(test)]
+            self.completed_history_preparation_barrier
+                .wait_if_armed(
+                    "__cli_native_terminal_saved__",
+                    &tokio_util::sync::CancellationToken::new(),
+                )
+                .await;
+            // Wait only on the producer, before enqueue. The ordered consumer
+            // remains free to ACK admission windows while this event waits.
+            let transition = match retained {
+                Some(transition) => transition.clone(),
+                None => Arc::new(
+                    self.cli_runtime_session_transition_mutex(instance.key())
+                        .await
+                        .lock_owned()
+                        .await,
+                ),
+            };
+            let current = self
+                .crud_store
+                .get_cli_runtime_turn_binding(&source.turn_id)
+                .await?;
+            let Some(binding) = current else {
+                return Ok(false);
+            };
+            if !self
+                .crud_store
+                .cli_runtime_terminal_event_source(&binding, &native_turn_id)
+                .await?
+                .as_ref()
+                .is_some_and(|current| current.same_execution(&source))
+            {
+                return Ok(false);
+            }
+            let saved = self
+                .crud_store
+                .get_cli_runtime_native_event(&record.id)
+                .await?
+                .context("saved CLI terminal outcome disappeared")?;
+            let (selected, event): (pioneer_protocol::CliRuntimeBlockedTurnGuard, RuntimeEvent) =
+                serde_json::from_str(&saved.payload_redacted_json)?;
+            if !selected.same_native_execution(&source) {
+                return Ok(false);
+            }
+            let goal_completion = matches!(event, RuntimeEvent::TurnCompleted(_))
+                && selected.segment_ack_needs_goal_completion(
+                    binding.native_goal_observed_at.is_some(),
+                    binding.native_goal_status.as_deref(),
+                );
+            // A segment ACK is not the canonical completion of its Goal.
+            if !goal_completion
+                && self
+                    .crud_store
+                    .get_cli_runtime_native_event(&format!("{}:ack", record.id))
+                    .await?
+                    .is_some()
+            {
+                return Ok(true);
+            }
+            let Some(mut delivery) = self
+                .crud_store
+                .authorize_cli_runtime_terminal_event(
+                    &saved,
+                    &selected,
+                    &source,
+                    self.turn_execution_owner_id.as_ref(),
+                )
+                .await?
+            else {
+                return Ok(false);
+            };
+            delivery.terminal_delivery_id = Some(record.id.clone());
+            let applied = self
+                .process_bound_cli_runtime_event_inner(
+                    instance,
+                    binding,
+                    event,
+                    Some(&transition),
+                    Some(&delivery),
+                )
+                .await;
+            if applied {
+                self.ack_cli_runtime_terminal_event(&record).await?;
+            }
+            Ok::<_, anyhow::Error>(applied)
+        }
+        .await;
+        match result {
+            Ok(applied) => applied,
+            Err(error) => {
+                warn!(turn_id = turn_binding.turn_id, error = %error, "failed to save or deliver CLI terminal outcome");
+                false
+            }
+        }
+    }
+
+    pub(super) async fn ack_cli_runtime_terminal_event(
+        &self,
+        record: &pioneer_crud::NewCliRuntimeNativeEvent,
+    ) -> anyhow::Result<()> {
+        let mut ack = record.clone();
+        ack.id.push_str(":ack");
+        ack.native_method = "gateway/terminal_ack".into();
+        ack.payload_redacted_json = "{}".into();
+        let store = self.crud_store.with_maintenance_access();
+        if store
+            .get_cli_runtime_native_event(&ack.id)
+            .await?
+            .is_some_and(|existing| existing.native_method == "gateway/terminal_recovery_ack")
+        {
+            // Recovery already transferred this outcome to its durable job in
+            // the authority-changing commit. Preserve that ACK; the repository
+            // still checks every identity/payload field on the idempotent insert.
+            ack.native_method = "gateway/terminal_recovery_ack".into();
+        }
+        store.append_cli_runtime_native_event_if_absent(ack).await?;
+        Ok(())
+    }
+
+    // One saved outcome per selected execution, sought by primary key. This
+    // runs before activity/human-wait/stale eligibility, including after reopen.
+    async fn replay_cli_runtime_terminal_event(
+        &self,
+        expected: &pioneer_crud::CliRuntimeTurnTerminalGuard,
+        transition: &Arc<tokio::sync::OwnedMutexGuard<()>>,
+    ) -> anyhow::Result<bool> {
+        let Some(attempt) = expected.attempt.as_ref() else {
+            return Ok(false);
+        };
+        let native = expected
+            .segment
+            .as_ref()
+            .map(|segment| segment.native_turn_id.as_str())
+            .or(attempt.native_turn_id.as_deref());
+        let Some(native) = native else {
+            return Ok(false);
+        };
+        let Some(source) = self
+            .crud_store
+            .cli_runtime_terminal_event_source(&expected.binding, native)
+            .await?
+        else {
+            return Ok(false);
+        };
+        let record = cli_runtime_terminal_event_record(&source, String::new());
+        let Some(saved) = self
+            .crud_store
+            .get_cli_runtime_native_event(&record.id)
+            .await?
+        else {
+            return Ok(false);
+        };
+        let (selected, event): (pioneer_protocol::CliRuntimeBlockedTurnGuard, RuntimeEvent) =
+            serde_json::from_str(&saved.payload_redacted_json)?;
+        anyhow::ensure!(
+            selected.same_native_execution(&source),
+            "accepted CLI terminal outcome source is superseded; observational fallback deferred"
+        );
+        let goal_completion = matches!(event, RuntimeEvent::TurnCompleted(_))
+            && selected.segment_ack_needs_goal_completion(
+                expected.binding.native_goal_observed_at.is_some(),
+                source.native_goal_status.as_deref(),
+            );
+        if !goal_completion
+            && self
+                .crud_store
+                .get_cli_runtime_native_event(&format!("{}:ack", record.id))
+                .await?
+                .is_some()
+        {
+            return Ok(false);
+        }
+        let Some(mut delivery) = self
+            .crud_store
+            .authorize_cli_runtime_terminal_event(
+                &saved,
+                &selected,
+                &source,
+                self.turn_execution_owner_id.as_ref(),
+            )
+            .await?
+        else {
+            anyhow::bail!("accepted CLI terminal outcome awaits current execution authority");
+        };
+        let manager = self
+            .cli_runtime_manager
+            .as_ref()
+            .context("CLI manager unavailable for saved terminal delivery")?;
+        let key = CLIAgentRuntimeSessionKey::new(
+            &expected.binding.workspace_id,
+            &expected.binding.runtime_id,
+            &expected.binding.continuation_thread_id,
+        )?;
+        let handle = match manager.existing_session(&key).await {
+            Some(handle) => handle,
+            None => {
+                let restored = match self
+                    .restore_cli_runtime_launch_spec(&expected.binding)
+                    .await
+                {
+                    CliRuntimeLaunchSpecRestore::Ready(restored) => restored,
+                    CliRuntimeLaunchSpecRestore::Unavailable { diagnostic }
+                    | CliRuntimeLaunchSpecRestore::InvalidBinding { diagnostic } => {
+                        anyhow::bail!("{diagnostic}")
+                    }
+                };
+                manager
+                    .get_or_start_with_launch_spec(restored.session_key, restored.launch_spec)
+                    .await?
+            }
+        };
+        // Event and Claude transcript UUID are on disk; no old process snapshot
+        // is consulted. Retained ownership covers the real lane through ACK.
+        delivery.terminal_delivery_id = Some(record.id.clone());
+        anyhow::ensure!(
+            self.process_bound_cli_runtime_event_inner(
+                handle.instance(),
+                expected.binding.clone(),
+                event,
+                Some(transition),
+                Some(&delivery)
+            )
+            .await,
+            "saved CLI terminal outcome could not be delivered in this quantum"
+        );
+        self.ack_cli_runtime_terminal_event(&record).await?;
+        Ok(true)
+    }
+
+    async fn process_bound_cli_runtime_event_inner(
+        &self,
+        instance: &CliSessionInstanceId,
         mut turn_binding: pioneer_crud::CliRuntimeTurnBindingRecord,
         event: RuntimeEvent,
+        turn_transition: Option<&Arc<tokio::sync::OwnedMutexGuard<()>>>,
+        terminal_delivery: Option<&pioneer_protocol::CliRuntimeBlockedTurnGuard>,
     ) -> bool {
         if !self.cli_runtime_instance_is_current(instance).await {
             self.audit_stale_cli_runtime_process_activity(instance, "bound_event");
@@ -5033,11 +5727,12 @@ impl MessageProcessor {
             return false;
         }
         if !self
-            .cli_runtime_turn_binding_accepts_native_activity(
+            .cli_runtime_turn_binding_accepts_native_activity_inner(
                 key,
                 &turn_binding,
                 native_thread_id,
                 event_label.as_str(),
+                turn_transition,
             )
             .await
         {
@@ -5052,6 +5747,41 @@ impl MessageProcessor {
                 "ignored CLI runtime event for non-active Pioneer turn"
             );
             return false;
+        }
+        if terminal_status.is_some() {
+            let restored = async {
+                let (workspace_id, turn) = self
+                    .crud_store
+                    .get_turn(&turn_binding.thread_id, &turn_binding.turn_id)
+                    .await?
+                    .context("native terminal Turn is missing")?;
+                self.ensure_runtime_turn_loaded_for_lifecycle(
+                    &workspace_id,
+                    &turn_binding.thread_id,
+                    &turn,
+                )
+                .await
+            }
+            .await;
+            if let Err(error) = restored {
+                warn!(turn_id = turn_binding.turn_id.as_str(), error = %error,
+                    "failed to rehydrate native terminal Turn lifecycle");
+                return false;
+            }
+        }
+        if turn_binding.runtime_kind == "codex"
+            && !self
+                .persist_codex_history_event(&turn_binding, &event)
+                .await
+        {
+            warn!(
+                workspace_id = key.workspace_id.as_str(),
+                runtime_id = key.runtime_id.as_str(),
+                thread_id = turn_binding.thread_id.as_str(),
+                turn_id = turn_binding.turn_id.as_str(),
+                event = %event_label,
+                "Codex aggregate history event could not be durably applied"
+            );
         }
         let recovery = if let Some(attempt) = turn_attempt {
             match self.cli_runtime_attempt_recovery_state(attempt).await {
@@ -5151,11 +5881,18 @@ impl MessageProcessor {
                     error = %format!("{error:#}"),
                     "refused to publish CLI TurnCompleted without durable finalization"
                 );
+                // A saved completion remains owed; preparation failure must
+                // not consume it as a synthetic recovery failure.
+                if terminal_delivery.is_some() {
+                    return false;
+                }
                 if let Some(recovery) = recovery.as_ref() {
                     self.handle_cli_runtime_recovery_native_failure(
                         turn_binding.turn_id.clone(),
                         recovery.clone(),
                         failure,
+                        turn_transition.cloned(),
+                        terminal_delivery.cloned(),
                     )
                     .await;
                 } else {
@@ -5175,13 +5912,47 @@ impl MessageProcessor {
             && let Some(provider_failure) =
                 classify_runtime_provider_failure(&event, chrono::Local::now().fixed_offset())
         {
+            let failure_message = provider_failure.message.clone();
+            self.update_cli_runtime_command_item_registry(instance, &turn_binding, &event)
+                .await;
+            let committed = self
+                .handle_provider_failure_detected_with_transition(
+                    turn_binding.thread_id.clone(),
+                    turn_binding.turn_id.clone(),
+                    "runtime:provider_failure".to_owned(),
+                    pioneer_protocol::TurnItemType::SystemEvent,
+                    pioneer_protocol::ProviderFailureDetails {
+                        error_reason: None,
+                        request_id: None,
+                        provider: turn_binding.runtime_kind.clone(),
+                        model: turn_binding
+                            .model
+                            .clone()
+                            .unwrap_or_else(|| "unknown".to_owned()),
+                        transport: pioneer_protocol::ProviderTransportKind::NonStream,
+                        class: provider_failure.class,
+                        stage: pioneer_protocol::ProviderFailureStage::FirstChunk,
+                        http_status: None,
+                        provider_code: provider_failure.provider_code,
+                        retry_after_ms: provider_failure.retry_after_ms,
+                        is_recoverable_hint: true,
+                        message: Some(provider_failure.message),
+                    },
+                    recovery.clone(),
+                    turn_transition.cloned(),
+                    terminal_delivery.cloned(),
+                )
+                .await;
+            if !committed {
+                return false;
+            }
             if let Some(attempt) = turn_attempt {
                 match self
                     .crud_store
                     .mark_cli_runtime_turn_attempt_terminal(
                         attempt.id.as_str(),
                         pioneer_crud::CliRuntimeTurnAttemptStatus::Failed,
-                        Some(provider_failure.message.clone()),
+                        Some(failure_message.clone()),
                         chrono::Utc::now().fixed_offset(),
                     )
                     .await
@@ -5205,32 +5976,7 @@ impl MessageProcessor {
                     }
                 }
             }
-            self.update_cli_runtime_command_item_registry(instance, &turn_binding, &event)
-                .await;
-            return self
-                .handle_provider_failure_detected(
-                    turn_binding.thread_id.clone(),
-                    turn_binding.turn_id.clone(),
-                    "runtime:provider_failure".to_owned(),
-                    pioneer_protocol::TurnItemType::SystemEvent,
-                    pioneer_protocol::ProviderFailureDetails {
-                        provider: turn_binding.runtime_kind.clone(),
-                        model: turn_binding
-                            .model
-                            .clone()
-                            .unwrap_or_else(|| "unknown".to_owned()),
-                        transport: pioneer_protocol::ProviderTransportKind::NonStream,
-                        class: provider_failure.class,
-                        stage: pioneer_protocol::ProviderFailureStage::FirstChunk,
-                        http_status: None,
-                        provider_code: provider_failure.provider_code,
-                        retry_after_ms: provider_failure.retry_after_ms,
-                        is_recoverable_hint: true,
-                        message: Some(provider_failure.message),
-                    },
-                    recovery.clone(),
-                )
-                .await;
+            return true;
         }
         if terminal_status.is_some()
             && let Some(recovery) = recovery.as_ref()
@@ -5256,6 +6002,20 @@ impl MessageProcessor {
                 ),
                 _ => unreachable!(),
             };
+            self.update_cli_runtime_command_item_registry(instance, &turn_binding, &event)
+                .await;
+            if !self
+                .handle_cli_runtime_recovery_native_failure(
+                    turn_binding.turn_id.clone(),
+                    recovery.clone(),
+                    failure_message.clone(),
+                    turn_transition.cloned(),
+                    terminal_delivery.cloned(),
+                )
+                .await
+            {
+                return false;
+            }
             if let Some(attempt) = turn_attempt {
                 match self
                     .crud_store
@@ -5274,7 +6034,6 @@ impl MessageProcessor {
                             native_turn_id = native_turn_id_label,
                             "ignored duplicate terminal event for CLI recovery attempt"
                         );
-                        return false;
                     }
                     Err(error) => {
                         warn!(
@@ -5287,14 +6046,6 @@ impl MessageProcessor {
                     }
                 }
             }
-            self.update_cli_runtime_command_item_registry(instance, &turn_binding, &event)
-                .await;
-            self.handle_cli_runtime_recovery_native_failure(
-                turn_binding.turn_id.clone(),
-                recovery.clone(),
-                failure_message,
-            )
-            .await;
             return true;
         }
         if recovery.is_none() && matches!(&event, RuntimeEvent::TurnInterrupted(_)) {
@@ -5302,6 +6053,19 @@ impl MessageProcessor {
                 RuntimeEvent::TurnInterrupted(interrupted) => interrupted.reason.clone(),
                 _ => unreachable!(),
             };
+            self.update_cli_runtime_command_item_registry(instance, &turn_binding, &event)
+                .await;
+            let committed = self
+                .report_turn_failure(
+                    turn_binding.thread_id.clone(),
+                    turn_binding.turn_id.clone(),
+                    TurnFailureRecoveryKind::RuntimeFailure,
+                    failure_message.clone(),
+                )
+                .await;
+            if !committed {
+                return false;
+            }
             if let Some(attempt) = turn_attempt {
                 match self
                     .crud_store
@@ -5320,7 +6084,6 @@ impl MessageProcessor {
                             native_turn_id = native_turn_id_label,
                             "ignored duplicate interruption for CLI runtime attempt"
                         );
-                        return false;
                     }
                     Err(error) => {
                         warn!(
@@ -5333,16 +6096,94 @@ impl MessageProcessor {
                     }
                 }
             }
-            self.update_cli_runtime_command_item_registry(instance, &turn_binding, &event)
-                .await;
-            return self
-                .report_turn_failure(
-                    turn_binding.thread_id.clone(),
-                    turn_binding.turn_id.clone(),
-                    TurnFailureRecoveryKind::RuntimeFailure,
-                    failure_message,
+            return true;
+        }
+        // Persist the provider's transcript record before canonical completion.
+        // A failed write keeps the completion retryable; a process exit after
+        // this write leaves a harmless boundary record for that exact turn.
+        if turn_binding.runtime_kind == "claude"
+            && let RuntimeEvent::TurnCompleted(completed) = &event
+        {
+            let from_event = completed
+                .native
+                .as_ref()
+                .and_then(|native| native.payload_redacted.as_ref())
+                .and_then(|payload| payload.get("assistantRecordUuid"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned);
+            let message_uuid = if let Some(value) = from_event {
+                Some(value)
+            } else {
+                match crate::cli_runtime::thread_binding::claude_terminal_record_uuid(
+                    self.crud_store.as_ref(),
+                    &turn_binding,
                 )
-                .await;
+                .await
+                {
+                    Ok(boundary) => boundary.map(|boundary| boundary.to_string()),
+                    Err(error) => {
+                        warn!(turn_id = turn_binding.turn_id.as_str(), error = %error,
+                            "failed to inspect durable Claude terminal evidence");
+                        return false;
+                    }
+                }
+            };
+            let Some(message_uuid) =
+                message_uuid.filter(|value| uuid::Uuid::parse_str(value).is_ok())
+            else {
+                warn!(
+                    turn_id = turn_binding.turn_id.as_str(),
+                    "refused to complete Claude turn without a transcript record UUID"
+                );
+                return false;
+            };
+            use sha2::Digest;
+            let boundary_event_id = hex::encode(sha2::Sha256::digest(
+                format!(
+                    "claude-boundary:{}:{}:{}:{}",
+                    turn_binding.workspace_id,
+                    turn_binding.runtime_id,
+                    turn_binding.turn_id,
+                    turn_binding.native_thread_id
+                )
+                .as_bytes(),
+            ));
+            #[cfg(test)]
+            let injected_boundary_failure = self
+                .claude_boundary_write_failures
+                .lock()
+                .await
+                .remove(turn_binding.turn_id.as_str());
+            #[cfg(not(test))]
+            let injected_boundary_failure = false;
+            let boundary_write = if injected_boundary_failure {
+                Err(anyhow::anyhow!("injected Claude boundary write failure"))
+            } else {
+                self.crud_store
+                    .append_cli_runtime_native_event_if_absent(
+                        pioneer_crud::NewCliRuntimeNativeEvent {
+                            id: boundary_event_id[..24].to_owned(),
+                            runtime_id: turn_binding.runtime_id.clone(),
+                            runtime_kind: "claude".to_owned(),
+                            workspace_id: Some(turn_binding.workspace_id.clone()),
+                            thread_id: Some(turn_binding.thread_id.clone()),
+                            turn_id: Some(turn_binding.turn_id.clone()),
+                            native_thread_id: Some(turn_binding.native_thread_id.clone()),
+                            native_turn_id: turn_binding.native_turn_id.clone(),
+                            native_method: "claude/assistant_record_boundary".to_owned(),
+                            payload_redacted_json: serde_json::json!({"messageUuid": message_uuid})
+                                .to_string(),
+                            sequence: now_timestamp_millis(),
+                            created_at: chrono::Utc::now().fixed_offset(),
+                        },
+                    )
+                    .await
+            };
+            if let Err(error) = boundary_write {
+                warn!(turn_id = turn_binding.turn_id.as_str(), error = %error,
+                    "refused to complete Claude turn without durable fork boundary");
+                return false;
+            }
         }
         let context = crate::cli_runtime::projector::CLIRuntimeProjectorContext {
             workspace_id: key.workspace_id.clone(),
@@ -5353,7 +6194,12 @@ impl MessageProcessor {
         let projected = crate::cli_runtime::projector::project_cli_runtime_event(&context, &event);
         for durable in projected.durable {
             if let Err(error) = self
-                .publish_cli_runtime_durable_and_wait(instance, durable)
+                .publish_cli_runtime_durable_guarded(
+                    instance,
+                    durable,
+                    turn_transition,
+                    terminal_delivery.cloned(),
+                )
                 .await
             {
                 warn!(
@@ -5369,6 +6215,51 @@ impl MessageProcessor {
                 return false;
             }
         }
+        if matches!(&event, RuntimeEvent::TurnCompleted(_)) {
+            let completed_context = async {
+                let (_, completed_turn) = self
+                    .crud_store
+                    .get_turn(
+                        turn_binding.thread_id.as_str(),
+                        turn_binding.turn_id.as_str(),
+                    )
+                    .await?
+                    .context("completed CLI turn disappeared before continuity capture")?;
+                let sent_basis =
+                    crate::cli_runtime::thread_binding::sent_context_basis_from_input_mapping(
+                        turn_binding.input_mapping_json.as_str(),
+                    )?
+                    .context(
+                        "completed CLI turn has no proof for the context sent to its provider",
+                    )?;
+                crate::cli_runtime::thread_binding::record_cli_runtime_completed_context(
+                    self.crud_store.as_ref(),
+                    turn_binding.continuation_thread_id.as_str(),
+                    turn_binding.native_thread_id.as_str(),
+                    crate::cli_runtime::thread_binding::CliRuntimeDeliveredTurn {
+                        turn_id: completed_turn.id,
+                        thread_id: Some(turn_binding.thread_id.clone()),
+                        message_revision: completed_turn.message_revision,
+                        message_deleted: completed_turn.message_deleted,
+                    },
+                    sent_basis,
+                    chrono::Utc::now().fixed_offset(),
+                )
+                .await?;
+                Ok::<(), anyhow::Error>(())
+            }
+            .await;
+            if let Err(error) = completed_context {
+                // The provider turn is already accepted. Leave its start-only
+                // receipt non-current so the next turn bootstraps rather than
+                // claiming continuity without a canonical proof.
+                warn!(
+                    turn_id = turn_binding.turn_id.as_str(),
+                    error = %format!("{error:#}"),
+                    "failed to record completed CLI runtime context; next turn will bootstrap"
+                );
+            }
+        }
         let event_hub = self.ensure_cli_runtime_execution_event_hub(instance).await;
         for snapshot in projected.snapshot {
             if !event_hub.publish_snapshot(snapshot) {
@@ -5381,10 +6272,11 @@ impl MessageProcessor {
                     "failed to enqueue CLI runtime snapshot because execution hub is closed"
                 );
                 if let Some(status) = terminal_status {
-                    self.cleanup_cli_runtime_terminal_turn_status(
+                    self.cleanup_cli_runtime_terminal_turn_status_with_transition(
                         &turn_binding,
                         status,
                         event_label.as_str(),
+                        turn_transition,
                     )
                     .await;
                 }
@@ -5445,10 +6337,11 @@ impl MessageProcessor {
                 .await
             {
                 Ok(Some(status)) if status != TurnStatus::InProgress => {
-                    self.cleanup_cli_runtime_terminal_turn_status(
+                    self.cleanup_cli_runtime_terminal_turn_status_with_transition(
                         &turn_binding,
                         status,
                         event_label.as_str(),
+                        turn_transition,
                     )
                     .await;
                 }
@@ -5489,6 +6382,8 @@ impl MessageProcessor {
                     }
                 )
             });
+        self.prepare_cli_post_turn_hook(binding, generation, final_item.as_ref())
+            .await?;
         let Some(final_item) = final_item else {
             debug!(
                 workspace_id = binding.workspace_id.as_str(),
@@ -5519,12 +6414,18 @@ impl MessageProcessor {
         Ok(CLIRuntimeSuccessFinalizationPreparation::WithFinalMessage)
     }
 
-    async fn apply_authoritative_cli_runtime_snapshot_event(
+    async fn apply_authoritative_cli_runtime_snapshot_event_inner(
         &self,
         instance: &CliSessionInstanceId,
         binding: &pioneer_crud::CliRuntimeTurnBindingRecord,
         event: RuntimeEvent,
+        turn_transition: Option<&Arc<tokio::sync::OwnedMutexGuard<()>>>,
     ) -> anyhow::Result<()> {
+        if binding.runtime_kind == "codex"
+            && !self.persist_codex_history_event(binding, &event).await
+        {
+            anyhow::bail!("failed to persist authoritative Codex aggregate event");
+        }
         let context = crate::cli_runtime::projector::CLIRuntimeProjectorContext {
             workspace_id: binding.workspace_id.clone(),
             thread_id: binding.thread_id.clone(),
@@ -5533,7 +6434,7 @@ impl MessageProcessor {
         };
         let projected = crate::cli_runtime::projector::project_cli_runtime_event(&context, &event);
         for durable in projected.durable {
-            self.publish_cli_runtime_durable_and_wait(instance, durable)
+            self.publish_cli_runtime_durable_and_wait_inner(instance, durable, turn_transition)
                 .await
                 .map_err(|error| {
                     anyhow::anyhow!(
@@ -5559,6 +6460,7 @@ impl MessageProcessor {
         &self,
         binding: &pioneer_crud::CliRuntimeTurnBindingRecord,
         recovery: pioneer_protocol::RecoveryAttemptContext,
+        transition: &Arc<tokio::sync::OwnedMutexGuard<()>>,
     ) -> CLIRuntimeObservationGapReconciliation {
         let native_turn_id = match binding.native_turn_id.as_deref() {
             Some(native_turn_id) if !native_turn_id.trim().is_empty() => native_turn_id,
@@ -5631,6 +6533,23 @@ impl MessageProcessor {
         };
 
         if observation.status == CLIAgentRuntimeObservedTurnStatus::InProgress {
+            // The production handler holds `transition` and revalidates the
+            // recovery source before entering reconciliation. Active native
+            // execution still needs the original Pioneer Turn restored, just
+            // like a restart attempt, before recovery can be marked successful.
+            if let Err(error) = self
+                .restore_cli_runtime_recovery_turn_snapshot(binding)
+                .await
+            {
+                return match error {
+                    CliRuntimeRecoveryStartFailure::Unavailable { diagnostic } => {
+                        CLIRuntimeObservationGapReconciliation::Unavailable { diagnostic }
+                    }
+                    CliRuntimeRecoveryStartFailure::InvalidBinding { diagnostic } => {
+                        CLIRuntimeObservationGapReconciliation::InvalidBinding { diagnostic }
+                    }
+                };
+            }
             let now_unix = now_timestamp_secs();
             if let Err(error) = self
                 .timeout_supervisor
@@ -5741,11 +6660,15 @@ impl MessageProcessor {
         }
 
         for event in observation.reconciliation_events {
+            if matches!(event, RuntimeEvent::TurnCompleted(_)) {
+                continue;
+            }
             if let Err(error) = self
-                .apply_authoritative_cli_runtime_snapshot_event(
+                .apply_authoritative_cli_runtime_snapshot_event_inner(
                     handle.instance(),
                     &restored.binding,
                     event,
+                    Some(transition),
                 )
                 .await
             {
@@ -5852,7 +6775,7 @@ impl MessageProcessor {
                     }
                 };
                 if let Err(error) = self
-                    .ensure_cli_runtime_turn_loaded_for_lifecycle(
+                    .ensure_runtime_turn_loaded_for_lifecycle(
                         binding.workspace_id.as_str(),
                         binding.thread_id.as_str(),
                         &turn,
@@ -5878,10 +6801,11 @@ impl MessageProcessor {
                             .to_owned(),
                     };
                 }
-                self.cleanup_cli_runtime_terminal_turn_status(
+                self.cleanup_cli_runtime_terminal_turn_status_with_transition(
                     &restored.binding,
                     TurnStatus::Completed,
                     "observation gap terminal reconciliation",
+                    Some(transition),
                 )
                 .await;
                 CLIRuntimeObservationGapReconciliation::Terminal {
@@ -5935,8 +6859,8 @@ impl MessageProcessor {
             self.crud_store
                 .materialize_agent_diff_final_snapshot_if_changed(
                     ItemCompletedNotification {
-                        workspace_id: key.workspace_id.clone(),
-                        thread_id: key.thread_id.clone(),
+                        workspace_id: turn_binding.workspace_id.clone(),
+                        thread_id: turn_binding.thread_id.clone(),
                         turn_id: turn_binding.turn_id.clone(),
                         item,
                     },
@@ -5966,6 +6890,92 @@ impl MessageProcessor {
                     error = %format!("{error:#}"),
                     "failed to commit final CLI runtime diff snapshot"
                 );
+            }
+        }
+    }
+
+    /// Persist Codex's provider-owned aggregate stream without routing it
+    /// through Pioneer PatchEngine or synthesizing per-call records.
+    async fn persist_codex_history_event(
+        &self,
+        binding: &pioneer_crud::CliRuntimeTurnBindingRecord,
+        event: &RuntimeEvent,
+    ) -> bool {
+        match event {
+            RuntimeEvent::DiffUpdated(diff) => {
+                let Some(diff_text) = diff.diff_text.as_deref() else {
+                    return true;
+                };
+                let normalized = match normalize_codex_diff_updated(
+                    CodexAggregateEventContext {
+                        workspace_id: binding.workspace_id.clone(),
+                        thread_id: binding.thread_id.clone(),
+                        turn_id: binding.turn_id.clone(),
+                        protocol_revision: CODEX_TURN_DIFF_PROTOCOL_REVISION.to_owned(),
+                        event_id: diff.event_id.clone(),
+                        revision: diff.revision,
+                    },
+                    &json!({
+                        "threadId": binding.thread_id,
+                        "turnId": binding.turn_id,
+                        "diff": diff_text,
+                        "exact": diff.provider_exact,
+                    }),
+                ) {
+                    Ok(event) => event,
+                    Err(error) => {
+                        warn!(
+                            thread_id = binding.thread_id.as_str(),
+                            turn_id = binding.turn_id.as_str(),
+                            error = %error,
+                            "rejected malformed or unsupported Codex aggregate event"
+                        );
+                        return false;
+                    }
+                };
+                let store = SqliteCodexAggregateStore::new(self.crud_store.database_connection());
+                match store.ingest_event(&normalized).await {
+                    Ok(_) => true,
+                    Err(error) => {
+                        warn!(
+                            thread_id = binding.thread_id.as_str(),
+                            turn_id = binding.turn_id.as_str(),
+                            error = %format!("{error:#}"),
+                            "failed to persist Codex aggregate projection"
+                        );
+                        false
+                    }
+                }
+            }
+            RuntimeEvent::TurnCompleted(_)
+            | RuntimeEvent::TurnFailed(_)
+            | RuntimeEvent::TurnInterrupted(_)
+            | RuntimeEvent::Error(_) => self.finalize_codex_history(binding).await,
+            _ => true,
+        }
+    }
+
+    async fn finalize_codex_history(
+        &self,
+        binding: &pioneer_crud::CliRuntimeTurnBindingRecord,
+    ) -> bool {
+        if binding.runtime_kind != "codex" {
+            return true;
+        }
+        let store = SqliteCodexAggregateStore::new(self.crud_store.database_connection());
+        match store
+            .finalize(binding.thread_id.as_str(), binding.turn_id.as_str())
+            .await
+        {
+            Ok(_) => true,
+            Err(error) => {
+                warn!(
+                    thread_id = binding.thread_id.as_str(),
+                    turn_id = binding.turn_id.as_str(),
+                    error = %format!("{error:#}"),
+                    "failed to finalize Codex aggregate projection"
+                );
+                false
             }
         }
     }
@@ -6111,44 +7121,98 @@ impl MessageProcessor {
         }
     }
 
-    pub(super) async fn fail_stale_cli_runtime_turns(&self, now_unix_ms: i64) {
-        let bindings = match self
-            .crud_store
-            .list_cli_runtime_turn_bindings(pioneer_crud::CliRuntimeTurnBindingListFilter {
-                statuses: vec![
-                    crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_STARTING.to_owned(),
-                    crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_RUNNING.to_owned(),
-                ],
-                limit: Some(CLI_RUNTIME_STALE_TURN_SCAN_LIMIT),
-                ..Default::default()
-            })
-            .await
-        {
-            Ok(bindings) => bindings,
-            Err(error) => {
-                warn!(
-                    error = %format!("{error:#}"),
-                    "failed to scan stale CLI runtime turn bindings"
-                );
-                return;
-            }
+    pub(super) async fn fail_stale_cli_runtime_turns(
+        &self,
+        now_unix_ms: i64,
+        scan: &mut CliRuntimeStaleTurnScan,
+    ) -> CliRuntimeStaleTurnScanSummary {
+        use pioneer_crud::CliRuntimeActiveTurnBindingStatus::{Running, Starting};
+        use pioneer_observability::{
+            GatewayOperation, GatewayOperationItemKind, GatewayOperationTrace,
         };
+        let trace = GatewayOperationTrace::start(GatewayOperation::CliRuntimeStaleTurnScan);
+        for kind in [
+            GatewayOperationItemKind::CliRuntimeStaleTurnSelected,
+            GatewayOperationItemKind::CliRuntimeStaleTurnProcessed,
+        ] {
+            trace.record_items(kind, 0);
+        }
+        let mut failed = false;
 
-        for binding in bindings {
-            if let Err(error) = self
-                .fail_stale_cli_runtime_turn_binding(binding, now_unix_ms)
+        // Discovery is always Maintenance; validation/commits inherit the
+        // existing caller scope (Maintenance reads / Critical correctness writes).
+        let discovery = self.crud_store.with_maintenance_access();
+        let mut summary = CliRuntimeStaleTurnScanSummary::default();
+        for (slot, status) in [Starting, Running].into_iter().enumerate() {
+            let bindings = match discovery
+                .list_active_cli_runtime_turn_binding_page(status, scan.after[slot].as_ref())
                 .await
             {
-                warn!(
-                    error = %format!("{error:#}"),
-                    "failed to reconcile stale CLI runtime turn binding"
-                );
+                Ok(bindings) => bindings,
+                Err(error) => {
+                    warn!(
+                        error = %format!("{error:#}"),
+                        status = status.as_str(),
+                        "failed to scan stale CLI runtime turn bindings"
+                    );
+                    failed = true;
+                    continue;
+                }
+            };
+            summary.selected += bindings.len();
+            trace.record_items(
+                GatewayOperationItemKind::CliRuntimeStaleTurnSelected,
+                summary.selected as u64,
+            );
+            // Advance on discovery, including healthy/error candidates and
+            // cancellation during validation. A short/empty page wraps only on
+            // the next quantum; never fetch a second page in this call.
+            scan.after[slot] = if bindings.len()
+                == pioneer_crud::CLI_RUNTIME_ACTIVE_TURN_BINDING_PAGE_MAX as usize
+            {
+                bindings
+                    .last()
+                    .map(|binding| (binding.created_at, binding.turn_id.clone()))
+            } else {
+                None
+            };
+            for binding in bindings {
+                match self
+                    .fail_stale_cli_runtime_turn_binding(binding, now_unix_ms)
+                    .await
+                {
+                    Ok(()) => {
+                        summary.processed += 1;
+                        trace.record_items(
+                            GatewayOperationItemKind::CliRuntimeStaleTurnProcessed,
+                            summary.processed as u64,
+                        );
+                    }
+                    Err(error) => {
+                        warn!(
+                            error = %format!("{error:#}"),
+                            "failed to reconcile stale CLI runtime turn binding"
+                        );
+                        failed = true;
+                    }
+                }
             }
         }
+        debug!(
+            selected = summary.selected,
+            processed = summary.processed,
+            "completed stale CLI runtime active binding quantum"
+        );
         self.prune_stale_cli_runtime_pending_turn_events(now_unix_ms)
             .await;
         self.prune_stale_cli_runtime_pending_turn_server_requests(now_unix_ms)
             .await;
+        if failed {
+            trace.finish_failure();
+        } else {
+            trace.finish_success();
+        }
+        summary
     }
 
     pub(super) async fn reconcile_cli_runtime_human_wait_for_turn(
@@ -6156,6 +7220,48 @@ impl MessageProcessor {
         turn_id: &str,
         now_unix_ms: i64,
         source: &str,
+    ) -> anyhow::Result<bool> {
+        let Some(binding) = self
+            .crud_store
+            .get_cli_runtime_turn_binding(turn_id)
+            .await?
+        else {
+            return Ok(false);
+        };
+        let Some(expected) = self
+            .crud_store
+            .cli_runtime_turn_terminal_guard(&binding)
+            .await?
+        else {
+            return Ok(true);
+        };
+        let Some(transition) = self.try_cli_runtime_turn_transition(&binding).await? else {
+            return Ok(true);
+        };
+        if self
+            .crud_store
+            .cli_runtime_turn_terminal_guard(&binding)
+            .await?
+            .as_ref()
+            != Some(&expected)
+        {
+            return Ok(true);
+        }
+        self.reconcile_cli_runtime_human_wait_for_turn_inner(
+            turn_id,
+            now_unix_ms,
+            source,
+            &transition,
+        )
+        .await
+    }
+
+    async fn reconcile_cli_runtime_human_wait_for_turn_inner(
+        &self,
+        turn_id: &str,
+        now_unix_ms: i64,
+        source: &str,
+        transition: &Arc<tokio::sync::OwnedMutexGuard<()>>,
     ) -> anyhow::Result<bool> {
         let pending_requests = self
             .crud_store
@@ -6230,12 +7336,16 @@ impl MessageProcessor {
             return Ok(false);
         };
         if !cli_runtime_turn_binding_status_is_active(binding.status.as_str()) {
-            self.cleanup_cli_runtime_terminal_binding_status(
-                &binding,
-                "CLI runtime human wait reconciliation",
-            )
-            .await;
-            return Ok(false);
+            let applied = self
+                .cleanup_cli_runtime_terminal_turn_status_with_transition(
+                    &binding,
+                    cli_runtime_turn_status_from_binding(&binding)
+                        .unwrap_or(TurnStatus::InProgress),
+                    "CLI runtime human wait reconciliation",
+                    Some(transition),
+                )
+                .await;
+            return Ok(!applied);
         }
         human_requests.retain(|request| {
             request.workspace_id == binding.workspace_id
@@ -6308,27 +7418,28 @@ impl MessageProcessor {
         if !cli_runtime_turn_binding_status_is_active(binding.status.as_str()) {
             return Ok(crate::resilience::RuntimeTimeoutObservation::NotApplicable);
         }
-        let Some((workspace_id, turn)) = (if let Some((workspace_id, turn)) = self
-            .thread_manager
-            .turn_get(binding.thread_id.as_str(), binding.turn_id.as_str())
-            .await
-        {
-            Some((workspace_id, turn))
-        } else {
-            self.crud_store
-                .get_turn(binding.thread_id.as_str(), binding.turn_id.as_str())
-                .await?
-        }) else {
+        let Some((workspace_id, turn)) = self
+            .crud_store
+            .get_turn(binding.thread_id.as_str(), binding.turn_id.as_str())
+            .await?
+        else {
             return Ok(crate::resilience::RuntimeTimeoutObservation::Unavailable);
         };
         if turn.status != TurnStatus::InProgress {
-            self.cleanup_cli_runtime_terminal_turn_status(
-                &binding,
-                turn.status,
-                "timeout supervisor observed terminal Pioneer turn",
-            )
-            .await;
-            return Ok(crate::resilience::RuntimeTimeoutObservation::Terminal);
+            return Ok(
+                if self
+                    .cleanup_cli_runtime_terminal_turn_status(
+                        &binding,
+                        turn.status,
+                        "timeout supervisor observed terminal Pioneer turn",
+                    )
+                    .await
+                {
+                    crate::resilience::RuntimeTimeoutObservation::Terminal
+                } else {
+                    crate::resilience::RuntimeTimeoutObservation::Deferred
+                },
+            );
         }
 
         match self
@@ -6348,6 +7459,10 @@ impl MessageProcessor {
             Ok(CLIRuntimeAuthoritativeTurnState::Terminal) => {
                 Ok(crate::resilience::RuntimeTimeoutObservation::Terminal)
             }
+            Ok(
+                CLIRuntimeAuthoritativeTurnState::Deferred
+                | CLIRuntimeAuthoritativeTurnState::Superseded,
+            ) => Ok(crate::resilience::RuntimeTimeoutObservation::Deferred),
             Ok(CLIRuntimeAuthoritativeTurnState::Unavailable) => {
                 Ok(crate::resilience::RuntimeTimeoutObservation::Unavailable)
             }
@@ -6370,37 +7485,80 @@ impl MessageProcessor {
         binding: pioneer_crud::CliRuntimeTurnBindingRecord,
         now_unix_ms: i64,
     ) -> anyhow::Result<()> {
-        let (workspace_id, turn) = if let Some((workspace_id, turn)) = self
-            .thread_manager
-            .turn_get(binding.thread_id.as_str(), binding.turn_id.as_str())
-            .await
-        {
-            (workspace_id, turn)
-        } else {
-            let Some((workspace_id, turn)) = self
-                .crud_store
-                .get_turn(binding.thread_id.as_str(), binding.turn_id.as_str())
-                .await?
-            else {
+        let Some(expected) = self
+            .crud_store
+            .cli_runtime_turn_terminal_guard(&binding)
+            .await?
+        else {
+            return Ok(());
+        };
+        let Some((workspace_id, turn)) = self
+            .crud_store
+            .get_turn(binding.thread_id.as_str(), binding.turn_id.as_str())
+            .await?
+        else {
+            return Ok(());
+        };
+        if turn.status != expected.turn_status {
+            return Ok(());
+        }
+        if turn.status != TurnStatus::InProgress {
+            let key = CLIAgentRuntimeSessionKey::new(
+                binding.workspace_id.clone(),
+                binding.runtime_id.clone(),
+                binding.continuation_thread_id.clone(),
+            )?;
+            #[cfg(test)]
+            self.completed_history_preparation_barrier
+                .wait_if_armed(
+                    "__cli_terminal_before_commit__",
+                    &tokio_util::sync::CancellationToken::new(),
+                )
+                .await;
+            let transition = self.cli_runtime_session_transition_mutex(&key).await;
+            let Ok(_transition) = transition.try_lock() else {
                 return Ok(());
             };
-            (workspace_id, turn)
+            self.cleanup_cli_runtime_terminal_turn_guard(&expected, "stale CLI runtime turn scan")
+                .await?;
+            return Ok(());
+        }
+
+        // Human-wait reconciliation can reach terminal cleanup too. Fence that
+        // path together with runtime observation, rather than only its tail.
+        let key = CLIAgentRuntimeSessionKey::new(
+            binding.workspace_id.clone(),
+            binding.runtime_id.clone(),
+            binding.continuation_thread_id.clone(),
+        )?;
+        let transition = self.cli_runtime_session_transition_mutex(&key).await;
+        let Ok(turn_transition) = transition.try_lock_owned() else {
+            return Ok(());
         };
-        if turn.status != TurnStatus::InProgress {
-            self.cleanup_cli_runtime_terminal_turn_status(
-                &binding,
-                turn.status,
-                "stale CLI runtime turn scan",
-            )
-            .await;
+        let turn_transition = Arc::new(turn_transition);
+        if self
+            .crud_store
+            .cli_runtime_turn_terminal_guard(&binding)
+            .await?
+            .as_ref()
+            != Some(&expected)
+        {
             return Ok(());
         }
 
         if self
-            .reconcile_cli_runtime_human_wait_for_turn(
+            .replay_cli_runtime_terminal_event(&expected, &turn_transition)
+            .await?
+        {
+            return Ok(());
+        }
+
+        if self
+            .reconcile_cli_runtime_human_wait_for_turn_inner(
                 binding.turn_id.as_str(),
                 now_unix_ms,
                 "CLI runtime stale turn scan",
+                &turn_transition,
             )
             .await?
         {
@@ -6431,7 +7589,12 @@ impl MessageProcessor {
         }
 
         match self
-            .reconcile_cli_runtime_turn_from_runtime(&binding, workspace_id.as_str(), &turn)
+            .reconcile_cli_runtime_turn_from_runtime_inner(
+                &binding,
+                workspace_id.as_str(),
+                &turn,
+                &turn_transition,
+            )
             .await?
         {
             CLIRuntimeAuthoritativeTurnState::Active(evidence) => {
@@ -6444,7 +7607,9 @@ impl MessageProcessor {
                     .await?;
                 return Ok(());
             }
-            CLIRuntimeAuthoritativeTurnState::Terminal => return Ok(()),
+            CLIRuntimeAuthoritativeTurnState::Terminal
+            | CLIRuntimeAuthoritativeTurnState::Superseded
+            | CLIRuntimeAuthoritativeTurnState::Deferred => return Ok(()),
             CLIRuntimeAuthoritativeTurnState::Unavailable => {
                 let reason = format!(
                     "CLI runtime observation is unavailable for stale turn `{}`; authoritative state rehydration is required",
@@ -6463,12 +7628,59 @@ impl MessageProcessor {
         }
     }
 
-    pub(super) async fn reconcile_cli_runtime_turn_from_runtime(
+    pub(crate) async fn reconcile_cli_runtime_turn_from_runtime(
         &self,
         binding: &pioneer_crud::CliRuntimeTurnBindingRecord,
         workspace_id: &str,
         turn: &Turn,
     ) -> anyhow::Result<CLIRuntimeAuthoritativeTurnState> {
+        let Some(expected) = self
+            .crud_store
+            .cli_runtime_turn_terminal_guard(binding)
+            .await?
+        else {
+            return Ok(CLIRuntimeAuthoritativeTurnState::Superseded);
+        };
+        let Some(transition) = self.try_cli_runtime_turn_transition(binding).await? else {
+            return Ok(CLIRuntimeAuthoritativeTurnState::Deferred);
+        };
+        if expected.turn_status != turn.status
+            || self
+                .crud_store
+                .cli_runtime_turn_terminal_guard(binding)
+                .await?
+                .as_ref()
+                != Some(&expected)
+        {
+            return Ok(CLIRuntimeAuthoritativeTurnState::Superseded);
+        }
+        self.reconcile_cli_runtime_turn_from_runtime_inner(binding, workspace_id, turn, &transition)
+            .await
+    }
+
+    async fn reconcile_cli_runtime_turn_from_runtime_inner(
+        &self,
+        binding: &pioneer_crud::CliRuntimeTurnBindingRecord,
+        workspace_id: &str,
+        turn: &Turn,
+        turn_transition: &Arc<tokio::sync::OwnedMutexGuard<()>>,
+    ) -> anyhow::Result<CLIRuntimeAuthoritativeTurnState> {
+        let Some(expected) = self
+            .crud_store
+            .cli_runtime_turn_terminal_guard(binding)
+            .await?
+        else {
+            return Ok(CLIRuntimeAuthoritativeTurnState::Superseded);
+        };
+        if expected.turn_status != turn.status {
+            return Ok(CLIRuntimeAuthoritativeTurnState::Superseded);
+        }
+        if self
+            .replay_cli_runtime_terminal_event(&expected, turn_transition)
+            .await?
+        {
+            return Ok(CLIRuntimeAuthoritativeTurnState::Terminal);
+        }
         if let Some(attempt) = self
             .crud_store
             .latest_cli_runtime_turn_attempt(binding.turn_id.as_str())
@@ -6499,7 +7711,7 @@ impl MessageProcessor {
                     return Ok(CLIRuntimeAuthoritativeTurnState::Unavailable);
                 }
             };
-            self.ensure_cli_runtime_turn_loaded_for_lifecycle(
+            self.ensure_runtime_turn_loaded_for_lifecycle(
                 workspace_id,
                 binding.thread_id.as_str(),
                 turn,
@@ -6510,6 +7722,12 @@ impl MessageProcessor {
                 i64::from(attempt.attempt_index),
             )
             .await?;
+            if !self.finalize_codex_history(binding).await {
+                anyhow::bail!(
+                    "completed Codex aggregate projection could not be finalized for turn `{}`",
+                    binding.turn_id
+                );
+            }
             if !self
                 .complete_native_turn(binding.thread_id.clone(), binding.turn_id.clone(), recovery)
                 .await
@@ -6520,10 +7738,11 @@ impl MessageProcessor {
                     binding.turn_id
                 );
             }
-            self.cleanup_cli_runtime_terminal_turn_status(
+            self.cleanup_cli_runtime_terminal_turn_status_with_transition(
                 binding,
                 TurnStatus::Completed,
                 "completed CLI runtime attempt reconciliation",
+                Some(turn_transition),
             )
             .await;
             info!(
@@ -6596,10 +7815,23 @@ impl MessageProcessor {
         }
 
         for event in observation.reconciliation_events.iter().cloned() {
-            self.apply_authoritative_cli_runtime_snapshot_event(handle.instance(), binding, event)
-                .await?;
+            if matches!(event, RuntimeEvent::TurnCompleted(_))
+                || cli_runtime_turn_status_for_terminal_event(&event).is_some()
+            {
+                continue;
+            }
+            self.apply_authoritative_cli_runtime_snapshot_event_inner(
+                handle.instance(),
+                binding,
+                event,
+                Some(turn_transition),
+            )
+            .await?;
         }
-        self.ensure_cli_runtime_turn_loaded_for_lifecycle(
+        if !self.finalize_codex_history(binding).await {
+            return Ok(CLIRuntimeAuthoritativeTurnState::Unavailable);
+        }
+        self.ensure_runtime_turn_loaded_for_lifecycle(
             workspace_id,
             binding.thread_id.as_str(),
             turn,
@@ -6608,12 +7840,20 @@ impl MessageProcessor {
 
         let terminal_event = match observation.status {
             CLIAgentRuntimeObservedTurnStatus::Completed => {
-                RuntimeEvent::TurnCompleted(RuntimeTurnCompleted {
+                let observed_completion =
+                    observation.reconciliation_events.iter().find_map(|event| {
+                        if let RuntimeEvent::TurnCompleted(completed) = event {
+                            Some(completed.clone())
+                        } else {
+                            None
+                        }
+                    });
+                RuntimeEvent::TurnCompleted(observed_completion.unwrap_or(RuntimeTurnCompleted {
                     native_thread_id: Some(binding.native_thread_id.clone()),
                     native_turn_id: native_turn_id.to_owned(),
                     status: "completed".to_owned(),
                     native: None,
-                })
+                }))
             }
             CLIAgentRuntimeObservedTurnStatus::Failed => {
                 RuntimeEvent::TurnFailed(RuntimeTurnFailed {
@@ -6640,34 +7880,67 @@ impl MessageProcessor {
                 let reason = observation
                     .message
                     .unwrap_or_else(|| "CLI runtime reported a blocked turn".to_owned());
-                if let Some(attempt) = self
+                let Some(owner) = self
                     .crud_store
                     .resolve_cli_runtime_native_turn_owner(
                         binding.runtime_id.as_str(),
                         native_turn_id.as_str(),
                     )
                     .await?
+                else {
+                    return Ok(CLIRuntimeAuthoritativeTurnState::Superseded);
+                };
+                if owner.binding.turn_id != binding.turn_id
+                    || owner.attempt.native_thread_id != binding.native_thread_id
+                    || !owner.attempt.status.is_active()
+                    || owner.segment.as_ref().is_some_and(|segment| {
+                        segment.status != pioneer_crud::CliRuntimeExecutionSegmentStatus::Running
+                    })
                 {
-                    let _ = self
-                        .crud_store
-                        .mark_cli_runtime_turn_attempt_terminal(
-                            attempt.attempt.id.as_str(),
-                            pioneer_crud::CliRuntimeTurnAttemptStatus::Interrupted,
-                            Some(reason.clone()),
-                            chrono::Utc::now().fixed_offset(),
-                        )
-                        .await?;
+                    return Ok(CLIRuntimeAuthoritativeTurnState::Superseded);
                 }
+                let recovery = match self
+                    .cli_runtime_attempt_recovery_state(&owner.attempt)
+                    .await?
+                {
+                    CLIRuntimeAttemptRecoveryState::Normal => None,
+                    CLIRuntimeAttemptRecoveryState::Active(recovery) => Some(recovery),
+                    CLIRuntimeAttemptRecoveryState::Inactive { .. } => {
+                        return Ok(CLIRuntimeAuthoritativeTurnState::Superseded);
+                    }
+                };
+                let Some(guard) = self
+                    .crud_store
+                    .cli_runtime_blocked_turn_guard(&owner.binding, &native_turn_id)
+                    .await?
+                else {
+                    return Ok(CLIRuntimeAuthoritativeTurnState::Superseded);
+                };
+                if guard.attempt_id != owner.attempt.id
+                    || guard.segment.as_ref().map(|(id, _, _)| id.as_str())
+                        != owner.segment.as_ref().map(|segment| segment.id.as_str())
+                {
+                    return Ok(CLIRuntimeAuthoritativeTurnState::Superseded);
+                }
+                #[cfg(test)]
+                self.completed_history_preparation_barrier
+                    .wait_if_armed(
+                        "__cli_blocked_before_enqueue__",
+                        &tokio_util::sync::CancellationToken::new(),
+                    )
+                    .await;
                 self.commit_cli_runtime_final_diff_snapshot(&key, binding, native_turn_id.as_str())
                     .await;
-                self.publish_cli_runtime_durable_and_wait(
+                self.publish_cli_runtime_durable_guarded(
                     handle.instance(),
                     AgentDurableEvent::TurnBlocked {
                         thread_id: binding.thread_id.clone(),
                         turn_id: binding.turn_id.clone(),
                         reason,
-                        recovery: None,
+                        recovery,
                     },
+                    Some(turn_transition),
+                    Some(guard),
                 )
                 .await
                 .map_err(|error| {
@@ -6678,7 +7951,12 @@ impl MessageProcessor {
             CLIAgentRuntimeObservedTurnStatus::InProgress => unreachable!(),
         };
         if !self
-            .process_bound_cli_runtime_event(handle.instance(), binding.clone(), terminal_event)
+            .process_bound_cli_runtime_event_with_transition(
+                handle.instance(),
+                binding.clone(),
+                terminal_event,
+                Some(turn_transition),
+            )
             .await
         {
             anyhow::bail!("failed to commit canonical runtime terminal observation");
@@ -6686,7 +7964,7 @@ impl MessageProcessor {
         Ok(CLIRuntimeAuthoritativeTurnState::Terminal)
     }
 
-    async fn ensure_cli_runtime_turn_loaded_for_lifecycle(
+    pub(super) async fn ensure_runtime_turn_loaded_for_lifecycle(
         &self,
         workspace_id: &str,
         thread_id: &str,
@@ -6734,6 +8012,7 @@ impl MessageProcessor {
                 turn_id: None,
                 native_thread_id: Some(binding.native_thread_id.clone()),
                 native_turn_id: Some(native_turn_id),
+                native_method: None,
                 limit: None,
             })
             .await?;
@@ -7004,27 +8283,19 @@ impl MessageProcessor {
 
         match request.method.as_str() {
             "item/permissions/requestApproval" => {
-                let params = request
-                    .params
-                    .as_ref()
-                    .and_then(JsonValue::as_object)
-                    .expect("validated Codex permission approval params");
-                let native_thread_id = params
-                    .get("threadId")
-                    .and_then(JsonValue::as_str)
+                let decoded = decode_codex_permission_approval_request(&request);
+                let native_thread_id = decoded
+                    .native_thread_id
+                    .as_deref()
                     .expect("validated Codex permission approval threadId");
-                let native_turn_id = params
-                    .get("turnId")
-                    .and_then(JsonValue::as_str)
+                let native_turn_id = decoded
+                    .native_turn_id
+                    .as_deref()
                     .expect("validated Codex permission approval turnId");
-                let native_item_id = params
-                    .get("itemId")
-                    .and_then(JsonValue::as_str)
+                let native_item_id = decoded
+                    .native_item_id
+                    .as_deref()
                     .expect("validated Codex permission approval itemId");
-                let requested_permissions = params
-                    .get("permissions")
-                    .cloned()
-                    .expect("validated Codex permission approval permissions");
 
                 let Some(turn_binding) = self
                     .cli_runtime_turn_binding_for_native_turn_option(
@@ -7050,7 +8321,7 @@ impl MessageProcessor {
                     self.fail_codex_machine_request(
                         &responder,
                         CLI_RUNTIME_MACHINE_REQUEST_STALE_CODE,
-                        "Codex MCP permission request has no active Pioneer turn binding",
+                        "Codex permission request has no active Pioneer turn binding",
                         Some(json!({"method": request.method})),
                     )
                     .await;
@@ -7068,7 +8339,7 @@ impl MessageProcessor {
                     self.fail_codex_machine_request(
                         &responder,
                         CLI_RUNTIME_MACHINE_REQUEST_STALE_CODE,
-                        "Codex MCP permission request belongs to a stale or terminal turn",
+                        "Codex permission request belongs to a stale or terminal turn",
                         Some(json!({"method": request.method})),
                     )
                     .await;
@@ -7081,7 +8352,7 @@ impl MessageProcessor {
                         native_thread_id: native_thread_id.to_owned(),
                         native_turn_id: native_turn_id.to_owned(),
                         native_item_id: native_item_id.to_owned(),
-                        requested_permissions,
+                        requested_permissions: decoded.requested_permissions.clone(),
                     })
                     .await;
                 match approval {
@@ -7100,13 +8371,73 @@ impl MessageProcessor {
                         }
                     }
                     Ok(None) => {
-                        self.fail_codex_machine_request(
-                            &responder,
-                            CLI_RUNTIME_MACHINE_REQUEST_STALE_CODE,
-                            "Codex MCP permission request does not match the active frozen binding",
-                            Some(json!({"method": request.method})),
-                        )
-                        .await;
+                        if let Err(error) = Self::validate_codex_permission_request(&decoded) {
+                            warn!(
+                                workspace_id = key.workspace_id.as_str(),
+                                runtime_id = key.runtime_id.as_str(),
+                                thread_id = key.thread_id.as_str(),
+                                native_thread_id,
+                                native_turn_id,
+                                native_item_id,
+                                error = %format!("{error:#}"),
+                                "invalid Codex permission request"
+                            );
+                            self.fail_codex_machine_request(
+                                &responder,
+                                CLI_RUNTIME_MACHINE_REQUEST_INVALID_PARAMS_CODE,
+                                "invalid Codex permission request",
+                                Some(json!({"method": request.method})),
+                            )
+                            .await;
+                            return;
+                        }
+                        match self
+                            .open_codex_permission_approval_request_for_turn(
+                                key.workspace_id.as_str(),
+                                key.runtime_id.as_str(),
+                                "codex",
+                                turn_binding.thread_id.as_str(),
+                                turn_binding.turn_id.clone(),
+                                decoded.clone(),
+                            )
+                            .await
+                        {
+                            Ok(opened) => {
+                                self.register_cli_runtime_machine_request(
+                                    instance,
+                                    &request,
+                                    responder.clone(),
+                                    &opened,
+                                )
+                                .await;
+                                self.confirm_cli_runtime_recovery_for_native_progress(
+                                    key,
+                                    &turn_binding,
+                                    native_turn_id,
+                                    request.method.as_str(),
+                                )
+                                .await;
+                            }
+                            Err(error) => {
+                                warn!(
+                                    workspace_id = key.workspace_id.as_str(),
+                                    runtime_id = key.runtime_id.as_str(),
+                                    thread_id = key.thread_id.as_str(),
+                                    native_thread_id,
+                                    native_turn_id,
+                                    native_item_id,
+                                    error = %format!("{error:#}"),
+                                    "failed to open Codex permission approval request"
+                                );
+                                self.fail_codex_machine_request(
+                                    &responder,
+                                    CLI_RUNTIME_MACHINE_REQUEST_UNAVAILABLE_CODE,
+                                    "failed to open Pioneer permission request",
+                                    Some(json!({"method": request.method})),
+                                )
+                                .await;
+                            }
+                        }
                     }
                     Err(error) => {
                         warn!(
@@ -7539,6 +8870,24 @@ impl MessageProcessor {
         native_thread_id: Option<&str>,
         source: &str,
     ) -> bool {
+        self.cli_runtime_turn_binding_accepts_native_activity_inner(
+            key,
+            binding,
+            native_thread_id,
+            source,
+            None,
+        )
+        .await
+    }
+
+    async fn cli_runtime_turn_binding_accepts_native_activity_inner(
+        &self,
+        key: &CLIAgentRuntimeSessionKey,
+        binding: &pioneer_crud::CliRuntimeTurnBindingRecord,
+        native_thread_id: Option<&str>,
+        source: &str,
+        transition: Option<&Arc<tokio::sync::OwnedMutexGuard<()>>>,
+    ) -> bool {
         if binding.workspace_id != key.workspace_id
             || binding.runtime_id != key.runtime_id
             || binding.continuation_thread_id != key.thread_id
@@ -7574,19 +8923,16 @@ impl MessageProcessor {
         }
 
         if !cli_runtime_turn_binding_status_is_active(binding.status.as_str()) {
-            self.compact_cli_runtime_terminal_native_events_for_turn(
-                binding.turn_id.as_str(),
-                source,
-            )
-            .await;
             return false;
         }
 
         match self.cli_runtime_turn_status_for_binding(binding).await {
             Ok(Some(TurnStatus::InProgress)) => true,
             Ok(Some(status)) => {
-                self.cleanup_cli_runtime_terminal_turn_status(binding, status, source)
-                    .await;
+                self.cleanup_cli_runtime_terminal_turn_status_with_transition(
+                    binding, status, source, transition,
+                )
+                .await;
                 false
             }
             Ok(None) => {
@@ -8061,95 +9407,6 @@ impl MessageProcessor {
         }
     }
 
-    pub(crate) async fn ensure_cli_runtime_turn_blocked_cleanup(
-        &self,
-        thread_id: &str,
-        turn_id: &str,
-        reason: Option<&str>,
-    ) {
-        let binding = match self.crud_store.get_cli_runtime_turn_binding(turn_id).await {
-            Ok(Some(binding)) => binding,
-            Ok(None) => return,
-            Err(error) => {
-                warn!(
-                    thread_id,
-                    turn_id,
-                    error = %format!("{error:#}"),
-                    "failed to load CLI runtime turn binding for blocked cleanup"
-                );
-                return;
-            }
-        };
-
-        if binding.thread_id != thread_id {
-            warn!(
-                thread_id,
-                turn_id,
-                binding_thread_id = binding.thread_id.as_str(),
-                "CLI runtime turn binding thread mismatch during blocked cleanup"
-            );
-        }
-
-        if let Err(error) =
-            crate::cli_runtime::turn_binding::update_cli_runtime_turn_binding_status(
-                self.crud_store.as_ref(),
-                turn_id,
-                crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_BLOCKED,
-                reason.map(str::to_owned),
-                chrono::Utc::now().fixed_offset(),
-            )
-            .await
-        {
-            warn!(
-                workspace_id = binding.workspace_id.as_str(),
-                runtime_id = binding.runtime_id.as_str(),
-                thread_id = binding.thread_id.as_str(),
-                turn_id = binding.turn_id.as_str(),
-                error = %format!("{error:#}"),
-                "failed to mark CLI runtime turn binding blocked"
-            );
-        }
-
-        self.expire_cli_runtime_pending_requests_for_turn(turn_id)
-            .await;
-        self.interrupt_and_close_cli_runtime_binding(&binding, reason)
-            .await;
-        self.release_cli_runtime_session_turn_lease(turn_id).await;
-    }
-
-    pub(crate) async fn ensure_cli_runtime_turn_interrupted_cleanup(
-        &self,
-        binding: &pioneer_crud::CliRuntimeTurnBindingRecord,
-        reason: Option<&str>,
-    ) {
-        if let Err(error) =
-            crate::cli_runtime::turn_binding::update_cli_runtime_turn_binding_status(
-                self.crud_store.as_ref(),
-                binding.turn_id.as_str(),
-                crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_INTERRUPTED,
-                reason.map(str::to_owned),
-                chrono::Utc::now().fixed_offset(),
-            )
-            .await
-        {
-            warn!(
-                workspace_id = binding.workspace_id.as_str(),
-                runtime_id = binding.runtime_id.as_str(),
-                thread_id = binding.thread_id.as_str(),
-                turn_id = binding.turn_id.as_str(),
-                error = %format!("{error:#}"),
-                "failed to mark CLI runtime turn binding interrupted"
-            );
-        }
-
-        self.expire_cli_runtime_pending_requests_for_turn(binding.turn_id.as_str())
-            .await;
-        self.interrupt_and_close_cli_runtime_binding(binding, reason)
-            .await;
-        self.release_cli_runtime_session_turn_lease(binding.turn_id.as_str())
-            .await;
-    }
-
     async fn validate_cli_runtime_pending_request_active_turn(
         &self,
         pending: &CliRuntimePendingRequestRecord,
@@ -8266,85 +9523,214 @@ impl MessageProcessor {
         }
     }
 
+    pub(super) async fn try_cli_runtime_turn_transition(
+        &self,
+        binding: &pioneer_crud::CliRuntimeTurnBindingRecord,
+    ) -> anyhow::Result<Option<Arc<tokio::sync::OwnedMutexGuard<()>>>> {
+        let key = CLIAgentRuntimeSessionKey::new(
+            &binding.workspace_id,
+            &binding.runtime_id,
+            &binding.continuation_thread_id,
+        )?;
+        Ok(self
+            .cli_runtime_session_transition_mutex(&key)
+            .await
+            .try_lock_owned()
+            .ok()
+            .map(Arc::new))
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn cleanup_completed_cli_task_fixture(&self, turn_id: &str) {
+        let binding = self
+            .crud_store
+            .get_cli_runtime_turn_binding(turn_id)
+            .await
+            .unwrap()
+            .expect("completed CLI fixture must have a native binding");
+        self.cleanup_cli_runtime_terminal_turn_status(
+            &binding,
+            TurnStatus::Completed,
+            "completed CLI task fixture",
+        )
+        .await;
+    }
+
     pub(super) async fn cleanup_cli_runtime_terminal_turn_status(
         &self,
         binding: &pioneer_crud::CliRuntimeTurnBindingRecord,
         status: TurnStatus,
         reason: &str,
-    ) {
-        if status != TurnStatus::InProgress {
-            self.mcp_service
-                .cancel_turn_mcp_invocations(binding.turn_id.as_str());
-            if let Some(manager) = self.cli_runtime_manager.as_ref()
-                && let Ok(key) = CLIAgentRuntimeSessionKey::new(
-                    binding.workspace_id.clone(),
-                    binding.runtime_id.clone(),
-                    binding.continuation_thread_id.clone(),
+    ) -> bool {
+        self.cleanup_cli_runtime_terminal_turn_status_with_transition(binding, status, reason, None)
+            .await
+    }
+
+    pub(super) async fn cleanup_cli_runtime_terminal_turn_status_with_transition(
+        &self,
+        binding: &pioneer_crud::CliRuntimeTurnBindingRecord,
+        status: TurnStatus,
+        reason: &str,
+        transition: Option<&Arc<tokio::sync::OwnedMutexGuard<()>>>,
+    ) -> bool {
+        let result = async {
+            let Some(expected) = self
+                .crud_store
+                .cli_runtime_turn_terminal_guard(binding)
+                .await?
+            else {
+                return Ok(false);
+            };
+            if status == TurnStatus::InProgress || expected.turn_status != status {
+                return Ok(false);
+            }
+            #[cfg(test)]
+            self.completed_history_preparation_barrier
+                .wait_if_armed(
+                    "__cli_cleanup_before_gate__",
+                    &tokio_util::sync::CancellationToken::new(),
                 )
-                && let Some(handle) = manager.existing_session(&key).await
-                && let Err(error) = handle
-                    .session()
-                    .terminal_mcp_turn(binding.turn_id.as_str())
-                    .await
-            {
-                warn!(
-                    workspace_id = binding.workspace_id.as_str(),
-                    runtime_id = binding.runtime_id.as_str(),
-                    thread_id = binding.thread_id.as_str(),
-                    turn_id = binding.turn_id.as_str(),
-                    error = %format!("{error:#}"),
-                    "failed to terminalize CLI MCP turn lease"
-                );
+                .await;
+            let _acquired = if transition.is_none() {
+                let Some(acquired) = self.try_cli_runtime_turn_transition(binding).await? else {
+                    return Ok(false);
+                };
+                Some(acquired)
+            } else {
+                None
+            };
+            self.cleanup_cli_runtime_terminal_turn_guard(&expected, reason)
+                .await
+        }
+        .await;
+        match result {
+            Ok(applied) => applied,
+            Err(error) => {
+                warn!(turn_id = binding.turn_id.as_str(), error = %error,
+                    "deferred guarded CLI terminal cleanup");
+                false
             }
         }
-        match status {
-            TurnStatus::InProgress => {}
-            TurnStatus::Completed => {
-                self.update_cli_runtime_turn_binding_terminal_status(
-                    binding,
-                    crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_COMPLETED,
-                    reason,
-                )
-                .await;
-                self.expire_cli_runtime_pending_requests_for_turn(binding.turn_id.as_str())
-                    .await;
+    }
+
+    // Caller holds the session transition gate through commit and all effects.
+    // A failed/unknown commit never grants authority to perform those effects.
+    async fn cleanup_cli_runtime_terminal_turn_guard(
+        &self,
+        expected: &pioneer_crud::CliRuntimeTurnTerminalGuard,
+        reason: &str,
+    ) -> anyhow::Result<bool> {
+        let attempt_status = match expected.turn_status {
+            TurnStatus::InProgress => return Ok(false),
+            TurnStatus::Completed => pioneer_crud::CliRuntimeTurnAttemptStatus::Completed,
+            TurnStatus::Failed => pioneer_crud::CliRuntimeTurnAttemptStatus::Failed,
+            TurnStatus::Interrupted | TurnStatus::Blocked => {
+                pioneer_crud::CliRuntimeTurnAttemptStatus::Interrupted
             }
-            TurnStatus::Failed => {
-                self.update_cli_runtime_turn_binding_terminal_status(
-                    binding,
-                    crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_FAILED,
-                    reason,
-                )
-                .await;
-                self.expire_cli_runtime_pending_requests_for_turn(binding.turn_id.as_str())
-                    .await;
-                self.interrupt_and_close_cli_runtime_binding(binding, Some(reason))
-                    .await;
-            }
-            TurnStatus::Interrupted => {
-                self.ensure_cli_runtime_turn_interrupted_cleanup(binding, Some(reason))
-                    .await;
-            }
-            TurnStatus::Blocked => {
-                self.ensure_cli_runtime_turn_blocked_cleanup(
-                    binding.thread_id.as_str(),
-                    binding.turn_id.as_str(),
-                    Some(reason),
-                )
-                .await;
-            }
-        }
-        if status != TurnStatus::InProgress {
-            self.invalidate_cli_runtime_turn_binding_cache(binding)
-                .await;
-            self.compact_cli_runtime_terminal_native_events_for_turn(
-                binding.turn_id.as_str(),
-                reason,
+        };
+        let session = self.cli_runtime_terminal_session(&expected.binding).await;
+        let Some(binding) = self
+            .crud_store
+            .terminalize_cli_runtime_turn_binding_guarded(
+                &expected.binding.turn_id,
+                cli_runtime_turn_status_label(expected.turn_status),
+                attempt_status,
+                Some(reason.to_owned()),
+                chrono::Utc::now().fixed_offset(),
+                Some(expected),
+            )
+            .await?
+        else {
+            return Ok(false);
+        };
+        #[cfg(test)]
+        self.completed_history_preparation_barrier
+            .wait_if_armed(
+                "__cli_terminal_after_commit__",
+                &tokio_util::sync::CancellationToken::new(),
             )
             .await;
-            self.release_cli_runtime_session_turn_lease(binding.turn_id.as_str())
-                .await;
+        let native_turn_id = expected
+            .segment
+            .as_ref()
+            .map(|segment| segment.native_turn_id.as_str())
+            .or_else(|| {
+                expected
+                    .attempt
+                    .as_ref()
+                    .and_then(|attempt| attempt.native_turn_id.as_deref())
+            })
+            .or(expected.binding.native_turn_id.as_deref());
+        self.cleanup_cli_runtime_terminal_turn_effects(
+            &binding,
+            expected.turn_status,
+            reason,
+            native_turn_id,
+            session.as_ref(),
+        )
+        .await;
+        Ok(true)
+    }
+
+    async fn cli_runtime_terminal_session(
+        &self,
+        binding: &pioneer_crud::CliRuntimeTurnBindingRecord,
+    ) -> Option<CLIAgentRuntimeSessionHandle> {
+        let manager = self.cli_runtime_manager.as_ref()?;
+        let key = CLIAgentRuntimeSessionKey::new(
+            &binding.workspace_id,
+            &binding.runtime_id,
+            &binding.continuation_thread_id,
+        )
+        .ok()?;
+        manager.existing_session(&key).await
+    }
+
+    async fn cleanup_cli_runtime_terminal_turn_effects(
+        &self,
+        binding: &pioneer_crud::CliRuntimeTurnBindingRecord,
+        status: TurnStatus,
+        reason: &str,
+        native_turn_id: Option<&str>,
+        session: Option<&CLIAgentRuntimeSessionHandle>,
+    ) {
+        if !self.finalize_codex_history(binding).await {
+            warn!(
+                thread_id = binding.thread_id.as_str(),
+                turn_id = binding.turn_id.as_str(),
+                "Codex aggregate finalization will be retried by terminal reconciliation"
+            );
         }
+        self.mcp_service
+            .cancel_turn_mcp_invocations(binding.turn_id.as_str());
+        if let Some(handle) = session
+            && let Err(error) = handle
+                .session()
+                .terminal_mcp_turn(binding.turn_id.as_str())
+                .await
+        {
+            warn!(turn_id = binding.turn_id.as_str(), error = %error,
+                "failed to terminalize CLI MCP turn lease");
+        }
+        self.expire_cli_runtime_pending_requests_for_turn(binding.turn_id.as_str())
+            .await;
+        if matches!(
+            status,
+            TurnStatus::Failed | TurnStatus::Interrupted | TurnStatus::Blocked
+        ) {
+            self.interrupt_and_close_cli_runtime_target(
+                binding,
+                native_turn_id,
+                Some(reason),
+                session,
+            )
+            .await;
+        }
+        self.invalidate_cli_runtime_turn_binding_cache(binding)
+            .await;
+        // Last: new native admission cannot run until the transition gate drops.
+        self.release_cli_runtime_session_turn_lease(binding.turn_id.as_str())
+            .await;
     }
 
     async fn cleanup_cli_runtime_terminal_binding_status(
@@ -8352,103 +9738,9 @@ impl MessageProcessor {
         binding: &pioneer_crud::CliRuntimeTurnBindingRecord,
         reason: &str,
     ) {
-        match binding.status.as_str() {
-            crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_COMPLETED => {
-                self.expire_cli_runtime_pending_requests_for_turn(binding.turn_id.as_str())
-                    .await;
-            }
-            crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_FAILED => {
-                self.expire_cli_runtime_pending_requests_for_turn(binding.turn_id.as_str())
-                    .await;
-                self.interrupt_and_close_cli_runtime_binding(binding, Some(reason))
-                    .await;
-            }
-            crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_INTERRUPTED => {
-                self.ensure_cli_runtime_turn_interrupted_cleanup(binding, Some(reason))
-                    .await;
-            }
-            crate::cli_runtime::turn_binding::CLI_RUNTIME_TURN_STATUS_BLOCKED => {
-                self.ensure_cli_runtime_turn_blocked_cleanup(
-                    binding.thread_id.as_str(),
-                    binding.turn_id.as_str(),
-                    Some(reason),
-                )
+        if let Some(status) = cli_runtime_turn_status_from_binding(binding) {
+            self.cleanup_cli_runtime_terminal_turn_status(binding, status, reason)
                 .await;
-            }
-            _ => {}
-        }
-        self.compact_cli_runtime_terminal_native_events_for_turn(binding.turn_id.as_str(), reason)
-            .await;
-    }
-
-    async fn compact_cli_runtime_terminal_native_events_for_turn(
-        &self,
-        turn_id: &str,
-        reason: &str,
-    ) {
-        loop {
-            match self
-                .crud_store
-                .compact_terminal_cli_runtime_native_events_for_turn(
-                    turn_id,
-                    CLI_RUNTIME_TERMINAL_NATIVE_EVENT_CLEANUP_BATCH_SIZE,
-                    false,
-                )
-                .await
-            {
-                Ok(summary) if summary.candidate_rows == 0 => break,
-                Ok(summary) => {
-                    debug!(
-                        turn_id,
-                        reason,
-                        candidate_rows = summary.candidate_rows,
-                        deleted_rows = summary.deleted_rows,
-                        payload_bytes = summary.payload_bytes,
-                        "compacted terminal CLI runtime native delta events for turn"
-                    );
-                    if summary.deleted_rows == 0 {
-                        break;
-                    }
-                }
-                Err(error) => {
-                    warn!(
-                        turn_id,
-                        reason,
-                        error = %format!("{error:#}"),
-                        "failed to compact terminal CLI runtime native delta events for turn"
-                    );
-                    break;
-                }
-            }
-        }
-    }
-
-    async fn update_cli_runtime_turn_binding_terminal_status(
-        &self,
-        binding: &pioneer_crud::CliRuntimeTurnBindingRecord,
-        terminal_status: &str,
-        reason: &str,
-    ) {
-        if let Err(error) =
-            crate::cli_runtime::turn_binding::update_cli_runtime_turn_binding_status(
-                self.crud_store.as_ref(),
-                binding.turn_id.as_str(),
-                terminal_status,
-                Some(reason.to_owned()),
-                chrono::Utc::now().fixed_offset(),
-            )
-            .await
-        {
-            warn!(
-                workspace_id = binding.workspace_id.as_str(),
-                runtime_id = binding.runtime_id.as_str(),
-                thread_id = binding.thread_id.as_str(),
-                turn_id = binding.turn_id.as_str(),
-                terminal_status,
-                reason,
-                error = %format!("{error:#}"),
-                "failed to reconcile CLI runtime turn binding terminal status"
-            );
         }
     }
 
@@ -8701,45 +9993,21 @@ impl MessageProcessor {
         Ok(expired)
     }
 
-    async fn interrupt_and_close_cli_runtime_binding(
+    async fn interrupt_and_close_cli_runtime_target(
         &self,
         binding: &pioneer_crud::CliRuntimeTurnBindingRecord,
+        native_turn_id: Option<&str>,
         reason: Option<&str>,
+        handle: Option<&CLIAgentRuntimeSessionHandle>,
     ) {
         let Some(manager) = self.cli_runtime_manager.as_ref() else {
             return;
         };
-        let key = match CLIAgentRuntimeSessionKey::new(
-            binding.workspace_id.as_str(),
-            binding.runtime_id.as_str(),
-            binding.continuation_thread_id.as_str(),
-        ) {
-            Ok(key) => key,
-            Err(error) => {
-                warn!(
-                    workspace_id = binding.workspace_id.as_str(),
-                    runtime_id = binding.runtime_id.as_str(),
-                    thread_id = binding.thread_id.as_str(),
-                    turn_id = binding.turn_id.as_str(),
-                    error = %format!("{error:#}"),
-                    "invalid CLI runtime key during terminal cleanup"
-                );
-                return;
-            }
+        let Some(handle) = handle else {
+            return;
         };
-        let native_turn_id = match self.cli_runtime_latest_native_turn_id(binding).await {
-            Ok(native_turn_id) => native_turn_id,
-            Err(error) => {
-                warn!(
-                    turn_id = binding.turn_id.as_str(),
-                    error = %format!("{error:#}"),
-                    "failed to resolve latest CLI runtime segment during terminal cleanup"
-                );
-                binding.native_turn_id.clone()
-            }
-        };
-
-        if let Some(handle) = manager.existing_session(&key).await {
+        let key = handle.instance().key();
+        {
             let session = handle.session();
             if let Err(error) = session
                 .clear_native_thread_goal(binding.native_thread_id.as_str())
@@ -8753,10 +10021,7 @@ impl MessageProcessor {
                 );
             }
             if let Err(error) = session
-                .interrupt_turn(
-                    Some(binding.native_thread_id.as_str()),
-                    native_turn_id.as_deref(),
-                )
+                .interrupt_turn(Some(binding.native_thread_id.as_str()), native_turn_id)
                 .await
             {
                 debug!(
@@ -8764,7 +10029,7 @@ impl MessageProcessor {
                     runtime_id = binding.runtime_id.as_str(),
                     thread_id = binding.thread_id.as_str(),
                     turn_id = binding.turn_id.as_str(),
-                    native_turn_id = native_turn_id.as_deref(),
+                    native_turn_id = native_turn_id,
                     reason,
                     error = %format!("{error:#}"),
                     "failed to interrupt CLI runtime turn during terminal cleanup"
@@ -8774,9 +10039,9 @@ impl MessageProcessor {
 
         if self
             .cli_runtime_has_active_other_turn_binding(
-                &key,
+                key,
                 Some(binding.native_thread_id.as_str()),
-                native_turn_id.as_deref(),
+                native_turn_id,
             )
             .await
         {
@@ -8785,14 +10050,14 @@ impl MessageProcessor {
                 runtime_id = binding.runtime_id.as_str(),
                 thread_id = binding.thread_id.as_str(),
                 turn_id = binding.turn_id.as_str(),
-                native_turn_id = native_turn_id.as_deref(),
+                native_turn_id = native_turn_id,
                 reason,
                 "kept CLI runtime session open during terminal cleanup because another turn binding is active"
             );
             return;
         }
 
-        if let Err(error) = manager.close_session(&key).await {
+        if let Err(error) = manager.close_session_instance(handle.instance()).await {
             warn!(
                 workspace_id = binding.workspace_id.as_str(),
                 runtime_id = binding.runtime_id.as_str(),
@@ -9249,6 +10514,12 @@ impl MessageProcessor {
                                 decision == CodexFileChangeApprovalDecision::Cancel,
                             )
                         }
+                        CLIRuntimeRequestKind::PermissionApproval => (
+                            codex_permission_approval_response_from_resolution(
+                                request, resolution,
+                            )?,
+                            matches!(resolution, CLIRuntimeRequestResolution::Cancelled),
+                        ),
                         CLIRuntimeRequestKind::UserInput => (
                             codex_user_input_response_from_resolution(request, resolution)?,
                             false,
@@ -9370,13 +10641,140 @@ impl MessageProcessor {
     }
 
     #[allow(dead_code)]
+    /// Replays provider-owned human requests to one connection after it opens
+    /// or reopens a collaborative Thread. Live fanout cannot cover a late
+    /// joiner, and durable approval blocks are not themselves the mobile
+    /// pending-request state.
+    pub(super) async fn replay_cli_runtime_pending_requests_for_thread(
+        &self,
+        connection_id: ConnectionId,
+        workspace_id: &str,
+        thread_id: &str,
+    ) {
+        let now_unix_ms = chrono::Utc::now().timestamp_millis();
+        let mut after = None;
+        loop {
+            let requests = match self
+                .crud_store
+                .list_cli_runtime_pending_requests(
+                    pioneer_crud::CliRuntimePendingRequestListFilter {
+                        workspace_id: Some(workspace_id.to_owned()),
+                        status: Some(StoredCliRuntimePendingRequestStatus::Pending),
+                        after,
+                        limit: Some(pioneer_crud::CLI_RUNTIME_PENDING_REQUEST_PAGE_MAX),
+                        ..Default::default()
+                    },
+                )
+                .await
+            {
+                Ok(requests) => requests,
+                Err(error) => {
+                    warn!(
+                        workspace_id,
+                        thread_id,
+                        error = %format!("{error:#}"),
+                        "failed to replay durable CLI human interactions"
+                    );
+                    break;
+                }
+            };
+            let next = requests
+                .last()
+                .map(|record| (record.created_at, record.request_id.clone()));
+
+            for request in requests {
+                // Native Pioneer requests have their own typed replay lane;
+                // machine-level provider requests are Gateway-management only.
+                if request.runtime_id == NATIVE_HUMAN_INTERACTION_RUNTIME_ID
+                    || request.authorization_binding.is_none()
+                {
+                    continue;
+                }
+                let visible_thread_ids = self.pending_request_ancestor_thread_ids(&request).await;
+                if request.thread_id != thread_id
+                    && !visible_thread_ids
+                        .iter()
+                        .any(|visible_thread_id| visible_thread_id == thread_id)
+                {
+                    continue;
+                }
+                if now_unix_ms.saturating_sub(request.created_at.timestamp_millis())
+                    >= CLI_RUNTIME_HUMAN_RESPONSE_TIMEOUT_MS
+                {
+                    if let Err(error) = self
+                        .expire_cli_runtime_pending_request_as_stale(&request)
+                        .await
+                    {
+                        warn!(
+                            request_id = request.request_id,
+                            error = %format!("{error:#}"),
+                            "failed to expire stale CLI human interaction during replay"
+                        );
+                    }
+                    continue;
+                }
+
+                let opened = cli_runtime_request_opened_notification_from_record(
+                    &request,
+                    visible_thread_ids.clone(),
+                );
+                self.send_execution_collaborator_notification_to_connections(
+                    thread_id,
+                    crate::authorization::ResourceAction::AgentRequestObserve,
+                    events::CLI_RUNTIME_REQUEST_OPENED,
+                    &opened,
+                    vec![connection_id],
+                )
+                .await;
+
+                // Resolution may race the replay. Never leave a late client
+                // with an opened card after the durable request was consumed.
+                let current = self
+                    .crud_store
+                    .get_cli_runtime_pending_request(request.request_id.as_str())
+                    .await
+                    .ok()
+                    .flatten();
+                if current.as_ref().is_some_and(|record| {
+                    record.status == StoredCliRuntimePendingRequestStatus::Pending
+                }) {
+                    continue;
+                }
+                let resolved_record = current.as_ref().unwrap_or(&request);
+                let resolved = cli_runtime_request_resolved_notification_from_record(
+                    resolved_record,
+                    visible_thread_ids,
+                    cli_runtime_replay_resolution(resolved_record),
+                );
+                self.send_execution_collaborator_notification_to_connections(
+                    thread_id,
+                    crate::authorization::ResourceAction::AgentRequestObserve,
+                    events::CLI_RUNTIME_REQUEST_RESOLVED,
+                    &resolved,
+                    vec![connection_id],
+                )
+                .await;
+            }
+
+            let Some(next) = next else {
+                break;
+            };
+            after = Some(next);
+        }
+    }
+
     pub(super) async fn emit_cli_runtime_request_opened(
         &self,
         request: CliRuntimePendingRequestRecord,
     ) {
-        let notification = cli_runtime_request_opened_notification_from_record(&request);
+        let visible_thread_ids = self.pending_request_ancestor_thread_ids(&request).await;
+        let notification = cli_runtime_request_opened_notification_from_record(
+            &request,
+            visible_thread_ids.clone(),
+        );
         self.send_cli_runtime_request_notification(
             &request,
+            visible_thread_ids.as_slice(),
             events::CLI_RUNTIME_REQUEST_OPENED,
             &notification,
         )
@@ -9390,10 +10788,15 @@ impl MessageProcessor {
         request: CliRuntimePendingRequestRecord,
         resolution: CLIRuntimeRequestResolution,
     ) {
-        let notification =
-            cli_runtime_request_resolved_notification_from_record(&request, resolution);
+        let visible_thread_ids = self.pending_request_ancestor_thread_ids(&request).await;
+        let notification = cli_runtime_request_resolved_notification_from_record(
+            &request,
+            visible_thread_ids.clone(),
+            resolution,
+        );
         self.send_cli_runtime_request_notification(
             &request,
+            visible_thread_ids.as_slice(),
             events::CLI_RUNTIME_REQUEST_RESOLVED,
             &notification,
         )
@@ -9405,12 +10808,16 @@ impl MessageProcessor {
     async fn send_cli_runtime_request_notification<T: serde::Serialize>(
         &self,
         request: &CliRuntimePendingRequestRecord,
+        visible_thread_ids: &[String],
         method: &str,
         notification: &T,
     ) {
         if request.authorization_binding.is_some() {
-            self.send_execution_collaborator_notification(
-                request.thread_id.as_str(),
+            let mut notification_thread_ids = Vec::with_capacity(visible_thread_ids.len() + 1);
+            notification_thread_ids.push(request.thread_id.as_str());
+            notification_thread_ids.extend(visible_thread_ids.iter().map(String::as_str));
+            self.send_execution_collaborator_notification_for_threads(
+                notification_thread_ids.as_slice(),
                 crate::authorization::ResourceAction::AgentRequestObserve,
                 method,
                 notification,
@@ -9463,22 +10870,6 @@ impl MessageProcessor {
         )
     }
 
-    async fn load_cli_runtime_summaries(
-        &self,
-        workspace_id: &str,
-    ) -> anyhow::Result<Vec<RuntimeSummary>> {
-        let instances = self.load_cli_runtime_instances()?;
-        let mut summaries = Vec::with_capacity(instances.len());
-        for instance in instances {
-            let proxy_url = self
-                .prepare_cli_runtime_proxy_url(workspace_id, instance.id.as_str())
-                .await?;
-            summaries.push(cli_runtime_summary_from_instance(instance, proxy_url));
-        }
-        sort_cli_runtime_summary_display_order(summaries.as_mut_slice());
-        Ok(summaries)
-    }
-
     async fn load_cli_runtime_summary_by_id(
         &self,
         connection_id: ConnectionId,
@@ -9486,8 +10877,11 @@ impl MessageProcessor {
         workspace_id: &str,
         runtime_id: &str,
     ) -> Option<RuntimeSummary> {
-        let runtimes = match self.load_cli_runtime_summaries(workspace_id).await {
-            Ok(runtimes) => runtimes,
+        let snapshot = match self
+            .cli_runtime_readiness_snapshot_or_seed(workspace_id)
+            .await
+        {
+            Ok(snapshot) => snapshot,
             Err(error) => {
                 self.send_error(
                     connection_id,
@@ -9502,7 +10896,7 @@ impl MessageProcessor {
             }
         };
 
-        match find_cli_runtime_summary(runtimes, runtime_id) {
+        match find_cli_runtime_summary(snapshot.runtimes, runtime_id) {
             Some(runtime) => Some(runtime),
             None => {
                 self.send_unknown_cli_runtime_error(connection_id, request_id, runtime_id)
@@ -9544,84 +10938,39 @@ impl MessageProcessor {
         }
     }
 
-    async fn load_cli_runtime_live_summary_by_id(
-        &self,
-        connection_id: ConnectionId,
-        request_id: RequestId,
-        workspace_id: &str,
-        runtime_id: &str,
-    ) -> Option<RuntimeSummary> {
-        let instances = match self.load_cli_runtime_instances() {
-            Ok(instances) => instances,
-            Err(error) => {
-                self.send_error(
-                    connection_id,
-                    cli_runtime_discovery_error(
-                        Some(request_id),
-                        INVALID_REQUEST_CODE,
-                        format!("failed to load CLI runtime catalog: {error:#}"),
-                    ),
-                )
-                .await;
-                return None;
-            }
-        };
-
-        match find_cli_runtime_instance(instances, runtime_id) {
-            Some(instance) => Some(
-                self.cli_runtime_live_summary_from_instance(workspace_id, instance)
-                    .await,
-            ),
-            None => {
-                self.send_unknown_cli_runtime_error(connection_id, request_id, runtime_id)
-                    .await;
-                None
-            }
-        }
-    }
-
-    pub(crate) async fn cli_runtime_live_summary_from_instance(
+    pub(super) async fn cli_runtime_live_summary_from_instance_with_trace(
         &self,
         workspace_id: &str,
         instance: EffectiveGatewayCliAgentRuntimeInstanceConfig,
-    ) -> RuntimeSummary {
-        self.cli_runtime_live_summary_from_instance_with_trace(workspace_id, instance, None)
-            .await
-    }
-
-    async fn cli_runtime_live_summary_from_instance_with_trace(
-        &self,
-        workspace_id: &str,
-        instance: EffectiveGatewayCliAgentRuntimeInstanceConfig,
-        refresh_trace: Option<&GatewayCliRuntimeRefreshTrace>,
-    ) -> RuntimeSummary {
+        refresh_trace: Option<&GatewayProviderWarmupTrace>,
+    ) -> anyhow::Result<CliRuntimeLiveReadiness> {
         let runtime_kind = match instance.kind {
             GatewayCliAgentRuntimeKindConfig::Codex => GatewayCliRuntimeKind::Codex,
             GatewayCliAgentRuntimeKindConfig::Claude => GatewayCliRuntimeKind::Claude,
             GatewayCliAgentRuntimeKindConfig::OpenCode => GatewayCliRuntimeKind::OpenCode,
         };
         let proxy_stage = refresh_trace.map(|trace| {
-            trace.runtime_stage(
-                GatewayCliRuntimeRefreshStage::RuntimeProxyLoad,
-                runtime_kind,
-            )
+            trace.runtime_stage(GatewayProviderWarmupStage::RuntimeProxyLoad, runtime_kind)
         });
         let proxy_url = self
-            .cli_runtime_proxy_url(workspace_id, instance.id.as_str())
-            .await;
+            .prepare_cli_runtime_proxy_url(workspace_id, instance.id.as_str())
+            .await?;
         if let Some(stage) = proxy_stage {
             stage.succeed();
         }
         let summary = cli_runtime_summary_from_instance(instance.clone(), proxy_url.clone());
         if !instance.enabled {
-            return summary;
+            return Ok(CliRuntimeLiveReadiness {
+                summary,
+                mcp_readiness: None,
+            });
         }
 
-        match instance.kind {
+        let (summary, mcp_readiness) = match instance.kind {
             GatewayCliAgentRuntimeKindConfig::Codex => {
                 let account_stage = refresh_trace.map(|trace| {
                     trace.runtime_stage(
-                        GatewayCliRuntimeRefreshStage::RuntimeAccountProbe,
+                        GatewayProviderWarmupStage::RuntimeAccountProbe,
                         runtime_kind,
                     )
                 });
@@ -9639,7 +10988,9 @@ impl MessageProcessor {
                 let mut summary = apply_codex_account_probe_to_summary(summary, probe);
                 let (max_tools, max_schema_bytes) = self.mcp_service.projection_limit_values();
                 #[cfg(test)]
-                let readiness_override = self.cli_mcp_readiness_override_for_tests();
+                let readiness_override = self.cli_mcp_readiness_override_for_tests(
+                    pioneer_protocol::CLIAgentRuntimeKind::Codex,
+                );
                 #[cfg(not(test))]
                 let readiness_override: Option<
                     pioneer_protocol::CliMcpAdapterReadiness,
@@ -9649,7 +11000,7 @@ impl MessageProcessor {
                     None => {
                         let mcp_stage = refresh_trace.map(|trace| {
                             trace.runtime_stage(
-                                GatewayCliRuntimeRefreshStage::RuntimeMcpReadiness,
+                                GatewayProviderWarmupStage::RuntimeMcpReadiness,
                                 runtime_kind,
                             )
                         });
@@ -9677,13 +11028,13 @@ impl MessageProcessor {
                 );
                 summary.capabilities =
                     cli_runtime_capabilities_for_kind_with_policy(instance.kind, policy);
-                summary.diagnostics.extend(readiness.diagnostics);
-                summary
+                summary.diagnostics.extend(readiness.diagnostics.clone());
+                (summary, readiness)
             }
             GatewayCliAgentRuntimeKindConfig::Claude => {
                 let account_stage = refresh_trace.map(|trace| {
                     trace.runtime_stage(
-                        GatewayCliRuntimeRefreshStage::RuntimeAccountProbe,
+                        GatewayProviderWarmupStage::RuntimeAccountProbe,
                         runtime_kind,
                     )
                 });
@@ -9702,7 +11053,9 @@ impl MessageProcessor {
                 let mut summary = apply_claude_account_probe_to_summary(summary, probe);
                 let (max_tools, max_schema_bytes) = self.mcp_service.projection_limit_values();
                 #[cfg(test)]
-                let readiness_override = self.cli_mcp_readiness_override_for_tests();
+                let readiness_override = self.cli_mcp_readiness_override_for_tests(
+                    pioneer_protocol::CLIAgentRuntimeKind::Claude,
+                );
                 #[cfg(not(test))]
                 let readiness_override: Option<
                     pioneer_protocol::CliMcpAdapterReadiness,
@@ -9712,7 +11065,7 @@ impl MessageProcessor {
                     None => {
                         let mcp_stage = refresh_trace.map(|trace| {
                             trace.runtime_stage(
-                                GatewayCliRuntimeRefreshStage::RuntimeMcpReadiness,
+                                GatewayProviderWarmupStage::RuntimeMcpReadiness,
                                 runtime_kind,
                             )
                         });
@@ -9740,13 +11093,13 @@ impl MessageProcessor {
                 );
                 summary.capabilities =
                     cli_runtime_capabilities_for_kind_with_policy(instance.kind, policy);
-                summary.diagnostics.extend(readiness.diagnostics);
-                summary
+                summary.diagnostics.extend(readiness.diagnostics.clone());
+                (summary, readiness)
             }
             GatewayCliAgentRuntimeKindConfig::OpenCode => {
                 let account_stage = refresh_trace.map(|trace| {
                     trace.runtime_stage(
-                        GatewayCliRuntimeRefreshStage::RuntimeAccountProbe,
+                        GatewayProviderWarmupStage::RuntimeAccountProbe,
                         runtime_kind,
                     )
                 });
@@ -9764,7 +11117,9 @@ impl MessageProcessor {
                 let mut summary = apply_opencode_probe_to_summary(summary, probe);
                 let (max_tools, max_schema_bytes) = self.mcp_service.projection_limit_values();
                 #[cfg(test)]
-                let readiness_override = self.cli_mcp_readiness_override_for_tests();
+                let readiness_override = self.cli_mcp_readiness_override_for_tests(
+                    pioneer_protocol::CLIAgentRuntimeKind::OpenCode,
+                );
                 #[cfg(not(test))]
                 let readiness_override: Option<
                     pioneer_protocol::CliMcpAdapterReadiness,
@@ -9774,7 +11129,7 @@ impl MessageProcessor {
                     None => {
                         let mcp_stage = refresh_trace.map(|trace| {
                             trace.runtime_stage(
-                                GatewayCliRuntimeRefreshStage::RuntimeMcpReadiness,
+                                GatewayProviderWarmupStage::RuntimeMcpReadiness,
                                 runtime_kind,
                             )
                         });
@@ -9799,13 +11154,68 @@ impl MessageProcessor {
                 );
                 summary.capabilities =
                     cli_runtime_capabilities_for_kind_with_policy(instance.kind, policy);
-                summary.diagnostics.extend(readiness.diagnostics);
-                summary
+                summary.diagnostics.extend(readiness.diagnostics.clone());
+                (summary, readiness)
             }
-        }
+        };
+        Ok(CliRuntimeLiveReadiness {
+            summary,
+            mcp_readiness: Some(mcp_readiness),
+        })
     }
 
-    pub(super) async fn prepare_cli_runtime_proxy_url(
+    /// Probes one CLI runtime model catalog for the Gateway supervisor.
+    ///
+    /// Client RPC handlers must read the resulting supervisor cache rather
+    /// than calling this method directly.
+    pub(super) async fn cli_runtime_model_list_from_instance_with_trace(
+        &self,
+        instance: &EffectiveGatewayCliAgentRuntimeInstanceConfig,
+        proxy_url: Option<&str>,
+        trace: Option<&GatewayProviderWarmupTrace>,
+    ) -> RuntimeModelListResult {
+        let runtime_kind = match instance.kind {
+            GatewayCliAgentRuntimeKindConfig::Codex => GatewayCliRuntimeKind::Codex,
+            GatewayCliAgentRuntimeKindConfig::Claude => GatewayCliRuntimeKind::Claude,
+            GatewayCliAgentRuntimeKindConfig::OpenCode => GatewayCliRuntimeKind::OpenCode,
+        };
+        let model_stage = trace.map(|trace| {
+            trace.runtime_stage(GatewayProviderWarmupStage::RuntimeModelsLoad, runtime_kind)
+        });
+        let result = match instance.kind {
+            GatewayCliAgentRuntimeKindConfig::Codex => {
+                let probe = CodexProbe::model_list(
+                    codex_account_probe_config_from_instance_with_proxy(instance, proxy_url),
+                )
+                .await;
+                runtime_model_list_from_codex_probe(probe, &instance.custom_models)
+            }
+            GatewayCliAgentRuntimeKindConfig::Claude => runtime_model_list_from_claude_probe(
+                ClaudeProbe::model_list(
+                    claude_account_probe_config_from_instance_with_proxy(instance, proxy_url),
+                    &instance.custom_models,
+                )
+                .await,
+            ),
+            GatewayCliAgentRuntimeKindConfig::OpenCode => runtime_model_list_from_opencode_probe(
+                probe_opencode_instance(
+                    instance,
+                    self.artifact_runtime_home.as_path(),
+                    &crate::cli_runtime::config::proxy_env(proxy_url),
+                )
+                .await,
+                &instance.custom_models,
+            ),
+        };
+        if let Some(stage) = model_stage
+            && result.error_message.is_none()
+        {
+            stage.succeed();
+        }
+        result
+    }
+
+    pub(crate) async fn prepare_cli_runtime_proxy_url(
         &self,
         workspace_id: &str,
         runtime_id: &str,
@@ -9826,7 +11236,11 @@ impl MessageProcessor {
         Ok(proxy_url)
     }
 
-    async fn cli_runtime_proxy_url(&self, workspace_id: &str, runtime_id: &str) -> Option<String> {
+    pub(crate) async fn cli_runtime_proxy_url(
+        &self,
+        workspace_id: &str,
+        runtime_id: &str,
+    ) -> Option<String> {
         match self
             .prepare_cli_runtime_proxy_url(workspace_id, runtime_id)
             .await
@@ -10094,7 +11508,7 @@ fn normalize_cli_runtime_optional_field(
     Ok(Some(trimmed.to_owned()))
 }
 
-fn sort_cli_runtime_summary_display_order(summaries: &mut [RuntimeSummary]) {
+pub(super) fn sort_cli_runtime_summary_display_order(summaries: &mut [RuntimeSummary]) {
     summaries.sort_by(|left, right| {
         let left_order = cli_runtime_default_display_order(left.runtime_id.as_str());
         let right_order = cli_runtime_default_display_order(right.runtime_id.as_str());
@@ -10117,15 +11531,13 @@ fn cli_runtime_default_display_order(runtime_id: &str) -> usize {
     }
 }
 
-fn cli_runtime_summary_from_instance(
+pub(super) fn cli_runtime_summary_from_instance(
     instance: EffectiveGatewayCliAgentRuntimeInstanceConfig,
     proxy_url: Option<String>,
 ) -> RuntimeSummary {
     let capability_policy = CliRuntimeCapabilityPolicy::phase_zero(true);
     let status = if instance.enabled {
-        RuntimeStatus::Degraded {
-            message: "CLI runtime has not been probed yet".to_owned(),
-        }
+        RuntimeStatus::Initializing
     } else {
         RuntimeStatus::Disabled
     };
@@ -10134,8 +11546,8 @@ fn cli_runtime_summary_from_instance(
         vec![
             RuntimeDiagnostic {
                 level: RuntimeDiagnosticLevel::Info,
-                code: "cli_runtime.unprobed".to_owned(),
-                message: "Runtime status will refresh after live probing is enabled".to_owned(),
+                code: "cli_runtime.initializing".to_owned(),
+                message: "Gateway is preparing runtime readiness".to_owned(),
             },
             RuntimeDiagnostic {
                 level: RuntimeDiagnosticLevel::Info,
@@ -10168,6 +11580,43 @@ fn cli_runtime_summary_from_instance(
         diagnostics,
         recent_stderr: Vec::new(),
     }
+}
+
+/// Removes every piece of live readiness evidence from a cached summary.
+///
+/// Configuration mutations use this transition before a replacement probe is
+/// scheduled. Keeping the static catalog fields lets clients render a stable
+/// provider row, while clearing account/version/MCP evidence ensures a stale
+/// `ready` result can never authorize a new turn during reconciliation.
+pub(super) fn cli_runtime_initializing_summary(mut summary: RuntimeSummary) -> RuntimeSummary {
+    let capability_policy = CliRuntimeCapabilityPolicy::phase_zero(true);
+    summary.account = None;
+    summary.version = None;
+    summary.models_refreshed_at_unix_ms = None;
+    summary.recent_stderr.clear();
+    summary.capabilities.supports_mcp_tools = capability_policy.supports_mcp_tools();
+
+    if summary.enabled {
+        let (mcp_code, mcp_message) = capability_policy.mcp_diagnostic();
+        summary.status = RuntimeStatus::Initializing;
+        summary.diagnostics = vec![
+            RuntimeDiagnostic {
+                level: RuntimeDiagnosticLevel::Info,
+                code: "cli_runtime.initializing".to_owned(),
+                message: "Gateway is preparing runtime readiness".to_owned(),
+            },
+            RuntimeDiagnostic {
+                level: RuntimeDiagnosticLevel::Info,
+                code: mcp_code.to_owned(),
+                message: mcp_message.to_owned(),
+            },
+        ];
+    } else {
+        summary.status = RuntimeStatus::Disabled;
+        summary.diagnostics.clear();
+    }
+
+    summary
 }
 
 fn cli_runtime_kind_from_config(kind: GatewayCliAgentRuntimeKindConfig) -> CLIAgentRuntimeKind {
@@ -10510,10 +11959,17 @@ fn runtime_models_from_codex_probe(
     runtime_models_with_custom_models(models, custom_models)
 }
 
-struct RuntimeModelListResult {
-    models: Vec<RuntimeModelInfo>,
-    diagnostics: Vec<RuntimeDiagnostic>,
-    error_message: Option<String>,
+#[derive(Clone, Debug)]
+pub(super) struct CliRuntimeLiveReadiness {
+    pub(super) summary: RuntimeSummary,
+    pub(super) mcp_readiness: Option<pioneer_protocol::CliMcpAdapterReadiness>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct RuntimeModelListResult {
+    pub(super) models: Vec<RuntimeModelInfo>,
+    pub(super) diagnostics: Vec<RuntimeDiagnostic>,
+    pub(super) error_message: Option<String>,
 }
 
 fn runtime_model_list_from_codex_probe(
@@ -10560,14 +12016,20 @@ fn runtime_model_list_from_claude_probe(probe: ClaudeModelListSnapshot) -> Runti
         .iter()
         .map(runtime_diagnostic_from_claude_probe)
         .collect::<Vec<_>>();
+    let models = probe
+        .models
+        .into_iter()
+        .map(runtime_model_from_claude_model)
+        .collect::<Vec<_>>();
+    let error_message = probe.error_message.or_else(|| {
+        models
+            .is_empty()
+            .then(|| "Claude model discovery returned no models".to_owned())
+    });
     RuntimeModelListResult {
-        models: probe
-            .models
-            .into_iter()
-            .map(runtime_model_from_claude_model)
-            .collect(),
+        models,
         diagnostics,
-        error_message: probe.error_message,
+        error_message,
     }
 }
 
@@ -10764,6 +12226,7 @@ fn cli_runtime_login_start_response_from_codex(
 #[allow(dead_code)]
 fn cli_runtime_request_opened_notification_from_record(
     record: &CliRuntimePendingRequestRecord,
+    visible_thread_ids: Vec<String>,
 ) -> CLIRuntimeRequestOpenedNotification {
     CLIRuntimeRequestOpenedNotification {
         workspace_id: record.workspace_id.clone(),
@@ -10772,12 +12235,14 @@ fn cli_runtime_request_opened_notification_from_record(
         thread_id: Some(record.thread_id.clone()),
         turn_id: record.turn_id.clone(),
         item_id: record.native_item_id.clone(),
+        visible_thread_ids,
         request: cli_runtime_pending_request_from_record(record),
     }
 }
 
 fn cli_runtime_request_resolved_notification_from_record(
     record: &CliRuntimePendingRequestRecord,
+    visible_thread_ids: Vec<String>,
     resolution: CLIRuntimeRequestResolution,
 ) -> CLIRuntimeRequestResolvedNotification {
     CLIRuntimeRequestResolvedNotification {
@@ -10787,12 +12252,31 @@ fn cli_runtime_request_resolved_notification_from_record(
         thread_id: Some(record.thread_id.clone()),
         turn_id: record.turn_id.clone(),
         item_id: record.native_item_id.clone(),
+        visible_thread_ids,
         resolution,
+    }
+}
+
+fn cli_runtime_replay_resolution(
+    record: &CliRuntimePendingRequestRecord,
+) -> CLIRuntimeRequestResolution {
+    if let Some(response_json) = record.response_json.as_deref()
+        && let Ok(resolution) = pioneer_crud::deserialize_cli_runtime_json(response_json)
+    {
+        return resolution;
+    }
+    match record.status {
+        StoredCliRuntimePendingRequestStatus::Cancelled => CLIRuntimeRequestResolution::Cancelled,
+        StoredCliRuntimePendingRequestStatus::Expired => CLIRuntimeRequestResolution::Expired,
+        _ => CLIRuntimeRequestResolution::Error {
+            message: "request is no longer awaiting a response".to_owned(),
+        },
     }
 }
 
 fn cli_runtime_command_approval_pending_request(
     request: &CodexCommandApprovalRequest,
+    supports_session_approval: bool,
 ) -> CLIRuntimePendingRequest {
     let display_command = request.display_command();
     CLIRuntimePendingRequest {
@@ -10815,7 +12299,33 @@ fn cli_runtime_command_approval_pending_request(
             "threadId": request.native_thread_id,
             "turnId": request.native_turn_id,
             "itemId": request.native_item_id,
+            "supportsSessionApproval": supports_session_approval,
             "raw": request.raw,
+        })),
+    }
+}
+
+fn cli_runtime_permission_approval_pending_request(
+    request: &CodexPermissionApprovalRequest,
+) -> CLIRuntimePendingRequest {
+    CLIRuntimePendingRequest {
+        kind: CLIRuntimeRequestKind::PermissionApproval,
+        title: Some("Grant sandbox permissions".to_owned()),
+        message: request
+            .reason
+            .clone()
+            .or_else(|| Some("Codex requested additional filesystem or network access".to_owned())),
+        native_request_id: Some(request.native_request_id.clone()),
+        payload: Some(json!({
+            "cwd": request.cwd,
+            "reason": request.reason,
+            "permissions": request.requested_permissions,
+            "startedAtMs": request.started_at_ms,
+            "nativeRequestId": request.native_request_id,
+            "nativeRequestIdJson": request.native_request_id_json,
+            "threadId": request.native_thread_id,
+            "turnId": request.native_turn_id,
+            "itemId": request.native_item_id,
         })),
     }
 }
@@ -10847,6 +12357,9 @@ fn cli_runtime_pending_request_from_runtime_event(
         .or_else(|| match kind {
             CLIRuntimeRequestKind::FileChangeApproval => Some("Review file changes".to_owned()),
             CLIRuntimeRequestKind::CommandApproval => Some("Approve command".to_owned()),
+            CLIRuntimeRequestKind::PermissionApproval => {
+                Some("Grant sandbox permissions".to_owned())
+            }
             CLIRuntimeRequestKind::UserInput => Some("User input required".to_owned()),
             CLIRuntimeRequestKind::Other => None,
         });
@@ -10877,6 +12390,7 @@ fn cli_runtime_pending_request_from_runtime_event(
 
 fn cli_runtime_file_change_approval_pending_request(
     request: &CodexFileChangeApprovalRequest,
+    supports_session_approval: bool,
 ) -> CLIRuntimePendingRequest {
     let changed_files = cli_runtime_file_change_changed_files(request);
     let summary = request.summary.clone().or_else(|| {
@@ -10923,6 +12437,7 @@ fn cli_runtime_file_change_approval_pending_request(
             "threadId": request.native_thread_id,
             "turnId": request.native_turn_id,
             "itemId": request.native_item_id,
+            "supportsSessionApproval": supports_session_approval,
         })),
     }
 }
@@ -11037,6 +12552,140 @@ fn cli_runtime_native_request_id_json_from_record(
     );
 }
 
+fn validate_codex_permission_profile_shape(permissions: &JsonValue) -> anyhow::Result<()> {
+    let profile = permissions
+        .as_object()
+        .context("Codex requested permissions must be an object")?;
+    if profile
+        .keys()
+        .any(|key| !matches!(key.as_str(), "fileSystem" | "network"))
+    {
+        anyhow::bail!("Codex requested permissions contain an unknown capability");
+    }
+
+    if let Some(file_system) = profile.get("fileSystem").filter(|value| !value.is_null()) {
+        let file_system = file_system
+            .as_object()
+            .context("Codex fileSystem permissions must be an object")?;
+        if file_system.keys().any(|key| {
+            !matches!(
+                key.as_str(),
+                "entries" | "read" | "write" | "globScanMaxDepth"
+            )
+        }) {
+            anyhow::bail!("Codex fileSystem permissions contain an unknown field");
+        }
+        for field in ["read", "write"] {
+            if let Some(paths) = file_system.get(field).filter(|value| !value.is_null()) {
+                let paths = paths
+                    .as_array()
+                    .with_context(|| format!("Codex fileSystem.{field} must be an array"))?;
+                if paths
+                    .iter()
+                    .any(|path| !path.as_str().is_some_and(|path| !path.trim().is_empty()))
+                {
+                    anyhow::bail!("Codex fileSystem.{field} contains an invalid path");
+                }
+            }
+        }
+        if let Some(depth) = file_system
+            .get("globScanMaxDepth")
+            .filter(|value| !value.is_null())
+            && !depth.as_u64().is_some_and(|depth| depth > 0)
+        {
+            anyhow::bail!("Codex globScanMaxDepth must be a positive integer");
+        }
+        if let Some(entries) = file_system.get("entries").filter(|value| !value.is_null()) {
+            for entry in entries
+                .as_array()
+                .context("Codex fileSystem.entries must be an array")?
+            {
+                let entry = entry
+                    .as_object()
+                    .context("Codex filesystem entry must be an object")?;
+                if entry
+                    .keys()
+                    .any(|key| !matches!(key.as_str(), "access" | "path"))
+                {
+                    anyhow::bail!("Codex filesystem entry contains an unknown field");
+                }
+                if !entry
+                    .get("access")
+                    .and_then(JsonValue::as_str)
+                    .is_some_and(|access| matches!(access, "read" | "write" | "deny"))
+                {
+                    anyhow::bail!("Codex filesystem entry has invalid access");
+                }
+                validate_codex_permission_path_shape(
+                    entry
+                        .get("path")
+                        .context("Codex filesystem entry has no path")?,
+                )?;
+            }
+        }
+    }
+
+    if let Some(network) = profile.get("network").filter(|value| !value.is_null()) {
+        let network = network
+            .as_object()
+            .context("Codex network permissions must be an object")?;
+        if network.keys().any(|key| key != "enabled")
+            || network
+                .get("enabled")
+                .is_some_and(|enabled| !enabled.is_null() && !enabled.is_boolean())
+        {
+            anyhow::bail!("Codex network permissions have invalid fields");
+        }
+    }
+    Ok(())
+}
+
+fn validate_codex_permission_path_shape(path: &JsonValue) -> anyhow::Result<()> {
+    let path = path
+        .as_object()
+        .context("Codex filesystem path must be an object")?;
+    match path.get("type").and_then(JsonValue::as_str) {
+        Some("path") => {
+            if !path
+                .get("path")
+                .and_then(JsonValue::as_str)
+                .is_some_and(|path| !path.trim().is_empty())
+            {
+                anyhow::bail!("Codex filesystem path is empty");
+            }
+        }
+        Some("glob_pattern") => {
+            if !path
+                .get("pattern")
+                .and_then(JsonValue::as_str)
+                .is_some_and(|pattern| !pattern.trim().is_empty())
+            {
+                anyhow::bail!("Codex filesystem glob is empty");
+            }
+        }
+        Some("special") => {
+            let value = path
+                .get("value")
+                .and_then(JsonValue::as_object)
+                .context("Codex special filesystem path has no value")?;
+            if !value
+                .get("kind")
+                .and_then(JsonValue::as_str)
+                .is_some_and(|kind| {
+                    matches!(
+                        kind,
+                        "root" | "minimal" | "project_roots" | "tmpdir" | "slash_tmp" | "unknown"
+                    )
+                })
+            {
+                anyhow::bail!("Codex special filesystem path has an unknown kind");
+            }
+        }
+        _ => anyhow::bail!("Codex filesystem path has an unknown type"),
+    }
+    Ok(())
+}
+
 fn validate_codex_machine_request_shape(
     request: &CodexJsonlRpcServerRequest,
 ) -> std::result::Result<(), String> {
@@ -11074,11 +12723,27 @@ fn validate_codex_machine_request_shape(
             .and_then(JsonValue::as_str)
             .is_some_and(|value| !value.trim().is_empty());
         if !item_id_is_valid {
-            return Err("Codex MCP permission approval requires non-empty `itemId`".to_owned());
+            return Err("Codex permission approval requires non-empty `itemId`".to_owned());
         }
-        if !params.get("permissions").is_some_and(JsonValue::is_object) {
-            return Err("Codex MCP permission approval requires object `permissions`".to_owned());
+        let cwd = params
+            .get("cwd")
+            .and_then(JsonValue::as_str)
+            .filter(|cwd| !cwd.trim().is_empty())
+            .ok_or_else(|| "Codex permission approval requires non-empty `cwd`".to_owned())?;
+        if !Path::new(cwd).is_absolute() {
+            return Err("Codex permission approval requires absolute `cwd`".to_owned());
         }
+        if !params.get("startedAtMs").is_some_and(|value| {
+            value.as_i64().is_some() || value.as_u64().is_some_and(|value| value <= i64::MAX as u64)
+        }) {
+            return Err("Codex permission approval requires integer `startedAtMs`".to_owned());
+        }
+        validate_codex_permission_profile_shape(
+            params
+                .get("permissions")
+                .ok_or_else(|| "Codex permission approval requires `permissions`".to_owned())?,
+        )
+        .map_err(|error| format!("invalid Codex permission approval: {error:#}"))?;
     }
     if matches!(
         request.method.as_str(),
@@ -11116,12 +12781,34 @@ fn validate_cli_runtime_native_request_resolution(
         }
     }
 
+    if matches!(resolution, CLIRuntimeRequestResolution::ApprovedForSession) {
+        let kind = cli_runtime_request_kind_from_stored(record.request_kind.as_str());
+        if !matches!(
+            kind,
+            CLIRuntimeRequestKind::CommandApproval | CLIRuntimeRequestKind::FileChangeApproval
+        ) {
+            anyhow::bail!("session approval is not supported for this request kind");
+        }
+        let supports_session = cli_runtime_pending_request_from_record(record)
+            .payload
+            .as_ref()
+            .and_then(|payload| payload.get("supportsSessionApproval"))
+            .and_then(JsonValue::as_bool)
+            .unwrap_or(false);
+        if !supports_session {
+            anyhow::bail!("this Codex request is not eligible for session approval");
+        }
+    }
+
     match cli_runtime_request_kind_from_stored(record.request_kind.as_str()) {
         CLIRuntimeRequestKind::CommandApproval => {
             let _ = codex_command_approval_decision_from_resolution(resolution)?;
         }
         CLIRuntimeRequestKind::FileChangeApproval => {
             let _ = codex_file_change_approval_decision_from_resolution(resolution)?;
+        }
+        CLIRuntimeRequestKind::PermissionApproval => {
+            let _ = codex_permission_approval_response_from_resolution(record, resolution)?;
         }
         CLIRuntimeRequestKind::UserInput => {
             let mut response = codex_user_input_response_from_resolution(record, resolution)?;
@@ -11138,13 +12825,17 @@ fn validate_cli_runtime_resolution_against_permission_profile(
     resolution: &CLIRuntimeRequestResolution,
     permission_profile: &pioneer_protocol::TurnPermissionProfileSnapshot,
 ) -> anyhow::Result<()> {
-    if !matches!(resolution, CLIRuntimeRequestResolution::Approved) {
+    if !matches!(
+        resolution,
+        CLIRuntimeRequestResolution::Approved | CLIRuntimeRequestResolution::ApprovedForSession
+    ) {
         return Ok(());
     }
 
     let behavior = match request_kind {
         CLIRuntimeRequestKind::CommandApproval => permission_profile.effective_policy.shell_command,
         CLIRuntimeRequestKind::FileChangeApproval => permission_profile.effective_policy.file_write,
+        CLIRuntimeRequestKind::PermissionApproval => return Ok(()),
         CLIRuntimeRequestKind::UserInput => return Ok(()),
         CLIRuntimeRequestKind::Other => {
             anyhow::bail!("opaque CLI approval request has no typed permission class")
@@ -11156,9 +12847,93 @@ fn validate_cli_runtime_resolution_against_permission_profile(
             match request_kind {
                 CLIRuntimeRequestKind::CommandApproval => "shell_command",
                 CLIRuntimeRequestKind::FileChangeApproval => "file_write",
-                CLIRuntimeRequestKind::UserInput | CLIRuntimeRequestKind::Other => unreachable!(),
+                CLIRuntimeRequestKind::PermissionApproval
+                | CLIRuntimeRequestKind::UserInput
+                | CLIRuntimeRequestKind::Other => unreachable!(),
             }
         );
+    }
+    Ok(())
+}
+
+fn validate_cli_runtime_pending_resolution_against_permission_profile(
+    request: &CliRuntimePendingRequestRecord,
+    resolution: &CLIRuntimeRequestResolution,
+    permission_profile: &pioneer_protocol::TurnPermissionProfileSnapshot,
+) -> anyhow::Result<()> {
+    let request_kind = cli_runtime_request_kind_from_stored(request.request_kind.as_str());
+    validate_cli_runtime_resolution_against_permission_profile(
+        request_kind,
+        resolution,
+        permission_profile,
+    )?;
+    if request_kind != CLIRuntimeRequestKind::PermissionApproval
+        || !matches!(resolution, CLIRuntimeRequestResolution::Approved)
+    {
+        return Ok(());
+    }
+
+    let permissions = cli_runtime_pending_request_from_record(request)
+        .payload
+        .as_ref()
+        .and_then(|payload| payload.get("permissions"))
+        .cloned()
+        .context("Codex permission approval request has no permissions")?;
+    validate_codex_requested_permissions_against_permission_profile(
+        &permissions,
+        permission_profile,
+    )
+}
+
+fn validate_codex_requested_permissions_against_permission_profile(
+    permissions: &JsonValue,
+    permission_profile: &pioneer_protocol::TurnPermissionProfileSnapshot,
+) -> anyhow::Result<()> {
+    validate_codex_permission_profile_shape(permissions)?;
+    let policy = &permission_profile.effective_policy;
+    let file_system = permissions.get("fileSystem").and_then(JsonValue::as_object);
+    let requests_file_read = file_system.is_some_and(|file_system| {
+        file_system
+            .get("read")
+            .and_then(JsonValue::as_array)
+            .is_some_and(|paths| !paths.is_empty())
+            || file_system
+                .get("entries")
+                .and_then(JsonValue::as_array)
+                .is_some_and(|entries| {
+                    entries.iter().any(|entry| {
+                        entry.get("access").and_then(JsonValue::as_str) == Some("read")
+                    })
+                })
+    });
+    let requests_file_write = file_system.is_some_and(|file_system| {
+        file_system
+            .get("write")
+            .and_then(JsonValue::as_array)
+            .is_some_and(|paths| !paths.is_empty())
+            || file_system
+                .get("entries")
+                .and_then(JsonValue::as_array)
+                .is_some_and(|entries| {
+                    entries.iter().any(|entry| {
+                        entry.get("access").and_then(JsonValue::as_str) == Some("write")
+                    })
+                })
+    });
+    let requests_network = permissions
+        .get("network")
+        .and_then(|network| network.get("enabled"))
+        .and_then(JsonValue::as_bool)
+        .unwrap_or(false);
+
+    if requests_file_read && policy.file_read == pioneer_protocol::PermissionBehavior::Deny {
+        anyhow::bail!("current `file_read` permission is deny");
+    }
+    if requests_file_write && policy.file_write == pioneer_protocol::PermissionBehavior::Deny {
+        anyhow::bail!("current `file_write` permission is deny");
+    }
+    if requests_network && policy.network == pioneer_protocol::PermissionBehavior::Deny {
+        anyhow::bail!("current `network` permission is deny");
     }
     Ok(())
 }
@@ -11215,6 +12990,9 @@ fn codex_command_approval_decision_from_resolution(
 ) -> anyhow::Result<CodexCommandApprovalDecision> {
     match resolution {
         CLIRuntimeRequestResolution::Approved => Ok(CodexCommandApprovalDecision::Accept),
+        CLIRuntimeRequestResolution::ApprovedForSession => {
+            Ok(CodexCommandApprovalDecision::AcceptForSession)
+        }
         CLIRuntimeRequestResolution::Denied { .. } => Ok(CodexCommandApprovalDecision::Decline),
         CLIRuntimeRequestResolution::Cancelled => Ok(CodexCommandApprovalDecision::Cancel),
         CLIRuntimeRequestResolution::Expired => Ok(CodexCommandApprovalDecision::Decline),
@@ -11230,12 +13008,47 @@ fn codex_file_change_approval_decision_from_resolution(
 ) -> anyhow::Result<CodexFileChangeApprovalDecision> {
     match resolution {
         CLIRuntimeRequestResolution::Approved => Ok(CodexFileChangeApprovalDecision::Accept),
+        CLIRuntimeRequestResolution::ApprovedForSession => {
+            Ok(CodexFileChangeApprovalDecision::AcceptForSession)
+        }
         CLIRuntimeRequestResolution::Denied { .. } => Ok(CodexFileChangeApprovalDecision::Decline),
         CLIRuntimeRequestResolution::Cancelled => Ok(CodexFileChangeApprovalDecision::Cancel),
         CLIRuntimeRequestResolution::Expired => Ok(CodexFileChangeApprovalDecision::Decline),
         CLIRuntimeRequestResolution::Error { .. } => Ok(CodexFileChangeApprovalDecision::Decline),
         CLIRuntimeRequestResolution::Answered { .. } => anyhow::bail!(
             "file-change approvals accept only canonical approve, deny, or cancel decisions"
+        ),
+    }
+}
+
+fn codex_permission_approval_response_from_resolution(
+    record: &CliRuntimePendingRequestRecord,
+    resolution: &CLIRuntimeRequestResolution,
+) -> anyhow::Result<JsonValue> {
+    let permissions = cli_runtime_pending_request_from_record(record)
+        .payload
+        .as_ref()
+        .and_then(|payload| payload.get("permissions"))
+        .cloned()
+        .context("Codex permission approval request has no permissions")?;
+    validate_codex_permission_profile_shape(&permissions)?;
+    match resolution {
+        CLIRuntimeRequestResolution::Approved => {
+            Ok(codex_permission_approval_response(permissions, true, false))
+        }
+        CLIRuntimeRequestResolution::ApprovedForSession => {
+            anyhow::bail!("Codex general permission requests are bounded to the active turn")
+        }
+        CLIRuntimeRequestResolution::Denied { .. }
+        | CLIRuntimeRequestResolution::Cancelled
+        | CLIRuntimeRequestResolution::Expired
+        | CLIRuntimeRequestResolution::Error { .. } => Ok(codex_permission_approval_response(
+            permissions,
+            false,
+            false,
+        )),
+        CLIRuntimeRequestResolution::Answered { .. } => anyhow::bail!(
+            "permission approvals accept only canonical approve, deny, or cancel decisions"
         ),
     }
 }
@@ -11254,6 +13067,9 @@ fn claude_permission_response_from_resolution(
                 "behavior": "allow",
                 "updatedInput": original_input,
             })
+        }
+        CLIRuntimeRequestResolution::ApprovedForSession => {
+            anyhow::bail!("Claude permission responses do not support session approval")
         }
         CLIRuntimeRequestResolution::Answered { .. } => {
             anyhow::bail!("Claude permission responses do not accept opaque answer payloads")
@@ -11368,9 +13184,9 @@ fn file_change_approval_timeline_status_for_resolution(
     resolution: &CLIRuntimeRequestResolution,
 ) -> &'static str {
     match resolution {
-        CLIRuntimeRequestResolution::Approved | CLIRuntimeRequestResolution::Answered { .. } => {
-            "approval_accepted"
-        }
+        CLIRuntimeRequestResolution::Approved
+        | CLIRuntimeRequestResolution::ApprovedForSession
+        | CLIRuntimeRequestResolution::Answered { .. } => "approval_accepted",
         CLIRuntimeRequestResolution::Denied { .. }
         | CLIRuntimeRequestResolution::Expired
         | CLIRuntimeRequestResolution::Error { .. } => "approval_declined",
@@ -11395,6 +13211,7 @@ fn codex_user_input_response_from_resolution(
             Ok(codex_user_input_response(answers))
         }
         CLIRuntimeRequestResolution::Approved
+        | CLIRuntimeRequestResolution::ApprovedForSession
         | CLIRuntimeRequestResolution::Denied { .. }
         | CLIRuntimeRequestResolution::Error { .. } => {
             anyhow::bail!("user input requests must be answered or cancelled")
@@ -11495,6 +13312,7 @@ pub(super) fn cli_runtime_request_kind_as_str(kind: CLIRuntimeRequestKind) -> &'
     match kind {
         CLIRuntimeRequestKind::CommandApproval => "command_approval",
         CLIRuntimeRequestKind::FileChangeApproval => "file_change_approval",
+        CLIRuntimeRequestKind::PermissionApproval => "permission_approval",
         CLIRuntimeRequestKind::UserInput => "user_input",
         CLIRuntimeRequestKind::Other => "other",
     }
@@ -11505,6 +13323,7 @@ fn cli_runtime_request_kind_from_stored(value: &str) -> CLIRuntimeRequestKind {
     match value {
         "command_approval" => CLIRuntimeRequestKind::CommandApproval,
         "file_change_approval" => CLIRuntimeRequestKind::FileChangeApproval,
+        "permission_approval" => CLIRuntimeRequestKind::PermissionApproval,
         "user_input" => CLIRuntimeRequestKind::UserInput,
         _ => CLIRuntimeRequestKind::Other,
     }
@@ -11515,6 +13334,7 @@ fn cli_runtime_request_kind_requires_turn_binding(kind: CLIRuntimeRequestKind) -
         kind,
         CLIRuntimeRequestKind::CommandApproval
             | CLIRuntimeRequestKind::FileChangeApproval
+            | CLIRuntimeRequestKind::PermissionApproval
             | CLIRuntimeRequestKind::UserInput
     )
 }
@@ -11720,9 +13540,10 @@ fn cli_runtime_turn_binding_status_is_active(status: &str) -> bool {
 fn cli_runtime_native_goal_keeps_turn_open(
     binding: &pioneer_crud::CliRuntimeTurnBindingRecord,
 ) -> bool {
-    binding.native_goal_observed_at.is_some()
-        && binding.native_goal_status.as_deref() != Some("complete")
-        && binding.native_goal_status.is_some()
+    pioneer_protocol::CliRuntimeBlockedTurnGuard::goal_keeps_turn_open(
+        binding.native_goal_observed_at.is_some(),
+        binding.native_goal_status.as_deref(),
+    )
 }
 
 fn cli_runtime_native_goal_status_for_storage(
@@ -11768,6 +13589,44 @@ fn cli_runtime_turn_binding_matches_native_activity(
             .is_some_and(|native_turn_id| binding.native_turn_id.as_deref() == Some(native_turn_id))
 }
 
+pub(super) fn cli_runtime_terminal_event_record(
+    source: &pioneer_protocol::CliRuntimeBlockedTurnGuard,
+    payload_redacted_json: String,
+) -> pioneer_crud::NewCliRuntimeNativeEvent {
+    let id = source.terminal_delivery_id();
+    let now = chrono::Utc::now().fixed_offset();
+    pioneer_crud::NewCliRuntimeNativeEvent {
+        id,
+        runtime_id: source.runtime_id.clone(),
+        runtime_kind: source.runtime_kind.clone(),
+        workspace_id: Some(source.workspace_id.clone()),
+        thread_id: Some(source.thread_id.clone()),
+        turn_id: Some(source.turn_id.clone()),
+        native_thread_id: Some(source.native_thread_id.clone()),
+        native_turn_id: source
+            .segment
+            .as_ref()
+            .map(|(_, native, _)| native.clone())
+            .or(source.attempt_native_turn_id.clone()),
+        native_method: "gateway/terminal_delivery".into(),
+        payload_redacted_json,
+        sequence: now.timestamp_millis(),
+        created_at: now,
+    }
+}
+
+fn cli_runtime_turn_status_from_binding(
+    binding: &pioneer_crud::CliRuntimeTurnBindingRecord,
+) -> Option<TurnStatus> {
+    match binding.status.as_str() {
+        "completed" => Some(TurnStatus::Completed),
+        "failed" => Some(TurnStatus::Failed),
+        "interrupted" => Some(TurnStatus::Interrupted),
+        "blocked" => Some(TurnStatus::Blocked),
+        _ => None,
+    }
+}
+
 fn cli_runtime_turn_status_label(status: TurnStatus) -> &'static str {
     match status {
         TurnStatus::InProgress => "in_progress",
@@ -11783,6 +13642,7 @@ fn cli_runtime_request_status_for_resolution(
 ) -> StoredCliRuntimePendingRequestStatus {
     match resolution {
         CLIRuntimeRequestResolution::Approved
+        | CLIRuntimeRequestResolution::ApprovedForSession
         | CLIRuntimeRequestResolution::Denied { .. }
         | CLIRuntimeRequestResolution::Answered { .. } => {
             StoredCliRuntimePendingRequestStatus::Answered
@@ -11818,13 +13678,6 @@ fn protocol_status_from_stored_status(
 
 fn cli_runtime_request_timestamp() -> sea_orm::entity::prelude::DateTimeWithTimeZone {
     chrono::Utc::now().fixed_offset()
-}
-
-fn current_unix_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
-        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -11883,6 +13736,54 @@ mod tests {
             )
             .is_ok()
         );
+
+        let requested_permissions = json!({
+            "fileSystem": {
+                "write": ["/tmp/project/output"],
+                "entries": [{
+                    "access": "read",
+                    "path": {"type": "path", "path": "/tmp/project/input"}
+                }]
+            },
+            "network": {"enabled": true}
+        });
+        assert!(
+            validate_codex_requested_permissions_against_permission_profile(
+                &requested_permissions,
+                &denied,
+            )
+            .is_err(),
+            "a provider sandbox permission response must not widen a denied execution cap"
+        );
+        assert!(
+            validate_codex_requested_permissions_against_permission_profile(
+                &requested_permissions,
+                &asking,
+            )
+            .is_ok(),
+            "an asking execution cap may be satisfied by this exact human approval"
+        );
+
+        let mut file_write_denied = asking.clone();
+        file_write_denied.effective_policy.file_write = pioneer_protocol::PermissionBehavior::Deny;
+        assert!(
+            validate_codex_requested_permissions_against_permission_profile(
+                &json!({"fileSystem": {"write": ["/tmp/project/output"]}}),
+                &file_write_denied,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_codex_requested_permissions_against_permission_profile(
+                &json!({"fileSystem": {"entries": [{
+                    "access": "deny",
+                    "path": {"type": "path", "path": "/tmp/project/secret"}
+                }]}}),
+                &file_write_denied,
+            )
+            .is_ok(),
+            "a provider-side deny entry does not request authority"
+        );
     }
 
     fn effective_instance(
@@ -11906,6 +13807,22 @@ mod tests {
             stderr_ring_lines: 200,
             debug_native_events: false,
         }
+    }
+
+    #[test]
+    fn model_discovery_requires_authoritative_ready_snapshot() {
+        let mut runtime = cli_runtime_summary_from_instance(effective_instance("codex", true));
+        runtime.status = RuntimeStatus::Ready;
+        assert!(cli_runtime_ready_for_model_discovery(&runtime));
+
+        runtime.status = RuntimeStatus::Degraded {
+            message: "probe degraded".to_owned(),
+        };
+        assert!(!cli_runtime_ready_for_model_discovery(&runtime));
+
+        runtime.status = RuntimeStatus::Ready;
+        runtime.enabled = false;
+        assert!(!cli_runtime_ready_for_model_discovery(&runtime));
     }
 
     #[test]
@@ -11998,7 +13915,7 @@ mod tests {
     }
 
     #[test]
-    fn cli_runtime_catalog_marks_enabled_instances_as_unprobed() {
+    fn cli_runtime_catalog_marks_enabled_instances_as_gateway_initializing() {
         let summaries =
             cli_runtime_summaries_from_instances(vec![effective_instance("codex", true)]);
 
@@ -12006,11 +13923,8 @@ mod tests {
         assert_eq!(summaries[0].runtime_id, "codex");
         assert_eq!(summaries[0].kind, CLIAgentRuntimeKind::Codex);
         assert!(summaries[0].enabled);
-        assert!(matches!(
-            summaries[0].status,
-            RuntimeStatus::Degraded { .. }
-        ));
-        assert_eq!(summaries[0].diagnostics[0].code, "cli_runtime.unprobed");
+        assert_eq!(summaries[0].status, RuntimeStatus::Initializing);
+        assert_eq!(summaries[0].diagnostics[0].code, "cli_runtime.initializing");
         assert!(summaries[0].capabilities.supports_threads);
         assert!(summaries[0].capabilities.supports_model_list);
     }
@@ -12132,7 +14046,7 @@ mod tests {
             !runtime
                 .diagnostics
                 .iter()
-                .any(|diagnostic| diagnostic.code == "cli_runtime.unprobed")
+                .any(|diagnostic| diagnostic.code == "cli_runtime.initializing")
         );
     }
 

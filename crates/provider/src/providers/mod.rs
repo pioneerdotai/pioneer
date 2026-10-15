@@ -1,17 +1,19 @@
-mod anthropic;
+pub(crate) mod anthropic;
 mod azure_openai;
 mod bedrock;
 mod compatible;
-mod copilot;
-mod deepseek;
+pub(crate) mod copilot;
+pub(crate) mod deepseek;
 mod echo;
-mod gemini;
-mod glm;
+pub mod embedding;
+pub(crate) mod gemini;
+pub(crate) mod glm;
 mod local;
-mod ollama;
-mod openai;
-mod openrouter;
-mod telnyx;
+pub(crate) mod ollama;
+pub(crate) mod openai;
+pub(crate) mod openrouter;
+pub(crate) mod retired;
+pub(crate) mod telnyx;
 
 pub use anthropic::AnthropicProvider;
 pub use azure_openai::AzureOpenAiProvider;
@@ -31,3 +33,12 @@ pub use ollama::OllamaProvider;
 pub use openai::OpenAiProvider;
 pub use openrouter::OpenRouterProvider;
 pub use telnyx::TelnyxProvider;
+
+#[cfg(test)]
+mod usage_tests;
+
+#[cfg(test)]
+mod history_test_support;
+
+#[cfg(test)]
+mod streaming_tests;

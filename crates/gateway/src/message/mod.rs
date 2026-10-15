@@ -8,10 +8,12 @@ mod artifact_tools;
 mod artifacts;
 mod auth_handlers;
 mod binary;
+mod cli_post_turn;
 #[path = "../cli_runtime/handlers.rs"]
 mod cli_runtime;
+mod compaction_background;
 mod dispatch;
-mod hooks;
+pub(crate) mod html_tools;
 mod invitation_handlers;
 mod invitation_lifecycle;
 mod markdown;
@@ -20,9 +22,13 @@ mod member_handlers;
 mod memory_handlers;
 mod message_mutations;
 mod message_turn;
+mod native_health;
 mod notifications;
+mod patch_history_handlers;
 mod permission_handlers;
 mod provider_handlers;
+mod provider_readiness;
+mod reconciliation_diagnostics;
 pub(crate) mod skills;
 mod summary;
 mod task_agent_executor;
@@ -33,16 +39,29 @@ mod tasks;
 #[cfg(test)]
 mod tests;
 mod thread_agents_doc_handlers;
+mod thread_file_handlers;
 mod thread_handlers;
+mod thread_tool_results;
 mod timeline_cursor;
 mod timeline_handlers;
 mod timeline_notifications;
 mod turn_handlers;
 mod voice_handlers;
 
-const NATIVE_HUMAN_INTERACTION_RUNTIME_ID: &str = "__native_permission__";
+const NATIVE_HUMAN_INTERACTION_RUNTIME_ID: &str =
+    pioneer_protocol::constants::runtime_ids::NATIVE_PERMISSION;
 const NATIVE_HUMAN_INTERACTION_RUNTIME_KIND: &str = "native";
 const NATIVE_HUMAN_INTERACTION_REQUEST_KIND: &str = "native_permission";
+
+/// Turn-start history keeps its caller's read contour with ordinary writes.
+/// A surrounding Task correctness transition must not promote metadata
+/// registration, restore, or compaction to Critical.
+pub(crate) fn ordinary_history_store(store: &CrudStore) -> CrudStore {
+    match store.database_connection().read_class() {
+        SqliteReadClass::Interactive => store.with_interactive_writes(),
+        SqliteReadClass::Maintenance => store.with_maintenance_access(),
+    }
+}
 mod workspace_handlers;
 
 pub use summary::SummaryConfig;
@@ -50,6 +69,71 @@ pub use summary::SummaryConfig;
 pub(crate) trait ArtifactStreamInvalidation: Send + Sync {
     fn cancel_artifact(&self, workspace_id: &str, artifact_id: &str) -> usize;
     fn cancel_authorization_signal(&self, signal: &AccessChangeSignal) -> usize;
+}
+
+/// Identifies whether Task child reconciliation is part of the live Turn
+/// lifecycle or a durable background repair pass. The distinction controls
+/// read admission independently from the correctness-critical writes shared
+/// by both paths.
+#[derive(Clone, Copy)]
+enum TaskChildReconciliationOrigin {
+    Live,
+    DurableBackground,
+}
+
+fn gateway_stage_for_read_model_repair(
+    stage: pioneer_crud::ReadModelRepairStage,
+) -> pioneer_observability::GatewayOperationStage {
+    use pioneer_crud::ReadModelRepairStage as RepairStage;
+    use pioneer_observability::GatewayOperationStage as OperationStage;
+
+    match stage {
+        RepairStage::TerminalPayloadCheckpointLoad => {
+            OperationStage::ResilienceReadModelCheckpointLoad
+        }
+        RepairStage::TerminalPayloadCheckpointReset => {
+            OperationStage::ResilienceReadModelCheckpointReset
+        }
+        RepairStage::TerminalPayloadFullScanBatchLoad => {
+            OperationStage::ResilienceReadModelFullScanBatchLoad
+        }
+        RepairStage::TerminalPayloadFullScanBatchEvaluate => {
+            OperationStage::ResilienceReadModelFullScanBatchEvaluate
+        }
+        RepairStage::TerminalPayloadFullScanBatchCommit => {
+            OperationStage::ResilienceReadModelFullScanBatchCommit
+        }
+        RepairStage::TerminalPayloadFullScanComplete => {
+            OperationStage::ResilienceReadModelFullScanComplete
+        }
+        RepairStage::TerminalPayloadIncrementalBegin => {
+            OperationStage::ResilienceReadModelIncrementalBegin
+        }
+        RepairStage::TerminalPayloadIncrementalDirtyBatchLoad => {
+            OperationStage::ResilienceReadModelIncrementalDirtyBatchLoad
+        }
+        RepairStage::TerminalPayloadIncrementalSourceBatchLoad => {
+            OperationStage::ResilienceReadModelIncrementalSourceBatchLoad
+        }
+        RepairStage::TerminalPayloadIncrementalBatchEvaluate => {
+            OperationStage::ResilienceReadModelIncrementalBatchEvaluate
+        }
+        RepairStage::TerminalPayloadIncrementalBatchCommit => {
+            OperationStage::ResilienceReadModelIncrementalBatchCommit
+        }
+        RepairStage::TerminalPayloadIncrementalComplete => {
+            OperationStage::ResilienceReadModelIncrementalComplete
+        }
+        RepairStage::TerminalTurnRunningAttempts => {
+            OperationStage::ResilienceReadModelRunningAttempts
+        }
+        RepairStage::TerminalTasksMissingCompletedAt => {
+            OperationStage::ResilienceReadModelTerminalTasks
+        }
+        RepairStage::TerminalRunsMissingCompletedAt => {
+            OperationStage::ResilienceReadModelTerminalRuns
+        }
+    }
 }
 
 use crate::hook_runtime::GatewayHookRuntimeBuilder;
@@ -66,7 +150,6 @@ use crate::thread_episodic_hooks::{
     ThreadContextRecallHookConfig, ThreadEpisodicMemoryRecallProvider,
     thread_context_recall_hook_package,
 };
-use crate::tokenizer::count_tokens;
 use anyhow::Context as AnyhowContext;
 use futures_util::FutureExt;
 use pioneer_agent::MemoryLoopConfig;
@@ -86,7 +169,8 @@ use pioneer_crud::{
     CliRuntimePendingRequestRecord,
     CliRuntimePendingRequestStatus as StoredCliRuntimePendingRequestStatus, ConversationEntry,
     CrudStore, NewCliRuntimePendingRequest, NewCliRuntimeThreadBinding,
-    ResolveCliRuntimePendingRequest, TimeoutCandidate,
+    ResolveCliRuntimePendingRequest, TimeoutCandidate, TurnFinalizationCommitOutcome,
+    TurnFinalizationReconciliationSummary,
 };
 use pioneer_hooks::{HookRecoveryOptions, HookRuntime};
 use pioneer_memory::{
@@ -104,11 +188,10 @@ use pioneer_protocol::{
     CLIRuntimeRefreshResponse, CLIRuntimeRequestKind, CLIRuntimeRequestOpenedNotification,
     CLIRuntimeRequestResolution, CLIRuntimeRequestResolvedNotification,
     CLIRuntimeRequestRespondParams, CLIRuntimeRequestRespondResponse, CLIRuntimeReviewStartParams,
-    CLIRuntimeStatusParams, CLIRuntimeStatusResponse, CLIRuntimeThreadBinding,
-    CLIRuntimeThreadBindingGetParams, CLIRuntimeThreadBindingGetResponse,
+    CLIRuntimeStatusChangedNotification, CLIRuntimeStatusParams, CLIRuntimeStatusResponse,
+    CLIRuntimeThreadBinding, CLIRuntimeThreadBindingGetParams, CLIRuntimeThreadBindingGetResponse,
     CLIRuntimeThreadBindingManagement, CLIRuntimeThreadCompactParams, CLIRuntimeThreadForkParams,
     CLIRuntimeThreadForkResponse, CLIRuntimeTurnSteerParams, CLIRuntimeTurnSteerResponse,
-    ContextCompressedNotification, ContextCompressingNotification,
     GatewayRemoteAccessStatusChangedNotification,
     GatewayThreadEpisodicVectorRefillStatusChangedNotification, GatewayVoiceInputSettings,
     GatewayVoiceInputStatusChangedNotification, INVALID_PARAMS_CODE, INVALID_REQUEST_CODE,
@@ -125,17 +208,18 @@ use pioneer_protocol::{
     McpServerRestartResponse, McpServerStatus, McpSourceKind, McpToolAnnotationSummary,
     McpToolCatalogItem, McpTransportSummary, McpTurnBindingSummary, McpUninstallParams,
     McpUninstallResponse, McpValidationDiagnostic, PARSE_ERROR_CODE, ProviderConfigureParams,
-    ProviderConfigureResponse, ProviderDeleteApiKeyParams, ProviderDeleteApiKeyResponse,
-    ProviderListModelsParams, ProviderListModelsResponse, ProviderListParams, ProviderListResponse,
-    ProviderModelCapabilities, ProviderModelInfo, ProviderModelLimits, ProviderModelPricing,
-    ProviderModelReasoningCapabilities, ProviderSetApiKeyParams, ProviderSetApiKeyResponse,
-    ProviderSummary, ProviderSummaryCapabilities, ReasoningCapabilitySource, RequestId,
-    RuntimeAccountSnapshot, RuntimeCapabilities, RuntimeDiagnostic, RuntimeDiagnosticLevel,
-    RuntimeModelInfo, RuntimeStatus, RuntimeSummary, SkillsUploadAbortParams,
-    SkillsUploadFinishParams, SkillsUploadStartParams, SystemEventLevel, TaskAcceptParams,
-    TaskAgendaParams, TaskCancelParams, TaskCreateParams, TaskDeliveriesParams, TaskDelivery,
-    TaskDeliveryAttempt, TaskDeliveryMode, TaskDetachParams, TaskEventsParams, TaskGetParams,
-    TaskListParams, TaskPauseParams, TaskRescheduleParams, TaskResumeParams, TaskReviseParams,
+    ProviderConfigureResponse, ProviderDefinition, ProviderDeleteApiKeyParams,
+    ProviderDeleteApiKeyResponse, ProviderListModelsParams, ProviderListModelsResponse,
+    ProviderListParams, ProviderListResponse, ProviderModelCapabilities, ProviderModelInfo,
+    ProviderModelLimits, ProviderModelPricing, ProviderModelReasoningCapabilities,
+    ProviderSetApiKeyParams, ProviderSetApiKeyResponse, ProviderSummary,
+    ProviderSummaryCapabilities, ReasoningCapabilitySource, RequestId, RuntimeAccountSnapshot,
+    RuntimeCapabilities, RuntimeDiagnostic, RuntimeDiagnosticLevel, RuntimeModelInfo,
+    RuntimeStatus, RuntimeSummary, SkillsUploadAbortParams, SkillsUploadFinishParams,
+    SkillsUploadStartParams, SystemEventLevel, TaskAcceptParams, TaskAgendaParams,
+    TaskCancelParams, TaskCreateParams, TaskDeliveriesParams, TaskDelivery, TaskDeliveryAttempt,
+    TaskDeliveryMode, TaskDetachParams, TaskEventsParams, TaskGetParams, TaskListParams,
+    TaskPauseParams, TaskRescheduleParams, TaskResumeParams, TaskReviseParams,
     TaskTreeParams as TaskTreeTaskParams, TaskWaitParams, ThreadAgentsDocArchiveParams,
     ThreadAgentsDocArchiveResponse, ThreadAgentsDocChangedNotification, ThreadAgentsDocGetParams,
     ThreadAgentsDocGetResponse, ThreadAgentsDocPayload, ThreadAgentsDocResolveForThreadParams,
@@ -168,10 +252,10 @@ use pioneer_protocol::{
     validate_voice_streaming_audio_format,
 };
 use pioneer_provider::{ChatMessage, ProviderRegistry};
-use pioneer_runtime_events::ExecutionEventHub;
+use pioneer_runtime_events::{DurableCommitRejection, ExecutionEventHub};
 use pioneer_sqlite::{
-    DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS,
-    is_anyhow_sqlite_transient_access, retry_with_backoff,
+    DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, SqliteReadClass,
+    SqliteWriteClass, is_anyhow_sqlite_transient_access, retry_with_backoff,
 };
 use pioneer_tasks::{TaskRuntime, TaskRuntimeConfig};
 use serde::Serialize;
@@ -184,6 +268,7 @@ use std::pin::Pin;
 use std::sync::RwLock as StdRwLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
+use std::time::Instant;
 use tokio::sync::{Mutex, OwnedMutexGuard, RwLock, broadcast, oneshot};
 use tokio::task::JoinHandle;
 
@@ -313,6 +398,29 @@ where
     F: Future<Output = T> + Send + 'static,
     T: Send + 'static,
 {
+    let startup_queued_at = std::time::Instant::now();
+    let future = pioneer_observability::turn_startup::scope(
+        pioneer_observability::turn_startup::current_key(),
+        async move {
+            pioneer_observability::turn_startup::record_current_duration(
+                pioneer_observability::turn_startup::Stage::GatewayWorkerWait,
+                startup_queued_at.elapsed(),
+            );
+            future.await
+        },
+    );
+    // Test-local reporting scopes must follow the same owned request tasks as
+    // the admission path. This does not install a global subscriber or change
+    // production reporting; it only preserves the fixture's local capture.
+    #[cfg(test)]
+    let future = {
+        use sentry::SentryFutureExt;
+        use tracing::instrument::WithSubscriber;
+        let dispatch = tracing::dispatcher::get_default(|dispatch| dispatch.clone());
+        future
+            .with_subscriber(dispatch)
+            .bind_hub(sentry::Hub::current())
+    };
     AbortOnDropMessageTask::new(tokio::spawn(future))
         .join()
         .await
@@ -321,10 +429,20 @@ where
 const RESILIENCE_WORKER_POLL_INTERVAL_SECONDS: u64 = 2;
 pub(super) const TURN_EXECUTION_OWNER_LEASE_SECONDS: i64 = 15;
 const RESILIENCE_WORKER_TRANSIENT_STORAGE_BACKOFF_SECONDS: u64 = 60;
+const PROGRESS_DELTA_HEARTBEAT_INTERVAL_SECONDS: i64 = 5;
+const PROGRESS_ITEM_TYPE_MISS_RETRY_SECONDS: i64 = 1;
+const PROGRESS_ITEM_TYPE_MISS_CACHE_CAPACITY: usize = 1_024;
 const CLI_RUNTIME_COMMAND_REHYDRATION_INTERVAL_SECONDS: i64 = 30;
 const AGENT_ACTION_LEDGER_COMPACTION_INTERVAL_SECONDS: i64 = 24 * 60 * 60;
 const AGENT_ACTION_LEDGER_COMPACTION_RETRY_SECONDS: i64 = 60 * 60;
 const AGENT_ACTION_LEDGER_COMPACTION_BATCH_SIZE: u64 = 256;
+const NATIVE_TERMINAL_EFFECT_RETENTION_SECONDS: i64 = 30 * 24 * 60 * 60;
+const NATIVE_TERMINAL_EFFECT_PURGE_INTERVAL_SECONDS: i64 = 24 * 60 * 60;
+const NATIVE_TERMINAL_EFFECT_PURGE_RETRY_SECONDS: i64 = 60 * 60;
+const NATIVE_TERMINAL_EFFECT_PURGE_BATCH_SIZE: u64 = 256;
+const NATIVE_TERMINAL_EFFECT_RECOVERY_INTERVAL_SECONDS: i64 = 10 * 60;
+const NATIVE_TERMINAL_EFFECT_RECOVERY_RETRY_SECONDS: i64 = 60;
+const NATIVE_TERMINAL_EFFECT_RECOVERY_BATCH_SIZE: u64 = 64;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct MessageProcessorResilienceConfig {
@@ -359,24 +477,45 @@ where
     .await
 }
 
-fn record_resilience_worker_poll_error(
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResilienceWorkerFailureImpact {
+    CriticalPoll,
+    Maintenance,
+}
+
+fn record_resilience_worker_error(
     operation: &'static str,
     error: &anyhow::Error,
-    transient_storage_poll_failed: &mut bool,
-) {
+    impact: ResilienceWorkerFailureImpact,
+) -> bool {
     if is_anyhow_sqlite_transient_access(error) {
-        *transient_storage_poll_failed = true;
         warn!(
             operation,
             error = %format!("{error:#}"),
             "resilience worker poll deferred by transient storage access failure"
         );
+        impact == ResilienceWorkerFailureImpact::CriticalPoll
     } else {
         error!(
             operation,
             error = %format!("{error:#}"),
             "resilience worker poll failed"
         );
+        false
+    }
+}
+
+fn record_resilience_worker_poll_error(
+    operation: &'static str,
+    error: &anyhow::Error,
+    transient_storage_poll_failed: &mut bool,
+) {
+    if record_resilience_worker_error(
+        operation,
+        error,
+        ResilienceWorkerFailureImpact::CriticalPoll,
+    ) {
+        *transient_storage_poll_failed = true;
     }
 }
 
@@ -390,19 +529,6 @@ async fn sleep_after_transient_storage_poll_failure(transient_storage_poll_faile
     ))
     .await;
     true
-}
-
-#[derive(Clone, Copy)]
-pub struct ContextBudget {
-    pub max_context_tokens: usize,
-    pub response_reserve_tokens: usize,
-}
-
-impl ContextBudget {
-    fn history_budget(&self) -> usize {
-        self.max_context_tokens
-            .saturating_sub(self.response_reserve_tokens)
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -445,9 +571,54 @@ pub struct MessageProcessor {
     gateway_secrets: Arc<GatewaySecrets>,
     invitation_gateway_base_url: Arc<pioneer_protocol::GatewayBaseUrl>,
     summary_config: Arc<summary::SummaryConfig>,
-    context_budget: ContextBudget,
-    agent_listener_tasks: Arc<Mutex<HashMap<String, JoinHandle<()>>>>,
-    agent_message_buffers: Arc<Mutex<HashMap<String, String>>>,
+    compaction_settings: Arc<StdRwLock<pioneer_compaction::CompactionSettings>>,
+    completed_history_checks: Arc<Mutex<HashMap<(String, String), compaction_background::OwnedHistoryCheck>>>,
+    compaction_lifecycle_not_before: Arc<StdRwLock<Option<tokio::time::Instant>>>,
+    #[cfg(test)]
+    completed_history_preparation_barrier:
+        Arc<compaction_background::CompletedHistoryPreparationBarrier>,
+    #[cfg(test)]
+    turn_execution_heartbeat_barrier:
+        Arc<compaction_background::CompletedHistoryPreparationBarrier>,
+    #[cfg(test)]
+    task_history_preparation_failure: Arc<std::sync::Mutex<Option<anyhow::Error>>>,
+    #[cfg(test)]
+    task_cli_terminal_preparation_finished: Arc<tokio::sync::Notify>,
+    #[cfg(test)]
+    task_cli_admission_failure: Arc<std::sync::Mutex<Option<turn_handlers::TurnStartFailure>>>,
+    #[cfg(test)]
+    task_cli_preparation_attempts: Arc<AtomicU64>,
+    #[cfg(test)]
+    task_cli_history_revalidation_failure: Arc<std::sync::Mutex<Option<anyhow::Error>>>,
+    #[cfg(test)]
+    task_cli_readiness_failure: Arc<std::sync::Mutex<Option<anyhow::Error>>>,
+    #[cfg(test)]
+    task_output_capture_failures: Arc<std::sync::Mutex<HashMap<String, anyhow::Error>>>,
+    pub(crate) compaction_coordinator: Arc<crate::compaction::ContextCompactionCoordinator>,
+    cli_history_shutdown: tokio_util::sync::CancellationToken,
+    #[cfg(test)]
+    cli_transfer_capture_count: Arc<AtomicU64>,
+    #[cfg(test)]
+    cli_transfer_test_deadline: Arc<tokio::sync::Notify>,
+    #[cfg(test)]
+    cli_history_monitor_drops: Arc<AtomicU64>,
+    #[cfg(test)]
+    cli_history_monitor_cleanup_drops: Arc<AtomicU64>,
+    #[cfg(test)]
+    predispatch_cli_turn_read_failures: Arc<Mutex<HashSet<String>>>,
+    #[cfg(test)]
+    claude_boundary_write_failures: Arc<Mutex<HashSet<String>>>,
+    #[cfg(test)]
+    native_cancellation_finish_barrier: Arc<Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>>,
+    #[cfg(test)]
+    native_cancellation_materialization_failure: Arc<Mutex<Option<sea_orm::DbErr>>>,
+    #[cfg(test)]
+    native_cancellation_materialization_barrier: Arc<Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>>,
+    workspace_compaction_settings: Arc<StdRwLock<std::collections::BTreeMap<String, crate::settings::WorkspaceCompactionSettings>>>,
+    agent_listener_tasks: Arc<Mutex<HashMap<String, AgentListenerTask>>>,
+    agent_listener_generation: Arc<AtomicU64>,
+    agent_message_buffers: Arc<Mutex<HashMap<String, AgentMarkdownBuffer>>>,
+    progress_items: Arc<Mutex<ProgressItemRegistry>>,
     agent_action_bindings:
         Arc<Mutex<HashMap<String, agent_action_tools::AgentActionRuntimeBinding>>>,
     parent_timeline_targets: Arc<Mutex<HashMap<String, agent_runtime::ParentTimelineTarget>>>,
@@ -458,6 +629,7 @@ pub struct MessageProcessor {
         Arc<Mutex<HashMap<CLIRuntimePendingTurnEventKey, Vec<CLIRuntimePendingTurnServerRequest>>>>,
     cli_runtime_machine_requests: Arc<Mutex<CLIRuntimeMachineRequestRegistry>>,
     cli_runtime_proxy_cache: Arc<Mutex<HashMap<(String, String), Option<String>>>>,
+    provider_readiness: Arc<provider_readiness::ProviderReadinessSupervisor>,
     cli_runtime_pending_turn_activity_sequence: Arc<AtomicU64>,
     cli_runtime_event_hubs:
         Arc<Mutex<HashMap<crate::cli_runtime::session_instance::CliSessionInstanceId, Arc<ExecutionEventHub>>>>,
@@ -467,7 +639,7 @@ pub struct MessageProcessor {
         Mutex<
             HashMap<
                 crate::cli_runtime::manager::CLIAgentRuntimeSessionKey,
-                Arc<tokio::sync::Mutex<()>>,
+                turn_handlers::CliRuntimeSessionTurnLocks,
             >,
         >,
     >,
@@ -475,7 +647,7 @@ pub struct MessageProcessor {
         Arc<Mutex<HashMap<String, tokio::sync::OwnedMutexGuard<()>>>>,
     cli_runtime_command_heartbeats: CliRuntimeCommandHeartbeatTracker,
     artifact_tool_states: Arc<Mutex<HashMap<String, Arc<ArtifactToolState>>>>,
-    artifact_output_dirs: Arc<Mutex<HashMap<String, String>>>,
+    artifact_output_dirs: Arc<Mutex<HashMap<String, pioneer_artifacts::ArtifactOutputDir>>>,
     turn_final_assistant_texts: Arc<Mutex<HashMap<String, String>>>,
     native_permission_pending_requests:
         Arc<Mutex<HashMap<String, PendingNativePermissionApprovalRequest>>>,
@@ -485,13 +657,17 @@ pub struct MessageProcessor {
     timeout_supervisor: Arc<TimeoutSupervisor>,
     recovery_coordinator: Arc<RecoveryCoordinator>,
     native_turn_event_delivery_kick_running: Arc<AtomicBool>,
+    native_terminal_effect_kick_running: Arc<AtomicBool>,
+    native_terminal_effect_kick_pending: Arc<AtomicBool>,
+    native_lifecycle_readiness: Arc<native_health::NativeLifecycleReadinessState>,
     resilience_worker: Arc<Mutex<Option<JoinHandle<()>>>>,
     hook_recovery_worker: Arc<Mutex<Option<JoinHandle<()>>>>,
     task_event_listener_worker: Arc<Mutex<Option<JoinHandle<()>>>>,
-    skills_watcher_worker: Arc<Mutex<Option<JoinHandle<()>>>>,
+    skills_watcher_worker: Arc<Mutex<Option<skills::watcher::SkillsWatcherWorker>>>,
     tool_loop_config: ToolLoopConfig,
     memory_loop_config: Arc<StdRwLock<MemoryLoopConfig>>,
     thread_episodic_runtime_config: Arc<StdRwLock<ThreadEpisodicRuntimeConfig>>,
+    administration_snapshot_version: Arc<AtomicU64>,
     skills_snapshot_version: Arc<AtomicU64>,
     mcp_snapshot_version: Arc<AtomicU64>,
     mcp_service: Arc<McpService>,
@@ -500,7 +676,7 @@ pub struct MessageProcessor {
     #[cfg(test)]
     cli_runtime_skill_preflight_test_events: Arc<Mutex<Vec<String>>>,
     #[cfg(test)]
-    cli_mcp_readiness_override: Option<pioneer_protocol::CliMcpAdapterReadiness>,
+    cli_mcp_readiness_overrides: [Option<pioneer_protocol::CliMcpAdapterReadiness>; 3],
     skill_upload_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     skill_upload_owners: Arc<Mutex<HashMap<String, AuthenticatedTransferOwner>>>,
     pub(crate) task_agent_executor: Arc<task_agent_executor::TaskAgentExecutor>,
@@ -522,8 +698,229 @@ pub struct MessageProcessor {
     voice_input_supervisor: Option<Arc<VoiceInputSupervisor>>,
     self_improvement_supervisor: Option<Arc<crate::self_improvement::supervisor::SelfImprovementSupervisor>>,
     gateway_settings_update_lock: Arc<Mutex<()>>,
+    pub(crate) voice_finalizations: crate::voice::finalization::VoiceFinalizations,
+    #[cfg(test)]
+    pub(crate) voice_test_transcriber: Option<crate::voice::transcription::TestVoiceSpeechTranscriber>,
     pub(crate) voice_sessions: GatewayVoiceSessionStore,
     pub(crate) voice_session_buffers: GatewayVoiceSessionBufferStore,
+}
+
+struct AgentListenerTask {
+    actor_generation: u64,
+    listener_generation: u64,
+    handle: JoinHandle<()>,
+}
+
+#[derive(Default)]
+struct AgentMarkdownBuffer {
+    text: String,
+    stats: Arc<AgentMarkdownBufferStats>,
+}
+
+impl AgentMarkdownBuffer {
+    fn new(text: String) -> Self {
+        Self {
+            text,
+            stats: Arc::new(AgentMarkdownBufferStats::default()),
+        }
+    }
+}
+
+#[derive(Default)]
+struct AgentMarkdownBufferStats {
+    delta_count: AtomicU64,
+    cumulative_parse_input_bytes: AtomicU64,
+    cumulative_parse_duration_ns: AtomicU64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct ProgressItemKey {
+    turn_id: String,
+    item_id: String,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ProgressItemState {
+    item_type: TurnItemType,
+    last_persisted_heartbeat_at: Option<i64>,
+    pending_heartbeat_claim: Option<u64>,
+}
+
+#[derive(Clone, Debug)]
+struct ProgressHeartbeatClaim {
+    key: ProgressItemKey,
+    claim_id: u64,
+    item_type: TurnItemType,
+    previous_heartbeat_at: Option<i64>,
+}
+
+#[derive(Default)]
+struct ProgressItemRegistry {
+    items: HashMap<ProgressItemKey, ProgressItemState>,
+    missing_item_types: HashMap<ProgressItemKey, i64>,
+    next_heartbeat_claim: u64,
+}
+
+impl ProgressItemRegistry {
+    fn item_type(&self, turn_id: &str, item_id: &str) -> Option<TurnItemType> {
+        self.items
+            .get(&ProgressItemKey {
+                turn_id: turn_id.to_owned(),
+                item_id: item_id.to_owned(),
+            })
+            .map(|state| state.item_type)
+    }
+
+    fn remember_item(
+        &mut self,
+        turn_id: &str,
+        item_id: &str,
+        item_type: TurnItemType,
+        persisted_heartbeat_at: Option<i64>,
+    ) {
+        let key = ProgressItemKey {
+            turn_id: turn_id.to_owned(),
+            item_id: item_id.to_owned(),
+        };
+        self.missing_item_types.remove(&key);
+        let state = self.items.entry(key).or_insert(ProgressItemState {
+            item_type,
+            last_persisted_heartbeat_at: persisted_heartbeat_at,
+            pending_heartbeat_claim: None,
+        });
+        state.item_type = item_type;
+        if let Some(persisted_heartbeat_at) = persisted_heartbeat_at {
+            state.last_persisted_heartbeat_at = Some(
+                state
+                    .last_persisted_heartbeat_at
+                    .map_or(persisted_heartbeat_at, |current| {
+                        current.max(persisted_heartbeat_at)
+                    }),
+            );
+            state.pending_heartbeat_claim = None;
+        }
+    }
+
+    fn missing_item_type_is_fresh(&self, turn_id: &str, item_id: &str, now_unix: i64) -> bool {
+        self.missing_item_types
+            .get(&ProgressItemKey {
+                turn_id: turn_id.to_owned(),
+                item_id: item_id.to_owned(),
+            })
+            .is_some_and(|last_lookup_at| {
+                now_unix.saturating_sub(*last_lookup_at) < PROGRESS_ITEM_TYPE_MISS_RETRY_SECONDS
+            })
+    }
+
+    fn remember_missing_item_type(&mut self, turn_id: &str, item_id: &str, now_unix: i64) {
+        self.missing_item_types.retain(|_, last_lookup_at| {
+            now_unix.saturating_sub(*last_lookup_at) < PROGRESS_ITEM_TYPE_MISS_RETRY_SECONDS
+        });
+        let key = ProgressItemKey {
+            turn_id: turn_id.to_owned(),
+            item_id: item_id.to_owned(),
+        };
+        if !self.missing_item_types.contains_key(&key)
+            && self.missing_item_types.len() >= PROGRESS_ITEM_TYPE_MISS_CACHE_CAPACITY
+            && let Some(oldest) = self
+                .missing_item_types
+                .iter()
+                .min_by_key(|(_, last_lookup_at)| **last_lookup_at)
+                .map(|(key, _)| key.clone())
+        {
+            self.missing_item_types.remove(&oldest);
+        }
+        self.missing_item_types.insert(key, now_unix);
+    }
+
+    fn claim_delta_heartbeat(
+        &mut self,
+        turn_id: &str,
+        item_id: &str,
+        now_unix: i64,
+    ) -> Option<ProgressHeartbeatClaim> {
+        let key = ProgressItemKey {
+            turn_id: turn_id.to_owned(),
+            item_id: item_id.to_owned(),
+        };
+        let state = self.items.get(&key)?;
+        if state.pending_heartbeat_claim.is_some()
+            || state.last_persisted_heartbeat_at.is_some_and(|last| {
+                now_unix.saturating_sub(last) < PROGRESS_DELTA_HEARTBEAT_INTERVAL_SECONDS
+            })
+        {
+            return None;
+        }
+        let previous_heartbeat_at = state.last_persisted_heartbeat_at;
+        let item_type = state.item_type;
+        self.next_heartbeat_claim = self.next_heartbeat_claim.wrapping_add(1).max(1);
+        let claim_id = self.next_heartbeat_claim;
+        let state = self
+            .items
+            .get_mut(&key)
+            .expect("progress item must remain present while claiming heartbeat");
+        state.last_persisted_heartbeat_at = Some(now_unix);
+        state.pending_heartbeat_claim = Some(claim_id);
+        Some(ProgressHeartbeatClaim {
+            key,
+            claim_id,
+            item_type,
+            previous_heartbeat_at,
+        })
+    }
+
+    fn finish_heartbeat_claim(&mut self, claim: &ProgressHeartbeatClaim, persisted: bool) {
+        let Some(state) = self.items.get_mut(&claim.key) else {
+            return;
+        };
+        if state.pending_heartbeat_claim != Some(claim.claim_id) {
+            return;
+        }
+        state.pending_heartbeat_claim = None;
+        if !persisted {
+            state.last_persisted_heartbeat_at = claim.previous_heartbeat_at;
+        }
+    }
+
+    fn forget_item(&mut self, turn_id: &str, item_id: &str) {
+        let key = ProgressItemKey {
+            turn_id: turn_id.to_owned(),
+            item_id: item_id.to_owned(),
+        };
+        self.items.remove(&key);
+        self.missing_item_types.remove(&key);
+    }
+
+    fn forget_turn(&mut self, turn_id: &str) {
+        self.items.retain(|key, _| key.turn_id != turn_id);
+        self.missing_item_types
+            .retain(|key, _| key.turn_id != turn_id);
+    }
+}
+
+impl AgentMarkdownBufferStats {
+    fn record_input(&self, source_bytes: usize) {
+        self.delta_count.fetch_add(1, Ordering::Relaxed);
+        self.cumulative_parse_input_bytes.fetch_add(
+            u64::try_from(source_bytes).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+    }
+
+    fn record_parse_duration(&self, elapsed: Duration) {
+        self.cumulative_parse_duration_ns.fetch_add(
+            u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+    }
+
+    fn snapshot(&self) -> (u64, u64, Duration) {
+        (
+            self.delta_count.load(Ordering::Relaxed),
+            self.cumulative_parse_input_bytes.load(Ordering::Relaxed),
+            Duration::from_nanos(self.cumulative_parse_duration_ns.load(Ordering::Relaxed)),
+        )
+    }
 }
 
 #[derive(Clone)]
@@ -599,6 +996,15 @@ struct PendingNativePermissionApprovalRequest {
     respond_to: oneshot::Sender<pioneer_tools::PermissionApprovalResolution>,
 }
 
+#[derive(Default)]
+struct TaskEventFanoutSummary {
+    selected: usize,
+    event_inputs: usize,
+    emitted: usize,
+    errors: usize,
+    pending: Option<bool>,
+}
+
 impl MessageProcessor {
     #[cfg(test)]
     pub fn new_with_memory_runtime(
@@ -609,7 +1015,6 @@ impl MessageProcessor {
         crud_store: Arc<CrudStore>,
         gateway_secrets: Arc<GatewaySecrets>,
         summary_config: summary::SummaryConfig,
-        context_budget: ContextBudget,
         tool_loop_config: ToolLoopConfig,
         memory_runtime: Arc<GatewayMemoryRuntime>,
         runtime_home: PathBuf,
@@ -625,7 +1030,6 @@ impl MessageProcessor {
             crud_store,
             gateway_secrets,
             summary_config,
-            context_budget,
             tool_loop_config,
             memory_runtime,
             runtime_home,
@@ -645,7 +1049,6 @@ impl MessageProcessor {
         crud_store: Arc<CrudStore>,
         gateway_secrets: Arc<GatewaySecrets>,
         summary_config: summary::SummaryConfig,
-        context_budget: ContextBudget,
         tool_loop_config: ToolLoopConfig,
         memory_runtime: Arc<GatewayMemoryRuntime>,
         runtime_home: PathBuf,
@@ -660,6 +1063,7 @@ impl MessageProcessor {
             Ok(duration) => duration.as_secs(),
             Err(_) => 0,
         };
+        let maintenance_crud_store = Arc::new(crud_store.with_maintenance_access());
         let mcp_snapshot_version = Arc::new(AtomicU64::new(0));
         let authorization_invalidation_hub =
             Arc::new(AuthorizationInvalidationHub::durable(crud_store.clone()));
@@ -739,19 +1143,34 @@ impl MessageProcessor {
                 thread_episodic_runtime_config.vector_search.clone(),
             ),
         );
-        let thread_episodic_index_executor = Arc::new(ThreadEpisodicIndexExecutor::new(
-            crud_store.clone(),
-            thread_episodic_backend.clone(),
-            Arc::new(RuntimeVectorThreadEpisodicIndexPayloadProvider::new(
-                Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(
-                    crud_store.clone(),
-                    thread_episodic_storage_uri_from_path(thread_episodic_storage_root.as_path()),
+        let thread_episodic_workspace_refill_supervisor =
+            Arc::new(crate::database::startup::ThreadEpisodicWorkspaceRefillSupervisor::default());
+        let thread_episodic_index_executor = Arc::new(
+            ThreadEpisodicIndexExecutor::new(
+                maintenance_crud_store.clone(),
+                thread_episodic_backend.clone(),
+                Arc::new(RuntimeVectorThreadEpisodicIndexPayloadProvider::new(
+                    Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(
+                        maintenance_crud_store.clone(),
+                        thread_episodic_storage_uri_from_path(
+                            thread_episodic_storage_root.as_path(),
+                        ),
+                    )),
+                    thread_episodic_embedding_provider_resolver.clone(),
+                    maintenance_crud_store,
                 )),
+            )
+            .with_projection_runtime(
+                thread_episodic_storage_root.clone(),
                 thread_episodic_embedding_provider_resolver.clone(),
-                crud_store.clone(),
-            )),
-        ));
+                thread_episodic_workspace_refill_supervisor.clone(),
+            ),
+        );
         thread_episodic_index_executor.apply_config(thread_episodic_runtime_config.index_executor);
+        thread_episodic_index_executor.set_indexing_enabled(
+            thread_episodic_runtime_config.enabled
+                && thread_episodic_runtime_config.indexing_enabled,
+        );
         let thread_episodic_recall_embedding_provider_resolver: Arc<
             dyn ThreadEpisodicIndexEmbeddingProviderResolver,
         > = thread_episodic_embedding_provider_resolver.clone();
@@ -767,8 +1186,6 @@ impl MessageProcessor {
         let thread_episodic_ingestion_enabled = thread_episodic_runtime_config.enabled
             && thread_episodic_runtime_config.indexing_enabled;
         let (thread_episodic_vector_refill_status_tx, _) = broadcast::channel(64);
-        let thread_episodic_workspace_refill_supervisor =
-            Arc::new(crate::database::startup::ThreadEpisodicWorkspaceRefillSupervisor::default());
 
         Self {
             thread_manager,
@@ -794,10 +1211,73 @@ impl MessageProcessor {
                 pioneer_protocol::GatewayBaseUrl::parse_presentation("http://127.0.0.1:17878")
                     .expect("static Gateway base URL is valid"),
             ),
+            completed_history_checks: Arc::new(Mutex::new(HashMap::new())),
+            compaction_lifecycle_not_before: Arc::new(StdRwLock::new(None)),
+            #[cfg(test)]
+            completed_history_preparation_barrier: Arc::new(Default::default()),
+            #[cfg(test)]
+            turn_execution_heartbeat_barrier: Arc::new(Default::default()),
+            #[cfg(test)]
+            task_history_preparation_failure: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            task_cli_terminal_preparation_finished: Arc::new(tokio::sync::Notify::new()),
+            #[cfg(test)]
+            task_cli_admission_failure: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            task_cli_preparation_attempts: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            task_cli_history_revalidation_failure: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            task_cli_readiness_failure: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            task_output_capture_failures: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            compaction_coordinator: Arc::new(
+                crate::compaction::ContextCompactionCoordinator::default(),
+            ),
+            cli_history_shutdown: tokio_util::sync::CancellationToken::new(),
+            #[cfg(test)]
+            cli_transfer_capture_count: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            cli_transfer_test_deadline: Arc::new(tokio::sync::Notify::new()),
+            #[cfg(test)]
+            cli_history_monitor_drops: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            cli_history_monitor_cleanup_drops: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            predispatch_cli_turn_read_failures: Arc::new(Mutex::new(HashSet::new())),
+            #[cfg(test)]
+            claude_boundary_write_failures: Arc::new(Mutex::new(HashSet::new())),
+            #[cfg(test)]
+            native_cancellation_finish_barrier: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            native_cancellation_materialization_failure: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            native_cancellation_materialization_barrier: Arc::new(Mutex::new(None)),
+            workspace_compaction_settings: Arc::new(StdRwLock::new(
+                std::collections::BTreeMap::new(),
+            )),
+            compaction_settings: Arc::new(StdRwLock::new(pioneer_compaction::CompactionSettings {
+                selection: if summary_config.summary_model.is_some()
+                    || summary_config.summary_model_provider.is_some()
+                {
+                    Some(pioneer_compaction::ModelSelection {
+                        transport: pioneer_compaction::Transport::Api,
+                        instance: summary_config
+                            .summary_model_provider
+                            .clone()
+                            .unwrap_or_default(),
+                        model: summary_config.summary_model.clone().unwrap_or_default(),
+                        effort: None,
+                    })
+                } else {
+                    None
+                },
+            })),
             summary_config: Arc::new(summary_config),
-            context_budget,
             agent_listener_tasks: Arc::new(Mutex::new(HashMap::new())),
+            agent_listener_generation: Arc::new(AtomicU64::new(1)),
             agent_message_buffers: Arc::new(Mutex::new(HashMap::new())),
+            progress_items: Arc::new(Mutex::new(ProgressItemRegistry::default())),
             agent_action_bindings: Arc::new(Mutex::new(HashMap::new())),
             parent_timeline_targets: Arc::new(Mutex::new(HashMap::new())),
             user_turn_cancel_intents: Arc::new(Mutex::new(HashMap::new())),
@@ -807,6 +1287,7 @@ impl MessageProcessor {
                 CLIRuntimeMachineRequestRegistry::default(),
             )),
             cli_runtime_proxy_cache: Arc::new(Mutex::new(HashMap::new())),
+            provider_readiness: Arc::new(provider_readiness::ProviderReadinessSupervisor::default()),
             cli_runtime_pending_turn_activity_sequence: Arc::new(AtomicU64::new(0)),
             cli_runtime_event_hubs: Arc::new(Mutex::new(HashMap::new())),
             cli_runtime_turn_binding_cache: Arc::new(Mutex::new(HashMap::new())),
@@ -823,6 +1304,11 @@ impl MessageProcessor {
             timeout_supervisor,
             recovery_coordinator,
             native_turn_event_delivery_kick_running: Arc::new(AtomicBool::new(false)),
+            native_terminal_effect_kick_running: Arc::new(AtomicBool::new(false)),
+            native_terminal_effect_kick_pending: Arc::new(AtomicBool::new(false)),
+            native_lifecycle_readiness: Arc::new(
+                native_health::NativeLifecycleReadinessState::default(),
+            ),
             resilience_worker: Arc::new(Mutex::new(None)),
             hook_recovery_worker: Arc::new(Mutex::new(None)),
             task_event_listener_worker: Arc::new(Mutex::new(None)),
@@ -832,6 +1318,7 @@ impl MessageProcessor {
             thread_episodic_runtime_config: Arc::new(StdRwLock::new(
                 thread_episodic_runtime_config,
             )),
+            administration_snapshot_version: Arc::new(AtomicU64::new(now_snapshot)),
             skills_snapshot_version: Arc::new(AtomicU64::new(now_snapshot)),
             mcp_snapshot_version,
             mcp_service,
@@ -840,7 +1327,7 @@ impl MessageProcessor {
             #[cfg(test)]
             cli_runtime_skill_preflight_test_events: Arc::new(Mutex::new(Vec::new())),
             #[cfg(test)]
-            cli_mcp_readiness_override: None,
+            cli_mcp_readiness_overrides: [None, None, None],
             skill_upload_locks: Arc::new(Mutex::new(HashMap::new())),
             skill_upload_owners: Arc::new(Mutex::new(HashMap::new())),
             task_agent_executor,
@@ -866,6 +1353,9 @@ impl MessageProcessor {
             voice_input_supervisor: None,
             self_improvement_supervisor: None,
             gateway_settings_update_lock: Arc::new(Mutex::new(())),
+            voice_finalizations: Default::default(),
+            #[cfg(test)]
+            voice_test_transcriber: None,
             voice_sessions: GatewayVoiceSessionStore::default(),
             voice_session_buffers: GatewayVoiceSessionBufferStore::default(),
         }
@@ -1019,47 +1509,13 @@ impl MessageProcessor {
         signal
     }
 
-    async fn publish_resource_selector_change(
-        &self,
-        workspace_id: &str,
-    ) -> pioneer_protocol::AuthorizationProjectionChangedNotification {
-        let change = self
-            .authorization_invalidation_hub
-            .publish_change(
-                pioneer_protocol::AuthorizationChangeKind::ResourceSelector,
-                pioneer_protocol::AuthorizationChangeScope::ResourceSelector {
-                    workspace_id: workspace_id.to_owned(),
-                    selector: "workspace_capability_catalog".to_owned(),
-                },
-            )
-            .await
-            .expect("resource selector change must advance durable policy generation");
-        self.send_notification_to_authorized_workspace_connections(
-            workspace_id,
-            pioneer_protocol::constants::events::AUTHORIZATION_PROJECTION_CHANGED,
-            &change,
-        )
-        .await;
-        change
-    }
-
-    async fn publish_invitation_selector_change(
-        &self,
-        invitation_id: &pioneer_protocol::InvitationId,
-    ) -> pioneer_protocol::AuthorizationProjectionChangedNotification {
-        let change = self
-            .authorization_invalidation_hub
-            .publish_change(
-                pioneer_protocol::AuthorizationChangeKind::ResourceSelector,
-                pioneer_protocol::AuthorizationChangeScope::Invitation {
-                    invitation_id: invitation_id.clone(),
-                },
-            )
-            .await
-            .expect("invitation selector change must advance durable policy generation");
-        self.send_scoped_invitation_authorization_changed_notification(invitation_id, &change)
-            .await;
-        change
+    /// Data notifications have their own sequence. Profile and invitation changes
+    /// do not change role grants or ACLs and must not advance the policy fence.
+    fn next_administration_revision(&self) -> u64 {
+        self.administration_snapshot_version
+            .fetch_add(1, Ordering::SeqCst)
+            .checked_add(1)
+            .expect("administration revision exhausted")
     }
 
     #[cfg(test)]
@@ -1076,6 +1532,10 @@ impl MessageProcessor {
             None,
         )
         .await
+    }
+
+    pub(crate) async fn shutdown_thread_episodic_index_runner(&self) {
+        self.thread_episodic_index_executor.shutdown().await;
     }
 
     pub(crate) fn thread_episodic_workspace_refill_supervisor(
@@ -1130,6 +1590,7 @@ impl MessageProcessor {
     }
 
     pub async fn shutdown_cli_runtime_manager(&self) {
+        self.cli_history_shutdown.cancel();
         let Some(manager) = self.cli_runtime_manager.as_ref() else {
             return;
         };
@@ -1148,6 +1609,13 @@ impl MessageProcessor {
                 );
             }
         }
+    }
+
+    /// Close ingress slots, suppress unclaimed outcomes, and drain the bounded
+    /// workers before database shutdown. Native calls retain ownership to completion.
+    pub async fn shutdown_voice_finalizations(&self) {
+        self.voice_finalizations.close();
+        self.voice_finalizations.tasks.wait().await;
     }
 
     pub async fn shutdown_mcp_service(&self) {
@@ -1275,15 +1743,26 @@ impl MessageProcessor {
         mut self,
         readiness: pioneer_protocol::CliMcpAdapterReadiness,
     ) -> Self {
-        self.cli_mcp_readiness_override = Some(readiness);
+        let slot = match readiness.injection {
+            pioneer_protocol::CliMcpInjectionKind::CodexManagedStdioMcp => 0,
+            pioneer_protocol::CliMcpInjectionKind::ClaudeStrictStdioMcp => 1,
+            pioneer_protocol::CliMcpInjectionKind::OpenCodeDynamicStdioMcp => 2,
+        };
+        self.cli_mcp_readiness_overrides[slot] = Some(readiness);
         self
     }
 
     #[cfg(test)]
     pub(crate) fn cli_mcp_readiness_override_for_tests(
         &self,
+        runtime_kind: pioneer_protocol::CLIAgentRuntimeKind,
     ) -> Option<pioneer_protocol::CliMcpAdapterReadiness> {
-        self.cli_mcp_readiness_override.clone()
+        let slot = match runtime_kind {
+            pioneer_protocol::CLIAgentRuntimeKind::Codex => 0,
+            pioneer_protocol::CLIAgentRuntimeKind::Claude => 1,
+            pioneer_protocol::CLIAgentRuntimeKind::OpenCode => 2,
+        };
+        self.cli_mcp_readiness_overrides[slot].clone()
     }
 
     #[cfg(test)]
@@ -1350,6 +1829,14 @@ impl MessageProcessor {
         self.bind_permission_approval_bridge().await;
         self.bind_task_bridge().await;
         self.bind_artifact_tool_bridge().await;
+    }
+
+    pub(crate) async fn bind_context_compaction(self: &Arc<Self>) {
+        self.agent_manager
+            .set_context_controller(Some(Arc::new(
+                crate::compaction::GatewayNativeContextController::new(Arc::downgrade(self)),
+            )))
+            .await;
     }
 
     /// Resolve the database-backed launch catalog on an isolated Tokio task.
@@ -1443,6 +1930,7 @@ impl MessageProcessor {
                     }
                     break;
                 };
+                let processor = processor.with_database_class(SqliteWriteClass::Critical);
                 match event {
                     crate::permissions::GatewayPermissionApprovalEvent::Revalidate(request) => {
                         let result = processor
@@ -1578,6 +2066,14 @@ impl MessageProcessor {
         self.authorization_invalidation_hub.current_revision().await
     }
 
+    pub(crate) async fn initialize_authorization_generation(&self) -> anyhow::Result<u64> {
+        Ok(self
+            .authorization_invalidation_hub
+            .current_generation_for_maintenance()
+            .await?
+            .get())
+    }
+
     pub(crate) async fn register_execution_lease(
         &self,
         turn_id: &str,
@@ -1611,6 +2107,28 @@ impl MessageProcessor {
             .await?;
         self.guard_execution_side_effect(turn_id, context.continuation_action())
             .await
+    }
+
+    async fn execution_progress_is_current_cached(&self, turn_id: &str) -> anyhow::Result<bool> {
+        let generation = self.current_authorization_revision().await?;
+        self.execution_leases
+            .guard_progress_cached(turn_id, generation)
+            .await
+    }
+
+    async fn guard_execution_progress(&self, turn_id: &str) -> anyhow::Result<()> {
+        if self.execution_progress_is_current_cached(turn_id).await? {
+            return Ok(());
+        }
+        self.guard_execution_commit(turn_id).await.map(drop)
+    }
+
+    async fn retire_execution_progress_state(&self, turn_id: &str) {
+        // Cache writers hold `progress_items` while rechecking this lease.
+        // Retiring the lease first therefore makes the subsequent cache clear
+        // a barrier: no in-flight progress can reinsert state behind it.
+        self.execution_leases.finish(turn_id).await;
+        self.progress_items.lock().await.forget_turn(turn_id);
     }
 
     pub(crate) async fn validate_task_execution_admission_seed(
@@ -1669,6 +2187,8 @@ impl MessageProcessor {
             *current = config.clone();
         }
         self.thread_episodic_index_executor
+            .set_indexing_enabled(thread_episodic_ingestion_enabled);
+        self.thread_episodic_index_executor
             .apply_config(config.index_executor);
         self.thread_episodic_recall_service
             .apply_config(config.recall_service);
@@ -1693,38 +2213,168 @@ impl MessageProcessor {
             .apply_workspace_configs(configs.clone());
         self.thread_episodic_recall_service
             .apply_workspace_vector_search_configs(configs);
+        self.thread_episodic_index_executor.wake();
+    }
+
+    pub(crate) fn compaction_settings(
+        &self,
+    ) -> anyhow::Result<pioneer_compaction::CompactionSettings> {
+        self.compaction_settings
+            .read()
+            .map(|value| value.clone())
+            .map_err(|_| anyhow::anyhow!("compaction settings unavailable"))
+    }
+    pub(crate) fn compaction_settings_for_workspace(
+        &self,
+        workspace: &str,
+    ) -> anyhow::Result<pioneer_compaction::CompactionSettings> {
+        let legacy = self.compaction_settings()?;
+        let settings = self
+            .workspace_compaction_settings
+            .read()
+            .map_err(|_| anyhow::anyhow!("workspace compaction settings unavailable"))?;
+        Ok(settings
+            .get(workspace)
+            .map_or(legacy.clone(), |value| value.compaction(&legacy)))
+    }
+    pub(crate) fn apply_workspace_compaction_settings(
+        &self,
+        settings: &crate::settings::GatewaySettings,
+    ) -> anyhow::Result<()> {
+        let prepared = settings.workspace_compaction_settings();
+        *self
+            .workspace_compaction_settings
+            .write()
+            .map_err(|_| anyhow::anyhow!("workspace compaction settings unavailable"))? = prepared;
+        Ok(())
     }
 
     pub(crate) fn apply_keepawake_setting(&self, enabled: bool) -> anyhow::Result<()> {
         self.keepawake.set_enabled(enabled)
     }
 
-    async fn run_projection_delivery_resilience_worker(processor: Weak<Self>) {
+    /// Clone the processor with one explicit class for its core persistence
+    /// services while preserving all shared runtime state. Long-lived workers
+    /// use this at their task boundary instead of inheriting request priority.
+    fn scoped_with_database_class(&self, class: SqliteWriteClass) -> Self {
+        let crud_store = Arc::new(match class {
+            SqliteWriteClass::Critical => self.crud_store.with_critical_writes(),
+            SqliteWriteClass::Interactive => self.crud_store.with_interactive_writes(),
+            SqliteWriteClass::Maintenance => self.crud_store.with_maintenance_access(),
+        });
+        self.scoped_with_crud_store(crud_store)
+    }
+
+    /// Background reconciliation performs bounded discovery reads but owns
+    /// correctness-critical mutations. Keep those two resource classes
+    /// independent instead of allowing critical writer priority to bypass the
+    /// maintenance read limiter.
+    fn scoped_for_background_reconciliation(&self) -> Self {
+        self.scoped_with_crud_store(Arc::new(
+            self.crud_store.with_maintenance_reads_and_critical_writes(),
+        ))
+    }
+
+    fn scoped_with_crud_store(&self, crud_store: Arc<CrudStore>) -> Self {
+        let mut scoped = self.clone();
+        scoped.crud_store = crud_store.clone();
+        scoped.workspace_manager = Arc::new(
+            self.workspace_manager
+                .with_database(crud_store.database_connection()),
+        );
+        scoped.timeout_supervisor =
+            Arc::new(self.timeout_supervisor.with_crud_store(crud_store.clone()));
+        scoped.recovery_coordinator = Arc::new(
+            self.recovery_coordinator
+                .with_crud_store(crud_store.clone()),
+        );
+        scoped
+    }
+
+    fn with_database_class(self: &Arc<Self>, class: SqliteWriteClass) -> Arc<Self> {
+        Arc::new(self.scoped_with_database_class(class))
+    }
+
+    fn for_background_reconciliation(self: &Arc<Self>) -> Arc<Self> {
+        Arc::new(self.scoped_for_background_reconciliation())
+    }
+
+    /// Selects the correctness-critical Task service without losing the read
+    /// class already carried by this scoped processor. This is the sole bridge
+    /// for nested TaskService calls made from MessageProcessor work.
+    fn critical_task_service(&self) -> Arc<pioneer_tasks::TaskService> {
+        match self.crud_store.database_connection().read_class() {
+            SqliteReadClass::Interactive => self.task_runtime.critical_service(),
+            SqliteReadClass::Maintenance => self.task_runtime.background_control_service(),
+        }
+    }
+
+    async fn run_turn_execution_owner_heartbeat_worker(processor: Weak<Self>) {
         loop {
             let Some(this) = processor.upgrade() else {
                 break;
             };
+            let store = this.crud_store.with_maintenance_reads_and_critical_writes();
+            let owner = this.turn_execution_owner_id.clone();
+            #[cfg(test)]
+            let barrier = this.turn_execution_heartbeat_barrier.clone();
+            // Keep only the DB scope and owner identity during I/O, retry and
+            // sleep. The heartbeat must not keep MessageProcessor alive.
+            drop(this);
             let cycle = AssertUnwindSafe(async {
-                let now = now_timestamp_secs();
-                match retry_transient_storage_access(|| {
-                    this.reconcile_prepared_native_turn_finalizations(now, 64)
-                })
+                if let Err(error) = crate::database::attribution::scope_database_workload_result(
+                    pioneer_observability::DatabaseWorkload::ExecutionSupervision,
+                    retry_transient_storage_access(|| {
+                        store.heartbeat_turn_executions_owned_by(
+                            owner.as_ref(),
+                            TURN_EXECUTION_OWNER_LEASE_SECONDS,
+                        )
+                    }),
+                )
                 .await
                 {
-                    Ok(reconciled) if reconciled > 0 => {
-                        info!(reconciled, "reconciled prepared native Turn finalizations");
-                        this.kick_native_turn_event_deliveries();
-                    }
-                    Ok(_) => {}
-                    Err(error) => error!(
-                        error = %format!("{error:#}"),
-                        "native Turn finalization reconciler failed"
-                    ),
+                    record_resilience_worker_error(
+                        "Turn execution owner heartbeat",
+                        &error,
+                        ResilienceWorkerFailureImpact::CriticalPoll,
+                    );
                 }
+            })
+            .catch_unwind()
+            .await;
+            if cycle.is_err() {
+                error!("contained panic in Turn execution owner heartbeat worker");
+            }
+            #[cfg(test)]
+            barrier
+                .wait_if_armed(
+                    "__execution_owner_heartbeat_written__",
+                    &tokio_util::sync::CancellationToken::new(),
+                )
+                .await;
+            // Retries are bounded by the existing storage policy; subsequent
+            // polls remain serial and use the existing short service interval.
+            sleep(Duration::from_secs(RESILIENCE_WORKER_POLL_INTERVAL_SECONDS)).await;
+        }
+    }
 
-                match retry_transient_storage_access(|| {
-                    this.crud_store.replay_due_turn_event_projections(now, 64)
-                })
+    async fn run_projection_delivery_resilience_worker(processor: Weak<Self>) {
+        let mut finalization_reporting = reconciliation_diagnostics::Reporter::new(
+            reconciliation_diagnostics::Operation::NativeFinalization,
+        );
+        loop {
+            let Some(this) = processor.upgrade() else {
+                break;
+            };
+            let this = this.for_background_reconciliation();
+            let cycle = AssertUnwindSafe(async {
+                let now = now_timestamp_secs();
+                match crate::database::attribution::scope_database_workload_result(
+                    pioneer_observability::DatabaseWorkload::ProjectionRecovery,
+                    retry_transient_storage_access(|| {
+                        this.crud_store.replay_due_turn_event_projections(now, 64)
+                    }),
+                )
                 .await
                 {
                     Ok(summary) if summary.quarantined > 0 || summary.missing_events > 0 => warn!(
@@ -1747,9 +2397,46 @@ impl MessageProcessor {
                     ),
                 }
 
-                if let Err(error) = retry_transient_storage_access(|| {
-                    this.process_due_native_turn_event_deliveries(now, 64)
-                })
+                let result = crate::database::attribution::scope_database_workload_result(
+                    pioneer_observability::DatabaseWorkload::FinalizationRecovery,
+                    retry_transient_storage_access(|| {
+                        this.reconcile_prepared_native_turn_finalizations(now, 64)
+                    }),
+                )
+                .await;
+                finalization_reporting.observe(&result, Instant::now());
+                match result {
+                    Ok(summary) => {
+                        let committed = summary.committed_count();
+                        if committed > 0 {
+                            info!(
+                                scanned = summary.scanned,
+                                committed,
+                                newly_committed = summary.newly_committed_count(),
+                                "reconciled prepared native Turn finalizations"
+                            );
+                            this.kick_native_turn_event_deliveries();
+                        }
+                        if summary.deferred_by_predecessor > 0
+                            || summary.superseded_by_terminal_status > 0
+                        {
+                            debug!(
+                                scanned = summary.scanned,
+                                deferred = summary.deferred_by_predecessor,
+                                superseded = summary.superseded_by_terminal_status,
+                                "prepared native Turn finalization reconciliation deferred work"
+                            );
+                        }
+                    }
+                    Err(_) => {}
+                }
+
+                if let Err(error) = crate::database::attribution::scope_database_workload_result(
+                    pioneer_observability::DatabaseWorkload::EventDelivery,
+                    retry_transient_storage_access(|| {
+                        this.process_due_native_turn_event_deliveries(now, 64)
+                    }),
+                )
                 .await
                 {
                     error!(
@@ -1768,15 +2455,20 @@ impl MessageProcessor {
     }
 
     async fn run_task_lifecycle_resilience_worker(processor: Weak<Self>) {
+        let mut occurrence_reporting = reconciliation_diagnostics::Reporter::new(
+            reconciliation_diagnostics::Operation::TaskRunOccurrence,
+        );
         loop {
             let Some(this) = processor.upgrade() else {
                 break;
             };
+            let this = this.for_background_reconciliation();
             let cycle = AssertUnwindSafe(async {
                 let now = now_timestamp_secs();
-                match retry_transient_storage_access(|| {
-                    this.reconcile_terminal_task_child_turns(64)
-                })
+                match crate::database::attribution::scope_database_workload_result(
+                    pioneer_observability::DatabaseWorkload::TaskReconcile,
+                    this.reconcile_terminal_task_child_turns_with_retry(64),
+                )
                 .await
                 {
                     Ok(reconciled) if reconciled > 0 => info!(
@@ -1784,31 +2476,45 @@ impl MessageProcessor {
                         "reconciled terminal child Turns with their TaskRun aggregates"
                     ),
                     Ok(_) => {}
-                    Err(error) => error!(
-                        error = %format!("{error:#}"),
-                        "task child terminal reconciler failed"
-                    ),
+                    Err(error) => tasks::report_task_child_reconciliation_error(error),
                 }
 
-                match retry_transient_storage_access(|| {
-                    this.reconcile_terminal_task_run_occurrence_turns(64)
-                })
-                .await
+                let result = crate::database::attribution::scope_database_workload_result(
+                    pioneer_observability::DatabaseWorkload::TaskReconcile,
+                    this.reconcile_terminal_task_run_occurrence_turns(64),
+                )
+                .await;
+                occurrence_reporting.observe_occurrences(&result, Instant::now());
+                if let Ok(summary) = result
+                    && summary.selected > 0
                 {
-                    Ok(reconciled) if reconciled > 0 => info!(
-                        reconciled,
-                        "reconciled terminal TaskRuns with parent occurrence Turns"
-                    ),
-                    Ok(_) => {}
-                    Err(error) => error!(
-                        error = %format!("{error:#}"),
-                        "task parent occurrence reconciler failed"
-                    ),
+                    info!(
+                        selected = summary.selected,
+                        claimed = summary.claimed,
+                        reconciled = summary.changed,
+                        lost_claims = summary.lost_claims,
+                        stale = summary.stale,
+                        unresolved = summary.unresolved,
+                        no_change = summary.no_change,
+                        claim_errors = summary.claim_errors,
+                        claim_deferrals = summary.claim_deferrals,
+                        claim_deferral_conflicts = summary.claim_deferral_conflicts,
+                        claim_deferral_errors = summary.claim_deferral_errors,
+                        claim_without_snapshot = summary.claim_without_snapshot,
+                        claim_commit_unknown = summary.claim_commit_unknown,
+                        repair_errors = summary.repair_errors,
+                        storage_errors = summary.storage_errors,
+                        notification_errors = summary.notification_errors,
+                        queue_state_errors = summary.queue_state_errors,
+                        "TaskRun parent occurrence reconciliation pass"
+                    );
                 }
 
-                if let Err(error) =
-                    retry_transient_storage_access(|| this.process_due_task_deliveries(now, 64))
-                        .await
+                if let Err(error) = crate::database::attribution::scope_database_workload_result(
+                    pioneer_observability::DatabaseWorkload::TaskReconcile,
+                    this.process_due_task_deliveries(now, 64),
+                )
+                .await
                 {
                     error!(error = %format!("{error:#}"), "task delivery worker failed");
                 }
@@ -1822,33 +2528,42 @@ impl MessageProcessor {
         }
     }
 
-    pub async fn start_resilience_workers(self: &Arc<Self>) {
-        self.authorization_invalidation_hub
-            .current_generation()
-            .await
-            .expect("Gateway startup requires durable authorization policy generation");
-        self.bind_agent_tool_bridges().await;
-        let processor = Arc::downgrade(self);
-        self.recovery_coordinator
-            .set_listener_starter(Arc::new(move |thread_id| {
-                let processor = processor.clone();
-                Box::pin(async move {
-                    let processor = processor.upgrade().ok_or_else(|| {
-                        "message processor stopped before recovery listener startup".to_owned()
-                    })?;
-                    processor
-                        .ensure_agent_listener_task(thread_id.as_str())
-                        .await
-                        .map_err(|error| format!("{error:#}"))
-                })
-            }))
-            .await;
-        match self
+    async fn initialize_resilience_workers(self: &Arc<Self>) -> anyhow::Result<()> {
+        self.thread_episodic_index_executor.wake();
+        let background = self.for_background_reconciliation();
+        let trace = pioneer_observability::GatewayOperationTrace::start(
+            pioneer_observability::GatewayOperation::ResilienceInitialize,
+        );
+        let repair_stage =
+            trace.stage(pioneer_observability::GatewayOperationStage::ResilienceReadModelRepair);
+        match background
             .crud_store
-            .repair_deterministic_read_model_violations()
+            .repair_deterministic_read_model_violations_with_timings()
             .await
         {
-            Ok(summary) => {
+            Ok(report) => {
+                for timing in report.stage_timings {
+                    trace.record_stage_timing(
+                        gateway_stage_for_read_model_repair(timing.stage),
+                        timing.started_at,
+                        timing.duration,
+                        timing.operations,
+                    );
+                }
+                let summary = report.summary;
+                trace.record_items(
+                    pioneer_observability::GatewayOperationItemKind::ReadModelRepairDetected,
+                    u64::try_from(summary.detected).unwrap_or(u64::MAX),
+                );
+                trace.record_items(
+                    pioneer_observability::GatewayOperationItemKind::ReadModelRepairRepaired,
+                    u64::try_from(summary.repaired).unwrap_or(u64::MAX),
+                );
+                trace.record_items(
+                    pioneer_observability::GatewayOperationItemKind::ReadModelRepairRemaining,
+                    u64::try_from(summary.remaining).unwrap_or(u64::MAX),
+                );
+                repair_stage.succeed();
                 if summary.remaining > 0 {
                     warn!(
                         detected = summary.detected,
@@ -1865,18 +2580,25 @@ impl MessageProcessor {
                 }
             }
             Err(error) => {
+                drop(repair_stage);
                 warn!(
                     error = %format!("{error:#}"),
                     "read-model invariant verification failed at startup"
                 );
+                trace.finish_failure();
+                return Err(error).context("read-model invariant verification failed at startup");
             }
         }
-        match self
+
+        let deadline_stage =
+            trace.stage(pioneer_observability::GatewayOperationStage::ResilienceDeadlineBackfill);
+        match background
             .timeout_supervisor
             .backfill_missing_deadlines(1024)
             .await
         {
             Ok(backfilled) => {
+                deadline_stage.succeed();
                 if backfilled > 0 {
                     warn!(
                         backfilled,
@@ -1885,35 +2607,148 @@ impl MessageProcessor {
                 }
             }
             Err(error) => {
+                drop(deadline_stage);
                 warn!(
                     error = %format!("{error:#}"),
                     "failed to backfill missing running item deadlines during startup"
                 );
+                trace.finish_failure();
+                return Err(error).context("deadline backfill failed at startup");
             }
         }
-        match self.crud_store.reconcile_execution_admission_leases().await {
-            Ok(reconciled) if reconciled > 0 => warn!(
-                reconciled,
-                "released stale execution admission quota leases during startup"
-            ),
-            Ok(_) => {}
-            Err(error) => warn!(
-                error = %format!("{error:#}"),
-                "failed to reconcile execution admission quota leases at startup"
-            ),
+
+        let admission_stage = trace
+            .stage(pioneer_observability::GatewayOperationStage::ResilienceAdmissionLeaseReconcile);
+        match background
+            .crud_store
+            .reconcile_execution_admission_leases()
+            .await
+        {
+            Ok(reconciled) => {
+                admission_stage.succeed();
+                if reconciled > 0 {
+                    warn!(
+                        reconciled,
+                        "released stale execution admission quota leases during startup"
+                    );
+                }
+            }
+            Err(error) => {
+                drop(admission_stage);
+                warn!(
+                    error = %format!("{error:#}"),
+                    "failed to reconcile execution admission quota leases at startup"
+                );
+                trace.finish_failure();
+                return Err(error).context("execution admission lease reconciliation failed");
+            }
         }
+
+        let task_runtime_stage =
+            trace.stage(pioneer_observability::GatewayOperationStage::ResilienceTaskRuntimeStart);
         if let Err(error) = self.task_runtime.start().await {
+            drop(task_runtime_stage);
             error!(error = %format!("{error:#}"), "failed to start task runtime");
+            trace.finish_failure();
+            return Err(error).context("failed to start task runtime");
+        } else {
+            task_runtime_stage.succeed();
         }
+
+        let task_events_stage = trace
+            .stage(pioneer_observability::GatewayOperationStage::ResilienceTaskEventListenerStart);
         self.start_task_event_listener().await;
+        task_events_stage.succeed();
+
+        let hook_recovery_stage =
+            trace.stage(pioneer_observability::GatewayOperationStage::ResilienceHookRecoveryStart);
         self.start_hook_recovery_worker().await;
+        hook_recovery_stage.succeed();
+
+        trace.finish_success();
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub async fn start_resilience_workers(self: &Arc<Self>) -> anyhow::Result<()> {
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        self.start_resilience_workers_with_cancellation(&cancellation, |_| {})
+            .await
+    }
+
+    pub(crate) async fn start_resilience_workers_with_cancellation<F>(
+        self: &Arc<Self>,
+        cancellation: &tokio_util::sync::CancellationToken,
+        on_degraded: F,
+    ) -> anyhow::Result<()>
+    where
+        F: Fn(bool) + Send + Sync,
+    {
         let mut guard = self.resilience_worker.lock().await;
         if guard.is_some() {
-            return;
+            on_degraded(false);
+            return Ok(());
         }
 
         let processor = Arc::downgrade(self);
-        let handle = tokio::spawn(async move {
+        self.recovery_coordinator
+            .set_listener_starter(Arc::new(move |thread_id| {
+                let processor = processor.clone();
+                Box::pin(async move {
+                    let processor = processor.upgrade().ok_or_else(|| {
+                        "message processor stopped before recovery listener startup".to_owned()
+                    })?;
+                    let processor = processor.with_database_class(SqliteWriteClass::Critical);
+                    processor
+                        .ensure_agent_listener_task(thread_id.as_str())
+                        .await
+                        .map_err(|error| format!("{error:#}"))
+                })
+            }))
+            .await;
+
+        let mut retry_delay = Duration::from_millis(250);
+        loop {
+            if cancellation.is_cancelled() {
+                return Err(anyhow::anyhow!("resilience initialization cancelled"));
+            }
+            let initialization = async {
+                self.authorization_invalidation_hub
+                    .current_generation_for_maintenance()
+                    .await
+                    .context("Gateway startup requires durable authorization policy generation")?;
+                self.initialize_resilience_workers().await
+            }
+            .await;
+            match initialization {
+                Ok(()) => {
+                    on_degraded(false);
+                    break;
+                }
+                Err(error) => {
+                    on_degraded(true);
+                    warn!(
+                        error = %format!("{error:#}"),
+                        retry_delay_ms = retry_delay.as_millis() as u64,
+                        "resilience initialization failed; retrying independently"
+                    );
+                    tokio::select! {
+                        _ = cancellation.cancelled() => {
+                            return Err(anyhow::anyhow!("resilience initialization cancelled"));
+                        }
+                        _ = sleep(retry_delay) => {}
+                    }
+                    retry_delay = retry_delay.saturating_mul(2).min(Duration::from_secs(30));
+                }
+            }
+        }
+        if cancellation.is_cancelled() {
+            return Err(anyhow::anyhow!("resilience initialization cancelled"));
+        }
+
+        let processor = Arc::downgrade(self);
+        let cancellation = cancellation.clone();
+        let worker = async move {
             struct IsolatedWorkerGuard(Vec<JoinHandle<()>>);
 
             impl Drop for IsolatedWorkerGuard {
@@ -1925,6 +2760,9 @@ impl MessageProcessor {
             }
 
             let _isolated_workers = IsolatedWorkerGuard(vec![
+                tokio::spawn(Self::run_turn_execution_owner_heartbeat_worker(
+                    processor.clone(),
+                )),
                 tokio::spawn(Self::run_projection_delivery_resilience_worker(
                     processor.clone(),
                 )),
@@ -1932,63 +2770,75 @@ impl MessageProcessor {
                     processor.clone(),
                 )),
             ]);
+            let mut cli_runtime_stale_turn_scan = cli_runtime::CliRuntimeStaleTurnScan::default();
             let mut next_skill_upload_cleanup = 0;
             let mut next_agent_action_ledger_compaction = 0;
+            let mut next_native_terminal_effect_purge = 0;
+            let mut next_native_terminal_effect_recovery = 0;
             loop {
                 let Some(this) = processor.upgrade() else {
                     break;
                 };
+                let this = this.for_background_reconciliation();
+                let maintenance = this.with_database_class(SqliteWriteClass::Maintenance);
                 let now = now_timestamp_secs();
                 let mut transient_storage_poll_failed = false;
-                if now >= next_skill_upload_cleanup {
-                    this.cleanup_stale_skill_uploads(now).await;
-                    next_skill_upload_cleanup = now.saturating_add(60);
-                }
-
-                if let Err(error) = retry_transient_storage_access(|| {
-                    this.crud_store.heartbeat_turn_executions_owned_by(
-                        this.turn_execution_owner_id.as_ref(),
-                        now,
-                        now.saturating_add(TURN_EXECUTION_OWNER_LEASE_SECONDS),
+                #[cfg(test)]
+                this.completed_history_preparation_barrier
+                    .wait_if_armed(
+                        "__resilience_before_history_poll__",
+                        &tokio_util::sync::CancellationToken::new(),
                     )
-                })
-                .await
-                {
-                    record_resilience_worker_poll_error(
-                        "Turn execution owner heartbeat",
-                        &error,
-                        &mut transient_storage_poll_failed,
-                    );
+                    .await;
+                if maintenance.poll_completed_history_checks().await.is_err() {
+                    warn!("failed to poll completed history checks");
                 }
-                if sleep_after_transient_storage_poll_failure(transient_storage_poll_failed).await {
-                    continue;
+                if now >= next_skill_upload_cleanup {
+                    crate::database::attribution::scope_database_workload(
+                        pioneer_observability::DatabaseWorkload::ExecutionSupervision,
+                        maintenance.cleanup_stale_skill_uploads(now),
+                    )
+                    .await;
+                    next_skill_upload_cleanup = now.saturating_add(60);
                 }
 
                 // Confirm live native command activity before timeout polling.
                 // A command whose lease is near its boundary must get the
                 // authoritative liveness check before any destructive claim.
-                this.heartbeat_due_cli_runtime_command_items(now).await;
+                crate::database::attribution::scope_database_workload(
+                    pioneer_observability::DatabaseWorkload::ExecutionSupervision,
+                    this.heartbeat_due_cli_runtime_command_items(now),
+                )
+                .await;
 
                 let agent_resource_policy =
                     crate::authorization::AgentWorkResourcePolicy::default();
-                match retry_transient_storage_access(|| {
-                    this.crud_store.promote_queued_agent_executions(
-                        pioneer_crud::utc_now(),
-                        64,
-                        i64::try_from(agent_resource_policy.idle_timeout_secs).unwrap_or(i64::MAX),
-                        i64::try_from(agent_resource_policy.hard_timeout_secs).unwrap_or(i64::MAX),
-                    )
-                })
+                match crate::database::attribution::scope_database_workload_result(
+                    pioneer_observability::DatabaseWorkload::ExecutionSupervision,
+                    retry_transient_storage_access(|| {
+                        this.crud_store.promote_queued_agent_executions(
+                            pioneer_crud::utc_now(),
+                            64,
+                            i64::try_from(agent_resource_policy.idle_timeout_secs)
+                                .unwrap_or(i64::MAX),
+                            i64::try_from(agent_resource_policy.hard_timeout_secs)
+                                .unwrap_or(i64::MAX),
+                        )
+                    }),
+                )
                 .await
                 {
                     Ok(promoted) => {
                         let database = this.crud_store.database_connection();
                         for execution in &promoted {
                             if let Err(error) =
-                                pioneer_crud::wake_agent_action_outbox_for_execution(
-                                    &database,
-                                    execution.execution_id.as_str(),
-                                    pioneer_crud::utc_now(),
+                                crate::database::attribution::scope_database_workload_result(
+                                    pioneer_observability::DatabaseWorkload::ExecutionSupervision,
+                                    pioneer_crud::wake_agent_action_outbox_for_execution(
+                                        &database,
+                                        execution.execution_id.as_str(),
+                                        pioneer_crud::utc_now(),
+                                    ),
                                 )
                                 .await
                             {
@@ -2004,8 +2854,13 @@ impl MessageProcessor {
                             .map(|execution| execution.root_execution_id)
                             .collect::<std::collections::BTreeSet<_>>();
                         for root_execution_id in roots {
-                            this.notify_agent_work_graph_state_changed(root_execution_id.as_str())
-                                .await;
+                            crate::database::attribution::scope_database_workload(
+                                pioneer_observability::DatabaseWorkload::ExecutionSupervision,
+                                this.notify_agent_work_graph_state_changed(
+                                    root_execution_id.as_str(),
+                                ),
+                            )
+                            .await;
                         }
                     }
                     Err(error) => {
@@ -2023,17 +2878,20 @@ impl MessageProcessor {
                 if now >= next_agent_action_ledger_compaction {
                     next_agent_action_ledger_compaction =
                         now.saturating_add(AGENT_ACTION_LEDGER_COMPACTION_INTERVAL_SECONDS);
-                    match retry_transient_storage_access(|| {
-                        let database = this.crud_store.database_connection();
-                        async move {
-                            pioneer_crud::compact_terminal_agent_action_ledger(
-                                &database,
-                                pioneer_crud::utc_now(),
-                                AGENT_ACTION_LEDGER_COMPACTION_BATCH_SIZE,
-                            )
-                            .await
-                        }
-                    })
+                    match crate::database::attribution::scope_database_workload_result(
+                        pioneer_observability::DatabaseWorkload::ExecutionSupervision,
+                        retry_transient_storage_access(|| {
+                            let database = maintenance.crud_store.database_connection();
+                            async move {
+                                pioneer_crud::compact_terminal_agent_action_ledger(
+                                    &database,
+                                    pioneer_crud::utc_now(),
+                                    AGENT_ACTION_LEDGER_COMPACTION_BATCH_SIZE,
+                                )
+                                .await
+                            }
+                        }),
+                    )
                     .await
                     {
                         Ok(summary) => {
@@ -2063,29 +2921,148 @@ impl MessageProcessor {
                     continue;
                 }
 
-                if let Err(error) = retry_transient_storage_access(|| {
-                    agent_action_tools::process_due_agent_action_outbox(&this, 64)
-                })
-                .await
-                {
-                    record_resilience_worker_poll_error(
-                        "agent domain agent action outbox",
-                        &error,
-                        &mut transient_storage_poll_failed,
-                    );
+                if now >= next_native_terminal_effect_recovery {
+                    next_native_terminal_effect_recovery =
+                        now.saturating_add(NATIVE_TERMINAL_EFFECT_RECOVERY_INTERVAL_SECONDS);
+                    match crate::database::attribution::scope_database_workload_result(
+                        pioneer_observability::DatabaseWorkload::ExecutionSupervision,
+                        retry_transient_storage_access(|| {
+                            maintenance
+                                .crud_store
+                                .requeue_retryable_unresolved_native_terminal_effects(
+                                    now,
+                                    NATIVE_TERMINAL_EFFECT_RECOVERY_BATCH_SIZE,
+                                )
+                        }),
+                    )
+                    .await
+                    {
+                        Ok(requeued) => {
+                            if requeued > 0 {
+                                info!(
+                                    requeued,
+                                    "requeued retryable unresolved native terminal effects"
+                                );
+                            }
+                            if requeued >= NATIVE_TERMINAL_EFFECT_RECOVERY_BATCH_SIZE {
+                                next_native_terminal_effect_recovery = now;
+                            }
+                        }
+                        Err(error) => {
+                            next_native_terminal_effect_recovery =
+                                now.saturating_add(NATIVE_TERMINAL_EFFECT_RECOVERY_RETRY_SECONDS);
+                            record_resilience_worker_error(
+                                "native terminal-effect retryable recovery",
+                                &error,
+                                ResilienceWorkerFailureImpact::Maintenance,
+                            );
+                        }
+                    }
                 }
                 if sleep_after_transient_storage_poll_failure(transient_storage_poll_failed).await {
                     continue;
                 }
 
-                match retry_transient_storage_access(|| {
-                    this.poll_timeouts_respecting_human_wait(now, 64)
-                })
+                if now >= next_native_terminal_effect_purge {
+                    next_native_terminal_effect_purge =
+                        now.saturating_add(NATIVE_TERMINAL_EFFECT_PURGE_INTERVAL_SECONDS);
+                    match crate::database::attribution::scope_database_workload_result(
+                        pioneer_observability::DatabaseWorkload::ExecutionSupervision,
+                        retry_transient_storage_access(|| {
+                            maintenance
+                                .crud_store
+                                .purge_resolved_native_terminal_effects_before(
+                                    now.saturating_sub(NATIVE_TERMINAL_EFFECT_RETENTION_SECONDS),
+                                    NATIVE_TERMINAL_EFFECT_PURGE_BATCH_SIZE,
+                                )
+                        }),
+                    )
+                    .await
+                    {
+                        Ok(purged) => {
+                            if purged > 0 {
+                                info!(purged, "purged retained native terminal effects");
+                            }
+                            if purged >= NATIVE_TERMINAL_EFFECT_PURGE_BATCH_SIZE {
+                                next_native_terminal_effect_purge = now;
+                            }
+                        }
+                        Err(error) => {
+                            next_native_terminal_effect_purge =
+                                now.saturating_add(NATIVE_TERMINAL_EFFECT_PURGE_RETRY_SECONDS);
+                            // Retention is maintenance, not recovery authority.
+                            // Its failure must not defer terminalization,
+                            // timeout supervision, or either durable outbox.
+                            record_resilience_worker_error(
+                                "native terminal-effect retention",
+                                &error,
+                                ResilienceWorkerFailureImpact::Maintenance,
+                            );
+                        }
+                    }
+                }
+                if sleep_after_transient_storage_poll_failure(transient_storage_poll_failed).await {
+                    continue;
+                }
+
+                match crate::database::attribution::scope_database_workload_result(
+                    pioneer_observability::DatabaseWorkload::ExecutionSupervision,
+                    // One input quantum. Report errors/back off only after all
+                    // independent known-committed rows have had their dispatch.
+                    agent_action_tools::process_due_agent_action_outbox(&this, 64),
+                )
+                .await
+                {
+                    Ok(batch) => {
+                        if !batch.errors.is_empty() {
+                            tracing::warn!(
+                                delivered = batch.delivered,
+                                candidate_failures = batch.errors.len(),
+                                "agent action outbox quantum made partial progress"
+                            );
+                            transient_storage_poll_failed = true;
+                            for error in batch.errors {
+                                record_resilience_worker_poll_error(
+                                    "agent domain agent action outbox",
+                                    &error,
+                                    &mut transient_storage_poll_failed,
+                                );
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        transient_storage_poll_failed = true;
+                        record_resilience_worker_poll_error(
+                            "agent domain agent action outbox",
+                            &error,
+                            &mut transient_storage_poll_failed,
+                        );
+                    }
+                }
+                if sleep_after_transient_storage_poll_failure(transient_storage_poll_failed).await {
+                    continue;
+                }
+
+                // Hook/cleanup handlers have their own bounded deadlines and
+                // must never block lease heartbeats, timeout recovery, or the
+                // rest of this global resilience control loop.
+                this.kick_native_terminal_effects();
+
+                match crate::database::attribution::scope_database_workload_result(
+                    pioneer_observability::DatabaseWorkload::ExecutionSupervision,
+                    retry_transient_storage_access(|| {
+                        this.poll_timeouts_respecting_human_wait(now, 64)
+                    }),
+                )
                 .await
                 {
                     Ok(candidates) => {
                         for candidate in candidates {
-                            this.handle_timeout_candidate(candidate, now).await;
+                            crate::database::attribution::scope_database_workload(
+                                pioneer_observability::DatabaseWorkload::ExecutionSupervision,
+                                this.handle_timeout_candidate(candidate, now),
+                            )
+                            .await;
                         }
                     }
                     Err(error) => {
@@ -2100,10 +3077,13 @@ impl MessageProcessor {
                     continue;
                 }
 
-                if let Err(error) = retry_transient_storage_access(|| {
-                    this.crud_store
-                        .enqueue_missing_recovery_terminalizations(64, now)
-                })
+                if let Err(error) = crate::database::attribution::scope_database_workload_result(
+                    pioneer_observability::DatabaseWorkload::RecoveryTerminalizationAudit,
+                    retry_transient_storage_access(|| {
+                        this.crud_store
+                            .enqueue_missing_recovery_terminalizations(64, now)
+                    }),
+                )
                 .await
                 {
                     record_resilience_worker_poll_error(
@@ -2116,9 +3096,12 @@ impl MessageProcessor {
                     continue;
                 }
 
-                if let Err(error) = retry_transient_storage_access(|| {
-                    this.process_due_recovery_terminalizations(now, 64)
-                })
+                if let Err(error) = crate::database::attribution::scope_database_workload_result(
+                    pioneer_observability::DatabaseWorkload::RecoveryTerminalizationApply,
+                    retry_transient_storage_access(|| {
+                        this.process_due_recovery_terminalizations(now, 64)
+                    }),
+                )
                 .await
                 {
                     record_resilience_worker_poll_error(
@@ -2131,14 +3114,21 @@ impl MessageProcessor {
                     continue;
                 }
 
-                match retry_transient_storage_access(|| {
-                    this.recovery_coordinator.run_ready_jobs(now, 64)
-                })
+                match crate::database::attribution::scope_database_workload_result(
+                    pioneer_observability::DatabaseWorkload::ExecutionSupervision,
+                    retry_transient_storage_access(|| {
+                        this.recovery_coordinator.run_ready_jobs(now, 64)
+                    }),
+                )
                 .await
                 {
                     Ok(events) => {
                         for event in events {
-                            this.handle_recovery_event(event, now).await;
+                            crate::database::attribution::scope_database_workload(
+                                pioneer_observability::DatabaseWorkload::ExecutionSupervision,
+                                this.handle_recovery_event(event, now),
+                            )
+                            .await;
                         }
                     }
                     Err(error) => {
@@ -2153,14 +3143,43 @@ impl MessageProcessor {
                     continue;
                 }
 
-                this.fail_stale_cli_runtime_turns(now_timestamp_millis())
-                    .await;
+                crate::database::attribution::scope_database_workload(
+                    pioneer_observability::DatabaseWorkload::ExecutionSupervision,
+                    this.fail_stale_cli_runtime_turns(
+                        now_timestamp_millis(),
+                        &mut cli_runtime_stale_turn_scan,
+                    ),
+                )
+                .await;
 
                 sleep(Duration::from_secs(RESILIENCE_WORKER_POLL_INTERVAL_SECONDS)).await;
+            }
+        };
+        let handle = tokio::spawn(async move {
+            tokio::select! {
+                _ = cancellation.cancelled() => {},
+                _ = worker => {},
             }
         });
 
         *guard = Some(handle);
+        Ok(())
+    }
+
+    pub(crate) async fn shutdown_resilience_workers(&self) {
+        self.cli_history_shutdown.cancel();
+        for worker in [
+            &self.resilience_worker,
+            &self.task_event_listener_worker,
+            &self.hook_recovery_worker,
+        ] {
+            if let Some(handle) = worker.lock().await.take() {
+                handle.abort();
+                let _ = handle.await;
+            }
+        }
+        self.suspend_completed_history_checks().await;
+        self.task_runtime.shutdown().await;
     }
 
     async fn update_cli_runtime_command_item_registry(
@@ -2456,6 +3475,10 @@ impl MessageProcessor {
                     self.cli_runtime_command_heartbeats.remove_key(&key).await;
                     continue;
                 }
+                Ok(
+                    cli_runtime::CLIRuntimeAuthoritativeTurnState::Deferred
+                    | cli_runtime::CLIRuntimeAuthoritativeTurnState::Superseded,
+                ) => continue,
                 Ok(cli_runtime::CLIRuntimeAuthoritativeTurnState::Unavailable) => {
                     self.cli_runtime_command_heartbeats
                         .mark_attempt_failed(&key, now_unix)
@@ -2532,9 +3555,14 @@ impl MessageProcessor {
                 let Some(this) = processor.upgrade() else {
                     break;
                 };
+                let this = this.for_background_reconciliation();
                 let config = this.hook_recovery_config.read().await.clone();
                 if config.enabled && (!first_pass || config.startup_scan) {
-                    this.run_hook_recovery_pass(config.clone()).await;
+                    crate::database::attribution::scope_database_workload(
+                        pioneer_observability::DatabaseWorkload::HookRecovery,
+                        this.run_hook_recovery_pass(config.clone()),
+                    )
+                    .await;
                 }
                 first_pass = false;
                 sleep(Duration::from_millis(config.poll_interval_ms.max(250))).await;
@@ -2551,6 +3579,9 @@ impl MessageProcessor {
         if !runtime.has_run_store() {
             return;
         }
+        let runtime = GatewayHookRuntimeBuilder::from_runtime(self.crud_store.clone(), &runtime)
+            .with_crud_run_store()
+            .build();
         let options = HookRecoveryOptions {
             now_unix_ms: now_timestamp_millis(),
             batch_size: config.batch_size,
@@ -2596,145 +3627,228 @@ impl MessageProcessor {
             .event_bus()
             .subscribe(pioneer_tasks::TaskEventFilter::default());
         *guard = Some(tokio::spawn(async move {
-            let mut cursors_by_task: HashMap<String, i64> = HashMap::new();
-            let mut durable_replay_after_task_id: Option<String> = None;
-            let mut durable_replay = interval(Duration::from_secs(5));
-            durable_replay.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            let mut bus_open = true;
+            let mut periodic = interval(Duration::from_secs(5));
+            periodic.set_missed_tick_behavior(MissedTickBehavior::Delay);
             loop {
+                // The bus is only a wake. This owned dispatcher is the sole
+                // emitter, so even slow Tasks cannot acquire competing lanes.
+                tokio::select! {
+                    delivery=subscription.recv(),if bus_open=>match delivery {
+                        pioneer_tasks::TaskEventWakeDelivery::Wake(_)=>{},
+                        pioneer_tasks::TaskEventWakeDelivery::Lagged(count)=>warn!(missed_wakes=count,"task fanout wake bus lagged"),
+                        pioneer_tasks::TaskEventWakeDelivery::Closed=>bus_open=false,
+                    },
+                    _=periodic.tick()=>{},
+                }
                 let Some(this) = processor.upgrade() else {
                     break;
                 };
-                tokio::select! {
-                    delivery = subscription.recv() => match delivery {
-                        pioneer_tasks::TaskEventWakeDelivery::Wake(wake) => {
-                            if let Err(error) = this
-                                .emit_committed_task_events_after_cursor(
-                                    wake.task_id.as_str(),
-                                    &mut cursors_by_task,
-                                )
-                                .await
-                            {
-                                warn!(
-                                    task_id = %wake.task_id,
-                                    event_id = %wake.event_id,
-                                    sequence = wake.sequence,
-                                    error = %format!("{error:#}"),
-                                    "failed to fan out committed task events after wake; durable replay will retry"
-                                );
-                            }
+                let result = crate::database::attribution::scope_database_workload_result(
+                    pioneer_observability::DatabaseWorkload::TaskEventFanout,
+                    this.for_background_reconciliation()
+                        .task_event_fanout_quantum(),
+                )
+                .await;
+                match result {
+                    Ok(summary) => {
+                        debug!(selected=summary.selected,event_inputs=summary.event_inputs,emitted=summary.emitted,errors=summary.errors,pending=?summary.pending,"task fanout quantum completed");
+                        if summary.errors > 0 {
+                            // Storage/claim failures cannot spin via a hot bus.
+                            // Sleep owns no DB resources; cancellation aborts it.
+                            tokio::time::sleep(Duration::from_secs(5)).await;
                         }
-                        pioneer_tasks::TaskEventWakeDelivery::Lagged(count) => {
-                            warn!(
-                                missed_wakes = count,
-                                "task wake bus lagged; durable fanout backlog will be rescanned"
-                            );
-                            if let Err(error) = this
-                                .replay_pending_task_event_fanout(
-                                    &mut cursors_by_task,
-                                    &mut durable_replay_after_task_id,
-                                )
-                                .await
-                            {
-                                warn!(
-                                    missed_wakes = count,
-                                    error = %format!("{error:#}"),
-                                    "failed to rescan durable task event fanout backlog after lag"
-                                );
-                            }
-                        }
-                        pioneer_tasks::TaskEventWakeDelivery::Closed => break,
-                    },
-                    _ = durable_replay.tick() => {
-                        if let Err(error) = this
-                            .replay_pending_task_event_fanout(
-                                &mut cursors_by_task,
-                                &mut durable_replay_after_task_id,
-                            )
-                            .await
-                        {
-                            warn!(
-                                error = %format!("{error:#}"),
-                                "periodic durable task event fanout replay failed"
-                            );
-                        }
+                    }
+                    Err(error) => {
+                        warn!(
+                            failure_class =
+                                if reconciliation_diagnostics::is_storage_failure(&error) {
+                                    "storage"
+                                } else {
+                                    "candidate"
+                                },
+                            "task fanout discovery failed"
+                        );
+                        tokio::time::sleep(Duration::from_secs(5)).await;
                     }
                 }
             }
         }));
     }
 
-    async fn replay_pending_task_event_fanout(
-        &self,
-        cursors_by_task: &mut HashMap<String, i64>,
-        after_task_id: &mut Option<String>,
-    ) -> anyhow::Result<()> {
-        const REPLAY_BATCH_SIZE: u64 = 256;
-        let mut task_ids = self
-            .crud_store
-            .list_pending_task_event_fanout_task_ids(after_task_id.as_deref(), REPLAY_BATCH_SIZE)
-            .await?;
-        if task_ids.is_empty() && after_task_id.is_some() {
-            *after_task_id = None;
-            task_ids = self
-                .crud_store
-                .list_pending_task_event_fanout_task_ids(None, REPLAY_BATCH_SIZE)
-                .await?;
-        }
-        *after_task_id = if task_ids.len() == REPLAY_BATCH_SIZE as usize {
-            task_ids.last().cloned()
-        } else {
-            None
-        };
-        for task_id in task_ids {
-            if let Err(error) = self
-                .emit_committed_task_events_after_cursor(task_id.as_str(), cursors_by_task)
-                .await
-            {
-                warn!(
-                    task_id = %task_id,
-                    error = %format!("{error:#}"),
-                    "failed to replay committed task events from durable fanout cursor"
-                );
-            }
-        }
-        Ok(())
+    async fn task_event_fanout_quantum(&self) -> anyhow::Result<TaskEventFanoutSummary> {
+        self.task_event_fanout_quantum_with_clock(&now_timestamp_secs)
+            .await
     }
 
-    async fn emit_committed_task_events_after_cursor(
+    async fn task_event_fanout_quantum_with_clock(
         &self,
-        task_id: &str,
-        cursors_by_task: &mut HashMap<String, i64>,
-    ) -> anyhow::Result<()> {
-        let after_sequence = match cursors_by_task.get(task_id).copied() {
-            Some(sequence) => sequence,
-            None => {
-                let sequence = self
-                    .crud_store
-                    .get_task_event_fanout_cursor(task_id)
+        clock: &(dyn Fn() -> i64 + Send + Sync),
+    ) -> anyhow::Result<TaskEventFanoutSummary> {
+        use pioneer_crud::{
+            TASK_EVENT_FANOUT_BYTE_BUDGET, TASK_EVENT_FANOUT_EVENT_BUDGET,
+            TASK_EVENT_FANOUT_TASK_BUDGET,
+        };
+        let maintenance = self.crud_store.with_maintenance_access();
+        let candidates = maintenance
+            .due_task_event_fanout(clock(), TASK_EVENT_FANOUT_TASK_BUDGET)
+            .await?;
+        let mut summary = TaskEventFanoutSummary {
+            selected: candidates.len(),
+            ..Default::default()
+        };
+        let mut events_left = TASK_EVENT_FANOUT_EVENT_BUDGET;
+        let mut bytes_left = TASK_EVENT_FANOUT_BYTE_BUDGET;
+        let mut tasks_left = candidates.len();
+        for candidate in candidates {
+            if events_left == 0 || bytes_left == 0 {
+                break;
+            }
+            let allowance = (events_left / tasks_left.max(1)).max(1);
+            tasks_left -= 1;
+            // One allocation even if claim/preparation/release panics. No
+            // compensating rediscovery or fresh budget after an unknown commit.
+            events_left = events_left.saturating_sub(allowance);
+            let result = std::panic::AssertUnwindSafe(async {
+                let Some(claim) = maintenance
+                    .claim_task_event_fanout(&candidate, clock)
                     .await?
-                    .with_context(|| {
-                        format!("missing durable task event fanout cursor for `{task_id}`")
-                    })?;
-                cursors_by_task.insert(task_id.to_owned(), sequence);
-                sequence
+                else {
+                    return Ok::<(), anyhow::Error>(());
+                };
+                let outcome = match self
+                    .emit_task_event_fanout_page(
+                        &claim,
+                        allowance,
+                        &mut bytes_left,
+                        &mut summary.emitted,
+                        clock,
+                    )
+                    .await
+                {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        summary.errors += 1;
+                        warn!(
+                            failure_class =
+                                if reconciliation_diagnostics::is_storage_failure(&error) {
+                                    "storage"
+                                } else {
+                                    "candidate"
+                                },
+                            "task fanout delivery failed; prefix ACKs retained"
+                        );
+                        pioneer_crud::TaskEventFanoutOutcome::Failed
+                    }
+                };
+                maintenance
+                    .release_task_event_fanout(&claim, outcome, clock)
+                    .await?;
+                Ok(())
+            })
+            .catch_unwind()
+            .await;
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    summary.errors += 1;
+                    warn!(
+                        failure_class = if reconciliation_diagnostics::is_storage_failure(&error) {
+                            "storage"
+                        } else {
+                            "candidate"
+                        },
+                        "task fanout candidate bookkeeping failed"
+                    );
+                }
+                Err(_) => {
+                    // Panic says nothing about commit/rollback. Leave durable
+                    // state intact, including confirmed ACKs; never compensate.
+                    summary.errors += 1;
+                    warn!(failure_class = "panic", "task fanout candidate panicked");
+                }
+            }
+        }
+        summary.event_inputs = TASK_EVENT_FANOUT_EVENT_BUDGET - events_left;
+        summary.pending = match maintenance.has_pending_task_event_fanout().await {
+            Ok(pending) => Some(pending),
+            Err(error) => {
+                summary.errors += 1;
+                warn!(
+                    failure_class = if reconciliation_diagnostics::is_storage_failure(&error) {
+                        "storage"
+                    } else {
+                        "candidate"
+                    },
+                    "task fanout queue state unavailable"
+                );
+                None
             }
         };
-        let events = self
-            .task_runtime
-            .service()
-            .list_task_events_after(task_id, after_sequence)
-            .await?;
+        Ok(summary)
+    }
 
+    async fn emit_task_event_fanout_page(
+        &self,
+        claim: &pioneer_crud::TaskEventFanoutClaim,
+        limit: usize,
+        bytes_left: &mut usize,
+        emitted: &mut usize,
+        clock: &(dyn Fn() -> i64 + Send + Sync),
+    ) -> anyhow::Result<pioneer_crud::TaskEventFanoutOutcome> {
+        let maintenance = self.crud_store.with_maintenance_access();
+        let after = maintenance
+            .get_task_event_fanout_cursor(&claim.task_id)
+            .await?
+            .with_context(|| {
+                format!(
+                    "missing durable task event fanout cursor for `{}`",
+                    claim.task_id
+                )
+            })?;
+        // Pending owns the durable post-install interval. A legacy or reset
+        // cursor may lag behind it, but must never reopen pre-install history.
+        let after = after.max(claim.first_sequence - 1);
+        let allow_oversized = *bytes_left == pioneer_crud::TASK_EVENT_FANOUT_BYTE_BUDGET;
+        let page = maintenance
+            .task_event_fanout_page(&claim.task_id, after, limit, bytes_left, allow_oversized)
+            .await;
+        let events = match page {
+            Ok(pioneer_crud::TaskEventFanoutPage::Prefix { events, .. }) => events,
+            Ok(pioneer_crud::TaskEventFanoutPage::BudgetDeferred) => {
+                return Ok(pioneer_crud::TaskEventFanoutOutcome::BudgetDeferred);
+            }
+            Err(error) => return Err(error),
+        };
+        // Repository charged the admissible prefix before reading full rows,
+        // so decode/read/emit panics cannot issue the same byte budget again.
         for event in events {
+            let event = event?;
+            if !maintenance.renew_task_event_fanout(claim, clock).await? {
+                anyhow::bail!("task fanout holder changed before emit");
+            }
             let sequence = event.sequence;
-            self.emit_task_event(event).await?;
+            // Poll emit and renewal together. Awaiting renewal inside a timer
+            // branch could deadlock if emit currently owns a short write tx.
+            // Both futures belong to this dispatcher and drop on cancellation.
+            let result: anyhow::Result<()> = tokio::select! {
+                result=self.emit_task_event(event)=>result,
+                result=async {
+                    loop {
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                        if !maintenance.renew_task_event_fanout(claim, clock).await? {
+                            anyhow::bail!("task fanout holder changed during emit");
+                        }
+                    }
+                }=>result,
+            };
+            result?;
             self.crud_store
-                .advance_task_event_fanout_cursor(task_id, sequence)
+                .ack_task_event_fanout(claim, sequence, clock)
                 .await?;
-            cursors_by_task.insert(task_id.to_owned(), sequence);
+            *emitted += 1;
         }
-
-        Ok(())
+        Ok(pioneer_crud::TaskEventFanoutOutcome::Delivered)
     }
 
     pub(crate) fn current_skills_snapshot_version(&self) -> u64 {
@@ -3092,7 +4206,8 @@ impl MessageProcessor {
         history: &[ChatMessage],
         agent_skill_overlay: &[pioneer_skills::AgentSkillRuntimeEntry],
     ) -> anyhow::Result<()> {
-        let snapshot = crate::turn_runtime_snapshot::new_turn_runtime_snapshot(
+        let canonical = history.iter().all(|message| message.provenance.is_some());
+        let mut snapshot = crate::turn_runtime_snapshot::new_turn_runtime_snapshot(
             thread_id,
             workspace_id,
             turn_id,
@@ -3106,13 +4221,38 @@ impl MessageProcessor {
             capabilities,
             resolved_artifacts,
             runtime_environment,
-            history,
+            if canonical { &[] } else { history },
             agent_skill_overlay,
         )?;
+        let mut frozen_prepared = None;
+        if canonical {
+            let allowed = crate::compaction::frozen::execution_history_scopes(
+                self.crud_store.as_ref(),
+                workspace_id,
+                thread_id,
+                turn_id,
+                hook_runtime_context.conversation_thread_id.as_deref(),
+            )
+            .await?;
+            let prepared = crate::compaction::frozen::capture_prepared(
+                self.crud_store.as_ref(),
+                workspace_id,
+                thread_id,
+                &allowed,
+                history,
+            )
+            .await
+            .context("failed to freeze canonical runtime history")?;
+            snapshot.history_json = serde_json::to_string(&prepared.descriptor)?;
+            frozen_prepared = Some(prepared);
+        }
+        // Temporary compatibility for the ordinary legacy loader is removed
+        // when that loader is replaced. Canonical Task histories never enter it.
         self.crud_store
             .upsert_turn_runtime_snapshot(snapshot)
             .await
             .with_context(|| format!("failed to persist runtime snapshot for turn `{turn_id}`"))?;
+        drop(frozen_prepared);
         Ok(())
     }
 
@@ -3414,7 +4554,6 @@ impl MessageProcessor {
         crud_store: Arc<CrudStore>,
         gateway_secrets: Arc<GatewaySecrets>,
         summary_config: summary::SummaryConfig,
-        context_budget: ContextBudget,
         tool_loop_config: ToolLoopConfig,
     ) -> Self {
         let memory_runtime = Arc::new(GatewayMemoryRuntime::disabled(crud_store.clone()));
@@ -3431,7 +4570,6 @@ impl MessageProcessor {
             crud_store,
             gateway_secrets,
             summary_config,
-            context_budget,
             tool_loop_config,
             memory_runtime,
             runtime_home,
@@ -3453,6 +4591,7 @@ impl MessageProcessor {
         workspace_manager: Arc<WorkspaceManager>,
         crud_store: Arc<CrudStore>,
     ) -> Self {
+        let maintenance_crud_store = Arc::new(crud_store.with_maintenance_access());
         let timeout_supervisor = Arc::new(TimeoutSupervisor::new(
             crud_store.clone(),
             TimeoutPolicyRegistry::default(),
@@ -3608,18 +4747,29 @@ impl MessageProcessor {
                 ThreadEpisodicRuntimeConfig::default().vector_search,
             ),
         );
-        let thread_episodic_index_executor = Arc::new(ThreadEpisodicIndexExecutor::new(
-            crud_store.clone(),
-            thread_episodic_backend.clone(),
-            Arc::new(RuntimeVectorThreadEpisodicIndexPayloadProvider::new(
-                Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(
-                    crud_store.clone(),
-                    thread_episodic_storage_uri_from_path(thread_episodic_storage_root.as_path()),
+        let thread_episodic_workspace_refill_supervisor =
+            Arc::new(crate::database::startup::ThreadEpisodicWorkspaceRefillSupervisor::default());
+        let thread_episodic_index_executor = Arc::new(
+            ThreadEpisodicIndexExecutor::new(
+                maintenance_crud_store.clone(),
+                thread_episodic_backend.clone(),
+                Arc::new(RuntimeVectorThreadEpisodicIndexPayloadProvider::new(
+                    Arc::new(StoreThreadEpisodicIndexPayloadProvider::new(
+                        maintenance_crud_store.clone(),
+                        thread_episodic_storage_uri_from_path(
+                            thread_episodic_storage_root.as_path(),
+                        ),
+                    )),
+                    thread_episodic_embedding_provider_resolver.clone(),
+                    maintenance_crud_store,
                 )),
+            )
+            .with_projection_runtime(
+                thread_episodic_storage_root.clone(),
                 thread_episodic_embedding_provider_resolver.clone(),
-                crud_store.clone(),
-            )),
-        ));
+                thread_episodic_workspace_refill_supervisor.clone(),
+            ),
+        );
         let thread_episodic_recall_embedding_provider_resolver: Arc<
             dyn ThreadEpisodicIndexEmbeddingProviderResolver,
         > = thread_episodic_embedding_provider_resolver.clone();
@@ -3631,8 +4781,6 @@ impl MessageProcessor {
             ),
         );
         let (thread_episodic_vector_refill_status_tx, _) = broadcast::channel(64);
-        let thread_episodic_workspace_refill_supervisor =
-            Arc::new(crate::database::startup::ThreadEpisodicWorkspaceRefillSupervisor::default());
         Self {
             thread_manager,
             agent_manager,
@@ -3657,18 +4805,64 @@ impl MessageProcessor {
                 pioneer_protocol::GatewayBaseUrl::parse_presentation("http://127.0.0.1:17878")
                     .expect("static Gateway base URL is valid"),
             ),
+            completed_history_checks: Arc::new(Mutex::new(HashMap::new())),
+            compaction_lifecycle_not_before: Arc::new(StdRwLock::new(None)),
+            #[cfg(test)]
+            completed_history_preparation_barrier: Arc::new(Default::default()),
+            #[cfg(test)]
+            turn_execution_heartbeat_barrier: Arc::new(Default::default()),
+            #[cfg(test)]
+            task_history_preparation_failure: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            task_cli_terminal_preparation_finished: Arc::new(tokio::sync::Notify::new()),
+            #[cfg(test)]
+            task_cli_admission_failure: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            task_cli_preparation_attempts: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            task_cli_history_revalidation_failure: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            task_cli_readiness_failure: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            task_output_capture_failures: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            compaction_coordinator: Arc::new(
+                crate::compaction::ContextCompactionCoordinator::default(),
+            ),
+            cli_history_shutdown: tokio_util::sync::CancellationToken::new(),
+            #[cfg(test)]
+            cli_transfer_capture_count: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            cli_transfer_test_deadline: Arc::new(tokio::sync::Notify::new()),
+            #[cfg(test)]
+            cli_history_monitor_drops: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            cli_history_monitor_cleanup_drops: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            predispatch_cli_turn_read_failures: Arc::new(Mutex::new(HashSet::new())),
+            #[cfg(test)]
+            claude_boundary_write_failures: Arc::new(Mutex::new(HashSet::new())),
+            #[cfg(test)]
+            native_cancellation_finish_barrier: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            native_cancellation_materialization_failure: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            native_cancellation_materialization_barrier: Arc::new(Mutex::new(None)),
+            workspace_compaction_settings: Arc::new(StdRwLock::new(
+                std::collections::BTreeMap::new(),
+            )),
+            compaction_settings: Arc::new(StdRwLock::new(
+                pioneer_compaction::CompactionSettings::default(),
+            )),
             summary_config: Arc::new(summary::SummaryConfig {
                 summary_model: Some("test-model".to_owned()),
                 summary_model_provider: Some("echo".to_owned()),
                 title_model: Some("test-model".to_owned()),
                 title_model_provider: Some("echo".to_owned()),
             }),
-            context_budget: ContextBudget {
-                max_context_tokens: 128_000,
-                response_reserve_tokens: 16_000,
-            },
             agent_listener_tasks: Arc::new(Mutex::new(HashMap::new())),
+            agent_listener_generation: Arc::new(AtomicU64::new(1)),
             agent_message_buffers: Arc::new(Mutex::new(HashMap::new())),
+            progress_items: Arc::new(Mutex::new(ProgressItemRegistry::default())),
             agent_action_bindings: Arc::new(Mutex::new(HashMap::new())),
             parent_timeline_targets: Arc::new(Mutex::new(HashMap::new())),
             user_turn_cancel_intents: Arc::new(Mutex::new(HashMap::new())),
@@ -3678,6 +4872,7 @@ impl MessageProcessor {
                 CLIRuntimeMachineRequestRegistry::default(),
             )),
             cli_runtime_proxy_cache: Arc::new(Mutex::new(HashMap::new())),
+            provider_readiness: Arc::new(provider_readiness::ProviderReadinessSupervisor::default()),
             cli_runtime_pending_turn_activity_sequence: Arc::new(AtomicU64::new(0)),
             cli_runtime_event_hubs: Arc::new(Mutex::new(HashMap::new())),
             cli_runtime_turn_binding_cache: Arc::new(Mutex::new(HashMap::new())),
@@ -3698,6 +4893,11 @@ impl MessageProcessor {
             timeout_supervisor,
             recovery_coordinator,
             native_turn_event_delivery_kick_running: Arc::new(AtomicBool::new(false)),
+            native_terminal_effect_kick_running: Arc::new(AtomicBool::new(false)),
+            native_terminal_effect_kick_pending: Arc::new(AtomicBool::new(false)),
+            native_lifecycle_readiness: Arc::new(
+                native_health::NativeLifecycleReadinessState::default(),
+            ),
             resilience_worker: Arc::new(Mutex::new(None)),
             hook_recovery_worker: Arc::new(Mutex::new(None)),
             task_event_listener_worker: Arc::new(Mutex::new(None)),
@@ -3707,6 +4907,7 @@ impl MessageProcessor {
             thread_episodic_runtime_config: Arc::new(StdRwLock::new(
                 ThreadEpisodicRuntimeConfig::default(),
             )),
+            administration_snapshot_version: Arc::new(AtomicU64::new(now_snapshot)),
             skills_snapshot_version: Arc::new(AtomicU64::new(now_snapshot)),
             mcp_snapshot_version,
             mcp_service,
@@ -3715,7 +4916,7 @@ impl MessageProcessor {
             #[cfg(test)]
             cli_runtime_skill_preflight_test_events: Arc::new(Mutex::new(Vec::new())),
             #[cfg(test)]
-            cli_mcp_readiness_override: None,
+            cli_mcp_readiness_overrides: [None, None, None],
             skill_upload_locks: Arc::new(Mutex::new(HashMap::new())),
             skill_upload_owners: Arc::new(Mutex::new(HashMap::new())),
             task_agent_executor,
@@ -3738,6 +4939,9 @@ impl MessageProcessor {
             voice_input_supervisor: None,
             self_improvement_supervisor: None,
             gateway_settings_update_lock: Arc::new(Mutex::new(())),
+            voice_finalizations: Default::default(),
+            #[cfg(test)]
+            voice_test_transcriber: None,
             voice_sessions: GatewayVoiceSessionStore::default(),
             voice_session_buffers: GatewayVoiceSessionBufferStore::default(),
         }

@@ -6,6 +6,7 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+pioneer-compaction.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 futures-util.workspace = true
@@ -13,6 +14,7 @@ hex.workspace = true
 pioneer-config.workspace = true
 pioneer-hooks.workspace = true
 pioneer-memory.workspace = true
+pioneer-observability.workspace = true
 pioneer-protocol.workspace = true
 pioneer-provider.workspace = true
 pioneer-runtime-events.workspace = true
@@ -29,4 +31,7 @@ dirs.workspace = true
 chrono.workspace = true
 
 [dev-dependencies]
+tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
+sentry = { workspace = true, features = ["test"] }
+tracing-subscriber.workspace = true

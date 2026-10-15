@@ -24,10 +24,23 @@ pub(crate) enum CliMcpSessionLaunch {
 
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) enum CliProviderContinuation {
-    CodexRpcThread { native_thread_id: Option<String> },
-    ClaudeNew { provider_session_id: Uuid },
-    ClaudeResume { provider_session_id: Uuid },
-    OpenCodeServerSession { native_session_id: Option<String> },
+    CodexRpcThread {
+        native_thread_id: Option<String>,
+    },
+    ClaudeNew {
+        provider_session_id: Uuid,
+    },
+    ClaudeResume {
+        provider_session_id: Uuid,
+    },
+    ClaudeFork {
+        source_session_id: Uuid,
+        boundary_message_uuid: Uuid,
+        provider_session_id: Uuid,
+    },
+    OpenCodeServerSession {
+        native_session_id: Option<String>,
+    },
 }
 
 impl fmt::Debug for CliProviderContinuation {
@@ -49,6 +62,10 @@ impl fmt::Debug for CliProviderContinuation {
                 .debug_struct("OpenCodeServerSession")
                 .field("native_session_id", native_session_id)
                 .finish(),
+            Self::ClaudeFork { .. } => formatter
+                .debug_struct("ClaudeFork")
+                .field("provider_session_id", &"<redacted>")
+                .finish(),
         }
     }
 }
@@ -61,6 +78,10 @@ impl CliProviderContinuation {
             }
             | Self::ClaudeResume {
                 provider_session_id,
+            }
+            | Self::ClaudeFork {
+                provider_session_id,
+                ..
             } => Some(*provider_session_id),
             Self::CodexRpcThread { .. } => None,
             Self::OpenCodeServerSession { .. } => None,
@@ -86,7 +107,7 @@ impl CliSessionLaunchSpec {
             options,
             mcp,
             continuation: CliProviderContinuation::CodexRpcThread { native_thread_id },
-            native_event_budget: pioneer_cli_agent_runtime::NativeEventBudget::default(),
+            native_event_budget: pioneer_cli_agent_runtime::codex::codex_native_event_budget(),
         }
     }
 
@@ -129,6 +150,25 @@ impl CliSessionLaunchSpec {
         }
     }
 
+    pub(crate) fn claude_fork(
+        options: CLIAgentRuntimeSessionStartOptions,
+        mcp: CliMcpSessionLaunch,
+        source_session_id: Uuid,
+        boundary_message_uuid: Uuid,
+        provider_session_id: Uuid,
+    ) -> Self {
+        Self {
+            options,
+            mcp,
+            continuation: CliProviderContinuation::ClaudeFork {
+                source_session_id,
+                boundary_message_uuid,
+                provider_session_id,
+            },
+            native_event_budget: pioneer_cli_agent_runtime::NativeEventBudget::default(),
+        }
+    }
+
     pub(crate) fn opencode(
         options: CLIAgentRuntimeSessionStartOptions,
         mcp: CliMcpSessionLaunch,
@@ -146,7 +186,17 @@ impl CliSessionLaunchSpec {
         mut self,
         budget: pioneer_cli_agent_runtime::NativeEventBudget,
     ) -> Self {
-        self.native_event_budget = budget;
+        // The role budget is an upper authorization ceiling, not a reason to
+        // make every provider accept the broadest transport allowance. The
+        // constructor installed the provider-specific ceiling, so intersect
+        // the two and fail closed on an impossible profile mismatch.
+        self.native_event_budget = self.native_event_budget.intersect(budget).unwrap_or(
+            pioneer_cli_agent_runtime::NativeEventBudget {
+                profile_version: self.native_event_budget.profile_version,
+                max_frame_bytes: 1,
+                max_recovery_frame_bytes: 1,
+            },
+        );
         self
     }
 }
@@ -167,9 +217,10 @@ fn restart_relevant_options_changed(
 ) -> bool {
     old.cwd != new.cwd
         || old.approval_policy != new.approval_policy
+        || old.authorization_scope_fingerprint != new.authorization_scope_fingerprint
         || old.app_server_args != new.app_server_args
         || old.env != new.env
-        || old.enable_user_skills != new.enable_user_skills
+        || old.selected_skills != new.selected_skills
         || instruction_fingerprint(&old.elevated_instructions)
             != instruction_fingerprint(&new.elevated_instructions)
 }
@@ -197,12 +248,20 @@ fn continuation_identity_changed(
             }
             | CliProviderContinuation::ClaudeResume {
                 provider_session_id: old,
+            }
+            | CliProviderContinuation::ClaudeFork {
+                provider_session_id: old,
+                ..
             },
             CliProviderContinuation::ClaudeNew {
                 provider_session_id: new,
             }
             | CliProviderContinuation::ClaudeResume {
                 provider_session_id: new,
+            }
+            | CliProviderContinuation::ClaudeFork {
+                provider_session_id: new,
+                ..
             },
         ) => old != new,
         (
@@ -255,6 +314,59 @@ mod tests {
                     ..pioneer_cli_agent_runtime::NativeEventBudget::default()
                 });
         assert!(requires_restart(&first, &narrowed));
+    }
+
+    #[test]
+    fn authorized_native_event_budget_is_clamped_per_provider() {
+        let authorized = pioneer_cli_agent_runtime::NativeEventBudget {
+            max_recovery_frame_bytes:
+                pioneer_cli_agent_runtime::codex::CODEX_MAX_RECOVERY_FRAME_BYTES,
+            ..pioneer_cli_agent_runtime::NativeEventBudget::default()
+        };
+        let codex =
+            CliSessionLaunchSpec::unmanaged_codex(CLIAgentRuntimeSessionStartOptions::default())
+                .with_native_event_budget(authorized);
+        assert_eq!(
+            codex.native_event_budget.max_recovery_frame_bytes,
+            pioneer_cli_agent_runtime::codex::CODEX_MAX_RECOVERY_FRAME_BYTES,
+        );
+
+        let claude = CliSessionLaunchSpec::claude_new(
+            CLIAgentRuntimeSessionStartOptions::default(),
+            CliMcpSessionLaunch::Disabled,
+            Uuid::new_v4(),
+        )
+        .with_native_event_budget(authorized);
+        assert_eq!(
+            claude.native_event_budget.max_recovery_frame_bytes,
+            pioneer_cli_agent_runtime::DEFAULT_MAX_RECOVERY_FRAME_BYTES,
+        );
+    }
+
+    #[test]
+    fn incompatible_native_event_budget_profile_fails_closed() {
+        let launch =
+            CliSessionLaunchSpec::unmanaged_codex(CLIAgentRuntimeSessionStartOptions::default())
+                .with_native_event_budget(pioneer_cli_agent_runtime::NativeEventBudget {
+                    profile_version: u32::MAX,
+                    max_frame_bytes: 1024 * 1024,
+                    max_recovery_frame_bytes:
+                        pioneer_cli_agent_runtime::codex::CODEX_MAX_RECOVERY_FRAME_BYTES,
+                });
+        assert_eq!(launch.native_event_budget.max_frame_bytes, 1);
+        assert_eq!(launch.native_event_budget.max_recovery_frame_bytes, 1);
+    }
+
+    #[test]
+    fn authorization_scope_change_restarts_provider_session_grants() {
+        let mut first_options = CLIAgentRuntimeSessionStartOptions::default();
+        first_options.authorization_scope_fingerprint = Some("shared-scope-a".to_owned());
+        let mut changed_options = first_options.clone();
+        changed_options.authorization_scope_fingerprint = Some("shared-scope-b".to_owned());
+        let first = CliSessionLaunchSpec::unmanaged_codex(first_options);
+        let changed = CliSessionLaunchSpec::unmanaged_codex(changed_options);
+
+        assert!(requires_restart(&first, &changed));
     }
 
     #[test]

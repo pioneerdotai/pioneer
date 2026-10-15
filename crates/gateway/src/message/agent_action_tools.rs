@@ -7,6 +7,7 @@ use super::MessageProcessor;
 use crate::authorization::{AgentActionKindName, AgentToolAdapterError, BoundAgentActionAdapter};
 use anyhow::Context as _;
 use async_trait::async_trait;
+use futures_util::FutureExt;
 use pioneer_agent::TurnToolContext;
 use pioneer_protocol::{
     AgentActionIntent, AgentExecutionId, AgentModelToolName, AgentPublicOutcome,
@@ -21,6 +22,7 @@ use pioneer_tools::{
 };
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
+use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Weak};
 use tokio::sync::Mutex;
 
@@ -857,9 +859,73 @@ pub(crate) async fn resolve_workspace_task_launch(
                 permission_profile: None,
                 skill_ids: Vec::new(),
                 mcp_server_ids: Vec::new(),
+                selected_capabilities: Vec::new(),
             },
         });
     Ok((canonical, Some((identity, profile))))
+}
+
+/// Freeze the already normalized Turn capability set into the durable Task
+/// launch selection. Composer keeps its presentation payload separately, but
+/// the actor contract must carry the exact execution IDs used by both API and
+/// CLI Agent backends.
+pub(crate) fn pin_launch_selection_capabilities(
+    launch: &mut pioneer_protocol::AgentLaunchSelection,
+    capabilities: &[pioneer_protocol::TurnCapability],
+) -> anyhow::Result<()> {
+    use pioneer_protocol::TurnCapabilityKind;
+
+    let mut skill_ids = Vec::new();
+    let mut mcp_server_ids = Vec::new();
+    for capability in capabilities {
+        match &capability.kind {
+            TurnCapabilityKind::Skill { skill_id, pack_id } => {
+                if pack_id.is_some() {
+                    anyhow::bail!(
+                        "normalized Task launch capability retains Skill pack membership"
+                    );
+                }
+                if skill_ids.iter().any(|selected| selected == skill_id) {
+                    anyhow::bail!("normalized Task launch contains duplicate Skill `{skill_id}`");
+                }
+                skill_ids.push(skill_id.clone());
+            }
+            TurnCapabilityKind::SkillPack { .. } => {
+                anyhow::bail!("normalized Task launch contains an unexpanded Skill pack");
+            }
+            TurnCapabilityKind::McpServer { name, scope_kind } => {
+                let capability_id = pioneer_protocol::mcp_server_capability_key(*scope_kind, name);
+                if !mcp_server_ids.contains(&capability_id) {
+                    mcp_server_ids.push(capability_id);
+                }
+            }
+            TurnCapabilityKind::McpTool {
+                server_name,
+                scope_kind,
+                ..
+            } => {
+                let capability_id =
+                    pioneer_protocol::mcp_server_capability_key(*scope_kind, server_name);
+                if !mcp_server_ids.contains(&capability_id) {
+                    mcp_server_ids.push(capability_id);
+                }
+            }
+        }
+    }
+    launch.execution.skill_ids = skill_ids;
+    launch.execution.mcp_server_ids = mcp_server_ids;
+    Ok(())
+}
+
+/// Pin the exact selection for an immediate Task after its inherited
+/// and additional capabilities have been merged and normalized.
+pub(crate) fn pin_immediate_task_capabilities(
+    launch: &mut pioneer_protocol::AgentLaunchSelection,
+    capabilities: &[pioneer_protocol::TurnCapability],
+) -> anyhow::Result<()> {
+    pin_launch_selection_capabilities(launch, capabilities)?;
+    launch.execution.selected_capabilities = capabilities.to_vec();
+    Ok(())
 }
 
 /// Compile the capability portion of the common agent domain launch contract
@@ -914,6 +980,66 @@ pub(crate) fn launch_selection_capabilities(
         });
     }
     Ok(capabilities)
+}
+
+/// Read the exact Task selection when one was pinned; older Tasks retain the
+/// server-only launch contract.
+pub(crate) fn task_launch_selection_capabilities(
+    selection: &pioneer_protocol::AgentExecutionSelection,
+) -> anyhow::Result<Vec<pioneer_protocol::TurnCapability>> {
+    use pioneer_protocol::TurnCapabilityKind;
+
+    if !selection.selected_capabilities.is_empty() {
+        let mut skill_ids = Vec::new();
+        let mut mcp_server_ids = Vec::new();
+        let mut capability_ids = Vec::new();
+        for capability in &selection.selected_capabilities {
+            if capability_ids.contains(&capability.id) {
+                anyhow::bail!("persisted Task launch contains duplicate capabilities");
+            }
+            capability_ids.push(capability.id.clone());
+            match &capability.kind {
+                TurnCapabilityKind::Skill {
+                    skill_id,
+                    pack_id: None,
+                } if capability.id == pioneer_protocol::skill_capability_key(skill_id) => {
+                    skill_ids.push(skill_id.clone());
+                }
+                TurnCapabilityKind::McpServer { name, scope_kind }
+                    if capability.id
+                        == pioneer_protocol::mcp_server_capability_key(*scope_kind, name) =>
+                {
+                    let id = capability.id.clone();
+                    if !mcp_server_ids.contains(&id) {
+                        mcp_server_ids.push(id);
+                    }
+                }
+                TurnCapabilityKind::McpTool {
+                    server_name,
+                    raw_tool_name,
+                    scope_kind,
+                } if capability.id
+                    == pioneer_protocol::mcp_tool_capability_key(
+                        *scope_kind,
+                        server_name,
+                        raw_tool_name,
+                    ) =>
+                {
+                    let id = pioneer_protocol::mcp_server_capability_key(*scope_kind, server_name);
+                    if !mcp_server_ids.contains(&id) {
+                        mcp_server_ids.push(id);
+                    }
+                }
+                _ => anyhow::bail!("persisted Task launch capability is not normalized"),
+            }
+        }
+        if skill_ids != selection.skill_ids || mcp_server_ids != selection.mcp_server_ids {
+            anyhow::bail!("persisted Task launch capabilities differ from its grant selection");
+        }
+        return Ok(selection.selected_capabilities.clone());
+    }
+
+    launch_selection_capabilities(selection)
 }
 
 pub(crate) fn root_agent_execution_id_for_turn(turn_id: &str) -> String {
@@ -1435,6 +1561,7 @@ pub(crate) async fn prepare_root_agent_execution_admission(
                     permission_profile: None,
                     skill_ids: Vec::new(),
                     mcp_server_ids: Vec::new(),
+                    selected_capabilities: Vec::new(),
                 },
             });
     let start_options = pioneer_protocol::AgentStartOptionsProjection {
@@ -1795,12 +1922,23 @@ pub(crate) async fn materialize(
     };
 
     // Target options are required by message as well as launch actions. The
-    // catalog still capability-filters agent_start_options/agent_start, while
+    // catalog still capability-filters threads_start_options/threads_turn_start, while
     // every projected mutation receives the same immutable opaque targets.
     let options = Some(binding.options.clone());
+    let initiating_thread_id = Some(
+        binding
+            .adapter
+            .lock()
+            .await
+            .persistence_facts()
+            .home_root_thread_id,
+    );
     let catalog = project_agent_model_tool_catalog(&binding.capabilities, options.as_ref());
     if catalog.is_empty() {
-        return Ok(pioneer_agent::TurnToolMaterialization::default());
+        return Ok(pioneer_agent::TurnToolMaterialization {
+            initiating_thread_id,
+            ..Default::default()
+        });
     }
 
     let adapter = binding.adapter.clone();
@@ -1836,6 +1974,7 @@ pub(crate) async fn materialize(
     Ok(pioneer_agent::TurnToolMaterialization {
         bundles: vec![bundle],
         diagnostics: Vec::new(),
+        initiating_thread_id,
     })
 }
 
@@ -1901,62 +2040,128 @@ struct DurableAgentStartDispatch {
 pub(crate) async fn process_due_agent_action_outbox(
     processor: &Arc<MessageProcessor>,
     limit: u64,
-) -> anyhow::Result<usize> {
-    let database = processor.crud_store.database_connection();
-    let now = pioneer_crud::utc_now();
-    let rows = pioneer_crud::claim_agent_action_outbox(&database, now.clone(), limit).await?;
-    let mut delivered = 0usize;
-    for row in rows {
-        let result = dispatch_agent_action_outbox_row(processor, &row).await;
-        match result {
-            Ok(AgentActionOutboxDispatch::Delivered) => {
-                if pioneer_crud::mark_agent_action_outbox_delivered(
-                    &database,
-                    row.id.as_str(),
-                    row.attempts,
-                    pioneer_crud::utc_now(),
-                )
-                .await?
-                {
-                    delivered = delivered.saturating_add(1);
+) -> anyhow::Result<AgentActionOutboxProcessingBatch> {
+    // Discovery, claim and retry bookkeeping use Maintenance. The dispatcher
+    // keeps the caller's existing scope for its narrow correctness operations.
+    let database = processor
+        .crud_store
+        .with_maintenance_access()
+        .database_connection();
+    let batch = pioneer_crud::claim_agent_action_outbox(&database, limit).await?;
+    Ok(
+        process_claimed_agent_action_outbox(&database, batch, |row| {
+            let processor = processor.clone();
+            async move { dispatch_agent_action_outbox_row(&processor, &row).await }
+        })
+        .await,
+    )
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct AgentActionOutboxProcessingBatch {
+    pub delivered: usize,
+    pub errors: Vec<anyhow::Error>,
+}
+
+// Keep dispatch/preparation outside DB capacity. This small loop also lets the
+// regression tests inject each dispatch outcome and local ACK storage faults.
+pub(super) async fn process_claimed_agent_action_outbox<C, F, Fut>(
+    database: &C,
+    batch: pioneer_crud::AgentActionOutboxClaimBatch,
+    mut dispatch: F,
+) -> AgentActionOutboxProcessingBatch
+where
+    C: sea_orm::ConnectionTrait,
+    F: FnMut(pioneer_entity::agent_action_outbox::Model) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<AgentActionOutboxDispatch>>,
+{
+    let mut output = AgentActionOutboxProcessingBatch {
+        delivered: 0,
+        errors: batch.errors,
+    };
+    for row in batch.rows {
+        // Calling dispatch inside the async block catches synchronous future
+        // creation panics too. The same boundary covers polling and callbacks.
+        let outcome = AssertUnwindSafe(async {
+            let (outbox_id, action_id, attempts) =
+                (row.id.clone(), row.action_id.clone(), row.attempts);
+            let result = dispatch(row).await;
+            let ack = match result {
+                Ok(AgentActionOutboxDispatch::Delivered) => {
+                    pioneer_crud::mark_agent_action_outbox_delivered(
+                        database,
+                        &outbox_id,
+                        attempts,
+                        pioneer_crud::utc_now(),
+                    )
+                    .await
                 }
-            }
-            Ok(AgentActionOutboxDispatch::AwaitingPermit) => {
-                pioneer_crud::defer_agent_action_outbox_for_permit(
-                    &database,
-                    row.id.as_str(),
-                    row.attempts,
-                    pioneer_crud::utc_now(),
-                )
-                .await?;
-            }
-            Err(_error) => {
-                let marked = pioneer_crud::mark_agent_action_outbox_failed(
-                    &database,
-                    row.id.as_str(),
-                    row.attempts,
-                    pioneer_crud::utc_now(),
-                )
-                .await?;
-                if marked && row.attempts >= pioneer_crud::AGENT_ACTION_OUTBOX_MAX_ATTEMPTS {
-                    tracing::error!(
-                        outbox_id = row.id,
-                        action_id = row.action_id,
-                        attempts = row.attempts,
-                        failure_class = "outbox_delivery_failed",
-                        "agent domain action outbox reached its delivery retry limit"
-                    );
+                Ok(AgentActionOutboxDispatch::AwaitingPermit) => {
+                    pioneer_crud::defer_agent_action_outbox_for_permit(
+                        database,
+                        &outbox_id,
+                        attempts,
+                        pioneer_crud::utc_now(),
+                    )
+                    .await
+                    .map(|_| false)
                 }
+                Ok(AgentActionOutboxDispatch::AwaitingRuntime) => {
+                    pioneer_crud::defer_agent_action_outbox_for_runtime(
+                        database,
+                        &outbox_id,
+                        attempts,
+                        pioneer_crud::utc_now(),
+                    )
+                    .await
+                    .map(|_| false)
+                }
+                Err(_error) => {
+                    let marked = pioneer_crud::mark_agent_action_outbox_failed(
+                        database,
+                        &outbox_id,
+                        attempts,
+                        pioneer_crud::utc_now(),
+                    )
+                    .await;
+                    if matches!(marked, Ok(true))
+                        && attempts >= pioneer_crud::AGENT_ACTION_OUTBOX_MAX_ATTEMPTS
+                    {
+                        tracing::error!(
+                            outbox_id,
+                            action_id,
+                            attempts = attempts,
+                            failure_class = "outbox_delivery_failed",
+                            "agent domain action outbox reached its delivery retry limit"
+                        );
+                    }
+                    marked.map(|_| false)
+                }
+            };
+            match ack {
+                Ok(true) => output.delivered += 1,
+                Ok(false) => {}
+                Err(error) => output.errors.push(error),
             }
+        })
+        .catch_unwind()
+        .await;
+        if outcome.is_err() {
+            // A dispatch/ACK may already have committed. Preserve its lease or
+            // committed state; never blindly compensate for an unknown outcome.
+            output.errors.push(anyhow::anyhow!(
+                "outbox_dispatch_callback_panic_outcome_unknown"
+            ));
         }
     }
-    Ok(delivered)
+    output
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AgentActionOutboxDispatch {
+pub(super) enum AgentActionOutboxDispatch {
     Delivered,
     AwaitingPermit,
+    AwaitingRuntime,
 }
 
 async fn dispatch_agent_action_outbox_row(
@@ -2058,16 +2263,32 @@ async fn dispatch_agent_action_outbox_row(
             execution.status.as_str(),
             "completed" | "succeeded" | "failed" | "blocked" | "cancelled" | "timed_out"
         )
-        || processor
-            .agent_manager
-            .observe_turn(dispatch.thread_id.as_str(), dispatch.turn_id.as_str())
-            .await
-            .is_some()
     {
         // The runtime was already activated (or has since reached a terminal
         // state). This is the crash-after-dispatch replay window: acknowledge
         // the outbox without starting the same provider/CLI turn again.
         return Ok(AgentActionOutboxDispatch::Delivered);
+    }
+    if processor
+        .agent_manager
+        .observe_turn(dispatch.thread_id.as_str(), dispatch.turn_id.as_str())
+        .await
+        .map_err(|error| anyhow::anyhow!("native control-plane observation failed: {error}"))?
+        .is_some()
+    {
+        return Ok(AgentActionOutboxDispatch::Delivered);
+    }
+    if processor
+        .thread_manager
+        .has_running_turn_other_than(dispatch.thread_id.as_str(), dispatch.turn_id.as_str())
+        .await
+        || processor
+            .agent_manager
+            .active_turn_id(dispatch.thread_id.as_str())
+            .await
+            .is_some_and(|active_turn_id| active_turn_id != dispatch.turn_id)
+    {
+        return Ok(AgentActionOutboxDispatch::AwaitingRuntime);
     }
     let resource = pioneer_crud::load_agent_execution_resource_state(
         &processor.crud_store.database_connection(),
@@ -2155,13 +2376,8 @@ async fn dispatch_agent_action_outbox_row(
                     anyhow::anyhow!("committed StartAgent CLI Turn has no security snapshot")
                 })?
                 .snapshot;
-            let history = processor
-                .load_conversation_history_for_workspace(
-                    execution.workspace_id.as_str(),
-                    dispatch.thread_id.as_str(),
-                    dispatch.turn_id.as_str(),
-                )
-                .await;
+            // Main CLI execution receives the new command, never a Pioneer
+            // history projection or a summary prepared for native continuation.
             // The outbox owns activation. Clear only the in-memory rehydrated
             // draft before the shared CLI admission path recreates the same
             // deterministic, already-durable Turn idempotently.
@@ -2179,7 +2395,6 @@ async fn dispatch_agent_action_outbox_row(
                     authority,
                     dispatch.thread_id.clone(),
                     dispatch.thread_id,
-                    history,
                     input_author,
                 )
                 .await?;
@@ -2210,14 +2425,10 @@ impl ToolHandler for AgentActionToolHandler {
                     ToolPayload::Function { arguments } => serde_json::from_value(arguments),
                     ToolPayload::Custom { input } => serde_json::from_str(input.as_str()),
                     _ => {
-                        return Err(ToolError::invalid_arguments(
-                            AgentPublicOutcome::AgentActionNotAllowed.as_str(),
-                        ));
+                        return Err(ToolError::invalid_arguments("agent_invalid_arguments"));
                     }
                 }
-                .map_err(|_| {
-                    ToolError::invalid_arguments(AgentPublicOutcome::AgentActionNotAllowed.as_str())
-                })?;
+                .map_err(|_| ToolError::invalid_arguments("agent_invalid_arguments"))?;
                 let options = self.options.as_ref().ok_or_else(|| {
                     ToolError::execution_failed("agent start options are unavailable")
                 })?;
@@ -2626,7 +2837,7 @@ impl AgentActionToolHandler {
         };
         let child_security_cap =
             crate::turn_security::task_security_cap_from_snapshot(&parent_security_snapshot);
-        let child_security_snapshot =
+        let mut child_security_snapshot =
             crate::turn_security::resolve_task_child_execution_security_for_backend(
                 self.context.workspace_id.as_str(),
                 self.context.turn_id.as_str(),
@@ -2643,6 +2854,18 @@ impl AgentActionToolHandler {
                     "failed to derive child Agent security snapshot: {error:#}"
                 ))
             })?;
+        processor
+            .add_native_turn_runtime_sandbox_roots(
+                &mut child_security_snapshot,
+                self.context.workspace_id.as_str(),
+                thread_id.as_str(),
+                turn_id.as_str(),
+            )
+            .map_err(|error| {
+                ToolError::execution_failed(format!(
+                    "failed to install child Agent runtime sandbox roots: {error:#}"
+                ))
+            })?;
         let permission_profile = child_security_snapshot.permission_profile.clone();
         let provider_authority = matches!(
             &child.grant.profile.backend,
@@ -2655,7 +2878,13 @@ impl AgentActionToolHandler {
                     self.context.workspace_id.as_str(),
                     child.grant.profile.provider_id.as_str(),
                 )
-        });
+        })
+        .transpose()
+        .map_err(|error| {
+            ToolError::execution_failed(format!(
+                "child provider authority could not be resolved: {error:#}"
+            ))
+        })?;
         let child_authority = parent_authority
             .derive_agent_continuation(
                 child.grant.home_root_thread_id.as_str(),
@@ -2692,22 +2921,11 @@ impl AgentActionToolHandler {
             permission_profile: start.launch.execution.permission_profile.clone(),
             cli_runtime_options: None,
         };
-        let outcome = processor
-            .thread_manager
-            .agent_turn_start_with_permission_profile(
-                params.clone(),
-                permission_profile.clone(),
-                child.authored_turn.author.clone(),
-            )
-            .await
-            .map_err(|error| {
-                ToolError::execution_failed(format!("failed to prepare child Agent: {error:#}"))
-            })?;
         let audit_event = processor.turn_profile_selected_audit_event_for_turn(
             self.context.workspace_id.as_str(),
             thread_id.as_str(),
             turn_id.as_str(),
-            permission_profile,
+            permission_profile.clone(),
         );
         let authorization_revision = processor
             .authorization_invalidation_hub
@@ -2773,10 +2991,6 @@ impl AgentActionToolHandler {
                     != i64::try_from(child.grant.identity.source_revision).unwrap_or(-1)
                 || row.source_fingerprint != child.grant.identity.source_fingerprint
         }) {
-            processor
-                .thread_manager
-                .rollback_turn_start(outcome.rollback_context.clone())
-                .await;
             return Err(ToolError::execution_failed(
                 "child identity changed before commit",
             ));
@@ -2808,13 +3022,43 @@ impl AgentActionToolHandler {
                 .map_err(|error| {
                     ToolError::internal(format!("failed to fingerprint child authority: {error:#}"))
                 })?;
-        let snapshot_id = pioneer_crud::canonical_agent_id(
-            'S',
-            &format!(
-                "agent-start-snapshot\0{}\0{}",
-                child.grant.identity.id, child.grant.execution_id
-            ),
-        );
+        let snapshot_id = if identity_row.is_some() {
+            let snapshot = pioneer_crud::load_current_agent_presentation_snapshot(
+                &processor.crud_store.database_connection(),
+                child.grant.identity.id.as_str(),
+                source_revision,
+                child.grant.identity.source_fingerprint.as_str(),
+            )
+            .await
+            .map_err(|error| {
+                ToolError::execution_failed(format!(
+                    "failed to resolve child presentation snapshot: {error:#}"
+                ))
+            })?
+            .ok_or_else(|| {
+                ToolError::execution_failed(
+                    "existing child identity has no authoritative presentation snapshot",
+                )
+            })?;
+            if snapshot.display_name != child.grant.identity.display_name
+                || snapshot.nickname != child.grant.identity.nickname
+                || snapshot.avatar_revision != child.grant.identity.avatar_revision
+                || snapshot.role_label != child.grant.identity.role_label
+            {
+                return Err(ToolError::execution_failed(
+                    "child presentation changed before commit",
+                ));
+            }
+            snapshot.id
+        } else {
+            pioneer_crud::canonical_agent_id(
+                'S',
+                &format!(
+                    "agent-start-snapshot\0{}\0{}",
+                    child.grant.identity.id, child.grant.execution_id
+                ),
+            )
+        };
         let resource =
             plan.input.resource.clone().ok_or_else(|| {
                 ToolError::internal("StartAgent action has no resource admission")
@@ -2822,10 +3066,6 @@ impl AgentActionToolHandler {
         if resource.execution_id != child.grant.execution_id.as_str()
             || resource.root_execution_id != child.grant.root_execution_id.as_str()
         {
-            processor
-                .thread_manager
-                .rollback_turn_start(outcome.rollback_context.clone())
-                .await;
             return Err(ToolError::internal(
                 "StartAgent resource admission differs from its child graph",
             ));
@@ -2992,6 +3232,21 @@ impl AgentActionToolHandler {
         // coordinator is only an early backpressure hint and must not write a
         // competing permit/queue transition.
         plan.input.resource = None;
+        // Keep the in-memory Turn admission immediately adjacent to its
+        // durable commit. Every fallible identity, authority, presentation,
+        // graph and outbox preparation step above therefore leaves no phantom
+        // child Turn behind when it fails.
+        let outcome = processor
+            .thread_manager
+            .concurrent_agent_turn_start_with_permission_profile(
+                params.clone(),
+                permission_profile,
+                child.authored_turn.author.clone(),
+            )
+            .await
+            .map_err(|error| {
+                ToolError::execution_failed(format!("failed to prepare child Agent: {error:#}"))
+            })?;
         let graph_result = match processor
             .crud_store
             .materialize_agent_turn_start_with_graph_and_action(
@@ -3594,7 +3849,11 @@ pub(crate) async fn authorize_task_observations(
 
 pub(crate) fn adapter_tool_error(error: AgentToolAdapterError) -> ToolError {
     match error {
+        AgentToolAdapterError::InvalidArguments => {
+            ToolError::invalid_arguments("agent_invalid_arguments")
+        }
         AgentToolAdapterError::InvalidInput(_) => {
+            // Preserve the existing non-disclosing launch restriction outcome.
             ToolError::invalid_arguments(AgentPublicOutcome::AgentActionNotAllowed.as_str())
         }
         AgentToolAdapterError::OptionsUnavailable => {
@@ -3626,7 +3885,7 @@ pub(crate) fn adapter_tool_error(error: AgentToolAdapterError) -> ToolError {
 
 /// Model-facing tool failures must never echo database/provider errors, raw
 /// target identifiers, host metadata, or authored payloads. Preserve only the
-/// fixed agent domain outcome vocabulary produced by the canonical adapter;
+/// fixed agent domain outcomes and explicitly classified decoding errors;
 /// collapse every other detail at this final disclosure boundary.
 pub(crate) fn sanitize_agent_tool_error(error: ToolError) -> ToolError {
     fn stable_outcome(message: &str) -> Option<&'static str> {
@@ -3659,6 +3918,11 @@ pub(crate) fn sanitize_agent_tool_error(error: ToolError) -> ToolError {
     }
 
     match error {
+        // This exact public code is assigned at decoding boundaries. Unknown
+        // InvalidArguments also include semantic failures after decoding.
+        ToolError::InvalidArguments(message) if message == "agent_invalid_arguments" => {
+            ToolError::invalid_arguments("agent_invalid_arguments")
+        }
         ToolError::InvalidArguments(message) => ToolError::invalid_arguments(
             stable_outcome(message.as_str())
                 .unwrap_or(AgentPublicOutcome::AgentActionNotAllowed.as_str()),
@@ -3772,6 +4036,50 @@ mod tests {
             payload.to_string(),
             "tool execution failed: agent_action_payload_limit_exceeded"
         );
+    }
+
+    #[test]
+    fn decoding_errors_remain_arguments_while_authorization_denial_remains_denial() {
+        let invalid =
+            sanitize_agent_tool_error(adapter_tool_error(AgentToolAdapterError::InvalidArguments));
+        assert!(matches!(invalid, ToolError::InvalidArguments(_)));
+        assert_eq!(
+            invalid.to_string(),
+            "invalid arguments: agent_invalid_arguments"
+        );
+        let direct_decode =
+            sanitize_agent_tool_error(ToolError::invalid_arguments("agent_invalid_arguments"));
+        assert_eq!(
+            direct_decode.to_string(),
+            "invalid arguments: agent_invalid_arguments"
+        );
+        let denied = sanitize_agent_tool_error(adapter_tool_error(AgentToolAdapterError::Action(
+            crate::authorization::AgentActionServiceError::NotAuthorized("hidden policy detail"),
+        )));
+        assert_eq!(
+            denied.to_string(),
+            "tool execution failed: agent_action_not_allowed"
+        );
+    }
+
+    #[test]
+    fn semantic_argument_errors_keep_the_non_disclosing_fallback() {
+        let secret = "secret://workspace/private-skill/internal-data";
+        for message in [
+            format!("child Agent launch capabilities are unavailable: {secret}"),
+            format!("invalid child Agent launch capabilities: {secret}"),
+            "agent action idempotency key was reused with different input".to_owned(),
+            secret.to_owned(),
+            // Mentioning a public code inside raw text does not classify it.
+            format!("agent_invalid_arguments: {secret}"),
+        ] {
+            let public = sanitize_agent_tool_error(ToolError::invalid_arguments(message));
+            assert_eq!(
+                public.to_string(),
+                "invalid arguments: agent_action_not_allowed"
+            );
+            assert!(!public.to_string().contains(secret));
+        }
     }
 
     #[test]

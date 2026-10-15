@@ -1,6 +1,175 @@
 use super::*;
+use std::time::Instant;
+
+fn markdown_notification_stream(
+    method: &str,
+) -> Option<pioneer_observability::GatewayMarkdownStreamKind> {
+    match method {
+        events::ITEM_AGENT_MESSAGE_DELTA => {
+            Some(pioneer_observability::GatewayMarkdownStreamKind::AgentMessage)
+        }
+        events::ITEM_COMMAND_EXECUTION_OUTPUT_DELTA => {
+            Some(pioneer_observability::GatewayMarkdownStreamKind::CommandOutput)
+        }
+        events::ITEM_FILE_CHANGE_OUTPUT_DELTA => {
+            Some(pioneer_observability::GatewayMarkdownStreamKind::FileChange)
+        }
+        events::ITEM_TOOL_PROGRESS => {
+            Some(pioneer_observability::GatewayMarkdownStreamKind::ToolProgress)
+        }
+        _ => None,
+    }
+}
+
+fn record_markdown_notification_stage(
+    stage: pioneer_observability::GatewayMarkdownStage,
+    stream: pioneer_observability::GatewayMarkdownStreamKind,
+    outcome: pioneer_observability::GatewayMarkdownOutcome,
+    elapsed: std::time::Duration,
+    output_bytes: Option<usize>,
+) {
+    pioneer_observability::record_gateway_markdown_stage(
+        pioneer_observability::GatewayMarkdownStageMetric {
+            stage,
+            stream,
+            outcome,
+            elapsed,
+            input_bytes: None,
+            output_bytes,
+            block_count: None,
+        },
+    );
+}
 
 impl MessageProcessor {
+    pub(super) async fn send_cli_runtime_status_changed_notification(
+        &self,
+        workspace_id: &str,
+        revision: u64,
+        runtime: RuntimeSummary,
+        removed: bool,
+    ) {
+        let candidates = self
+            .session_manager
+            .connection_ids_for_workspace(workspace_id)
+            .await;
+        if candidates.is_empty() {
+            return;
+        }
+
+        let notification = CLIRuntimeStatusChangedNotification {
+            workspace_id: workspace_id.to_owned(),
+            revision,
+            removed,
+            runtime: runtime.clone(),
+        };
+        self.send_cli_runtime_notification_to_reauthorized_connections(
+            workspace_id,
+            runtime.runtime_id.as_str(),
+            CliRuntimeNotificationDisclosure::Full,
+            events::CLI_RUNTIME_STATUS_CHANGED,
+            &notification,
+            candidates.clone(),
+        )
+        .await;
+
+        let collaborator_notification = CLIRuntimeStatusChangedNotification {
+            workspace_id: workspace_id.to_owned(),
+            revision,
+            removed,
+            runtime: super::cli_runtime::collaborator_safe_runtime_summary(runtime),
+        };
+        self.send_cli_runtime_notification_to_reauthorized_connections(
+            workspace_id,
+            collaborator_notification.runtime.runtime_id.as_str(),
+            CliRuntimeNotificationDisclosure::Collaborator,
+            events::CLI_RUNTIME_STATUS_CHANGED,
+            &collaborator_notification,
+            candidates,
+        )
+        .await;
+    }
+
+    async fn send_cli_runtime_notification_to_reauthorized_connections<T: Serialize>(
+        &self,
+        workspace_id: &str,
+        runtime_id: &str,
+        disclosure: CliRuntimeNotificationDisclosure,
+        method: &str,
+        payload: &T,
+        candidate_connection_ids: Vec<ConnectionId>,
+    ) {
+        let serialization_connection_ids = self
+            .authorized_cli_runtime_notification_recipients(
+                workspace_id,
+                runtime_id,
+                disclosure,
+                candidate_connection_ids,
+            )
+            .await;
+        if serialization_connection_ids.is_empty() {
+            return;
+        }
+        let Some(serialized) = self.serialize_notification(method, payload) else {
+            return;
+        };
+        let connection_ids = self
+            .authorized_cli_runtime_notification_recipients(
+                workspace_id,
+                runtime_id,
+                disclosure,
+                serialization_connection_ids,
+            )
+            .await;
+        self.send_serialized_notification_to_connections(method, &serialized, connection_ids)
+            .await;
+    }
+
+    async fn authorized_cli_runtime_notification_recipients(
+        &self,
+        workspace_id: &str,
+        runtime_id: &str,
+        disclosure: CliRuntimeNotificationDisclosure,
+        candidate_connection_ids: Vec<ConnectionId>,
+    ) -> Vec<ConnectionId> {
+        let candidates = self
+            .authorized_workspace_notification_recipients(workspace_id, candidate_connection_ids)
+            .await;
+        let authorization = crate::authorization::AuthorizationService::new();
+        let mut recipients = Vec::with_capacity(candidates.len());
+        for connection_id in candidates {
+            let Ok(principal) = self
+                .session_manager
+                .connection_principal(connection_id)
+                .await
+            else {
+                continue;
+            };
+            if !authorization.cli_runtime_allowed(
+                principal.kind,
+                principal.role_key.as_ref(),
+                runtime_id,
+            ) {
+                continue;
+            }
+            let current_disclosure = match authorization
+                .role_disclosure_policy(principal.kind, principal.role_key.as_ref())
+            {
+                Some(crate::authorization::RoleDisclosurePolicy::Administrative) => {
+                    CliRuntimeNotificationDisclosure::Full
+                }
+                Some(crate::authorization::RoleDisclosurePolicy::Collaborator) => {
+                    CliRuntimeNotificationDisclosure::Collaborator
+                }
+                None => continue,
+            };
+            if current_disclosure == disclosure {
+                recipients.push(connection_id);
+            }
+        }
+        recipients
+    }
+
     pub(super) async fn send_principal_owned_notification<T: Serialize>(
         &self,
         owner_principal_id: &str,
@@ -257,6 +426,25 @@ impl MessageProcessor {
         recipients
     }
 
+    pub(super) async fn send_execution_collaborator_notification_to_connections<T: Serialize>(
+        &self,
+        thread_id: &str,
+        action: crate::authorization::ResourceAction,
+        method: &str,
+        payload: &T,
+        candidate_connection_ids: Vec<ConnectionId>,
+    ) {
+        self.send_execution_scoped_notification(
+            thread_id,
+            action,
+            method,
+            payload,
+            candidate_connection_ids,
+        )
+        .await;
+    }
+
+    #[allow(dead_code)]
     pub(super) async fn send_execution_collaborator_notification<T: Serialize>(
         &self,
         thread_id: &str,
@@ -275,22 +463,46 @@ impl MessageProcessor {
         .await;
     }
 
-    pub(super) async fn send_execution_collaborator_notification_to_connections<T: Serialize>(
+    pub(super) async fn send_execution_collaborator_notification_for_threads<T: Serialize>(
         &self,
-        thread_id: &str,
+        thread_ids: &[&str],
         action: crate::authorization::ResourceAction,
         method: &str,
         payload: &T,
-        candidate_connection_ids: Vec<ConnectionId>,
     ) {
-        self.send_execution_scoped_notification(
-            thread_id,
-            action,
-            method,
-            payload,
-            candidate_connection_ids,
-        )
-        .await;
+        let candidate_connection_ids = self.session_manager.connection_ids().await;
+        let initially_authorized_connection_ids = self
+            .authorized_execution_collaborator_notification_recipients_for_threads(
+                thread_ids,
+                action,
+                candidate_connection_ids,
+            )
+            .await;
+        if initially_authorized_connection_ids.is_empty() {
+            return;
+        }
+        let serialization_connection_ids = self
+            .authorized_execution_collaborator_notification_recipients_for_threads(
+                thread_ids,
+                action,
+                initially_authorized_connection_ids,
+            )
+            .await;
+        if serialization_connection_ids.is_empty() {
+            return;
+        }
+        let Some(serialized) = self.serialize_notification(method, payload) else {
+            return;
+        };
+        let connection_ids = self
+            .authorized_execution_collaborator_notification_recipients_for_threads(
+                thread_ids,
+                action,
+                serialization_connection_ids,
+            )
+            .await;
+        self.send_serialized_notification_to_connections(method, &serialized, connection_ids)
+            .await;
     }
 
     async fn send_execution_scoped_notification<T: Serialize>(
@@ -459,6 +671,31 @@ impl MessageProcessor {
         recipients
     }
 
+    async fn authorized_execution_collaborator_notification_recipients_for_threads(
+        &self,
+        thread_ids: &[&str],
+        action: crate::authorization::ResourceAction,
+        candidate_connection_ids: Vec<ConnectionId>,
+    ) -> Vec<ConnectionId> {
+        let mut recipients = Vec::new();
+        let mut seen = HashSet::new();
+        for thread_id in thread_ids {
+            for connection_id in self
+                .authorized_execution_collaborator_notification_recipients(
+                    thread_id,
+                    action,
+                    candidate_connection_ids.clone(),
+                )
+                .await
+            {
+                if seen.insert(connection_id) {
+                    recipients.push(connection_id);
+                }
+            }
+        }
+        recipients
+    }
+
     pub(super) async fn send_gateway_management_notification<T: Serialize>(
         &self,
         method: &str,
@@ -548,63 +785,6 @@ impl MessageProcessor {
             .await;
         self.send_serialized_notification_to_connections(
             events::INVITATION_CHANGED,
-            &serialized,
-            authorized,
-        )
-        .await;
-    }
-
-    pub(super) async fn send_scoped_invitation_authorization_changed_notification(
-        &self,
-        invitation_id: &pioneer_protocol::InvitationId,
-        change: &pioneer_protocol::AuthorizationProjectionChangedNotification,
-    ) {
-        let Some(invitation) =
-            pioneer_crud::load_invitation(&self.crud_store.database_connection(), invitation_id)
-                .await
-                .ok()
-                .flatten()
-        else {
-            tracing::warn!(
-                invitation_id = %invitation_id,
-                "committed invitation authorization notification could not reload authoritative owner"
-            );
-            return;
-        };
-        let Ok(inviter_principal_id) =
-            pioneer_protocol::PrincipalId::new(invitation.created_by_principal_id)
-        else {
-            return;
-        };
-        let candidates = self.session_manager.connection_ids().await;
-        let initially_authorized = self
-            .authorized_invitation_notification_recipients(&inviter_principal_id, candidates)
-            .await;
-        if initially_authorized.is_empty() {
-            return;
-        }
-        let serialization_authorized = self
-            .authorized_invitation_notification_recipients(
-                &inviter_principal_id,
-                initially_authorized,
-            )
-            .await;
-        if serialization_authorized.is_empty() {
-            return;
-        }
-        let Some(serialized) =
-            self.serialize_notification(events::AUTHORIZATION_PROJECTION_CHANGED, change)
-        else {
-            return;
-        };
-        let authorized = self
-            .authorized_invitation_notification_recipients(
-                &inviter_principal_id,
-                serialization_authorized,
-            )
-            .await;
-        self.send_serialized_notification_to_connections(
-            events::AUTHORIZATION_PROJECTION_CHANGED,
             &serialized,
             authorized,
         )
@@ -957,6 +1137,65 @@ impl MessageProcessor {
         recipients
     }
 
+    pub(super) async fn send_delegated_startup_outcome(
+        &self,
+        thread: &str,
+        parent: &str,
+        outcome: &str,
+    ) {
+        use pioneer_observability::turn_startup;
+        let Some(owner) = turn_startup::delegated_owner(parent) else {
+            return;
+        };
+        let params = serde_json::json!({"turn_id": parent, "outcome": outcome});
+        let Some(result) = turn_startup::notification_outcome("turn/startup/outcome", &params)
+        else {
+            return;
+        };
+        self.send_execution_scoped_notification(
+            thread,
+            crate::authorization::ResourceAction::ThreadRead,
+            "turn/startup/outcome",
+            &params,
+            vec![owner],
+        )
+        .await;
+        turn_startup::finish(parent, result);
+    }
+
+    // Send only the first model event and first text (or a terminal without
+    // output) to the startup owner even while their UI stays in the parent.
+    // This does not create a subscription or grant access to the child.
+    async fn send_delegated_startup_notification<T: Serialize>(
+        &self,
+        thread_id: &str,
+        method: &str,
+        payload: &T,
+        subscribers: &[crate::thread::ThreadSubscriber],
+    ) {
+        use pioneer_observability::turn_startup;
+        if !turn_startup::current_is_delegated() {
+            return;
+        }
+        let Ok(params) = serde_json::to_value(payload) else {
+            return;
+        };
+        let Some(owner) = turn_startup::delegated_delivery_candidate(method, &params) else {
+            return;
+        };
+        if subscribers.iter().any(|s| s.connection_id == owner) {
+            return;
+        }
+        self.send_execution_scoped_notification(
+            thread_id,
+            crate::authorization::ResourceAction::ChildObserve,
+            method,
+            payload,
+            vec![owner],
+        )
+        .await;
+    }
+
     pub(crate) async fn send_notification_to_thread_subscribers<T: Serialize>(
         &self,
         thread_id: &str,
@@ -964,6 +1203,8 @@ impl MessageProcessor {
         payload: &T,
     ) {
         let subscribers = self.thread_manager.subscribed_connections(thread_id).await;
+        self.send_delegated_startup_notification(thread_id, method, payload, &subscribers)
+            .await;
         self.send_notification_to_authorized_thread_subscribers(
             thread_id,
             method,
@@ -971,6 +1212,44 @@ impl MessageProcessor {
             subscribers,
         )
         .await;
+    }
+
+    /// Progress payloads are already bounded and coalesced before reaching the
+    /// Gateway. They still require one current authorization check immediately
+    /// before delivery, but serializing the same in-memory payload does not
+    /// justify the two earlier duplicate database reauthorizations used by the
+    /// general durable-notification path.
+    pub(crate) async fn send_progress_notification_to_thread_subscribers<T: Serialize>(
+        &self,
+        thread_id: &str,
+        method: &str,
+        payload: &T,
+    ) {
+        let _startup_fanout = pioneer_observability::turn_startup::current_stage(
+            pioneer_observability::turn_startup::Stage::Fanout,
+        );
+        let subscribers = self.thread_manager.subscribed_connections(thread_id).await;
+        self.send_delegated_startup_notification(thread_id, method, payload, &subscribers)
+            .await;
+        if subscribers.is_empty() {
+            return;
+        }
+        let candidate_connection_ids = subscribers
+            .into_iter()
+            .map(|subscriber| subscriber.connection_id)
+            .collect();
+        let Some(serialized) = self.serialize_notification(method, payload) else {
+            return;
+        };
+        let subscribers = self
+            .thread_manager
+            .subscribed_connections_for_candidates(thread_id, candidate_connection_ids)
+            .await;
+        let connection_ids = self
+            .authorized_thread_notification_recipients(thread_id, subscribers)
+            .await;
+        self.send_serialized_notification_to_connections(method, &serialized, connection_ids)
+            .await;
     }
 
     pub(crate) async fn send_notification_to_authorized_thread_connections<T: Serialize>(
@@ -1593,9 +1872,31 @@ impl MessageProcessor {
     }
 
     fn serialize_notification<T: Serialize>(&self, method: &str, payload: &T) -> Option<String> {
-        let notification = match JsonRpcNotification::from_params(method, payload) {
-            Ok(notification) => notification,
+        let markdown_stream = markdown_notification_stream(method);
+        let encode_started = markdown_stream.map(|_| Instant::now());
+        let mut notification = match JsonRpcNotification::from_params(method, payload) {
+            Ok(notification) => {
+                if let (Some(stream), Some(started)) = (markdown_stream, encode_started.as_ref()) {
+                    record_markdown_notification_stage(
+                        pioneer_observability::GatewayMarkdownStage::NotificationEncode,
+                        stream,
+                        pioneer_observability::GatewayMarkdownOutcome::Ok,
+                        started.elapsed(),
+                        None,
+                    );
+                }
+                notification
+            }
             Err(error) => {
+                if let (Some(stream), Some(started)) = (markdown_stream, encode_started.as_ref()) {
+                    record_markdown_notification_stage(
+                        pioneer_observability::GatewayMarkdownStage::NotificationEncode,
+                        stream,
+                        pioneer_observability::GatewayMarkdownOutcome::Error,
+                        started.elapsed(),
+                        None,
+                    );
+                }
                 crate::epic5_observability::record_outcome(
                     crate::epic5_observability::Epic5Operation::Notification,
                     crate::epic5_observability::Epic5Outcome::Unavailable,
@@ -1605,9 +1906,35 @@ impl MessageProcessor {
             }
         };
 
+        if let Some(params) = notification.params.as_mut() {
+            pioneer_observability::turn_startup::decorate_notification(params);
+        }
+        let serialize_started = markdown_stream.map(|_| Instant::now());
         match serde_json::to_string(&notification) {
-            Ok(payload) => Some(payload),
+            Ok(payload) => {
+                if let (Some(stream), Some(started)) = (markdown_stream, serialize_started.as_ref())
+                {
+                    record_markdown_notification_stage(
+                        pioneer_observability::GatewayMarkdownStage::NotificationSerialize,
+                        stream,
+                        pioneer_observability::GatewayMarkdownOutcome::Ok,
+                        started.elapsed(),
+                        Some(payload.len()),
+                    );
+                }
+                Some(payload)
+            }
             Err(error) => {
+                if let (Some(stream), Some(started)) = (markdown_stream, serialize_started.as_ref())
+                {
+                    record_markdown_notification_stage(
+                        pioneer_observability::GatewayMarkdownStage::NotificationSerialize,
+                        stream,
+                        pioneer_observability::GatewayMarkdownOutcome::Error,
+                        started.elapsed(),
+                        None,
+                    );
+                }
                 crate::epic5_observability::record_outcome(
                     crate::epic5_observability::Epic5Operation::Notification,
                     crate::epic5_observability::Epic5Outcome::Unavailable,
@@ -1624,8 +1951,15 @@ impl MessageProcessor {
         serialized: &str,
         connection_ids: Vec<ConnectionId>,
     ) -> usize {
+        let startup_key = pioneer_observability::turn_startup::outgoing_key(serialized);
         let mut accepted = 0usize;
         for target_connection_id in connection_ids {
+            if let Some(key) = startup_key.as_deref() {
+                pioneer_observability::turn_startup::queued_on_connection(
+                    key,
+                    target_connection_id,
+                );
+            }
             if let Err(error) = self
                 .session_manager
                 .try_send_notification_text(target_connection_id, serialized.to_owned())
@@ -1653,6 +1987,12 @@ impl MessageProcessor {
         connection_id: ConnectionId,
         response: JsonRpcErrorResponse,
     ) {
+        if let Some(key) = pioneer_observability::turn_startup::current_key() {
+            pioneer_observability::turn_startup::finish(
+                &key,
+                pioneer_observability::turn_startup::Outcome::Rejected,
+            );
+        }
         if let Err(error) = self.send_json(connection_id, &response).await {
             warn!(
                 connection_id,
@@ -1670,6 +2010,12 @@ impl MessageProcessor {
         let payload = serde_json::to_string(value)?;
         self.session_manager.send_text(connection_id, payload).await
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CliRuntimeNotificationDisclosure {
+    Full,
+    Collaborator,
 }
 
 fn retain_thread_subscribers(

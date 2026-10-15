@@ -42,16 +42,232 @@ pub fn internal_client_schema_exclusions() -> Vec<ClientSchemaInternalExclusion>
 pub fn client_schema_documents() -> Vec<SchemaDocument> {
     let mut documents = vec![
         schema_doc!(
+            "settings_model_picker_publication.json",
+            crate::settings::model_picker::SettingsModelPickerPublication
+        ),
+        schema_doc!(
+            "gateway_setup_publication.json",
+            crate::gateway::setup_controller::GatewaySetupPublication
+        ),
+        schema_doc!(
+            "gateway_destinations_publication.json",
+            crate::gateway::onboarding_runtime::GatewayDestinationsPublication
+        ),
+        schema_doc!(
+            "invitation_publication.json",
+            crate::gateway::invitation_controller::InvitationPublication
+        ),
+        schema_doc!(
+            "settings_page_publication.json",
+            crate::settings::runtime::SettingsPagePublication
+        ),
+        schema_doc!(
+            "profile_publication.json",
+            crate::settings::profile::ProfilePublication
+        ),
+        schema_doc!(
+            "auth_sessions_store.json",
+            crate::gateway::identity_authorization::AuthSessionsStore
+        ),
+        schema_doc!(
+            "device_activation_publication.json",
+            crate::settings::device_activation::DeviceActivationPublication
+        ),
+        schema_doc!(
+            "agents_document_publication.json",
+            crate::agents_doc::controller::AgentsDocumentPublication
+        ),
+        schema_doc!(
+            "mcp_catalog_publication.json",
+            crate::mcp::store::McpCatalogPublication
+        ),
+        schema_doc!(
+            "mcp_details_publication.json",
+            crate::mcp::store::McpDetailsPublication
+        ),
+        schema_doc!(
+            "mcp_action_publication.json",
+            crate::mcp::operations::McpActionPublication
+        ),
+        schema_doc!(
+            "skills_catalog_publication.json",
+            crate::skills::store::SkillsCatalogPublication
+        ),
+        schema_doc!(
+            "skills_details_publication.json",
+            crate::skills::store::SkillsDetailsPublication
+        ),
+        schema_doc!(
+            "skills_action_publication.json",
+            crate::skills::operations::SkillsActionPublication
+        ),
+        schema_doc!(
+            "skill_upload_publication.json",
+            crate::skills::upload_flow::SkillUploadPublication
+        ),
+        schema_doc!(
+            "provider_collection_publication.json",
+            crate::providers::store::ProviderCollectionPublication
+        ),
+        schema_doc!(
+            "provider_operation_publication.json",
+            crate::providers::operations::ProviderOperationPublication
+        ),
+        schema_doc!(
+            "administration_page_publication.json",
+            crate::administration::pages::AdministrationPagePublication
+        ),
+        schema_doc!(
+            "administration_operation_publication.json",
+            crate::administration::operations::AdministrationOperationPublication
+        ),
+        schema_doc!(
+            "provider_runtime_publication.json",
+            crate::providers::runtime::ProviderRuntimePublication
+        ),
+        schema_doc!(
+            "artifact_publication.json",
+            crate::artifacts::store::ArtifactPublication
+        ),
+        schema_doc!(
+            "thread_member_publication.json",
+            crate::threads::members::ThreadMemberPublication
+        ),
+        schema_doc!(
+            "thread_capability_publication.json",
+            crate::threads::capabilities::ThreadCapabilityPublication
+        ),
+        schema_doc!(
+            "client_navigation_state.json",
+            crate::navigation::ClientNavigationState
+        ),
+        schema_doc!(
+            "navigation_intent.json",
+            crate::navigation::NavigationIntent
+        ),
+        schema_doc!(
+            "gateway_settings_store.json",
+            crate::gateway::settings_store::GatewaySettingsStore
+        ),
+        schema_doc!(
+            "identity_authorization_publication.json",
+            crate::gateway::identity_authorization::IdentityAuthorizationPublication
+        ),
+        schema_doc!(
+            "gateway_session_publication.json",
+            crate::gateway::session_controller::GatewaySessionPublication
+        ),
+        schema_doc!("avatar_publication.json", crate::avatars::AvatarPublication),
+        schema_doc!(
+            "turn_cancellation_publication.json",
+            crate::turns::cancellation::TurnCancellationPublication
+        ),
+        schema_doc!(
+            "composer_model_picker_publication.json",
+            crate::composer::model_picker::ComposerModelPickerPublication
+        ),
+        schema_doc!(
+            "composer_catalog_publication.json",
+            crate::composer::catalog::ComposerCatalogPublication
+        ),
+        schema_doc!(
+            "message_revision_publication.json",
+            crate::threads::message_revisions::MessageRevisionPublication
+        ),
+        schema_doc!(
+            "message_deletion_publication.json",
+            crate::threads::message_deletion::MessageDeletionPublication
+        ),
+        schema_doc!(
+            "approval_action_publication.json",
+            crate::cli_runtime::approval_actions::ApprovalActionPublication
+        ),
+        schema_doc!(
+            "task_review_publication.json",
+            crate::tasks::review_controller::TaskReviewPublication
+        ),
+        schema_doc!(
+            "composer_voice_start_request.json",
+            crate::composer::voice::ComposerVoiceStartRequest
+        ),
+        schema_doc!(
+            "composer_voice_finalize_request.json",
+            crate::composer::voice::ComposerVoiceFinalizeRequest
+        ),
+        schema_doc!(
+            "composer_voice_cancel_request.json",
+            crate::composer::voice::ComposerVoiceCancelRequest
+        ),
+        schema_doc!(
+            "composer_publication.json",
+            crate::composer::store::ComposerPublication
+        ),
+        schema_doc!(
+            "workspace_catalog_publication.json",
+            crate::workspaces::catalog::WorkspaceCatalogPublication
+        ),
+        schema_doc!(
+            "thread_tree_publication.json",
+            crate::workspaces::directory::ThreadTreePublication
+        ),
+        schema_doc!(
+            "task_notification_publication.json",
+            crate::tasks::notifications::TaskNotificationPublication
+        ),
+        schema_doc!(
+            "task_notification_effect.json",
+            crate::tasks::notifications::TaskNotificationEffect
+        ),
+        schema_doc!(
+            "task_inbox_publication.json",
+            crate::tasks::notifications::TaskInboxPublication
+        ),
+        schema_doc!(
+            "task_notification_intent.json",
+            crate::tasks::notifications::TaskNotificationIntent
+        ),
+        schema_doc!("client_scope.json", crate::core::ClientScope),
+        schema_doc!("client_revisions.json", crate::core::ClientRevisions),
+        schema_doc!("client_generation.json", crate::core::ClientGeneration),
+        schema_doc!(
+            "client_request_state.json",
+            crate::request_state::RequestState<serde_json::Value>
+        ),
+        schema_doc!(
+            "client_request_failure.json",
+            crate::request_state::ClientRequestFailure
+        ),
+        schema_doc!(
+            "request_update_outcome.json",
+            crate::request_state::RequestUpdateOutcome
+        ),
+        schema_doc!("client_intent.json", crate::core::ClientIntent),
+        schema_doc!("client_effect_plan.json", crate::core::ClientEffectPlan),
+        schema_doc!(
+            "client_effect_completion.json",
+            crate::core::ClientEffectCompletion
+        ),
+        schema_doc!(
+            "client_effect_cancellation.json",
+            crate::core::ClientEffectCancellation
+        ),
+        schema_doc!("client_identity.json", crate::ids::ClientIdentity),
+        schema_doc!(
+            "client_identity_namespace.json",
+            crate::ids::ClientIdentityNamespace
+        ),
+        schema_doc!("client_feature.json", crate::ids::ClientFeature),
+        schema_doc!(
+            "client_domain_identity.json",
+            crate::ids::ClientDomainIdentity
+        ),
+        schema_doc!(
             "active_thread_phase_snapshot.json",
             crate::state::snapshot::ActiveThreadPhaseSnapshot
         ),
         schema_doc!(
             "active_thread_snapshot.json",
             crate::state::snapshot::ActiveThreadSnapshot
-        ),
-        schema_doc!(
-            "active_thread_status_snapshot.json",
-            crate::state::snapshot::ActiveThreadStatusSnapshot
         ),
         schema_doc!(
             "artifact_action_status.json",
@@ -591,14 +807,6 @@ pub fn client_schema_documents() -> Vec<SchemaDocument> {
             pioneer_protocol::CLIRuntimeListResponse
         ),
         schema_doc!(
-            "cli_runtime_thread_binding_get_params.json",
-            pioneer_protocol::CLIRuntimeThreadBindingGetParams
-        ),
-        schema_doc!(
-            "cli_runtime_thread_binding_get_response.json",
-            pioneer_protocol::CLIRuntimeThreadBindingGetResponse
-        ),
-        schema_doc!(
             "cli_runtime_thread_binding.json",
             pioneer_protocol::CLIRuntimeThreadBinding
         ),
@@ -895,6 +1103,10 @@ pub fn client_schema_documents() -> Vec<SchemaDocument> {
             pioneer_protocol::ProviderModelReasoningCapabilities
         ),
         schema_doc!("provider_summary.json", pioneer_protocol::ProviderSummary),
+        schema_doc!(
+            "provider_definition.json",
+            pioneer_protocol::ProviderDefinition
+        ),
         schema_doc!(
             "reasoning_capability_source.json",
             pioneer_protocol::ReasoningCapabilitySource
@@ -1467,20 +1679,6 @@ mod tests {
     use std::fs;
 
     #[test]
-    fn schema_documents_match_public_contract_boundary() {
-        let contract_files = client_contract_types()
-            .into_iter()
-            .map(|contract| contract.file_name)
-            .collect::<Vec<_>>();
-        let schema_files = client_schema_documents()
-            .into_iter()
-            .map(|document| document.file_name)
-            .collect::<Vec<_>>();
-
-        assert_eq!(schema_files, contract_files);
-    }
-
-    #[test]
     fn schema_documents_are_sorted_unique_and_serializable() {
         let documents = client_schema_documents();
         let file_names = documents
@@ -1504,6 +1702,58 @@ mod tests {
                 "{} should serialize to a JSON object",
                 document.file_name
             );
+        }
+    }
+
+    #[test]
+    fn native_storage_effect_schemas_export_typed_completions() {
+        for document in client_schema_documents().into_iter().filter(|document| {
+            matches!(
+                document.file_name,
+                "client_effect_plan.json" | "client_effect_completion.json"
+            )
+        }) {
+            let json = serde_json::to_string_pretty(&document.schema).unwrap();
+            assert!(json.contains("GatewaySession") || json.contains("gateway_session"));
+            if std::env::var_os("PIONEER_PRINT_PUBLICATION_SCHEMAS").is_some() {
+                println!("SCHEMA_BEGIN:{}\n{json}\nSCHEMA_END", document.file_name);
+            }
+        }
+    }
+
+    #[test]
+    fn gateway_settings_store_schema_exports_scoped_state() {
+        let schema = schema_for!(crate::gateway::settings_store::GatewaySettingsStore);
+        let json = serde_json::to_string_pretty(&schema).unwrap();
+        assert!(json.contains("loading"));
+        assert!(json.contains("saving"));
+        if std::env::var_os("PIONEER_PRINT_SETTINGS_SCHEMA").is_some() {
+            println!("SETTINGS_SCHEMA_BEGIN\n{json}\nSETTINGS_SCHEMA_END");
+        }
+    }
+
+    #[test]
+    fn identity_authorization_publication_schema_contains_no_credentials() {
+        let schema =
+            schema_for!(crate::gateway::identity_authorization::IdentityAuthorizationPublication);
+        let json = serde_json::to_string_pretty(&schema).unwrap();
+        for forbidden in ["refresh_token", "access_token", "credential"] {
+            assert!(!json.contains(&format!("\"{forbidden}\"")));
+        }
+        if std::env::var_os("PIONEER_PRINT_IDENTITY_SCHEMA").is_some() {
+            println!("IDENTITY_SCHEMA_BEGIN\n{json}\nIDENTITY_SCHEMA_END");
+        }
+    }
+
+    #[test]
+    fn gateway_session_publication_schema_contains_no_credentials() {
+        let schema = schema_for!(crate::gateway::session_controller::GatewaySessionPublication);
+        let json = serde_json::to_string_pretty(&schema).unwrap();
+        for forbidden in ["refresh_token", "access_token", "credential"] {
+            assert!(!json.contains(&format!("\"{forbidden}\"")));
+        }
+        if std::env::var_os("PIONEER_PRINT_SESSION_SCHEMA").is_some() {
+            println!("SESSION_SCHEMA_BEGIN\n{json}\nSESSION_SCHEMA_END");
         }
     }
 

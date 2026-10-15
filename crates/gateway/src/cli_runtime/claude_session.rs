@@ -3,9 +3,7 @@ use crate::cli_runtime::claude_mcp::{
     append_claude_exact_allowed_tools, is_claude_native_mcp_permission_candidate,
     materialize_claude_mcp_config, parse_claude_native_mcp_permission_request,
 };
-use crate::cli_runtime::config::{
-    claude_account_probe_config_from_instance, load_effective_cli_runtime_instances,
-};
+use crate::cli_runtime::config::load_effective_cli_runtime_instances;
 use crate::cli_runtime::continuation::{
     CliMcpSessionLaunch, CliProviderContinuation, CliSessionLaunchSpec,
 };
@@ -30,6 +28,7 @@ use crate::cli_runtime::permissions::{
     ClaudeMcpPermissionFallbackDecision, claude_mcp_permission_fallback_response,
 };
 use crate::cli_runtime::session_instance::{CliSessionGenerationAllocator, CliSessionInstanceId};
+use crate::cli_runtime::skills::CliRuntimeSelectedSkill;
 use crate::turn_mcp::invoker::{
     TurnMcpInvocation, TurnMcpInvocationError, TurnMcpInvocationErrorCode, TurnMcpInvoker,
 };
@@ -42,9 +41,8 @@ use async_trait::async_trait;
 use base64::Engine as _;
 use pioneer_cli_agent_runtime::BoundedNativeEventCodec;
 use pioneer_cli_agent_runtime::claude::{
-    ClaudeAccountProbeStatus, ClaudeManagedMcpConfigDescriptor, ClaudeManagedMcpConfigIdentity,
-    ClaudeProbe, ClaudeProviderSessionLaunch, cleanup_claude_managed_mcp_config,
-    materialize_claude_system_prompt_extension,
+    ClaudeManagedMcpConfigDescriptor, ClaudeManagedMcpConfigIdentity, ClaudeProviderSessionLaunch,
+    cleanup_claude_managed_mcp_config, materialize_claude_system_prompt_extension,
 };
 use pioneer_cli_agent_runtime::event::{
     RuntimeAgentMessagePhase, RuntimeErrorEvent, RuntimeEvent, RuntimeItemCompleted,
@@ -64,9 +62,10 @@ use pioneer_crud::CliRuntimeProviderSessionLifecycle;
 use pioneer_crud::CrudStore;
 use pioneer_protocol::ToolMetadataValue;
 use pioneer_runtime_events::{OrderedEventIngress, OrderedIngressConfig, OrderedIngressOffer};
+use pioneer_skills::{compute_skill_folder_hash, replace_external_runtime_skill, sanitize_name};
 use serde_json::{Value as JsonValue, json};
 use std::collections::{HashMap, HashSet};
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write as StdWrite};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -686,39 +685,6 @@ impl CLIAgentRuntimeSessionFactory for ClaudeCLIAgentRuntimeSessionFactory {
             );
         }
 
-        let mut probe_config = claude_account_probe_config_from_instance(&instance);
-        probe_config.env.extend_from(&options.env);
-        let probe = ClaudeProbe::account_read(probe_config).await;
-        match probe.status {
-            ClaudeAccountProbeStatus::Ready => {}
-            ClaudeAccountProbeStatus::NeedsAuth => {
-                bail!(
-                    "{}",
-                    probe
-                        .message
-                        .unwrap_or_else(|| "Claude CLI authentication is required".to_owned())
-                );
-            }
-            ClaudeAccountProbeStatus::MissingBinary => {
-                bail!(
-                    "{}",
-                    probe
-                        .message
-                        .unwrap_or_else(|| "Claude CLI binary was not found".to_owned())
-                );
-            }
-            ClaudeAccountProbeStatus::SpawnFailed
-            | ClaudeAccountProbeStatus::UnsupportedVersion
-            | ClaudeAccountProbeStatus::Error => {
-                bail!(
-                    "{}",
-                    probe
-                        .message
-                        .unwrap_or_else(|| "Claude CLI probe failed".to_owned())
-                );
-            }
-        }
-
         let managed_mcp_identity = ClaudeManagedMcpConfigIdentity::new(
             key.workspace_id.clone(),
             key.runtime_id.clone(),
@@ -988,6 +954,144 @@ impl Drop for ClaudeManagedMcpConfigStartupGuard {
     }
 }
 
+fn materialize_claude_selected_skill_plugins(
+    managed_mcp_config: &ClaudeManagedMcpConfigDescriptor,
+    selected_skills: &[CliRuntimeSelectedSkill],
+) -> Result<Vec<PathBuf>> {
+    let plugins_root = managed_mcp_config
+        .session_root_path
+        .join("selected-skill-plugins");
+    match std::fs::symlink_metadata(plugins_root.as_path()) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+            std::fs::remove_dir_all(plugins_root.as_path()).with_context(|| {
+                format!(
+                    "failed to reset managed Claude skill plugin root `{}`",
+                    plugins_root.display()
+                )
+            })?;
+        }
+        Ok(_) => bail!(
+            "managed Claude skill plugin root `{}` is not a real directory",
+            plugins_root.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to inspect managed Claude skill plugin root `{}`",
+                    plugins_root.display()
+                )
+            });
+        }
+    }
+    if selected_skills.is_empty() {
+        return Ok(Vec::new());
+    }
+    std::fs::create_dir(plugins_root.as_path()).with_context(|| {
+        format!(
+            "failed to create managed Claude skill plugin root `{}`",
+            plugins_root.display()
+        )
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            plugins_root.as_path(),
+            std::fs::Permissions::from_mode(0o700),
+        )?;
+    }
+
+    let mut plugins = Vec::with_capacity(selected_skills.len());
+    for (index, selected) in selected_skills.iter().enumerate() {
+        let install_name = sanitize_name(selected.install_name.as_str());
+        if install_name != selected.install_name {
+            bail!(
+                "selected Claude skill install name `{}` is not canonical",
+                selected.install_name
+            );
+        }
+        // Plugin identifiers are provider-facing and intentionally independent
+        // from the selected skill's install name: install names may legally
+        // contain characters that are not accepted by Claude's plugin-name
+        // grammar. The manifest still points to the exact canonical skill
+        // directory below this generation-scoped plugin root.
+        let plugin_name = format!("pioneer-selected-skill-{index}");
+        let plugin_root = plugins_root.join(plugin_name.as_str());
+        let skill_destination = plugin_root.join("skills").join(install_name.as_str());
+        replace_external_runtime_skill(
+            selected.installed_path.as_path(),
+            skill_destination.as_path(),
+        )
+        .with_context(|| {
+            format!(
+                "failed to snapshot selected Claude skill `{}`",
+                selected.install_name
+            )
+        })?;
+        let copied_hash =
+            compute_skill_folder_hash(skill_destination.as_path()).with_context(|| {
+                format!(
+                    "failed to fingerprint managed Claude skill snapshot `{}`",
+                    selected.install_name
+                )
+            })?;
+        if copied_hash != selected.source_folder_hash {
+            bail!(
+                "selected Claude skill `{}` changed after its installation receipt was verified",
+                selected.install_name
+            );
+        }
+
+        let manifest_dir = plugin_root.join(".claude-plugin");
+        std::fs::create_dir(manifest_dir.as_path()).with_context(|| {
+            format!(
+                "failed to create Claude skill plugin manifest directory `{}`",
+                manifest_dir.display()
+            )
+        })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                plugin_root.as_path(),
+                std::fs::Permissions::from_mode(0o700),
+            )?;
+            std::fs::set_permissions(
+                manifest_dir.as_path(),
+                std::fs::Permissions::from_mode(0o700),
+            )?;
+        }
+        let manifest_path = manifest_dir.join("plugin.json");
+        let manifest = serde_json::to_vec_pretty(&json!({
+            "name": plugin_name,
+            "version": "1.0.0",
+            "description": format!("Pioneer-selected skill {}", selected.install_name),
+            "skills": [format!("./skills/{install_name}")]
+        }))
+        .context("failed to serialize managed Claude skill plugin manifest")?;
+        let mut manifest_file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(manifest_path.as_path())
+            .with_context(|| {
+                format!(
+                    "failed to create managed Claude skill plugin manifest `{}`",
+                    manifest_path.display()
+                )
+            })?;
+        manifest_file.write_all(manifest.as_slice())?;
+        manifest_file.sync_all()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            manifest_file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+        plugins.push(plugin_root);
+    }
+    Ok(plugins)
+}
+
 fn claude_process_config_from_instance_with_managed_mcp(
     instance: &EffectiveGatewayCliAgentRuntimeInstanceConfig,
     options: &CLIAgentRuntimeSessionStartOptions,
@@ -1031,6 +1135,10 @@ fn claude_process_config_from_instance_with_managed_mcp(
         .filter(|mode| !mode.is_empty())
         .unwrap_or("default")
         .to_owned();
+    let selected_skill_plugins = materialize_claude_selected_skill_plugins(
+        managed_mcp_config,
+        options.selected_skills.as_slice(),
+    )?;
 
     let elevated_prompt_path = options
         .elevated_instructions
@@ -1061,20 +1169,26 @@ fn claude_process_config_from_instance_with_managed_mcp(
             .to_string_lossy()
             .into_owned(),
         "--strict-mcp-config".to_owned(),
-        if options.enable_user_skills {
-            "--setting-sources=user".to_owned()
-        } else {
-            "--setting-sources=".to_owned()
-        },
+        "--setting-sources=".to_owned(),
         "--include-partial-messages".to_owned(),
         "--input-format".to_owned(),
         "stream-json".to_owned(),
     ]);
-    if !options.enable_user_skills
-        && !managed_mcp_config.has_pioneer_server
-        && permission_mode != "bypassPermissions"
-    {
-        args.push("--safe-mode".to_owned());
+    for plugin in selected_skill_plugins {
+        args.push("--plugin-dir".to_owned());
+        args.push(plugin.to_string_lossy().into_owned());
+    }
+    if managed_mcp_config.has_pioneer_server {
+        // A tracked profile has exactly one mutation authority.  Claude's
+        // built-in writers remain unavailable even in full-access mode; the
+        // permission mode controls approvals, not history ownership.
+        args.extend([
+            "--disallowedTools".to_owned(),
+            "Edit".to_owned(),
+            "Write".to_owned(),
+            "MultiEdit".to_owned(),
+            "NotebookEdit".to_owned(),
+        ]);
     }
     append_claude_exact_allowed_tools(&mut args, managed_mcp_config, allowed_tool_names)
         .context("Claude exact MCP allowed-tool projection is invalid")?;
@@ -1092,6 +1206,19 @@ fn claude_process_config_from_instance_with_managed_mcp(
             ClaudeProviderSessionLaunch::resume(*provider_session_id)
                 .context("invalid Claude resume continuation")?
                 .append_process_args(&mut args);
+        }
+        CliProviderContinuation::ClaudeFork {
+            source_session_id,
+            boundary_message_uuid,
+            provider_session_id,
+        } => {
+            ClaudeProviderSessionLaunch::fork(
+                *source_session_id,
+                *boundary_message_uuid,
+                *provider_session_id,
+            )
+            .context("invalid Claude bounded fork continuation")?
+            .append_process_args(&mut args);
         }
         CliProviderContinuation::CodexRpcThread { .. }
         | CliProviderContinuation::OpenCodeServerSession { .. } => {
@@ -1295,7 +1422,6 @@ pub(crate) async fn run_claude_mcp_local_provider_probe(
     validate_claude_readiness_launch_matrix(
         &probed_instance,
         &options,
-        &managed,
         &empty,
         launch_projection.preflight.allowed_tool_names.as_slice(),
         &continuation,
@@ -1371,7 +1497,6 @@ pub(crate) async fn run_claude_mcp_local_provider_probe(
 fn validate_claude_readiness_launch_matrix(
     instance: &EffectiveGatewayCliAgentRuntimeInstanceConfig,
     base_options: &CLIAgentRuntimeSessionStartOptions,
-    managed: &ClaudeManagedMcpConfigDescriptor,
     empty: &ClaudeManagedMcpConfigDescriptor,
     allowed_tool_names: &[String],
     continuation: &CliProviderContinuation,
@@ -1405,31 +1530,23 @@ fn validate_claude_readiness_launch_matrix(
     {
         bail!("Claude readiness launch does not contain the exact allowed tool set");
     }
-    for (skills, expected_safe_mode) in [(false, true), (true, false)] {
-        let mut options = base_options.clone();
-        options.enable_user_skills = skills;
-        let config = claude_process_config_from_instance_with_managed_mcp(
-            instance,
-            &options,
-            empty,
-            &[],
-            continuation,
-        )?;
-        if has(&config, "--safe-mode") != expected_safe_mode {
-            bail!("Claude empty-projection safe-mode launch matrix changed");
-        }
-    }
-    let mut skills_options = base_options.clone();
-    skills_options.enable_user_skills = true;
-    let skills_with_mcp = claude_process_config_from_instance_with_managed_mcp(
+    let empty_config = claude_process_config_from_instance_with_managed_mcp(
         instance,
-        &skills_options,
-        managed,
-        allowed_tool_names,
+        base_options,
+        empty,
+        &[],
         continuation,
     )?;
-    if has(&skills_with_mcp, "--safe-mode") {
-        bail!("Claude skills plus MCP readiness launch unexpectedly enabled safe mode");
+    for config in [non_empty_config, &empty_config] {
+        if has(config, "--safe-mode") {
+            bail!("Claude launch must leave sandboxing to the provider permission mode");
+        }
+        if has(config, "--setting-sources=user") || !has(config, "--setting-sources=") {
+            bail!("Claude launch must not load the shared user settings source");
+        }
+        if has(config, "--plugin-dir") {
+            bail!("Claude readiness launch projected a skill that was not selected");
+        }
     }
     Ok(())
 }
@@ -1890,6 +2007,9 @@ struct ClaudeStreamState {
     active_text_item_started: bool,
     active_reasoning_item_started: bool,
     emitted_final_text: bool,
+    /// Top-level transcript record UUID, distinct from message.id and the
+    /// synthetic native turn ID used by Pioneer's stream adapter.
+    last_assistant_record_uuid: Option<uuid::Uuid>,
     tool_items: HashMap<String, ClaudeToolItemState>,
     mcp_items: HashMap<String, ClaudeMcpToolItemState>,
     completed_mcp_permission_requests: HashSet<String>,
@@ -2009,6 +2129,9 @@ impl ClaudeStreamClient {
     }
 
     async fn initialize(&self, timeout: Duration) -> Result<()> {
+        let _startup_stage = pioneer_observability::turn_startup::current_stage(
+            pioneer_observability::turn_startup::Stage::CliHandshake,
+        );
         self.send_control_request(json!({ "subtype": "initialize", "hooks": null }), timeout)
             .await?;
         Ok(())
@@ -2078,6 +2201,11 @@ impl ClaudeStreamClient {
         input: JsonValue,
         timeout: Duration,
     ) -> Result<()> {
+        // Materialize the exact Claude content before acknowledging the turn.
+        // In particular, LocalImage paths become base64 here and can be much
+        // larger than the generic JSON mapping that named the path.
+        let provider_request =
+            claude_provider_user_request(self.expected_provider_session_id, input)?;
         if let Some(model) = model.filter(|model| !model.trim().is_empty()) {
             self.send_control_request(json!({ "subtype": "set_model", "model": model }), timeout)
                 .await?;
@@ -2110,6 +2238,7 @@ impl ClaudeStreamClient {
             state.active_text_item_started = false;
             state.active_reasoning_item_started = false;
             state.emitted_final_text = false;
+            state.last_assistant_record_uuid = None;
             state.tool_items.clear();
             state.mcp_items.clear();
             state.completed_mcp_permission_requests.clear();
@@ -2125,14 +2254,7 @@ impl ClaudeStreamClient {
         }))
         .await;
 
-        let prompt = claude_prompt_from_input(input)?;
-        self.write_json_line(json!({
-            "type": "user",
-            "message": { "role": "user", "content": prompt },
-            "parent_tool_use_id": null,
-            "session_id": self.expected_provider_session_id.to_string(),
-        }))
-        .await
+        self.write_json_line(provider_request).await
     }
 
     async fn send_control_request(
@@ -2303,10 +2425,10 @@ impl ClaudeStreamClient {
         let (native_thread_id, native_turn_id, mcp_terminal_events) = {
             let mut state = self.state.lock().await;
             let ids = (state.native_thread_id.clone(), state.active_turn_id.clone());
-            let mcp_terminal_events = terminalize_running_claude_mcp_items(
+            let mcp_terminal_events = terminalize_running_claude_tools(
                 &mut state,
                 ClaudeMcpToolLifecycle::Failed,
-                "Claude process disconnected before the MCP call reached a terminal result",
+                "Claude process disconnected before the tool reached a terminal result",
                 "process_eof/mcp_terminal_reconciliation",
             );
             if ids.1.is_some() {
@@ -2666,10 +2788,52 @@ impl ClaudeStreamClient {
             Some("stream_event") => self.map_stream_event(value).await,
             Some("assistant") => self.map_assistant_message(value).await,
             Some("user") => self.map_user_message(value).await,
+            Some("tool_progress") => self.map_tool_progress_message(value).await,
             Some("result") => self.map_result_message(value).await,
             Some("error") => self.map_error_message(value).await,
             _ => Vec::new(),
         }
+    }
+
+    async fn map_tool_progress_message(&self, value: JsonValue) -> Vec<RuntimeEvent> {
+        let state = self.state.lock().await;
+        // Claude's bash progress uses a fresh tool_use_id for every update;
+        // parent_tool_use_id identifies the command that actually started.
+        let item = ["parent_tool_use_id", "tool_use_id"]
+            .into_iter()
+            .find_map(|key| {
+                let id = value.get(key)?.as_str()?;
+                state
+                    .tool_items
+                    .get(id)
+                    .map(|tool| (tool.item_id.clone(), tool.item_kind.clone()))
+                    .or_else(|| {
+                        state
+                            .mcp_items
+                            .get(id)
+                            .filter(|tool| tool.lifecycle == ClaudeMcpToolLifecycle::Running)
+                            .map(|tool| (tool.binding.native_item_id.clone(), "mcpToolCall".into()))
+                    })
+            });
+        let (Some((native_item_id, item_kind)), Some(native_turn_id)) =
+            (item, state.active_turn_id.clone())
+        else {
+            return Vec::new();
+        };
+        let elapsed = value
+            .get("elapsed_time_seconds")
+            .cloned()
+            .unwrap_or(JsonValue::Null);
+        vec![RuntimeEvent::ItemDelta(RuntimeItemDelta {
+            native_thread_id: state.native_thread_id.clone(),
+            native_turn_id,
+            native_item_id,
+            item_kind,
+            delta_kind: RuntimeItemDeltaKind::ToolProgress,
+            delta: format!("Tool running: {elapsed} seconds"),
+            metadata: Some(value.clone()),
+            native: None,
+        })]
     }
 
     async fn map_system_message(&self, value: JsonValue) -> Vec<RuntimeEvent> {
@@ -2787,6 +2951,13 @@ impl ClaudeStreamClient {
     }
 
     async fn map_assistant_message(&self, value: JsonValue) -> Vec<RuntimeEvent> {
+        if let Some(record_uuid) = value
+            .get("uuid")
+            .and_then(JsonValue::as_str)
+            .and_then(|raw| uuid::Uuid::parse_str(raw).ok())
+        {
+            self.state.lock().await.last_assistant_record_uuid = Some(record_uuid);
+        }
         let content = value
             .get("message")
             .and_then(|message| message.get("content"))
@@ -3088,6 +3259,9 @@ impl ClaudeStreamClient {
                 "message".to_owned(),
                 ToolMetadataValue::from_json(JsonValue::String(output.clone())),
             );
+            if let Some(result) = value.get("tool_use_result") {
+                metadata.insert("result", ToolMetadataValue::from_json(result.clone()));
+            }
             if is_error {
                 metadata.insert(
                     "error".to_owned(),
@@ -3113,13 +3287,55 @@ impl ClaudeStreamClient {
         let Some(tool) = state.tool_items.remove(tool_use_id) else {
             return Vec::new();
         };
-        let metadata = metadata_for_claude_tool(
+        let mut metadata = metadata_for_claude_tool(
             tool.tool_name.as_str(),
             &tool.input,
             Some(output.as_str()),
             Some(!is_error),
         );
-        vec![RuntimeEvent::ItemCompleted(RuntimeItemCompleted {
+        let mut events = Vec::new();
+        if let Some(result) = value.get("tool_use_result") {
+            metadata["result"] = result.clone();
+            if tool.tool_name == "Bash" {
+                // Keep the provider's separate streams when present. Never infer
+                // an exit code from is_error or parse it out of display text.
+                for (source, target) in [
+                    ("stdout", "stdout"),
+                    ("stderr", "stderr"),
+                    ("exitCode", "exitCode"),
+                    ("exit_code", "exitCode"),
+                    ("durationMs", "durationMs"),
+                    ("timedOut", "timedOut"),
+                    ("truncated", "truncated"),
+                ] {
+                    if let Some(field) = result.get(source) {
+                        metadata[target] = field.clone();
+                    }
+                }
+                if result.get("interrupted").and_then(JsonValue::as_bool) == Some(true) {
+                    metadata["status"] = json!("cancelled");
+                    metadata["success"] = json!(false);
+                }
+                // Extra result facts (e.g. a provider output-file reference) must
+                // survive even though shell storage has only typed stream fields.
+                let mut extra = result.clone();
+                if let Some(fields) = extra.as_object_mut() {
+                    fields.remove("stdout");
+                    fields.remove("stderr");
+                }
+                events.push(RuntimeEvent::ItemDelta(RuntimeItemDelta {
+                    native_thread_id: state.native_thread_id.clone(),
+                    native_turn_id: state.active_turn_id.clone().unwrap_or_default(),
+                    native_item_id: tool.item_id.clone(),
+                    item_kind: tool.item_kind.clone(),
+                    delta_kind: RuntimeItemDeltaKind::ToolProgress,
+                    delta: "Tool result details".into(),
+                    metadata: Some(json!({"result": extra})),
+                    native: None,
+                }));
+            }
+        }
+        events.push(RuntimeEvent::ItemCompleted(RuntimeItemCompleted {
             native_thread_id: state.native_thread_id.clone(),
             native_turn_id: state.active_turn_id.clone().unwrap_or_default(),
             native_item_id: tool.item_id,
@@ -3131,7 +3347,8 @@ impl ClaudeStreamClient {
             metadata: Some(metadata),
             native_item_redacted: Some(block.clone()),
             native: Some(native_event("user/tool_result", value.clone())),
-        })]
+        }));
+        events
     }
 
     async fn map_result_message(&self, value: JsonValue) -> Vec<RuntimeEvent> {
@@ -3146,6 +3363,7 @@ impl ClaudeStreamClient {
             .get("is_error")
             .and_then(JsonValue::as_bool)
             .unwrap_or(false);
+        let completed = pioneer_cli_agent_runtime::claude::session_result_completed(&value);
         let interrupted = matches!(
             value.get("subtype").and_then(JsonValue::as_str),
             Some("interrupted" | "cancelled" | "canceled")
@@ -3180,13 +3398,17 @@ impl ClaudeStreamClient {
                 text: Some(result.to_owned()),
                 summary: Vec::new(),
                 content: Vec::new(),
-                phase: RuntimeAgentMessagePhase::FinalAnswer,
+                phase: if completed {
+                    RuntimeAgentMessagePhase::FinalAnswer
+                } else {
+                    RuntimeAgentMessagePhase::Commentary
+                },
                 metadata: None,
                 native_item_redacted: None,
                 native: Some(native_event("result/final_text", value.clone())),
             }));
         }
-        events.extend(terminalize_running_claude_mcp_items(
+        events.extend(terminalize_running_claude_tools(
             &mut state,
             if interrupted {
                 ClaudeMcpToolLifecycle::Cancelled
@@ -3194,9 +3416,9 @@ impl ClaudeStreamClient {
                 ClaudeMcpToolLifecycle::Failed
             },
             if interrupted {
-                "Claude turn ended while the MCP call was cancelled"
+                "Claude turn ended while the tool was cancelled"
             } else {
-                "Claude turn ended before an MCP tool_result was observed"
+                "Claude turn ended before a tool_result was observed"
             },
             if interrupted {
                 "result/mcp_cancelled_reconciliation"
@@ -3211,23 +3433,40 @@ impl ClaudeStreamClient {
                 reason: claude_result_error_message(&value),
                 native: Some(native_event("result/interrupted", value)),
             }));
-        } else if is_error {
+        } else if !completed {
             events.push(RuntimeEvent::TurnFailed(RuntimeTurnFailed {
                 native_thread_id: Some(native_thread_id),
                 native_turn_id: Some(native_turn_id.clone()),
-                message: claude_result_error_message(&value),
-                code: value
-                    .get("subtype")
-                    .and_then(JsonValue::as_str)
-                    .map(str::to_owned),
+                message: if is_error {
+                    claude_result_error_message(&value)
+                } else {
+                    "Claude session did not affirm a successful terminal result".to_owned()
+                },
+                code: if is_error {
+                    value
+                        .get("subtype")
+                        .and_then(JsonValue::as_str)
+                        .map(str::to_owned)
+                } else {
+                    Some("invalid_terminal_result".to_owned())
+                },
                 native: Some(native_event("result/error", value)),
             }));
         } else {
+            let boundary = state
+                .last_assistant_record_uuid
+                .map(|uuid| uuid.to_string());
             events.push(RuntimeEvent::TurnCompleted(RuntimeTurnCompleted {
                 native_thread_id: Some(native_thread_id),
                 native_turn_id: native_turn_id.clone(),
                 status: "completed".to_owned(),
-                native: Some(native_event("result/success", value)),
+                native: Some(native_event(
+                    "result/success",
+                    serde_json::json!({
+                        "result": value,
+                        "assistantRecordUuid": boundary,
+                    }),
+                )),
             }));
         }
         state.active_turn_id = None;
@@ -3236,6 +3475,7 @@ impl ClaudeStreamClient {
         state.active_text_item_started = false;
         state.active_reasoning_item_started = false;
         state.emitted_final_text = false;
+        state.last_assistant_record_uuid = None;
         state.tool_items.clear();
         events
     }
@@ -3244,10 +3484,10 @@ impl ClaudeStreamClient {
         let mut state = self.state.lock().await;
         let native_thread_id = state.native_thread_id.clone();
         let native_turn_id = state.active_turn_id.clone();
-        let mut events = terminalize_running_claude_mcp_items(
+        let mut events = terminalize_running_claude_tools(
             &mut state,
             ClaudeMcpToolLifecycle::Failed,
-            "Claude stream failed before the MCP call reached a terminal result",
+            "Claude stream failed before the tool reached a terminal result",
             "error/mcp_terminal_reconciliation",
         );
         state.active_turn_id = None;
@@ -3310,7 +3550,11 @@ impl ClaudeStreamClient {
             RuntimeEvent::TurnCompleted(completed)
                 if state.observed_turn_id.as_deref() == Some(completed.native_turn_id.as_str()) =>
             {
-                let reconciliation_events = state.reconciliation_events.clone();
+                let mut reconciliation_events = state.reconciliation_events.clone();
+                // Keep the actual terminal evidence, including the transcript
+                // record UUID. A synthesized observation must not turn a
+                // completed Claude answer into a boundary-less completion.
+                reconciliation_events.push(event.clone());
                 state.last_turn_observation = Some(CLIAgentRuntimeTurnObservation {
                     status: CLIAgentRuntimeObservedTurnStatus::Completed,
                     message: None,
@@ -3402,6 +3646,26 @@ fn claude_prompt_from_input(input: JsonValue) -> Result<JsonValue> {
         }
     }
     Ok(JsonValue::Array(content))
+}
+
+fn claude_provider_user_request(
+    provider_session_id: uuid::Uuid,
+    input: JsonValue,
+) -> Result<JsonValue> {
+    let prompt = claude_prompt_from_input(input)?;
+    let request = json!({
+        "type": "user",
+        "message": { "role": "user", "content": prompt },
+        "parent_tool_use_id": null,
+        "session_id": provider_session_id.to_string(),
+    });
+    let request_bytes = serde_json::to_vec(&request)?.len().saturating_add(1);
+    anyhow::ensure!(
+        request_bytes <= crate::cli_runtime::context::MAX_CLI_TURN_INPUT_FRAME_BYTES,
+        "Claude turn request requires {request_bytes} bytes after attachment materialization, exceeding the {}-byte request frame",
+        crate::cli_runtime::context::MAX_CLI_TURN_INPUT_FRAME_BYTES
+    );
+    Ok(request)
 }
 
 fn push_claude_text_block(content: &mut Vec<JsonValue>, text: impl Into<String>) {
@@ -3556,7 +3820,7 @@ fn claude_mcp_stream_error(
     })
 }
 
-fn terminalize_running_claude_mcp_items(
+fn terminalize_running_claude_tools(
     state: &mut ClaudeStreamState,
     lifecycle: ClaudeMcpToolLifecycle,
     message: &str,
@@ -3569,6 +3833,27 @@ fn terminalize_running_claude_mcp_items(
         ClaudeMcpToolLifecycle::Running => ("failed", false),
     };
     let mut events = Vec::new();
+    for (_, tool) in std::mem::take(&mut state.tool_items) {
+        let mut metadata =
+            metadata_for_claude_tool(&tool.tool_name, &tool.input, None, Some(false));
+        metadata["status"] = json!(status);
+        metadata["message"] = json!(message);
+        metadata["error"] = json!({"message":message});
+        events.push(RuntimeEvent::ItemCompleted(RuntimeItemCompleted {
+            native_thread_id: state.native_thread_id.clone(),
+            native_turn_id: state.active_turn_id.clone().unwrap_or_default(),
+            native_item_id: tool.item_id,
+            item_kind: tool.item_kind,
+            text: Some(message.into()),
+            summary: Vec::new(),
+            content: Vec::new(),
+            phase: RuntimeAgentMessagePhase::FinalAnswer,
+            metadata: Some(metadata),
+            native_item_redacted: None,
+            native: Some(native_event(native_method, json!({"reason":message}))),
+        }));
+    }
+
     for item in state.mcp_items.values_mut() {
         if item.lifecycle != ClaudeMcpToolLifecycle::Running {
             continue;
@@ -3645,10 +3930,12 @@ fn claude_tool_result_text(block: &JsonValue) -> String {
         Some(JsonValue::String(text)) => text.clone(),
         Some(JsonValue::Array(items)) => items
             .iter()
-            .filter_map(|item| {
+            .map(|item| {
                 item.get("text")
                     .and_then(JsonValue::as_str)
                     .or_else(|| item.as_str())
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| item.to_string())
             })
             .collect::<Vec<_>>()
             .join("\n"),
@@ -3682,7 +3969,12 @@ fn claude_result_error_message(value: &JsonValue) -> String {
         .map(|errors| {
             errors
                 .iter()
-                .filter_map(JsonValue::as_str)
+                .map(|error| {
+                    error
+                        .as_str()
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| error.to_string())
+                })
                 .collect::<Vec<_>>()
                 .join("; ")
         })
@@ -3715,7 +4007,7 @@ fn new_runtime_id() -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::cli_runtime::claude_mcp::build_claude_mcp_session_launch_projection;
     use crate::cli_runtime::projector::{CLIRuntimeProjectorContext, project_cli_runtime_event};
@@ -3733,6 +4025,176 @@ mod tests {
     use std::process::Stdio;
     use tokio::io::duplex;
     use tokio_util::sync::CancellationToken;
+
+    #[tokio::test]
+    async fn claude_bash_wire_results_and_parent_progress_are_retained() {
+        let temp = tempfile::tempdir().unwrap();
+        let (client, mut child) = fake_claude_stream_client(&temp.path().join("bash.log")).await;
+        {
+            let mut state = client.state.lock().await;
+            state.native_thread_id = Some("session".into());
+            state.active_turn_id = Some("turn".into());
+            state.tool_items.insert(
+                "bash-use".into(),
+                ClaudeToolItemState {
+                    item_id: "bash-item".into(),
+                    item_kind: "commandExecution".into(),
+                    tool_name: "Bash".into(),
+                    input: json!({"command":"make"}),
+                },
+            );
+        }
+        let progress = client.map_message(json!({"type":"tool_progress", "tool_use_id":"new-progress-id", "parent_tool_use_id":"bash-use", "elapsed_time_seconds":30, "tool_name":"Bash"})).await;
+        let [RuntimeEvent::ItemDelta(delta)] = progress.as_slice() else {
+            panic!("progress missing")
+        };
+        assert_eq!(delta.native_item_id, "bash-item");
+        assert_eq!(delta.delta_kind, RuntimeItemDeltaKind::ToolProgress);
+        assert_eq!(delta.metadata.as_ref().unwrap()["elapsed_time_seconds"], 30);
+        let result = client.map_message(json!({"type":"user", "message":{"content":[{"type":"tool_result","tool_use_id":"bash-use","is_error":true,"content":"display error"}]},
+            "tool_use_result":{"stdout":"before failure\n","stderr":"compiler error\n","interrupted":true,"persistedOutputPath":"/provider/output.txt"}})).await;
+        assert_eq!(result.len(), 2);
+        let RuntimeEvent::ItemDelta(details) = &result[0] else {
+            panic!("details missing")
+        };
+        assert_eq!(
+            details.metadata.as_ref().unwrap()["result"]["persistedOutputPath"],
+            "/provider/output.txt"
+        );
+        assert!(
+            details.metadata.as_ref().unwrap()["result"]
+                .get("stdout")
+                .is_none()
+        );
+        let RuntimeEvent::ItemCompleted(item) = &result[1] else {
+            panic!("result missing")
+        };
+        let projected = project_cli_runtime_event(
+            &CLIRuntimeProjectorContext {
+                workspace_id: "w".into(),
+                thread_id: "t".into(),
+                turn_id: "u".into(),
+                recovery: None,
+            },
+            &RuntimeEvent::ItemCompleted(item.clone()),
+        );
+        let AgentDurableEvent::ItemCompleted { notification } = &projected.durable[0] else {
+            panic!("terminal missing")
+        };
+        let TurnItem::CommandExecution {
+            status,
+            storage:
+                pioneer_protocol::ToolStoragePayload::Shell {
+                    stdout,
+                    stderr,
+                    exit_code,
+                    ..
+                },
+            ..
+        } = &notification.item
+        else {
+            panic!("shell missing")
+        };
+        assert_eq!(*status, ToolCallStatus::Failed);
+        assert_eq!(stdout.as_deref(), Some("before failure\n"));
+        assert_eq!(stderr.as_deref(), Some("compiler error\n"));
+        assert_eq!(*exit_code, None);
+        assert!(client.map_message(json!({"type":"tool_progress", "tool_use_id":"bash-use", "elapsed_time_seconds":60})).await.is_empty());
+        child.kill().await.unwrap();
+    }
+
+    #[test]
+    fn claude_bash_output_and_interruption_are_retained() {
+        let context = CLIRuntimeProjectorContext {
+            workspace_id: "w".into(),
+            thread_id: "t".into(),
+            turn_id: "u".into(),
+            recovery: None,
+        };
+        for (success, text) in [(true, "ok\n"), (false, "shell failed\n")] {
+            let e = RuntimeEvent::ItemCompleted(RuntimeItemCompleted {
+                native_thread_id: Some("nt".into()),
+                native_turn_id: "nu".into(),
+                native_item_id: "cmd".into(),
+                item_kind: "commandExecution".into(),
+                text: Some(text.into()),
+                summary: vec![],
+                content: vec![],
+                phase: RuntimeAgentMessagePhase::FinalAnswer,
+                metadata: Some(metadata_for_claude_tool(
+                    "Bash",
+                    &json!({"command":"printf hi"}),
+                    Some(text),
+                    Some(success),
+                )),
+                native_item_redacted: None,
+                native: None,
+            });
+            let projected = project_cli_runtime_event(&context, &e);
+            let AgentDurableEvent::ItemCompleted { notification } = &projected.durable[0] else {
+                panic!("missing result")
+            };
+            let TurnItem::CommandExecution {
+                storage, status, ..
+            } = &notification.item
+            else {
+                panic!("missing command")
+            };
+            assert_eq!(
+                *status,
+                if success {
+                    ToolCallStatus::Completed
+                } else {
+                    ToolCallStatus::Failed
+                }
+            );
+            let pioneer_protocol::ToolStoragePayload::Shell {
+                aggregated_output, ..
+            } = storage
+            else {
+                panic!("missing output")
+            };
+            assert_eq!(aggregated_output.as_deref(), Some(text));
+        }
+        let mut state = ClaudeStreamState::default();
+        state.native_thread_id = Some("nt".into());
+        state.active_turn_id = Some("nu".into());
+        state.tool_items.insert(
+            "use".into(),
+            ClaudeToolItemState {
+                item_id: "cmd".into(),
+                item_kind: "commandExecution".into(),
+                tool_name: "Bash".into(),
+                input: json!({"command":"sleep 60"}),
+            },
+        );
+        let events = terminalize_running_claude_tools(
+            &mut state,
+            ClaudeMcpToolLifecycle::Cancelled,
+            "execution interrupted before tool_result",
+            "test",
+        );
+        assert_eq!(events.len(), 1);
+        assert!(state.tool_items.is_empty());
+        let RuntimeEvent::ItemCompleted(item) = &events[0] else {
+            panic!("missing terminal item")
+        };
+        assert_eq!(item.metadata.as_ref().unwrap()["status"], "cancelled");
+        assert!(
+            item.metadata.as_ref().unwrap()["error"]
+                .to_string()
+                .contains("interrupted")
+        );
+        assert!(
+            terminalize_running_claude_tools(
+                &mut state,
+                ClaudeMcpToolLifecycle::Cancelled,
+                "repeat",
+                "test"
+            )
+            .is_empty()
+        );
+    }
 
     struct NeverInvoke;
 
@@ -4193,6 +4655,68 @@ done
         state.native_thread_id = Some(provider_session_id.to_string());
         state.active_turn_id = Some(native_turn_id.to_owned());
         state.observed_turn_id = Some(native_turn_id.to_owned());
+    }
+
+    pub(crate) async fn mapped_assistant_completion_for_gateway_test(
+        provider_session: uuid::Uuid,
+        native_turn_id: &str,
+        record_uuid: uuid::Uuid,
+    ) -> RuntimeEvent {
+        let temp = tempfile::tempdir().unwrap();
+        let (client, mut child, _) = fake_claude_stream_client_with_mcp(
+            &temp.path().join("gateway-record.log"),
+            provider_session,
+            None,
+        )
+        .await;
+        bind_claude_mcp_test_turn(&client, provider_session, native_turn_id).await;
+        client.map_message(json!({
+            "type":"assistant", "session_id":provider_session, "uuid":record_uuid,
+            "message":{"id":"msg_api_id_not_a_record_uuid", "content":[{"type":"text","text":"answer"}]}
+        })).await;
+        let completion = client
+            .map_message(json!({
+                "type":"result", "session_id":provider_session, "subtype":"success",
+                "is_error":false, "result":"answer"
+            }))
+            .await
+            .into_iter()
+            .find(|event| matches!(event, RuntimeEvent::TurnCompleted(_)))
+            .expect("Claude stream mapper must emit a completed turn");
+        let _ = child.kill().await;
+        completion
+    }
+
+    #[tokio::test]
+    async fn assistant_record_uuid_reaches_completion_separately_from_api_message_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let session = uuid::Uuid::new_v4();
+        let record = uuid::Uuid::new_v4();
+        let (client, mut child, _) =
+            fake_claude_stream_client_with_mcp(&temp.path().join("record.log"), session, None)
+                .await;
+        bind_claude_mcp_test_turn(&client, session, "synthetic-native-turn").await;
+        client.map_message(json!({
+            "type":"assistant", "session_id":session, "uuid":record,
+            "message":{"id":"msg_api_id_not_a_record_uuid", "content":[{"type":"text","text":"answer"}]}
+        })).await;
+        let completed = client
+            .map_message(json!({
+                "type":"result", "session_id":session, "subtype":"success", "is_error":false,
+                "result":"answer"
+            }))
+            .await;
+        let boundary = completed.iter().find_map(|event| match event {
+            RuntimeEvent::TurnCompleted(event) => event
+                .native
+                .as_ref()
+                .and_then(|native| native.payload_redacted.as_ref())
+                .and_then(|payload| payload.get("assistantRecordUuid"))
+                .and_then(JsonValue::as_str),
+            _ => None,
+        });
+        assert_eq!(boundary, Some(record.to_string().as_str()));
+        let _ = child.kill().await;
     }
 
     #[tokio::test]
@@ -4675,6 +5199,21 @@ done
         args.iter().any(|arg| arg == flag)
     }
 
+    fn arg_values_after(args: &[String], flag: &str) -> Vec<PathBuf> {
+        args.windows(2)
+            .filter(|pair| pair[0] == flag)
+            .map(|pair| PathBuf::from(pair[1].as_str()))
+            .collect()
+    }
+
+    fn selected_skill_fixture(path: &Path, install_name: &str) -> CliRuntimeSelectedSkill {
+        CliRuntimeSelectedSkill {
+            install_name: install_name.to_owned(),
+            installed_path: path.to_path_buf(),
+            source_folder_hash: compute_skill_folder_hash(path).expect("skill fixture hash"),
+        }
+    }
+
     fn elevated_instructions(text: &str) -> CLIRuntimeElevatedInstructions {
         let fingerprint = Sha256::digest(text.as_bytes())
             .iter()
@@ -4713,9 +5252,20 @@ done
         std::fs::set_permissions(bootstrap.as_path(), std::fs::Permissions::from_mode(0o600))
             .expect("bootstrap permissions");
         let managed_root = temp.path().join("managed");
+        let selected_skill_root = temp.path().join("selected-skill");
+        std::fs::create_dir_all(selected_skill_root.join("references"))
+            .expect("selected skill directory");
+        std::fs::write(selected_skill_root.join("SKILL.md"), b"# selected\n")
+            .expect("selected skill");
+        std::fs::write(
+            selected_skill_root.join("references/guide.txt"),
+            b"selected support\n",
+        )
+        .expect("selected skill support");
+        let selected_skill = selected_skill_fixture(selected_skill_root.as_path(), "selected");
         let mut generation = 1;
 
-        for enable_user_skills in [false, true] {
+        for skills_selected in [false, true] {
             for mcp_enabled in [false, true] {
                 let artifact = serialize_claude_managed_mcp_config(if mcp_enabled {
                     ClaudeManagedMcpConfigInput::pioneer(helper.clone(), bootstrap.clone())
@@ -4747,7 +5297,10 @@ done
                     &CLIAgentRuntimeSessionStartOptions {
                         cwd: Some(temp.path().to_path_buf()),
                         approval_policy: Some("default".to_owned()),
-                        enable_user_skills,
+                        selected_skills: skills_selected
+                            .then(|| selected_skill.clone())
+                            .into_iter()
+                            .collect(),
                         ..Default::default()
                     },
                     &descriptor,
@@ -4767,14 +5320,19 @@ done
                     arg_value_after(&process.args, "--permission-prompt-tool").as_deref(),
                     Some("stdio")
                 );
-                assert_eq!(
-                    has_arg(&process.args, "--safe-mode"),
-                    !enable_user_skills && !mcp_enabled
-                );
-                assert_eq!(
-                    has_arg(&process.args, "--setting-sources=user"),
-                    enable_user_skills
-                );
+                assert!(!has_arg(&process.args, "--safe-mode"));
+                assert!(has_arg(&process.args, "--setting-sources="));
+                assert!(!has_arg(&process.args, "--setting-sources=user"));
+                assert_eq!(has_arg(&process.args, "--plugin-dir"), skills_selected);
+                if skills_selected {
+                    let plugins = arg_values_after(&process.args, "--plugin-dir");
+                    assert_eq!(plugins.len(), 1);
+                    assert_eq!(
+                        std::fs::read(plugins[0].join("skills/selected/SKILL.md"))
+                            .expect("managed selected skill"),
+                        b"# selected\n"
+                    );
+                }
                 assert_eq!(has_arg(&process.args, "--allowedTools"), mcp_enabled);
                 if mcp_enabled {
                     let flag_index = process
@@ -4807,6 +5365,8 @@ done
             "# test skill",
         )
         .expect("write user skill");
+        let selected_skill =
+            selected_skill_fixture(config_dir.join("skills/test-skill").as_path(), "test-skill");
         std::fs::write(
             config_dir.join(".mcp.json"),
             r#"{"mcpServers":{"malicious_sentinel":{"command":"/sentinel"}}}"#,
@@ -4822,13 +5382,16 @@ done
         instance.shadow_home_path = Some(config_dir.to_string_lossy().into_owned());
         let mut generated_paths = HashSet::new();
 
-        for enable_user_skills in [false, true] {
+        for skills_selected in [false, true] {
             for permission_mode in ["default", "acceptEdits", "bypassPermissions"] {
                 let process = claude_process_config_from_instance(
                     &instance,
                     &CLIAgentRuntimeSessionStartOptions {
                         approval_policy: Some(permission_mode.to_owned()),
-                        enable_user_skills,
+                        selected_skills: skills_selected
+                            .then(|| selected_skill.clone())
+                            .into_iter()
+                            .collect(),
                         ..Default::default()
                     },
                 )
@@ -4849,14 +5412,10 @@ done
                         .iter()
                         .any(|arg| arg.contains("malicious_sentinel"))
                 );
-                assert_eq!(
-                    has_arg(&process.args, "--safe-mode"),
-                    !enable_user_skills && permission_mode != "bypassPermissions"
-                );
-                assert_eq!(
-                    has_arg(&process.args, "--setting-sources=user"),
-                    enable_user_skills
-                );
+                assert!(!has_arg(&process.args, "--safe-mode"));
+                assert!(has_arg(&process.args, "--setting-sources="));
+                assert!(!has_arg(&process.args, "--setting-sources=user"));
+                assert_eq!(has_arg(&process.args, "--plugin-dir"), skills_selected);
             }
         }
         assert_eq!(generated_paths.len(), 6);
@@ -4928,9 +5487,10 @@ done
             &CLIAgentRuntimeSessionStartOptions {
                 cwd: None,
                 approval_policy: Some("acceptEdits".to_owned()),
+                authorization_scope_fingerprint: None,
                 app_server_args: Vec::new(),
                 env: Default::default(),
-                enable_user_skills: false,
+                selected_skills: Vec::new(),
                 elevated_instructions: None,
             },
         )
@@ -4952,9 +5512,10 @@ done
             &CLIAgentRuntimeSessionStartOptions {
                 cwd: None,
                 approval_policy: Some("bypassPermissions".to_owned()),
+                authorization_scope_fingerprint: None,
                 app_server_args: Vec::new(),
                 env: Default::default(),
-                enable_user_skills: false,
+                selected_skills: Vec::new(),
                 elevated_instructions: None,
             },
         )
@@ -4968,10 +5529,14 @@ done
             !has_arg(config.args.as_slice(), "--safe-mode"),
             "FullAccess must not leave Claude trapped in safe-mode"
         );
+        assert!(
+            !has_arg(config.args.as_slice(), "--tools"),
+            "FullAccess must retain Claude's built-in tool surface"
+        );
     }
 
     #[test]
-    fn claude_cli_runtime_restricted_modes_keep_safe_mode() {
+    fn claude_cli_runtime_restricted_modes_use_only_provider_permission_mode() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let instance = claude_instance(temp_dir.path().to_string_lossy().into_owned());
 
@@ -4981,9 +5546,10 @@ done
                 &CLIAgentRuntimeSessionStartOptions {
                     cwd: None,
                     approval_policy: Some(permission_mode.to_owned()),
+                    authorization_scope_fingerprint: None,
                     app_server_args: Vec::new(),
                     env: Default::default(),
-                    enable_user_skills: false,
+                    selected_skills: Vec::new(),
                     elevated_instructions: None,
                 },
             )
@@ -4994,14 +5560,18 @@ done
                 Some(permission_mode)
             );
             assert!(
-                has_arg(config.args.as_slice(), "--safe-mode"),
-                "restricted Claude mode `{permission_mode}` should keep safe-mode"
+                !has_arg(config.args.as_slice(), "--safe-mode"),
+                "restricted Claude mode `{permission_mode}` must not receive a Pioneer-selected sandbox flag"
+            );
+            assert!(
+                !has_arg(config.args.as_slice(), "--tools"),
+                "Pioneer must not replace Claude's provider-owned tool sandbox"
             );
         }
     }
 
     #[test]
-    fn claude_process_config_skill_enabled_mode_uses_complete_user_source() {
+    fn claude_process_config_projects_only_exact_selected_skill_plugins() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let config_dir = temp_dir.path().join("effective-config");
         for relative in [
@@ -5011,12 +5581,16 @@ done
             "agents/agent.md",
             "rules/rule.md",
             "CLAUDE.md",
+            "skills/selected/SKILL.md",
+            "skills/selected/references/guide.txt",
             "skills/unrelated/SKILL.md",
         ] {
             let path = config_dir.join(relative);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(path, relative).unwrap();
         }
+        let selected =
+            selected_skill_fixture(config_dir.join("skills/selected").as_path(), "selected");
         let mut instance =
             claude_instance(temp_dir.path().join("home").to_string_lossy().into_owned());
         instance.shadow_home_path = Some(config_dir.to_string_lossy().into_owned());
@@ -5034,7 +5608,7 @@ done
                 &instance,
                 &CLIAgentRuntimeSessionStartOptions {
                     approval_policy: Some(permission_mode.to_owned()),
-                    enable_user_skills: true,
+                    selected_skills: vec![selected.clone()],
                     ..Default::default()
                 },
             )
@@ -5042,8 +5616,28 @@ done
 
             assert!(has_arg(&normal.args, "--setting-sources="));
             assert!(!has_arg(&normal.args, "--setting-sources=user"));
-            assert!(has_arg(&enabled.args, "--setting-sources=user"));
-            assert!(!has_arg(&enabled.args, "--setting-sources="));
+            assert!(has_arg(&enabled.args, "--setting-sources="));
+            assert!(!has_arg(&enabled.args, "--setting-sources=user"));
+            assert!(!has_arg(&normal.args, "--plugin-dir"));
+            let plugins = arg_values_after(&enabled.args, "--plugin-dir");
+            assert_eq!(plugins.len(), 1);
+            let plugin = &plugins[0];
+            assert_eq!(
+                std::fs::read(plugin.join("skills/selected/SKILL.md")).unwrap(),
+                b"skills/selected/SKILL.md"
+            );
+            assert_eq!(
+                std::fs::read(plugin.join("skills/selected/references/guide.txt")).unwrap(),
+                b"skills/selected/references/guide.txt"
+            );
+            assert!(!plugin.join("skills/unrelated").exists());
+            let manifest: JsonValue = serde_json::from_slice(
+                std::fs::read(plugin.join(".claude-plugin/plugin.json"))
+                    .unwrap()
+                    .as_slice(),
+            )
+            .unwrap();
+            assert_eq!(manifest["skills"], json!(["./skills/selected"]));
             assert!(!has_arg(&enabled.args, "--safe-mode"));
             assert_eq!(
                 arg_value_after(&enabled.args, "--permission-mode").as_deref(),
@@ -5066,10 +5660,26 @@ done
             "agents/agent.md",
             "rules/rule.md",
             "CLAUDE.md",
+            "skills/selected/SKILL.md",
+            "skills/selected/references/guide.txt",
             "skills/unrelated/SKILL.md",
         ] {
             assert!(config_dir.join(relative).exists());
         }
+
+        let mut stale = selected;
+        stale.source_folder_hash = "0".repeat(64);
+        let error = claude_process_config_from_instance(
+            &instance,
+            &CLIAgentRuntimeSessionStartOptions {
+                selected_skills: vec![stale],
+                ..Default::default()
+            },
+        )
+        .expect_err("stale selected skill receipt must fail before Claude spawn");
+        assert!(
+            format!("{error:#}").contains("changed after its installation receipt was verified")
+        );
     }
 
     #[test]
@@ -5097,6 +5707,25 @@ done
                     },
                 },
             ])
+        );
+    }
+
+    #[test]
+    fn claude_provider_frame_limit_counts_materialized_base64_image() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let image_path = temp_dir.path().join("oversized.png");
+        let file = std::fs::File::create(&image_path).expect("create image");
+        file.set_len(7 * 1024 * 1024).expect("size image");
+
+        let error = claude_provider_user_request(
+            uuid::Uuid::nil(),
+            json!([{ "type": "localImage", "path": image_path.to_string_lossy() }]),
+        )
+        .expect_err("base64-expanded Claude request must be rejected before provider write");
+
+        assert!(
+            format!("{error:#}").contains("after attachment materialization"),
+            "request boundary should report the runtime-specific payload"
         );
     }
 
@@ -5149,12 +5778,13 @@ done
         .unwrap();
         let mut instance = claude_instance(temp_dir.path().join("home").to_string_lossy().into());
         instance.shadow_home_path = Some(config_dir.to_string_lossy().into_owned());
+        let selected = selected_skill_fixture(installed.as_path(), "proposal-51-sentinel");
         let skill_config = claude_process_config_from_instance(
             &instance,
             &CLIAgentRuntimeSessionStartOptions {
                 cwd: Some(temp_dir.path().join("workspace")),
                 approval_policy: Some("acceptEdits".to_owned()),
-                enable_user_skills: true,
+                selected_skills: vec![selected],
                 ..Default::default()
             },
         )
@@ -5164,15 +5794,20 @@ done
             &CLIAgentRuntimeSessionStartOptions {
                 cwd: Some(temp_dir.path().join("workspace")),
                 approval_policy: Some("acceptEdits".to_owned()),
-                enable_user_skills: false,
                 ..Default::default()
             },
         )
         .unwrap();
-        assert!(has_arg(&skill_config.args, "--setting-sources=user"));
+        assert!(has_arg(&skill_config.args, "--setting-sources="));
+        assert!(!has_arg(&skill_config.args, "--setting-sources=user"));
+        assert_eq!(
+            arg_values_after(&skill_config.args, "--plugin-dir").len(),
+            1
+        );
         assert!(!has_arg(&skill_config.args, "--safe-mode"));
         assert!(has_arg(&zero_config.args, "--setting-sources="));
-        assert!(has_arg(&zero_config.args, "--safe-mode"));
+        assert!(!has_arg(&zero_config.args, "--plugin-dir"));
+        assert!(!has_arg(&zero_config.args, "--safe-mode"));
         assert_eq!(skill_config.executable, zero_config.executable);
         assert_eq!(skill_config.cwd, zero_config.cwd);
         assert_eq!(
@@ -5321,14 +5956,22 @@ done
                 native: None,
             }))
             .await;
-        client
-            .emit(RuntimeEvent::TurnCompleted(RuntimeTurnCompleted {
-                native_thread_id: Some("claude-thread".to_owned()),
-                native_turn_id: "claude-turn".to_owned(),
-                status: "completed".to_owned(),
-                native: None,
+        let record_uuid = uuid::Uuid::new_v4();
+        client.map_message(json!({
+            "type":"assistant", "session_id":"claude-thread", "uuid":record_uuid,
+            "message":{"id":"msg_api_id_not_a_record_uuid", "content":[{"type":"text","text":"final answer"}]}
+        })).await;
+        for event in client
+            .map_message(json!({
+                "type":"result", "session_id":"claude-thread", "subtype":"success",
+                "is_error":false, "result":"final answer"
             }))
-            .await;
+            .await
+        {
+            if matches!(event, RuntimeEvent::TurnCompleted(_)) {
+                client.emit(event).await;
+            }
+        }
 
         let state = client.state.lock().await;
         let observation = state
@@ -5341,7 +5984,12 @@ done
         );
         assert!(matches!(
             observation.reconciliation_events.as_slice(),
-            [RuntimeEvent::ItemCompleted(item)] if item.native_item_id == "claude-final"
+            [RuntimeEvent::ItemCompleted(item), RuntimeEvent::TurnCompleted(completed)]
+                if item.native_item_id == "claude-final"
+                    && completed.native.as_ref()
+                        .and_then(|native| native.payload_redacted.as_ref())
+                        .and_then(|payload| payload.get("assistantRecordUuid"))
+                        .and_then(JsonValue::as_str) == Some(record_uuid.to_string().as_str())
         ));
         drop(state);
 

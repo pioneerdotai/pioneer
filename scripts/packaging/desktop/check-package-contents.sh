@@ -29,7 +29,15 @@ require_cmd() {
 require_zip_entry() {
   local zip_path="$1"
   local pattern="$2"
-  if ! unzip -Z1 "$zip_path" | grep -E -q "$pattern"; then
+  local entries
+  # Capture the listing before matching: `unzip | grep -q` races grep's early
+  # exit against unzip's writes, and the resulting SIGPIPE fails the pipeline
+  # under `set -o pipefail` even when the entry exists.
+  entries="$(unzip -Z1 "$zip_path")" || {
+    echo "failed to list zip entries: $zip_path" >&2
+    exit 1
+  }
+  if ! grep -E -q "$pattern" <<<"$entries"; then
     echo "missing required zip entry matching: $pattern" >&2
     exit 1
   fi

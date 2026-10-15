@@ -107,7 +107,7 @@ pub fn render_memory_post_turn_extractor_prompt(
 
     prompt.push_str("# Manifest, Duplicate, and Conflict Rules\n");
     prompt.push_str("- Use the memory manifest only to detect duplicates and conflicts. Do not copy manifest facts into output unless the current turn provides new direct evidence.\n");
-    prompt.push_str("- If the current turn corrects or supersedes the manifest, emit the corrected durable fact with direct user evidence. The memory service will merge or supersede.\n");
+    prompt.push_str("- If the current turn corrects a manifest fact, emit the corrected durable fact with direct user evidence and target_memory_id copied exactly from that manifest record. Keep its scope and semantic identity. Never invent an ID or target an unrelated fact. The service validates the target, preserves its existing key and binds the canonical identity explicitly; similarity alone does not merge arbitrary keys. Use null for a genuinely new fact.\n");
     prompt.push_str("- If the current turn merely repeats an active manifest fact without new value, omit it.\n\n");
 
     prompt.push_str("# Allowed Values\n");
@@ -127,6 +127,22 @@ pub fn render_memory_post_turn_extractor_prompt(
     prompt.push_str("ontology.evidence_class: direct_user_assertion, user_correction, user_approval, assistant_inference, tool_observation, task_runtime_observation, system_observation, generated_summary, missing_or_weak.\n");
     prompt.push_str("ontology.proposed_ownership_class: durable_user_memory, durable_workspace_memory, durable_agent_memory, thread_episodic_context, task_runtime_state, domain_runtime_state, audit_only, reject.\n\n");
 
+    prompt.push_str("# Semantic Identity Requirements\n");
+    prompt.push_str("- For subject project, person, organization, or artifact, subject_key is required: use a stable identity directly established by the supplied evidence. For current_user, current_agent, and workspace, subject_key may be null; the service resolves their identity.\n");
+    prompt.push_str("- For subject custom, custom_subject is required. Otherwise custom_subject may be null. For attribute custom, custom_attribute is required. Otherwise custom_attribute may be null. These requirements are independent.\n");
+    prompt.push_str("- Required identity strings must contain letters or digits after normalization; whitespace, punctuation, separators, or emoji alone are invalid. If the evidence does not establish a required identity, omit the fact. Never invent missing values. The memory service still builds the canonical key.\n");
+    prompt.push_str(r#"Valid semantic identity examples (use only when supported by this turn):
+{"subject":"project","subject_key":"Pioneer","custom_subject":null,"attribute":"migration_policy","custom_attribute":null}
+{"subject":"person","subject_key":"Alex","custom_subject":null,"attribute":"name","custom_attribute":null}
+{"subject":"organization","subject_key":"Acme","custom_subject":null,"attribute":"custom","custom_attribute":"review policy"}
+{"subject":"artifact","subject_key":"architecture.md","custom_subject":null,"attribute":"custom","custom_attribute":"purpose"}
+{"subject":"custom","subject_key":null,"custom_subject":"release workflow","attribute":"custom","custom_attribute":"approval policy"}
+{"subject":"workspace","subject_key":null,"custom_subject":null,"attribute":"review_style","custom_attribute":null}
+{"subject":"current_user","subject_key":null,"custom_subject":null,"attribute":"preferred_language","custom_attribute":null}
+{"subject":"current_agent","subject_key":null,"custom_subject":null,"attribute":"review_style","custom_attribute":null}
+
+"#);
+
     prompt.push_str("# Output Contract\n");
     prompt.push_str("Return strict JSON only. No markdown. No prose outside JSON.\n");
     prompt.push_str("Return exactly this envelope shape. Use null for unknown optional ids and non-authoritative numeric fields.\n");
@@ -134,6 +150,7 @@ pub fn render_memory_post_turn_extractor_prompt(
     prompt.push_str("{\n");
     prompt.push_str("  \"facts\": [\n");
     prompt.push_str("    {\n");
+    prompt.push_str("      \"target_memory_id\": null,\n");
     prompt.push_str("      \"semantic\": {\n");
     prompt.push_str("        \"intent\": \"explicit_store|implicit_candidate\",\n");
     prompt.push_str("        \"explicitness\": \"explicit|implicit|unclear\",\n");
@@ -239,6 +256,10 @@ mod tests {
         assert!(prompt.contains("# Language and Evidence Rules"));
         assert!(prompt.contains("# Manifest, Duplicate, and Conflict Rules"));
         assert!(prompt.contains("# Output Contract"));
+        assert!(prompt.contains("subject_key is required"));
+        assert!(prompt.contains("custom_subject is required"));
+        assert!(prompt.contains("custom_attribute is required"));
+        assert!(prompt.contains("Never invent missing values"));
         assert!(prompt.contains("# Final Self-Check Before Output"));
         assert!(prompt.contains("# Provided Turn"));
         assert!(prompt.contains("Do not generate canonical memory keys"));

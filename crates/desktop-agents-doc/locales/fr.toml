@@ -1,0 +1,24 @@
+[editor.agents_doc]
+title = "AGENTS.md"
+loading = "Chargement de AGENTS.md..."
+load_error = "Impossible de charger AGENTS.md"
+retry = "Réessayer"
+retry_save = "Réessayer l'enregistrement"
+save_conflict = "AGENTS.md a été modifié ailleurs. Rechargez ou réessayez après avoir résolu le conflit."
+save_conflict_missing_remote = "AGENTS.md a été modifié ailleurs, mais le document distant n'a pas pu être chargé."
+
+[editor.agents_doc.conflict]
+title = "Conflit AGENTS.md"
+description = "Le document distant a changé avant que cette modification ne puisse être enregistrée."
+reload_remote = "Recharger le distant"
+overwrite_remote = "Écraser le distant"
+local = "Local"
+remote = "Distant"
+
+[editor.agents_doc.save_state]
+clean = "Aucune modification non enregistrée"
+dirty = "Modifications non enregistrées"
+saving = "Enregistrement..."
+saved = "Enregistré"
+error = "Échec de l'enregistrement : %{message}"
+conflict = "Résolvez le conflit avant d'enregistrer"

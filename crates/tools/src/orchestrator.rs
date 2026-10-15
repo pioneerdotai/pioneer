@@ -1,15 +1,17 @@
 use crate::classifier::{DefaultErrorClassifier, ErrorClassifier};
 use crate::context::ToolOutcome;
-use crate::context::{AnyToolResult, ToolInvocation, ToolPayload};
+use crate::context::{AnyToolResult, ApplyPatchPreflight, ToolInvocation, ToolPayload};
 use crate::error::ToolError;
 use crate::events::ToolEventTrace;
 use crate::mcp_policy::enforce_mcp_network_policy;
-use crate::network_policy::{NetworkPolicyChecker, NetworkPolicyDenyReason};
+use crate::network_policy::{NetworkPolicyChecker, NetworkPolicyDenyReason, is_localhost};
+#[cfg(test)]
+use crate::permissions::extract_permission_intent;
 use crate::permissions::{
     PermissionActionKind, PermissionApprovalBroker, PermissionApprovalResolution,
     PermissionDecision, PermissionDecisionReason, PermissionEvaluationContext, PermissionIntent,
     PermissionRequestScope, ProfileToolPermissionEvaluator, StaticPermissionApprovalBroker,
-    ToolPermissionEvaluator, extract_permission_intent, write_stdin_session_id,
+    ToolPermissionEvaluator, extract_permission_intent_with_preflight, write_stdin_session_id,
 };
 use crate::registry::ToolRegistry;
 use crate::spec::ToolIdempotencyMode;
@@ -47,7 +49,10 @@ pub struct OrchestratorPolicy {
 impl Default for OrchestratorPolicy {
     fn default() -> Self {
         Self {
-            retry_with_escalated_sandbox: true,
+            // Kept for wire/source compatibility. Sandbox authority is now
+            // granted before dispatch and this legacy flag must never replay
+            // a side effect under an identical execution snapshot.
+            retry_with_escalated_sandbox: false,
         }
     }
 }
@@ -130,6 +135,7 @@ fn shell_result_is_finished(raw: &serde_json::Value) -> bool {
 #[derive(Debug, Clone)]
 struct PermissionEvaluationGrant {
     intent: PermissionIntent,
+    apply_patch_preflight: Option<ApplyPatchPreflight>,
     request_key: Option<crate::PermissionRequestKey>,
     approval_scope: PermissionApprovalGrantScope,
 }
@@ -170,13 +176,17 @@ struct FilesystemAccessGrant {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum NetworkAccessRequirement {
     Enabled,
-    Host { url: String, host: String },
+    Origin {
+        url: String,
+        origin: String,
+        host: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum NetworkAccessGrant {
     Enabled,
-    Host(String),
+    Origin { origin: String, host: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -403,41 +413,117 @@ impl ToolOrchestrator {
         self.enforce_idempotency_contract(&invocation)?;
 
         invocation.attempt_id = 1;
-        enforce_non_escalatable_mcp_network_policy(&invocation)?;
 
-        let effective_permission_context = self
+        let effective_permission_context = match self
             .revalidate_permission_context(permission_context, &invocation)
-            .await?;
-        self.apply_effective_permission_profile(&effective_permission_context.permission_profile)?;
+            .await
+        {
+            Ok(context) => context,
+            Err(error) => {
+                if let Some(result) =
+                    self.canonical_apply_patch_permission_result(&invocation, &error)?
+                {
+                    return Ok(result);
+                }
+                return Err(error);
+            }
+        };
+        if let Err(error) = self
+            .apply_effective_permission_profile(&effective_permission_context.permission_profile)
+        {
+            if let Some(result) =
+                self.canonical_apply_patch_permission_result(&invocation, &error)?
+            {
+                return Ok(result);
+            }
+            return Err(error);
+        }
 
-        let permission_grant = self
+        let permission_grant = match self
             .evaluate_permission(&invocation, &effective_permission_context, trace)
-            .await?;
-        self.ensure_filesystem_access(
-            &mut invocation,
-            &effective_permission_context,
-            &permission_grant,
-            trace,
-        )
-        .await?;
-        self.ensure_network_access(
-            &mut invocation,
-            &effective_permission_context,
-            &permission_grant,
-            trace,
-        )
-        .await?;
+            .await
+        {
+            Ok(grant) => grant,
+            Err(error) => {
+                if let Some(result) =
+                    self.canonical_apply_patch_permission_result(&invocation, &error)?
+                {
+                    return Ok(result);
+                }
+                return Err(error);
+            }
+        };
+        invocation.apply_patch_preflight = permission_grant.apply_patch_preflight.clone();
+        if let Err(error) = self
+            .ensure_filesystem_access(
+                &mut invocation,
+                &effective_permission_context,
+                &permission_grant,
+                trace,
+            )
+            .await
+        {
+            if let Some(result) =
+                self.canonical_apply_patch_permission_result(&invocation, &error)?
+            {
+                return Ok(result);
+            }
+            return Err(error);
+        }
+        if let Err(error) = self
+            .ensure_network_access(
+                &mut invocation,
+                &effective_permission_context,
+                &permission_grant,
+                trace,
+            )
+            .await
+        {
+            if let Some(result) =
+                self.canonical_apply_patch_permission_result(&invocation, &error)?
+            {
+                return Ok(result);
+            }
+            return Err(error);
+        }
+        if let Err(error) = enforce_mcp_network_policy_after_grants(&invocation) {
+            if let Some(result) =
+                self.canonical_apply_patch_permission_result(&invocation, &error)?
+            {
+                return Ok(result);
+            }
+            return Err(error);
+        }
 
         // Permission and sandbox approvals may wait for a person for hours.
         // Revalidate again after every such wait, at the actual dispatch
         // boundary, so a committed revoke cannot be bypassed by answering an
         // approval that was opened under an older authority generation.
-        self.revalidate_immediately_before_side_effect(
-            permission_context,
-            &effective_permission_context,
-            &invocation,
-        )
-        .await?;
+        if let Err(error) = self
+            .revalidate_immediately_before_side_effect(
+                permission_context,
+                &effective_permission_context,
+                &invocation,
+            )
+            .await
+        {
+            if let Some(result) =
+                self.canonical_apply_patch_permission_result(&invocation, &error)?
+            {
+                return Ok(result);
+            }
+            return Err(error);
+        }
+        if let Err(error) =
+            self.finalize_deferred_apply_patch_preflight(&mut invocation, &permission_grant.intent)
+        {
+            if let Some(result) =
+                self.canonical_apply_patch_permission_result(&invocation, &error)?
+            {
+                return Ok(result);
+            }
+            return Err(error);
+        }
 
         let first_attempt = self
             .run_in_sandbox(registry, invocation.clone(), SandboxTarget::Default, trace)
@@ -460,45 +546,6 @@ impl ToolOrchestrator {
                     })),
                 );
                 self.post_policy.apply(&invocation, &mut result);
-                Ok(result)
-            }
-            Err(error)
-                if self.policy.retry_with_escalated_sandbox
-                    && self.can_retry_invocation(&invocation)
-                    && self.should_retry_with_escalated_sandbox(&error) =>
-            {
-                trace.emit_stage(
-                    1,
-                    "retry.scheduled",
-                    Some(error.to_string()),
-                    Some(serde_json::json!({
-                        "reason": "permission_or_sandbox_error",
-                    })),
-                );
-                trace.emit_stage(2, "retry.started", None, None);
-                let mut retry_invocation = invocation.clone();
-                retry_invocation.attempt_id = 2;
-                self.revalidate_immediately_before_side_effect(
-                    permission_context,
-                    &effective_permission_context,
-                    &retry_invocation,
-                )
-                .await?;
-                let mut result = self
-                    .run_in_sandbox(
-                        registry,
-                        retry_invocation.clone(),
-                        SandboxTarget::Escalated,
-                        trace,
-                    )
-                    .await?;
-                self.update_shell_session_permission(
-                    &retry_invocation,
-                    &effective_permission_context,
-                    &permission_grant,
-                    &result,
-                );
-                self.post_policy.apply(&retry_invocation, &mut result);
                 Ok(result)
             }
             Err(error) => {
@@ -579,6 +626,116 @@ impl ToolOrchestrator {
         self.post_policy.classify_error(invocation, error)
     }
 
+    fn canonical_apply_patch_permission_result(
+        &self,
+        invocation: &ToolInvocation,
+        error: &ToolError,
+    ) -> Result<Option<AnyToolResult>, ToolError> {
+        if invocation.tool_name != "apply_patch" {
+            return Ok(None);
+        }
+        let ToolError::Rejected(message) = error else {
+            return Ok(None);
+        };
+        let source = match &invocation.payload {
+            ToolPayload::Function { .. } => {
+                crate::apply_patch::file_mutation::PatchRequestSource::NativeFunction
+            }
+            _ => crate::apply_patch::file_mutation::PatchRequestSource::NativeFreeform,
+        };
+        let profile = invocation
+            .execution_security_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.permission_profile.mode.as_str())
+            .unwrap_or("missing");
+        let output = crate::handlers::ApplyPatchHandler::canonical_rejection_output(
+            source,
+            profile,
+            crate::apply_patch::file_mutation::PatchStage::Authorize,
+            crate::apply_patch::file_mutation::PatchErrorCode::PermissionDenied,
+            message.clone(),
+            None,
+        )?;
+        let mut result = AnyToolResult {
+            call_id: invocation.call_id.clone(),
+            tool_name: invocation.tool_name.clone(),
+            payload: invocation.payload.clone(),
+            output,
+            outcome: ToolOutcome::ok(),
+            projection: None,
+        };
+        self.post_policy.apply(invocation, &mut result);
+        Ok(Some(result))
+    }
+
+    fn finalize_deferred_apply_patch_preflight(
+        &self,
+        invocation: &mut ToolInvocation,
+        approved_intent: &PermissionIntent,
+    ) -> Result<(), ToolError> {
+        if invocation.tool_name != "apply_patch" || invocation.apply_patch_preflight.is_some() {
+            return Ok(());
+        }
+
+        let (resolved_intent, preflight) = extract_permission_intent_with_preflight(invocation);
+        let Some(preflight) = preflight else {
+            return Err(ToolError::Rejected(
+                "apply_patch filesystem grant did not produce a sealed preflight".to_owned(),
+            ));
+        };
+        if matches!(&preflight, ApplyPatchPreflight::Rejected(_)) {
+            invocation.apply_patch_preflight = Some(preflight);
+            return Ok(());
+        }
+        let approved_paths = intent_paths(approved_intent);
+        let resolved_paths = intent_paths(&resolved_intent);
+        let same_payload = approved_intent.scope.entries.get("payload_hash")
+            == resolved_intent.scope.entries.get("payload_hash");
+        let same_schema = approved_intent.scope.entries.get("parser_schema_version")
+            == resolved_intent.scope.entries.get("parser_schema_version");
+        if approved_intent.action != resolved_intent.action
+            || !same_payload
+            || !same_schema
+            || approved_paths != resolved_paths
+        {
+            return Err(ToolError::Rejected(
+                "apply_patch target manifest changed after permission approval".to_owned(),
+            ));
+        }
+
+        invocation.apply_patch_preflight = Some(preflight);
+        Ok(())
+    }
+
+    /// Run the same permission decision and authority revalidation used by
+    /// the shared runtime for a gateway-owned direct adapter.  First-party
+    /// MCP file calls cannot be materialized through a normal model-visible
+    /// router bundle, but they must not bypass the turn permission profile or
+    /// the approval broker before invoking their canonical handlers.
+    pub async fn authorize_direct_invocation(
+        &self,
+        invocation: &mut ToolInvocation,
+        trace: &ToolEventTrace,
+        permission_context: &PermissionEvaluationContext,
+    ) -> Result<(), ToolError> {
+        let grant = self
+            .evaluate_permission(invocation, permission_context, trace)
+            .await?;
+        invocation.apply_patch_preflight = grant.apply_patch_preflight.clone();
+        self.ensure_filesystem_access(invocation, permission_context, &grant, trace)
+            .await?;
+        self.ensure_network_access(invocation, permission_context, &grant, trace)
+            .await?;
+        enforce_mcp_network_policy_after_grants(invocation)?;
+        self.revalidate_immediately_before_side_effect(
+            permission_context,
+            permission_context,
+            invocation,
+        )
+        .await?;
+        self.finalize_deferred_apply_patch_preflight(invocation, &grant.intent)
+    }
+
     async fn emit_permission_audit(
         &self,
         trace: &ToolEventTrace,
@@ -647,13 +804,25 @@ impl ToolOrchestrator {
 
         let inherited_session_permission =
             self.inherited_shell_session_permission(invocation, permission_context);
-        let intent = inherited_session_permission
+        let (intent, apply_patch_preflight) = inherited_session_permission
             .as_ref()
-            .map(|permission| permission.intent.clone())
-            .unwrap_or_else(|| extract_permission_intent(invocation));
+            .map(|permission| (permission.intent.clone(), None))
+            .unwrap_or_else(|| extract_permission_intent_with_preflight(invocation));
         let mut decision =
             self.permission_evaluator
                 .evaluate(permission_context, invocation, &intent);
+        // A rejected Apply Patch preflight is a sealed, non-mutating result.
+        // Preserve explicit policy denial, but do not interrupt the user with
+        // an approval dialog merely to return a syntax/path diagnostic.
+        if matches!(
+            apply_patch_preflight.as_ref(),
+            Some(ApplyPatchPreflight::Rejected(_))
+        ) && matches!(decision, PermissionDecision::Ask { .. })
+        {
+            decision = PermissionDecision::Allow {
+                reason: PermissionDecisionReason::PolicyAllowsAction,
+            };
+        }
         if let (Some(permission), PermissionDecision::Ask { key: _, reason }) =
             (&inherited_session_permission, decision.clone())
         {
@@ -686,6 +855,7 @@ impl ToolOrchestrator {
                 .await?;
                 Ok(PermissionEvaluationGrant {
                     intent,
+                    apply_patch_preflight,
                     request_key: None,
                     approval_scope: PermissionApprovalGrantScope::None,
                 })
@@ -741,6 +911,7 @@ impl ToolOrchestrator {
                     .await?;
                     return Ok(PermissionEvaluationGrant {
                         intent,
+                        apply_patch_preflight,
                         request_key: Some(key),
                         approval_scope: PermissionApprovalGrantScope::Turn,
                     });
@@ -784,6 +955,7 @@ impl ToolOrchestrator {
                         .await?;
                         Ok(PermissionEvaluationGrant {
                             intent,
+                            apply_patch_preflight,
                             request_key: Some(key),
                             approval_scope: PermissionApprovalGrantScope::Once,
                         })
@@ -806,6 +978,7 @@ impl ToolOrchestrator {
                         }
                         Ok(PermissionEvaluationGrant {
                             intent,
+                            apply_patch_preflight,
                             request_key: Some(key),
                             approval_scope: PermissionApprovalGrantScope::Turn,
                         })
@@ -1461,7 +1634,8 @@ impl ToolOrchestrator {
                 }
             })),
         );
-        // Foundation for sandbox selection is present. Current behavior is allow-all.
+        // Dispatch wrapper only. Concrete process, filesystem, and network handlers enforce
+        // the immutable turn snapshot supplied with the invocation.
         let dispatched = registry.dispatch(invocation.clone(), trace).await;
         match dispatched {
             Ok(result) => {
@@ -1482,20 +1656,6 @@ impl ToolOrchestrator {
                 );
                 Err(error)
             }
-        }
-    }
-
-    fn should_retry_with_escalated_sandbox(&self, error: &ToolError) -> bool {
-        match error {
-            ToolError::ExecutionFailed(message) | ToolError::Internal(message) => {
-                let lower = message.to_lowercase();
-                lower.contains("permission denied") || lower.contains("operation not permitted")
-            }
-            ToolError::InvalidArguments(_)
-            | ToolError::NotFound(_)
-            | ToolError::NotVisible(_)
-            | ToolError::Rejected(_)
-            | ToolError::Cancelled(_) => false,
         }
     }
 
@@ -1527,18 +1687,9 @@ impl ToolOrchestrator {
             }
         }
     }
-
-    fn can_retry_invocation(&self, invocation: &ToolInvocation) -> bool {
-        matches!(
-            invocation.recovery.idempotency_mode,
-            ToolIdempotencyMode::None | ToolIdempotencyMode::Safe
-        )
-    }
 }
 
-fn enforce_non_escalatable_mcp_network_policy(
-    invocation: &ToolInvocation,
-) -> Result<(), ToolError> {
+fn enforce_mcp_network_policy_after_grants(invocation: &ToolInvocation) -> Result<(), ToolError> {
     let ToolPayload::Mcp {
         server,
         tool,
@@ -1630,17 +1781,18 @@ fn network_grants_within_authority_cap(
     let cap = &snapshot.authority_cap;
     grants.iter().all(|grant| match grant {
         NetworkAccessGrant::Enabled => cap.network.mode == TurnNetworkMode::Enabled,
-        NetworkAccessGrant::Host(host) => {
+        NetworkAccessGrant::Origin { origin, host } => {
+            if is_localhost(host.as_str())
+                && cap.network.mode != TurnNetworkMode::Enabled
+                && !cap.network.allow_localhost
+            {
+                return false;
+            }
             let mut cap_snapshot = snapshot.clone();
             cap_snapshot.network = cap.network.clone();
             cap_snapshot.sandbox.network = cap.network.clone();
-            let url = if host.contains(':') && !host.starts_with('[') {
-                format!("https://[{host}]/")
-            } else {
-                format!("https://{host}/")
-            };
             matches!(
-                NetworkPolicyChecker::check_url(&cap_snapshot, url.as_str(), "authority cap"),
+                NetworkPolicyChecker::check_url(&cap_snapshot, origin.as_str(), "authority cap"),
                 crate::network_policy::NetworkPolicyDecision::Allowed(_)
             )
         }
@@ -1688,31 +1840,44 @@ fn filesystem_access_requirements(
                 grant_access: TurnFilesystemAccess::Write,
             })
             .collect(),
-        PermissionActionKind::ShellCommand
-            if invocation.tool_name == "exec_command"
-                && matches!(
-                    &invocation.payload,
-                    crate::context::ToolPayload::LocalShell(
-                        crate::context::LocalShellPayload::ExecCommand(args)
-                    ) if args.workdir.as_deref().is_some_and(|workdir| !workdir.trim().is_empty())
-                ) =>
-        {
-            intent
-                .scope
-                .entries
-                .get("cwd")
-                .map(|cwd| {
-                    let cwd = normalize_path_lexically(PathBuf::from(cwd));
-                    FilesystemAccessRequirement {
-                        requested_path: cwd.clone(),
-                        grant_root: cwd,
-                        operation: FilePolicyOperation::Write,
-                        grant_access: TurnFilesystemAccess::Write,
-                    }
-                })
-                .into_iter()
-                .collect()
-        }
+        PermissionActionKind::ShellCommand if invocation.tool_name == "exec_command" => intent
+            .scope
+            .entries
+            .get("cwd")
+            .and_then(|cwd| {
+                let cwd = normalize_path_lexically(PathBuf::from(cwd));
+                let grant_root = invocation
+                    .execution_security_snapshot
+                    .as_ref()
+                    .filter(|snapshot| {
+                        snapshot.authority_cap.filesystem.kind
+                            == TurnFilesystemSandboxKind::Unrestricted
+                    })
+                    .and_then(|_| filesystem_volume_root(cwd.as_path()))
+                    .unwrap_or_else(|| cwd.clone());
+                let requirement = FilesystemAccessRequirement {
+                    requested_path: grant_root.clone(),
+                    grant_root,
+                    operation: FilePolicyOperation::Write,
+                    grant_access: TurnFilesystemAccess::Write,
+                };
+                let grant = FilesystemAccessGrant {
+                    root: requirement.grant_root.clone(),
+                    access: requirement.grant_access,
+                };
+                // An approved root shell invocation is an opaque execution
+                // boundary: argv can reference paths that cannot be inferred
+                // soundly before spawn. Bind the broad filesystem grant to the
+                // exact approved command/cwd scope. Child/task turns keep their
+                // durable cap and therefore receive at most the capped cwd.
+                filesystem_grants_within_authority_cap(
+                    invocation.execution_security_snapshot.as_ref(),
+                    std::slice::from_ref(&grant),
+                )
+                .then_some(requirement)
+            })
+            .into_iter()
+            .collect(),
         PermissionActionKind::Network if invocation.tool_name == "download_url" => intent
             .scope
             .entries
@@ -1736,15 +1901,82 @@ fn network_access_requirements(
     invocation: &ToolInvocation,
     intent: &PermissionIntent,
 ) -> Vec<NetworkAccessRequirement> {
+    // A shell command is an opaque program execution boundary. The exact
+    // argv/cwd is already subject to the shell approval, but its eventual
+    // network behavior cannot be determined soundly before spawn. Install a
+    // grant only for that approved invocation instead of leaving an approved
+    // command in a network-disabled sandbox where it will fail afterwards.
+    if intent.action == PermissionActionKind::ShellCommand
+        && invocation.tool_name == "exec_command"
+        && invocation
+            .execution_security_snapshot
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.authority_cap.network.mode == TurnNetworkMode::Enabled)
+    {
+        return vec![NetworkAccessRequirement::Enabled];
+    }
+
     if intent.action == PermissionActionKind::Network {
         if invocation.tool_name == "web_search" {
-            return vec![NetworkAccessRequirement::Enabled];
+            let origins = intent
+                .scope
+                .entries
+                .get("network_origins")
+                .and_then(|origins| serde_json::from_str::<Vec<String>>(origins).ok())
+                .unwrap_or_default();
+            if !origins.is_empty() {
+                return origins
+                    .into_iter()
+                    .filter_map(|origin| {
+                        let parsed = Url::parse(origin.as_str()).ok()?;
+                        let host = parsed.host_str()?.to_ascii_lowercase();
+                        matches!(parsed.scheme(), "http" | "https").then(|| {
+                            NetworkAccessRequirement::Origin {
+                                url: origin,
+                                origin: parsed.origin().ascii_serialization(),
+                                host,
+                            }
+                        })
+                    })
+                    .collect();
+            }
+
+            // Backward-compatible fallback for a directly constructed or
+            // persisted intent from before exact origins were bound.
+            return intent
+                .scope
+                .entries
+                .get("network_hosts")
+                .and_then(|hosts| serde_json::from_str::<Vec<String>>(hosts).ok())
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|host| {
+                    let host = host.trim().to_ascii_lowercase();
+                    if host.is_empty() {
+                        return None;
+                    }
+                    let url = if host.contains(':') && !host.starts_with('[') {
+                        format!("https://[{host}]/")
+                    } else {
+                        format!("https://{host}/")
+                    };
+                    Some(NetworkAccessRequirement::Origin {
+                        origin: Url::parse(url.as_str())
+                            .expect("generated HTTP origin must parse")
+                            .origin()
+                            .ascii_serialization(),
+                        url,
+                        host,
+                    })
+                })
+                .collect();
         }
         if let Some(url) = network_url_from_intent(intent)
             && let Ok(parsed) = Url::parse(url.as_str())
             && let Some(host) = parsed.host_str().map(|host| host.to_ascii_lowercase())
         {
-            return vec![NetworkAccessRequirement::Host { url, host }];
+            let origin = parsed.origin().ascii_serialization();
+            return vec![NetworkAccessRequirement::Origin { url, origin, host }];
         }
     }
 
@@ -1793,7 +2025,7 @@ fn missing_network_access_grants(
                     missing.push(NetworkAccessGrant::Enabled);
                 }
             }
-            NetworkAccessRequirement::Host { url, host } => {
+            NetworkAccessRequirement::Origin { url, origin, host } => {
                 match NetworkPolicyChecker::check_url(snapshot, url.as_str(), "network grant") {
                     crate::network_policy::NetworkPolicyDecision::Allowed(_) => {}
                     crate::network_policy::NetworkPolicyDecision::Denied(deny)
@@ -1803,7 +2035,10 @@ fn missing_network_access_grants(
                                 | NetworkPolicyDenyReason::HostNotAllowed
                         ) =>
                     {
-                        missing.push(NetworkAccessGrant::Host(host.clone()));
+                        missing.push(NetworkAccessGrant::Origin {
+                            origin: origin.clone(),
+                            host: host.clone(),
+                        });
                     }
                     crate::network_policy::NetworkPolicyDecision::Denied(_) => {}
                 }
@@ -1824,10 +2059,17 @@ fn network_access_permission_intent(
     let broad = grants
         .iter()
         .any(|grant| matches!(grant, NetworkAccessGrant::Enabled));
+    let origins = grants
+        .iter()
+        .filter_map(|grant| match grant {
+            NetworkAccessGrant::Origin { origin, .. } => Some(origin.clone()),
+            NetworkAccessGrant::Enabled => None,
+        })
+        .collect::<Vec<_>>();
     let hosts = grants
         .iter()
         .filter_map(|grant| match grant {
-            NetworkAccessGrant::Host(host) => Some(host.clone()),
+            NetworkAccessGrant::Origin { host, .. } => Some(host.clone()),
             NetworkAccessGrant::Enabled => None,
         })
         .collect::<Vec<_>>();
@@ -1841,9 +2083,26 @@ fn network_access_permission_intent(
     for (key, value) in &original_intent.scope.entries {
         if matches!(
             key.as_str(),
-            "url_origin" | "domain" | "method" | "server" | "tool"
+            "url_origin"
+                | "domain"
+                | "method"
+                | "server"
+                | "tool"
+                | "network_hosts"
+                | "network_origins"
         ) {
             scope.entries.insert(key.clone(), value.clone());
+        }
+    }
+    if !origins.is_empty() {
+        scope.entries.insert(
+            "network_origins".to_owned(),
+            serde_json::to_string(&origins).unwrap_or_else(|_| "[]".to_owned()),
+        );
+        if let Some(first) = origins.first() {
+            scope
+                .entries
+                .insert("network_origin".to_owned(), first.clone());
         }
     }
     if !hosts.is_empty() {
@@ -1863,7 +2122,7 @@ fn network_access_permission_intent(
         scope,
         summary: Some(format!(
             "grant {} network access for `{}`",
-            if broad { "enabled" } else { "host-scoped" },
+            if broad { "enabled" } else { "origin-scoped" },
             invocation.tool_name
         )),
     }
@@ -2110,17 +2369,25 @@ fn merge_network_policy_grants(
     }
 
     for grant in grants {
-        let NetworkAccessGrant::Host(host) = grant else {
+        let NetworkAccessGrant::Origin { origin, host } = grant else {
             continue;
         };
-        if is_localhost_network_host(host.as_str()) {
+        if is_localhost(host.as_str()) {
+            // The exact origin below remains the URL authorization. This flag
+            // only permits the policy DNS resolver to connect that approved
+            // localhost name to a loopback address.
             policy.allow_localhost = true;
-        } else if !policy
+        }
+        let exact_origin = format!("={origin}");
+        if !policy
             .allowed_domains
             .iter()
-            .any(|existing| existing.eq_ignore_ascii_case(host))
+            .any(|existing| existing.eq_ignore_ascii_case(exact_origin.as_str()))
         {
-            policy.allowed_domains.push(host.clone());
+            // Invocation grants authorize exactly the scheme, host, and
+            // effective port shown in the approval prompt. Configured domain
+            // rules retain their historical host-and-subdomain semantics.
+            policy.allowed_domains.push(exact_origin);
         }
     }
 }
@@ -2160,33 +2427,22 @@ fn merge_network_grants(existing: &mut Vec<NetworkAccessGrant>, incoming: &[Netw
         return;
     }
     for grant in incoming {
-        let NetworkAccessGrant::Host(host) = grant else {
+        let NetworkAccessGrant::Origin { origin, host } = grant else {
             continue;
         };
         if !existing.iter().any(|existing| match existing {
-            NetworkAccessGrant::Host(existing_host) => existing_host.eq_ignore_ascii_case(host),
+            NetworkAccessGrant::Origin {
+                origin: existing_origin,
+                ..
+            } => existing_origin.eq_ignore_ascii_case(origin),
             NetworkAccessGrant::Enabled => true,
         }) {
-            existing.push(NetworkAccessGrant::Host(host.clone()));
+            existing.push(NetworkAccessGrant::Origin {
+                origin: origin.clone(),
+                host: host.clone(),
+            });
         }
     }
-}
-
-fn is_localhost_network_host(host: &str) -> bool {
-    let normalized = host.trim().trim_matches(['[', ']']).to_ascii_lowercase();
-    normalized == "localhost"
-        || normalized.ends_with(".localhost")
-        || normalized.parse::<std::net::IpAddr>().is_ok_and(|ip| {
-            ip.is_loopback()
-                || ip.is_unspecified()
-                || match ip {
-                    std::net::IpAddr::V4(ip) => ip.is_private() || ip.is_link_local(),
-                    std::net::IpAddr::V6(ip) => {
-                        ((ip.segments()[0] & 0xfe00) == 0xfc00)
-                            || ((ip.segments()[0] & 0xffc0) == 0xfe80)
-                    }
-                }
-        })
 }
 
 fn access_rank(access: TurnFilesystemAccess) -> u8 {
@@ -2202,6 +2458,25 @@ fn writable_parent_root(path: &Path) -> PathBuf {
         .filter(|parent| !parent.as_os_str().is_empty())
         .map(Path::to_path_buf)
         .unwrap_or_else(|| path.to_path_buf())
+}
+
+fn filesystem_volume_root(path: &Path) -> Option<PathBuf> {
+    let mut root = PathBuf::new();
+    let mut rooted = false;
+    for component in path.components() {
+        match component {
+            std::path::Component::Prefix(_) => root.push(component.as_os_str()),
+            std::path::Component::RootDir => {
+                root.push(component.as_os_str());
+                rooted = true;
+                break;
+            }
+            std::path::Component::CurDir
+            | std::path::Component::ParentDir
+            | std::path::Component::Normal(_) => break,
+        }
+    }
+    rooted.then_some(root)
 }
 
 fn dedupe_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
@@ -2222,7 +2497,12 @@ fn normalize_path_lexically(path: PathBuf) -> PathBuf {
         match component {
             Component::CurDir => {}
             Component::ParentDir => {
-                normalized.pop();
+                if !matches!(
+                    normalized.components().next_back(),
+                    Some(Component::RootDir | Component::Prefix(_))
+                ) {
+                    normalized.pop();
+                }
             }
             Component::Normal(value) => normalized.push(value),
             Component::RootDir | Component::Prefix(_) => normalized.push(component.as_os_str()),
@@ -2292,7 +2572,18 @@ mod tests {
     struct NetworkSnapshotAssertHandler {
         calls: Arc<AtomicUsize>,
         required_url: Option<&'static str>,
+        denied_url: Option<&'static str>,
         expect_enabled: bool,
+    }
+
+    struct FunctionPayloadAssertHandler {
+        calls: Arc<AtomicUsize>,
+        expected_arguments: serde_json::Value,
+    }
+
+    struct ComputerUseApprovalBroker {
+        calls: Arc<AtomicUsize>,
+        expected_arguments: serde_json::Value,
     }
 
     impl ToolPermissionEvaluator for StaticEvaluator {
@@ -2371,6 +2662,33 @@ mod tests {
                     }
                 }
             }
+            if let Some(url) = self.denied_url {
+                assert!(
+                    matches!(
+                        NetworkPolicyChecker::check_url(snapshot, url, "test"),
+                        crate::network_policy::NetworkPolicyDecision::Denied(_)
+                    ),
+                    "origin-scoped runtime grant unexpectedly authorized `{url}`"
+                );
+            }
+            Ok(Box::new(FunctionToolOutput::new("ok", true)))
+        }
+    }
+
+    #[async_trait]
+    impl ToolHandler for FunctionPayloadAssertHandler {
+        async fn handle(
+            &self,
+            invocation: ToolInvocation,
+            _trace: crate::events::ToolEventTrace,
+        ) -> Result<Box<dyn crate::context::ToolOutput>, ToolError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            match invocation.payload {
+                ToolPayload::Function { arguments } => {
+                    assert_eq!(arguments, self.expected_arguments);
+                }
+                payload => panic!("expected function payload, got {payload:?}"),
+            }
             Ok(Box::new(FunctionToolOutput::new("ok", true)))
         }
     }
@@ -2387,6 +2705,34 @@ mod tests {
         ) -> PermissionApprovalResolution {
             self.calls.fetch_add(1, Ordering::SeqCst);
             self.resolution.clone()
+        }
+    }
+
+    #[async_trait]
+    impl PermissionApprovalBroker for ComputerUseApprovalBroker {
+        async fn request_approval(
+            &self,
+            _context: &PermissionEvaluationContext,
+            invocation: &ToolInvocation,
+            intent: &PermissionIntent,
+            _key: &PermissionRequestKey,
+            reason: PermissionDecisionReason,
+        ) -> PermissionApprovalResolution {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(intent.action, PermissionActionKind::ComputerUse);
+            assert_eq!(reason, PermissionDecisionReason::PolicyRequiresApproval);
+            assert_eq!(
+                intent.scope.entries.get("action").map(String::as_str),
+                Some("act")
+            );
+            assert!(intent.scope.entries.contains_key("payload_hash"));
+            match &invocation.payload {
+                ToolPayload::Function { arguments } => {
+                    assert_eq!(arguments, &self.expected_arguments);
+                }
+                payload => panic!("expected function payload, got {payload:?}"),
+            }
+            PermissionApprovalResolution::AllowOnce
         }
     }
 
@@ -2483,6 +2829,7 @@ mod tests {
             recovery: crate::spec::ToolRecoveryMetadata::default(),
             permission_metadata: crate::spec::ToolPermissionMetadata::default(),
             execution_security_snapshot: None,
+            apply_patch_preflight: None,
             cancellation: tokio_util::sync::CancellationToken::new(),
         }
     }
@@ -2629,7 +2976,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn file_read_approval_cannot_widen_immutable_filesystem_authority() {
+    async fn file_read_outside_initial_sandbox_prompts_and_applies_bounded_grant() {
         let base = temp_path("file-read-grant");
         let workspace = base.join("backend");
         let frontend = base.join("frontend");
@@ -2675,37 +3022,74 @@ mod tests {
 
         let trace =
             crate::events::ToolEventBus::default().start_trace("turn", "call_1", "read_file");
-        let error = orchestrator
+        orchestrator
             .run_with_context(&registry, invocation, &trace, &context)
             .await
-            .err()
-            .expect("approval must not widen filesystem authority");
+            .expect("approved read should receive invocation-scoped filesystem access");
 
-        assert!(
-            matches!(error, ToolError::Rejected(message) if message.contains("outside the immutable execution authority"))
-        );
-        assert_eq!(broker_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(handler_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(broker_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(handler_calls.load(Ordering::SeqCst), 1);
         let _ = std::fs::remove_dir_all(base);
     }
 
     #[tokio::test]
-    async fn file_write_approval_cannot_widen_immutable_filesystem_authority() {
-        let base = temp_path("file-write-grant");
-        let workspace = base.join("backend");
-        let frontend = base.join("frontend");
-        std::fs::create_dir_all(workspace.as_path()).expect("workspace should create");
-        std::fs::create_dir_all(frontend.as_path()).expect("frontend should create");
-        let file = frontend.join("package.json");
-
-        let handler_calls = Arc::new(AtomicUsize::new(0));
-        let handler = Arc::new(SnapshotAssertHandler {
-            calls: handler_calls.clone(),
-            required_path: file.clone(),
-            operation: FilePolicyOperation::Write,
+    async fn supervised_computer_use_prompt_dispatches_exact_payload_once() {
+        let arguments = serde_json::json!({
+            "action": "act",
+            "session_id": 42,
+            "act": {
+                "type": "input",
+                "text": "exact payload must survive approval",
+                "target": { "node_id": "field-1" }
+            }
         });
-        let registry =
-            registry_with_named_handlers([("write_file", handler as Arc<dyn ToolHandler>)]);
+        let handler_calls = Arc::new(AtomicUsize::new(0));
+        let approval_calls = Arc::new(AtomicUsize::new(0));
+        let registry = registry_with_named_handlers([(
+            "computer_use",
+            Arc::new(FunctionPayloadAssertHandler {
+                calls: handler_calls.clone(),
+                expected_arguments: arguments.clone(),
+            }) as Arc<dyn ToolHandler>,
+        )]);
+        let orchestrator = ToolOrchestrator::with_approval_broker(
+            OrchestratorPolicy::default(),
+            Arc::new(ComputerUseApprovalBroker {
+                calls: approval_calls.clone(),
+                expected_arguments: arguments.clone(),
+            }),
+        );
+        let context = PermissionEvaluationContext::for_turn(
+            "workspace_test",
+            "thread_test",
+            "turn",
+            pioneer_protocol::TurnPermissionProfileSnapshot::from_mode(
+                pioneer_protocol::TurnPermissionMode::Supervised,
+                pioneer_protocol::TurnPermissionProfileSource::Composer,
+            ),
+        );
+        let invocation = invocation_for_tool("computer_use", ToolPayload::Function { arguments });
+        let trace =
+            crate::events::ToolEventBus::default().start_trace("turn", "call_1", "computer_use");
+
+        orchestrator
+            .run_with_context(&registry, invocation, &trace, &context)
+            .await
+            .expect("approved computer-use invocation should dispatch once");
+
+        assert_eq!(approval_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(handler_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn supervised_apply_patch_prompts_then_creates_missing_grant_root() {
+        let workspace = temp_path("supervised-apply-patch");
+        std::fs::create_dir_all(workspace.as_path()).expect("workspace should create");
+        let target = workspace.join("new").join("nested").join("approved.txt");
+        let registry = registry_with_named_handlers([(
+            "apply_patch",
+            Arc::new(crate::handlers::ApplyPatchHandler) as Arc<dyn ToolHandler>,
+        )]);
         let broker_calls = Arc::new(AtomicUsize::new(0));
         let orchestrator = ToolOrchestrator::with_approval_broker(
             OrchestratorPolicy::default(),
@@ -2723,41 +3107,55 @@ mod tests {
                 pioneer_protocol::TurnPermissionProfileSource::Composer,
             ),
         );
-        let invocation = with_execution_security_snapshot(
+        let mut invocation = with_execution_security_snapshot(
             invocation_for_tool(
-                "write_file",
+                "apply_patch",
                 ToolPayload::Function {
                     arguments: serde_json::json!({
-                        "path": file.display().to_string(),
-                        "content": "{}",
+                        "patch": "*** Begin Patch\n*** Add File: new/nested/approved.txt\n+approved\n*** End Patch"
                     }),
                 },
             ),
             read_only_snapshot(workspace.as_path()),
         );
+        invocation.workdir = workspace.clone();
+        let identity = crate::apply_patch::history::InvocationIdentity::new(
+            "thread_test",
+            "turn",
+            "call_apply_patch",
+        )
+        .expect("native patch identity should be valid");
+        let observer = Arc::new(crate::apply_patch::DurableCommitObserver::default());
+        assert!(crate::events::register_native_patch_observer(
+            &identity, observer
+        ));
+        let trace = crate::events::ToolEventBus::with_thread_id(16, "thread_test").start_trace(
+            "turn",
+            "call_apply_patch",
+            "apply_patch",
+        );
 
-        let trace =
-            crate::events::ToolEventBus::default().start_trace("turn", "call_1", "write_file");
-        let error = orchestrator
+        let result = orchestrator
             .run_with_context(&registry, invocation, &trace, &context)
             .await
-            .err()
-            .expect("approval must not widen filesystem authority");
+            .expect("approved supervised patch should return its canonical result");
+        crate::events::unregister_native_patch_observer(&identity);
 
         assert!(
-            matches!(error, ToolError::Rejected(message) if message.contains("outside the immutable execution authority"))
+            result.success(),
+            "unexpected patch output: {}",
+            result.raw_output_text()
         );
         assert_eq!(
-            broker_calls.load(Ordering::SeqCst),
-            1,
-            "file write approval must still remain bounded by immutable filesystem authority"
+            std::fs::read_to_string(target.as_path()).expect("approved file should be written"),
+            "approved"
         );
-        assert_eq!(handler_calls.load(Ordering::SeqCst), 0);
-        let _ = std::fs::remove_dir_all(base);
+        assert_eq!(broker_calls.load(Ordering::SeqCst), 1);
+        let _ = std::fs::remove_dir_all(workspace);
     }
 
     #[tokio::test]
-    async fn shell_approval_cannot_widen_immutable_cwd_authority() {
+    async fn shell_approval_applies_cwd_and_network_grants_before_dispatch() {
         let base = temp_path("shell-cwd-grant");
         let workspace = base.join("backend");
         let frontend = base.join("frontend");
@@ -2806,26 +3204,99 @@ mod tests {
 
         let trace =
             crate::events::ToolEventBus::default().start_trace("turn", "call_1", "exec_command");
-        let error = orchestrator
+        orchestrator
             .run_with_context(&registry, invocation, &trace, &context)
             .await
-            .err()
-            .expect("approval must not widen cwd authority");
+            .expect("approved shell should receive invocation-scoped cwd and network access");
 
-        assert!(
-            matches!(error, ToolError::Rejected(message) if message.contains("outside the immutable execution authority"))
-        );
         assert_eq!(
             broker_calls.load(Ordering::SeqCst),
             1,
-            "shell action approval should also cover the cwd filesystem grant"
+            "one shell approval should cover the exact invocation capabilities"
         );
-        assert_eq!(handler_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(handler_calls.load(Ordering::SeqCst), 1);
         let _ = std::fs::remove_dir_all(base);
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn approved_supervised_shell_runs_once_with_exact_invocation_authority() {
+        if !nono::Sandbox::is_supported() {
+            return;
+        }
+
+        let current = std::env::current_dir().expect("test cwd");
+        let temp = tempfile::tempdir_in(current).expect("shell fixture");
+        let workspace = temp.path().join("workspace");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(workspace.as_path()).expect("workspace");
+        std::fs::create_dir_all(outside.as_path()).expect("outside");
+        let source = outside.join("approved-source.txt");
+        let destination = workspace.join("approved-copy.txt");
+        std::fs::write(source.as_path(), "approved\n").expect("source fixture");
+
+        let registry = registry_with_named_handlers([(
+            "exec_command",
+            Arc::new(crate::handlers::UnifiedExecHandler::default()) as Arc<dyn ToolHandler>,
+        )]);
+        let broker_calls = Arc::new(AtomicUsize::new(0));
+        let orchestrator = ToolOrchestrator::with_approval_broker(
+            OrchestratorPolicy::default(),
+            Arc::new(CountingApprovalBroker {
+                calls: broker_calls.clone(),
+                resolution: PermissionApprovalResolution::AllowOnce,
+            }),
+        );
+        let context = PermissionEvaluationContext::for_turn(
+            "workspace_test",
+            "thread_test",
+            "turn",
+            pioneer_protocol::TurnPermissionProfileSnapshot::from_mode(
+                pioneer_protocol::TurnPermissionMode::Supervised,
+                pioneer_protocol::TurnPermissionProfileSource::Composer,
+            ),
+        );
+        let mut invocation = with_execution_security_snapshot(
+            invocation_for_tool(
+                "exec_command",
+                ToolPayload::LocalShell(LocalShellPayload::ExecCommand(ExecCommandArgs {
+                    command: Some(vec![
+                        "/bin/cp".to_owned(),
+                        source.to_string_lossy().into_owned(),
+                        destination.to_string_lossy().into_owned(),
+                    ]),
+                    workdir: None,
+                    timeout_ms: Some(10_000),
+                    max_output_tokens: Some(1_000),
+                    yield_time_ms: None,
+                    tty: Some(false),
+                })),
+            ),
+            read_only_snapshot(workspace.as_path()),
+        );
+        invocation.workdir = workspace.clone();
+        let trace =
+            crate::events::ToolEventBus::default().start_trace("turn", "call_1", "exec_command");
+
+        let result = orchestrator
+            .run_with_context(&registry, invocation, &trace, &context)
+            .await
+            .expect("approved supervised shell should dispatch");
+
+        assert!(
+            result.success(),
+            "unexpected shell output: {}",
+            result.raw_output_text()
+        );
+        assert_eq!(broker_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            std::fs::read_to_string(destination).expect("approved copy"),
+            "approved\n"
+        );
+    }
+
     #[test]
-    fn shell_without_explicit_workdir_does_not_expand_filesystem_write_access() {
+    fn shell_without_explicit_workdir_requests_resolved_cwd_and_network_access() {
         let mut invocation = invocation_for_tool(
             "exec_command",
             ToolPayload::LocalShell(LocalShellPayload::ExecCommand(ExecCommandArgs {
@@ -2838,18 +3309,41 @@ mod tests {
             })),
         );
         invocation.workdir = PathBuf::from("/");
+        invocation =
+            with_execution_security_snapshot(invocation, read_only_snapshot(Path::new("/")));
         let intent = extract_permission_intent(&invocation);
 
-        assert!(filesystem_access_requirements(&invocation, &intent).is_empty());
+        assert_eq!(
+            filesystem_access_requirements(&invocation, &intent),
+            vec![FilesystemAccessRequirement {
+                requested_path: PathBuf::from("/"),
+                grant_root: PathBuf::from("/"),
+                operation: FilePolicyOperation::Write,
+                grant_access: TurnFilesystemAccess::Write,
+            }]
+        );
+        assert_eq!(
+            network_access_requirements(&invocation, &intent),
+            vec![NetworkAccessRequirement::Enabled]
+        );
+
+        let mut capped = invocation.clone();
+        let snapshot = capped
+            .execution_security_snapshot
+            .as_mut()
+            .expect("shell test snapshot");
+        snapshot.authority_cap.filesystem = snapshot.sandbox.filesystem.clone();
+        snapshot.authority_cap.network = TurnNetworkPolicySnapshot::disabled();
+        assert!(filesystem_access_requirements(&capped, &intent).is_empty());
+        assert!(network_access_requirements(&capped, &intent).is_empty());
     }
 
     #[tokio::test]
-    async fn download_approval_cannot_widen_immutable_destination_authority() {
+    async fn download_approval_applies_destination_and_network_grants() {
         let base = temp_path("download-destination-grant");
         let workspace = base.join("backend");
         let downloads = base.join("downloads");
         std::fs::create_dir_all(workspace.as_path()).expect("workspace should create");
-        std::fs::create_dir_all(downloads.as_path()).expect("downloads should create");
         let destination = downloads.join("archive.tgz");
 
         let handler_calls = Arc::new(AtomicUsize::new(0));
@@ -2892,26 +3386,22 @@ mod tests {
 
         let trace =
             crate::events::ToolEventBus::default().start_trace("turn", "call_1", "download_url");
-        let error = orchestrator
+        orchestrator
             .run_with_context(&registry, invocation, &trace, &context)
             .await
-            .err()
-            .expect("approval must not widen destination authority");
+            .expect("approved download should receive destination and network access");
 
-        assert!(
-            matches!(error, ToolError::Rejected(message) if message.contains("outside the immutable execution authority"))
-        );
         assert_eq!(
             broker_calls.load(Ordering::SeqCst),
             1,
-            "network approval should also cover the destination filesystem grant"
+            "network tool approval should cover its exact destination grant"
         );
-        assert_eq!(handler_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(handler_calls.load(Ordering::SeqCst), 1);
         let _ = std::fs::remove_dir_all(base);
     }
 
     #[tokio::test]
-    async fn web_fetch_approval_cannot_widen_immutable_network_authority() {
+    async fn web_fetch_approval_applies_origin_scoped_network_grant() {
         let workspace = temp_path("web-fetch-network-grant");
         std::fs::create_dir_all(workspace.as_path()).expect("workspace should create");
 
@@ -2919,6 +3409,7 @@ mod tests {
         let handler = Arc::new(NetworkSnapshotAssertHandler {
             calls: handler_calls.clone(),
             required_url: Some("https://example.com/docs"),
+            denied_url: Some("https://example.com:8443/docs"),
             expect_enabled: false,
         });
         let registry =
@@ -2952,30 +3443,27 @@ mod tests {
 
         let trace =
             crate::events::ToolEventBus::default().start_trace("turn", "call_1", "web_fetch");
-        let error = orchestrator
+        orchestrator
             .run_with_context(&registry, invocation, &trace, &context)
             .await
-            .err()
-            .expect("approval must not widen network authority");
+            .expect("approved fetch should receive host-scoped network access");
 
-        assert!(
-            matches!(error, ToolError::Rejected(message) if message.contains("outside the immutable execution authority"))
-        );
         assert_eq!(broker_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(handler_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(handler_calls.load(Ordering::SeqCst), 1);
         let _ = std::fs::remove_dir_all(workspace);
     }
 
     #[tokio::test]
-    async fn web_search_approval_cannot_widen_immutable_network_authority() {
+    async fn web_search_approval_applies_network_grant() {
         let workspace = temp_path("web-search-network-grant");
         std::fs::create_dir_all(workspace.as_path()).expect("workspace should create");
 
         let handler_calls = Arc::new(AtomicUsize::new(0));
         let handler = Arc::new(NetworkSnapshotAssertHandler {
             calls: handler_calls.clone(),
-            required_url: None,
-            expect_enabled: true,
+            required_url: Some("https://duckduckgo.com/html/"),
+            denied_url: Some("https://unrelated.example/"),
+            expect_enabled: false,
         });
         let registry =
             registry_with_named_handlers([("web_search", handler as Arc<dyn ToolHandler>)]);
@@ -3008,22 +3496,18 @@ mod tests {
 
         let trace =
             crate::events::ToolEventBus::default().start_trace("turn", "call_1", "web_search");
-        let error = orchestrator
+        orchestrator
             .run_with_context(&registry, invocation, &trace, &context)
             .await
-            .err()
-            .expect("approval must not widen network authority");
+            .expect("approved search should receive network access");
 
-        assert!(
-            matches!(error, ToolError::Rejected(message) if message.contains("outside the immutable execution authority"))
-        );
         assert_eq!(broker_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(handler_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(handler_calls.load(Ordering::SeqCst), 1);
         let _ = std::fs::remove_dir_all(workspace);
     }
 
     #[tokio::test]
-    async fn mcp_network_policy_denial_precedes_approval_and_does_not_widen_sandbox() {
+    async fn mcp_network_policy_runs_after_approval_grant_is_installed() {
         let workspace = temp_path("mcp-network-grant");
         std::fs::create_dir_all(workspace.as_path()).expect("workspace should create");
 
@@ -3031,7 +3515,8 @@ mod tests {
         let handler = Arc::new(NetworkSnapshotAssertHandler {
             calls: handler_calls.clone(),
             required_url: None,
-            expect_enabled: false,
+            denied_url: None,
+            expect_enabled: true,
         });
         let registry =
             registry_with_named_handlers([("mcp.example", handler as Arc<dyn ToolHandler>)]);
@@ -3069,25 +3554,18 @@ mod tests {
 
         let trace =
             crate::events::ToolEventBus::default().start_trace("turn", "call_1", "mcp.example");
-        let result = orchestrator
+        orchestrator
             .run_with_context(&registry, invocation, &trace, &context)
-            .await;
-        let error = match result {
-            Ok(_) => panic!("MCP approval must not widen the frozen network sandbox"),
-            Err(error) => error,
-        };
+            .await
+            .expect("approved open-world MCP call should receive bounded network access");
 
-        assert!(
-            matches!(error, ToolError::Rejected(ref message) if message.contains("network is disabled")),
-            "unexpected error: {error}"
-        );
-        assert_eq!(broker_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(handler_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(broker_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(handler_calls.load(Ordering::SeqCst), 1);
         let _ = std::fs::remove_dir_all(workspace);
     }
 
     #[tokio::test]
-    async fn cached_turn_approval_cannot_widen_immutable_filesystem_authority() {
+    async fn cached_turn_filesystem_grant_is_reused_only_for_the_same_capability() {
         let base = temp_path("file-read-grant-cache");
         let workspace = base.join("backend");
         let frontend = base.join("frontend");
@@ -3136,18 +3614,14 @@ mod tests {
             );
             let trace =
                 crate::events::ToolEventBus::default().start_trace("turn", call_id, "read_file");
-            let error = orchestrator
+            orchestrator
                 .run_with_context(&registry, invocation, &trace, &context)
                 .await
-                .err()
-                .expect("cached approval must not widen filesystem authority");
-            assert!(
-                matches!(error, ToolError::Rejected(message) if message.contains("outside the immutable execution authority"))
-            );
+                .expect("turn-scoped exact filesystem grant should be reusable");
         }
 
-        assert_eq!(broker_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(handler_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(broker_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(handler_calls.load(Ordering::SeqCst), 2);
         let _ = std::fs::remove_dir_all(base);
     }
 
@@ -3162,8 +3636,9 @@ mod tests {
                 "web_search",
                 Arc::new(NetworkSnapshotAssertHandler {
                     calls: web_calls.clone(),
-                    required_url: None,
-                    expect_enabled: true,
+                    required_url: Some("https://duckduckgo.com/html/"),
+                    denied_url: Some("https://unrelated.example/"),
+                    expect_enabled: false,
                 }) as Arc<dyn ToolHandler>,
             ),
             (
@@ -3171,14 +3646,16 @@ mod tests {
                 Arc::new(NetworkSnapshotAssertHandler {
                     calls: shell_calls.clone(),
                     required_url: None,
-                    expect_enabled: false,
+                    denied_url: None,
+                    expect_enabled: true,
                 }) as Arc<dyn ToolHandler>,
             ),
         ]);
+        let broker_calls = Arc::new(AtomicUsize::new(0));
         let orchestrator = ToolOrchestrator::with_approval_broker(
             OrchestratorPolicy::default(),
             Arc::new(CountingApprovalBroker {
-                calls: Arc::new(AtomicUsize::new(0)),
+                calls: broker_calls.clone(),
                 resolution: PermissionApprovalResolution::AllowForTurn,
             }),
         );
@@ -3192,8 +3669,7 @@ mod tests {
             ),
         );
 
-        let mut network_cap_snapshot = read_only_snapshot(workspace.as_path());
-        network_cap_snapshot.authority_cap.network = TurnNetworkPolicySnapshot::enabled();
+        let network_cap_snapshot = read_only_snapshot(workspace.as_path());
 
         let web_invocation = with_execution_security_snapshot(
             invocation_for_tool(
@@ -3236,15 +3712,20 @@ mod tests {
         orchestrator
             .run_with_context(&registry, shell_invocation, &shell_trace, &context)
             .await
-            .expect("shell invocation should run with its original network snapshot");
+            .expect("shell invocation should receive its own approved network grant");
 
         assert_eq!(web_calls.load(Ordering::SeqCst), 1);
         assert_eq!(shell_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            broker_calls.load(Ordering::SeqCst),
+            2,
+            "a web grant must not become ambient authority for a later shell"
+        );
         let _ = std::fs::remove_dir_all(workspace);
     }
 
     #[tokio::test]
-    async fn retries_once_with_escalated_sandbox_on_permission_error() {
+    async fn legacy_escalation_flag_never_replays_a_permission_error() {
         let calls = Arc::new(AtomicUsize::new(0));
         let handler = Arc::new(CountingHandler {
             calls: calls.clone(),
@@ -3261,8 +3742,8 @@ mod tests {
         let result = orchestrator
             .run_with_context(&registry, invocation(), &trace, &context)
             .await;
-        assert!(result.is_ok());
-        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(matches!(result, Err(ToolError::ExecutionFailed(_))));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -3317,6 +3798,110 @@ mod tests {
             .await;
         assert!(matches!(result, Err(ToolError::Rejected(_))));
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn apply_patch_permission_deny_is_a_canonical_v1_result_without_dispatch() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let handler: Arc<dyn ToolHandler> = Arc::new(CountingHandler {
+            calls: calls.clone(),
+            first_error: None,
+            success_text: "unexpected",
+        });
+        let registry = registry_with_named_handlers([("apply_patch", handler)]);
+        let orchestrator = ToolOrchestrator::with_permission_evaluator(
+            OrchestratorPolicy::default(),
+            PostExecutionPolicy::default(),
+            Arc::new(StaticEvaluator {
+                decision: PermissionDecision::Deny {
+                    reason: PermissionDecisionReason::PolicyDeniesAction,
+                    message: "denied for test".to_owned(),
+                },
+            }),
+        );
+        let invocation = with_execution_security_snapshot(
+            invocation_for_tool(
+                "apply_patch",
+                ToolPayload::Function {
+                    arguments: serde_json::json!({
+                        "patch": "*** Begin Patch\n*** Add File: denied.txt\n+denied\n*** End Patch"
+                    }),
+                },
+            ),
+            TurnExecutionSecuritySnapshot::unrestricted_full_access(".", 1),
+        );
+        let trace =
+            crate::events::ToolEventBus::default().start_trace("turn", "call_1", "apply_patch");
+        let context = default_test_permission_context();
+
+        let result = orchestrator
+            .run_with_context(&registry, invocation, &trace, &context)
+            .await
+            .expect("permission denial must be represented by the v1 tool contract");
+        let payload = result.raw_output_json();
+
+        assert!(!result.success());
+        assert_eq!(payload["schema_version"], 1);
+        assert_eq!(payload["status"], "rejected");
+        assert_eq!(payload["exact"], true);
+        assert_eq!(payload["changed_files"], serde_json::json!([]));
+        assert_eq!(payload["error"]["stage"], "authorize");
+        assert_eq!(payload["error"]["code"], "permission_denied");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn rejected_apply_patch_preflight_does_not_request_useless_approval() {
+        let request_key = PermissionRequestKey {
+            profile_mode: pioneer_protocol::TurnPermissionMode::Supervised,
+            tool_name: "apply_patch".to_owned(),
+            action: PermissionActionKind::FileWrite,
+            normalized_scope_hash: "malformed_patch".to_owned(),
+            turn_id: "turn".to_owned(),
+        };
+        let broker_calls = Arc::new(AtomicUsize::new(0));
+        let orchestrator = ToolOrchestrator::with_permission_evaluator_and_approval_broker(
+            OrchestratorPolicy::default(),
+            PostExecutionPolicy::default(),
+            Arc::new(StaticEvaluator {
+                decision: PermissionDecision::Ask {
+                    key: request_key,
+                    reason: PermissionDecisionReason::PolicyRequiresApproval,
+                },
+            }),
+            Arc::new(CountingApprovalBroker {
+                calls: broker_calls.clone(),
+                resolution: PermissionApprovalResolution::AllowOnce,
+            }),
+        );
+        let invocation = with_execution_security_snapshot(
+            invocation_for_tool(
+                "apply_patch",
+                ToolPayload::Function {
+                    arguments: serde_json::json!({
+                        "patch": "*** Add File: invalid.txt\n+invalid"
+                    }),
+                },
+            ),
+            TurnExecutionSecuritySnapshot::unrestricted_full_access(".", 1),
+        );
+        let trace = crate::events::ToolEventBus::default().start_trace(
+            "turn",
+            "call_invalid_patch",
+            "apply_patch",
+        );
+
+        let grant = orchestrator
+            .evaluate_permission(&invocation, &default_test_permission_context(), &trace)
+            .await
+            .expect("a sealed rejected preflight needs no approval");
+
+        assert!(matches!(
+            grant.apply_patch_preflight,
+            Some(ApplyPatchPreflight::Rejected(_))
+        ));
+        assert_eq!(grant.intent.action, PermissionActionKind::FileWrite);
+        assert_eq!(broker_calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -3697,6 +4282,93 @@ mod tests {
             broker_calls.load(Ordering::SeqCst),
             1,
             "write_stdin should reuse the exec_command allow-for-turn request key"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_stdin_does_not_promote_allow_once_to_session_or_turn_authority() {
+        let handler_calls = Arc::new(AtomicUsize::new(0));
+        let handler = Arc::new(StaticJsonHandler {
+            calls: handler_calls.clone(),
+            payload: serde_json::json!({
+                "exit_code": null,
+                "timed_out": false,
+                "duration_ms": 1,
+                "stdout": "",
+                "stderr": "",
+                "aggregated_output": "",
+                "truncated": {
+                    "stdout": false,
+                    "stderr": false,
+                    "aggregated_output": false
+                },
+                "session_id": 42,
+                "command": ["bash"]
+            }),
+        });
+        let registry = registry_with_named_handlers([
+            ("exec_command", handler.clone() as Arc<dyn ToolHandler>),
+            ("write_stdin", handler.clone() as Arc<dyn ToolHandler>),
+        ]);
+        let broker_calls = Arc::new(AtomicUsize::new(0));
+        let orchestrator = ToolOrchestrator::with_approval_broker(
+            OrchestratorPolicy::default(),
+            Arc::new(CountingApprovalBroker {
+                calls: broker_calls.clone(),
+                resolution: PermissionApprovalResolution::AllowOnce,
+            }),
+        );
+        let context = PermissionEvaluationContext::for_turn(
+            "workspace_test",
+            "thread_test",
+            "turn",
+            pioneer_protocol::TurnPermissionProfileSnapshot::from_mode(
+                pioneer_protocol::TurnPermissionMode::Supervised,
+                pioneer_protocol::TurnPermissionProfileSource::Composer,
+            ),
+        );
+
+        let exec_invocation = invocation_for_tool(
+            "exec_command",
+            ToolPayload::LocalShell(LocalShellPayload::ExecCommand(ExecCommandArgs {
+                command: Some(vec!["bash".to_owned()]),
+                workdir: None,
+                timeout_ms: None,
+                max_output_tokens: None,
+                yield_time_ms: None,
+                tty: Some(true),
+            })),
+        );
+        let trace =
+            crate::events::ToolEventBus::default().start_trace("turn", "call_1", "exec_command");
+        orchestrator
+            .run_with_context(&registry, exec_invocation, &trace, &context)
+            .await
+            .expect("one-time-approved exec_command should dispatch");
+
+        for (call_id, chars) in [("call_2", "echo first\n"), ("call_3", "echo second\n")] {
+            let write_invocation = invocation_for_tool(
+                "write_stdin",
+                ToolPayload::LocalShell(LocalShellPayload::WriteStdin(WriteStdinArgs {
+                    session_id: 42,
+                    chars: Some(chars.to_owned()),
+                    yield_time_ms: None,
+                    max_output_tokens: None,
+                })),
+            );
+            let trace =
+                crate::events::ToolEventBus::default().start_trace("turn", call_id, "write_stdin");
+            orchestrator
+                .run_with_context(&registry, write_invocation, &trace, &context)
+                .await
+                .expect("each one-time-approved write_stdin should dispatch");
+        }
+
+        assert_eq!(handler_calls.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            broker_calls.load(Ordering::SeqCst),
+            3,
+            "allow-once must authorize one interaction, not the remaining TTY session"
         );
     }
 

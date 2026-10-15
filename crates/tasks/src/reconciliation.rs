@@ -3,18 +3,22 @@ use crate::event_bus::TaskEventBus;
 use crate::executor::{TaskExecutionContext, TaskExecutionHandle, TaskExecutorRegistry};
 use crate::projector::TaskProjector;
 use crate::scheduler::{TASK_EXECUTION_LEASE_SECONDS, TaskSchedulerHandle};
-use anyhow::Context;
-use pioneer_crud::CrudStore;
-use pioneer_protocol::{
-    TaskEventPayload, TaskOccurrenceStatus, TaskRun, TaskRunStatus, TaskTriggerStatus, generate_id,
+use crate::task_boundary::task_fresh_task;
+use pioneer_crud::{
+    CrudStore, TaskOccurrenceClaimDeferral, TaskOccurrenceClaimFailure,
+    TaskOccurrenceTerminalRepairOutcome,
 };
+use pioneer_protocol::{TaskEventPayload, TaskRun, TaskRunStatus, TaskTriggerStatus, generate_id};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::sync::Mutex;
 use tracing::warn;
 
 const DORMANT_TRIGGER_RECOVERY_MESSAGE: &str =
     "active trigger has no next_fire_at; scheduler will keep it dormant";
 const DISPATCHABLE_RUN_RECOVERY_MESSAGE: &str = "queued run is dispatchable after startup";
 const ID_LEN: usize = 21;
+const OCCURRENCE_STORAGE_BACKOFF: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ReconciliationReport {
@@ -24,6 +28,8 @@ pub struct ReconciliationReport {
     pub running_runs: usize,
     pub waiting_review_runs: usize,
     pub recovered_events: usize,
+    pub terminal_occurrence_mismatches: usize,
+    pub repaired_terminal_occurrences: usize,
 }
 
 pub struct TaskStartupReconciler {
@@ -32,6 +38,7 @@ pub struct TaskStartupReconciler {
     event_bus: Arc<TaskEventBus>,
     executors: Arc<TaskExecutorRegistry>,
     scheduler: TaskSchedulerHandle,
+    terminal_occurrence_retry_at: Mutex<Option<Instant>>,
 }
 
 impl TaskStartupReconciler {
@@ -41,6 +48,7 @@ impl TaskStartupReconciler {
         executors: Arc<TaskExecutorRegistry>,
         scheduler: TaskSchedulerHandle,
     ) -> Self {
+        let store = Arc::new(store.with_maintenance_access());
         let projector = TaskProjector::new(store.clone());
         Self {
             store,
@@ -48,6 +56,7 @@ impl TaskStartupReconciler {
             event_bus,
             executors,
             scheduler,
+            terminal_occurrence_retry_at: Mutex::new(None),
         }
     }
 
@@ -114,6 +123,9 @@ impl TaskStartupReconciler {
             }
         }
 
+        let (terminal_occurrence_mismatch_count, repaired_terminal_occurrences) =
+            self.reconcile_terminal_occurrences(now).await?;
+
         self.scheduler.wake();
         Ok(ReconciliationReport {
             active_triggers: active_triggers.len(),
@@ -122,7 +134,104 @@ impl TaskStartupReconciler {
             running_runs: running_runs.len(),
             waiting_review_runs: waiting_review_runs.len(),
             recovered_events,
+            terminal_occurrence_mismatches: terminal_occurrence_mismatch_count,
+            repaired_terminal_occurrences,
         })
+    }
+
+    async fn reconcile_terminal_occurrences(&self, now: i64) -> TaskRuntimeResult<(usize, usize)> {
+        // This mutex only serializes quanta/backoff; it retains no DB capacity.
+        // Durable locators, claims and checkpoints survive cancellation/restart.
+        let mut retry_at = self.terminal_occurrence_retry_at.lock().await;
+        if retry_at.is_some_and(|deadline| deadline > Instant::now()) {
+            return Ok((0, 0));
+        }
+        let clock = || chrono::Utc::now().timestamp();
+        // Fixed fair quotas: scope <=16 inputs, seed <=16, due runs <=32.
+        // Bookkeeping failures don't prevent this pass's healthy run checks.
+        let mut storage_error = false;
+        if self
+            .store
+            .expand_task_occurrence_scope(&clock)
+            .await
+            .is_err()
+        {
+            storage_error = true;
+            warn!(
+                failure_class = "task_occurrence_scope_storage_failed",
+                "Task occurrence scope expansion failed"
+            );
+        }
+        if self
+            .store
+            .seed_unfinished_task_occurrences(&clock)
+            .await
+            .is_err()
+        {
+            storage_error = true;
+            warn!(
+                failure_class = "task_occurrence_seed_storage_failed",
+                "Task occurrence seed failed"
+            );
+        }
+        let candidates = match self.store.discover_task_occurrence_reconcile(clock()).await {
+            Ok(candidates) => candidates,
+            Err(error) => {
+                *retry_at = Some(Instant::now() + OCCURRENCE_STORAGE_BACKOFF);
+                return Err(error);
+            }
+        };
+        let mut changed = 0;
+        for candidate in candidates {
+            let store = self.store.clone();
+            // Reuse the owned/abort-on-drop task boundary. A candidate panic or
+            // storage failure cannot abort the rest of the selected quantum.
+            let outcome = task_fresh_task(
+                async move {
+                    let Some(claim) = store
+                        .claim_task_occurrence_reconcile(&candidate, &|| {
+                            chrono::Utc::now().timestamp()
+                        })
+                        .await?
+                    else {
+                        return Ok(TaskOccurrenceTerminalRepairOutcome::StaleClaim);
+                    };
+                    store.reconcile_claimed_task_occurrence(&claim, now).await
+                },
+                "Task occurrence repair task did not finish",
+            )
+            .await;
+            match outcome {
+                Ok(TaskOccurrenceTerminalRepairOutcome::Changed) => {
+                    changed += 1;
+                    warn!(
+                        failure_class = "task_terminal_occurrence_mismatch_repaired",
+                        "repaired terminal Task occurrence projection mismatch"
+                    );
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    // Claim errors already attempted an exact-snapshot durable
+                    // deferral. If storage prevented it, also delay the worker.
+                    storage_error |= error
+                        .downcast_ref::<TaskOccurrenceClaimFailure>()
+                        .is_none_or(|failure| {
+                            matches!(
+                                failure.deferral,
+                                TaskOccurrenceClaimDeferral::NoSnapshot
+                                    | TaskOccurrenceClaimDeferral::Failed
+                            )
+                        });
+                    warn!(
+                        failure_class = "task_terminal_occurrence_repair_failed",
+                        "failed to repair terminal Task occurrence projection mismatch"
+                    );
+                }
+            }
+        }
+        *retry_at = storage_error.then(|| Instant::now() + OCCURRENCE_STORAGE_BACKOFF);
+        // Count confirmed mismatches, not dirty candidates (which may agree).
+        Ok((changed, changed))
     }
 
     async fn recover_run(&self, run: &TaskRun, now: i64) -> TaskRuntimeResult<bool> {
@@ -132,25 +241,6 @@ impl TaskStartupReconciler {
         let Some(task_response) = self.store.get_task(run.task_id.as_str()).await? else {
             return Ok(false);
         };
-        let mut occurrence = self
-            .store
-            .get_task_occurrence_contract_by_run(run.id.as_str())
-            .await?
-            .with_context(|| {
-                format!(
-                    "recoverable Task run `{}` has no durable occurrence contract",
-                    run.id
-                )
-            })?;
-        occurrence.status = match run.status {
-            TaskRunStatus::Queued => TaskOccurrenceStatus::Queued,
-            TaskRunStatus::Starting | TaskRunStatus::Running => TaskOccurrenceStatus::Recovering,
-            TaskRunStatus::WaitingReview => TaskOccurrenceStatus::WaitingReview,
-            _ => occurrence.status.clone(),
-        };
-        self.store
-            .upsert_task_occurrence_contract(&occurrence, now)
-            .await?;
         let recovery_message = match run.status {
             TaskRunStatus::Queued => DISPATCHABLE_RUN_RECOVERY_MESSAGE,
             TaskRunStatus::Starting | TaskRunStatus::Running => {
@@ -160,11 +250,33 @@ impl TaskStartupReconciler {
             _ => return Ok(false),
         };
         if run.status == TaskRunStatus::Queued {
+            if !self
+                .store
+                .revalidate_and_sync_active_task_occurrence(
+                    run.id.as_str(),
+                    TaskRunStatus::Queued,
+                    now,
+                )
+                .await?
+            {
+                return Ok(false);
+            }
             return self
                 .emit_recovery_event_if_missing(run, recovery_message, now)
                 .await;
         }
         if run.status == TaskRunStatus::WaitingReview {
+            if !self
+                .store
+                .revalidate_and_sync_active_task_occurrence(
+                    run.id.as_str(),
+                    TaskRunStatus::WaitingReview,
+                    now,
+                )
+                .await?
+            {
+                return Ok(false);
+            }
             let emitted_recovery_event = self
                 .emit_recovery_event_if_missing(run, recovery_message, now)
                 .await?;
@@ -197,20 +309,21 @@ impl TaskStartupReconciler {
             return Ok(emitted_recovery_event);
         }
 
-        let execution = self
-            .store
-            .reserve_execution_for_run(run.id.as_str(), run.executor_kind, now)
-            .await?;
         let worker_id = format!("task-recovery-{}", generate_id(ID_LEN));
         let lease_until = now.saturating_add(TASK_EXECUTION_LEASE_SECONDS);
         let Some(execution) = self
             .store
-            .claim_execution_at(execution.id.as_str(), worker_id.as_str(), now, lease_until)
+            .claim_task_run_execution_for_recovery(
+                run.id.as_str(),
+                run.executor_kind,
+                worker_id.as_str(),
+                now,
+                lease_until,
+            )
             .await?
         else {
-            // A valid execution lease proves that this run is currently
-            // owned. Live reconciliation must not label or restart it as
-            // recovered merely because its status is Running.
+            // A valid execution lease or a terminal authority prevents both
+            // recovery ownership and the occurrence transition atomically.
             return Ok(false);
         };
         let emitted_recovery_event = self
@@ -222,18 +335,26 @@ impl TaskStartupReconciler {
             run.task_id.clone(),
             run.id.clone(),
         );
-        if let Err(error) = executor
-            .recover_run(
-                TaskExecutionContext {
-                    workspace_id: task_response.task.workspace_id,
-                    task_id: run.task_id.clone(),
-                    execution_id: Some(execution.id),
-                    worker_id,
-                },
-                run.clone(),
-                handle,
-            )
-            .await
+        let recovery_context = TaskExecutionContext {
+            workspace_id: task_response.task.workspace_id,
+            task_id: run.task_id.clone(),
+            execution_id: Some(execution.id),
+            worker_id,
+        };
+        let recovery_run = run.clone();
+        // A recovered executor run is an independently owned durable unit of
+        // work. Keep its (potentially deep) implementation out of the startup
+        // reconciler's poll stack while still awaiting it in deterministic
+        // order and cancelling it if reconciliation is cancelled.
+        if let Err(error) = task_fresh_task(
+            async move {
+                executor
+                    .recover_run(recovery_context, recovery_run, handle)
+                    .await
+            },
+            "task executor recovery task did not finish",
+        )
+        .await
         {
             warn!(
                 task_id = %run.task_id,

@@ -121,6 +121,7 @@ pub struct AgentMemoryListFilter {
     pub include_deleted: bool,
     pub include_superseded: bool,
     pub allowed_source_thread_ids: Option<Vec<String>>,
+    pub owned_scopes: Vec<MemoryScope>,
     pub limit: Option<u64>,
 }
 

@@ -1,12 +1,143 @@
 use super::*;
-use anyhow::{Result, bail};
-use pioneer_crud::TaskRunOccurrenceTerminalizationOutcome;
+use anyhow::Result;
+use pioneer_crud::TaskEventContext;
+use pioneer_crud::{
+    TaskRunOccurrenceClaimDeferral, TaskRunOccurrenceClaimFailure,
+    TaskRunOccurrenceClaimFailurePhase, TaskRunOccurrenceClock,
+    TaskRunOccurrenceTerminalizationOutcome,
+};
 use pioneer_protocol::{
-    ItemUpdatedNotification, TaskAttachmentMode, TaskDeliveryStatus, TaskEventPayload,
-    TaskExecutorKind, TaskGetResponse, TaskRescheduleReason, TaskResultCandidateStatus,
+    ItemUpdatedNotification, TaskDeliveryStatus, TaskEventPayload, TaskRescheduleReason,
     TaskTriggerKind,
 };
 use serde_json::json;
+
+/// Batch ownership is local to terminal-child reconciliation. Only descriptors
+/// enter this aggregate; TaskStartFailure's private source never does.
+#[derive(Debug, Default)]
+pub(super) struct TaskChildReconciliationFailures {
+    reported: Vec<pioneer_tasks::TaskStartFailureDescriptor>,
+    independent: Vec<String>,
+}
+
+impl TaskChildReconciliationFailures {
+    fn push(&mut self, thread_id: &str, turn_id: &str, mut error: anyhow::Error) {
+        if let Some(failure) = error.downcast_mut::<pioneer_tasks::TaskStartFailure>() {
+            failure.report_in_place();
+            self.reported.push(failure.descriptor().clone());
+        } else {
+            // Preserve the former independent-error diagnostic and retry input.
+            self.independent
+                .push(format!("{thread_id}/{turn_id}: {error:#}"));
+        }
+    }
+
+    pub(super) fn retry_transient_storage_access(&self) -> bool {
+        !self.independent.is_empty()
+            && is_anyhow_sqlite_transient_access(&anyhow::anyhow!(self.independent.join("; ")))
+    }
+
+    pub(super) fn report_worker_failure(&self) {
+        if !self.independent.is_empty() {
+            error!(
+                error = %self.independent.join("; "),
+                "task child terminal reconciler failed"
+            );
+        }
+    }
+}
+
+impl std::fmt::Display for TaskChildReconciliationFailures {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "terminal task child reconciliation failed: reported={:?}",
+            self.reported
+        )?;
+        if !self.independent.is_empty() {
+            write!(f, "; {}", self.independent.join("; "))?;
+        }
+        Ok(())
+    }
+}
+
+// Deliberately no source: private typed causes must not become a worker chain.
+impl std::error::Error for TaskChildReconciliationFailures {}
+
+pub(super) fn retry_task_child_reconciliation_error(error: &anyhow::Error) -> bool {
+    if error
+        .downcast_ref::<pioneer_tasks::TaskStartFailure>()
+        .is_some()
+    {
+        return false;
+    }
+    if let Some(batch) = error.downcast_ref::<TaskChildReconciliationFailures>() {
+        return batch.retry_transient_storage_access();
+    }
+    is_anyhow_sqlite_transient_access(error)
+}
+
+pub(super) fn report_task_child_reconciliation_error(mut error: anyhow::Error) {
+    if let Some(batch) = error.downcast_ref::<TaskChildReconciliationFailures>() {
+        batch.report_worker_failure();
+    } else if let Some(failure) = error.downcast_mut::<pioneer_tasks::TaskStartFailure>() {
+        failure.report_in_place();
+    } else {
+        error!(error = %format!("{error:#}"), "task child terminal reconciler failed");
+    }
+}
+
+/// Partial progress survives candidate errors. Only an allowlisted diagnostic
+/// classification of first_error reaches reporting; no IDs or raw errors.
+#[derive(Default)]
+pub(super) struct TaskRunOccurrenceReconcileSummary {
+    pub selected: usize,
+    pub claimed: usize,
+    pub changed: usize,
+    pub lost_claims: usize,
+    pub stale: usize,
+    pub unresolved: usize,
+    pub no_change: usize,
+    pub claim_errors: usize,
+    pub claim_deferrals: usize,
+    pub claim_deferral_conflicts: usize,
+    pub claim_deferral_errors: usize,
+    pub claim_without_snapshot: usize,
+    pub claim_commit_unknown: usize,
+    pub repair_errors: usize,
+    pub storage_errors: usize,
+    pub notification_errors: usize,
+    pub queue_state_errors: usize,
+    // None means unobserved/unknown, never evidence of recovery.
+    pub pending: Option<bool>,
+    pub first_error: Option<anyhow::Error>,
+}
+impl TaskRunOccurrenceReconcileSummary {
+    pub(super) fn record_pending_state(&mut self, result: Result<bool>) {
+        match result {
+            Ok(pending) => self.pending = Some(pending),
+            Err(error) => {
+                self.pending = None;
+                self.queue_state_errors += 1;
+                self.record_error(error);
+            }
+        }
+    }
+    fn record_error(&mut self, error: anyhow::Error) {
+        let storage = super::reconciliation_diagnostics::is_storage_failure(&error);
+        self.storage_errors += usize::from(storage);
+        // A later global storage failure must not be hidden by an earlier poison
+        // candidate. Retain at most one error for typed, allowlisted reporting.
+        if self.first_error.is_none()
+            || (storage
+                && self.first_error.as_ref().is_some_and(|first| {
+                    !super::reconciliation_diagnostics::is_storage_failure(first)
+                }))
+        {
+            self.first_error = Some(error);
+        }
+    }
+}
 
 struct TaskTimelineChangedTarget {
     workspace_id: String,
@@ -16,13 +147,26 @@ struct TaskTimelineChangedTarget {
 }
 
 impl MessageProcessor {
+    pub(super) async fn reconcile_terminal_task_child_turns_with_retry(
+        &self,
+        limit: u64,
+    ) -> Result<usize> {
+        retry_with_backoff(
+            || self.reconcile_terminal_task_child_turns(limit),
+            retry_task_child_reconciliation_error,
+            DEFAULT_LOCK_RETRY_ATTEMPTS,
+            Duration::from_millis(DEFAULT_LOCK_RETRY_BASE_DELAY_MS),
+        )
+        .await
+    }
+
     pub(super) async fn reconcile_terminal_task_child_turns(&self, limit: u64) -> Result<usize> {
         let turns = self
             .crud_store
             .list_unreconciled_terminal_task_child_turns(limit)
             .await?;
         let mut reconciled = 0usize;
-        let mut errors = Vec::new();
+        let mut errors = TaskChildReconciliationFailures::default();
         for turn in turns {
             let result = match turn.status {
                 TurnStatus::Completed => {
@@ -30,6 +174,7 @@ impl MessageProcessor {
                         .reconcile_child_turn_completed(
                             turn.thread_id.as_str(),
                             turn.turn_id.as_str(),
+                            TaskChildReconciliationOrigin::DurableBackground,
                         )
                         .await
                 }
@@ -40,6 +185,7 @@ impl MessageProcessor {
                             turn.thread_id.as_str(),
                             turn.turn_id.as_str(),
                             error,
+                            TaskChildReconciliationOrigin::DurableBackground,
                         )
                         .await
                 }
@@ -53,6 +199,7 @@ impl MessageProcessor {
                             turn.thread_id.as_str(),
                             turn.turn_id.as_str(),
                             reason,
+                            TaskChildReconciliationOrigin::DurableBackground,
                         )
                         .await
                 }
@@ -63,6 +210,7 @@ impl MessageProcessor {
                             turn.thread_id.as_str(),
                             turn.turn_id.as_str(),
                             reason,
+                            TaskChildReconciliationOrigin::DurableBackground,
                         )
                         .await
                 }
@@ -93,16 +241,11 @@ impl MessageProcessor {
                     reconciled = reconciled.saturating_add(1);
                 }
                 Ok(false) => {}
-                Err(error) => {
-                    errors.push(format!("{}/{}: {error:#}", turn.thread_id, turn.turn_id))
-                }
+                Err(error) => errors.push(&turn.thread_id, &turn.turn_id, error),
             }
         }
-        if !errors.is_empty() {
-            bail!(
-                "terminal task child reconciliation failed: {}",
-                errors.join("; ")
-            );
+        if !errors.reported.is_empty() || !errors.independent.is_empty() {
+            return Err(anyhow::Error::new(errors));
         }
         Ok(reconciled)
     }
@@ -110,45 +253,150 @@ impl MessageProcessor {
     pub(super) async fn reconcile_terminal_task_run_occurrence_turns(
         &self,
         limit: u64,
-    ) -> Result<usize> {
-        let run_ids = self
+    ) -> Result<TaskRunOccurrenceReconcileSummary> {
+        self.reconcile_task_run_occurrences_with_clock(&now_timestamp_secs, limit)
+            .await
+    }
+
+    #[cfg(test)]
+    pub(super) async fn reconcile_task_run_occurrences_at(
+        &self,
+        now: i64,
+        limit: u64,
+    ) -> Result<TaskRunOccurrenceReconcileSummary> {
+        self.reconcile_task_run_occurrences_with_clock(&|| now, limit)
+            .await
+    }
+
+    pub(super) async fn reconcile_task_run_occurrences_with_clock(
+        &self,
+        clock: &TaskRunOccurrenceClock<'_>,
+        limit: u64,
+    ) -> Result<TaskRunOccurrenceReconcileSummary> {
+        // Exactly one advisory discovery per pass. Every selected candidate
+        // consumes budget, including lost claims and failed preparations.
+        let candidates = self
             .crud_store
-            .list_mismatched_terminal_task_run_occurrence_ids(limit)
+            .discover_task_run_occurrence_reconcile(clock(), limit)
             .await?;
-        let mut reconciled = 0usize;
-        for run_id in run_ids {
-            let Some(run) = self.crud_store.get_task_run(run_id.as_str()).await? else {
-                continue;
-            };
-            match self
-                .mark_task_run_occurrence_turn_terminal(run.id.as_str())
-                .await?
+        let mut summary = TaskRunOccurrenceReconcileSummary {
+            selected: candidates.len(),
+            ..Default::default()
+        };
+        for candidate in candidates {
+            let claim = match self
+                .crud_store
+                .claim_task_run_occurrence_reconcile(&candidate, clock)
+                .await
             {
-                TaskRunOccurrenceTerminalizationOutcome::Changed => {
-                    reconciled = reconciled.saturating_add(1);
+                Ok(Some(claim)) => claim,
+                Ok(None) => {
+                    summary.lost_claims += 1;
+                    continue;
                 }
-                TaskRunOccurrenceTerminalizationOutcome::AlreadyConsistent => {}
-                TaskRunOccurrenceTerminalizationOutcome::NotFound => warn!(
-                    run_id = run.id.as_str(),
-                    "TaskRun occurrence reconciliation could not find the canonical occurrence Turn"
-                ),
-                TaskRunOccurrenceTerminalizationOutcome::InvalidBinding => warn!(
-                    run_id = run.id.as_str(),
-                    "TaskRun occurrence reconciliation rejected a non-task_run canonical Turn binding"
-                ),
+                Err(error) => {
+                    summary.claim_errors += 1;
+                    match error.downcast::<TaskRunOccurrenceClaimFailure>() {
+                        Ok(failure) => {
+                            summary.claim_commit_unknown += usize::from(
+                                failure.phase
+                                    == TaskRunOccurrenceClaimFailurePhase::CommitOutcomeUnknown,
+                            );
+                            match failure.deferral {
+                                TaskRunOccurrenceClaimDeferral::Deferred => {
+                                    summary.claim_deferrals += 1
+                                }
+                                TaskRunOccurrenceClaimDeferral::StateChanged => {
+                                    summary.claim_deferral_conflicts += 1
+                                }
+                                TaskRunOccurrenceClaimDeferral::Failed => {
+                                    summary.claim_deferral_errors += 1
+                                }
+                                TaskRunOccurrenceClaimDeferral::NoSnapshot => {
+                                    summary.claim_without_snapshot += 1
+                                }
+                            }
+                            summary.record_error(failure.error);
+                            if let Some(error) = failure.deferral_error {
+                                summary.record_error(error);
+                            }
+                        }
+                        Err(error) => summary.record_error(error),
+                    }
+                    continue;
+                }
+            };
+            summary.claimed += 1;
+            match self
+                .crud_store
+                .reconcile_claimed_task_run_occurrence(&claim, clock())
+                .await
+            {
+                Ok(TaskRunOccurrenceTerminalizationOutcome::Changed) => {
+                    summary.changed += 1;
+                    if self
+                        .notify_task_run_occurrence_terminal(&claim.run_id)
+                        .await
+                        .is_err()
+                    {
+                        summary.notification_errors += 1;
+                    }
+                }
+                Ok(TaskRunOccurrenceTerminalizationOutcome::StaleClaim) => summary.stale += 1,
+                Ok(TaskRunOccurrenceTerminalizationOutcome::NotFound) => summary.unresolved += 1,
+                Ok(
+                    TaskRunOccurrenceTerminalizationOutcome::AlreadyConsistent
+                    | TaskRunOccurrenceTerminalizationOutcome::InvalidBinding,
+                ) => summary.no_change += 1,
+                Err(error) => {
+                    summary.repair_errors += 1;
+                    summary.record_error(error);
+                }
             }
         }
-        Ok(reconciled)
+        // LIMIT 1 service-table probe, not due discovery or a queue COUNT.
+        // A read failure remains visible in the partial summary and cannot
+        // turn an unknown queue state into recovery.
+        summary.record_pending_state(
+            self.crud_store
+                .has_pending_task_run_occurrence_reconcile()
+                .await,
+        );
+        Ok(summary)
     }
 
     pub(super) async fn emit_task_event(
         &self,
         event: pioneer_crud::AppendedTaskEvent,
     ) -> Result<()> {
-        let task_id = event.payload.task_id().to_owned();
-        let Some(task_response) = self.crud_store.get_task(task_id.as_str()).await? else {
+        let Some(task_response) = self
+            .crud_store
+            .get_task_event_context(&event.payload)
+            .await?
+        else {
             return Ok(());
         };
+        if let Some(work) = task_response
+            .task
+            .metadata
+            .as_ref()
+            .and_then(|m| m.composer_work.as_ref())
+        {
+            let outcome = match &event.payload {
+                TaskEventPayload::TaskCancelled { .. } => Some("cancelled"),
+                TaskEventPayload::TaskFailed { .. } => Some("failed"),
+                TaskEventPayload::TaskBlocked { .. } => Some("blocked"),
+                _ => None,
+            };
+            if let Some(outcome) = outcome {
+                self.send_delegated_startup_outcome(
+                    &work.launch.thread_id,
+                    &work.launch.turn_id,
+                    outcome,
+                )
+                .await;
+            }
+        }
         let context = pioneer_protocol::TaskNotificationContext {
             workspace_id: task_response.task.workspace_id.clone(),
             task_id: task_response.task.id.clone(),
@@ -160,15 +408,13 @@ impl MessageProcessor {
             event_id: event.id,
             sequence: event.sequence,
         };
-        self.resolve_deferred_task_result_post_turn(&task_response, &event.payload)
-            .await;
         let workspace_id = context.workspace_id.clone();
         let notification_task_id = context.task_id.clone();
         let is_progress_event = matches!(event.payload, TaskEventPayload::Progress { .. });
         let is_terminal_event = event.payload.is_terminal();
-        let awaits_origin_thread_delivery = match event.payload.run_id() {
+        let awaits_occurrence_thread_delivery = match event.payload.run_id() {
             Some(run_id) => {
-                self.task_run_awaits_origin_thread_delivery(&task_response, run_id)
+                self.task_run_awaits_occurrence_thread_delivery(&task_response, run_id)
                     .await?
             }
             None => false,
@@ -187,12 +433,13 @@ impl MessageProcessor {
                 .await
         };
         let refresh_parent_anchor = !is_progress_event
-            && !awaits_origin_thread_delivery
-            && should_refresh_parent_task_anchor(&task_response, &event.payload);
+            && !awaits_occurrence_thread_delivery
+            && should_refresh_parent_task_anchor(&self.crud_store, &task_response, &event.payload)
+                .await?;
         if refresh_parent_anchor {
             self.refresh_parent_task_anchor(&task_response).await?;
         }
-        if !awaits_origin_thread_delivery
+        if !awaits_occurrence_thread_delivery
             && let Some(notification) = timeline_changed.as_ref()
             && task_response.task.created_by_turn_id.as_deref()
                 != Some(notification.turn_id.as_str())
@@ -235,9 +482,9 @@ impl MessageProcessor {
             }
             TaskEventPayload::TaskScheduled { trigger_id, .. } => {
                 if let Some(trigger) = task_response
-                    .triggers
-                    .into_iter()
-                    .find(|trigger| trigger.id == trigger_id)
+                    .scheduled_trigger
+                    .as_ref()
+                    .filter(|trigger| trigger.id == trigger_id)
                 {
                     self.send_notification_to_task_workspace_connections(
                         notification_task_id.as_str(),
@@ -252,20 +499,14 @@ impl MessageProcessor {
                 }
             }
             TaskEventPayload::TaskQueued { .. } => {
-                let run = context.run_id.as_ref().and_then(|run_id| {
-                    task_response
-                        .runs
-                        .iter()
-                        .find(|run| run.id == *run_id)
-                        .cloned()
-                });
+                let run = task_response.run.as_ref();
                 self.send_notification_to_task_workspace_connections(
                     notification_task_id.as_str(),
                     workspace_id.as_str(),
                     events::TASK_QUEUED,
                     &json!({
                         "context": context,
-                        "run": run.as_ref().map(crate::task_projection::project_run),
+                        "run": run.map(crate::task_projection::project_run),
                     }),
                 )
                 .await;
@@ -283,7 +524,7 @@ impl MessageProcessor {
                 .await;
             }
             TaskEventPayload::RunStarted { run_id, .. } => {
-                if let Some(run) = task_response.runs.into_iter().find(|run| run.id == run_id) {
+                if let Some(run) = task_response.run.as_ref().filter(|run| run.id == run_id) {
                     self.send_notification_to_task_workspace_connections(
                         notification_task_id.as_str(),
                         workspace_id.as_str(),
@@ -319,7 +560,7 @@ impl MessageProcessor {
             TaskEventPayload::RunCompleted { run_id, .. } => {
                 self.mark_task_run_occurrence_turn_terminal(run_id.as_str())
                     .await?;
-                if let Some(run) = task_response.runs.into_iter().find(|run| run.id == run_id) {
+                if let Some(run) = task_response.run.as_ref().filter(|run| run.id == run_id) {
                     self.send_notification_to_task_workspace_connections(
                         notification_task_id.as_str(),
                         workspace_id.as_str(),
@@ -335,7 +576,7 @@ impl MessageProcessor {
             TaskEventPayload::RunFailed { run_id, .. } => {
                 self.mark_task_run_occurrence_turn_terminal(run_id.as_str())
                     .await?;
-                if let Some(run) = task_response.runs.into_iter().find(|run| run.id == run_id) {
+                if let Some(run) = task_response.run.as_ref().filter(|run| run.id == run_id) {
                     self.send_notification_to_task_workspace_connections(
                         notification_task_id.as_str(),
                         workspace_id.as_str(),
@@ -351,7 +592,7 @@ impl MessageProcessor {
             TaskEventPayload::RunBlocked { run_id, .. } => {
                 self.mark_task_run_occurrence_turn_terminal(run_id.as_str())
                     .await?;
-                if let Some(run) = task_response.runs.into_iter().find(|run| run.id == run_id) {
+                if let Some(run) = task_response.run.as_ref().filter(|run| run.id == run_id) {
                     self.send_notification_to_task_workspace_connections(
                         notification_task_id.as_str(),
                         workspace_id.as_str(),
@@ -367,7 +608,7 @@ impl MessageProcessor {
             TaskEventPayload::RunCancelled { run_id, .. } => {
                 self.mark_task_run_occurrence_turn_terminal(run_id.as_str())
                     .await?;
-                if let Some(run) = task_response.runs.into_iter().find(|run| run.id == run_id) {
+                if let Some(run) = task_response.run.as_ref().filter(|run| run.id == run_id) {
                     self.send_notification_to_task_workspace_connections(
                         notification_task_id.as_str(),
                         workspace_id.as_str(),
@@ -675,13 +916,27 @@ impl MessageProcessor {
             | TaskEventPayload::TaskRunTurnBlocked { .. }
             | TaskEventPayload::TaskResultCandidateCreated { .. }
             | TaskEventPayload::TaskResultReviewEventRecorded { .. }
-            | TaskEventPayload::TaskResultCandidateAccepted { .. }
-            | TaskEventPayload::TaskResultCandidateRejected { .. }
-            | TaskEventPayload::TaskResultCandidateCancelled { .. }
             | TaskEventPayload::TaskRevisionRequested { .. }
             | TaskEventPayload::TaskRunEnteredReview { .. }
             | TaskEventPayload::DepthLimitExceeded { .. }
             | TaskEventPayload::WriteLockExtended { .. } => {
+                self.send_notification_to_task_workspace_connections(
+                    notification_task_id.as_str(),
+                    workspace_id.as_str(),
+                    events::TASK_TREE_CHANGED,
+                    &pioneer_protocol::TaskTreeChangedNotification { context },
+                )
+                .await;
+            }
+            TaskEventPayload::TaskResultCandidateAccepted { .. }
+            | TaskEventPayload::TaskResultCandidateRejected { .. }
+            | TaskEventPayload::TaskResultCandidateCancelled { .. } => {
+                // Candidate projection resolves the acceptance gate in the
+                // durable terminal-effect outbox. Wake execution after the
+                // committed task event is visible; otherwise an effect whose
+                // Turn committed first can remain asleep until the periodic
+                // resilience sweep.
+                self.kick_native_terminal_effects();
                 self.send_notification_to_task_workspace_connections(
                     notification_task_id.as_str(),
                     workspace_id.as_str(),
@@ -702,77 +957,7 @@ impl MessageProcessor {
         Ok(())
     }
 
-    async fn resolve_deferred_task_result_post_turn(
-        &self,
-        response: &TaskGetResponse,
-        payload: &TaskEventPayload,
-    ) {
-        let attachment = response
-            .task
-            .lifecycle_policy
-            .as_ref()
-            .map(|policy| policy.attachment)
-            .unwrap_or(TaskAttachmentMode::Detached);
-        if response.task.executor_kind != TaskExecutorKind::Agent
-            || attachment != TaskAttachmentMode::Detached
-        {
-            return;
-        }
-
-        match payload {
-            TaskEventPayload::TaskResultCandidateAccepted { candidate, .. } => {
-                self.agent_manager
-                    .accept_deferred_task_result_post_turn(
-                        candidate.thread_id.as_str(),
-                        candidate.turn_id.as_str(),
-                    )
-                    .await;
-            }
-            TaskEventPayload::TaskResultCandidateCreated { candidate } => match candidate.status {
-                TaskResultCandidateStatus::Accepted => {
-                    self.agent_manager
-                        .accept_deferred_task_result_post_turn(
-                            candidate.thread_id.as_str(),
-                            candidate.turn_id.as_str(),
-                        )
-                        .await;
-                }
-                TaskResultCandidateStatus::PendingReview => {}
-                TaskResultCandidateStatus::Rejected
-                | TaskResultCandidateStatus::Superseded
-                | TaskResultCandidateStatus::Cancelled
-                | TaskResultCandidateStatus::ExtractionFailed => {
-                    self.agent_manager
-                        .discard_deferred_task_result_post_turn(
-                            candidate.thread_id.as_str(),
-                            candidate.turn_id.as_str(),
-                        )
-                        .await;
-                }
-            },
-            TaskEventPayload::TaskResultCandidateRejected { candidate, .. }
-            | TaskEventPayload::TaskResultCandidateCancelled { candidate, .. } => {
-                self.agent_manager
-                    .discard_deferred_task_result_post_turn(
-                        candidate.thread_id.as_str(),
-                        candidate.turn_id.as_str(),
-                    )
-                    .await;
-            }
-            TaskEventPayload::TaskRunTurnFailed { task_run_turn, .. }
-            | TaskEventPayload::TaskRunTurnBlocked { task_run_turn, .. } => {
-                self.agent_manager
-                    .discard_deferred_task_result_post_turn(
-                        task_run_turn.thread_id.as_str(),
-                        task_run_turn.turn_id.as_str(),
-                    )
-                    .await;
-            }
-            _ => {}
-        }
-    }
-
-    async fn refresh_parent_task_anchor(&self, response: &TaskGetResponse) -> Result<bool> {
+    async fn refresh_parent_task_anchor(&self, response: &TaskEventContext) -> Result<bool> {
         let Some(parent_thread_id) = response.task.created_by_thread_id.as_deref() else {
             return Ok(false);
         };
@@ -785,7 +970,7 @@ impl MessageProcessor {
 
     pub(super) async fn refresh_task_anchor_in_turn(
         &self,
-        response: &TaskGetResponse,
+        response: &TaskEventContext,
         thread_id: &str,
         turn_id: &str,
         run_id: Option<&str>,
@@ -796,42 +981,36 @@ impl MessageProcessor {
 
     async fn refresh_task_anchor_in_turn_with_progress(
         &self,
-        response: &TaskGetResponse,
+        response: &TaskEventContext,
         thread_id: &str,
         turn_id: &str,
         run_id: Option<&str>,
         progress_preview: Option<String>,
     ) -> Result<bool> {
-        let item = match run_id {
-            Some(run_id) if task_run_uses_creation_anchor(response, run_id) => {
-                crate::task_tools::task_turn_item_from_response_for_run_with_progress(
-                    self,
-                    response,
-                    run_id,
-                    crate::task_tools::task_anchor_id(response.task.id.as_str()),
-                    progress_preview,
+        let anchor = if run_id.is_some() {
+            self.crud_store
+                .get_task_run_anchor_context(
+                    &response.task,
+                    response.run.as_ref(),
+                    response.run_trigger.as_ref(),
                 )
                 .await?
-            }
-            Some(run_id) => {
-                crate::task_tools::task_turn_item_from_response_for_run_with_progress(
-                    self,
-                    response,
-                    run_id,
-                    crate::task_tools::task_run_anchor_id(run_id),
-                    progress_preview,
-                )
+        } else {
+            self.crud_store
+                .get_task_creation_anchor_context(&response.task)
                 .await?
-            }
-            None => {
-                crate::task_tools::task_turn_item_from_response_with_progress(
-                    self,
-                    response,
-                    progress_preview,
-                )
-                .await?
-            }
         };
+        let item_id = parent_task_anchor_item_id(response, run_id);
+        let item = crate::task_tools::task_turn_item_from_context(
+            &self.crud_store,
+            &response.task,
+            anchor.run.as_ref(),
+            anchor.trigger.as_ref(),
+            anchor.agent.as_ref(),
+            item_id,
+            progress_preview,
+        )
+        .await?;
         let Some(existing) = self
             .crud_store
             .get_turn_item(turn_id, item.id.as_str())
@@ -871,7 +1050,7 @@ impl MessageProcessor {
 
     async fn publish_parent_task_progress_snapshot(
         &self,
-        response: &TaskGetResponse,
+        response: &TaskEventContext,
         payload: &TaskEventPayload,
     ) -> Result<()> {
         let TaskEventPayload::Progress {
@@ -940,7 +1119,7 @@ impl MessageProcessor {
 
     async fn flush_parent_task_progress_snapshot(
         &self,
-        response: &TaskGetResponse,
+        response: &TaskEventContext,
         payload: &TaskEventPayload,
     ) {
         let item_id = parent_task_anchor_item_id(response, payload.run_id());
@@ -967,7 +1146,7 @@ impl MessageProcessor {
 
     async fn task_timeline_changed_target(
         &self,
-        response: &TaskGetResponse,
+        response: &TaskEventContext,
         payload: &TaskEventPayload,
     ) -> Option<TaskTimelineChangedTarget> {
         let task = &response.task;
@@ -990,7 +1169,7 @@ impl MessageProcessor {
 
     async fn task_timeline_parent_target(
         &self,
-        response: &TaskGetResponse,
+        response: &TaskEventContext,
         payload: &TaskEventPayload,
     ) -> Option<(String, String)> {
         if let TaskEventPayload::ChildThreadLinked { lineage } = payload {
@@ -1017,7 +1196,7 @@ impl MessageProcessor {
 
     async fn task_progress_parent_target(
         &self,
-        response: &TaskGetResponse,
+        response: &TaskEventContext,
         payload: &TaskEventPayload,
     ) -> Option<(String, String)> {
         match payload.run_id() {
@@ -1031,7 +1210,7 @@ impl MessageProcessor {
 
     async fn task_progress_flush_targets(
         &self,
-        response: &TaskGetResponse,
+        response: &TaskEventContext,
         payload: &TaskEventPayload,
     ) -> Vec<(String, String)> {
         let mut targets = Vec::new();
@@ -1049,10 +1228,18 @@ impl MessageProcessor {
             targets.push((thread_id, turn_id));
         }
 
-        for run in &response.runs {
-            if let Some(target) = self.task_run_parent_target(response, run.id.as_str()).await
-                && !targets.iter().any(|existing| existing == &target)
-            {
+        // Task terminal events have no run_id. Only buffered snapshots can
+        // produce a flush; empty historical targets were no-ops. Consult the
+        // existing bounded coalescers instead of loading every historical run.
+        for target in self
+            .agent_manager
+            .pending_progress_targets_for_item(
+                response.task.workspace_id.as_str(),
+                crate::task_tools::task_anchor_id(response.task.id.as_str()).as_str(),
+            )
+            .await
+        {
+            if !targets.contains(&target) {
                 targets.push(target);
             }
         }
@@ -1062,9 +1249,19 @@ impl MessageProcessor {
 
     async fn task_run_parent_target(
         &self,
-        response: &TaskGetResponse,
+        response: &TaskEventContext,
         run_id: &str,
     ) -> Option<(String, String)> {
+        // The occurrence Turn is the authoritative presentation address and is
+        // committed before child launch. Resolve it directly so progress and
+        // pre-child failures do not depend on child lineage.
+        if let Ok(Some((thread_id, workspace_id))) = self.crud_store.get_turn_location(run_id).await
+            && workspace_id == response.task.workspace_id
+            && let Ok(Some((_, turn))) = self.crud_store.get_turn(thread_id.as_str(), run_id).await
+            && turn.turn_kind == pioneer_protocol::TurnKind::TaskRun
+        {
+            return Some((thread_id, run_id.to_owned()));
+        }
         if let Ok(Some(binding)) = self
             .crud_store
             .get_task_run_primary_thread_binding(run_id)
@@ -1098,10 +1295,16 @@ impl MessageProcessor {
     #[cfg(test)]
     pub(super) async fn task_progress_parent_target_for_test(
         &self,
-        response: &TaskGetResponse,
+        _response: &pioneer_protocol::TaskGetResponse,
         payload: &TaskEventPayload,
     ) -> Option<(String, String)> {
-        self.task_progress_parent_target(response, payload).await
+        let response = self
+            .crud_store
+            .get_task_event_context(payload)
+            .await
+            .ok()
+            .flatten()?;
+        self.task_progress_parent_target(&response, payload).await
     }
 }
 
@@ -1118,41 +1321,28 @@ impl MessageProcessor {
             return Ok(outcome);
         }
 
-        // Durable CAS is authoritative. Subscriber fan-out is deliberately
-        // best-effort and cannot turn an already committed reconciliation into
-        // an apparent failure that would be retried and counted again.
-        let Some((parent_thread_id, _workspace_id)) =
-            (match self.crud_store.get_turn_location(run_id).await {
-                Ok(location) => location,
-                Err(error) => {
-                    warn!(
-                        run_id,
-                        error = %format!("{error:#}"),
-                        "failed to locate reconciled TaskRun occurrence for subscriber fan-out"
-                    );
-                    None
-                }
-            })
-        else {
-            return Ok(outcome);
-        };
-        let Some((workspace_id, turn)) = (match self
-            .crud_store
-            .get_turn(parent_thread_id.as_str(), run_id)
+        // Commit is authoritative; fanout failure cannot retry a domain change.
+        if self
+            .notify_task_run_occurrence_terminal(run_id)
             .await
+            .is_err()
         {
-            Ok(turn) => turn,
-            Err(error) => {
-                warn!(
-                    run_id,
-                    thread_id = parent_thread_id.as_str(),
-                    error = %format!("{error:#}"),
-                    "failed to load reconciled TaskRun occurrence for subscriber fan-out"
-                );
-                None
-            }
-        }) else {
-            return Ok(outcome);
+            warn!(
+                cause = "notification",
+                "TaskRun occurrence subscriber fanout failed after commit"
+            );
+        }
+        Ok(outcome)
+    }
+
+    pub(super) async fn notify_task_run_occurrence_terminal(&self, run_id: &str) -> Result<()> {
+        let Some((parent_thread_id, _)) = self.crud_store.get_turn_location(run_id).await? else {
+            return Ok(());
+        };
+        let Some((workspace_id, turn)) =
+            self.crud_store.get_turn(&parent_thread_id, run_id).await?
+        else {
+            return Ok(());
         };
 
         match turn.status {
@@ -1215,23 +1405,24 @@ impl MessageProcessor {
                 .await;
             }
             TurnStatus::InProgress => warn!(
-                run_id,
-                "TaskRun occurrence remained in_progress after terminal CAS"
+                cause = "changed_again",
+                "TaskRun occurrence changed before subscriber fanout"
             ),
         }
-        Ok(outcome)
+        Ok(())
     }
 }
 
-fn should_refresh_parent_task_anchor(
-    response: &TaskGetResponse,
+async fn should_refresh_parent_task_anchor(
+    store: &pioneer_crud::CrudStore,
+    response: &TaskEventContext,
     payload: &TaskEventPayload,
-) -> bool {
+) -> Result<bool> {
     if let Some(run_id) = payload.run_id() {
-        return task_run_uses_creation_anchor(response, run_id);
+        return Ok(task_run_uses_creation_anchor(response, run_id));
     }
 
-    match payload {
+    Ok(match payload {
         TaskEventPayload::TaskScheduled { .. }
         | TaskEventPayload::TaskUpdated { .. }
         | TaskEventPayload::TaskPaused { .. }
@@ -1244,44 +1435,21 @@ fn should_refresh_parent_task_anchor(
         ),
         TaskEventPayload::TaskCompleted { .. }
         | TaskEventPayload::TaskFailed { .. }
-        | TaskEventPayload::TaskBlocked { .. } => response
-            .runs
-            .last()
-            .map(|run| task_run_uses_creation_anchor(response, run.id.as_str()))
-            .unwrap_or(false),
+        | TaskEventPayload::TaskBlocked { .. } => {
+            response.task.created_by_turn_id.is_some()
+                && store
+                    .latest_task_run_uses_creation_anchor(&response.task)
+                    .await?
+        }
         _ => false,
-    }
+    })
 }
 
-fn task_run_uses_creation_anchor(response: &TaskGetResponse, run_id: &str) -> bool {
-    if response.task.created_by_turn_id.is_none() {
-        return false;
-    }
-    if !response
-        .task
-        .lifecycle_policy
-        .as_ref()
-        .map(|policy| policy.attachment == TaskAttachmentMode::Attached)
-        .unwrap_or(false)
-    {
-        return false;
-    }
-    response
-        .runs
-        .iter()
-        .find(|run| run.id == run_id)
-        .and_then(|run| run.trigger_id.as_deref())
-        .and_then(|trigger_id| {
-            response
-                .triggers
-                .iter()
-                .find(|trigger| trigger.id == trigger_id)
-        })
-        .map(|trigger| trigger.kind() == TaskTriggerKind::Immediate)
-        .unwrap_or(false)
+fn task_run_uses_creation_anchor(response: &TaskEventContext, run_id: &str) -> bool {
+    response.run_uses_creation_anchor(run_id)
 }
 
-fn parent_task_anchor_item_id(response: &TaskGetResponse, run_id: Option<&str>) -> String {
+fn parent_task_anchor_item_id(response: &TaskEventContext, run_id: Option<&str>) -> String {
     match run_id {
         Some(run_id) if !task_run_uses_creation_anchor(response, run_id) => {
             crate::task_tools::task_run_anchor_id(run_id)
@@ -1304,5 +1472,54 @@ async fn task_delivery_child_lineage(
             );
             (None, None)
         }
+    }
+}
+
+#[cfg(test)]
+mod task_child_failure_tests {
+    use super::*;
+    use pioneer_tasks::{TaskStartCause, TaskStartFailure, TaskStartStage};
+
+    #[test]
+    fn aggregate_owns_only_safe_reported_descriptors_and_preserves_independent_retry_input() {
+        let (_, events) = crate::public_error::test_support::capture_events(|| {
+            let mut batch = TaskChildReconciliationFailures::default();
+            // A typed expected refusal cannot be reclassified from the Context.
+            batch.push(
+                "PRIVATE_THREAD",
+                "PRIVATE_TURN",
+                anyhow::Error::new(
+                    TaskStartFailure::new(TaskStartStage::CliAdmission, TaskStartCause::Policy)
+                        .with_correlation_id("existing-correlation".to_owned()),
+                )
+                .context("PRIVATE_SQL_PATH_HISTORY_SECRET unable to open database file"),
+            );
+            assert!(!batch.retry_transient_storage_access());
+            let display = format!("{batch}");
+            let debug = format!("{batch:?}");
+            assert!(!display.contains("PRIVATE_"));
+            assert!(!debug.contains("PRIVATE_"));
+            assert!(std::error::Error::source(&batch).is_none());
+            assert_eq!(
+                batch.reported[0].correlation_id.as_deref(),
+                Some("existing-correlation")
+            );
+            batch.report_worker_failure();
+            // The independent legacy storage failure still drives its former
+            // predicate and retains a separate worker ERROR in a mixed batch.
+            batch.push(
+                "independent-thread",
+                "independent-turn",
+                anyhow::anyhow!("unable to open database file"),
+            );
+            assert!(batch.retry_transient_storage_access());
+            batch.report_worker_failure();
+        });
+        assert_eq!(
+            events.len(),
+            1,
+            "only the independent failure creates ERROR"
+        );
+        assert!(!serde_json::to_string(&events).unwrap().contains("PRIVATE_"));
     }
 }

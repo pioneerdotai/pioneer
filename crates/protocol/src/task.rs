@@ -842,6 +842,8 @@ pub struct TaskResult {
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskError {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_diagnostic: Option<crate::RecoveryDiagnostic>,
     pub code: String,
     pub message: String,
     pub class: TaskErrorClass,
@@ -849,6 +851,15 @@ pub struct TaskError {
     pub details: Option<TaskValue>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failed_run_id: Option<String>,
+}
+
+impl TaskError {
+    pub fn recovery_public_message(&self) -> Option<String> {
+        self.recovery_diagnostic
+            .as_ref()
+            .filter(|value| value.stop_reason.is_some())
+            .map(crate::RecoveryDiagnostic::public_message)
+    }
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
@@ -1056,6 +1067,11 @@ pub struct TaskAgentToolPolicy {
 #[serde(rename_all = "camelCase")]
 pub struct TaskAgentSecurityCap {
     pub max_permission_profile: crate::TurnPermissionProfileCap,
+    /// Distinguishes a restricted cap with zero roots from an unrestricted
+    /// cap, whose bounded-root list is also empty. Legacy records omit this
+    /// field and are interpreted conservatively by the Gateway.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_filesystem_kind: Option<crate::TurnFilesystemSandboxKind>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub max_filesystem_entries: Vec<crate::TurnFilesystemSandboxEntry>,
     pub max_network_policy: crate::TurnNetworkPolicySnapshot,
@@ -2690,6 +2706,8 @@ pub struct PublicTaskResult {
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct PublicTaskFailure {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_diagnostic: Option<crate::RecoveryDiagnostic>,
     pub class: TaskErrorClass,
     pub error: crate::PublicError,
 }
@@ -2736,6 +2754,8 @@ pub struct PublicTaskRun {
     pub status: TaskRunStatus,
     pub executor_kind: TaskExecutorKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution: Option<PublicTaskRunExecutionObservation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started_at: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completed_at: Option<i64>,
@@ -2745,6 +2765,19 @@ pub struct PublicTaskRun {
     pub error: Option<PublicTaskFailure>,
     pub created_at: i64,
     pub updated_at: i64,
+}
+
+/// A read-only observation of the execution belonging to this run. Timestamps
+/// are Unix seconds. A missing status means no execution row was observed.
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicTaskRunExecutionObservation {
+    pub status: Option<TaskRunExecutionStatus>,
+    pub heartbeat_at: Option<i64>,
+    /// Confirmed task progress recorded for this execution attempt, if any.
+    /// This is distinct from a periodic heartbeat and does not promise a result.
+    pub last_activity_at: Option<i64>,
+    pub observed_at: i64,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq)]
@@ -3533,6 +3566,7 @@ mod tests {
             max_permission_profile: crate::task_permission_cap_for_mode(
                 crate::TurnPermissionMode::AutoAcceptEdits,
             ),
+            max_filesystem_kind: Some(crate::TurnFilesystemSandboxKind::Restricted),
             max_filesystem_entries: vec![crate::TurnFilesystemSandboxEntry::workspace_root(
                 crate::TurnFilesystemAccess::Write,
                 "/workspace",

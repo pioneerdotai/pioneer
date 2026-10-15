@@ -239,172 +239,203 @@ impl MessageProcessor {
         .await;
     }
 
-    pub(super) async fn voice_session_finalize(
-        &self,
-        request_context: &RequestContext,
+    pub(super) fn voice_session_finalize<'a>(
+        &'a self,
+        request_context: &'a RequestContext,
         request_id: RequestId,
         params: VoiceSessionFinalizeParams,
-    ) {
-        let connection_id = request_context.connection_id();
-        let owner = AuthenticatedTransferOwner::from_request_context(request_context);
-        let request_actor = request_context.persisted_actor();
-        if let Err(message) = validate_voice_finalize_params(&params) {
-            self.send_voice_error(
-                connection_id,
-                request_id,
-                INVALID_PARAMS_CODE,
-                methods::VOICE_SESSION_FINALIZE,
-                VoiceError {
-                    kind: VoiceErrorKind::InvalidSession,
-                    message,
-                    public_error: None,
-                },
-            )
-            .await;
-            return;
-        }
-
-        let pending_session = match self
-            .voice_sessions
-            .lookup_authenticated_session(params.session_id.as_str(), &owner)
-        {
-            Ok(session) => session,
-            Err(error) => {
+    ) -> MessageFuture<'a, ()> {
+        // Finalization includes admission, turn preparation and publication.
+        // Keep its state out of the dispatch branch's generated poll frame,
+        // just like the other large turn-start handlers.
+        message_future(async move {
+            let connection_id = request_context.connection_id();
+            let owner = AuthenticatedTransferOwner::from_request_context(request_context);
+            let request_actor = request_context.persisted_actor();
+            if let Err(message) = validate_voice_finalize_params(&params) {
                 self.send_voice_error(
                     connection_id,
                     request_id,
-                    INVALID_REQUEST_CODE,
+                    INVALID_PARAMS_CODE,
                     methods::VOICE_SESSION_FINALIZE,
-                    error.into_voice_error(),
+                    VoiceError {
+                        kind: VoiceErrorKind::InvalidSession,
+                        message,
+                        public_error: None,
+                    },
                 )
                 .await;
                 return;
             }
-        };
 
-        if let Err(error) = self
-            .ensure_voice_context_owned_by_connection(connection_id, &params.context)
-            .await
-            .and_then(|_| {
-                ensure_voice_finalize_context_matches_session(&pending_session, &params.context)
-            })
-        {
-            self.send_voice_error(
-                connection_id,
-                request_id,
-                INVALID_REQUEST_CODE,
-                methods::VOICE_SESSION_FINALIZE,
-                error,
-            )
-            .await;
-            return;
-        }
-        if !self
-            .revalidate_voice_thread_access(
-                request_context,
-                pending_session.workspace_id.as_str(),
-                pending_session.thread_id.as_str(),
-            )
-            .await
-        {
-            self.send_voice_error(
-                connection_id,
-                request_id,
-                INVALID_REQUEST_CODE,
-                methods::VOICE_SESSION_FINALIZE,
-                VoiceError {
-                    kind: VoiceErrorKind::InvalidSession,
-                    message: "voice session target is unavailable".to_owned(),
-                    public_error: None,
-                },
-            )
-            .await;
-            return;
-        }
-
-        if let Err(error) = self
-            .voice_sessions
-            .mark_finalizing_authenticated(params.session_id.as_str(), &owner)
-        {
-            self.send_voice_error(
-                connection_id,
-                request_id,
-                INVALID_REQUEST_CODE,
-                methods::VOICE_SESSION_FINALIZE,
-                error.into_voice_error(),
-            )
-            .await;
-            return;
-        }
-
-        let session = match self
-            .voice_sessions
-            .mark_transcribing_authenticated(params.session_id.as_str(), &owner)
-        {
-            Ok(session) => session,
-            Err(error) => {
-                self.send_voice_error(
-                    connection_id,
-                    request_id,
-                    INVALID_REQUEST_CODE,
-                    methods::VOICE_SESSION_FINALIZE,
-                    error.into_voice_error(),
-                )
-                .await;
-                return;
-            }
-        };
-
-        self.send_voice_result(
-            connection_id,
-            request_id.clone(),
-            methods::VOICE_SESSION_FINALIZE,
-            &VoiceSessionFinalizeResponse {
-                status: VoiceStatus::Transcribing,
-            },
-        )
-        .await;
-
-        let pipeline_outcome = self.finalize_voice_session_audio(&session).await;
-        let _ = self
-            .voice_sessions
-            .remove_authenticated_session(session.session_id.as_str(), &owner);
-
-        match pipeline_outcome {
-            Ok(GatewayVoiceSessionPipelineOutcome::Transcript {
-                transcript,
-                signal_stats,
-            }) => {
-                let execution_admission = match self
-                    .resolve_voice_execution_admission(
-                        request_context,
-                        session.workspace_id.as_str(),
-                        session.thread_id.as_str(),
+            let pending_session = match self
+                .voice_sessions
+                .lookup_authenticated_session(params.session_id.as_str(), &owner)
+            {
+                Ok(session) => session,
+                Err(error) => {
+                    self.send_voice_error(
+                        connection_id,
+                        request_id,
+                        INVALID_REQUEST_CODE,
+                        methods::VOICE_SESSION_FINALIZE,
+                        error.into_voice_error(),
                     )
-                    .await
-                {
-                    Some(admission) => admission,
-                    None => {
-                        self.send_voice_session_result_notification(
-                            connection_id,
+                    .await;
+                    return;
+                }
+            };
+
+            if let Err(error) = self
+                .ensure_voice_context_owned_by_connection(connection_id, &params.context)
+                .await
+                .and_then(|_| {
+                    ensure_voice_finalize_context_matches_session(&pending_session, &params.context)
+                })
+            {
+                self.send_voice_error(
+                    connection_id,
+                    request_id,
+                    INVALID_REQUEST_CODE,
+                    methods::VOICE_SESSION_FINALIZE,
+                    error,
+                )
+                .await;
+                return;
+            }
+            if !self
+                .revalidate_voice_thread_access(
+                    request_context,
+                    pending_session.workspace_id.as_str(),
+                    pending_session.thread_id.as_str(),
+                )
+                .await
+            {
+                self.send_voice_error(
+                    connection_id,
+                    request_id,
+                    INVALID_REQUEST_CODE,
+                    methods::VOICE_SESSION_FINALIZE,
+                    VoiceError {
+                        kind: VoiceErrorKind::InvalidSession,
+                        message: "voice session target is unavailable".to_owned(),
+                        public_error: None,
+                    },
+                )
+                .await;
+                return;
+            }
+
+            if let Err(error) = self
+                .voice_sessions
+                .mark_finalizing_authenticated(params.session_id.as_str(), &owner)
+            {
+                self.send_voice_error(
+                    connection_id,
+                    request_id,
+                    INVALID_REQUEST_CODE,
+                    methods::VOICE_SESSION_FINALIZE,
+                    error.into_voice_error(),
+                )
+                .await;
+                return;
+            }
+
+            let session = match self
+                .voice_sessions
+                .mark_transcribing_authenticated(params.session_id.as_str(), &owner)
+            {
+                Ok(session) => session,
+                Err(error) => {
+                    self.send_voice_error(
+                        connection_id,
+                        request_id,
+                        INVALID_REQUEST_CODE,
+                        methods::VOICE_SESSION_FINALIZE,
+                        error.into_voice_error(),
+                    )
+                    .await;
+                    return;
+                }
+            };
+
+            self.send_voice_result(
+                connection_id,
+                request_id.clone(),
+                methods::VOICE_SESSION_FINALIZE,
+                &VoiceSessionFinalizeResponse {
+                    status: VoiceStatus::Transcribing,
+                },
+            )
+            .await;
+
+            crate::voice::finalization::acknowledge();
+            let pipeline_outcome = self.finalize_voice_session_audio(&session).await;
+            if self.voice_finalizations.shutdown.is_cancelled() {
+                return;
+            }
+            // Claim the terminal outcome atomically against cancel/disconnect. The
+            // native call cannot be interrupted, but a removed session must never
+            // materialize its late transcript as a user turn or emit a second result.
+            match self
+                .voice_sessions
+                .claim_finalized_authenticated_session(session.session_id.as_str(), &owner)
+            {
+                Ok(true) => {}
+                Ok(false) => return,
+                Err(error) => {
+                    self.send_voice_session_result_notification(
+                        connection_id,
+                        session.thread_id.as_str(),
+                        VoiceSessionResultNotification {
+                            session_id: session.session_id.clone(),
+                            outcome: VoiceSessionOutcome::Failed,
+                            turn_id: Some(session.turn_id.clone()),
+                            error: Some(error.into_voice_error()),
+                        },
+                    )
+                    .await;
+                    return;
+                }
+            }
+
+            match pipeline_outcome {
+                Ok(GatewayVoiceSessionPipelineOutcome::Transcript {
+                    transcript,
+                    signal_stats,
+                }) => {
+                    let execution_admission = match self
+                        .resolve_voice_execution_admission(
+                            request_context,
+                            session.workspace_id.as_str(),
                             session.thread_id.as_str(),
-                            VoiceSessionResultNotification {
-                                session_id: session.session_id.clone(),
-                                outcome: VoiceSessionOutcome::Failed,
-                                turn_id: Some(session.turn_id.clone()),
-                                error: Some(VoiceError {
-                                    kind: VoiceErrorKind::InvalidSession,
-                                    message: "voice session target is unavailable".to_owned(),
-                                    public_error: None,
-                                }),
-                            },
                         )
-                        .await;
-                        return;
-                    }
-                };
-                let turn_params =
-                    match voice_turn_start_params_from_transcript(&params.context, transcript) {
+                        .await
+                    {
+                        Some(admission) => admission,
+                        None => {
+                            self.send_voice_session_result_notification(
+                                connection_id,
+                                session.thread_id.as_str(),
+                                VoiceSessionResultNotification {
+                                    session_id: session.session_id.clone(),
+                                    outcome: VoiceSessionOutcome::Failed,
+                                    turn_id: Some(session.turn_id.clone()),
+                                    error: Some(VoiceError {
+                                        kind: VoiceErrorKind::InvalidSession,
+                                        message: "voice session target is unavailable".to_owned(),
+                                        public_error: None,
+                                    }),
+                                },
+                            )
+                            .await;
+                            return;
+                        }
+                    };
+                    let turn_params = match voice_turn_start_params_from_transcript(
+                        &params.context,
+                        transcript,
+                    ) {
                         Ok(turn_params) => turn_params,
                         Err(no_speech) => {
                             let voice_error =
@@ -435,32 +466,60 @@ impl MessageProcessor {
                             return;
                         }
                     };
-                if turn_params.mode == Some(ThreadMode::Message) {
-                    let message_admission =
+                    if turn_params.mode == Some(ThreadMode::Message) {
+                        let message_admission =
                         super::message_turn::MessageTurnAdmission::from_voice_execution_admission(
                             &execution_admission,
                         );
-                    self.turn_start_message(
-                        request_context,
-                        message_admission,
-                        super::message_turn::MessageTurnResponse::Voice {
-                            session_id: session.session_id.clone(),
-                            thread_id: session.thread_id.clone(),
-                            turn_id: session.turn_id.clone(),
-                        },
-                        turn_params,
-                        false,
-                    )
-                    .await;
-                    return;
-                }
-                let thread = match self
-                    .thread_manager
-                    .thread_get(turn_params.thread_id.trim())
-                    .await
-                {
-                    Some(thread) => thread,
-                    None => {
+                        self.turn_start_message(
+                            request_context,
+                            message_admission,
+                            super::message_turn::MessageTurnResponse::Voice {
+                                session_id: session.session_id.clone(),
+                                thread_id: session.thread_id.clone(),
+                                turn_id: session.turn_id.clone(),
+                            },
+                            turn_params,
+                            false,
+                        )
+                        .await;
+                        return;
+                    }
+                    let thread = match self
+                        .thread_manager
+                        .thread_get(turn_params.thread_id.trim())
+                        .await
+                    {
+                        Some(thread) => thread,
+                        None => {
+                            self.send_voice_session_result_notification(
+                                connection_id,
+                                session.thread_id.as_str(),
+                                VoiceSessionResultNotification {
+                                    session_id: session.session_id.clone(),
+                                    outcome: VoiceSessionOutcome::Failed,
+                                    turn_id: Some(session.turn_id.clone()),
+                                    error: Some(VoiceError {
+                                        kind: VoiceErrorKind::Unknown,
+                                        message: format!(
+                                            "thread `{}` is not loaded",
+                                            turn_params.thread_id.trim()
+                                        ),
+                                        public_error: None,
+                                    }),
+                                },
+                            )
+                            .await;
+                            return;
+                        }
+                    };
+                    if let Err(error) = execution_admission.validate_provider_request(
+                        thread.model_provider.as_str(),
+                        thread.model.as_str(),
+                        turn_params.model_provider.as_deref(),
+                        turn_params.model.as_deref(),
+                        turn_params.execution_backend.as_ref(),
+                    ) {
                         self.send_voice_session_result_notification(
                             connection_id,
                             session.thread_id.as_str(),
@@ -469,11 +528,8 @@ impl MessageProcessor {
                                 outcome: VoiceSessionOutcome::Failed,
                                 turn_id: Some(session.turn_id.clone()),
                                 error: Some(VoiceError {
-                                    kind: VoiceErrorKind::Unknown,
-                                    message: format!(
-                                        "thread `{}` is not loaded",
-                                        turn_params.thread_id.trim()
-                                    ),
+                                    kind: VoiceErrorKind::InvalidSession,
+                                    message: error.to_string(),
                                     public_error: None,
                                 }),
                             },
@@ -481,35 +537,14 @@ impl MessageProcessor {
                         .await;
                         return;
                     }
-                };
-                if let Err(error) = execution_admission.validate_provider_request(
-                    thread.model_provider.as_str(),
-                    thread.model.as_str(),
-                    turn_params.model_provider.as_deref(),
-                    turn_params.model.as_deref(),
-                    turn_params.execution_backend.as_ref(),
-                ) {
-                    self.send_voice_session_result_notification(
-                        connection_id,
-                        session.thread_id.as_str(),
-                        VoiceSessionResultNotification {
-                            session_id: session.session_id.clone(),
-                            outcome: VoiceSessionOutcome::Failed,
-                            turn_id: Some(session.turn_id.clone()),
-                            error: Some(VoiceError {
-                                kind: VoiceErrorKind::InvalidSession,
-                                message: error.to_string(),
-                                public_error: None,
-                            }),
-                        },
-                    )
-                    .await;
-                    return;
-                }
-                if thread.origin_kind.composer_execution_mode()
-                    == pioneer_protocol::ThreadComposerExecutionMode::DetachedTask
-                {
-                    self.composer_detached_task_start(
+                    pioneer_observability::turn_startup::thread_role(
+                        &turn_params.turn_id,
+                        thread.origin_kind == pioneer_protocol::ThreadOriginKind::TaskRun,
+                    );
+                    if thread.origin_kind.composer_execution_mode()
+                        == pioneer_protocol::ThreadComposerExecutionMode::DetachedTask
+                    {
+                        self.composer_detached_task_start(
                         connection_id,
                         request_id,
                         request_actor.clone(),
@@ -521,17 +556,17 @@ impl MessageProcessor {
                         },
                     )
                     .await;
-                    return;
-                }
+                        return;
+                    }
 
-                if let Some(backend) = turn_params.execution_backend.clone() {
-                    match backend {
-                        AgentExecutionBackend::ApiProvider { .. } => {}
-                        AgentExecutionBackend::CLIAgentRuntime {
-                            runtime_id,
-                            runtime_kind,
-                        } => {
-                            self.turn_start_cli_runtime(
+                    if let Some(backend) = turn_params.execution_backend.clone() {
+                        match backend {
+                            AgentExecutionBackend::ApiProvider { .. } => {}
+                            AgentExecutionBackend::CLIAgentRuntime {
+                                runtime_id,
+                                runtime_kind,
+                            } => {
+                                self.turn_start_cli_runtime(
                                 connection_id,
                                 request_id,
                                 request_actor,
@@ -546,35 +581,35 @@ impl MessageProcessor {
                                 },
                             )
                             .await;
-                            return;
-                        }
-                        AgentExecutionBackend::ACPAgentRuntime { runtime_id } => {
-                            let error = VoiceError {
-                                kind: VoiceErrorKind::Unknown,
-                                message: format!(
-                                    "ACP agent runtime `{runtime_id}` is not supported"
-                                ),
-                                public_error: None,
-                            };
-                            self.send_voice_session_result_notification(
-                                connection_id,
-                                session.thread_id.as_str(),
-                                VoiceSessionResultNotification {
-                                    session_id: session.session_id.clone(),
-                                    outcome: VoiceSessionOutcome::Failed,
-                                    turn_id: Some(session.turn_id.clone()),
-                                    error: Some(error),
-                                },
-                            )
-                            .await;
-                            return;
+                                return;
+                            }
+                            AgentExecutionBackend::ACPAgentRuntime { runtime_id } => {
+                                let error = VoiceError {
+                                    kind: VoiceErrorKind::Unknown,
+                                    message: format!(
+                                        "ACP agent runtime `{runtime_id}` is not supported"
+                                    ),
+                                    public_error: None,
+                                };
+                                self.send_voice_session_result_notification(
+                                    connection_id,
+                                    session.thread_id.as_str(),
+                                    VoiceSessionResultNotification {
+                                        session_id: session.session_id.clone(),
+                                        outcome: VoiceSessionOutcome::Failed,
+                                        turn_id: Some(session.turn_id.clone()),
+                                        error: Some(error),
+                                    },
+                                )
+                                .await;
+                                return;
+                            }
                         }
                     }
-                }
 
-                let requested_reasoning_effort =
-                    super::turn_handlers::requested_reasoning_effort(&turn_params);
-                let admission = match self
+                    let requested_reasoning_effort =
+                        super::turn_handlers::requested_reasoning_effort(&turn_params);
+                    let admission = match self
                     .prepare_api_provider_turn_start(
                         connection_id,
                         request_actor,
@@ -617,33 +652,97 @@ impl MessageProcessor {
                         return;
                     }
                 };
-                let prepared = match admission {
-                    super::turn_handlers::ApiProviderTurnAdmission::New(prepared) => prepared,
-                    super::turn_handlers::ApiProviderTurnAdmission::Replay(_) => {
+                    let prepared = match admission {
+                        super::turn_handlers::ApiProviderTurnAdmission::New(prepared) => prepared,
+                        super::turn_handlers::ApiProviderTurnAdmission::Replay(_) => {
+                            self.send_voice_session_result_notification(
+                                connection_id,
+                                session.thread_id.as_str(),
+                                VoiceSessionResultNotification {
+                                    session_id: session.session_id.clone(),
+                                    outcome: VoiceSessionOutcome::TurnStarted,
+                                    turn_id: Some(session.turn_id.clone()),
+                                    error: None,
+                                },
+                            )
+                            .await;
+                            return;
+                        }
+                    };
+
+                    if !self
+                        .finish_api_provider_turn_start_without_response(connection_id, &prepared)
+                        .await
+                    {
+                        self.block_prepared_api_provider_turn_start(
+                            &prepared,
+                            "failed to commit native voice turn start lifecycle".to_owned(),
+                        )
+                        .await;
                         self.send_voice_session_result_notification(
                             connection_id,
                             session.thread_id.as_str(),
                             VoiceSessionResultNotification {
                                 session_id: session.session_id.clone(),
-                                outcome: VoiceSessionOutcome::TurnStarted,
+                                outcome: VoiceSessionOutcome::Failed,
                                 turn_id: Some(session.turn_id.clone()),
-                                error: None,
+                                error: Some(VoiceError {
+                                    kind: VoiceErrorKind::Unknown,
+                                    message: "failed to commit native voice turn start lifecycle"
+                                        .to_owned(),
+                                    public_error: None,
+                                }),
                             },
                         )
                         .await;
                         return;
                     }
-                };
-
-                if !self
-                    .finish_api_provider_turn_start_without_response(connection_id, &prepared)
-                    .await
-                {
-                    self.block_prepared_api_provider_turn_start(
-                        &prepared,
-                        "failed to commit native voice turn start lifecycle".to_owned(),
+                    self.send_voice_session_result_notification(
+                        connection_id,
+                        session.thread_id.as_str(),
+                        VoiceSessionResultNotification {
+                            session_id: session.session_id.clone(),
+                            outcome: VoiceSessionOutcome::TurnStarted,
+                            turn_id: Some(session.turn_id.clone()),
+                            error: None,
+                        },
                     )
                     .await;
+                    self.dispatch_prepared_api_provider_turn_start(prepared)
+                        .await;
+                    return;
+                }
+                Ok(GatewayVoiceSessionPipelineOutcome::NoSpeech {
+                    no_speech,
+                    signal_stats,
+                }) => {
+                    let voice_error = voice_error_for_no_speech(&no_speech, Some(signal_stats));
+                    debug!(
+                        connection_id,
+                        session_id = %session.session_id,
+                        thread_id = %session.thread_id,
+                        turn_id = %session.turn_id,
+                        reason = ?no_speech.reason,
+                        total_samples = no_speech.total_samples,
+                        signal_rms = signal_stats.rms,
+                        signal_peak = signal_stats.peak,
+                        non_zero_samples = signal_stats.non_zero_samples,
+                        "voice session finalized with no speech; no turn will be created"
+                    );
+                    self.send_voice_session_result_notification(
+                        connection_id,
+                        session.thread_id.as_str(),
+                        VoiceSessionResultNotification {
+                            session_id: session.session_id.clone(),
+                            outcome: VoiceSessionOutcome::NoSpeech,
+                            turn_id: Some(session.turn_id.clone()),
+                            error: Some(voice_error),
+                        },
+                    )
+                    .await;
+                    return;
+                }
+                Err(error) => {
                     self.send_voice_session_result_notification(
                         connection_id,
                         session.thread_id.as_str(),
@@ -651,77 +750,14 @@ impl MessageProcessor {
                             session_id: session.session_id.clone(),
                             outcome: VoiceSessionOutcome::Failed,
                             turn_id: Some(session.turn_id.clone()),
-                            error: Some(VoiceError {
-                                kind: VoiceErrorKind::Unknown,
-                                message: "failed to commit native voice turn start lifecycle"
-                                    .to_owned(),
-                                public_error: None,
-                            }),
+                            error: Some(error),
                         },
                     )
                     .await;
                     return;
                 }
-                self.send_voice_session_result_notification(
-                    connection_id,
-                    session.thread_id.as_str(),
-                    VoiceSessionResultNotification {
-                        session_id: session.session_id.clone(),
-                        outcome: VoiceSessionOutcome::TurnStarted,
-                        turn_id: Some(session.turn_id.clone()),
-                        error: None,
-                    },
-                )
-                .await;
-                self.dispatch_prepared_api_provider_turn_start(prepared)
-                    .await;
-                return;
             }
-            Ok(GatewayVoiceSessionPipelineOutcome::NoSpeech {
-                no_speech,
-                signal_stats,
-            }) => {
-                let voice_error = voice_error_for_no_speech(&no_speech, Some(signal_stats));
-                debug!(
-                    connection_id,
-                    session_id = %session.session_id,
-                    thread_id = %session.thread_id,
-                    turn_id = %session.turn_id,
-                    reason = ?no_speech.reason,
-                    total_samples = no_speech.total_samples,
-                    signal_rms = signal_stats.rms,
-                    signal_peak = signal_stats.peak,
-                    non_zero_samples = signal_stats.non_zero_samples,
-                    "voice session finalized with no speech; no turn will be created"
-                );
-                self.send_voice_session_result_notification(
-                    connection_id,
-                    session.thread_id.as_str(),
-                    VoiceSessionResultNotification {
-                        session_id: session.session_id.clone(),
-                        outcome: VoiceSessionOutcome::NoSpeech,
-                        turn_id: Some(session.turn_id.clone()),
-                        error: Some(voice_error),
-                    },
-                )
-                .await;
-                return;
-            }
-            Err(error) => {
-                self.send_voice_session_result_notification(
-                    connection_id,
-                    session.thread_id.as_str(),
-                    VoiceSessionResultNotification {
-                        session_id: session.session_id.clone(),
-                        outcome: VoiceSessionOutcome::Failed,
-                        turn_id: Some(session.turn_id.clone()),
-                        error: Some(error),
-                    },
-                )
-                .await;
-                return;
-            }
-        }
+        })
     }
 
     pub(super) async fn voice_session_cancel(
@@ -1031,83 +1067,139 @@ impl MessageProcessor {
         &self,
         session: &GatewayVoiceSession,
     ) -> Result<GatewayVoiceSessionPipelineOutcome, VoiceError> {
-        let audio = self
-            .voice_session_buffers
-            .take_session_audio(session.session_id.as_str())
-            .map_err(|error| error.into_voice_error())?;
-        let signal_stats = VoiceSignalStats::from_samples(audio.normalized_samples.as_slice());
-        debug!(
-            session_id = %session.session_id,
-            thread_id = %session.thread_id,
-            turn_id = %session.turn_id,
-            sample_rate_hz = audio.audio_format.sample_rate_hz,
-            buffered_chunks = audio.chunks.len(),
-            buffered_bytes = audio.buffered_bytes,
-            total_samples = signal_stats.total_samples,
-            signal_rms = signal_stats.rms,
-            signal_peak = signal_stats.peak,
-            non_zero_samples = signal_stats.non_zero_samples,
-            "voice session audio signal stats"
+        let _startup_stage = pioneer_observability::turn_startup::stage(
+            &session.turn_id,
+            pioneer_observability::turn_startup::Stage::VoiceFinalize,
         );
-        let speech_outcome = if audio.normalized_samples.is_empty() {
-            VoiceTranscriptionOutcome::NoSpeech(VoiceTranscriptionNoSpeech {
-                reason: crate::voice::transcription::VoiceTranscriptionNoSpeechReason::EmptyBuffer,
-                total_samples: 0,
-            })
-        } else {
-            let detector =
-                EnergyVoiceActivityDetector::new(GATEWAY_VOICE_ENERGY_VAD_THRESHOLD_FLOOR)
-                    .map_err(|error| VoiceError {
-                        kind: VoiceErrorKind::TranscriptionFailed,
-                        message: format!("failed to initialize gateway voice VAD: {error:#}"),
-                        public_error: None,
-                    })?;
-            let mut vad =
-                SmoothedVoiceVad::new(detector, VoiceVadConfig::default()).map_err(|error| {
-                    VoiceError {
-                        kind: VoiceErrorKind::TranscriptionFailed,
-                        message: format!("failed to initialize gateway voice VAD: {error:#}"),
-                        public_error: None,
+        let audio = {
+            let _startup_part = pioneer_observability::turn_startup::stage(
+                &session.turn_id,
+                pioneer_observability::turn_startup::Stage::VoiceFinish,
+            );
+            self.voice_session_buffers
+                .take_session_audio(session.session_id.as_str())
+                .map_err(|error| error.into_voice_error())?
+        };
+        let supervisor = self.voice_input_supervisor.clone();
+        let session_id = session.session_id.clone();
+        let thread_id = session.thread_id.clone();
+        let turn_id = session.turn_id.clone();
+        #[cfg(test)]
+        let test_transcriber = self.voice_test_transcriber.clone();
+        // The owned finalization task awaits this call, retaining its slot and
+        // audio/engine ownership even when cancel removes terminal authority.
+        // Capture while the request's async dispatcher scope is installed. The
+        // blocking thread has independent thread-local state; keep None intact.
+        let startup_key = pioneer_observability::turn_startup::current_key();
+        let startup_queued_at = std::time::Instant::now();
+        tokio::task::spawn_blocking(move || {
+            pioneer_observability::turn_startup::scope_sync(startup_key, || {
+                pioneer_observability::turn_startup::record_current_duration(
+                    pioneer_observability::turn_startup::Stage::VoiceWorkerWait,
+                    startup_queued_at.elapsed(),
+                );
+                let signal_stats = VoiceSignalStats::from_samples(audio.normalized_samples.as_slice());
+                debug!(
+                    session_id = %session_id,
+                    thread_id = %thread_id,
+                    turn_id = %turn_id,
+                    sample_rate_hz = audio.audio_format.sample_rate_hz,
+                    buffered_chunks = audio.chunks.len(),
+                    buffered_bytes = audio.buffered_bytes,
+                    total_samples = signal_stats.total_samples,
+                    signal_rms = signal_stats.rms,
+                    signal_peak = signal_stats.peak,
+                    non_zero_samples = signal_stats.non_zero_samples,
+                    "voice session audio signal stats"
+                );
+                let speech_outcome = {
+                    let _startup_part = pioneer_observability::turn_startup::stage(
+                        &turn_id,
+                        pioneer_observability::turn_startup::Stage::VoiceVad,
+                    );
+                    if audio.normalized_samples.is_empty() {
+                        VoiceTranscriptionOutcome::NoSpeech(VoiceTranscriptionNoSpeech {
+                        reason:
+                            crate::voice::transcription::VoiceTranscriptionNoSpeechReason::EmptyBuffer,
+                        total_samples: 0,
+                    })
+                    } else {
+                        let detector =
+                            EnergyVoiceActivityDetector::new(GATEWAY_VOICE_ENERGY_VAD_THRESHOLD_FLOOR)
+                                .map_err(|error| VoiceError {
+                                    kind: VoiceErrorKind::TranscriptionFailed,
+                                    message: format!(
+                                        "failed to initialize gateway voice VAD: {error:#}"
+                                    ),
+                                    public_error: None,
+                                })?;
+                        let mut vad = SmoothedVoiceVad::new(detector, VoiceVadConfig::default())
+                            .map_err(|error| VoiceError {
+                                kind: VoiceErrorKind::TranscriptionFailed,
+                                message: format!("failed to initialize gateway voice VAD: {error:#}"),
+                                public_error: None,
+                            })?;
+                        let vad_outcome = vad
+                            .segment_samples(audio.normalized_samples.as_slice())
+                            .map_err(|error| VoiceError {
+                                kind: VoiceErrorKind::TranscriptionFailed,
+                                message: format!("failed to segment voice audio: {error:#}"),
+                                public_error: None,
+                            })?;
+                        PreparedSpeechBuffer::from_vad_outcome(
+                            audio.audio_format.sample_rate_hz,
+                            vad_outcome,
+                        )
                     }
-                })?;
-            let vad_outcome = vad
-                .segment_samples(audio.normalized_samples.as_slice())
-                .map_err(|error| VoiceError {
-                    kind: VoiceErrorKind::TranscriptionFailed,
-                    message: format!("failed to segment voice audio: {error:#}"),
-                    public_error: None,
-                })?;
-            PreparedSpeechBuffer::from_vad_outcome(audio.audio_format.sample_rate_hz, vad_outcome)
-        };
+                };
 
-        let buffer = match speech_outcome {
-            VoiceTranscriptionOutcome::Ready(buffer) => buffer,
-            VoiceTranscriptionOutcome::NoSpeech(no_speech) => {
-                return Ok(GatewayVoiceSessionPipelineOutcome::NoSpeech {
-                    no_speech,
-                    signal_stats,
-                });
-            }
-        };
+                let buffer = match speech_outcome {
+                    VoiceTranscriptionOutcome::Ready(buffer) => buffer,
+                    VoiceTranscriptionOutcome::NoSpeech(no_speech) => {
+                        return Ok(GatewayVoiceSessionPipelineOutcome::NoSpeech {
+                            no_speech,
+                            signal_stats,
+                        });
+                    }
+                };
 
-        let Some(supervisor) = self.voice_input_supervisor.as_ref() else {
-            return Err(VoiceError {
-                kind: VoiceErrorKind::ModelUnavailable,
-                message: "Voice Input is not configured".to_owned(),
-                public_error: None,
-            });
-        };
-        match transcribe_prepared_speech_buffer(supervisor.as_ref(), buffer) {
-            Ok(Ok(transcript)) => Ok(GatewayVoiceSessionPipelineOutcome::Transcript {
-                transcript,
-                signal_stats,
-            }),
-            Ok(Err(no_speech)) => Ok(GatewayVoiceSessionPipelineOutcome::NoSpeech {
-                no_speech,
-                signal_stats,
-            }),
-            Err(error) => Err(error.into_voice_error()),
-        }
+                let Some(supervisor) = supervisor.as_ref() else {
+                    return Err(VoiceError {
+                        kind: VoiceErrorKind::ModelUnavailable,
+                        message: "Voice Input is not configured".to_owned(),
+                        public_error: None,
+                    });
+                };
+                #[cfg(test)]
+                let outcome = if let Some(fake) = test_transcriber {
+                    transcribe_prepared_speech_buffer(
+                        &crate::voice::transcription::TestSpeechTranscriber(fake),
+                        buffer,
+                    )
+                } else {
+                    transcribe_prepared_speech_buffer(supervisor.as_ref(), buffer)
+                };
+                #[cfg(not(test))]
+                let outcome = transcribe_prepared_speech_buffer(supervisor.as_ref(), buffer);
+                match outcome {
+                    Ok(Ok(transcript)) => Ok(GatewayVoiceSessionPipelineOutcome::Transcript {
+                        transcript,
+                        signal_stats,
+                    }),
+                    Ok(Err(no_speech)) => Ok(GatewayVoiceSessionPipelineOutcome::NoSpeech {
+                        no_speech,
+                        signal_stats,
+                    }),
+                    Err(error) => Err(error.into_voice_error()),
+                }
+            })
+        })
+        .await
+        .map_err(|error| VoiceError {
+            kind: VoiceErrorKind::TranscriptionFailed,
+            message: format!("voice finalization worker failed: {error}"),
+            public_error: None,
+        })?
     }
 
     async fn send_voice_result<T>(
@@ -1153,6 +1245,23 @@ impl MessageProcessor {
         thread_id: &str,
         mut notification: VoiceSessionResultNotification,
     ) {
+        if let Some(key) = notification.turn_id.as_deref() {
+            let outcome = match notification.outcome {
+                VoiceSessionOutcome::Cancelled => {
+                    Some(pioneer_observability::turn_startup::Outcome::Cancelled)
+                }
+                VoiceSessionOutcome::NoSpeech => {
+                    Some(pioneer_observability::turn_startup::Outcome::NoSpeech)
+                }
+                VoiceSessionOutcome::Failed => {
+                    Some(pioneer_observability::turn_startup::Outcome::Failed)
+                }
+                VoiceSessionOutcome::TurnStarted => None,
+            };
+            if let Some(outcome) = outcome {
+                pioneer_observability::turn_startup::finish(key, outcome);
+            }
+        }
         if let Some(error) = notification.error.take() {
             notification.error = Some(voice_error_at_public_boundary(
                 error,
@@ -1215,8 +1324,26 @@ fn voice_error_at_public_boundary(
                 pioneer_protocol::PublicErrorCode::Internal
             }
         };
-        let public_error =
-            crate::public_error::map_agent_failure(public_code, stage, error.message);
+        let public_error = crate::public_error::build_public_error(public_code, stage);
+        match error.kind {
+            VoiceErrorKind::Cancelled => crate::public_error::report_expected_failure(
+                &public_error,
+                "voice_request",
+                "cancelled",
+            ),
+            VoiceErrorKind::MicrophonePermissionBlocked
+            | VoiceErrorKind::DeviceUnavailable
+            | VoiceErrorKind::InvalidSession
+            | VoiceErrorKind::StaleChunk
+            | VoiceErrorKind::SequenceGap
+            | VoiceErrorKind::NoSpeech => crate::public_error::report_expected_failure(
+                &public_error,
+                "voice_request",
+                "protocol_refusal",
+            ),
+            // Availability and unknown errors can represent infrastructure failures.
+            _ => crate::public_error::report_agent_failure(&public_error, error.message),
+        }
         error.message = public_error.message.clone();
         error.public_error = Some(public_error);
     }
@@ -1288,6 +1415,9 @@ fn voice_turn_start_params_from_transcript(
     context: &pioneer_protocol::VoiceTurnContext,
     transcript: VoiceTranscript,
 ) -> Result<TurnStartParams, VoiceTranscriptionNoSpeech> {
+    let _startup_input = pioneer_observability::turn_startup::current_stage(
+        pioneer_observability::turn_startup::Stage::VoiceInput,
+    );
     let transcript_text = transcript.text.trim();
     if transcript_text.is_empty() {
         return Err(VoiceTranscriptionNoSpeech {
@@ -1423,6 +1553,76 @@ fn voice_error_kind_code(kind: VoiceErrorKind) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn typed_cancellation_and_protocol_refusal_are_breadcrumbs() {
+        use crate::public_error::test_support::capture_events;
+        let (_, events) = capture_events(|| {
+            for kind in [
+                VoiceErrorKind::Cancelled,
+                VoiceErrorKind::InvalidSession,
+                VoiceErrorKind::StaleChunk,
+                VoiceErrorKind::SequenceGap,
+                VoiceErrorKind::NoSpeech,
+            ] {
+                let error = voice_error_at_public_boundary(
+                    VoiceError {
+                        kind,
+                        message: "bearer-token /Users/operator/private".to_owned(),
+                        public_error: None,
+                    },
+                    pioneer_protocol::PublicErrorStage::Execution,
+                );
+                let encoded = serde_json::to_string(&error).unwrap();
+                assert!(!encoded.contains("bearer-token"));
+                assert!(!encoded.contains("/Users/operator/private"));
+                let public = error.public_error.as_ref().unwrap();
+                assert_eq!(public.stage, pioneer_protocol::PublicErrorStage::Execution);
+                assert_eq!(
+                    public.code,
+                    if kind == VoiceErrorKind::Cancelled {
+                        pioneer_protocol::PublicErrorCode::Conflict
+                    } else {
+                        pioneer_protocol::PublicErrorCode::InvalidInput
+                    }
+                );
+                // Reusing an already sanitized error also does not register a failure.
+                assert_eq!(
+                    voice_error_at_public_boundary(
+                        error.clone(),
+                        pioneer_protocol::PublicErrorStage::Admission
+                    ),
+                    error
+                );
+            }
+        });
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn unknown_and_infrastructure_voice_failures_remain_errors() {
+        use crate::public_error::test_support::*;
+        for kind in [
+            VoiceErrorKind::Unknown,
+            VoiceErrorKind::GatewayBusy,
+            VoiceErrorKind::ModelUnavailable,
+            VoiceErrorKind::TranscriptionFailed,
+        ] {
+            let (error, events) = capture_events(|| {
+                voice_error_at_public_boundary(
+                    VoiceError {
+                        kind,
+                        message: "cancelled is only raw text here".to_owned(),
+                        public_error: None,
+                    },
+                    pioneer_protocol::PublicErrorStage::Execution,
+                )
+            });
+            assert_eq!(events.len(), 1);
+            assert_correlated(&events[0], error.public_error.as_ref().unwrap());
+        }
+    }
+
     use crate::voice::transcription::{
         VoiceTranscriptionDiagnostics, VoiceTranscriptionNoSpeechReason, VoiceTranscriptionStrategy,
     };

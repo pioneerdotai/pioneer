@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock, Weak};
 use tokio::sync::Mutex;
 
 const THREAD_EPISODIC_SCHEMA_VERSION: &str = "1";
@@ -617,6 +617,15 @@ pub trait ThreadEpisodicMemvidBackend: Send + Sync {
         request: ThreadEpisodicMemvidIndexRequest,
     ) -> Result<ThreadEpisodicMemvidIndexOutput, ThreadEpisodicMemvidError>;
 
+    async fn index_item_with_workspace_ownership(
+        &self,
+        request: ThreadEpisodicMemvidIndexRequest,
+        ownership: ThreadEpisodicWorkspaceOwnership,
+    ) -> Result<ThreadEpisodicMemvidIndexOutput, ThreadEpisodicMemvidError> {
+        let _ownership = ownership;
+        self.index_item(request).await
+    }
+
     async fn search(
         &self,
         request: ThreadEpisodicMemvidSearchRequest,
@@ -638,30 +647,163 @@ pub trait ThreadEpisodicMemvidBackend: Send + Sync {
 
 pub struct MemvidThreadEpisodicBackend {
     capabilities: ThreadEpisodicMemvidBackendCapabilities,
-    locks: Mutex<BTreeMap<PathBuf, Arc<Mutex<()>>>>,
+    workspace_ownership: Option<ThreadEpisodicWorkspaceOwnership>,
+}
+
+// Shared by ordinary indexing and destructive projection replacement. The
+// clone passed into a blocking capsule operation outlives a canceled waiter.
+pub type ThreadEpisodicWorkspaceOwnership = Arc<ThreadEpisodicWorkspaceGuard>;
+
+pub struct ThreadEpisodicWorkspaceGuard {
+    guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+fn workspace_releases() -> &'static tokio::sync::watch::Sender<()> {
+    static RELEASES: OnceLock<tokio::sync::watch::Sender<()>> = OnceLock::new();
+    RELEASES.get_or_init(|| tokio::sync::watch::channel(()).0)
+}
+
+// A single coalesced release signal covers all workspaces, including releases
+// by blocking capsule operations whose async waiter has been canceled.
+pub fn thread_episodic_workspace_releases() -> tokio::sync::watch::Receiver<()> {
+    workspace_releases().subscribe()
+}
+
+impl Drop for ThreadEpisodicWorkspaceGuard {
+    fn drop(&mut self) {
+        drop(self.guard.take());
+        workspace_releases().send_replace(());
+    }
+}
+type WorkspaceLockRegistry = Mutex<BTreeMap<String, Weak<Mutex<()>>>>;
+
+async fn workspace_lock(workspace_id: &str) -> Arc<Mutex<()>> {
+    static LOCKS: OnceLock<WorkspaceLockRegistry> = OnceLock::new();
+    let mut locks = LOCKS
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .await;
+    if let Some(lock) = locks.get(workspace_id).and_then(Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(Mutex::new(()));
+    locks.insert(workspace_id.to_owned(), Arc::downgrade(&lock));
+    lock
+}
+
+pub async fn lock_thread_episodic_workspace(
+    workspace_id: &str,
+) -> ThreadEpisodicWorkspaceOwnership {
+    Arc::new(ThreadEpisodicWorkspaceGuard {
+        guard: Some(workspace_lock(workspace_id).await.lock_owned().await),
+    })
+}
+
+pub async fn try_lock_thread_episodic_workspace(
+    workspace_id: &str,
+) -> Option<ThreadEpisodicWorkspaceOwnership> {
+    workspace_lock(workspace_id)
+        .await
+        .try_lock_owned()
+        .ok()
+        .map(|guard| Arc::new(ThreadEpisodicWorkspaceGuard { guard: Some(guard) }))
+}
+
+// Serialize deletion with capsule readers too, and retain workspace ownership
+// in the actual blocking removal even if its async caller is canceled.
+pub async fn remove_thread_episodic_capsule_file(
+    path: &Path,
+    ownership: ThreadEpisodicWorkspaceOwnership,
+) -> std::io::Result<()> {
+    let path_for_task = path.to_owned();
+    run_capsule_blocking(path, move || {
+        let _ownership = ownership;
+        std::fs::remove_file(path_for_task)
+    })
+    .await
+    .map_err(std::io::Error::other)?
+}
+
+type CapsuleLock = Arc<Mutex<()>>;
+type CapsuleLockRegistry = Mutex<BTreeMap<PathBuf, Weak<Mutex<()>>>>;
+
+fn capsule_lock_registry() -> &'static CapsuleLockRegistry {
+    static LOCKS: OnceLock<CapsuleLockRegistry> = OnceLock::new();
+    LOCKS.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn normalized_capsule_lock_path(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| {
+        let Some(file_name) = path.file_name() else {
+            return path.to_path_buf();
+        };
+        path.parent()
+            .and_then(|parent| parent.canonicalize().ok())
+            .map_or_else(|| path.to_path_buf(), |parent| parent.join(file_name))
+    })
+}
+
+async fn lock_for_capsule_path(path: &Path) -> CapsuleLock {
+    let path = normalized_capsule_lock_path(path);
+    let mut locks = capsule_lock_registry().lock().await;
+    if let Some(lock) = locks.get(&path).and_then(Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(Mutex::new(()));
+    locks.insert(path, Arc::downgrade(&lock));
+    lock
+}
+
+async fn run_capsule_blocking<T, F>(path: &Path, operation: F) -> Result<T, tokio::task::JoinError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let guard = lock_for_capsule_path(path).await.lock_owned().await;
+    tokio::task::spawn_blocking(move || {
+        // Keep ownership inside the blocking task. Cancelling the async waiter detaches the
+        // task but cannot expose the capsule to another operation while this closure is running.
+        let _guard = guard;
+        operation()
+    })
+    .await
 }
 
 impl MemvidThreadEpisodicBackend {
     pub fn new() -> Self {
         Self {
             capabilities: ThreadEpisodicMemvidBackendCapabilities::memvid_default(),
-            locks: Mutex::new(BTreeMap::new()),
+            workspace_ownership: None,
         }
     }
 
     pub fn with_capabilities(capabilities: ThreadEpisodicMemvidBackendCapabilities) -> Self {
         Self {
             capabilities,
-            locks: Mutex::new(BTreeMap::new()),
+            workspace_ownership: None,
         }
     }
 
-    async fn lock_for_path(&self, path: &Path) -> Arc<Mutex<()>> {
-        let mut locks = self.locks.lock().await;
-        locks
-            .entry(path.to_path_buf())
-            .or_insert_with(|| Arc::new(Mutex::new(())))
-            .clone()
+    pub fn with_workspace_ownership(mut self, ownership: ThreadEpisodicWorkspaceOwnership) -> Self {
+        self.workspace_ownership = Some(ownership);
+        self
+    }
+
+    async fn run_blocking<T, F>(
+        &self,
+        path: &Path,
+        operation: F,
+    ) -> Result<T, tokio::task::JoinError>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> T + Send + 'static,
+    {
+        let ownership = self.workspace_ownership.clone();
+        run_capsule_blocking(path, move || {
+            let _ownership = ownership;
+            operation()
+        })
+        .await
     }
 }
 
@@ -695,18 +837,29 @@ impl ThreadEpisodicMemvidBackend for MemvidThreadEpisodicBackend {
             ))
         })?;
 
-        let lock = self.lock_for_path(path.as_path()).await;
-        let _guard = lock.lock().await;
         let path_for_task = path.clone();
         let request_for_task = request.clone();
 
-        tokio::task::spawn_blocking(move || index_item_blocking(path_for_task, request_for_task))
+        self.run_blocking(path.as_path(), move || {
+            index_item_blocking(path_for_task, request_for_task)
+        })
+        .await
+        .map_err(|error| {
+            ThreadEpisodicMemvidError::retryable(format!(
+                "thread episodic memvid index task failed: {error}"
+            ))
+        })?
+    }
+
+    async fn index_item_with_workspace_ownership(
+        &self,
+        request: ThreadEpisodicMemvidIndexRequest,
+        ownership: ThreadEpisodicWorkspaceOwnership,
+    ) -> Result<ThreadEpisodicMemvidIndexOutput, ThreadEpisodicMemvidError> {
+        Self::with_capabilities(self.capabilities.clone())
+            .with_workspace_ownership(ownership)
+            .index_item(request)
             .await
-            .map_err(|error| {
-                ThreadEpisodicMemvidError::retryable(format!(
-                    "thread episodic memvid index task failed: {error}"
-                ))
-            })?
     }
 
     async fn search(
@@ -733,8 +886,6 @@ impl ThreadEpisodicMemvidBackend for MemvidThreadEpisodicBackend {
                 continue;
             }
 
-            let lock = self.lock_for_path(path.as_path()).await;
-            let _guard = lock.lock().await;
             let path_for_task = path.clone();
             let search_request = memvid_thread_episodic_search_request(
                 &request.profile,
@@ -744,21 +895,22 @@ impl ThreadEpisodicMemvidBackend for MemvidThreadEpisodicBackend {
             let segment_for_task = segment.clone();
             let workspace_id = request.workspace_id.clone();
             let thread_id = request.thread_id.clone();
-            let segment_hits = tokio::task::spawn_blocking(move || {
-                search_segment_blocking(
-                    path_for_task,
-                    search_request,
-                    segment_for_task,
-                    workspace_id.as_str(),
-                    thread_id.as_str(),
-                )
-            })
-            .await
-            .map_err(|error| {
-                ThreadEpisodicMemvidError::retryable(format!(
-                    "thread episodic memvid search task failed: {error}"
-                ))
-            })?;
+            let segment_hits = self
+                .run_blocking(path.as_path(), move || {
+                    search_segment_blocking(
+                        path_for_task,
+                        search_request,
+                        segment_for_task,
+                        workspace_id.as_str(),
+                        thread_id.as_str(),
+                    )
+                })
+                .await
+                .map_err(|error| {
+                    ThreadEpisodicMemvidError::retryable(format!(
+                        "thread episodic memvid search task failed: {error}"
+                    ))
+                })?;
 
             match segment_hits {
                 Ok(hits) => {
@@ -805,8 +957,6 @@ impl ThreadEpisodicMemvidBackend for MemvidThreadEpisodicBackend {
                 continue;
             }
 
-            let lock = self.lock_for_path(path.as_path()).await;
-            let _guard = lock.lock().await;
             let path_for_task = path.clone();
             let ask_request = memvid_thread_episodic_ask_request(
                 &request.profile,
@@ -818,22 +968,23 @@ impl ThreadEpisodicMemvidBackend for MemvidThreadEpisodicBackend {
             let segment_for_task = segment.clone();
             let workspace_id = request.workspace_id.clone();
             let thread_id = request.thread_id.clone();
-            let segment_hits = tokio::task::spawn_blocking(move || {
-                ask_segment_blocking(
-                    path_for_task,
-                    ask_request,
-                    embedder_for_task,
-                    segment_for_task,
-                    workspace_id.as_str(),
-                    thread_id.as_str(),
-                )
-            })
-            .await
-            .map_err(|error| {
-                ThreadEpisodicMemvidError::retryable(format!(
-                    "thread episodic memvid ask retrieval task failed: {error}"
-                ))
-            })?;
+            let segment_hits = self
+                .run_blocking(path.as_path(), move || {
+                    ask_segment_blocking(
+                        path_for_task,
+                        ask_request,
+                        embedder_for_task,
+                        segment_for_task,
+                        workspace_id.as_str(),
+                        thread_id.as_str(),
+                    )
+                })
+                .await
+                .map_err(|error| {
+                    ThreadEpisodicMemvidError::retryable(format!(
+                        "thread episodic memvid ask retrieval task failed: {error}"
+                    ))
+                })?;
 
             match segment_hits {
                 Ok(hits) => {
@@ -1690,6 +1841,263 @@ mod tests {
     use super::*;
     use crate::thread_episodic_embedding::ThreadEpisodicEmbeddingProvider;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn independent_backends_share_capsule_lock_after_async_cancellation() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let path = temp_dir.path().join("shared-capsule.mv2");
+        let refill_backend = Arc::new(MemvidThreadEpisodicBackend::new());
+        let indexer_backend = Arc::new(MemvidThreadEpisodicBackend::new());
+        let (first_started_tx, first_started_rx) = tokio::sync::oneshot::channel();
+        let (first_finished_tx, first_finished_rx) = tokio::sync::oneshot::channel();
+        let (release_first_tx, release_first_rx) = std::sync::mpsc::channel();
+
+        let first_path = path.clone();
+        let first_backend = refill_backend.clone();
+        let first = tokio::spawn(async move {
+            first_backend
+                .run_blocking(first_path.as_path(), move || {
+                    let _ = first_started_tx.send(());
+                    release_first_rx.recv().expect("release first writer");
+                    let _ = first_finished_tx.send(());
+                })
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), first_started_rx)
+            .await
+            .expect("first blocking writer start timeout")
+            .expect("first blocking writer started");
+
+        first.abort();
+        assert!(
+            first
+                .await
+                .expect_err("async waiter should be cancelled")
+                .is_cancelled()
+        );
+
+        let other_path = temp_dir.path().join("independent-capsule.mv2");
+        let (other_started_tx, other_started_rx) = tokio::sync::oneshot::channel();
+        let other_backend = indexer_backend.clone();
+        let other = tokio::spawn(async move {
+            other_backend
+                .run_blocking(other_path.as_path(), move || {
+                    let _ = other_started_tx.send(());
+                })
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), other_started_rx)
+            .await
+            .expect("different capsule start timeout")
+            .expect("different capsule must remain independently runnable");
+        other
+            .await
+            .expect("other capsule async task")
+            .expect("other capsule blocking task");
+
+        let (second_attempting_tx, second_attempting_rx) = tokio::sync::oneshot::channel();
+        let (second_started_tx, second_started_rx) = tokio::sync::oneshot::channel();
+        let second_path = path.clone();
+        let second_backend = indexer_backend.clone();
+        let second = tokio::spawn(async move {
+            let _ = second_attempting_tx.send(());
+            second_backend
+                .run_blocking(second_path.as_path(), move || {
+                    let _ = second_started_tx.send(());
+                })
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), second_attempting_rx)
+            .await
+            .expect("second task attempt timeout")
+            .expect("second task reached the lock attempt");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), second_started_rx)
+                .await
+                .is_err(),
+            "cancelling the async waiter must not release a running blocking writer's lock"
+        );
+
+        release_first_tx.send(()).expect("finish first writer");
+        tokio::time::timeout(Duration::from_secs(2), second)
+            .await
+            .expect("second writer completion timeout")
+            .expect("second async task")
+            .expect("second blocking task");
+        tokio::time::timeout(Duration::from_secs(2), first_finished_rx)
+            .await
+            .expect("detached blocking writer completion timeout")
+            .expect("detached blocking writer finished");
+    }
+
+    fn concurrent_index_request(
+        path: &Path,
+        name: &str,
+        vector: Vec<f32>,
+    ) -> ThreadEpisodicMemvidIndexRequest {
+        ThreadEpisodicMemvidIndexRequest {
+            storage_uri: thread_episodic_storage_uri_from_path(path),
+            capsule_id: "shared_capsule".to_owned(),
+            capsule_ref: "mv2://pioneer/thread_episodic/shared_capsule".to_owned(),
+            workspace_capsule: true,
+            index_item_id: format!("index_{name}"),
+            frame_uri: format!("mv2://workspace/shared/item/{name}"),
+            text: format!("concurrent payload {name}"),
+            metadata: BTreeMap::from([("writer".to_owned(), name.to_owned())]),
+            embedding: Some(
+                ThreadEpisodicMemvidIndexEmbedding::new(
+                    ThreadEpisodicEmbeddingIdentity::new("test", "test-model", 3, true),
+                    vector,
+                )
+                .expect("valid test embedding"),
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn refill_and_ordinary_backend_instances_preserve_both_indexed_documents() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let path = temp_dir.path().join("shared-writers.mv2");
+        let start = Arc::new(tokio::sync::Barrier::new(3));
+
+        let refill_backend = Arc::new(MemvidThreadEpisodicBackend::new());
+        let refill_request = concurrent_index_request(&path, "refill", vec![1.0, 0.0, 0.0]);
+        let refill_start = start.clone();
+        let refill = tokio::spawn(async move {
+            refill_start.wait().await;
+            refill_backend.index_item(refill_request).await
+        });
+
+        let ordinary_backend = Arc::new(MemvidThreadEpisodicBackend::new());
+        let ordinary_request = concurrent_index_request(&path, "ordinary", vec![0.0, 1.0, 0.0]);
+        let ordinary_start = start.clone();
+        let ordinary = tokio::spawn(async move {
+            ordinary_start.wait().await;
+            ordinary_backend.index_item(ordinary_request).await
+        });
+
+        start.wait().await;
+        let refill_output = refill
+            .await
+            .expect("refill task")
+            .expect("refill write succeeds");
+        let ordinary_output = ordinary
+            .await
+            .expect("ordinary task")
+            .expect("ordinary write succeeds");
+        assert_ne!(refill_output.frame_id, ordinary_output.frame_id);
+
+        let mut memvid = Memvid::open_read_only(&path).expect("reopen shared capsule");
+        for (name, vector, output) in [
+            ("refill", [1.0, 0.0, 0.0], refill_output),
+            ("ordinary", [0.0, 1.0, 0.0], ordinary_output),
+        ] {
+            let uri = format!("mv2://workspace/shared/item/{name}");
+            let frame = memvid.frame_by_uri(&uri).expect("indexed frame exists");
+            assert_eq!(frame.id, output.frame_id as u64);
+            assert_eq!(output.frame_uri, uri);
+            assert_eq!(
+                memvid
+                    .frame_canonical_payload(frame.id)
+                    .expect("indexed payload"),
+                format!("concurrent payload {name}").as_bytes()
+            );
+            assert_eq!(
+                memvid
+                    .search_vec(&vector, 1)
+                    .expect("search indexed vector")[0]
+                    .frame_id,
+                frame.id
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn canceled_blocking_index_retains_workspace_until_real_write_finishes_before_reset() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("transition.mv2");
+        let workspace = "blocking_projection_transition";
+        let ownership = lock_thread_episodic_workspace(workspace).await;
+        let backend = MemvidThreadEpisodicBackend::new().with_workspace_ownership(ownership);
+        let old_request = concurrent_index_request(&path, "model_a", vec![1.0, 0.0, 0.0]);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let old_path = path.clone();
+        let waiter = tokio::spawn(async move {
+            // The real backend helper moves ownership into its blocking task.
+            // This controlled point is inside the capsule write, outside Tokio
+            // and DB capacity. Dropping release_tx on panic also unblocks it.
+            let task_path = old_path.clone();
+            backend
+                .run_blocking(&old_path, move || {
+                    let _ = started_tx.send(());
+                    if release_rx.recv().is_err() {
+                        return None;
+                    }
+                    let output = index_item_blocking(task_path, old_request);
+                    let _ = finished_tx.send(output);
+                    Some(())
+                })
+                .await
+        });
+        started_rx.await.unwrap();
+        assert!(
+            try_lock_thread_episodic_workspace(workspace)
+                .await
+                .is_none()
+        );
+        waiter.abort();
+        assert!(waiter.await.unwrap_err().is_cancelled());
+        // Cancellation of the waiter cannot admit cleanup or a new claim.
+        assert!(
+            try_lock_thread_episodic_workspace(workspace)
+                .await
+                .is_none()
+        );
+        assert!(
+            try_lock_thread_episodic_workspace("independent_projection_transition")
+                .await
+                .is_some()
+        );
+        release_tx.send(()).unwrap();
+        finished_rx.await.unwrap().unwrap();
+        let replacement = lock_thread_episodic_workspace(workspace).await;
+        remove_thread_episodic_capsule_file(&path, replacement.clone())
+            .await
+            .unwrap();
+        let mut request_b = concurrent_index_request(&path, "model_b", vec![0.0, 1.0, 0.0]);
+        request_b.embedding = Some(
+            ThreadEpisodicMemvidIndexEmbedding::new(
+                ThreadEpisodicEmbeddingIdentity::new("test", "model-b", 4, true),
+                vec![0.0, 1.0, 0.0, 0.0],
+            )
+            .unwrap(),
+        );
+        MemvidThreadEpisodicBackend::new()
+            .index_item_with_workspace_ownership(request_b, replacement.clone())
+            .await
+            .unwrap();
+        // The detached A task has completed before deletion and B's actual
+        // commit. Its old frame cannot reappear after the replacement.
+        let mut capsule = Memvid::open_read_only(&path).unwrap();
+        assert!(
+            capsule
+                .frame_by_uri("mv2://workspace/shared/item/model_a")
+                .is_err()
+        );
+        let frame_b = capsule
+            .frame_by_uri("mv2://workspace/shared/item/model_b")
+            .unwrap();
+        assert_eq!(
+            capsule
+                .frame_canonical_payload(frame_b.id)
+                .unwrap()
+                .as_slice(),
+            b"concurrent payload model_b"
+        );
+    }
 
     struct StaticEmbeddingProvider {
         calls: Arc<AtomicUsize>,

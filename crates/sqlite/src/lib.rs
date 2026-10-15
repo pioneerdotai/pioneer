@@ -1,87 +1,30 @@
 use anyhow::{Context, Result, bail};
-use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, Statement};
+use sea_orm::{ConnectionTrait, DbBackend, Statement};
 use std::future::Future;
 use std::path::{Component, Path};
 use std::pin::Pin;
-use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Mutex;
+
+mod database;
+mod reader;
+mod writer;
+
+pub use database::{SqliteDatabase, SqliteReadTransaction};
+pub use reader::{
+    DEFAULT_MAX_CONCURRENT_MAINTENANCE_READS, SqliteReadClass, SqliteReadEvent, SqliteReadObserver,
+    SqliteReadOutcome,
+};
+pub use writer::{
+    DEFAULT_MAX_CRITICAL_BURST, DEFAULT_MAX_MAINTENANCE_WAIT_MS, DEFAULT_MAX_NON_MAINTENANCE_BURST,
+    SqliteQueryStream, SqliteTransaction, SqliteWriteClass, SqliteWriteEvent, SqliteWriteExecutor,
+    SqliteWriteGrantReason, SqliteWriteObserver, SqliteWritePolicy, SqliteWriteQueueSnapshot,
+};
 
 pub mod zstd;
 
 pub const DEFAULT_LOCK_RETRY_ATTEMPTS: usize = 5;
 pub const DEFAULT_LOCK_RETRY_BASE_DELAY_MS: u64 = 20;
 pub const DEFAULT_SQLITE_BUSY_TIMEOUT_MS: u64 = 5000;
-
-#[derive(Clone)]
-pub struct SqliteWriteCoordinator {
-    lock: Arc<Mutex<()>>,
-    retry_attempts: usize,
-    retry_base_delay: Duration,
-}
-
-impl Default for SqliteWriteCoordinator {
-    fn default() -> Self {
-        Self::new(
-            DEFAULT_LOCK_RETRY_ATTEMPTS,
-            Duration::from_millis(DEFAULT_LOCK_RETRY_BASE_DELAY_MS),
-        )
-    }
-}
-
-impl SqliteWriteCoordinator {
-    pub fn new(retry_attempts: usize, retry_base_delay: Duration) -> Self {
-        Self {
-            lock: Arc::new(Mutex::new(())),
-            retry_attempts,
-            retry_base_delay,
-        }
-    }
-
-    pub async fn run_serialized_with_retry<T, E, F, Fut, P>(
-        &self,
-        operation: F,
-        is_retryable: P,
-    ) -> Result<T, E>
-    where
-        F: FnMut() -> Fut,
-        Fut: Future<Output = Result<T, E>>,
-        P: Fn(&E) -> bool,
-    {
-        let _write_guard = self.lock.lock().await;
-        retry_with_backoff(
-            operation,
-            is_retryable,
-            self.retry_attempts,
-            self.retry_base_delay,
-        )
-        .await
-    }
-
-    pub async fn try_run_serialized_with_retry<T, E, F, Fut, P>(
-        &self,
-        operation: F,
-        is_retryable: P,
-    ) -> Option<Result<T, E>>
-    where
-        F: FnMut() -> Fut,
-        Fut: Future<Output = Result<T, E>>,
-        P: Fn(&E) -> bool,
-    {
-        let Ok(_write_guard) = self.lock.try_lock() else {
-            return None;
-        };
-        Some(
-            retry_with_backoff(
-                operation,
-                is_retryable,
-                self.retry_attempts,
-                self.retry_base_delay,
-            )
-            .await,
-        )
-    }
-}
 
 pub async fn retry_with_backoff<T, E, F, Fut, P>(
     mut operation: F,
@@ -147,7 +90,10 @@ pub fn is_anyhow_sqlite_transient_access(error: &anyhow::Error) -> bool {
     is_anyhow_sqlite_transient_open(error) || is_anyhow_sqlite_pool_timeout(error)
 }
 
-pub async fn apply_sqlite_pragmas(connection: &DatabaseConnection) -> Result<()> {
+pub async fn apply_sqlite_pragmas<C>(connection: &C) -> Result<()>
+where
+    C: ConnectionTrait + Sync,
+{
     connection
         .query_one_raw(Statement::from_string(
             DbBackend::Sqlite,
@@ -176,6 +122,14 @@ pub async fn apply_sqlite_pragmas(connection: &DatabaseConnection) -> Result<()>
 }
 
 pub fn sqlite_connection_url(path: &Path) -> String {
+    sqlite_connection_url_with_mode(path, "rwc")
+}
+
+pub fn sqlite_read_only_connection_url(path: &Path) -> String {
+    sqlite_connection_url_with_mode(path, "ro")
+}
+
+fn sqlite_connection_url_with_mode(path: &Path, mode: &str) -> String {
     let normalized_path = path.to_string_lossy().replace('\\', "/");
     let has_windows_drive_prefix = normalized_path
         .as_bytes()
@@ -190,7 +144,7 @@ pub fn sqlite_connection_url(path: &Path) -> String {
         normalized_path
     };
 
-    format!("sqlite://{path_part}?mode=rwc")
+    format!("sqlite://{path_part}?mode={mode}")
 }
 
 pub fn normalize_relative_database_file_name(value: &str, field_name: &str) -> Result<String> {
@@ -222,11 +176,8 @@ fn is_disallowed_component(component: Component<'_>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        SqliteWriteCoordinator, is_sqlite_lock_message, is_sqlite_pool_timeout_message,
-        is_sqlite_transient_open_message,
+        is_sqlite_lock_message, is_sqlite_pool_timeout_message, is_sqlite_transient_open_message,
     };
-    use std::sync::Arc;
-    use tokio::sync::Notify;
 
     #[test]
     fn detects_sqlite_transient_open_errors() {
@@ -255,46 +206,5 @@ mod tests {
         assert!(!is_sqlite_lock_message(
             "Failed to acquire connection from pool: Connection pool timed out"
         ));
-    }
-
-    #[tokio::test]
-    async fn low_priority_write_skips_while_foreground_write_is_active() {
-        let coordinator = SqliteWriteCoordinator::default();
-        let foreground_coordinator = coordinator.clone();
-        let entered = Arc::new(Notify::new());
-        let release = Arc::new(Notify::new());
-        let foreground = tokio::spawn({
-            let entered = entered.clone();
-            let release = release.clone();
-            async move {
-                foreground_coordinator
-                    .run_serialized_with_retry(
-                        || async {
-                            entered.notify_one();
-                            release.notified().await;
-                            Ok::<_, ()>(())
-                        },
-                        |_| false,
-                    )
-                    .await
-            }
-        });
-
-        entered.notified().await;
-        let skipped = coordinator
-            .try_run_serialized_with_retry(|| async { Ok::<_, ()>(()) }, |_| false)
-            .await;
-        assert!(skipped.is_none());
-
-        release.notify_one();
-        foreground
-            .await
-            .expect("foreground task should join")
-            .expect("foreground write should succeed");
-
-        let completed = coordinator
-            .try_run_serialized_with_retry(|| async { Ok::<_, ()>(42) }, |_| false)
-            .await;
-        assert_eq!(completed, Some(Ok(42)));
     }
 }

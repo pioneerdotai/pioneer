@@ -7,6 +7,11 @@ mod debug;
 mod extractor_ontology;
 pub mod hooks;
 mod lifecycle;
+mod manifest_failure;
+pub use manifest_failure::{
+    MemoryManifestFailure, MemoryManifestFailureClass, MemoryManifestFailureStage,
+    is_invalid_stored_memory_data,
+};
 mod memvid;
 mod ownership_route;
 mod policy;
@@ -19,6 +24,8 @@ mod service;
 mod thread_episodic;
 mod thread_episodic_embedding;
 mod write;
+mod write_failure;
+pub use write_failure::MemoryWriteFailure;
 
 pub use backend::{
     BackendDeleteRequest, BackendDeleteResult, BackendGetRequest, BackendPayload,
@@ -79,9 +86,11 @@ pub use thread_episodic::{
     ThreadEpisodicMemvidSearchOutput, ThreadEpisodicMemvidSearchRequest,
     ThreadEpisodicMemvidSearchSegment, ThreadEpisodicMemvidStats, ThreadEpisodicRankedSearchHit,
     ThreadEpisodicRankingContext, ThreadEpisodicSearchDiagnostics, ThreadEpisodicSearchProfile,
-    ThreadEpisodicSearchProfileKind, filter_thread_episodic_search_candidates,
-    rank_thread_episodic_search_hits, thread_episodic_memvid_metadata,
-    thread_episodic_storage_uri_from_path,
+    ThreadEpisodicSearchProfileKind, ThreadEpisodicWorkspaceOwnership,
+    filter_thread_episodic_search_candidates, lock_thread_episodic_workspace,
+    rank_thread_episodic_search_hits, remove_thread_episodic_capsule_file,
+    thread_episodic_memvid_metadata, thread_episodic_storage_uri_from_path,
+    thread_episodic_workspace_releases, try_lock_thread_episodic_workspace,
 };
 pub use thread_episodic_embedding::{
     ThreadEpisodicEmbeddingDiagnostic, ThreadEpisodicEmbeddingError,

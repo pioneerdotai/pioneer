@@ -10,8 +10,22 @@ use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder
 use crate::convention::{task_trigger_kind_to_db, task_trigger_status_to_db};
 use crate::util::unix_to_datetime;
 
+#[derive(Clone, Debug)]
+pub struct PreparedTaskTriggerProjection(task_trigger::ActiveModel);
+
+pub fn prepare_trigger_projection(trigger: &TaskTrigger) -> Result<PreparedTaskTriggerProjection> {
+    active_model_from_trigger(trigger).map(PreparedTaskTriggerProjection)
+}
+
 pub async fn upsert_trigger<C: ConnectionTrait>(db: &C, trigger: &TaskTrigger) -> Result<()> {
-    task_trigger::Entity::insert(active_model_from_trigger(trigger)?)
+    upsert_prepared_trigger(db, prepare_trigger_projection(trigger)?).await
+}
+
+pub async fn upsert_prepared_trigger<C: ConnectionTrait>(
+    db: &C,
+    prepared: PreparedTaskTriggerProjection,
+) -> Result<()> {
+    task_trigger::Entity::insert(prepared.0)
         .on_conflict(
             OnConflict::column(task_trigger::Column::Id)
                 .update_columns([

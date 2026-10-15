@@ -1,5 +1,8 @@
 //! Claude CLI streaming runtime primitives.
 
+#[path = "claude_service.rs"]
+pub mod service;
+
 use crate::codex::CodexMcpSchemaTransformer;
 use crate::instructions::CLIRuntimeElevatedInstructions;
 use crate::mcp::{
@@ -43,6 +46,11 @@ static CLAUDE_MCP_CONFIG_NONCE_COUNTER: AtomicU64 = AtomicU64::new(1);
 pub enum ClaudeProviderSessionLaunch {
     New(uuid::Uuid),
     Resume(uuid::Uuid),
+    Fork {
+        source_session_id: uuid::Uuid,
+        boundary_message_uuid: uuid::Uuid,
+        provider_session_id: uuid::Uuid,
+    },
 }
 
 impl fmt::Debug for ClaudeProviderSessionLaunch {
@@ -51,6 +59,9 @@ impl fmt::Debug for ClaudeProviderSessionLaunch {
             Self::New(_) => formatter.write_str("ClaudeProviderSessionLaunch::New(<redacted>)"),
             Self::Resume(_) => {
                 formatter.write_str("ClaudeProviderSessionLaunch::Resume(<redacted>)")
+            }
+            Self::Fork { .. } => {
+                formatter.write_str("ClaudeProviderSessionLaunch::Fork(<redacted>)")
             }
         }
     }
@@ -69,6 +80,24 @@ impl ClaudeProviderSessionLaunch {
         Ok(Self::Resume(provider_session_id))
     }
 
+    pub fn fork(
+        source_session_id: uuid::Uuid,
+        boundary_message_uuid: uuid::Uuid,
+        provider_session_id: uuid::Uuid,
+    ) -> Result<Self, ClaudeProviderSessionLaunchError> {
+        validate_claude_provider_session_id(source_session_id)?;
+        validate_claude_provider_session_id(boundary_message_uuid)?;
+        validate_claude_provider_session_id(provider_session_id)?;
+        if source_session_id == provider_session_id {
+            return Err(ClaudeProviderSessionLaunchError);
+        }
+        Ok(Self::Fork {
+            source_session_id,
+            boundary_message_uuid,
+            provider_session_id,
+        })
+    }
+
     pub fn append_process_args(&self, args: &mut Vec<String>) {
         match self {
             Self::New(provider_session_id) => {
@@ -79,14 +108,32 @@ impl ClaudeProviderSessionLaunch {
                 args.push("--resume".to_owned());
                 args.push(provider_session_id.to_string());
             }
+            Self::Fork {
+                source_session_id,
+                boundary_message_uuid,
+                provider_session_id,
+            } => {
+                args.extend([
+                    "--resume".to_owned(),
+                    source_session_id.to_string(),
+                    "--fork-session".to_owned(),
+                    "--resume-session-at".to_owned(),
+                    boundary_message_uuid.to_string(),
+                    "--session-id".to_owned(),
+                    provider_session_id.to_string(),
+                ]);
+            }
         }
     }
 
     pub fn provider_session_id(&self) -> uuid::Uuid {
         match self {
-            Self::New(provider_session_id) | Self::Resume(provider_session_id) => {
-                *provider_session_id
-            }
+            Self::New(provider_session_id)
+            | Self::Resume(provider_session_id)
+            | Self::Fork {
+                provider_session_id,
+                ..
+            } => *provider_session_id,
         }
     }
 }
@@ -238,7 +285,7 @@ pub async fn probe_claude_help_contract(
         "--strict-mcp-config",
         "--allowedTools",
         "--setting-sources",
-        "--safe-mode",
+        "--plugin-dir",
         "--session-id",
         "--resume",
         "--no-session-persistence",
@@ -1317,6 +1364,10 @@ impl ClaudeProbe {
         command.env("CLAUDE_AGENT_SDK_CLIENT_APP", "pioneer");
         command.envs(config.env.expose_iter());
         command.env_remove("CLAUDECODE");
+        // Account probes are now owned by a cancellable Gateway supervisor.
+        // A timeout, shutdown, or superseding configuration generation must
+        // not leave a detached `claude --version` process behind.
+        command.kill_on_drop(true);
 
         let output = match timeout(config.request_timeout, command.output()).await {
             Ok(Ok(output)) => output,
@@ -1592,7 +1643,6 @@ async fn run_initialize_probe(
             "stdio",
             "--permission-mode",
             "default",
-            "--safe-mode",
             "--setting-sources=",
             "--include-partial-messages",
             "--input-format",
@@ -2191,6 +2241,32 @@ mod tests {
     }
 
     #[test]
+    fn claude_bounded_fork_uses_transcript_record_uuid_and_preassigned_session() {
+        let source = uuid::Uuid::parse_str("01900000-0000-7000-8000-000000000041").unwrap();
+        let boundary = uuid::Uuid::parse_str("01900000-0000-7000-8000-000000000042").unwrap();
+        let branch = uuid::Uuid::parse_str("01900000-0000-7000-8000-000000000043").unwrap();
+        let launch = ClaudeProviderSessionLaunch::fork(source, boundary, branch).unwrap();
+        let mut args = Vec::new();
+        launch.append_process_args(&mut args);
+        assert_eq!(
+            args,
+            vec![
+                "--resume".to_owned(),
+                source.to_string(),
+                "--fork-session".to_owned(),
+                "--resume-session-at".to_owned(),
+                boundary.to_string(),
+                "--session-id".to_owned(),
+                branch.to_string(),
+            ]
+        );
+        assert_eq!(launch.provider_session_id(), branch);
+        assert!(!format!("{launch:?}").contains(source.to_string().as_str()));
+        assert!(!format!("{launch:?}").contains(boundary.to_string().as_str()));
+        assert!(ClaudeProviderSessionLaunch::fork(source, boundary, source).is_err());
+    }
+
+    #[test]
     fn claude_mcp_event_fixtures_decode_success_error_parallel_and_replay() {
         let fixture: JsonValue =
             serde_json::from_str(include_str!("../tests/fixtures/claude_mcp/lifecycle.json"))
@@ -2336,7 +2412,7 @@ mod tests {
         let executable = root.join("claude-help-fixture");
         fs::write(
             executable.as_path(),
-            b"#!/bin/sh\nprintf '%s\\n' '--mcp-config --strict-mcp-config --allowedTools --setting-sources --safe-mode --session-id --resume --no-session-persistence --input-format --output-format'\n",
+            b"#!/bin/sh\nprintf '%s\\n' '--mcp-config --strict-mcp-config --allowedTools --setting-sources --plugin-dir --session-id --resume --no-session-persistence --input-format --output-format'\n",
         )
         .expect("help fixture");
         fs::set_permissions(executable.as_path(), fs::Permissions::from_mode(0o700))
@@ -2573,5 +2649,60 @@ mod tests {
 
         assert_eq!(model.effort_options, vec!["low", "medium", "high", "max"]);
         assert_eq!(model.supports_reasoning, Some(true));
+    }
+}
+
+/// A session result must affirm success. Pinned session transcripts may omit
+/// stop_reason, unlike the separately versioned ClaudeService print contract.
+/// When present, a truncated/error/unknown reason cannot affirm completion.
+/// https://code.claude.com/docs/en/headless#stream-responses
+pub fn session_result_completed(value: &serde_json::Value) -> bool {
+    if value["type"] != "result" || value["subtype"] != "success" || value["is_error"] != false {
+        return false;
+    }
+    match value.get("stop_reason") {
+        None | Some(serde_json::Value::Null) => true,
+        Some(reason) => matches!(reason.as_str(), Some("end_turn" | "stop_sequence")),
+    }
+}
+
+#[cfg(test)]
+mod terminal_result_tests {
+    use super::session_result_completed;
+    use serde_json::json;
+    #[test]
+    fn session_success_requires_affirmative_fields_and_no_known_truncation() {
+        let success = json!({"type":"result","subtype":"success","is_error":false});
+        assert!(session_result_completed(&success));
+        for flag in [json!(true), json!(null), json!("false")] {
+            let mut invalid = success.clone();
+            invalid["is_error"] = flag;
+            assert!(!session_result_completed(&invalid));
+        }
+        for field in ["subtype", "is_error"] {
+            let mut missing = success.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(!session_result_completed(&missing));
+        }
+        for subtype in [
+            "error_max_turns",
+            "error_during_execution",
+            "interrupted",
+            "future",
+        ] {
+            let mut value = success.clone();
+            value["subtype"] = json!(subtype);
+            assert!(!session_result_completed(&value));
+        }
+        for reason in ["max_tokens", "tool_use", "refusal", "pause_turn", "future"] {
+            let mut value = success.clone();
+            value["stop_reason"] = json!(reason);
+            assert!(!session_result_completed(&value));
+        }
+        for reason in [json!(null), json!("end_turn"), json!("stop_sequence")] {
+            let mut value = success.clone();
+            value["stop_reason"] = reason;
+            assert!(session_result_completed(&value));
+        }
     }
 }

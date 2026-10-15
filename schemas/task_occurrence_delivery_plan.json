@@ -1,0 +1,99 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TaskOccurrenceDeliveryPlan",
+  "description": "Immutable delivery and presentation decision for one logical occurrence.\n\nThe Task policy may be edited while a run is in flight. Keeping the\nnormalized policy beside the occurrence guarantees that retries, result\ndelivery and the visible lifecycle card continue to use the same target.",
+  "type": "object",
+  "properties": {
+    "policy": {
+      "$ref": "#/$defs/TaskDeliveryPolicy"
+    },
+    "presentationThreadId": {
+      "description": "Thread that owns the TaskRun lifecycle card. Thread delivery uses the\nexact normalized delivery target; non-thread delivery has no target and\ntherefore leaves this absent for the executor to use its local fallback.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "routingVersion": {
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "routingVersion",
+    "policy"
+  ],
+  "$defs": {
+    "TaskDeliveryFormat": {
+      "type": "string",
+      "enum": [
+        "summary",
+        "full_result"
+      ]
+    },
+    "TaskDeliveryMode": {
+      "type": "string",
+      "enum": [
+        "none",
+        "thread",
+        "user_notification",
+        "webhook"
+      ]
+    },
+    "TaskDeliveryPolicy": {
+      "type": "object",
+      "properties": {
+        "format": {
+          "$ref": "#/$defs/TaskDeliveryFormat"
+        },
+        "includeResult": {
+          "type": "boolean"
+        },
+        "mode": {
+          "$ref": "#/$defs/TaskDeliveryMode"
+        },
+        "threadId": {
+          "description": "Canonical target persisted by Gateway. Callers provide this only for\n`ExactThread`; for semantic targets it is server-owned output.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "threadTarget": {
+          "description": "Required for `Thread` delivery. Gateway resolves semantic targets to a\ncanonical `thread_id` before persisting the Task.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TaskDeliveryThreadTarget"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "webhookUrl": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "mode",
+        "includeResult",
+        "format"
+      ]
+    },
+    "TaskDeliveryThreadTarget": {
+      "description": "Semantic thread target resolved and persisted by Gateway.",
+      "type": "string",
+      "enum": [
+        "origin_thread",
+        "current_thread",
+        "collaboration_root",
+        "exact_thread"
+      ]
+    }
+  }
+}

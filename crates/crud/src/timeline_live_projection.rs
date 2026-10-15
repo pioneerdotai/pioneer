@@ -25,8 +25,7 @@ use crate::timeline_projection_model::{
 use crate::util::unix_to_datetime;
 use crate::{
     ProjectionPageAnchor, ThreadTimelineBlockRecord, TurnWorkItemProjectionRecord,
-    TurnWorkProjectionRecord, WORK_ITEM_STATUS_RUNNING, WORK_VISIBILITY_HIDDEN,
-    WORK_VISIBILITY_VISIBLE,
+    TurnWorkProjectionRecord, WORK_VISIBILITY_HIDDEN, WORK_VISIBILITY_VISIBLE,
 };
 
 pub(crate) async fn project_semantic_timeline_live_turn_event<C: ConnectionTrait>(
@@ -498,30 +497,14 @@ async fn project_terminal_turn_event<C: ConnectionTrait>(
         return Ok(());
     }
 
-    let mut after_order_key: Option<String> = None;
-    loop {
-        let running_rows = timeline_repository::list_turn_work_items_by_status_page(
-            db,
-            turn_model.id.as_str(),
-            WORK_ITEM_STATUS_RUNNING,
-            after_order_key.as_deref(),
-            128,
-        )
-        .await?;
-        if running_rows.is_empty() {
-            break;
-        }
-
-        for row in &running_rows {
-            if let Some(item_model) =
-                turn::find_turn_item(db, turn_model.id.as_str(), row.item_id.as_str()).await?
-            {
-                project_turn_item_row(db, &thread_model, &turn_model, &item_model, event).await?;
-            }
-        }
-
-        after_order_key = running_rows.last().map(|row| row.order_key.clone());
-    }
+    timeline_repository::refresh_terminal_running_turn_work_item_projections(
+        db,
+        turn_model.id.as_str(),
+        event.id.as_str(),
+        event.sequence,
+        event.created_at,
+    )
+    .await?;
 
     refresh_turn_work_summary(
         db,
@@ -993,6 +976,19 @@ async fn refresh_turn_work_summary<C: ConnectionTrait>(
     source_sequence: i64,
     refreshed_at: DateTimeWithTimeZone,
 ) -> Result<()> {
+    // A collaborative Composer parent persists the user message, while its
+    // detached child Task owns the execution UI. This immutable admission fact
+    // prevents the parent from ever exposing a transient empty work row.
+    if turn_model.work_owner == crate::TurnWorkOwner::DetachedTask.as_db_str() {
+        timeline_repository::delete_turn_work_projection(db, turn_model.id.as_str()).await?;
+        timeline_repository::delete_thread_timeline_block(
+            db,
+            work_block_id(turn_model.id.as_str()).as_str(),
+        )
+        .await?;
+        return Ok(());
+    }
+
     let visible_work_count = count_to_i64(
         timeline_repository::count_turn_work_items(
             db,
@@ -1010,6 +1006,14 @@ async fn refresh_turn_work_summary<C: ConnectionTrait>(
         .await?,
     );
     let work_count = visible_work_count.saturating_add(hidden_work_count);
+    let has_html_publication = crate::repositories::artifact::ArtifactRepository::new()
+        .has_html_publication(
+            db,
+            &thread_model.workspace_id,
+            &thread_model.id,
+            &turn_model.id,
+        )
+        .await?;
     let has_final = timeline_repository::count_thread_timeline_blocks_for_turn_kind(
         db,
         turn_model.id.as_str(),
@@ -1021,6 +1025,7 @@ async fn refresh_turn_work_summary<C: ConnectionTrait>(
         .await?
         || detached_task_run_origin_hint(turn_model);
     let terminal_system_task_delivery_without_work = work_count == 0
+        && !has_html_publication
         && turn_model.status != "in_progress"
         && turn_model.turn_kind == "conversation"
         && turn_model.origin == "task_delivery"
@@ -1032,7 +1037,7 @@ async fn refresh_turn_work_summary<C: ConnectionTrait>(
     let completed_without_work = turn_model.status == "completed" && work_count == 0;
     let needs_work_block = !has_detached_task_run
         && !terminal_system_task_delivery_without_work
-        && (work_count > 0 || (!has_final && !completed_without_work));
+        && (has_html_publication || work_count > 0 || (!has_final && !completed_without_work));
 
     if !needs_work_block {
         timeline_repository::delete_turn_work_projection(db, turn_model.id.as_str()).await?;
@@ -1057,15 +1062,30 @@ async fn refresh_turn_work_summary<C: ConnectionTrait>(
         .map(|projection| projection.source_high_watermark)
         .unwrap_or(0)
         .max(source_sequence);
-    let summary_updated_at = max_datetime(turn_model.updated_at, refreshed_at);
+    let mut summary_updated_at = max_datetime(turn_model.updated_at, refreshed_at);
+    if has_html_publication && let Some(existing) = &existing {
+        // An event rounded to seconds must not rewind an artifact-only revision.
+        summary_updated_at = max_datetime(summary_updated_at, existing.updated_at);
+    }
     let pending_request_count =
         count_pending_cli_runtime_requests(db, thread_model.id.as_str(), turn_model.id.as_str())
             .await?;
     let running_item_state =
         find_running_item_state(db, turn_model.id.as_str(), summary_updated_at).await?;
-    let cli_runtime_status = find_turn_binding(db, turn_model.id.as_str())
+    let mut cli_runtime_status = find_turn_binding(db, turn_model.id.as_str())
         .await?
         .map(|binding| binding.status);
+    // A child is visible before CLI history preparation creates its runtime
+    // binding. Its existing execution receipt owns that queued interval.
+    if cli_runtime_status.is_none()
+        && turn_model.status == "in_progress"
+        && let Some(execution) =
+            crate::repositories::turn_execution::find(db, &turn_model.id).await?
+        && execution.executor_kind == crate::TurnExecutorKind::CliRuntime
+        && execution.status == crate::TurnExecutionStatus::Starting
+    {
+        cli_runtime_status = Some("starting".to_owned());
+    }
     let presentation = turn_work_presentation(turn_model, has_final);
     let state = turn_work_state(
         turn_model.status.as_str(),

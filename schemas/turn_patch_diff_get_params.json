@@ -1,0 +1,115 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TurnPatchDiffGetParams",
+  "type": "object",
+  "properties": {
+    "maxBytes": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "minimum": 0
+    },
+    "selection": {
+      "$ref": "#/$defs/PatchDiffSelection"
+    },
+    "threadId": {
+      "type": "string"
+    },
+    "turnId": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "threadId",
+    "turnId",
+    "selection"
+  ],
+  "$defs": {
+    "PatchDiffSelection": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "record"
+            },
+            "selector": {
+              "$ref": "#/$defs/PatchRecordSelector"
+            }
+          },
+          "required": [
+            "kind",
+            "selector"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "afterOrdinal": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint64",
+              "minimum": 0
+            },
+            "kind": {
+              "type": "string",
+              "const": "boundary"
+            },
+            "throughOrdinal": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "uint64",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        }
+      ]
+    },
+    "PatchRecordSelector": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "record_id"
+            },
+            "recordId": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "recordId"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "invocationId": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "const": "invocation"
+            }
+          },
+          "required": [
+            "kind",
+            "invocationId"
+          ]
+        }
+      ]
+    }
+  }
+}

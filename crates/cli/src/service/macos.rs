@@ -8,54 +8,69 @@ use tracing::info;
 
 use pioneer_config::InstallManagedBy;
 
-use super::{GatewayServiceWarning, SERVICE_MODE_ARG, ServiceSettings};
+use super::{GatewayServiceStartReport, GatewayServiceWarning, SERVICE_MODE_ARG, ServiceSettings};
 
 const MACOS_LAUNCH_AGENT_SCOPE_WARNING_CODE: &str = "macos_launch_agent_login_session_scoped";
 
-pub fn start_gateway_service(settings: &ServiceSettings) -> Result<Vec<GatewayServiceWarning>> {
+pub fn start_gateway_service(
+    settings: &ServiceSettings,
+    report: &mut GatewayServiceStartReport,
+) -> Result<Vec<GatewayServiceWarning>> {
     let service_label = settings.service_name.as_str();
-    let plist_path = launch_agents_dir()?.join(format!("{service_label}.plist"));
-    let executable = env::current_exe().context("failed to determine current executable path")?;
-    let launchd_executable = launchd_executable_path(settings, &executable)
-        .context("failed to prepare macOS launchd executable path")?;
-    let logs_dir = user_logs_dir()
-        .context("failed to resolve user logs directory for launch agent")?
-        .join("Logs")
-        .join("Pioneer")
-        .join(service_label);
+    let (plist_path, domain) = report.observe("service.definition.prepare", || {
+        let plist_path = launch_agents_dir()?.join(format!("{service_label}.plist"));
+        let executable =
+            env::current_exe().context("failed to determine current executable path")?;
+        let launchd_executable = launchd_executable_path(settings, &executable)
+            .context("failed to prepare macOS launchd executable path")?;
+        let logs_dir = user_logs_dir()
+            .context("failed to resolve user logs directory for launch agent")?
+            .join("Logs")
+            .join("Pioneer")
+            .join(service_label);
 
-    fs::create_dir_all(
-        plist_path
-            .parent()
-            .context("failed to get launchd directory")?,
-    )
-    .context("failed to create launchd directory")?;
-    fs::create_dir_all(&logs_dir).context("failed to create service logs directory")?;
-
-    let launchd_path = super::resolve_service_path();
-    let plist_content = render_launchd_plist(
-        service_label,
-        &launchd_executable,
-        &logs_dir,
-        launchd_path.as_deref(),
-        settings.macos_associated_bundle_identifier.as_str(),
-    );
-    fs::write(&plist_path, plist_content).with_context(|| {
-        format!(
-            "failed to write launchd service file at {}",
-            plist_path.display()
+        fs::create_dir_all(
+            plist_path
+                .parent()
+                .context("failed to get launchd directory")?,
         )
+        .context("failed to create launchd directory")?;
+        fs::create_dir_all(&logs_dir).context("failed to create service logs directory")?;
+
+        let launchd_path = super::resolve_service_path();
+        let plist_content = render_launchd_plist(
+            service_label,
+            &launchd_executable,
+            &logs_dir,
+            launchd_path.as_deref(),
+            settings.macos_associated_bundle_identifier.as_str(),
+        );
+        fs::write(&plist_path, plist_content).with_context(|| {
+            format!(
+                "failed to write launchd service file at {}",
+                plist_path.display()
+            )
+        })?;
+
+        Ok((plist_path, launchctl_domain()?))
     })?;
-
-    let domain = launchctl_domain()?;
     let service_target = format!("{domain}/{service_label}");
-    let plist_path_str = path_to_str(&plist_path)?;
+    let plist_path_string = path_to_str(&plist_path)?.to_owned();
 
-    remove_legacy_services(domain.as_str(), settings.legacy_service_names.as_slice())?;
-    let _ = run_launchctl(&["bootout", domain.as_str(), plist_path_str.as_ref()]);
-    run_launchctl(&["enable", &service_target])?;
-    run_launchctl(&["bootstrap", domain.as_str(), plist_path_str.as_ref()])?;
-    run_launchctl(&["kickstart", "-k", &service_target])?;
+    report.observe("service.previous.remove", || {
+        remove_legacy_services(domain.as_str(), settings.legacy_service_names.as_slice())?;
+        let _ = run_launchctl(&["bootout", domain.as_str(), plist_path_string.as_str()]);
+        Ok(())
+    })?;
+    report.observe("service.manager.enable", || {
+        run_launchctl(&["enable", &service_target])
+    })?;
+    report.observe("service.manager.register", || {
+        run_launchctl(&["bootstrap", domain.as_str(), plist_path_string.as_str()])
+    })?;
+    report.observe("service.manager.activate", || {
+        run_launchctl(&["kickstart", "-k", &service_target])
+    })?;
 
     info!(
         service = service_label,

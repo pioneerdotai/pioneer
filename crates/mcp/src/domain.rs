@@ -135,6 +135,23 @@ pub enum McpConfigValue {
 pub struct McpAuthConfig {
     #[serde(default)]
     pub required: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth: Option<McpOAuthConfig>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct McpOAuthConfig {
+    /// Effective client authentication for a pre-registered OAuth client.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_endpoint_auth_method: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_secret_ref: Option<String>,
+    #[serde(default)]
+    pub scopes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issuer: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, PartialOrd, Ord)]
@@ -290,5 +307,11 @@ mod tests {
         assert!(McpDependencyKey::parse("").is_err());
         assert!(McpDependencyKey::parse("github/").is_err());
         assert!(McpDependencyKey::parse("/search").is_err());
+    }
+}
+
+impl McpTransportConfig {
+    pub fn has_authorization_header(&self) -> bool {
+        matches!(self, Self::StreamableHttp { headers, .. } if headers.keys().any(|key|key.eq_ignore_ascii_case("authorization")))
     }
 }

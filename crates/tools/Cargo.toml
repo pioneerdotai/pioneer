@@ -15,6 +15,9 @@ async-trait.workspace = true
 pioneer-protocol.workspace = true
 pioneer-provider.workspace = true
 pioneer-mcp.workspace = true
+pioneer-observability.workspace = true
+pioneer-crud.workspace = true
+pioneer-sqlite.workspace = true
 pioneer-skills.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -27,9 +30,18 @@ tokio-util.workspace = true
 tracing.workspace = true
 chrono.workspace = true
 libc.workspace = true
+base64.workspace = true
+tempfile.workspace = true
+zstd.workspace = true
+sea-orm = { workspace = true, features = ["sqlx-sqlite", "runtime-tokio-rustls"] }
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
 scraper.workspace = true
 webclaw-core.workspace = true
 futures-util.workspace = true
+fff-search = "0.11.0"
+globset = "0.4"
+regex = "1"
+jsonschema = { version = "0.58", default-features = false }
 xa11y = { workspace = true, optional = true }
 xcap = { workspace = true, optional = true }
 image = { workspace = true, optional = true }
@@ -38,4 +50,4 @@ image = { workspace = true, optional = true }
 nono.workspace = true
 
 [dev-dependencies]
-tempfile.workspace = true
+pioneer-migration.workspace = true

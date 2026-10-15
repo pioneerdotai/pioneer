@@ -25,6 +25,73 @@ fn assert_post_turn_eligibility_skip(
 }
 
 #[test]
+fn durable_terminal_effect_claim_requires_a_complete_text_fence() {
+    let effect_key = HookMetadataKey::new("native_terminal_effect_id")
+        .expect("valid terminal-effect metadata key");
+    let claim_key = HookMetadataKey::new("native_terminal_effect_claim_token")
+        .expect("valid terminal-effect claim metadata key");
+    let mut context = HookContext::default();
+    context.metadata.insert(
+        effect_key.clone(),
+        HookValue::Text("effect-durable-1".to_owned()),
+    );
+    assert!(
+        memory_durable_terminal_effect_claim(&context).is_err(),
+        "an effect id without its claim token must fail closed"
+    );
+
+    context.metadata.insert(
+        claim_key.clone(),
+        HookValue::Text("claim-durable-1".to_owned()),
+    );
+    assert_eq!(
+        memory_durable_terminal_effect_claim(&context).expect("complete claim should decode"),
+        Some(MemoryDurableTerminalEffectClaim {
+            effect_id: "effect-durable-1".to_owned(),
+            claim_token: "claim-durable-1".to_owned(),
+        })
+    );
+
+    context.metadata.insert(claim_key, HookValue::I64(1));
+    assert!(
+        memory_durable_terminal_effect_claim(&context).is_err(),
+        "a non-text claim token must fail closed"
+    );
+}
+
+#[test]
+fn post_turn_correction_retains_explicit_target_through_the_write_contract() {
+    let mut raw: serde_json::Value =
+        serde_json::from_str(&valid_post_turn_extractor_json()).unwrap();
+    raw["facts"][0]["target_memory_id"] = serde_json::json!("existing_manifest_record");
+    let parsed = parse_memory_post_turn_extractor_json(
+        &raw.to_string(),
+        &MemoryPostTurnExtractorConfig::default(),
+    )
+    .unwrap();
+    let params = memory_semantic_write_params_from_extracted_fact(
+        0,
+        parsed.facts.into_iter().next().unwrap(),
+        &test_memory_turn_context(),
+        &MemoryTurnPolicy::normal_default_allow(),
+        &MemoryPostTurnExtractorConfig::default(),
+        MemorySourceContextKind::DirectUserConversation,
+        Some("test-model"),
+        Some("test-provider"),
+    )
+    .unwrap();
+    assert_eq!(
+        params.target_memory_id.as_deref(),
+        Some("existing_manifest_record")
+    );
+    assert_eq!(params.scope.kind, MemoryScopeKind::User);
+    assert_eq!(
+        params.source_context_kind,
+        Some(MemorySourceContextKind::DirectUserConversation)
+    );
+}
+
+#[test]
 fn strict_json_parser_accepts_typed_semantic_fact() {
     let parsed = parse_memory_post_turn_extractor_json(
         valid_post_turn_extractor_json().as_str(),
@@ -1093,6 +1160,38 @@ async fn post_turn_extractor_writes_semantic_fact_through_provider() {
 }
 
 #[tokio::test]
+async fn post_turn_without_api_model_reports_configuration_diagnostic_without_provider_call() {
+    let write = Arc::new(TestMemoryWriteProvider::default());
+    let extractor = Arc::new(TestPostTurnExtractorProvider::json(
+        valid_post_turn_extractor_json(),
+    ));
+    let hook = MemoryPostTurnExtractorHook {
+        write_provider: Some(write.clone()),
+        extractor_provider: Some(extractor.clone()),
+        config: MemoryPostTurnExtractorConfig::default(),
+    };
+    let mut request = test_post_turn_hook_request(
+        memory_policy_set(&MemoryTurnPolicy::normal_default_allow()),
+        "Меня зовут Александр",
+        "Понял.",
+    );
+    if let pioneer_hooks::HookInputPayload::TurnPostTurn(input) = &mut request.input.payload {
+        input.model = None;
+        input.model_provider = None;
+    }
+    let response = hook.execute(request).await.unwrap();
+    assert!(
+        response
+            .diagnostics
+            .iter()
+            .any(|d| d.code.as_str() == "memory.post_turn_extractor.model_unavailable")
+    );
+    assert_eq!(extractor.call_count(), 0);
+    assert_eq!(write.manifest_call_count(), 0);
+    assert_eq!(write.write_call_count(), 0);
+}
+
+#[tokio::test]
 async fn accepted_detached_task_result_extracts_once_in_parent_scope_with_child_provenance() {
     let write_provider = Arc::new(TestMemoryWriteProvider::default());
     let extractor_provider = Arc::new(TestPostTurnExtractorProvider::json(
@@ -1227,10 +1326,42 @@ async fn post_turn_extractor_uses_configured_model_override() {
 }
 
 #[tokio::test]
-async fn post_turn_extractor_retries_configured_model_with_thread_model() {
+async fn post_turn_extractor_uses_thread_model_when_not_configured() {
+    let write_provider = Arc::new(TestMemoryWriteProvider::default());
+    let extractor_provider = Arc::new(TestPostTurnExtractorProvider::json(
+        valid_post_turn_extractor_json(),
+    ));
+    let hook = MemoryPostTurnExtractorHook {
+        write_provider: Some(write_provider),
+        extractor_provider: Some(extractor_provider.clone()),
+        config: MemoryPostTurnExtractorConfig::default(),
+    };
+
+    hook.execute(test_post_turn_hook_request(
+        memory_policy_set(&MemoryTurnPolicy::normal_default_allow()),
+        "Меня зовут Александр",
+        "Понял.",
+    ))
+    .await
+    .expect("post-turn extractor executes");
+
+    let context = extractor_provider
+        .contexts()
+        .into_iter()
+        .next()
+        .expect("extractor context recorded");
+    assert_eq!(context.model.as_deref(), Some("test-model"));
+    assert_eq!(context.model_provider.as_deref(), Some("test-provider"));
+}
+
+#[tokio::test]
+async fn post_turn_extractor_does_not_fallback_to_thread_model() {
     let write_provider = Arc::new(TestMemoryWriteProvider::default());
     let extractor_provider = Arc::new(TestSequencedPostTurnExtractorProvider::new([
-        Err("configured extractor failed".to_owned()),
+        Err(memory_retryable_safe_hook_error(
+            "memory.post_turn_extractor.provider_network_transient",
+            "configured extractor failed",
+        )),
         Ok(valid_post_turn_extractor_json()),
     ]));
     let hook = MemoryPostTurnExtractorHook {
@@ -1243,44 +1374,27 @@ async fn post_turn_extractor_retries_configured_model_with_thread_model() {
         },
     };
 
-    let response = hook
+    let error = hook
         .execute(test_post_turn_hook_request(
             memory_policy_set(&MemoryTurnPolicy::normal_default_allow()),
             "Меня зовут Александр",
             "Понял.",
         ))
         .await
-        .expect("post-turn extractor retries with thread model");
+        .expect_err("configured extractor failure must not fall back to the thread model");
 
     let contexts = extractor_provider.contexts();
-    assert_eq!(contexts.len(), 2);
+    assert_eq!(contexts.len(), 1);
     assert_eq!(contexts[0].model.as_deref(), Some("memory-model"));
     assert_eq!(
         contexts[0].model_provider.as_deref(),
         Some("memory-provider")
     );
-    assert_eq!(contexts[1].model.as_deref(), Some("test-model"));
-    assert_eq!(contexts[1].model_provider.as_deref(), Some("test-provider"));
-
-    let params = write_provider
-        .write_params()
-        .into_iter()
-        .next()
-        .expect("write params recorded");
+    assert!(write_provider.write_params().is_empty());
     assert_eq!(
-        params.metadata.get("model"),
-        Some(&serde_json::json!("test-model"))
+        error.code.as_str(),
+        "memory.post_turn_extractor.provider_network_transient"
     );
-    assert_eq!(
-        params.metadata.get("model_provider"),
-        Some(&serde_json::json!("test-provider"))
-    );
-    assert!(response.diagnostics.iter().any(|diagnostic| {
-        diagnostic
-            .message
-            .as_str()
-            .contains("memory.post_turn_extractor.thread_model_retry_used")
-    }));
 }
 
 #[tokio::test]
@@ -1369,7 +1483,7 @@ async fn post_turn_extractor_provider_failure_is_retryable_hook_failure() {
 
     assert_eq!(
         error.code.as_str(),
-        "memory.post_turn_extractor.provider_failed"
+        "memory.post_turn_extractor.provider_network_transient"
     );
     assert!(error.retryable);
     assert!(error.safe_for_user);
@@ -1859,4 +1973,432 @@ async fn post_turn_extractor_suppresses_implicit_when_proactive_disabled() {
                 .as_str()
                 .contains("validation_rejected=1")
     }));
+}
+
+#[test]
+fn post_turn_shared_format_validator_matches_typed_parser_and_redacts_values() {
+    let config = MemoryPostTurnExtractorConfig::default();
+    for raw in [
+        r#"{"facts":[]}"#.to_owned(),
+        r#"{}"#.to_owned(), // Preserve the existing default for omitted facts.
+        valid_post_turn_extractor_json(),
+        r#"{"facts":"PRIVATE_PARSE_CANARY"}"#.to_owned(),
+        r#"{"facts":PRIVATE_PARSE_CANARY}"#.to_owned(),
+    ] {
+        let format = validate_memory_post_turn_response_format(&raw);
+        let parsed = parse_memory_post_turn_extractor_json(&raw, &config);
+        assert_eq!(format.is_ok(), parsed.is_ok());
+        if let Err(error) = format {
+            assert!(!format!("{error:?} {error}").contains("PRIVATE_PARSE_CANARY"));
+            assert!(matches!(
+                error.category,
+                MemoryPostTurnResponseFormatCategory::Syntax
+                    | MemoryPostTurnResponseFormatCategory::Structure
+            ));
+        }
+    }
+}
+
+#[test]
+fn post_turn_identity_validation_matches_canonical_keys_after_normalization() {
+    let config = MemoryPostTurnExtractorConfig::default();
+    let scope = MemoryScope {
+        kind: MemoryScopeKind::Workspace,
+        key: "workspace".into(),
+    };
+    for subject in ["project", "person", "organization", "artifact", "custom"] {
+        for value in [
+            serde_json::Value::Null,
+            serde_json::json!(""),
+            serde_json::json!("  "),
+            serde_json::json!("__ / -- 🚀"),
+            serde_json::json!("Проект Pioneer"),
+        ] {
+            let mut raw: serde_json::Value =
+                serde_json::from_str(&valid_post_turn_extractor_json()).unwrap();
+            raw["facts"][0]["semantic"]["subject"] = serde_json::json!(subject);
+            let field = if subject == "custom" {
+                "custom_subject"
+            } else {
+                "subject_key"
+            };
+            raw["facts"][0]["semantic"][field] = value.clone();
+            let semantic: MemorySemanticFields =
+                serde_json::from_value(raw["facts"][0]["semantic"].clone()).unwrap();
+            let parsed = parse_memory_post_turn_extractor_json(&raw.to_string(), &config).unwrap();
+            let valid = value == serde_json::json!("Проект Pioneer");
+            assert_eq!(
+                crate::build_memory_canonical_key(&scope, &semantic).is_ok(),
+                valid,
+                "{subject}: {value}"
+            );
+            assert_eq!(parsed.facts.len(), usize::from(valid), "{subject}: {value}");
+            assert_eq!(parsed.validation_rejected_count, usize::from(!valid));
+            if value.is_null() {
+                raw["facts"][0]["semantic"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove(field);
+                let omitted =
+                    parse_memory_post_turn_extractor_json(&raw.to_string(), &config).unwrap();
+                assert_eq!(omitted.validation_rejected_count, 1);
+            }
+            assert!(!parsed.diagnostics.join(" ").contains("Проект Pioneer"));
+        }
+    }
+    for subject in ["current_user", "current_agent", "workspace"] {
+        for attribute in ["name", "custom"] {
+            for value in [
+                serde_json::Value::Null,
+                serde_json::json!(""),
+                serde_json::json!(" -- 🚀 "),
+                serde_json::json!("review policy"),
+            ] {
+                let mut raw: serde_json::Value =
+                    serde_json::from_str(&valid_post_turn_extractor_json()).unwrap();
+                raw["facts"][0]["semantic"]["subject"] = serde_json::json!(subject);
+                raw["facts"][0]["semantic"]["attribute"] = serde_json::json!(attribute);
+                raw["facts"][0]["semantic"]["custom_attribute"] = value.clone();
+                let semantic: MemorySemanticFields =
+                    serde_json::from_value(raw["facts"][0]["semantic"].clone()).unwrap();
+                let parsed =
+                    parse_memory_post_turn_extractor_json(&raw.to_string(), &config).unwrap();
+                let valid = attribute == "name" || value == serde_json::json!("review policy");
+                assert_eq!(
+                    crate::build_memory_canonical_key(&scope, &semantic).is_ok(),
+                    valid
+                );
+                assert_eq!(parsed.facts.len(), usize::from(valid));
+                if value.is_null() {
+                    raw["facts"][0]["semantic"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("custom_attribute");
+                    let omitted =
+                        parse_memory_post_turn_extractor_json(&raw.to_string(), &config).unwrap();
+                    assert_eq!(omitted.facts.len(), usize::from(valid));
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn post_turn_mixed_invalid_candidates_never_reach_write_provider() {
+    let mut raw: serde_json::Value =
+        serde_json::from_str(&valid_post_turn_extractor_json()).unwrap();
+    let mut invalid = raw["facts"][0].clone();
+    invalid["semantic"]["attribute"] = serde_json::json!("custom");
+    raw["facts"].as_array_mut().unwrap().insert(0, invalid);
+    let writes = Arc::new(TestMemoryWriteProvider::default());
+    let hook = MemoryPostTurnExtractorHook {
+        write_provider: Some(writes.clone()),
+        extractor_provider: Some(Arc::new(TestPostTurnExtractorProvider::json(
+            raw.to_string(),
+        ))),
+        config: MemoryPostTurnExtractorConfig::default(),
+    };
+    let response = hook
+        .execute(test_post_turn_hook_request(
+            memory_policy_set(&MemoryTurnPolicy::normal_default_allow()),
+            "Меня зовут Александр",
+            "Понял.",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(writes.write_call_count(), 1);
+    assert!(
+        response
+            .diagnostics
+            .iter()
+            .any(|d| d.message.as_str().contains("validation_rejected=1")
+                && d.message.as_str().contains("write_successes=1"))
+    );
+}
+
+#[tokio::test]
+async fn durable_write_failures_are_typed_safe_and_transient_failure_survives_partial_success() {
+    use crate::MemoryWriteFailure::*;
+    for failures in [
+        vec![Some(InvalidInput)],
+        vec![Some(AuthorizationOrDomain)],
+        vec![Some(Unclassified)],
+        vec![Some(StorageTransient)],
+        vec![None, Some(AuthorizationOrDomain), Some(StorageTransient)],
+        vec![Some(StorageTransient), Some(AuthorizationOrDomain), None],
+    ] {
+        let count = failures.len();
+        let retryable = failures.contains(&Some(StorageTransient));
+        let writes = Arc::new(TestMemoryWriteProvider {
+            failures: Mutex::new(failures.into()),
+            ..Default::default()
+        });
+        let mut raw: serde_json::Value =
+            serde_json::from_str(&valid_post_turn_extractor_json()).unwrap();
+        raw["facts"] = serde_json::Value::Array(vec![raw["facts"][0].clone(); count]);
+        let hook = MemoryPostTurnExtractorHook {
+            write_provider: Some(writes.clone()),
+            extractor_provider: Some(Arc::new(TestPostTurnExtractorProvider::json(
+                raw.to_string(),
+            ))),
+            config: MemoryPostTurnExtractorConfig::default(),
+        };
+        let mut request = test_post_turn_hook_request(
+            memory_policy_set(&MemoryTurnPolicy::normal_default_allow()),
+            "Меня зовут Александр",
+            "Понял.",
+        );
+        request.context.metadata.insert(
+            hook_metadata_key("native_terminal_effect_id"),
+            HookValue::Text("effect".into()),
+        );
+        request.context.metadata.insert(
+            hook_metadata_key("native_terminal_effect_claim_token"),
+            HookValue::Text("claim".into()),
+        );
+        let error = hook.execute(request.clone()).await.unwrap_err();
+        assert_eq!(writes.write_call_count(), count);
+        assert_eq!(error.retryable, retryable);
+        assert_ne!(
+            error.code.as_str(),
+            "memory.post_turn_extractor.write_failed"
+        );
+        assert_eq!(
+            error.metadata[&hook_metadata_key("failure_stage")],
+            "semantic_write"
+        );
+        assert_eq!(error.metadata[&hook_metadata_key("model")], "test-model");
+        assert_eq!(
+            error.metadata[&hook_metadata_key("provider")],
+            "test-provider"
+        );
+        assert!(
+            error
+                .metadata
+                .contains_key(&hook_metadata_key("fact_index"))
+        );
+        if count == 3 {
+            assert_eq!(
+                error.metadata[&hook_metadata_key("write_success_count")],
+                "1"
+            );
+            assert_eq!(
+                error.metadata[&hook_metadata_key("write_failure_authorization_or_domain_count")],
+                "1"
+            );
+            assert_eq!(
+                error.metadata[&hook_metadata_key("write_failure_storage_transient_count")],
+                "1"
+            );
+        }
+        let safe = serde_json::to_string(&error).unwrap();
+        assert!(!safe.contains("Александр"));
+        assert!(!safe.contains("quote_or_span"));
+        if retryable {
+            // Replaying all valid facts is allowed; duplicate protection remains
+            // the service's canonical identity/fingerprint responsibility.
+            assert!(hook.execute(request).await.is_ok());
+            assert_eq!(writes.write_call_count(), count * 2);
+        }
+    }
+}
+
+/// Checkpoint-only provider seam: no model client is installed. Gateway's
+/// checkpoint codec/authority fences are covered separately in gateway tests.
+struct CheckpointOnlyPostTurnExtractor {
+    checkpoint_json: String,
+}
+
+#[async_trait::async_trait]
+impl AgentMemoryPostTurnExtractorProvider for CheckpointOnlyPostTurnExtractor {
+    async fn extract_post_turn_memory_json(
+        &self,
+        context: MemoryPostTurnExtractorContext,
+        _request: MemoryPostTurnExtractorRequest,
+    ) -> HookResult<String> {
+        assert!(context.durable_terminal_effect.is_some());
+        let checkpoint: serde_json::Value = serde_json::from_str(&self.checkpoint_json).unwrap();
+        Ok(checkpoint["raw_json"].as_str().unwrap().to_owned())
+    }
+}
+
+#[tokio::test]
+async fn old_checkpoint_invalid_facts_are_rejected_on_every_replay_without_model_or_write() {
+    let mut raw: serde_json::Value =
+        serde_json::from_str(&valid_post_turn_extractor_json()).unwrap();
+    raw["facts"][0]["semantic"]["attribute"] = serde_json::json!("custom");
+    let mut second = raw["facts"][0].clone();
+    second["semantic"]["subject"] = serde_json::json!("project");
+    raw["facts"].as_array_mut().unwrap().push(second);
+    let checkpoint_json = serde_json::json!({
+        "schema_version": 1, "raw_json": raw.to_string(),
+        "model": "test-model", "model_provider": "test-provider",
+    })
+    .to_string();
+    let writes = Arc::new(TestMemoryWriteProvider::default());
+    let checkpoint = Arc::new(CheckpointOnlyPostTurnExtractor {
+        checkpoint_json: checkpoint_json.clone(),
+    });
+    let hook = MemoryPostTurnExtractorHook {
+        write_provider: Some(writes.clone()),
+        extractor_provider: Some(checkpoint.clone()),
+        config: MemoryPostTurnExtractorConfig::default(),
+    };
+    let mut request = test_post_turn_hook_request(
+        memory_policy_set(&MemoryTurnPolicy::normal_default_allow()),
+        "Меня зовут Александр",
+        "Понял.",
+    );
+    request.context.metadata.insert(
+        hook_metadata_key("native_terminal_effect_id"),
+        HookValue::Text("effect".into()),
+    );
+    request.context.metadata.insert(
+        hook_metadata_key("native_terminal_effect_claim_token"),
+        HookValue::Text("claim".into()),
+    );
+    for _ in 0..2 {
+        let response = hook.execute(request.clone()).await.unwrap();
+        assert!(
+            response.diagnostics.iter().any(|d| d
+                .message
+                .as_str()
+                .contains("validation_rejected=2")
+                && d.message.as_str().contains("write_successes=0"))
+        );
+        assert!(
+            !response
+                .diagnostics
+                .iter()
+                .any(|d| d.code.as_str() == "memory.post_turn_extractor.write_failed")
+        );
+        assert_eq!(writes.write_call_count(), 0);
+    }
+    assert_eq!(checkpoint.checkpoint_json, checkpoint_json);
+}
+
+#[tokio::test]
+async fn manifest_failure_stops_extraction_and_writes_with_safe_durable_and_skip_metadata() {
+    use crate::{
+        MemoryManifestFailure, MemoryManifestFailureClass as Class,
+        MemoryManifestFailureStage as Stage,
+    };
+    for class in [
+        Class::StorageTransient,
+        Class::AuthorizationOrDomain,
+        Class::InvalidStoredData,
+        Class::Unclassified,
+    ] {
+        for stage in [
+            Stage::Runtime,
+            Stage::Authorization,
+            Stage::Active,
+            Stage::Candidates,
+        ] {
+            for durable in [false, true] {
+                let failure = MemoryManifestFailure::new(class, stage);
+                let writes = Arc::new(TestMemoryWriteProvider {
+                    manifest_failures: Mutex::new(vec![failure].into()),
+                    ..Default::default()
+                });
+                let extractor = Arc::new(TestPostTurnExtractorProvider::json(
+                    valid_post_turn_extractor_json(),
+                ));
+                let hook = MemoryPostTurnExtractorHook {
+                    write_provider: Some(writes.clone()),
+                    extractor_provider: Some(extractor.clone()),
+                    config: MemoryPostTurnExtractorConfig::default(),
+                };
+                let mut request = test_post_turn_hook_request(
+                    memory_policy_set(&MemoryTurnPolicy::normal_default_allow()),
+                    "Меня зовут Александр",
+                    "Понял.",
+                );
+                if durable {
+                    request.context.metadata.insert(
+                        hook_metadata_key("native_terminal_effect_id"),
+                        HookValue::Text("effect".into()),
+                    );
+                    request.context.metadata.insert(
+                        hook_metadata_key("native_terminal_effect_claim_token"),
+                        HookValue::Text("claim".into()),
+                    );
+                }
+                let result = hook.execute(request.clone()).await;
+                if durable {
+                    let error = result.unwrap_err();
+                    assert_eq!(error.code.as_str(), failure.code());
+                    assert_eq!(error.retryable, failure.retryable());
+                    assert_eq!(
+                        error.metadata[&hook_metadata_key("failure_class")],
+                        failure.class_name()
+                    );
+                    assert_eq!(
+                        error.metadata[&hook_metadata_key("failure_stage")],
+                        stage.as_str()
+                    );
+                } else {
+                    let response = result.unwrap();
+                    let diagnostic = response
+                        .diagnostics
+                        .iter()
+                        .find(|d| d.code.as_str() == "memory.post_turn_extractor.skipped")
+                        .unwrap();
+                    assert_eq!(
+                        diagnostic.metadata[&hook_metadata_key("manifest_failure_code")],
+                        HookValue::Text(failure.code().into())
+                    );
+                    assert_eq!(
+                        diagnostic.metadata[&hook_metadata_key("failure_stage")],
+                        HookValue::Text(stage.as_str().into())
+                    );
+                }
+                assert_eq!(extractor.call_count(), 0);
+                assert_eq!(writes.write_call_count(), 0);
+                if failure.retryable() {
+                    hook.execute(request).await.unwrap();
+                    assert_eq!(extractor.call_count(), 1);
+                    assert_eq!(writes.write_call_count(), 1);
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn manifest_failure_precedes_checkpoint_replay() {
+    let failure = crate::MemoryManifestFailure::new(
+        crate::MemoryManifestFailureClass::Unclassified,
+        crate::MemoryManifestFailureStage::Active,
+    );
+    let writes = Arc::new(TestMemoryWriteProvider {
+        manifest_failures: Mutex::new(vec![failure].into()),
+        ..Default::default()
+    });
+    // Invalid checkpoint would panic in this fixture if reached.
+    let hook = MemoryPostTurnExtractorHook {
+        write_provider: Some(writes.clone()),
+        extractor_provider: Some(Arc::new(CheckpointOnlyPostTurnExtractor {
+            checkpoint_json: "must not be decoded".into(),
+        })),
+        config: MemoryPostTurnExtractorConfig::default(),
+    };
+    let mut request = test_post_turn_hook_request(
+        memory_policy_set(&MemoryTurnPolicy::normal_default_allow()),
+        "Меня зовут Александр",
+        "Понял.",
+    );
+    request.context.metadata.insert(
+        hook_metadata_key("native_terminal_effect_id"),
+        HookValue::Text("effect".into()),
+    );
+    request.context.metadata.insert(
+        hook_metadata_key("native_terminal_effect_claim_token"),
+        HookValue::Text("claim".into()),
+    );
+    assert_eq!(
+        hook.execute(request).await.unwrap_err().code.as_str(),
+        failure.code()
+    );
+    assert_eq!(writes.write_call_count(), 0);
 }

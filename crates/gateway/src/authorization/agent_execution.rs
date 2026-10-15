@@ -632,6 +632,7 @@ mod tests {
                 permission_profile: None,
                 skill_ids: Vec::new(),
                 mcp_server_ids: Vec::new(),
+                selected_capabilities: Vec::new(),
             },
         }
     }
@@ -678,6 +679,7 @@ mod tests {
                 permission_profile: None,
                 skill_ids: Vec::new(),
                 mcp_server_ids: Vec::new(),
+                selected_capabilities: Vec::new(),
             },
         };
 

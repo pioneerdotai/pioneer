@@ -1,0 +1,270 @@
+{
+  "initial": [
+    {
+      "payload": {
+        "changes": {
+          "changed": [
+            {
+              "id": "a2",
+              "kind": "thread"
+            }
+          ],
+          "removed": [],
+          "reordered_folders": [
+            "__root__"
+          ]
+        },
+        "error": null,
+        "loading": false,
+        "revision": 2,
+        "snapshot": {
+          "agents_doc_summaries_by_folder_key": {},
+          "child_folder_ids_by_parent_id": {},
+          "folders_by_id": {},
+          "placements_by_thread_id": {},
+          "thread_ids_by_folder_id": {
+            "__root__": [
+              "a2",
+              "a1"
+            ]
+          },
+          "threads_by_id": {
+            "a1": {
+              "created_at": 1,
+              "id": "a1",
+              "mode": "Chat",
+              "model": "model",
+              "model_provider": "provider",
+              "name": "a1",
+              "origin_kind": "user",
+              "preview": "",
+              "sidebar_visibility": "visible",
+              "status": "Idle",
+              "turns": [],
+              "updated_at": 1,
+              "workspace_id": "a"
+            },
+            "a2": {
+              "created_at": 1,
+              "id": "a2",
+              "mode": "Chat",
+              "model": "model",
+              "model_provider": "provider",
+              "name": "a2",
+              "origin_kind": "user",
+              "preview": "",
+              "sidebar_visibility": "visible",
+              "status": "Idle",
+              "turns": [],
+              "updated_at": 2,
+              "workspace_id": "a"
+            }
+          },
+          "unread": [],
+          "workspace_id": "a"
+        },
+        "actions": {}
+      },
+      "revisions": {
+        "content": 2,
+        "domain": 2,
+        "presentation": 2,
+        "scoped": 2
+      },
+      "schema_version": 1,
+      "scope": {
+        "kind": "workspace_tree",
+        "workspace_id": "a"
+      },
+      "sequence": 2
+    },
+    {
+      "payload": {
+        "changes": {
+          "changed": [
+            {
+              "id": "b1",
+              "kind": "thread"
+            }
+          ],
+          "removed": [],
+          "reordered_folders": [
+            "__root__"
+          ]
+        },
+        "error": null,
+        "loading": false,
+        "revision": 1,
+        "snapshot": {
+          "agents_doc_summaries_by_folder_key": {},
+          "child_folder_ids_by_parent_id": {},
+          "folders_by_id": {},
+          "placements_by_thread_id": {},
+          "thread_ids_by_folder_id": {
+            "__root__": [
+              "b1"
+            ]
+          },
+          "threads_by_id": {
+            "b1": {
+              "created_at": 1,
+              "id": "b1",
+              "mode": "Chat",
+              "model": "model",
+              "model_provider": "provider",
+              "name": "b1",
+              "origin_kind": "user",
+              "preview": "",
+              "sidebar_visibility": "visible",
+              "status": "Idle",
+              "turns": [],
+              "updated_at": 1,
+              "workspace_id": "b"
+            }
+          },
+          "unread": [],
+          "workspace_id": "b"
+        },
+        "actions": {}
+      },
+      "revisions": {
+        "content": 1,
+        "domain": 1,
+        "presentation": 1,
+        "scoped": 1
+      },
+      "schema_version": 1,
+      "scope": {
+        "kind": "workspace_tree",
+        "workspace_id": "b"
+      },
+      "sequence": 3
+    }
+  ],
+  "updated": [
+    {
+      "payload": {
+        "changes": {
+          "changed": [],
+          "removed": [
+            {
+              "id": "a1",
+              "kind": "thread"
+            }
+          ],
+          "reordered_folders": [
+            "__root__"
+          ]
+        },
+        "error": null,
+        "loading": false,
+        "revision": 5,
+        "snapshot": {
+          "agents_doc_summaries_by_folder_key": {},
+          "child_folder_ids_by_parent_id": {},
+          "folders_by_id": {},
+          "placements_by_thread_id": {},
+          "thread_ids_by_folder_id": {
+            "__root__": [
+              "a2"
+            ]
+          },
+          "threads_by_id": {
+            "a2": {
+              "created_at": 1,
+              "id": "a2",
+              "mode": "Chat",
+              "model": "model",
+              "model_provider": "provider",
+              "name": "a2",
+              "origin_kind": "user",
+              "preview": "new preview",
+              "sidebar_visibility": "visible",
+              "status": "Idle",
+              "turns": [],
+              "updated_at": 3,
+              "workspace_id": "a"
+            }
+          },
+          "unread": [],
+          "workspace_id": "a"
+        },
+        "actions": {}
+      },
+      "revisions": {
+        "content": 5,
+        "domain": 5,
+        "presentation": 5,
+        "scoped": 5
+      },
+      "schema_version": 1,
+      "scope": {
+        "kind": "workspace_tree",
+        "workspace_id": "a"
+      },
+      "sequence": 6
+    },
+    {
+      "payload": {
+        "changes": {
+          "changed": [
+            {
+              "id": "b1",
+              "kind": "thread"
+            }
+          ],
+          "removed": [],
+          "reordered_folders": [
+            "__root__"
+          ]
+        },
+        "error": null,
+        "loading": false,
+        "revision": 1,
+        "snapshot": {
+          "agents_doc_summaries_by_folder_key": {},
+          "child_folder_ids_by_parent_id": {},
+          "folders_by_id": {},
+          "placements_by_thread_id": {},
+          "thread_ids_by_folder_id": {
+            "__root__": [
+              "b1"
+            ]
+          },
+          "threads_by_id": {
+            "b1": {
+              "created_at": 1,
+              "id": "b1",
+              "mode": "Chat",
+              "model": "model",
+              "model_provider": "provider",
+              "name": "b1",
+              "origin_kind": "user",
+              "preview": "",
+              "sidebar_visibility": "visible",
+              "status": "Idle",
+              "turns": [],
+              "updated_at": 1,
+              "workspace_id": "b"
+            }
+          },
+          "unread": [],
+          "workspace_id": "b"
+        },
+        "actions": {}
+      },
+      "revisions": {
+        "content": 1,
+        "domain": 1,
+        "presentation": 1,
+        "scoped": 1
+      },
+      "schema_version": 1,
+      "scope": {
+        "kind": "workspace_tree",
+        "workspace_id": "b"
+      },
+      "sequence": 3
+    }
+  ]
+}

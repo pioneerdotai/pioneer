@@ -23,6 +23,11 @@ use tokio_util::sync::CancellationToken;
 pub enum McpRuntimeErrorKind {
     Failed,
     AuthRequired,
+    RefreshRejected,
+    TransientRefresh,
+    CredentialStore,
+    InsufficientScope,
+    Forbidden,
     Cancelled,
     TimedOut,
 }
@@ -32,6 +37,7 @@ pub struct McpRuntimeError {
     pub kind: McpRuntimeErrorKind,
     pub state: McpRuntimeState,
     pub message: String,
+    pub oauth_failure: Option<crate::OAuthFailureCause>,
 }
 
 impl std::fmt::Display for McpRuntimeError {
@@ -48,6 +54,7 @@ impl McpRuntimeError {
             kind: McpRuntimeErrorKind::Failed,
             state: McpRuntimeState::Failed,
             message: message.into(),
+            oauth_failure: None,
         }
     }
 
@@ -56,6 +63,7 @@ impl McpRuntimeError {
             kind: McpRuntimeErrorKind::AuthRequired,
             state: McpRuntimeState::AuthRequired,
             message: message.into(),
+            oauth_failure: None,
         }
     }
 
@@ -64,6 +72,7 @@ impl McpRuntimeError {
             kind: McpRuntimeErrorKind::Cancelled,
             state: McpRuntimeState::Failed,
             message: message.into(),
+            oauth_failure: None,
         }
     }
 
@@ -72,6 +81,7 @@ impl McpRuntimeError {
             kind: McpRuntimeErrorKind::TimedOut,
             state: McpRuntimeState::Failed,
             message: message.into(),
+            oauth_failure: None,
         }
     }
 }

@@ -1,0 +1,639 @@
+{
+  "groq": {
+    "text": {
+      "id": "text",
+      "name": "text",
+      "provider": "groq",
+      "api": "openai-completions",
+      "baseUrl": "https://example.invalid",
+      "contextWindow": 1000000,
+      "maxTokens": 16000,
+      "reasoning": false,
+      "input": [
+        "text"
+      ],
+      "cost": {},
+      "inputOrigin": {
+        "kind": "source",
+        "expression": "contract fixture"
+      },
+      "output": [
+        "text"
+      ]
+    },
+    "vision": {
+      "id": "vision",
+      "name": "vision",
+      "provider": "groq",
+      "api": "openai-completions",
+      "baseUrl": "https://example.invalid",
+      "contextWindow": 1000000,
+      "maxTokens": 16000,
+      "reasoning": false,
+      "input": [
+        "text",
+        "image"
+      ],
+      "cost": {},
+      "inputOrigin": {
+        "kind": "source",
+        "expression": "contract fixture"
+      },
+      "output": [
+        "text"
+      ]
+    },
+    "media": {
+      "id": "media",
+      "name": "media",
+      "provider": "groq",
+      "api": "openai-completions",
+      "baseUrl": "https://example.invalid",
+      "contextWindow": 1000000,
+      "maxTokens": 16000,
+      "reasoning": false,
+      "input": [
+        "text",
+        "image",
+        "audio",
+        "video",
+        "pdf"
+      ],
+      "cost": {},
+      "inputOrigin": {
+        "kind": "source",
+        "expression": "contract fixture"
+      },
+      "output": [
+        "text"
+      ]
+    },
+    "unknown": {
+      "id": "unknown",
+      "name": "unknown",
+      "provider": "groq",
+      "api": "openai-completions",
+      "baseUrl": "https://example.invalid",
+      "contextWindow": 1000000,
+      "maxTokens": 16000,
+      "reasoning": false,
+      "input": [],
+      "cost": {},
+      "inputOrigin": {
+        "kind": "fallback",
+        "expression": "contract fixture"
+      },
+      "output": [
+        "text"
+      ]
+    }
+  },
+  "openai": {
+    "text": {
+      "id": "text",
+      "name": "text",
+      "provider": "openai",
+      "api": "openai-responses",
+      "baseUrl": "https://example.invalid",
+      "contextWindow": 1000000,
+      "maxTokens": 16000,
+      "reasoning": false,
+      "input": [
+        "text"
+      ],
+      "cost": {},
+      "inputOrigin": {
+        "kind": "source",
+        "expression": "contract fixture"
+      },
+      "output": [
+        "text"
+      ]
+    },
+    "vision": {
+      "id": "vision",
+      "name": "vision",
+      "provider": "openai",
+      "api": "openai-responses",
+      "baseUrl": "https://example.invalid",
+      "contextWindow": 1000000,
+      "maxTokens": 16000,
+      "reasoning": false,
+      "input": [
+        "text",
+        "image"
+      ],
+      "cost": {},
+      "inputOrigin": {
+        "kind": "source",
+        "expression": "contract fixture"
+      },
+      "output": [
+        "text"
+      ]
+    },
+    "media": {
+      "id": "media",
+      "name": "media",
+      "provider": "openai",
+      "api": "openai-responses",
+      "baseUrl": "https://example.invalid",
+      "contextWindow": 1000000,
+      "maxTokens": 16000,
+      "reasoning": false,
+      "input": [
+        "text",
+        "image",
+        "audio",
+        "video",
+        "pdf"
+      ],
+      "cost": {},
+      "inputOrigin": {
+        "kind": "source",
+        "expression": "contract fixture"
+      },
+      "output": [
+        "text"
+      ]
+    },
+    "unknown": {
+      "id": "unknown",
+      "name": "unknown",
+      "provider": "openai",
+      "api": "openai-responses",
+      "baseUrl": "https://example.invalid",
+      "contextWindow": 1000000,
+      "maxTokens": 16000,
+      "reasoning": false,
+      "input": [],
+      "cost": {},
+      "inputOrigin": {
+        "kind": "fallback",
+        "expression": "contract fixture"
+      },
+      "output": [
+        "text"
+      ]
+    }
+  },
+  "anthropic": {
+    "text": {
+      "id": "text",
+      "name": "text",
+      "provider": "anthropic",
+      "api": "anthropic-messages",
+      "baseUrl": "https://example.invalid",
+      "contextWindow": 1000000,
+      "maxTokens": 16000,
+      "reasoning": false,
+      "input": [
+        "text"
+      ],
+      "cost": {},
+      "inputOrigin": {
+        "kind": "source",
+        "expression": "contract fixture"
+      },
+      "output": [
+        "text"
+      ]
+    },
+    "vision": {
+      "id": "vision",
+      "name": "vision",
+      "provider": "anthropic",
+      "api": "anthropic-messages",
+      "baseUrl": "https://example.invalid",
+      "contextWindow": 1000000,
+      "maxTokens": 16000,
+      "reasoning": false,
+      "input": [
+        "text",
+        "image"
+      ],
+      "cost": {},
+      "inputOrigin": {
+        "kind": "source",
+        "expression": "contract fixture"
+      },
+      "output": [
+        "text"
+      ]
+    },
+    "media": {
+      "id": "media",
+      "name": "media",
+      "provider": "anthropic",
+      "api": "anthropic-messages",
+      "baseUrl": "https://example.invalid",
+      "contextWindow": 1000000,
+      "maxTokens": 16000,
+      "reasoning": false,
+      "input": [
+        "text",
+        "image",
+        "audio",
+        "video",
+        "pdf"
+      ],
+      "cost": {},
+      "inputOrigin": {
+        "kind": "source",
+        "expression": "contract fixture"
+      },
+      "output": [
+        "text"
+      ]
+    },
+    "unknown": {
+      "id": "unknown",
+      "name": "unknown",
+      "provider": "anthropic",
+      "api": "anthropic-messages",
+      "baseUrl": "https://example.invalid",
+      "contextWindow": 1000000,
+      "maxTokens": 16000,
+      "reasoning": false,
+      "input": [],
+      "cost": {},
+      "inputOrigin": {
+        "kind": "fallback",
+        "expression": "contract fixture"
+      },
+      "output": [
+        "text"
+      ]
+    }
+  },
+  "google": {
+    "text": {
+      "id": "text",
+      "name": "text",
+      "provider": "google",
+      "api": "google-generative-ai",
+      "baseUrl": "https://example.invalid",
+      "contextWindow": 1000000,
+      "maxTokens": 16000,
+      "reasoning": false,
+      "input": [
+        "text"
+      ],
+      "cost": {},
+      "inputOrigin": {
+        "kind": "source",
+        "expression": "contract fixture"
+      },
+      "output": [
+        "text"
+      ]
+    },
+    "vision": {
+      "id": "vision",
+      "name": "vision",
+      "provider": "google",
+      "api": "google-generative-ai",
+      "baseUrl": "https://example.invalid",
+      "contextWindow": 1000000,
+      "maxTokens": 16000,
+      "reasoning": false,
+      "input": [
+        "text",
+        "image"
+      ],
+      "cost": {},
+      "inputOrigin": {
+        "kind": "source",
+        "expression": "contract fixture"
+      },
+      "output": [
+        "text"
+      ]
+    },
+    "media": {
+      "id": "media",
+      "name": "media",
+      "provider": "google",
+      "api": "google-generative-ai",
+      "baseUrl": "https://example.invalid",
+      "contextWindow": 1000000,
+      "maxTokens": 16000,
+      "reasoning": false,
+      "input": [
+        "text",
+        "image",
+        "audio",
+        "video",
+        "pdf"
+      ],
+      "cost": {},
+      "inputOrigin": {
+        "kind": "source",
+        "expression": "contract fixture"
+      },
+      "output": [
+        "text"
+      ]
+    },
+    "unknown": {
+      "id": "unknown",
+      "name": "unknown",
+      "provider": "google",
+      "api": "google-generative-ai",
+      "baseUrl": "https://example.invalid",
+      "contextWindow": 1000000,
+      "maxTokens": 16000,
+      "reasoning": false,
+      "input": [],
+      "cost": {},
+      "inputOrigin": {
+        "kind": "fallback",
+        "expression": "contract fixture"
+      },
+      "output": [
+        "text"
+      ]
+    }
+  },
+  "openrouter": {
+    "text": {
+      "id": "text",
+      "name": "text",
+      "provider": "openrouter",
+      "api": "openai-completions",
+      "baseUrl": "https://example.invalid",
+      "contextWindow": 1000000,
+      "maxTokens": 16000,
+      "reasoning": false,
+      "input": [
+        "text"
+      ],
+      "cost": {},
+      "inputOrigin": {
+        "kind": "source",
+        "expression": "contract fixture"
+      },
+      "output": [
+        "text"
+      ]
+    },
+    "vision": {
+      "id": "vision",
+      "name": "vision",
+      "provider": "openrouter",
+      "api": "openai-completions",
+      "baseUrl": "https://example.invalid",
+      "contextWindow": 1000000,
+      "maxTokens": 16000,
+      "reasoning": false,
+      "input": [
+        "text",
+        "image"
+      ],
+      "cost": {},
+      "inputOrigin": {
+        "kind": "source",
+        "expression": "contract fixture"
+      },
+      "output": [
+        "text"
+      ]
+    },
+    "media": {
+      "id": "media",
+      "name": "media",
+      "provider": "openrouter",
+      "api": "openai-completions",
+      "baseUrl": "https://example.invalid",
+      "contextWindow": 1000000,
+      "maxTokens": 16000,
+      "reasoning": false,
+      "input": [
+        "text",
+        "image",
+        "audio",
+        "video",
+        "pdf"
+      ],
+      "cost": {},
+      "inputOrigin": {
+        "kind": "source",
+        "expression": "contract fixture"
+      },
+      "output": [
+        "text"
+      ],
+      "inputConstraints": {
+        "audio": {
+          "mimeTypes": [
+            "audio/wav"
+          ],
+          "sources": [
+            "bytes"
+          ],
+          "roles": [
+            "user"
+          ],
+          "maxBytes": 4
+        }
+      }
+    },
+    "unknown": {
+      "id": "unknown",
+      "name": "unknown",
+      "provider": "openrouter",
+      "api": "openai-completions",
+      "baseUrl": "https://example.invalid",
+      "contextWindow": 1000000,
+      "maxTokens": 16000,
+      "reasoning": false,
+      "input": [],
+      "cost": {},
+      "inputOrigin": {
+        "kind": "fallback",
+        "expression": "contract fixture"
+      },
+      "output": [
+        "text"
+      ]
+    }
+  },
+  "amazon-bedrock": {
+    "text": {
+      "id": "text",
+      "name": "text",
+      "provider": "amazon-bedrock",
+      "api": "bedrock-converse-stream",
+      "baseUrl": "https://example.invalid",
+      "contextWindow": 1000000,
+      "maxTokens": 16000,
+      "reasoning": false,
+      "input": [
+        "text"
+      ],
+      "cost": {},
+      "inputOrigin": {
+        "kind": "source",
+        "expression": "contract fixture"
+      },
+      "output": [
+        "text"
+      ]
+    },
+    "vision": {
+      "id": "vision",
+      "name": "vision",
+      "provider": "amazon-bedrock",
+      "api": "bedrock-converse-stream",
+      "baseUrl": "https://example.invalid",
+      "contextWindow": 1000000,
+      "maxTokens": 16000,
+      "reasoning": false,
+      "input": [
+        "text",
+        "image"
+      ],
+      "cost": {},
+      "inputOrigin": {
+        "kind": "source",
+        "expression": "contract fixture"
+      },
+      "output": [
+        "text"
+      ]
+    },
+    "media": {
+      "id": "media",
+      "name": "media",
+      "provider": "amazon-bedrock",
+      "api": "bedrock-converse-stream",
+      "baseUrl": "https://example.invalid",
+      "contextWindow": 1000000,
+      "maxTokens": 16000,
+      "reasoning": false,
+      "input": [
+        "text",
+        "image",
+        "audio",
+        "video",
+        "pdf"
+      ],
+      "cost": {},
+      "inputOrigin": {
+        "kind": "source",
+        "expression": "contract fixture"
+      },
+      "output": [
+        "text"
+      ]
+    },
+    "unknown": {
+      "id": "unknown",
+      "name": "unknown",
+      "provider": "amazon-bedrock",
+      "api": "bedrock-converse-stream",
+      "baseUrl": "https://example.invalid",
+      "contextWindow": 1000000,
+      "maxTokens": 16000,
+      "reasoning": false,
+      "input": [],
+      "cost": {},
+      "inputOrigin": {
+        "kind": "fallback",
+        "expression": "contract fixture"
+      },
+      "output": [
+        "text"
+      ]
+    }
+  },
+  "github-copilot": {
+    "text": {
+      "id": "text",
+      "name": "text",
+      "provider": "github-copilot",
+      "api": "openai-responses",
+      "baseUrl": "https://example.invalid",
+      "contextWindow": 1000000,
+      "maxTokens": 16000,
+      "reasoning": false,
+      "input": [
+        "text"
+      ],
+      "cost": {},
+      "inputOrigin": {
+        "kind": "source",
+        "expression": "contract fixture"
+      },
+      "output": [
+        "text"
+      ]
+    },
+    "vision": {
+      "id": "vision",
+      "name": "vision",
+      "provider": "github-copilot",
+      "api": "openai-responses",
+      "baseUrl": "https://example.invalid",
+      "contextWindow": 1000000,
+      "maxTokens": 16000,
+      "reasoning": false,
+      "input": [
+        "text",
+        "image"
+      ],
+      "cost": {},
+      "inputOrigin": {
+        "kind": "source",
+        "expression": "contract fixture"
+      },
+      "output": [
+        "text"
+      ]
+    },
+    "media": {
+      "id": "media",
+      "name": "media",
+      "provider": "github-copilot",
+      "api": "openai-responses",
+      "baseUrl": "https://example.invalid",
+      "contextWindow": 1000000,
+      "maxTokens": 16000,
+      "reasoning": false,
+      "input": [
+        "text",
+        "image",
+        "audio",
+        "video",
+        "pdf"
+      ],
+      "cost": {},
+      "inputOrigin": {
+        "kind": "source",
+        "expression": "contract fixture"
+      },
+      "output": [
+        "text"
+      ]
+    },
+    "unknown": {
+      "id": "unknown",
+      "name": "unknown",
+      "provider": "github-copilot",
+      "api": "openai-responses",
+      "baseUrl": "https://example.invalid",
+      "contextWindow": 1000000,
+      "maxTokens": 16000,
+      "reasoning": false,
+      "input": [],
+      "cost": {},
+      "inputOrigin": {
+        "kind": "fallback",
+        "expression": "contract fixture"
+      },
+      "output": [
+        "text"
+      ]
+    }
+  }
+}

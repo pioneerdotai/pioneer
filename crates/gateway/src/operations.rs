@@ -42,8 +42,11 @@ pub struct KeystoreEncryptionReport {
 pub struct SecretKindCounts {
     pub provider_api_key: usize,
     pub provider_proxy: usize,
+    pub provider_base_url: usize,
     pub cli_runtime_proxy: usize,
+    pub model_catalog_proxy: usize,
     pub mcp_secret: usize,
+    pub mcp_oauth: usize,
     pub gateway_access_jwt_signing_key: usize,
     pub gateway_auth_credential_hmac_key: usize,
     pub user_jwt_token: usize,
@@ -64,6 +67,9 @@ pub struct McpSecretOrphanStatusReport {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct McpSecretGarbageCollectionReport {
+    pub oauth_stored: usize,
+    pub oauth_orphans: usize,
+    pub oauth_deleted: usize,
     pub dry_run: bool,
     pub active_refs: usize,
     pub stored_refs: usize,
@@ -151,6 +157,9 @@ pub async fn secrets_garbage_collection(
         .context("failed to garbage collect orphan MCP secrets")?;
 
     Ok(McpSecretGarbageCollectionReport {
+        oauth_stored: report.oauth_stored,
+        oauth_orphans: report.oauth_orphans,
+        oauth_deleted: report.oauth_deleted,
         dry_run,
         active_refs: report.active_refs,
         stored_refs: report.stored_refs,
@@ -221,7 +230,7 @@ async fn open_artifact_service_for_operations(
         );
     };
     Ok(ArtifactService::new_with_policies(
-        Arc::new(CrudStore::new(database)),
+        Arc::new(CrudStore::new(database.maintenance())),
         Arc::new(LocalArtifactBlobStore::new(runtime_home.to_path_buf())),
         ArtifactQuotaPolicy {
             max_file_bytes: config.gateway.artifacts.max_file_bytes,
@@ -250,9 +259,16 @@ fn count_secret_kinds(entries: &[SecretEntryMeta]) -> SecretKindCounts {
             Some(SecretKind::ProviderProxy) => {
                 counts.provider_proxy = counts.provider_proxy.saturating_add(1)
             }
+            Some(SecretKind::ProviderBaseUrl) => {
+                counts.provider_base_url = counts.provider_base_url.saturating_add(1)
+            }
             Some(SecretKind::CliRuntimeProxy) => {
                 counts.cli_runtime_proxy = counts.cli_runtime_proxy.saturating_add(1)
             }
+            Some(SecretKind::ModelCatalogProxy) => {
+                counts.model_catalog_proxy = counts.model_catalog_proxy.saturating_add(1)
+            }
+            Some(SecretKind::McpOAuth) => counts.mcp_oauth = counts.mcp_oauth.saturating_add(1),
             Some(SecretKind::McpSecret) => counts.mcp_secret = counts.mcp_secret.saturating_add(1),
             Some(SecretKind::GatewayAccessJwtSigningKey) => {
                 counts.gateway_access_jwt_signing_key =
@@ -594,8 +610,8 @@ mod tests {
                 preflight_model: Default::default(),
                 telemetry: Default::default(),
                 thread: GatewayThreadConfig {
-                    default_model: "gpt-5.4".to_owned(),
-                    default_model_provider: "openai".to_owned(),
+                    default_model: Some("gpt-5.4".to_owned()),
+                    default_model_provider: Some("openai".to_owned()),
                     summary_model: None,
                     summary_model_provider: None,
                     title_model: None,
@@ -639,6 +655,7 @@ mod tests {
                 },
             },
             desktop: DesktopConfig {
+                mcp_oauth: Default::default(),
                 gateway: GatewayRuntimeConfig {
                     connect_timeout_ms: 300,
                     startup_timeout_ms: 10_000,

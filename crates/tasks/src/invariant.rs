@@ -63,6 +63,15 @@ pub enum TaskRuntimeInvariantViolationKind {
         delivery_id: String,
         reason: String,
     },
+    TerminalExecutionOccurrenceMismatch {
+        task_id: String,
+        run_id: String,
+        execution_id: String,
+        run_status: String,
+        execution_status: String,
+        occurrence_status: String,
+        expected_occurrence_status: String,
+    },
     StaleInProgressTurn {
         turn_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -223,6 +232,9 @@ impl TaskRuntimeInvariantViolationKind {
             Self::MultipleChildThreadLinksForRun { .. } => "multiple_child_thread_links_for_run",
             Self::InvalidDeliveredTaskResult { .. } => "invalid_delivered_task_result",
             Self::DeliveryPointsToInvalidResult { .. } => "delivery_points_to_invalid_result",
+            Self::TerminalExecutionOccurrenceMismatch { .. } => {
+                "terminal_execution_occurrence_mismatch"
+            }
             Self::StaleInProgressTurn { .. } => "stale_in_progress_turn",
             Self::StaleTurnItemAttempt { .. } => "stale_turn_item_attempt",
             Self::PrimaryExecutorBindingMissingLineage { .. } => {
@@ -274,6 +286,7 @@ impl TaskRuntimeInvariantViolationKind {
             | Self::MultipleChildThreadLinksForRun { .. }
             | Self::InvalidDeliveredTaskResult { .. }
             | Self::DeliveryPointsToInvalidResult { .. }
+            | Self::TerminalExecutionOccurrenceMismatch { .. }
             | Self::StaleTurnItemAttempt { .. }
             | Self::PrimaryExecutorBindingMissingLineage { .. }
             | Self::PrimaryExecutorBindingMissingExecution { .. }
@@ -307,6 +320,7 @@ impl TaskRuntimeInvariantViolationKind {
             | Self::MultipleChildThreadLinksForRun { task_id, .. }
             | Self::InvalidDeliveredTaskResult { task_id, .. }
             | Self::DeliveryPointsToInvalidResult { task_id, .. }
+            | Self::TerminalExecutionOccurrenceMismatch { task_id, .. }
             | Self::PrimaryExecutorBindingMissingLineage { task_id, .. }
             | Self::PrimaryExecutorBindingMissingExecution { task_id, .. }
             | Self::MultiplePrimaryExecutorBindingsForRun { task_id, .. }
@@ -476,6 +490,10 @@ impl TaskRuntimeInvariantScanner {
         observed_at_unix: i64,
     ) -> Result<TaskRuntimeInvariantReport> {
         let db_path = db_path.as_ref();
+        // Auto-extensions only apply to connections opened after registration.
+        // The standalone scanner must also be able to read sqlite-zstd views.
+        pioneer_sqlite::zstd::register_auto_extension_once()
+            .context("failed to register sqlite-zstd extension for invariant scan")?;
         let mut options = ConnectOptions::new(sqlite_read_only_connection_url(db_path));
         options.sqlx_logging(false);
         let connection = Database::connect(options).await.with_context(|| {
@@ -500,6 +518,7 @@ impl TaskRuntimeInvariantScanner {
         self.detect_duplicate_lifecycle_events(&events, &mut report);
         self.detect_child_link_violations(&events, &mut report);
         self.detect_invalid_deliveries(snapshot.delivered_task_results.as_slice(), &mut report)?;
+        self.detect_terminal_occurrence_mismatches(snapshot, &mut report);
         self.detect_stale_turns(
             snapshot.in_progress_turns.as_slice(),
             observed_at_unix,
@@ -510,6 +529,27 @@ impl TaskRuntimeInvariantScanner {
             &mut report,
         );
         Ok(report)
+    }
+
+    fn detect_terminal_occurrence_mismatches(
+        &self,
+        snapshot: &TaskRuntimeInvariantSnapshot,
+        report: &mut TaskRuntimeInvariantReport,
+    ) {
+        for mismatch in &snapshot.terminal_occurrence_mismatches {
+            report.push(TaskRuntimeInvariantViolation::new(
+                TaskRuntimeInvariantViolationKind::TerminalExecutionOccurrenceMismatch {
+                    task_id: mismatch.task_id.clone(),
+                    run_id: mismatch.run_id.clone(),
+                    execution_id: mismatch.execution_id.clone(),
+                    run_status: mismatch.run_status.clone(),
+                    execution_status: mismatch.execution_status.clone(),
+                    occurrence_status: mismatch.occurrence_status.clone(),
+                    expected_occurrence_status: mismatch.expected_occurrence_status.clone(),
+                },
+                "terminal Task authorities disagree with the durable occurrence status",
+            ));
+        }
     }
 
     fn detect_duplicate_lifecycle_events(
@@ -826,6 +866,17 @@ mod tests {
             },
         ));
         report.push(violation(
+            TaskRuntimeInvariantViolationKind::TerminalExecutionOccurrenceMismatch {
+                task_id: "task_4".to_owned(),
+                run_id: "run_4".to_owned(),
+                execution_id: "execution_4".to_owned(),
+                run_status: "succeeded".to_owned(),
+                execution_status: "succeeded".to_owned(),
+                occurrence_status: "recovering".to_owned(),
+                expected_occurrence_status: "delivered".to_owned(),
+            },
+        ));
+        report.push(violation(
             TaskRuntimeInvariantViolationKind::StaleInProgressTurn {
                 turn_id: "turn_1".to_owned(),
                 thread_id: Some("thread_1".to_owned()),
@@ -845,8 +896,8 @@ mod tests {
                 reason: "terminal item has running attempt".to_owned(),
             },
         ));
-        assert_eq!(report.violation_count(), 6);
-        assert_eq!(report.error_count(), 5);
+        assert_eq!(report.violation_count(), 7);
+        assert_eq!(report.error_count(), 6);
         assert_eq!(report.warning_count(), 1);
         assert!(format!("{report}").contains("duplicate_lifecycle_events task_1"));
         assert!(format!("{report}").contains("stale_in_progress_turn turn_1"));
@@ -969,6 +1020,15 @@ mod tests {
                 run_status: Some("succeeded".to_owned()),
                 result_json: Some(serde_json::to_string(&invalid_result).unwrap()),
             }],
+            terminal_occurrence_mismatches: vec![pioneer_crud::TerminalTaskOccurrenceMismatch {
+                task_id: "task_3".to_owned(),
+                run_id: "run_3".to_owned(),
+                execution_id: "execution_3".to_owned(),
+                run_status: "succeeded".to_owned(),
+                execution_status: "succeeded".to_owned(),
+                occurrence_status: "recovering".to_owned(),
+                expected_occurrence_status: "delivered".to_owned(),
+            }],
             in_progress_turns: vec![TaskRuntimeInvariantTurnRecord {
                 turn_id: "turn_stale".to_owned(),
                 thread_id: Some("thread_1".to_owned()),
@@ -997,6 +1057,7 @@ mod tests {
         assert!(codes.contains(&"duplicate_lifecycle_events"));
         assert!(codes.contains(&"multiple_child_thread_links_for_run"));
         assert!(codes.contains(&"invalid_delivered_task_result"));
+        assert!(codes.contains(&"terminal_execution_occurrence_mismatch"));
         assert!(codes.contains(&"stale_in_progress_turn"));
         assert!(codes.contains(&"stale_turn_item_attempt"));
     }
@@ -1029,6 +1090,7 @@ mod tests {
                 run_status: Some("succeeded".to_owned()),
                 result_json: Some(serde_json::to_string(&valid_result).unwrap()),
             }],
+            terminal_occurrence_mismatches: Vec::new(),
             in_progress_turns: Vec::new(),
             stale_turn_item_attempts: Vec::new(),
         };
@@ -1067,6 +1129,7 @@ mod tests {
                         task_id: "task_1".to_owned(),
                         run_id: "run_1".to_owned(),
                         error: Some(TaskError {
+                            recovery_diagnostic: None,
                             code: "late_failure".to_owned(),
                             message: "late failure".to_owned(),
                             class: TaskErrorClass::Internal,
@@ -1078,6 +1141,7 @@ mod tests {
                 ),
             ],
             delivered_task_results: Vec::new(),
+            terminal_occurrence_mismatches: Vec::new(),
             in_progress_turns: Vec::new(),
             stale_turn_item_attempts: Vec::new(),
         };

@@ -1,4 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::error::Error;
+use std::fmt::{Display, Formatter};
 
 use anyhow::{Context, Result, bail};
 use pioneer_crud::{CrudStore, PersistedThreadAccessClass};
@@ -59,6 +61,29 @@ pub(crate) struct ExecutionLeaseGuard {
     pub(crate) authorizing_principal_id: PrincipalId,
     pub(crate) admitted_policy_generation: u64,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ExecutionTurnNotInProgress {
+    status: TurnStatus,
+}
+
+impl ExecutionTurnNotInProgress {
+    pub(crate) fn status(self) -> TurnStatus {
+        self.status
+    }
+}
+
+impl Display for ExecutionTurnNotInProgress {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "execution lease is not active (turn status: {:?})",
+            self.status
+        )
+    }
+}
+
+impl Error for ExecutionTurnNotInProgress {}
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ExecutionLeaseReprojection {
@@ -165,7 +190,18 @@ impl ExecutionLeaseRegistry {
             .await?
             .context("execution turn disappeared during lease validation")?;
         if turn.status != TurnStatus::InProgress {
-            bail!("execution lease is not active");
+            return Err(ExecutionTurnNotInProgress {
+                status: turn.status,
+            }
+            .into());
+        }
+        // Canonical cancellation may be accepted while its ordered projection
+        // is deferred. The receipt fences execution across that durable gap.
+        if store.native_cancellation_was_accepted(execution_id).await? {
+            return Err(ExecutionTurnNotInProgress {
+                status: TurnStatus::Interrupted,
+            }
+            .into());
         }
         let needs_restore = !self.leases.read().await.contains_key(execution_id);
         if needs_restore {
@@ -230,6 +266,38 @@ impl ExecutionLeaseRegistry {
             authorizing_principal_id,
             admitted_policy_generation,
         })
+    }
+
+    /// Returns `Ok(true)` only when the already-projected continuation lease
+    /// is sufficient to admit a lossy progress fragment without storage I/O.
+    /// Missing and stale leases return `Ok(false)` so the caller can restore
+    /// or reproject through the full durable guard. A current fenced lease is
+    /// an authoritative denial and must never be treated as a cache miss.
+    pub(crate) async fn guard_progress_cached(
+        &self,
+        execution_id: &str,
+        current_policy_generation: u64,
+    ) -> Result<bool> {
+        if execution_id.trim().is_empty() || execution_id != execution_id.trim() {
+            bail!("execution lease requires an exact execution id");
+        }
+        let leases = self.leases.read().await;
+        let Some(lease) = leases.get(execution_id) else {
+            return Ok(false);
+        };
+        if lease.projected_policy_generation != current_policy_generation {
+            return Ok(false);
+        }
+        if lease.state != ExecutionLeaseState::Active
+            || !lease.immutable_actions.contains(&lease.continuation_action)
+            || !lease.projected_actions.contains(&lease.continuation_action)
+        {
+            bail!(
+                "execution lease is fenced for action `{}`",
+                lease.continuation_action.safe_name()
+            );
+        }
+        Ok(true)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -816,6 +884,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn progress_cache_admits_only_current_active_continuation_lease() {
+        let harness = IsolatedEpic4Harness::new()
+            .await
+            .expect("isolated authorization fixture");
+        let store = CrudStore::new(harness.database.clone());
+        let member = principal(
+            MEMBER_A_ID,
+            PrincipalKind::User,
+            Some(RoleKey::member()),
+            "D00000000000000000001",
+            "S00000000000000000001",
+        );
+        let supervised = pioneer_protocol::compile_turn_permission_profile(
+            pioneer_protocol::TurnPermissionMode::Supervised,
+            pioneer_protocol::TurnPermissionProfileSource::Composer,
+        );
+        let context = ExecutionAuthorizationContext::for_test(
+            &member,
+            WORKSPACE_RED_ID,
+            THREAD_RED_PRIVATE_A_ID,
+            &supervised,
+            None,
+        );
+        let registry = ExecutionLeaseRegistry::default();
+        let execution_id = "V00000000000000000010";
+        registry
+            .register(&store, execution_id, &context, 7)
+            .await
+            .expect("register current execution lease");
+
+        assert!(
+            registry
+                .guard_progress_cached(execution_id, 7)
+                .await
+                .expect("current progress lease should validate")
+        );
+        assert!(
+            !registry
+                .guard_progress_cached(execution_id, 8)
+                .await
+                .expect("stale progress lease should request durable reprojection")
+        );
+
+        registry
+            .leases
+            .write()
+            .await
+            .get_mut(execution_id)
+            .expect("registered lease")
+            .state = ExecutionLeaseState::Fenced;
+        assert!(
+            registry
+                .guard_progress_cached(execution_id, 7)
+                .await
+                .expect_err("a current fenced lease must fail closed")
+                .to_string()
+                .contains("fenced")
+        );
+
+        registry.finish(execution_id).await;
+        assert!(
+            !registry
+                .guard_progress_cached(execution_id, 7)
+                .await
+                .expect("a missing lease should request durable restoration")
+        );
+    }
+
+    #[tokio::test]
     async fn superuser_started_execution_is_controlled_by_every_current_thread_member() {
         let harness = IsolatedEpic4Harness::new()
             .await
@@ -861,6 +998,90 @@ mod tests {
                 .expect("Member action is projected");
             assert!(collaborators.contains(&member_a));
             assert!(collaborators.contains(&member_b));
+        }
+    }
+
+    #[tokio::test]
+    async fn participant_add_reprojects_running_execution_without_fencing_it() {
+        let harness = IsolatedEpic4Harness::new()
+            .await
+            .expect("isolated authorization fixture");
+        let store = CrudStore::new(harness.database.clone());
+        let member_a = principal(
+            MEMBER_A_ID,
+            PrincipalKind::User,
+            Some(RoleKey::member()),
+            "D0000000000000000000A",
+            "S0000000000000000000A",
+        );
+        let supervised = pioneer_protocol::TurnPermissionProfileSnapshot::from_mode(
+            pioneer_protocol::TurnPermissionMode::Supervised,
+            pioneer_protocol::TurnPermissionProfileSource::Composer,
+        );
+        let context = ExecutionAuthorizationContext::for_test(
+            &member_a,
+            WORKSPACE_RED_ID,
+            THREAD_RED_PRIVATE_A_ID,
+            &supervised,
+            None,
+        );
+        let registry = ExecutionLeaseRegistry::default();
+        registry
+            .register(&store, "V00000000000000000004", &context, 1)
+            .await
+            .expect("register running collaborative execution");
+
+        let member_b = PrincipalId::new(MEMBER_B_ID).expect("Member B id");
+        {
+            let leases = registry.leases.read().await;
+            let lease = leases
+                .get("V00000000000000000004")
+                .expect("registered lease");
+            assert!(
+                lease
+                    .action_collaborators
+                    .get(&ResourceAction::AgentRequestRespond)
+                    .is_none_or(|ids| !ids.contains(&member_b))
+            );
+        }
+
+        add_member_b_to_private_root(&harness).await;
+        let signal = crate::authorization::AuthorizationInvalidationHub::default()
+            .publish(
+                pioneer_protocol::AccessChangeKind::ThreadParticipantAdded,
+                Some(member_b.clone()),
+                WORKSPACE_RED_ID,
+                Some(THREAD_RED_PRIVATE_A_ID.to_owned()),
+            )
+            .await
+            .expect("publish participant-add invalidation");
+        let reprojection = registry
+            .reproject_scope(&store, &signal)
+            .await
+            .expect("reproject shared execution");
+        assert!(
+            reprojection.fenced_execution_ids.is_empty(),
+            "adding a collaborator must not stop the running shared execution"
+        );
+
+        let leases = registry.leases.read().await;
+        let lease = leases
+            .get("V00000000000000000004")
+            .expect("reprojected lease");
+        for action in [
+            ResourceAction::AgentExecutionCancel,
+            ResourceAction::AgentExecutionSteer,
+            ResourceAction::AgentRequestRespond,
+            ResourceAction::TaskCreate,
+        ] {
+            assert!(
+                lease
+                    .action_collaborators
+                    .get(&action)
+                    .is_some_and(|ids| ids.contains(&member_b)),
+                "new collaborator must receive current `{}` authority",
+                action.safe_name()
+            );
         }
     }
 

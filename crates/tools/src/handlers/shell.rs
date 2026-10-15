@@ -4,7 +4,8 @@ use crate::context::{
 use crate::error::ToolError;
 use crate::registry::ToolHandler;
 use crate::shell_format::{
-    ExecModelPayload, ExecPayloadInput, build_exec_model_payload, render_exec_ui_text,
+    ExecModelPayload, ExecOutputStats, ExecPayloadInput, ExecStreamOutputStats,
+    build_exec_model_payload, build_exec_model_payload_with_stats, render_exec_ui_text,
 };
 use crate::{
     NativeSandboxPrepareOutcome, NativeSandboxRequest, NonoSandboxBackend, ProcessSpawnPlan,
@@ -12,13 +13,11 @@ use crate::{
     configure_windows_restricted_token_command, prepare_native_sandbox_backend,
 };
 use async_trait::async_trait;
-use chrono::Utc;
 use pioneer_protocol::{SandboxBackendKind, TurnExecutionSecuritySnapshot};
-use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
-use std::fs;
+use std::future::pending;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -26,20 +25,51 @@ use std::time::Instant;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::{Mutex, mpsc};
-use tokio::time::{Duration, sleep};
+use tokio::time::{Duration, Instant as TokioInstant, sleep, sleep_until};
 
 const DEFAULT_TIMEOUT_MS: u64 = 60_000;
 const DEFAULT_YIELD_MS: u64 = 120;
 const MAX_ACTIVE_SESSIONS: usize = 64;
 const SESSION_MAX_BUFFER_BYTES: usize = 512 * 1024;
+const ONE_SHOT_MAX_STREAM_BYTES: usize = 512 * 1024;
+const ONE_SHOT_MAX_TOTAL_BYTES: usize = 1024 * 1024;
+const ONE_SHOT_ABSOLUTE_MAX_BYTES: usize = 64 * 1024 * 1024;
+const ONE_SHOT_CHUNK_CHANNEL_CAPACITY: usize = 64;
 const SESSION_TTL_MS: u64 = if cfg!(test) { 500 } else { 10 * 60 * 1000 };
 const PROCESS_KILL_GRACE_MS: u64 = 300;
-const SESSION_STATE_FILE: &str = "pioneer_tools_exec_sessions.json";
+const ONE_SHOT_PIPE_DRAIN_GRACE_MS: u64 = 5_000;
+const ONE_SHOT_STREAM_LIMIT_ENV: &str = "PIONEER_EXEC_ONE_SHOT_MAX_STREAM_BYTES";
+const ONE_SHOT_TOTAL_LIMIT_ENV: &str = "PIONEER_EXEC_ONE_SHOT_MAX_TOTAL_BYTES";
+
+#[derive(Debug, Clone, Copy)]
+struct OneShotOutputLimits {
+    stream_bytes: usize,
+    total_bytes: usize,
+}
+
+impl Default for OneShotOutputLimits {
+    fn default() -> Self {
+        let configured = |name: &str, fallback: usize| {
+            std::env::var(name)
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .filter(|value| *value > 0)
+                .map(|value| value.min(ONE_SHOT_ABSOLUTE_MAX_BYTES))
+                .unwrap_or(fallback)
+        };
+        let total_bytes = configured(ONE_SHOT_TOTAL_LIMIT_ENV, ONE_SHOT_MAX_TOTAL_BYTES);
+        Self {
+            stream_bytes: configured(ONE_SHOT_STREAM_LIMIT_ENV, ONE_SHOT_MAX_STREAM_BYTES)
+                .min(total_bytes),
+            total_bytes,
+        }
+    }
+}
 
 pub struct UnifiedExecHandler {
     sessions: Arc<Mutex<HashMap<u64, Arc<Mutex<ExecSession>>>>>,
     next_session_id: AtomicU64,
-    persistence: Option<SessionPersistence>,
+    one_shot_limits: OneShotOutputLimits,
 }
 
 struct ExecSession {
@@ -52,6 +82,7 @@ struct ExecSession {
     command: Vec<String>,
     started_at: Instant,
     last_touched: Instant,
+    _runtime_temp_dir: Option<Arc<crate::process_policy::ProcessRuntimeTempDir>>,
 }
 
 impl Default for UnifiedExecHandler {
@@ -59,7 +90,7 @@ impl Default for UnifiedExecHandler {
         Self {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             next_session_id: AtomicU64::new(0),
-            persistence: SessionPersistence::new_default(),
+            one_shot_limits: OneShotOutputLimits::default(),
         }
     }
 }
@@ -67,39 +98,21 @@ impl Default for UnifiedExecHandler {
 impl Drop for UnifiedExecHandler {
     fn drop(&mut self) {
         if let Ok(sessions) = self.sessions.try_lock() {
-            for (session_id, session) in sessions.iter() {
+            for session in sessions.values() {
                 if let Ok(mut guard) = session.try_lock() {
                     terminate_child_process_now(&mut guard.child);
-                    if let Some(persistence) = self.persistence.as_ref() {
-                        persistence.mark_unresumable(*session_id);
-                    }
                 }
             }
         }
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct PersistedSessionRecord {
-    session_id: u64,
-    command: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pid: Option<u32>,
-    created_unix_ms: i64,
-    last_touched_unix_ms: i64,
-    resumable: bool,
-}
-
-#[derive(Clone)]
-struct SessionPersistence {
-    path: PathBuf,
-    records: Arc<std::sync::Mutex<HashMap<u64, PersistedSessionRecord>>>,
-}
-
 #[derive(Default)]
 struct SessionBuffer {
     bytes: Vec<u8>,
     base_offset: usize,
+    closed: bool,
+    read_error: Option<String>,
 }
 
 impl SessionBuffer {
@@ -117,132 +130,17 @@ impl SessionBuffer {
         let start_offset = cursor.max(self.base_offset);
         let start_index = start_offset.saturating_sub(self.base_offset);
         let lost_output = cursor < self.base_offset;
-        (self.bytes[start_index..].to_vec(), current_end, lost_output)
-    }
-}
-
-impl SessionPersistence {
-    fn new_for_path(path: PathBuf) -> Self {
-        let loaded = fs::read_to_string(path.as_path())
-            .ok()
-            .and_then(|raw| serde_json::from_str::<Vec<PersistedSessionRecord>>(raw.as_str()).ok())
-            .unwrap_or_default();
-
-        let mut map = HashMap::new();
-        for mut record in loaded {
-            record.resumable = false;
-            map.insert(record.session_id, record);
-        }
-
-        let persistence = Self {
-            path,
-            records: Arc::new(std::sync::Mutex::new(map)),
-        };
-        persistence.persist_snapshot();
-        persistence
-    }
-
-    fn new_default() -> Option<Self> {
-        if cfg!(test) {
-            return None;
-        }
-
-        let path = std::env::var_os("PIONEER_EXEC_SESSION_STATE_PATH")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                std::env::temp_dir().join(format!("{SESSION_STATE_FILE}.{}", std::process::id()))
-            });
-        Some(Self::new_for_path(path))
-    }
-
-    fn insert_live(&self, session_id: u64, command: &[String], pid: Option<u32>) {
-        let now = Utc::now().timestamp_millis();
-        if let Ok(mut guard) = self.records.lock() {
-            guard.insert(
-                session_id,
-                PersistedSessionRecord {
-                    session_id,
-                    command: command.to_vec(),
-                    pid,
-                    created_unix_ms: now,
-                    last_touched_unix_ms: now,
-                    resumable: true,
-                },
-            );
-        }
-        self.persist_snapshot();
-    }
-
-    fn touch(&self, session_id: u64) {
-        if let Ok(mut guard) = self.records.lock()
-            && let Some(record) = guard.get_mut(&session_id)
-        {
-            record.last_touched_unix_ms = Utc::now().timestamp_millis();
-        }
-        self.persist_snapshot();
-    }
-
-    fn mark_unresumable(&self, session_id: u64) {
-        if let Ok(mut guard) = self.records.lock()
-            && let Some(record) = guard.get_mut(&session_id)
-        {
-            record.resumable = false;
-            record.last_touched_unix_ms = Utc::now().timestamp_millis();
-        }
-        self.persist_snapshot();
-    }
-
-    fn remove(&self, session_id: u64) {
-        if let Ok(mut guard) = self.records.lock() {
-            guard.remove(&session_id);
-        }
-        self.persist_snapshot();
-    }
-
-    fn take_resume_error(&self, session_id: u64) -> Option<String> {
-        let record = if let Ok(mut guard) = self.records.lock() {
-            guard.remove(&session_id)
+        let bytes = &self.bytes[start_index..];
+        let length = if self.closed {
+            bytes.len()
         } else {
-            None
+            complete_utf8_prefix(bytes)
         };
-        if record.is_some() {
-            self.persist_snapshot();
-        }
-
-        record.map(|record| {
-            if record.resumable {
-                format!(
-                    "session {} metadata exists but active process is unavailable; run exec_command again to create a new session",
-                    session_id
-                )
-            } else {
-                format!(
-                    "session {} was created before runtime restart and cannot be resumed; run exec_command again",
-                    session_id
-                )
-            }
-        })
-    }
-
-    fn persist_snapshot(&self) {
-        let snapshot = if let Ok(guard) = self.records.lock() {
-            guard.values().cloned().collect::<Vec<_>>()
-        } else {
-            return;
-        };
-
-        if let Some(parent) = self.path.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
-        let serialized = match serde_json::to_string_pretty(&snapshot) {
-            Ok(serialized) => serialized,
-            Err(_) => return,
-        };
-
-        let tmp_path = self.path.with_extension("tmp");
-        if fs::write(tmp_path.as_path(), serialized.as_bytes()).is_ok() {
-            let _ = fs::rename(tmp_path, self.path.as_path());
-        }
+        (
+            bytes[..length].to_vec(),
+            start_offset.saturating_add(length).min(current_end),
+            lost_output,
+        )
     }
 }
 
@@ -318,6 +216,7 @@ impl UnifiedExecHandler {
                 invocation.execution_security_snapshot.as_ref(),
                 &trace,
                 cancellation,
+                self.one_shot_limits,
             )
             .await?;
             return Ok(Box::new(result.into_tool_output()));
@@ -356,8 +255,6 @@ impl UnifiedExecHandler {
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
         let stdin = child.stdin.take();
-        let child_pid = child.id();
-
         let session_id = self
             .next_session_id
             .fetch_add(1, Ordering::Relaxed)
@@ -381,15 +278,13 @@ impl UnifiedExecHandler {
             command: command_preview.clone(),
             started_at: session_started_at,
             last_touched: Instant::now(),
+            _runtime_temp_dir: process_plan.runtime_temp_dir.clone(),
         }));
 
         self.sessions
             .lock()
             .await
             .insert(session_id, session.clone());
-        if let Some(persistence) = self.persistence.as_ref() {
-            persistence.insert_live(session_id, command_preview.as_slice(), child_pid);
-        }
 
         let session_cancelled = tokio::select! {
             _ = cancellation.cancelled() => true,
@@ -408,15 +303,28 @@ impl UnifiedExecHandler {
                 }
             }
             self.sessions.lock().await.remove(&session_id);
-            if let Some(persistence) = self.persistence.as_ref() {
-                persistence.remove(session_id);
-            }
             return Err(ToolError::cancelled("command cancelled"));
         }
 
         let initial = read_session_chunk(session.clone()).await?;
-        emit_shell_chunk_delta(&trace, &initial.stdout, "stdout");
-        emit_shell_chunk_delta(&trace, &initial.stderr, "stderr");
+        let output_commit = tokio::select! {
+            result = async {
+                emit_shell_chunk_delta(&trace, &initial.stdout, "stdout").await?;
+                emit_shell_chunk_delta(&trace, &initial.stderr, "stderr").await?;
+                match initial.read_error.as_ref() {
+                    Some(error) => Err(ToolError::execution_failed(error.clone())),
+                    None => Ok(()),
+                }
+            } => result,
+            _ = cancellation.cancelled() => Err(ToolError::cancelled("shell cancelled while saving output")),
+        };
+        if let Err(error) = output_commit {
+            let mut guard = session.lock().await;
+            let _ = terminate_child_process(&mut guard.child).await;
+            drop(guard);
+            self.sessions.lock().await.remove(&session_id);
+            return Err(error);
+        }
         let state = {
             let mut guard = session.lock().await;
             let status = guard.child.try_wait().map_err(|error| {
@@ -427,9 +335,6 @@ impl UnifiedExecHandler {
 
         if state.finished {
             self.sessions.lock().await.remove(&session_id);
-            if let Some(persistence) = self.persistence.as_ref() {
-                persistence.remove(session_id);
-            }
         }
 
         let payload = build_exec_model_payload(ExecPayloadInput {
@@ -466,20 +371,12 @@ impl UnifiedExecHandler {
             .get(&args.session_id)
             .cloned()
             .ok_or_else(|| {
-                if let Some(persistence) = self.persistence.as_ref()
-                    && let Some(message) = persistence.take_resume_error(args.session_id)
-                {
-                    return ToolError::NotFound(message);
-                }
                 ToolError::NotFound(format!("session {} was not found", args.session_id))
             })?;
 
         if let Some(chars) = args.chars.as_deref() {
             let mut guard = session.lock().await;
             guard.last_touched = Instant::now();
-            if let Some(persistence) = self.persistence.as_ref() {
-                persistence.touch(args.session_id);
-            }
             match guard.stdin.as_mut() {
                 Some(stdin) => {
                     stdin.write_all(chars.as_bytes()).await.map_err(|error| {
@@ -505,8 +402,24 @@ impl UnifiedExecHandler {
         }
 
         let chunk = read_session_chunk(session.clone()).await?;
-        emit_shell_chunk_delta(&trace, &chunk.stdout, "stdout");
-        emit_shell_chunk_delta(&trace, &chunk.stderr, "stderr");
+        let output_commit = tokio::select! {
+            result = async {
+                emit_shell_chunk_delta(&trace, &chunk.stdout, "stdout").await?;
+                emit_shell_chunk_delta(&trace, &chunk.stderr, "stderr").await?;
+                match chunk.read_error.as_ref() {
+                    Some(error) => Err(ToolError::execution_failed(error.clone())),
+                    None => Ok(()),
+                }
+            } => result,
+            _ = cancellation.cancelled() => Err(ToolError::cancelled("shell cancelled while saving output")),
+        };
+        if let Err(error) = output_commit {
+            let mut guard = session.lock().await;
+            let _ = terminate_child_process(&mut guard.child).await;
+            drop(guard);
+            self.sessions.lock().await.remove(&args.session_id);
+            return Err(error);
+        }
 
         let (state, command_preview, started_at) = {
             let mut guard = session.lock().await;
@@ -523,9 +436,6 @@ impl UnifiedExecHandler {
 
         if state.finished {
             self.sessions.lock().await.remove(&args.session_id);
-            if let Some(persistence) = self.persistence.as_ref() {
-                persistence.remove(args.session_id);
-            }
         }
 
         let payload = build_exec_model_payload(ExecPayloadInput {
@@ -581,9 +491,6 @@ impl UnifiedExecHandler {
             let mut sessions = self.sessions.lock().await;
             for session_id in to_remove {
                 sessions.remove(&session_id);
-                if let Some(persistence) = self.persistence.as_ref() {
-                    persistence.remove(session_id);
-                }
             }
         }
     }
@@ -648,6 +555,7 @@ struct SessionChunk {
     stderr: String,
     stdout_lost_output: bool,
     stderr_lost_output: bool,
+    read_error: Option<String>,
 }
 
 #[derive(Debug)]
@@ -682,6 +590,7 @@ async fn run_one_shot(
     execution_security_snapshot: Option<&pioneer_protocol::TurnExecutionSecuritySnapshot>,
     trace: &crate::events::ToolEventTrace,
     cancellation: tokio_util::sync::CancellationToken,
+    configured_limits: OneShotOutputLimits,
 ) -> Result<OneShotCommandResult, ToolError> {
     let started_at = Instant::now();
     let process_plan = build_process_spawn_plan(
@@ -701,6 +610,7 @@ async fn run_one_shot(
     let mut child = command.spawn().map_err(|error| {
         ToolError::execution_failed(format!("failed to spawn command: {error}"))
     })?;
+    let process_id = child.id();
 
     let stdout_reader = child.stdout.take().ok_or_else(|| {
         ToolError::internal("stdout pipe was unexpectedly unavailable".to_owned())
@@ -709,59 +619,133 @@ async fn run_one_shot(
         ToolError::internal("stderr pipe was unexpectedly unavailable".to_owned())
     })?;
 
-    let (chunk_tx, mut chunk_rx) = mpsc::unbounded_channel::<ShellChunkEvent>();
+    let (stream_limit, total_limit) =
+        one_shot_output_limits(args.max_output_tokens, configured_limits);
+    let output_budget = Arc::new(OneShotOutputBudget::new(stream_limit, total_limit));
+    let reader_shutdown = tokio_util::sync::CancellationToken::new();
+    let (chunk_tx, mut chunk_rx) =
+        mpsc::channel::<ShellChunkEvent>(ONE_SHOT_CHUNK_CHANNEL_CAPACITY);
     let stdout_task = tokio::spawn(read_stream_with_chunks(
         stdout_reader,
         "stdout",
         chunk_tx.clone(),
+        output_budget.clone(),
+        reader_shutdown.child_token(),
     ));
-    let stderr_task = tokio::spawn(read_stream_with_chunks(stderr_reader, "stderr", chunk_tx));
+    let stderr_task = tokio::spawn(read_stream_with_chunks(
+        stderr_reader,
+        "stderr",
+        chunk_tx,
+        output_budget,
+        reader_shutdown.child_token(),
+    ));
 
     let mut stdout_buf = String::new();
     let mut stderr_buf = String::new();
+    let mut stdout_pending = Vec::new();
+    let mut stderr_pending = Vec::new();
     let wait_deadline = tokio::time::sleep(Duration::from_millis(timeout_ms));
     tokio::pin!(wait_deadline);
 
     let mut status_opt: Option<ExitStatus> = None;
     let mut timed_out = false;
     let mut cancelled = false;
+    let mut limit_termination_started = false;
+    let mut stdout_truncated = false;
+    let mut stderr_truncated = false;
+    let mut pipe_drain_deadline: Option<TokioInstant> = None;
 
     loop {
-        if status_opt.is_some() && stdout_task.is_finished() && stderr_task.is_finished() {
+        if status_opt.is_some()
+            && stdout_task.is_finished()
+            && stderr_task.is_finished()
+            && chunk_rx.is_empty()
+        {
             break;
         }
 
+        let active_pipe_drain_deadline = pipe_drain_deadline;
         tokio::select! {
-            _ = cancellation.cancelled(), if status_opt.is_none() => {
+            _ = cancellation.cancelled() => {
                 cancelled = true;
-                status_opt = Some(terminate_child_process(&mut child).await?);
+                if status_opt.is_none() {
+                    status_opt = Some(terminate_child_process(&mut child).await?);
+                } else {
+                    kill_process_tree(process_id, true);
+                }
+                reader_shutdown.cancel();
+                stdout_task.abort();
+                stderr_task.abort();
+                break;
             }
             _ = &mut wait_deadline, if status_opt.is_none() => {
                 timed_out = true;
                 status_opt = Some(terminate_child_process(&mut child).await?);
+                pipe_drain_deadline.get_or_insert_with(|| {
+                    TokioInstant::now() + Duration::from_millis(ONE_SHOT_PIPE_DRAIN_GRACE_MS)
+                });
             }
             wait_result = child.wait(), if status_opt.is_none() => {
                 let status = wait_result.map_err(|error| {
                     ToolError::execution_failed(format!("failed to wait for command: {error}"))
                 })?;
                 status_opt = Some(status);
+                // A one-shot invocation owns its whole process group. Do not
+                // let a detached descendant retain stdout/stderr indefinitely
+                // after the direct child exits.
+                kill_process_tree(process_id, true);
+                pipe_drain_deadline.get_or_insert_with(|| {
+                    TokioInstant::now() + Duration::from_millis(ONE_SHOT_PIPE_DRAIN_GRACE_MS)
+                });
             }
             chunk = chunk_rx.recv() => {
                 match chunk {
                     Some(ShellChunkEvent::Data { stream, text }) => {
+                        let pending = if stream == "stdout" { &mut stdout_pending } else { &mut stderr_pending };
+                        let text = decode_shell_bytes(pending, &text, false);
+                        if text.is_empty() { continue; }
                         if stream == "stdout" {
                             stdout_buf.push_str(text.as_str());
                         } else {
                             stderr_buf.push_str(text.as_str());
                         }
-                        trace.emit_output_chunk_delta(
-                            1,
-                            shell_delta_stream(stream),
-                            text,
-                            false,
-                        );
+                        let commit = tokio::select! {
+                            result = trace.emit_output_chunk_delta(1, shell_delta_stream(stream), text, false) => result,
+                            _ = cancellation.cancelled() => Err(ToolError::cancelled("command cancelled while saving output")),
+                            _ = &mut wait_deadline, if status_opt.is_none() => Err(ToolError::execution_failed("command timed out while saving output")),
+                        };
+                        if let Err(error) = commit {
+                            // Do not leave descendants or blocked reader tasks alive
+                            // when the consumer rejects output or cancellation wins.
+                            kill_process_tree(process_id, true);
+                            let _ = child.kill().await;
+                            reader_shutdown.cancel();
+                            stdout_task.abort(); stderr_task.abort();
+                            return Err(error);
+                        }
                     }
-                    Some(ShellChunkEvent::Closed) => {}
+                    Some(ShellChunkEvent::LimitExceeded { stream }) => {
+                        if stream == "stdout" {
+                            stdout_truncated = true;
+                        } else {
+                            stderr_truncated = true;
+                        }
+                        if status_opt.is_none() && !limit_termination_started {
+                            limit_termination_started = true;
+                            status_opt = Some(terminate_child_process(&mut child).await?);
+                            pipe_drain_deadline.get_or_insert_with(|| {
+                                TokioInstant::now()
+                                    + Duration::from_millis(ONE_SHOT_PIPE_DRAIN_GRACE_MS)
+                            });
+                        }
+                    }
+                    Some(ShellChunkEvent::Closed { stream }) => {
+                        let pending = if stream == "stdout" { &mut stdout_pending } else { &mut stderr_pending };
+                        let text = decode_shell_bytes(pending, &[], true);
+                        if stream == "stdout" { stdout_buf.push_str(&text); } else { stderr_buf.push_str(&text); }
+                        // Only an incomplete final byte sequence can remain here;
+                        // the terminal result retains its replacement character.
+                    }
                     None => {
                         if status_opt.is_some() && stdout_task.is_finished() && stderr_task.is_finished() {
                             break;
@@ -769,44 +753,78 @@ async fn run_one_shot(
                     }
                 }
             }
+            _ = async {
+                if let Some(deadline) = active_pipe_drain_deadline {
+                    sleep_until(deadline).await;
+                } else {
+                    pending::<()>().await;
+                }
+            } => {
+                // A descendant may retain inherited pipes even after the
+                // direct child and its nominal process group are gone. EOF is
+                // controlled by that untrusted descendant, so it cannot be
+                // the terminal condition for a one-shot invocation.
+                reader_shutdown.cancel();
+                // Keep consuming the bounded channel until both readers have
+                // observed cancellation. This preserves every chunk that was
+                // already admitted before the fence fired.
+                pipe_drain_deadline = None;
+            }
         }
     }
-
-    let stdout_full = stdout_task
-        .await
-        .map_err(|error| ToolError::internal(format!("stdout task failed: {error}")))?
-        .map_err(|error| ToolError::execution_failed(format!("failed to read stdout: {error}")))?;
-    let stderr_full = stderr_task
-        .await
-        .map_err(|error| ToolError::internal(format!("stderr task failed: {error}")))?
-        .map_err(|error| ToolError::execution_failed(format!("failed to read stderr: {error}")))?;
-
-    // Channel-delivered chunks are used for live deltas and may race with process exit.
-    // Final persisted output must use the full reader results so terminal payload never drops
-    // trailing stdout/stderr bytes on fast commands.
-    stdout_buf = stdout_full;
-    stderr_buf = stderr_full;
-
-    let status = status_opt.ok_or_else(|| {
-        ToolError::execution_failed("command finished without exit status".to_owned())
-    })?;
 
     if cancelled {
         return Err(ToolError::cancelled("command cancelled"));
     }
 
-    let payload = build_exec_model_payload(ExecPayloadInput {
-        exit_code: status.code(),
-        timed_out,
-        duration_ms: started_at.elapsed().as_millis() as u64,
-        stdout: stdout_buf,
-        stderr: stderr_buf,
-        session_id: None,
-        command: command_preview,
-        max_output_tokens: args.max_output_tokens,
-        force_truncated_stdout: false,
-        force_truncated_stderr: false,
-    });
+    let stdout_summary = stdout_task
+        .await
+        .map_err(|error| ToolError::internal(format!("stdout task failed: {error}")))?
+        .map_err(|error| ToolError::execution_failed(format!("failed to read stdout: {error}")))?;
+    let stderr_summary = stderr_task
+        .await
+        .map_err(|error| ToolError::internal(format!("stderr task failed: {error}")))?
+        .map_err(|error| ToolError::execution_failed(format!("failed to read stderr: {error}")))?;
+    stdout_truncated |= stdout_summary.truncated;
+    stderr_truncated |= stderr_summary.truncated;
+
+    let status = status_opt.ok_or_else(|| {
+        ToolError::execution_failed("command finished without exit status".to_owned())
+    })?;
+
+    let output_stats = ExecOutputStats {
+        stdout: ExecStreamOutputStats {
+            bytes_seen: stdout_summary.bytes_seen,
+            bytes_retained: stdout_summary.bytes_retained,
+            bytes_dropped: stdout_summary
+                .bytes_seen
+                .saturating_sub(stdout_summary.bytes_retained),
+        },
+        stderr: ExecStreamOutputStats {
+            bytes_seen: stderr_summary.bytes_seen,
+            bytes_retained: stderr_summary.bytes_retained,
+            bytes_dropped: stderr_summary
+                .bytes_seen
+                .saturating_sub(stderr_summary.bytes_retained),
+        },
+        truncation_method: "bounded_head_then_drain".to_owned(),
+        full_output_available: false,
+    };
+    let payload = build_exec_model_payload_with_stats(
+        ExecPayloadInput {
+            exit_code: status.code(),
+            timed_out,
+            duration_ms: started_at.elapsed().as_millis() as u64,
+            stdout: stdout_buf,
+            stderr: stderr_buf,
+            session_id: None,
+            command: command_preview,
+            max_output_tokens: args.max_output_tokens,
+            force_truncated_stdout: stdout_truncated,
+            force_truncated_stderr: stderr_truncated,
+        },
+        Some(output_stats),
+    );
 
     let success = status.success() && !timed_out;
     let ui_text = render_exec_ui_text(&payload);
@@ -819,31 +837,121 @@ async fn run_one_shot(
 }
 
 enum ShellChunkEvent {
-    Data { stream: &'static str, text: String },
-    Closed,
+    Data { stream: &'static str, text: Vec<u8> },
+    LimitExceeded { stream: &'static str },
+    Closed { stream: &'static str },
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct StreamReadSummary {
+    bytes_seen: usize,
+    bytes_retained: usize,
+    truncated: bool,
+}
+
+struct OneShotOutputBudget {
+    stream_limit: usize,
+    total_limit: usize,
+    total_seen: AtomicU64,
+}
+
+impl OneShotOutputBudget {
+    fn new(stream_limit: usize, total_limit: usize) -> Self {
+        Self {
+            stream_limit,
+            total_limit,
+            total_seen: AtomicU64::new(0),
+        }
+    }
+
+    fn claim(&self, stream_seen: usize, requested: usize) -> (usize, bool) {
+        let total_before = self
+            .total_seen
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                Some(used.saturating_add(requested as u64))
+            })
+            .unwrap_or(u64::MAX) as usize;
+        let stream_remaining = self.stream_limit.saturating_sub(stream_seen);
+        let total_remaining = self.total_limit.saturating_sub(total_before);
+        let retained = requested.min(stream_remaining).min(total_remaining);
+        (retained, retained < requested)
+    }
+}
+
+fn one_shot_output_limits(
+    max_output_tokens: Option<usize>,
+    configured: OneShotOutputLimits,
+) -> (usize, usize) {
+    let token_limit = max_output_tokens
+        .map(|tokens| tokens.saturating_mul(4))
+        .unwrap_or(usize::MAX);
+    let total_limit = configured.total_bytes.min(token_limit);
+    (configured.stream_bytes.min(total_limit), total_limit)
 }
 
 async fn read_stream_with_chunks<R>(
     mut reader: R,
     stream: &'static str,
-    tx: mpsc::UnboundedSender<ShellChunkEvent>,
-) -> std::io::Result<String>
+    tx: mpsc::Sender<ShellChunkEvent>,
+    budget: Arc<OneShotOutputBudget>,
+    shutdown: tokio_util::sync::CancellationToken,
+) -> std::io::Result<StreamReadSummary>
 where
     R: AsyncRead + Unpin,
 {
-    let mut out = String::new();
+    let mut summary = StreamReadSummary::default();
     let mut chunk = [0u8; 4096];
     loop {
-        let read = reader.read(&mut chunk).await?;
+        let read = tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => {
+                summary.truncated = true;
+                break;
+            },
+            read = reader.read(&mut chunk) => read?,
+        };
         if read == 0 {
-            let _ = tx.send(ShellChunkEvent::Closed);
+            let _ = send_shell_chunk(&tx, ShellChunkEvent::Closed { stream }, &shutdown).await;
             break;
         }
-        let text = String::from_utf8_lossy(&chunk[..read]).to_string();
-        out.push_str(text.as_str());
-        let _ = tx.send(ShellChunkEvent::Data { stream, text });
+        summary.bytes_seen = summary.bytes_seen.saturating_add(read);
+        let (retained, exceeded) = budget.claim(summary.bytes_seen.saturating_sub(read), read);
+        if retained > 0 {
+            if !send_shell_chunk(
+                &tx,
+                ShellChunkEvent::Data {
+                    stream,
+                    text: chunk[..retained].to_vec(),
+                },
+                &shutdown,
+            )
+            .await
+            {
+                summary.truncated = true;
+                break;
+            }
+            summary.bytes_retained = summary.bytes_retained.saturating_add(retained);
+        }
+        if exceeded && !summary.truncated {
+            summary.truncated = true;
+            if !send_shell_chunk(&tx, ShellChunkEvent::LimitExceeded { stream }, &shutdown).await {
+                break;
+            }
+        }
     }
-    Ok(out)
+    Ok(summary)
+}
+
+async fn send_shell_chunk(
+    tx: &mpsc::Sender<ShellChunkEvent>,
+    event: ShellChunkEvent,
+    shutdown: &tokio_util::sync::CancellationToken,
+) -> bool {
+    tokio::select! {
+        biased;
+        _ = shutdown.cancelled() => false,
+        result = tx.send(event) => result.is_ok(),
+    }
 }
 
 fn apply_shell_sandbox_backend(
@@ -870,7 +978,9 @@ fn apply_shell_sandbox_backend(
                 execution_label: "shell",
             };
             match prepare_native_sandbox_backend(&backend, &request)? {
-                NativeSandboxPrepareOutcome::Ready(_) => configure_nono_command(command, snapshot),
+                NativeSandboxPrepareOutcome::Ready(_) => {
+                    configure_nono_command(command, snapshot, process_plan)
+                }
                 NativeSandboxPrepareOutcome::Degraded { reason, .. }
                 | NativeSandboxPrepareOutcome::Unavailable { reason, .. } => {
                     tracing::warn!(
@@ -1001,7 +1111,6 @@ fn configure_process_group(command: &mut Command) -> Result<(), ToolError> {
     }
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
         command.creation_flags(CREATE_NEW_PROCESS_GROUP);
     }
@@ -1011,6 +1120,7 @@ fn configure_process_group(command: &mut Command) -> Result<(), ToolError> {
 }
 
 async fn terminate_child_process(child: &mut Child) -> Result<ExitStatus, ToolError> {
+    let process_id = child.id();
     #[cfg(unix)]
     if let Some(pid) = child.id() {
         let pgid = -(pid as i32);
@@ -1023,27 +1133,20 @@ async fn terminate_child_process(child: &mut Child) -> Result<ExitStatus, ToolEr
         let _ = terminate_windows_process_tree(pid, false);
     }
 
-    let _ = child.start_kill();
-
     let waited =
         tokio::time::timeout(Duration::from_millis(PROCESS_KILL_GRACE_MS), child.wait()).await;
     match waited {
-        Ok(Ok(status)) => Ok(status),
+        Ok(Ok(status)) => {
+            // The parent can exit on SIGTERM while a descendant ignores it.
+            // Always fence the original process group before returning.
+            kill_process_tree(process_id, true);
+            Ok(status)
+        }
         Ok(Err(error)) => Err(ToolError::execution_failed(format!(
             "failed to wait for process termination: {error}"
         ))),
         Err(_) => {
-            #[cfg(unix)]
-            if let Some(pid) = child.id() {
-                let pgid = -(pid as i32);
-                unsafe {
-                    let _ = libc::kill(pgid, libc::SIGKILL);
-                }
-            }
-            #[cfg(windows)]
-            if let Some(pid) = child.id() {
-                let _ = terminate_windows_process_tree(pid, true);
-            }
+            kill_process_tree(process_id, true);
             let _ = child.start_kill();
             child.wait().await.map_err(|error| {
                 ToolError::execution_failed(format!(
@@ -1055,18 +1158,26 @@ async fn terminate_child_process(child: &mut Child) -> Result<ExitStatus, ToolEr
 }
 
 fn terminate_child_process_now(child: &mut Child) {
+    terminate_process_group_now(child);
+    let _ = child.start_kill();
+}
+
+fn terminate_process_group_now(child: &mut Child) {
+    kill_process_tree(child.id(), true);
+}
+
+fn kill_process_tree(process_id: Option<u32>, force: bool) {
     #[cfg(unix)]
-    if let Some(pid) = child.id() {
+    if let Some(pid) = process_id {
         let pgid = -(pid as i32);
         unsafe {
-            let _ = libc::kill(pgid, libc::SIGKILL);
+            let _ = libc::kill(pgid, if force { libc::SIGKILL } else { libc::SIGTERM });
         }
     }
     #[cfg(windows)]
-    if let Some(pid) = child.id() {
-        let _ = terminate_windows_process_tree(pid, true);
+    if let Some(pid) = process_id {
+        let _ = terminate_windows_process_tree(pid, force);
     }
-    let _ = child.start_kill();
 }
 
 #[cfg(windows)]
@@ -1101,6 +1212,36 @@ fn terminate_windows_process_tree(pid: u32, force: bool) -> Result<(), ToolError
     )))
 }
 
+// Pipe reads may end in the middle of a UTF-8 codepoint. Keep that suffix
+// for the next read; actual invalid bytes retain the usual lossy decoding.
+fn complete_utf8_prefix(bytes: &[u8]) -> usize {
+    let mut offset = 0;
+    while offset < bytes.len() {
+        match std::str::from_utf8(&bytes[offset..]) {
+            Ok(_) => return bytes.len(),
+            Err(error) => {
+                offset += error.valid_up_to();
+                match error.error_len() {
+                    Some(len) => offset += len,
+                    None => return offset,
+                }
+            }
+        }
+    }
+    offset
+}
+fn decode_shell_bytes(pending: &mut Vec<u8>, bytes: &[u8], eof: bool) -> String {
+    pending.extend_from_slice(bytes);
+    let length = if eof {
+        pending.len()
+    } else {
+        complete_utf8_prefix(pending)
+    };
+    let text = String::from_utf8_lossy(&pending[..length]).into_owned();
+    pending.drain(..length);
+    text
+}
+
 fn spawn_reader<R>(mut reader: R, target: Arc<Mutex<SessionBuffer>>)
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -1110,9 +1251,15 @@ where
         loop {
             let read = match reader.read(&mut chunk).await {
                 Ok(read) => read,
-                Err(_) => return,
+                Err(error) => {
+                    let mut buffer = target.lock().await;
+                    buffer.closed = true;
+                    buffer.read_error = Some(error.to_string());
+                    return;
+                }
             };
             if read == 0 {
+                target.lock().await.closed = true;
                 return;
             }
             target.lock().await.append(&chunk[..read]);
@@ -1120,11 +1267,17 @@ where
     });
 }
 
-fn emit_shell_chunk_delta(trace: &crate::events::ToolEventTrace, text: &str, stream: &str) {
+async fn emit_shell_chunk_delta(
+    trace: &crate::events::ToolEventTrace,
+    text: &str,
+    stream: &str,
+) -> Result<(), ToolError> {
     if text.is_empty() {
-        return;
+        return Ok(());
     }
-    trace.emit_output_chunk_delta(1, shell_delta_stream(stream), text.to_owned(), false);
+    trace
+        .emit_output_chunk_delta(1, shell_delta_stream(stream), text.to_owned(), false)
+        .await
 }
 
 fn shell_delta_stream(stream: &str) -> pioneer_protocol::ItemDeltaStream {
@@ -1142,6 +1295,7 @@ async fn read_session_chunk(session: Arc<Mutex<ExecSession>>) -> Result<SessionC
         stderr_cursor,
         stdout_lost_output,
         stderr_lost_output,
+        read_error,
     ) = {
         let guard = session.lock().await;
         let stdout = guard.stdout.lock().await;
@@ -1159,6 +1313,14 @@ async fn read_session_chunk(session: Arc<Mutex<ExecSession>>) -> Result<SessionC
             stderr_cursor,
             stdout_lost_output,
             stderr_lost_output,
+            match (&stdout.read_error, &stderr.read_error) {
+                (Some(out), Some(err)) => Some(format!(
+                    "failed to read stdout: {out}; failed to read stderr: {err}"
+                )),
+                (Some(error), None) => Some(format!("failed to read stdout: {error}")),
+                (None, Some(error)) => Some(format!("failed to read stderr: {error}")),
+                (None, None) => None,
+            },
         )
     };
 
@@ -1174,6 +1336,7 @@ async fn read_session_chunk(session: Arc<Mutex<ExecSession>>) -> Result<SessionC
         stderr: String::from_utf8_lossy(stderr_slice.as_slice()).to_string(),
         stdout_lost_output,
         stderr_lost_output,
+        read_error,
     })
 }
 
@@ -1204,6 +1367,7 @@ mod tests {
                 TurnPermissionMode::FullAccess,
                 workdir.as_path(),
             )),
+            apply_patch_preflight: None,
             cancellation: tokio_util::sync::CancellationToken::new(),
         }
     }
@@ -1256,6 +1420,119 @@ mod tests {
                 ],
                 1,
             ),
+        }
+    }
+
+    #[tokio::test]
+    async fn session_pipe_error_retains_partial_output_and_diagnostic() {
+        struct BrokenReader(bool);
+        impl tokio::io::AsyncRead for BrokenReader {
+            fn poll_read(
+                mut self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+                buf: &mut tokio::io::ReadBuf<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                if !self.0 {
+                    self.0 = true;
+                    buf.put_slice(b"partial output");
+                    std::task::Poll::Ready(Ok(()))
+                } else {
+                    std::task::Poll::Ready(Err(std::io::Error::other("broken output pipe")))
+                }
+            }
+        }
+        let buffer = Arc::new(Mutex::new(SessionBuffer::default()));
+        spawn_reader(BrokenReader(false), buffer.clone());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if buffer.lock().await.closed {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let buffer = buffer.lock().await;
+        assert_eq!(buffer.read_from(0).0, b"partial output");
+        assert_eq!(buffer.read_error.as_deref(), Some("broken output pipe"));
+    }
+
+    #[test]
+    fn shell_output_preserves_utf8_across_pipe_and_session_reads() {
+        let original = "ошибка 🦀\n";
+        let mut pending = Vec::new();
+        let mut decoded = String::new();
+        for byte in original.as_bytes() {
+            decoded.push_str(&decode_shell_bytes(&mut pending, &[*byte], false));
+        }
+        decoded.push_str(&decode_shell_bytes(&mut pending, &[], true));
+        assert_eq!(decoded, original);
+        let mut buffer = SessionBuffer::default();
+        let mut cursor = 0;
+        let mut decoded = String::new();
+        for byte in original.as_bytes() {
+            buffer.append(&[*byte]);
+            let (chunk, next, lost) = buffer.read_from(cursor);
+            assert!(!lost);
+            cursor = next;
+            decoded.push_str(std::str::from_utf8(&chunk).unwrap());
+        }
+        assert_eq!(decoded, original);
+    }
+
+    #[tokio::test]
+    async fn command_output_commit_is_cancellable_and_rejection_stops_process() {
+        for reject in [false, true] {
+            let handler = UnifiedExecHandler::default();
+            let cancellation = tokio_util::sync::CancellationToken::new();
+            let mut invocation = invocation(
+                "exec_command",
+                ToolPayload::LocalShell(LocalShellPayload::ExecCommand(ExecCommandArgs {
+                    command: Some(vec![
+                        "sh".into(),
+                        "-c".into(),
+                        "printf before; sleep 30".into(),
+                    ]),
+                    workdir: None,
+                    timeout_ms: None,
+                    max_output_tokens: None,
+                    yield_time_ms: None,
+                    tty: Some(false),
+                })),
+            );
+            invocation.cancellation = cancellation.clone();
+            let bus = ToolEventBus::new(8);
+            let mut durable = bus.take_durable_receiver().unwrap();
+            let trace = bus.start_trace("turn", "call", "exec_command");
+            let task = tokio::spawn(async move { handler.handle(invocation, trace).await });
+            let chunk = tokio::time::timeout(Duration::from_secs(5), durable.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(matches!(
+                &chunk.event.payload,
+                crate::events::ToolEventPayload::OutputDelta(_)
+            ));
+            assert!(!task.is_finished());
+            if reject {
+                chunk.acknowledge(Err("disk unavailable".into()));
+            } else {
+                cancellation.cancel();
+            }
+            let result = tokio::time::timeout(Duration::from_secs(3), task)
+                .await
+                .expect("output wait must not block cancellation")
+                .unwrap();
+            let error = match result {
+                Err(error) => error,
+                Ok(_) => panic!("must fail"),
+            };
+            if reject {
+                assert!(error.to_string().contains("disk unavailable"));
+            } else {
+                assert!(matches!(error, ToolError::Cancelled(_)));
+            }
         }
     }
 
@@ -1490,6 +1767,92 @@ mod tests {
         }
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn restricted_tty_keeps_spawn_sandbox_across_write_stdin() {
+        if !nono::Sandbox::is_supported() {
+            return;
+        }
+
+        let current = std::env::current_dir().expect("test cwd");
+        let fixture = tempfile::tempdir_in(current).expect("tty sandbox fixture");
+        let workspace = fixture.path().join("workspace");
+        let outside = fixture.path().join("outside");
+        std::fs::create_dir_all(workspace.as_path()).expect("workspace");
+        std::fs::create_dir_all(outside.as_path()).expect("outside");
+        let outside_secret = outside.join("secret.txt");
+        std::fs::write(outside_secret.as_path(), "OUTSIDE_SECRET\n").expect("outside fixture");
+
+        let handler = UnifiedExecHandler::default();
+        let mut exec_invocation = invocation(
+            "exec_command",
+            ToolPayload::LocalShell(LocalShellPayload::ExecCommand(ExecCommandArgs {
+                command: Some(vec![
+                    "sh".to_owned(),
+                    "-c".to_owned(),
+                    "read target; if cat \"$target\" 2>/dev/null; then echo LEAKED; else echo DENIED; fi; printf WORKSPACE_OK > allowed.txt; cat allowed.txt".to_owned(),
+                ]),
+                workdir: None,
+                timeout_ms: None,
+                max_output_tokens: None,
+                yield_time_ms: Some(50),
+                tty: Some(true),
+            })),
+        );
+        exec_invocation.workdir = workspace.clone();
+        exec_invocation.execution_security_snapshot = Some(shell_security_snapshot(
+            TurnPermissionMode::AutoAcceptEdits,
+            workspace.as_path(),
+        ));
+
+        let exec_output = handler
+            .handle(exec_invocation, trace("exec_command"))
+            .await
+            .expect("restricted tty should start");
+        let session_id = parse_session_id(exec_output.raw_text().as_str());
+
+        let mut write_invocation = invocation(
+            "write_stdin",
+            ToolPayload::LocalShell(LocalShellPayload::WriteStdin(WriteStdinArgs {
+                session_id,
+                chars: Some(format!("{}\n", outside_secret.display())),
+                yield_time_ms: Some(250),
+                max_output_tokens: None,
+            })),
+        );
+        write_invocation.workdir = workspace.clone();
+        write_invocation.execution_security_snapshot = Some(shell_security_snapshot(
+            TurnPermissionMode::AutoAcceptEdits,
+            workspace.as_path(),
+        ));
+
+        let output = handler
+            .handle(write_invocation, trace("write_stdin"))
+            .await
+            .expect("write_stdin should interact with the live restricted process");
+        let text = output.raw_text();
+        let stdout = output
+            .raw_json()
+            .get("stdout")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        assert!(text.contains("DENIED"), "outside read must fail: {text}");
+        assert!(
+            text.contains("WORKSPACE_OK"),
+            "workspace write/read should remain available: {text}"
+        );
+        assert!(
+            !stdout.contains("OUTSIDE_SECRET") && !stdout.contains("LEAKED"),
+            "stdin must not widen the spawn sandbox: {stdout}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("allowed.txt"))
+                .expect("workspace output should exist"),
+            "WORKSPACE_OK"
+        );
+    }
+
     #[tokio::test]
     async fn exec_command_marks_non_zero_exit_as_failed() {
         let handler = UnifiedExecHandler::default();
@@ -1613,6 +1976,121 @@ mod tests {
             json.get("timed_out").and_then(serde_json::Value::as_bool),
             Some(true),
             "payload should include timed_out=true: {json}"
+        );
+    }
+
+    #[tokio::test]
+    async fn one_shot_output_is_bounded_before_reader_completion() {
+        let handler = UnifiedExecHandler::default();
+        let output = handler
+            .handle(
+                invocation(
+                    "exec_command",
+                    ToolPayload::LocalShell(LocalShellPayload::ExecCommand(ExecCommandArgs {
+                        command: Some(vec![
+                            "sh".to_owned(),
+                            "-c".to_owned(),
+                            "head -c 2000000 /dev/zero".to_owned(),
+                        ]),
+                        workdir: None,
+                        timeout_ms: Some(5_000),
+                        max_output_tokens: None,
+                        yield_time_ms: None,
+                        tty: Some(false),
+                    })),
+                ),
+                trace("exec_command"),
+            )
+            .await
+            .expect("bounded output should return a structured result");
+
+        let payload = output.raw_json();
+        let stdout = payload
+            .get("stdout")
+            .and_then(serde_json::Value::as_str)
+            .expect("stdout should be present");
+        assert!(stdout.len() <= ONE_SHOT_MAX_STREAM_BYTES);
+        assert_eq!(
+            payload
+                .pointer("/truncated/stdout")
+                .and_then(serde_json::Value::as_bool),
+            Some(true),
+            "oversized one-shot stdout must carry truncation metadata: {payload}"
+        );
+        assert_eq!(
+            payload
+                .pointer("/output_stats/stdout/bytes_retained")
+                .and_then(serde_json::Value::as_u64),
+            Some(ONE_SHOT_MAX_STREAM_BYTES as u64),
+            "the retained head must stay at the per-stream hard limit: {payload}"
+        );
+        assert!(
+            payload
+                .pointer("/output_stats/stdout/bytes_dropped")
+                .and_then(serde_json::Value::as_u64)
+                .is_some_and(|dropped| dropped > 0)
+        );
+        assert_eq!(
+            payload.pointer("/output_stats/full_output_available"),
+            Some(&serde_json::Value::Bool(false))
+        );
+    }
+
+    #[test]
+    fn model_output_hint_can_only_narrow_deployment_limits() {
+        let configured = OneShotOutputLimits {
+            stream_bytes: 2_000,
+            total_bytes: 3_000,
+        };
+        assert_eq!(one_shot_output_limits(None, configured), (2_000, 3_000));
+        assert_eq!(one_shot_output_limits(Some(100), configured), (400, 400));
+        assert_eq!(
+            one_shot_output_limits(Some(100_000), configured),
+            (2_000, 3_000)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn one_shot_reaps_descendant_that_keeps_pipes_open_after_parent_exit() {
+        let handler = UnifiedExecHandler::default();
+        let run = handler.handle(
+            invocation(
+                "exec_command",
+                ToolPayload::LocalShell(LocalShellPayload::ExecCommand(ExecCommandArgs {
+                    command: Some(vec![
+                        "sh".to_owned(),
+                        "-c".to_owned(),
+                        "printf 'parent-finished\\n'; (trap '' TERM; sleep 120) & exit 0"
+                            .to_owned(),
+                    ]),
+                    workdir: None,
+                    // Keep the command's own timeout well outside the outer
+                    // assertion window. The test must prove cleanup after the
+                    // direct child exits, not race that cleanup against the
+                    // ordinary command-timeout path under suite load.
+                    timeout_ms: Some(60_000),
+                    max_output_tokens: None,
+                    yield_time_ms: None,
+                    tty: Some(false),
+                })),
+            ),
+            trace("exec_command"),
+        );
+        // A leaked descendant would retain both pipes for 120 seconds. Keep
+        // the assertion far below that lifetime while allowing heavily
+        // parallel CI suites enough scheduling headroom.
+        let output = tokio::time::timeout(Duration::from_secs(20), run)
+            .await
+            .expect("descendant pipe ownership must have a bounded terminal path")
+            .expect("process tree cleanup should produce a result");
+        assert_eq!(
+            output
+                .raw_json()
+                .get("stdout")
+                .and_then(serde_json::Value::as_str),
+            Some("parent-finished\n"),
+            "output admitted before the terminal pipe fence must be preserved"
         );
     }
 
@@ -1812,29 +2290,5 @@ mod tests {
                 "set -o pipefail; echo ok | cat".to_owned(),
             ]
         );
-    }
-
-    #[test]
-    fn persisted_sessions_become_unresumable_after_reload() {
-        let path = std::env::temp_dir().join(format!(
-            "pioneer-shell-persist-test-{}-{}.json",
-            std::process::id(),
-            Utc::now().timestamp_nanos_opt().unwrap_or_default()
-        ));
-
-        let persistence = SessionPersistence::new_for_path(path.clone());
-        persistence.insert_live(
-            42,
-            &["sh".to_owned(), "-c".to_owned(), "echo hi".to_owned()],
-            Some(1234),
-        );
-
-        let reloaded = SessionPersistence::new_for_path(path.clone());
-        let message = reloaded
-            .take_resume_error(42)
-            .expect("expected persisted session message");
-        assert!(message.contains("cannot be resumed"));
-
-        let _ = std::fs::remove_file(path);
     }
 }

@@ -2,16 +2,21 @@ use pioneer_crud::list_active_workspaces_for_principal;
 use pioneer_entity::workspace;
 use pioneer_protocol::Workspace;
 use pioneer_sqlite::{
-    DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, SqliteWriteCoordinator,
+    DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, SqliteDatabase,
     is_sqlite_lock_message, retry_with_backoff,
 };
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter,
-    QueryOrder, Set, TransactionTrait,
+    ActiveModelTrait, ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, Set,
+    TransactionTrait,
 };
 use sea_orm::{ConnectionTrait, prelude::Expr};
 use std::future::Future;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 use std::time::Duration;
+use tokio::sync::Notify;
 
 use crate::authorization::{AuthorizedWorkspace, AuthorizedWorkspaceCollection, ResourceAction};
 
@@ -47,16 +52,59 @@ impl std::error::Error for WorkspaceError {}
 
 #[derive(Clone)]
 pub struct WorkspaceManager {
-    connection: DatabaseConnection,
-    write_coordinator: SqliteWriteCoordinator,
+    connection: SqliteDatabase,
+    changes: Arc<WorkspaceChanges>,
+}
+
+#[derive(Default)]
+pub(crate) struct WorkspaceChanges {
+    revision: AtomicU64,
+    pub(crate) wake: Notify,
+}
+
+impl WorkspaceChanges {
+    pub(crate) fn revision(&self) -> u64 {
+        self.revision.load(Ordering::Acquire)
+    }
+    fn committed(&self) {
+        self.revision
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                value.checked_add(1)
+            })
+            .expect("Workspace revision exhausted");
+        self.wake.notify_one();
+    }
 }
 
 impl WorkspaceManager {
-    pub fn new(connection: DatabaseConnection) -> Self {
+    pub fn new(connection: impl Into<SqliteDatabase>) -> Self {
+        Self {
+            connection: connection.into(),
+            changes: Arc::default(),
+        }
+    }
+
+    pub(crate) fn with_database(&self, connection: SqliteDatabase) -> Self {
         Self {
             connection,
-            write_coordinator: SqliteWriteCoordinator::default(),
+            changes: self.changes.clone(),
         }
+    }
+
+    pub(crate) fn changes(&self) -> Arc<WorkspaceChanges> {
+        self.changes.clone()
+    }
+
+    pub(crate) async fn active_page(
+        &self,
+        after: Option<&str>,
+    ) -> Result<Vec<workspace::Model>, WorkspaceError> {
+        pioneer_crud::CrudStore::new(self.connection.clone())
+            .list_active_workspace_page(after)
+            .await
+            .map_err(|error| {
+                WorkspaceError::Internal(format!("failed to page active workspaces: {error}"))
+            })
     }
 
     pub async fn validate_workspace_id(
@@ -117,7 +165,7 @@ impl WorkspaceManager {
         requested_name: Option<&str>,
     ) -> Result<Workspace, WorkspaceError> {
         let workspace = self
-            .run_serialized_write(|| async {
+            .run_with_retry(|| async {
                 let requested_workspace_id = normalize_workspace_id(requested_workspace_id)?;
                 let explicit_name = normalize_workspace_name(requested_name)?;
 
@@ -175,6 +223,7 @@ impl WorkspaceManager {
                     WorkspaceError::Internal(format!("failed to create workspace: {error}"))
                 })?;
 
+                self.changes.committed();
                 Ok(model_to_workspace(model))
             })
             .await?;
@@ -195,7 +244,7 @@ impl WorkspaceManager {
 
     pub async fn ensure_default_workspace(&self) -> Result<Workspace, WorkspaceError> {
         let workspace = self
-            .run_serialized_write(|| async {
+            .run_with_retry(|| async {
                 let existing_workspaces = self.list_workspaces().await?;
                 if let Some(workspace) = select_default_workspace(existing_workspaces.as_slice()) {
                     return Ok(workspace);
@@ -212,7 +261,10 @@ impl WorkspaceManager {
                 .await;
 
                 match inserted {
-                    Ok(model) => Ok(model_to_workspace(model)),
+                    Ok(model) => {
+                        self.changes.committed();
+                        Ok(model_to_workspace(model))
+                    }
                     Err(insert_error) => {
                         let existing = workspace::Entity::find_by_id(
                             DEFAULT_WORKSPACE_ID.to_owned(),
@@ -246,6 +298,7 @@ impl WorkspaceManager {
                             ))
                         })?;
 
+                        self.changes.committed();
                         Ok(model_to_workspace(updated))
                     }
                 }
@@ -311,7 +364,7 @@ impl WorkspaceManager {
                 .await;
         }
 
-        self.run_serialized_write(|| async {
+        self.run_with_retry(|| async {
             let workspace_id = normalize_workspace_id(requested_workspace_id)?;
             let transaction = self.connection.begin().await.map_err(|error| {
                 WorkspaceError::Internal(format!(
@@ -360,6 +413,7 @@ impl WorkspaceManager {
                 ))
             })?;
 
+            self.changes.committed();
             Ok(model_to_workspace(updated))
         })
         .await
@@ -385,7 +439,7 @@ impl WorkspaceManager {
         requested_workspace_id: &str,
         requested_name: Option<&str>,
     ) -> Result<Workspace, WorkspaceError> {
-        self.run_serialized_write(|| async {
+        self.run_with_retry(|| async {
             let workspace_id = normalize_workspace_id(requested_workspace_id)?;
             let name = normalize_workspace_name(requested_name)?;
 
@@ -408,6 +462,7 @@ impl WorkspaceManager {
                 ))
             })?;
 
+            self.changes.committed();
             Ok(model_to_workspace(updated))
         })
         .await
@@ -425,16 +480,6 @@ impl WorkspaceManager {
             Duration::from_millis(DEFAULT_LOCK_RETRY_BASE_DELAY_MS),
         )
         .await
-    }
-
-    async fn run_serialized_write<T, F, Fut>(&self, operation: F) -> Result<T, WorkspaceError>
-    where
-        F: FnMut() -> Fut,
-        Fut: Future<Output = Result<T, WorkspaceError>>,
-    {
-        self.write_coordinator
-            .run_serialized_with_retry(operation, is_workspace_sqlite_lock_error)
-            .await
     }
 }
 
@@ -858,6 +903,27 @@ mod tests {
             .await
             .expect("workspace list should succeed");
         assert_eq!(rows.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn manager_preserves_the_typed_database_scope() {
+        let connection = Database::connect("sqlite::memory:")
+            .await
+            .expect("must connect to sqlite memory");
+        let database = pioneer_sqlite::SqliteDatabase::from_single_connection(connection)
+            .maintenance()
+            .with_critical_writes();
+
+        let manager = WorkspaceManager::new(database);
+
+        assert_eq!(
+            manager.connection.read_class(),
+            pioneer_sqlite::SqliteReadClass::Maintenance
+        );
+        assert_eq!(
+            manager.connection.write_class(),
+            pioneer_sqlite::SqliteWriteClass::Critical
+        );
     }
 
     async fn setup_workspace_manager() -> WorkspaceManager {

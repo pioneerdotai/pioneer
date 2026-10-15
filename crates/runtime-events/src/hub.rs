@@ -3,6 +3,7 @@ use std::fmt::{Display, Formatter};
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use pioneer_protocol::{AgentDurableEvent, AgentProgressEvent, TurnItemType};
 use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
@@ -15,7 +16,71 @@ use crate::{DEFAULT_DURABLE_EVENT_CHANNEL_CAPACITY, DEFAULT_LIVE_EVENT_CHANNEL_C
 pub enum ExecutionEventHubError {
     DurableLaneClosed,
     CommitAcknowledgementDropped,
-    CommitRejected(String),
+    CommitRejected(DurableCommitRejection),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DurableCommitRejectionKind {
+    Retryable,
+    Permanent,
+    SupersededByDurableInterruption,
+}
+
+/// A safe, low-cardinality reason why a durable projection was rejected.
+///
+/// The gateway keeps raw storage and authorization errors in its local logs;
+/// publishers only need the retry decision and a stable diagnostic code.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DurableCommitRejection {
+    kind: DurableCommitRejectionKind,
+    code: &'static str,
+    message: &'static str,
+}
+
+impl DurableCommitRejection {
+    pub const fn retryable(code: &'static str, message: &'static str) -> Self {
+        Self {
+            kind: DurableCommitRejectionKind::Retryable,
+            code,
+            message,
+        }
+    }
+
+    pub const fn permanent(code: &'static str, message: &'static str) -> Self {
+        Self {
+            kind: DurableCommitRejectionKind::Permanent,
+            code,
+            message,
+        }
+    }
+
+    /// The consumer confirmed an accepted Interrupted canonical event with
+    /// durable obligations for this turn. This is not a successful execution write.
+    pub const fn superseded_by_durable_interruption() -> Self {
+        Self {
+            kind: DurableCommitRejectionKind::SupersededByDurableInterruption,
+            code: "durable_interruption_accepted",
+            message: "execution was superseded by confirmed durable interruption",
+        }
+    }
+
+    pub const fn kind(&self) -> DurableCommitRejectionKind {
+        self.kind
+    }
+
+    pub const fn code(&self) -> &'static str {
+        self.code
+    }
+
+    pub const fn is_retryable(&self) -> bool {
+        matches!(self.kind, DurableCommitRejectionKind::Retryable)
+    }
+}
+
+impl Display for DurableCommitRejection {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.code, self.message)
+    }
 }
 
 impl Display for ExecutionEventHubError {
@@ -40,7 +105,10 @@ impl Error for ExecutionEventHubError {}
 #[derive(Debug)]
 struct DurableEventEnvelope {
     event: Box<AgentDurableEvent>,
-    committed_tx: Option<oneshot::Sender<Result<(), String>>>,
+    committed_tx: Option<oneshot::Sender<Result<(), DurableCommitRejection>>>,
+    enqueued_at: Instant,
+    turn_transition: Option<Arc<tokio::sync::OwnedMutexGuard<()>>>,
+    cli_blocked_guard: Option<pioneer_protocol::CliRuntimeBlockedTurnGuard>,
 }
 
 /// Receiver for the durable lane. Events published with a commit waiter must
@@ -48,32 +116,60 @@ struct DurableEventEnvelope {
 #[derive(Debug)]
 pub struct DurableEventReceiver {
     lane: Arc<DurableLane>,
-    pending_commit: Option<oneshot::Sender<Result<(), String>>>,
+    pending_commit: Option<oneshot::Sender<Result<(), DurableCommitRejection>>>,
+    pending_enqueue_age: Option<Duration>,
+    pending_turn_transition: Option<Arc<tokio::sync::OwnedMutexGuard<()>>>,
+    pending_cli_blocked_guard: Option<pioneer_protocol::CliRuntimeBlockedTurnGuard>,
 }
 
 impl DurableEventReceiver {
     pub async fn recv(&mut self) -> Option<AgentDurableEvent> {
-        self.acknowledge_last(Err(
-            "durable event consumer requested the next event without acknowledging the previous commit"
-                .to_owned(),
-        ));
+        self.acknowledge_last(Err(DurableCommitRejection::retryable(
+            "consumer_missing_ack",
+            "durable event consumer requested the next event without acknowledging the previous commit",
+        )));
         let envelope = self.lane.receiver.lock().await.recv().await?;
         self.pending_commit = envelope.committed_tx;
+        self.pending_turn_transition = envelope.turn_transition;
+        self.pending_cli_blocked_guard = envelope.cli_blocked_guard;
+        self.pending_enqueue_age = Some(envelope.enqueued_at.elapsed());
         Some(*envelope.event)
     }
 
-    pub fn acknowledge_last(&mut self, result: Result<(), String>) {
+    /// Queue residence measured when the current durable envelope was
+    /// received. It contains no identifiers and is cleared with the ACK.
+    pub fn pending_enqueue_age(&self) -> Option<Duration> {
+        self.pending_enqueue_age
+    }
+
+    pub fn cli_blocked_guard(&self) -> Option<&pioneer_protocol::CliRuntimeBlockedTurnGuard> {
+        self.pending_cli_blocked_guard.as_ref()
+    }
+
+    pub fn turn_transition(&self) -> Option<&Arc<tokio::sync::OwnedMutexGuard<()>>> {
+        self.pending_turn_transition.as_ref()
+    }
+
+    pub fn owns_turn_transition(&self) -> bool {
+        self.pending_turn_transition.is_some()
+    }
+
+    pub fn acknowledge_last(&mut self, result: Result<(), DurableCommitRejection>) {
+        self.pending_enqueue_age = None;
         if let Some(committed_tx) = self.pending_commit.take() {
             let _ = committed_tx.send(result);
         }
+        self.pending_turn_transition = None;
+        self.pending_cli_blocked_guard = None;
     }
 }
 
 impl Drop for DurableEventReceiver {
     fn drop(&mut self) {
-        self.acknowledge_last(Err(
-            "durable event consumer was dropped before acknowledging the commit".to_owned(),
-        ));
+        self.acknowledge_last(Err(DurableCommitRejection::retryable(
+            "consumer_dropped",
+            "durable event consumer was dropped before acknowledging the commit",
+        )));
         self.lane.receiver_claimed.store(false, Ordering::Release);
     }
 }
@@ -140,18 +236,44 @@ impl ExecutionEventHub {
         &self,
         event: AgentDurableEvent,
     ) -> impl Future<Output = Result<(), ExecutionEventHubError>> + Send + '_ {
-        self.publish_durable_envelope(Box::new(event), None)
+        self.publish_durable_envelope(Box::new(event), None, None, None)
     }
 
     pub fn publish_durable_and_wait(
         &self,
         event: AgentDurableEvent,
     ) -> impl Future<Output = Result<(), ExecutionEventHubError>> + Send + '_ {
+        self.publish_durable_and_wait_with_turn_transition(event, None)
+    }
+
+    /// Keep a CLI session transition owned until the queued lifecycle handler
+    /// has finished, even if its publisher is cancelled while waiting for ACK.
+    /// This shares the existing ordered, bounded durable lane.
+    pub fn publish_durable_and_wait_with_turn_transition(
+        &self,
+        event: AgentDurableEvent,
+        turn_transition: Option<Arc<tokio::sync::OwnedMutexGuard<()>>>,
+    ) -> impl Future<Output = Result<(), ExecutionEventHubError>> + Send + '_ {
+        self.publish_cli_runtime_blocked_and_wait(event, turn_transition, None)
+    }
+
+    /// CLI source facts for the atomic Blocked commit or native terminal delivery.
+    pub fn publish_cli_runtime_blocked_and_wait(
+        &self,
+        event: AgentDurableEvent,
+        turn_transition: Option<Arc<tokio::sync::OwnedMutexGuard<()>>>,
+        cli_blocked_guard: Option<pioneer_protocol::CliRuntimeBlockedTurnGuard>,
+    ) -> impl Future<Output = Result<(), ExecutionEventHubError>> + Send + '_ {
         let event = Box::new(event);
         async move {
             let (committed_tx, committed_rx) = oneshot::channel();
-            self.publish_durable_envelope(event, Some(committed_tx))
-                .await?;
+            self.publish_durable_envelope(
+                event,
+                Some(committed_tx),
+                turn_transition,
+                cli_blocked_guard,
+            )
+            .await?;
             committed_rx
                 .await
                 .map_err(|_| ExecutionEventHubError::CommitAcknowledgementDropped)?
@@ -162,14 +284,23 @@ impl ExecutionEventHub {
     async fn publish_durable_envelope(
         &self,
         event: Box<AgentDurableEvent>,
-        committed_tx: Option<oneshot::Sender<Result<(), String>>>,
+        committed_tx: Option<oneshot::Sender<Result<(), DurableCommitRejection>>>,
+        turn_transition: Option<Arc<tokio::sync::OwnedMutexGuard<()>>>,
+        cli_blocked_guard: Option<pioneer_protocol::CliRuntimeBlockedTurnGuard>,
     ) -> Result<(), ExecutionEventHubError> {
         self.flush_progress_for_durable(&event).await;
         self.flush_snapshots_for_durable(&event);
+        // Start queue residence only after prerequisite coalescer flushes.
+        // The duration still includes bounded-channel backpressure, but not
+        // unrelated pre-enqueue projection work.
+        let enqueued_at = Instant::now();
         self.durable_tx
             .send(DurableEventEnvelope {
                 event,
                 committed_tx,
+                enqueued_at,
+                turn_transition,
+                cli_blocked_guard,
             })
             .await
             .map_err(|_| ExecutionEventHubError::DurableLaneClosed)
@@ -207,6 +338,15 @@ impl ExecutionEventHub {
 
     pub async fn flush_progress_for_durable(&self, event: &AgentDurableEvent) {
         self.progress.flush_for_durable(event).await;
+    }
+
+    pub fn pending_progress_targets_for_item(
+        &self,
+        workspace_id: &str,
+        item_id: &str,
+    ) -> Vec<(String, String)> {
+        self.progress
+            .pending_targets_for_item(workspace_id, item_id)
     }
 
     pub async fn flush_progress_for_item(
@@ -275,6 +415,9 @@ impl ExecutionEventHub {
         Some(DurableEventReceiver {
             lane: self.durable_lane.clone(),
             pending_commit: None,
+            pending_enqueue_age: None,
+            pending_turn_transition: None,
+            pending_cli_blocked_guard: None,
         })
     }
 

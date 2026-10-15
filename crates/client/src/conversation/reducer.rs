@@ -139,6 +139,8 @@ pub struct PermissionAuditDisplayItem {
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct ItemView {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub html_publications: Vec<pioneer_protocol::HtmlPublication>,
     pub id: String,
     pub turn_id: String,
     pub item_type: String,
@@ -183,6 +185,32 @@ pub struct ConversationViewState {
 }
 
 impl ConversationViewState {
+    /// The revision is a notification counter, not a change to visible content.
+    /// Compare borrowed fields instead of cloning/serializing the whole history.
+    pub(crate) fn same_content(&self, other: &Self) -> bool {
+        let Self {
+            timeline,
+            turns,
+            items,
+            revision: _,
+            composer_locked,
+            in_flight_turn_id,
+            pending_request_id,
+            phase_label,
+            last_error,
+            permission_audit,
+        } = self;
+        timeline == &other.timeline
+            && turns == &other.turns
+            && items == &other.items
+            && composer_locked == &other.composer_locked
+            && in_flight_turn_id == &other.in_flight_turn_id
+            && pending_request_id == &other.pending_request_id
+            && phase_label == &other.phase_label
+            && last_error == &other.last_error
+            && permission_audit == &other.permission_audit
+    }
+
     pub fn item_by_id(&self, item_id: &str) -> Option<&ItemView> {
         self.items.iter().find(|item| item.id == item_id)
     }
@@ -334,6 +362,14 @@ impl ConversationProjector {
         self.view_state.in_flight_turn_id = state_machine.in_flight_turn_id().map(str::to_owned);
         self.view_state.pending_request_id = state_machine.pending_request_id().map(str::to_owned);
         self.view_state.phase_label = state_machine.status_label().to_owned();
+        // A user item can arrive while Composer is still waiting for admission.
+        // Its item lifecycle must not project that submission as executing work.
+        if let Some(turn_id) = state_machine.in_flight_turn_id()
+            && state_machine.pending_request_id().is_some()
+            && state_machine.is_local_admission(turn_id)
+        {
+            self.upsert_turn(turn_id, TurnPhase::Starting, None, None, None);
+        }
     }
 
     pub fn upsert_turn_snapshot_metadata(&mut self, turn: &Turn) {
@@ -384,6 +420,53 @@ impl ConversationProjector {
 
     pub fn apply_local_turn_start_accepted(&mut self, turn_id: &str, ts_unix_ms: i64) {
         self.upsert_turn(turn_id, TurnPhase::Running, Some(ts_unix_ms), None, None);
+    }
+
+    // Detached admission errors belong to the semantic outcome row. Keep its
+    // legacy Turn metadata in sync without creating an additional RPC error item.
+    pub(super) fn apply_admission_outcome(
+        &mut self,
+        turn_id: &str,
+        status: TurnStatus,
+        error: Option<&str>,
+        now_unix_ms: i64,
+        update_flow_error: bool,
+        resume: Option<&TurnBlockedResumeMetadata>,
+    ) {
+        let phase = match status {
+            TurnStatus::InProgress | TurnStatus::Completed => TurnPhase::Completed,
+            TurnStatus::Failed => TurnPhase::Failed,
+            TurnStatus::Blocked => TurnPhase::Blocked,
+            TurnStatus::Interrupted => TurnPhase::Cancelled,
+        };
+        // Snapshot metadata can insert a TurnView before the projector has indexed it.
+        // Reuse that view so a fresh/reconnected client keeps one admission Turn.
+        if !self.turn_index.contains_key(turn_id)
+            && let Some(index) = self
+                .view_state
+                .turns
+                .iter()
+                .position(|turn| turn.id == turn_id)
+        {
+            self.turn_index.insert(turn_id.to_owned(), index);
+        }
+        self.upsert_turn(turn_id, phase, None, None, None);
+        let turn = self
+            .view_state
+            .turns
+            .get_mut(self.turn_index[turn_id])
+            .expect("upserted admission");
+        // None is authoritative here: successful confirmation clears a local timeout.
+        turn.error = error.map(str::to_owned);
+        turn.completed_at_unix_ms.get_or_insert(now_unix_ms);
+        if status != TurnStatus::Blocked {
+            turn.resume = None;
+        } else if let Some(resume) = resume {
+            turn.resume = Some(resume.clone());
+        }
+        if update_flow_error {
+            self.view_state.last_error = error.map(str::to_owned);
+        }
     }
 
     pub fn apply_local_turn_start_rejected(&mut self, turn_id: &str, error: &str, ts_unix_ms: i64) {
@@ -1106,6 +1189,7 @@ impl ConversationProjector {
             index
         } else {
             self.view_state.items.push(ItemView {
+                html_publications: Vec::new(),
                 id: item_id.to_owned(),
                 turn_id: turn_id.to_owned(),
                 item_type: item_type.to_owned(),
@@ -1285,19 +1369,19 @@ impl ConversationProjector {
     }
 
     fn should_suppress_turn_failure_system_event(&self, turn_id: &str, error: &str) -> bool {
-        is_recovery_failure_error(error)
-            && self.has_system_event_code(turn_id, "item_recovery_exhausted")
-    }
-
-    fn has_system_event_code(&self, turn_id: &str, code: &str) -> bool {
         self.view_state.items.iter().any(|item| {
             item.turn_id == turn_id
                 && matches!(
                     &item.item,
                     TurnItem::SystemEvent {
-                        code: Some(existing),
+                        code: Some(code),
+                        details,
                         ..
-                    } if existing == code
+                    } if code == "item_recovery_exhausted"
+                        && (is_recovery_failure_error(error)
+                            || details.as_ref()
+                                .and_then(|details| details.get("error_message"))
+                                .and_then(JsonValue::as_str) == Some(error))
                 )
         })
     }
@@ -1738,6 +1822,7 @@ fn merge_item_opaque_meta(existing: &mut Option<JsonValue>, incoming: Option<Jso
     *existing = Some(incoming);
 }
 
+// Legacy Turn errors wrapped the recovery message instead of matching it exactly.
 fn is_recovery_failure_error(error: &str) -> bool {
     error.starts_with("recovery failed for item `")
 }

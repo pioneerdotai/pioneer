@@ -6,7 +6,7 @@ use pioneer_protocol::{
 };
 use sha2::{Digest, Sha256};
 
-use pioneer_cli_agent_runtime::NativeEventBudget;
+use pioneer_cli_agent_runtime::{NativeEventBudget, codex::CODEX_MAX_RECOVERY_FRAME_BYTES};
 use pioneer_crud::{ExecutionAdmissionQuotaPolicy, ExecutionQuotaCeilings};
 
 use crate::human_interaction::HumanInteractionBudget;
@@ -371,8 +371,12 @@ fn synthetic_observer_permission_cap() -> TurnPermissionProfileCap {
             dynamic_skill_tool: pioneer_protocol::PermissionBehavior::Deny,
             computer_use: pioneer_protocol::PermissionBehavior::Deny,
             task_subagent: pioneer_protocol::PermissionBehavior::Deny,
+            memory_write: pioneer_protocol::PermissionBehavior::Deny,
+            agent_action: pioneer_protocol::PermissionBehavior::Deny,
+            allowed_tools_restricted: true,
             allowed_tools: vec!["review_read".to_owned()],
             denied_tools: vec!["shell".to_owned()],
+            allowed_paths_restricted: false,
             allowed_paths: Vec::new(),
         },
     }
@@ -400,7 +404,10 @@ const DEFAULT_MCP_INVOCATION_RESOURCES: McpInvocationResourceLimits = McpInvocat
 const DEFAULT_NATIVE_EVENT_RESOURCES: NativeEventBudget = NativeEventBudget {
     profile_version: 2,
     max_frame_bytes: 1024 * 1024,
-    max_recovery_frame_bytes: 64 * 1024 * 1024,
+    // This is the authorization ceiling. Each provider adapter intersects it
+    // with its own transport ceiling; Claude remains at the provider-neutral
+    // 64 MiB default while Codex may use the larger disk-only recovery path.
+    max_recovery_frame_bytes: CODEX_MAX_RECOVERY_FRAME_BYTES,
 };
 
 #[cfg(test)]

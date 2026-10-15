@@ -4,12 +4,30 @@ use anyhow::{Context, Result};
 use pioneer_entity::task_agent_spec;
 use pioneer_protocol::TaskAgentSpec;
 use sea_orm::sea_query::OnConflict;
-use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, Set};
+use sea_orm::{
+    ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set,
+};
 
 use crate::util::{optional_typed_json_to_db, typed_json_to_db, unix_to_datetime};
 
+#[derive(Clone, Debug)]
+pub struct PreparedTaskAgentSpecProjection(task_agent_spec::ActiveModel);
+
+pub fn prepare_agent_spec_projection(
+    spec: &TaskAgentSpec,
+) -> Result<PreparedTaskAgentSpecProjection> {
+    active_model_from_spec(spec).map(PreparedTaskAgentSpecProjection)
+}
+
 pub async fn upsert_agent_spec<C: ConnectionTrait>(db: &C, spec: &TaskAgentSpec) -> Result<()> {
-    task_agent_spec::Entity::insert(active_model_from_spec(spec)?)
+    upsert_prepared_agent_spec(db, prepare_agent_spec_projection(spec)?).await
+}
+
+pub async fn upsert_prepared_agent_spec<C: ConnectionTrait>(
+    db: &C,
+    prepared: PreparedTaskAgentSpecProjection,
+) -> Result<()> {
+    task_agent_spec::Entity::insert(prepared.0)
         .on_conflict(
             OnConflict::column(task_agent_spec::Column::Id)
                 .update_columns([
@@ -48,6 +66,27 @@ pub async fn find_latest_agent_spec_by_task<C: ConnectionTrait>(
         .one(db)
         .await
         .context("failed to query latest task agent spec")
+}
+
+/// Matches the executor's historical selection: latest per-run spec first,
+/// otherwise the latest default spec, ordered by creation rather than updates.
+pub async fn find_terminal_agent_spec<C: ConnectionTrait>(
+    db: &C,
+    task_id: &str,
+    run_id: &str,
+) -> Result<Option<task_agent_spec::Model>> {
+    task_agent_spec::Entity::find()
+        .filter(task_agent_spec::Column::TaskId.eq(task_id.to_owned()))
+        .filter(
+            sea_orm::Condition::any()
+                .add(task_agent_spec::Column::RunId.eq(run_id.to_owned()))
+                .add(task_agent_spec::Column::RunId.is_null()),
+        )
+        .order_by_desc(task_agent_spec::Column::RunId)
+        .order_by_desc(task_agent_spec::Column::CreatedAt)
+        .one(db)
+        .await
+        .context("failed to query terminal task agent spec")
 }
 
 pub async fn find_agent_spec_by_run<C: ConnectionTrait>(
@@ -107,4 +146,44 @@ fn active_model_from_spec(spec: &TaskAgentSpec) -> Result<task_agent_spec::Activ
         created_at: Set(unix_to_datetime(spec.created_at)),
         updated_at: Set(unix_to_datetime(spec.updated_at)),
     })
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, sea_orm::FromQueryResult)]
+pub(crate) struct TaskDeliveryReviewPolicyFacts {
+    pub id: String,
+    pub task_id: String,
+    pub review_policy_json: Option<String>,
+}
+
+pub(crate) async fn find_delivery_review_policy<C: ConnectionTrait>(
+    db: &C,
+    task_id: &str,
+    run_id: &str,
+) -> Result<Option<TaskDeliveryReviewPolicyFacts>> {
+    let columns = [
+        task_agent_spec::Column::Id,
+        task_agent_spec::Column::TaskId,
+        task_agent_spec::Column::ReviewPolicyJson,
+    ];
+    let run_spec = task_agent_spec::Entity::find()
+        .select_only()
+        .columns(columns)
+        .filter(task_agent_spec::Column::RunId.eq(run_id.to_owned()))
+        .order_by_desc(task_agent_spec::Column::UpdatedAt)
+        .into_model::<TaskDeliveryReviewPolicyFacts>()
+        .one(db)
+        .await
+        .context("failed to read exact delivery review policy")?;
+    if run_spec.is_some() {
+        return Ok(run_spec);
+    }
+    task_agent_spec::Entity::find()
+        .select_only()
+        .columns(columns)
+        .filter(task_agent_spec::Column::TaskId.eq(task_id.to_owned()))
+        .order_by_desc(task_agent_spec::Column::UpdatedAt)
+        .into_model::<TaskDeliveryReviewPolicyFacts>()
+        .one(db)
+        .await
+        .context("failed to read legacy delivery review policy")
 }

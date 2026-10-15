@@ -232,7 +232,19 @@ impl MessageProcessor {
 
         let management = if management_allowed {
             let health = health_details_from_runtime(&server, runtime);
+            let (oauth_state, cleanup_available) =
+                match crate::mcp_service::installation_from_record(&row) {
+                    Ok(installation) => {
+                        self.mcp_service
+                            .oauth()
+                            .management_projection(&server_id, &installation)
+                            .await
+                    }
+                    Err(_) => (None, false),
+                };
             let management = McpManagementDetails {
+                oauth_cleanup_available: Some(cleanup_available),
+                oauth_state: oauth_state.map(crate::mcp_oauth::map_state),
                 scope: match protocol_scope_kind(row.scope_kind.as_str()) {
                     Ok(scope) => scope,
                     Err(error) => {

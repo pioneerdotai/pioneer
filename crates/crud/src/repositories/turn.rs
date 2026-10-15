@@ -1,3 +1,4 @@
+use crate::TurnWorkOwner;
 use anyhow::{Context, Result};
 use pioneer_entity::{turn, turn_input, turn_item, turn_message_revision, turn_status_history};
 use pioneer_protocol::{
@@ -8,8 +9,8 @@ use pioneer_protocol::{
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::sea_query::{Expr, OnConflict};
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, DatabaseBackend, EntityTrait, PaginatorTrait, QueryFilter,
-    QueryOrder, QuerySelect, Set, Statement,
+    ColumnTrait, ConnectionTrait, DatabaseBackend, EntityTrait, FromQueryResult, PaginatorTrait,
+    QueryFilter, QueryOrder, QuerySelect, Set, Statement,
 };
 
 use crate::convention::{
@@ -21,6 +22,112 @@ use crate::convention::{
 use crate::repositories::identity::{actor_ref_from_db, actor_ref_to_db};
 
 const DB_ID_LEN: usize = 21;
+pub const TURN_MESSAGE_GUARD_PAGE_ROWS: usize = 128;
+pub const TURN_MESSAGE_GUARD_PAGE_BYTES: usize = 32 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq, FromQueryResult)]
+pub struct TurnMessageGuard {
+    pub id: String,
+    pub message_revision: i64,
+    pub message_deleted_at: Option<DateTimeWithTimeZone>,
+}
+
+/// Metadata only: no command arguments, tool output or provider prompt.
+pub struct PostTurnToolSummary {
+    pub item_id: String,
+    pub item_type: pioneer_protocol::TurnItemType,
+    pub tool_name: String,
+    pub attempt_number: u32,
+    pub success: bool,
+    pub outcome_status: Option<pioneer_protocol::ToolOutcomeStatus>,
+    pub error_class: Option<pioneer_protocol::ToolErrorClass>,
+}
+
+pub async fn post_turn_tool_summaries<C: ConnectionTrait>(
+    db: &C,
+    turn_id: &str,
+    limit: usize,
+) -> Result<Vec<PostTurnToolSummary>> {
+    let rows = db
+        .query_all_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "SELECT item_id, item_type, active_attempt_number, \
+         substr(json_extract(payload, '$.toolName'), 1, 160) AS tool_name, \
+         json_extract(payload, '$.success') AS success, \
+         json_extract(payload, '$.outcome.status') AS outcome_status, \
+         json_extract(payload, '$.outcome.errorClass') AS error_class \
+         FROM turn_item WHERE turn_id = ? AND status IN ('completed', 'failed') \
+         AND json_type(payload, '$.toolName') = 'text' \
+         AND json_type(payload, '$.success') IN ('true', 'false') \
+         ORDER BY created_at ASC, item_id ASC LIMIT ?",
+            [turn_id.into(), (limit.clamp(1, 129) as i64).into()],
+        ))
+        .await?;
+    rows.into_iter()
+        .map(|row| {
+            let outcome: Option<String> = row.try_get("", "outcome_status")?;
+            let error: Option<String> = row.try_get("", "error_class")?;
+            Ok(PostTurnToolSummary {
+                item_id: row.try_get("", "item_id")?,
+                item_type: crate::convention::turn_item_type_from_db(
+                    &row.try_get::<String>("", "item_type")?,
+                )
+                .context("unknown post-turn tool item type")?,
+                tool_name: row.try_get("", "tool_name")?,
+                attempt_number: u32::try_from(row.try_get::<i64>("", "active_attempt_number")?)?,
+                success: row.try_get::<i64>("", "success")? != 0,
+                outcome_status: outcome
+                    .map(|v| serde_json::from_value(serde_json::Value::String(v)))
+                    .transpose()?,
+                error_class: error
+                    .map(|v| serde_json::from_value(serde_json::Value::String(v)))
+                    .transpose()?,
+            })
+        })
+        .collect()
+}
+
+/// Bounded original user messages for post-turn processing. Read the canonical
+/// turn input, never a CLI prompt with injected instructions/history. Text extraction
+/// in SQLite avoids loading attachments and unbounded message payloads.
+pub async fn post_turn_user_text<C: ConnectionTrait>(
+    db: &C,
+    turn_id: &str,
+    max_chars: usize,
+) -> Result<(String, bool)> {
+    let max_chars = max_chars.clamp(1, 32_768);
+    let rows = db
+        .query_all_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "SELECT substr(text, 1, ?) AS text, length(text) AS char_count \
+         FROM turn_input WHERE turn_id = ? AND input_type = 'text' \
+         ORDER BY input_index ASC LIMIT 65",
+            [(max_chars as i64).into(), turn_id.into()],
+        ))
+        .await
+        .context("failed to read bounded post-turn user messages")?;
+    let mut truncated = rows.len() > 64;
+    let mut text = String::new();
+    let mut remaining = max_chars;
+    for row in rows.into_iter().take(64) {
+        let part: String = row.try_get("", "text")?;
+        let char_count: i64 = row.try_get("", "char_count")?;
+        if !text.is_empty() && !part.is_empty() {
+            if remaining > 0 {
+                text.push('\n');
+                remaining -= 1;
+            } else {
+                truncated = true;
+            }
+        }
+        let kept: String = part.chars().take(remaining).collect();
+        let count = kept.chars().count();
+        truncated |= char_count > count as i64;
+        text.push_str(&kept);
+        remaining -= count;
+    }
+    Ok((text, truncated))
+}
 const TURN_MESSAGE_REVISION_INPUT_JSON_MAX_BYTES: usize = 1_048_576;
 const TURN_AGENT_AUTHOR_SNAPSHOT_JSON_MAX_BYTES: usize = 4_096;
 
@@ -45,6 +152,23 @@ pub struct NewTurnMessageRevision<'a> {
     pub created_at: DateTimeWithTimeZone,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct PreparedTurnMessageRevision {
+    row: turn_message_revision::ActiveModel,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PreparedMessageTurnMutationState {
+    thread_id: String,
+    turn_id: String,
+    revision: i64,
+    mentions_json: String,
+    deleted_at: Option<DateTimeWithTimeZone>,
+    deleted_by_actor_kind: Option<String>,
+    deleted_by_actor_id: Option<String>,
+    updated_at: DateTimeWithTimeZone,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TurnPromptManifestColumns {
     pub prompt_manifest_json: String,
@@ -67,6 +191,26 @@ pub struct TurnExecutionSecuritySnapshotRecord {
     pub turn_id: String,
     pub version: i64,
     pub snapshot: TurnExecutionSecuritySnapshot,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PreparedTurnUpsert {
+    expected_existing: Option<turn::Model>,
+    row: turn::ActiveModel,
+    update_columns: Vec<turn::Column>,
+}
+
+impl PreparedTurnUpsert {
+    pub(crate) fn changes_status_history(&self, status: TurnStatus, error: Option<&str>) -> bool {
+        self.expected_existing.as_ref().is_none_or(|existing| {
+            existing.status != turn_status_to_db(status) || existing.error.as_deref() != error
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PreparedTurnStatusHistory {
+    row: turn_status_history::ActiveModel,
 }
 
 pub async fn find_turn_by_id<C: ConnectionTrait>(
@@ -110,6 +254,45 @@ pub async fn find_turns_by_thread_and_ids<C: ConnectionTrait>(
         .context("failed to query turns by thread and ids")
 }
 
+pub async fn find_turn_message_guards_by_thread_and_ids<C: ConnectionTrait>(
+    db: &C,
+    thread_id: &str,
+    turn_ids: &[String],
+) -> Result<Vec<TurnMessageGuard>> {
+    anyhow::ensure!(
+        turn_ids.len() <= TURN_MESSAGE_GUARD_PAGE_ROWS,
+        "turn message guard page exceeds row bound"
+    );
+    let encoded_bytes = turn_ids
+        .iter()
+        .try_fold(2_usize, |bytes, id| -> Result<usize> {
+            anyhow::ensure!(
+                id.len().saturating_add(3) <= TURN_MESSAGE_GUARD_PAGE_BYTES,
+                "one turn message guard id exceeds byte bound"
+            );
+            Ok(bytes.saturating_add(id.len()).saturating_add(1))
+        })?;
+    anyhow::ensure!(
+        encoded_bytes <= TURN_MESSAGE_GUARD_PAGE_BYTES,
+        "turn message guard page exceeds byte bound"
+    );
+    if turn_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    turn::Entity::find()
+        .select_only()
+        .column(turn::Column::Id)
+        .column(turn::Column::MessageRevision)
+        .column(turn::Column::MessageDeletedAt)
+        .filter(turn::Column::ThreadId.eq(thread_id.to_owned()))
+        .filter(turn::Column::Id.is_in(turn_ids.iter().cloned()))
+        .into_model::<TurnMessageGuard>()
+        .all(db)
+        .await
+        .context("failed to query bounded turn message guards")
+}
+
 pub async fn has_in_progress_conversation_turn<C: ConnectionTrait>(
     db: &C,
     thread_id: &str,
@@ -124,6 +307,7 @@ pub async fn has_in_progress_conversation_turn<C: ConnectionTrait>(
     Ok(count > 0)
 }
 
+#[cfg(test)]
 pub async fn upsert_turn<C: ConnectionTrait>(
     db: &C,
     turn_id: &str,
@@ -150,6 +334,7 @@ pub async fn upsert_turn<C: ConnectionTrait>(
     .await
 }
 
+#[cfg(test)]
 pub async fn upsert_turn_with_initiator<C: ConnectionTrait>(
     db: &C,
     turn_id: &str,
@@ -191,6 +376,41 @@ pub async fn upsert_turn_with_initiator<C: ConnectionTrait>(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn prepare_projected_turn_upsert<C: ConnectionTrait>(
+    db: &C,
+    turn_id: &str,
+    thread_id: &str,
+    turn_model: &Turn,
+    prompt_manifest: Option<&TurnPromptManifestColumns>,
+    reasoning_effort: Option<&str>,
+    work_owner: Option<TurnWorkOwner>,
+    initiator: Option<&PersistedActorRef>,
+    update_initiator: bool,
+    created_at: DateTimeWithTimeZone,
+    updated_at: DateTimeWithTimeZone,
+) -> Result<PreparedTurnUpsert> {
+    let (actor_kind, actor_id) = match initiator {
+        Some(initiator) => actor_ref_to_db(initiator),
+        None => (None, None),
+    };
+    prepare_turn_upsert_with_actor_columns(
+        db,
+        turn_id,
+        thread_id,
+        turn_model,
+        prompt_manifest,
+        reasoning_effort,
+        work_owner,
+        actor_kind,
+        actor_id,
+        update_initiator,
+        created_at,
+        updated_at,
+    )
+    .await
+}
+
 pub async fn find_turn_initiator<C: ConnectionTrait>(
     db: &C,
     turn_id: &str,
@@ -206,6 +426,7 @@ pub async fn find_turn_initiator<C: ConnectionTrait>(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 async fn upsert_turn_with_actor_columns<C: ConnectionTrait>(
     db: &C,
     turn_id: &str,
@@ -219,6 +440,39 @@ async fn upsert_turn_with_actor_columns<C: ConnectionTrait>(
     created_at: DateTimeWithTimeZone,
     updated_at: DateTimeWithTimeZone,
 ) -> Result<()> {
+    let prepared = prepare_turn_upsert_with_actor_columns(
+        db,
+        turn_id,
+        thread_id,
+        turn_model,
+        prompt_manifest,
+        reasoning_effort,
+        None,
+        initiated_by_actor_kind,
+        initiated_by_actor_id,
+        update_initiator,
+        created_at,
+        updated_at,
+    )
+    .await?;
+    apply_prepared_turn_upsert(db, prepared).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn prepare_turn_upsert_with_actor_columns<C: ConnectionTrait>(
+    db: &C,
+    turn_id: &str,
+    thread_id: &str,
+    turn_model: &Turn,
+    prompt_manifest: Option<&TurnPromptManifestColumns>,
+    reasoning_effort: Option<&str>,
+    work_owner: Option<TurnWorkOwner>,
+    initiated_by_actor_kind: Option<String>,
+    initiated_by_actor_id: Option<String>,
+    update_initiator: bool,
+    created_at: DateTimeWithTimeZone,
+    updated_at: DateTimeWithTimeZone,
+) -> Result<PreparedTurnUpsert> {
     let existing_collaboration = find_turn_by_id(db, turn_id).await?;
     let preserve_legacy_null_mode = existing_collaboration
         .as_ref()
@@ -235,6 +489,9 @@ async fn upsert_turn_with_actor_columns<C: ConnectionTrait>(
         turn::Column::MentionsJson,
         turn::Column::MessageRevision,
     ];
+    if work_owner.is_some() {
+        update_columns.push(turn::Column::WorkOwner);
+    }
     update_columns.extend([
         turn::Column::PermissionProfileMode,
         turn::Column::PermissionProfileSource,
@@ -251,6 +508,20 @@ async fn upsert_turn_with_actor_columns<C: ConnectionTrait>(
         initiated_by_actor_kind.as_deref(),
         initiated_by_actor_id.as_deref(),
     )?;
+    if update_initiator
+        && let (Some(existing), Some(supplied)) =
+            (existing_collaboration.as_ref(), supplied_initiator.as_ref())
+    {
+        let existing_initiator = actor_ref_from_db(
+            existing.initiated_by_actor_kind.as_deref(),
+            existing.initiated_by_actor_id.as_deref(),
+        )
+        .with_context(|| format!("turn `{turn_id}` has an invalid persisted initiator pair"))?
+        .with_context(|| format!("turn `{turn_id}` is missing its persisted initiator"))?;
+        if &existing_initiator != supplied {
+            anyhow::bail!("turn `{turn_id}` already has a different persisted initiator");
+        }
+    }
     let effective_initiator = if supplied_initiator.is_some() {
         supplied_initiator
     } else if let Some(existing) = existing_collaboration.as_ref() {
@@ -277,6 +548,21 @@ async fn upsert_turn_with_actor_columns<C: ConnectionTrait>(
             anyhow::bail!("Turn author snapshot cannot change after initial persistence");
         }
     }
+    let supplied_work_owner = work_owner.map(TurnWorkOwner::as_db_str);
+    if let (Some(existing), Some(supplied_work_owner)) =
+        (existing_collaboration.as_ref(), supplied_work_owner)
+        && existing.work_owner != supplied_work_owner
+    {
+        anyhow::bail!("Turn work owner cannot change after initial persistence");
+    }
+    let effective_work_owner = supplied_work_owner
+        .map(str::to_owned)
+        .or_else(|| {
+            existing_collaboration
+                .as_ref()
+                .map(|existing| existing.work_owner.clone())
+        })
+        .unwrap_or_else(|| TurnWorkOwner::Turn.as_db_str().to_owned());
     let author = turn_model
         .author
         .as_ref()
@@ -344,7 +630,7 @@ async fn upsert_turn_with_actor_columns<C: ConnectionTrait>(
         )
     };
 
-    turn::Entity::insert(turn::ActiveModel {
+    let row = turn::ActiveModel {
         id: Set(turn_id.to_owned()),
         thread_id: Set(thread_id.to_owned()),
         initiated_by_actor_id: Set(initiated_by_actor_id),
@@ -352,6 +638,7 @@ async fn upsert_turn_with_actor_columns<C: ConnectionTrait>(
         status: Set(turn_status_to_db(turn_model.status).to_owned()),
         turn_kind: Set(turn_kind_to_db(turn_model.turn_kind).to_owned()),
         origin: Set(turn_origin_to_db(turn_model.origin).to_owned()),
+        work_owner: Set(effective_work_owner),
         error: Set(turn_model.error.clone()),
         prompt_manifest_json: Set(prompt_manifest
             .map(|manifest| manifest.prompt_manifest_json.clone())
@@ -389,15 +676,32 @@ async fn upsert_turn_with_actor_columns<C: ConnectionTrait>(
         message_deleted_by_actor_kind: Set(None),
         created_at: Set(created_at),
         updated_at: Set(updated_at),
+    };
+    Ok(PreparedTurnUpsert {
+        expected_existing: existing_collaboration,
+        row,
+        update_columns,
     })
-    .on_conflict(
-        OnConflict::column(turn::Column::Id)
-            .update_columns(update_columns)
-            .to_owned(),
-    )
-    .exec(db)
-    .await
-    .context("failed to upsert turn")?;
+}
+
+pub(crate) async fn apply_prepared_turn_upsert<C: ConnectionTrait>(
+    db: &C,
+    prepared: PreparedTurnUpsert,
+) -> Result<()> {
+    let turn_id = prepared.row.id.as_ref().to_owned();
+    let current = find_turn_by_id(db, turn_id.as_str()).await?;
+    if current != prepared.expected_existing {
+        anyhow::bail!("turn `{turn_id}` changed during projection preparation");
+    }
+    turn::Entity::insert(prepared.row)
+        .on_conflict(
+            OnConflict::column(turn::Column::Id)
+                .update_columns(prepared.update_columns)
+                .to_owned(),
+        )
+        .exec(db)
+        .await
+        .context("failed to upsert turn")?;
 
     Ok(())
 }
@@ -494,43 +798,13 @@ pub async fn insert_turn_message_revision<C: ConnectionTrait>(
     db: &C,
     revision: NewTurnMessageRevision<'_>,
 ) -> Result<()> {
-    let revision_number = i64::try_from(revision.revision)
-        .context("Turn message revision exceeds database integer range")?;
-    let input_json = serde_json::to_string(revision.input)
-        .context("failed to encode Turn message revision input")?;
-    if input_json.len() > TURN_MESSAGE_REVISION_INPUT_JSON_MAX_BYTES {
-        anyhow::bail!(
-            "Turn message revision input exceeds {TURN_MESSAGE_REVISION_INPUT_JSON_MAX_BYTES} bytes"
-        );
-    }
-    let mentions_json = canonical_turn_mentions_json(revision.mentions)?;
-    let (changed_by_actor_kind, changed_by_actor_id) = actor_ref_to_db(revision.changed_by);
-    let changed_by_actor_kind =
-        changed_by_actor_kind.context("Turn message revision actor kind must be persisted")?;
-    let change_kind = match revision.change_kind {
-        TurnMessageRevisionChangeKind::Edit => "edit",
-        TurnMessageRevisionChangeKind::Delete => "delete",
-    };
-    turn_message_revision::Entity::insert(turn_message_revision::ActiveModel {
-        turn_id: Set(revision.turn_id.to_owned()),
-        revision: Set(revision_number),
-        input_json: Set(input_json),
-        mentions_json: Set(mentions_json),
-        changed_by_actor_kind: Set(changed_by_actor_kind),
-        changed_by_actor_id: Set(changed_by_actor_id),
-        change_kind: Set(change_kind.to_owned()),
-        created_at: Set(revision.created_at),
-    })
-    .exec(db)
-    .await
-    .context("failed to insert Turn message revision")?;
-    Ok(())
+    let prepared = prepare_turn_message_revision(revision)?;
+    insert_prepared_turn_message_revision(db, prepared, false).await
 }
 
-pub async fn insert_turn_message_revision_if_absent<C: ConnectionTrait>(
-    db: &C,
+pub(crate) fn prepare_turn_message_revision(
     revision: NewTurnMessageRevision<'_>,
-) -> Result<()> {
+) -> Result<PreparedTurnMessageRevision> {
     let revision_number = i64::try_from(revision.revision)
         .context("Turn message revision exceeds database integer range")?;
     let input_json = serde_json::to_string(revision.input)
@@ -548,27 +822,41 @@ pub async fn insert_turn_message_revision_if_absent<C: ConnectionTrait>(
         TurnMessageRevisionChangeKind::Edit => "edit",
         TurnMessageRevisionChangeKind::Delete => "delete",
     };
-    turn_message_revision::Entity::insert(turn_message_revision::ActiveModel {
-        turn_id: Set(revision.turn_id.to_owned()),
-        revision: Set(revision_number),
-        input_json: Set(input_json),
-        mentions_json: Set(mentions_json),
-        changed_by_actor_kind: Set(changed_by_actor_kind),
-        changed_by_actor_id: Set(changed_by_actor_id),
-        change_kind: Set(change_kind.to_owned()),
-        created_at: Set(revision.created_at),
+    Ok(PreparedTurnMessageRevision {
+        row: turn_message_revision::ActiveModel {
+            turn_id: Set(revision.turn_id.to_owned()),
+            revision: Set(revision_number),
+            input_json: Set(input_json),
+            mentions_json: Set(mentions_json),
+            changed_by_actor_kind: Set(changed_by_actor_kind),
+            changed_by_actor_id: Set(changed_by_actor_id),
+            change_kind: Set(change_kind.to_owned()),
+            created_at: Set(revision.created_at),
+        },
     })
-    .on_conflict(
-        OnConflict::columns([
-            turn_message_revision::Column::TurnId,
-            turn_message_revision::Column::Revision,
-        ])
-        .do_nothing()
-        .to_owned(),
-    )
-    .exec(db)
-    .await
-    .context("failed to idempotently insert Turn message revision")?;
+}
+
+pub(crate) async fn insert_prepared_turn_message_revision<C: ConnectionTrait>(
+    db: &C,
+    prepared: PreparedTurnMessageRevision,
+    if_absent: bool,
+) -> Result<()> {
+    let mut insert = turn_message_revision::Entity::insert(prepared.row);
+    if if_absent {
+        insert = insert.on_conflict(
+            OnConflict::columns([
+                turn_message_revision::Column::TurnId,
+                turn_message_revision::Column::Revision,
+            ])
+            .do_nothing()
+            .to_owned(),
+        );
+    }
+    insert.exec(db).await.context(if if_absent {
+        "failed to idempotently insert Turn message revision"
+    } else {
+        "failed to insert Turn message revision"
+    })?;
     Ok(())
 }
 
@@ -832,97 +1120,77 @@ pub async fn update_turn_status<C: ConnectionTrait>(
     Ok(update_result.rows_affected > 0)
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub async fn replace_turn_input<C: ConnectionTrait>(
     db: &C,
     turn_id: &str,
     input: &[UserInput],
     created_at: DateTimeWithTimeZone,
 ) -> Result<()> {
-    turn_input::Entity::delete_many()
-        .filter(turn_input::Column::TurnId.eq(turn_id.to_owned()))
-        .exec(db)
-        .await
-        .context("failed to clear turn input rows before projection")?;
+    let prepared = prepare_turn_input_projection(turn_id, input, created_at)?;
+    replace_prepared_turn_input(db, prepared).await
+}
 
+#[derive(Clone, Debug)]
+pub(crate) struct PreparedTurnInputProjection {
+    turn_id: String,
+    rows: Vec<turn_input::ActiveModel>,
+}
+
+pub(crate) fn prepare_turn_input_projection(
+    turn_id: &str,
+    input: &[UserInput],
+    created_at: DateTimeWithTimeZone,
+) -> Result<PreparedTurnInputProjection> {
+    let mut rows = Vec::with_capacity(input.len());
     for (index, item) in input.iter().enumerate() {
         let (input_type, text) = input_type_and_text(item);
-        let payload_json =
-            serde_json::to_string(item).context("failed to serialize turn input payload")?;
-
-        turn_input::Entity::insert(turn_input::ActiveModel {
+        rows.push(turn_input::ActiveModel {
             id: Set(generate_id(DB_ID_LEN)),
             turn_id: Set(turn_id.to_owned()),
             input_index: Set(i64::try_from(index).unwrap_or(i64::MAX)),
             input_type: Set(input_type.to_owned()),
             text: Set(text),
-            payload: Set(payload_json),
+            payload: Set(
+                serde_json::to_string(item).context("failed to serialize turn input payload")?
+            ),
             created_at: Set(created_at),
-        })
+        });
+    }
+    Ok(PreparedTurnInputProjection {
+        turn_id: turn_id.to_owned(),
+        rows,
+    })
+}
+
+pub(crate) async fn replace_prepared_turn_input<C: ConnectionTrait>(
+    db: &C,
+    prepared: PreparedTurnInputProjection,
+) -> Result<()> {
+    turn_input::Entity::delete_many()
+        .filter(turn_input::Column::TurnId.eq(prepared.turn_id))
         .exec(db)
         .await
-        .context("failed to insert projected turn input row")?;
+        .context("failed to clear turn input rows before projection")?;
+
+    for rows in prepared.rows.chunks(32) {
+        turn_input::Entity::insert_many(rows.iter().cloned())
+            .exec_without_returning(db)
+            .await
+            .context("failed to insert projected turn input rows")?;
     }
 
     Ok(())
 }
 
-pub async fn compare_and_set_message_turn_mutation<C: ConnectionTrait>(
-    db: &C,
-    thread_id: &str,
-    turn_id: &str,
-    expected_revision: u64,
-    mentions: &[TurnMention],
-    deleted_by: Option<&PersistedActorRef>,
-    updated_at: DateTimeWithTimeZone,
-) -> Result<bool> {
-    let expected_revision = i64::try_from(expected_revision)
-        .context("expected Turn message revision exceeds database integer range")?;
-    let next_revision = expected_revision
-        .checked_add(1)
-        .context("Turn message revision exceeds database integer range")?;
-    let mentions_json = canonical_turn_mentions_json(mentions)?;
-    let (deleted_by_actor_kind, deleted_by_actor_id) = match deleted_by {
-        Some(actor) => actor_ref_to_db(actor),
-        None => (None, None),
-    };
-
-    let result = turn::Entity::update_many()
-        .filter(turn::Column::ThreadId.eq(thread_id.to_owned()))
-        .filter(turn::Column::Id.eq(turn_id.to_owned()))
-        .filter(turn::Column::SendMode.eq("message"))
-        .filter(turn::Column::MessageRevision.eq(expected_revision))
-        .filter(turn::Column::MessageDeletedAt.is_null())
-        .col_expr(turn::Column::MentionsJson, Expr::value(mentions_json))
-        .col_expr(turn::Column::MessageRevision, Expr::value(next_revision))
-        .col_expr(
-            turn::Column::MessageDeletedAt,
-            Expr::value(deleted_by.map(|_| updated_at)),
-        )
-        .col_expr(
-            turn::Column::MessageDeletedByActorKind,
-            Expr::value(deleted_by_actor_kind),
-        )
-        .col_expr(
-            turn::Column::MessageDeletedByActorId,
-            Expr::value(deleted_by_actor_id),
-        )
-        .col_expr(turn::Column::UpdatedAt, Expr::value(updated_at))
-        .exec(db)
-        .await
-        .context("failed to compare-and-set Turn message mutation")?;
-
-    Ok(result.rows_affected == 1)
-}
-
-pub async fn project_message_turn_mutation_state<C: ConnectionTrait>(
-    db: &C,
+pub(crate) fn prepare_message_turn_mutation_state(
     thread_id: &str,
     turn_id: &str,
     revision: u64,
     mentions: &[TurnMention],
     deleted_by: Option<&PersistedActorRef>,
     updated_at: DateTimeWithTimeZone,
-) -> Result<bool> {
+) -> Result<PreparedMessageTurnMutationState> {
     let revision = i64::try_from(revision)
         .context("projected Turn message revision exceeds database integer range")?;
     let mentions_json = canonical_turn_mentions_json(mentions)?;
@@ -930,26 +1198,48 @@ pub async fn project_message_turn_mutation_state<C: ConnectionTrait>(
         Some(actor) => actor_ref_to_db(actor),
         None => (None, None),
     };
+    Ok(PreparedMessageTurnMutationState {
+        thread_id: thread_id.to_owned(),
+        turn_id: turn_id.to_owned(),
+        revision,
+        mentions_json,
+        deleted_at: deleted_by.map(|_| updated_at),
+        deleted_by_actor_kind,
+        deleted_by_actor_id,
+        updated_at,
+    })
+}
+
+pub(crate) async fn project_prepared_message_turn_mutation_state<C: ConnectionTrait>(
+    db: &C,
+    prepared: PreparedMessageTurnMutationState,
+) -> Result<bool> {
     let result = turn::Entity::update_many()
-        .filter(turn::Column::ThreadId.eq(thread_id.to_owned()))
-        .filter(turn::Column::Id.eq(turn_id.to_owned()))
+        .filter(turn::Column::ThreadId.eq(prepared.thread_id))
+        .filter(turn::Column::Id.eq(prepared.turn_id))
         .filter(turn::Column::SendMode.eq("message"))
-        .filter(turn::Column::MessageRevision.lte(revision))
-        .col_expr(turn::Column::MentionsJson, Expr::value(mentions_json))
-        .col_expr(turn::Column::MessageRevision, Expr::value(revision))
+        .filter(turn::Column::MessageRevision.lte(prepared.revision))
+        .col_expr(
+            turn::Column::MentionsJson,
+            Expr::value(prepared.mentions_json),
+        )
+        .col_expr(
+            turn::Column::MessageRevision,
+            Expr::value(prepared.revision),
+        )
         .col_expr(
             turn::Column::MessageDeletedAt,
-            Expr::value(deleted_by.map(|_| updated_at)),
+            Expr::value(prepared.deleted_at),
         )
         .col_expr(
             turn::Column::MessageDeletedByActorKind,
-            Expr::value(deleted_by_actor_kind),
+            Expr::value(prepared.deleted_by_actor_kind),
         )
         .col_expr(
             turn::Column::MessageDeletedByActorId,
-            Expr::value(deleted_by_actor_id),
+            Expr::value(prepared.deleted_by_actor_id),
         )
-        .col_expr(turn::Column::UpdatedAt, Expr::value(updated_at))
+        .col_expr(turn::Column::UpdatedAt, Expr::value(prepared.updated_at))
         .exec(db)
         .await
         .context("failed to project Turn message mutation state")?;
@@ -963,60 +1253,119 @@ pub async fn append_turn_status_history<C: ConnectionTrait>(
     error: Option<String>,
     created_at: DateTimeWithTimeZone,
 ) -> Result<()> {
-    turn_status_history::Entity::insert(turn_status_history::ActiveModel {
-        id: Set(generate_id(DB_ID_LEN)),
-        turn_id: Set(turn_id.to_owned()),
-        status: Set(turn_status_to_db(status).to_owned()),
-        error: Set(error),
-        created_at: Set(created_at),
-    })
-    .exec(db)
-    .await
-    .context("failed to append turn status history")?;
+    let prepared = prepare_turn_status_history(turn_id, status, error, created_at);
+    append_prepared_turn_status_history(db, prepared).await
+}
 
+pub(crate) fn prepare_turn_status_history(
+    turn_id: &str,
+    status: TurnStatus,
+    error: Option<String>,
+    created_at: DateTimeWithTimeZone,
+) -> PreparedTurnStatusHistory {
+    PreparedTurnStatusHistory {
+        row: turn_status_history::ActiveModel {
+            id: Set(generate_id(DB_ID_LEN)),
+            turn_id: Set(turn_id.to_owned()),
+            status: Set(turn_status_to_db(status).to_owned()),
+            error: Set(error),
+            created_at: Set(created_at),
+        },
+    }
+}
+
+pub(crate) async fn append_prepared_turn_status_history<C: ConnectionTrait>(
+    db: &C,
+    prepared: PreparedTurnStatusHistory,
+) -> Result<()> {
+    turn_status_history::Entity::insert(prepared.row)
+        .exec(db)
+        .await
+        .context("failed to append turn status history")?;
     Ok(())
 }
 
-pub async fn upsert_turn_item<C: ConnectionTrait>(
-    db: &C,
+#[derive(Clone, Debug)]
+pub(crate) struct PreparedTurnItemProjection {
+    row_id: String,
+    turn_id: String,
+    item_id: String,
+    item_type: String,
+    status: Option<String>,
+    payload_json: String,
+    created_at: DateTimeWithTimeZone,
+    updated_at: DateTimeWithTimeZone,
+}
+
+impl PreparedTurnItemProjection {
+    /// An update carries content, not a completion transition. Check the
+    /// transaction's current item so event B observes event A in atomic batches.
+    pub(crate) async fn preserve_uncommitted_source_status<C: ConnectionTrait>(
+        &mut self,
+        db: &C,
+    ) -> Result<()> {
+        if matches!(
+            self.item_type.as_str(),
+            "user_message" | "agent_message" | "task"
+        ) {
+            let current = find_turn_item(db, &self.turn_id, &self.item_id).await?;
+            if current.as_ref().is_none_or(|row| {
+                !crate::thread_episodic_source::source_status_is_committed(row.status.as_deref())
+            }) {
+                self.status = Some(crate::convention::TURN_ITEM_STATUS_IN_PROGRESS.to_owned());
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn payload_json(&self) -> &str {
+        self.payload_json.as_str()
+    }
+}
+
+pub(crate) fn prepare_turn_item_projection(
     turn_id: &str,
     item: &TurnItem,
     status: Option<&str>,
     created_at: DateTimeWithTimeZone,
     updated_at: DateTimeWithTimeZone,
-) -> Result<()> {
+) -> Result<PreparedTurnItemProjection> {
     let (item_id, item_type) = turn_item_id_and_type_to_db(item);
-    let payload_json =
-        serde_json::to_string(item).context("failed to serialize turn item payload")?;
+    Ok(PreparedTurnItemProjection {
+        row_id: generate_id(DB_ID_LEN),
+        turn_id: turn_id.to_owned(),
+        item_id: item_id.to_owned(),
+        item_type: item_type.to_owned(),
+        status: status.map(str::to_owned),
+        payload_json: serde_json::to_string(item)
+            .context("failed to serialize turn item payload")?,
+        created_at,
+        updated_at,
+    })
+}
 
+pub(crate) async fn upsert_prepared_turn_item<C: ConnectionTrait>(
+    db: &C,
+    prepared: PreparedTurnItemProjection,
+) -> Result<()> {
     if db.get_database_backend() == DatabaseBackend::Sqlite {
-        return upsert_turn_item_sqlite_compatible(
-            db,
-            turn_id,
-            item_id,
-            item_type,
-            status,
-            payload_json.as_str(),
-            created_at,
-            updated_at,
-        )
-        .await;
+        return upsert_turn_item_sqlite_compatible(db, prepared).await;
     }
 
     turn_item::Entity::insert(turn_item::ActiveModel {
-        id: Set(generate_id(DB_ID_LEN)),
-        turn_id: Set(turn_id.to_owned()),
-        item_id: Set(item_id.to_owned()),
-        item_type: Set(item_type.to_owned()),
-        status: Set(status.map(str::to_owned)),
-        payload: Set(payload_json),
+        id: Set(prepared.row_id),
+        turn_id: Set(prepared.turn_id),
+        item_id: Set(prepared.item_id),
+        item_type: Set(prepared.item_type),
+        status: Set(prepared.status),
+        payload: Set(prepared.payload_json),
         active_attempt_number: Set(0),
         active_attempt_status: Set(None),
         active_attempt_id: Set(None),
         last_heartbeat_at: Set(None),
         lease_expires_at: Set(None),
-        created_at: Set(created_at),
-        updated_at: Set(updated_at),
+        created_at: Set(prepared.created_at),
+        updated_at: Set(prepared.updated_at),
     })
     .on_conflict(
         OnConflict::columns([turn_item::Column::TurnId, turn_item::Column::ItemId])
@@ -1037,15 +1386,9 @@ pub async fn upsert_turn_item<C: ConnectionTrait>(
 
 async fn upsert_turn_item_sqlite_compatible<C: ConnectionTrait>(
     db: &C,
-    turn_id: &str,
-    item_id: &str,
-    item_type: &str,
-    status: Option<&str>,
-    payload_json: &str,
-    created_at: DateTimeWithTimeZone,
-    updated_at: DateTimeWithTimeZone,
+    prepared: PreparedTurnItemProjection,
 ) -> Result<()> {
-    if sqlite_turn_item_exists(db, turn_id, item_id).await? {
+    if sqlite_turn_item_exists(db, prepared.turn_id.as_str(), prepared.item_id.as_str()).await? {
         db.execute_raw(Statement::from_sql_and_values(
             DatabaseBackend::Sqlite,
             r#"
@@ -1058,12 +1401,12 @@ async fn upsert_turn_item_sqlite_compatible<C: ConnectionTrait>(
                 WHERE turn_id = ? AND item_id = ?
             "#,
             vec![
-                item_type.to_owned().into(),
-                status.map(str::to_owned).into(),
-                payload_json.to_owned().into(),
-                updated_at.into(),
-                turn_id.to_owned().into(),
-                item_id.to_owned().into(),
+                prepared.item_type.into(),
+                prepared.status.into(),
+                prepared.payload_json.into(),
+                prepared.updated_at.into(),
+                prepared.turn_id.into(),
+                prepared.item_id.into(),
             ],
         ))
         .await
@@ -1092,14 +1435,14 @@ async fn upsert_turn_item_sqlite_compatible<C: ConnectionTrait>(
             VALUES (?, ?, ?, ?, ?, ?, 0, NULL, NULL, NULL, NULL, ?, ?)
         "#,
         vec![
-            generate_id(DB_ID_LEN).into(),
-            turn_id.to_owned().into(),
-            item_id.to_owned().into(),
-            item_type.to_owned().into(),
-            status.map(str::to_owned).into(),
-            payload_json.to_owned().into(),
-            created_at.into(),
-            updated_at.into(),
+            prepared.row_id.into(),
+            prepared.turn_id.into(),
+            prepared.item_id.into(),
+            prepared.item_type.into(),
+            prepared.status.into(),
+            prepared.payload_json.into(),
+            prepared.created_at.into(),
+            prepared.updated_at.into(),
         ],
     ))
     .await
@@ -1275,6 +1618,293 @@ pub async fn find_latest_turn_for_thread<C: ConnectionTrait>(
         .context("failed to query latest turn for thread")
 }
 
+pub(crate) const THREAD_TURN_SNAPSHOT_BATCH_SIZE: usize = 128;
+
+/// Only the already selected thread IDs are visited. Each correlated seek
+/// walks the existing history index backwards and stops at its first match;
+/// the outer primary-key lookup fetches at most one model per selected ID.
+/// CROSS JOIN keeps selected IDs as the outer loop in SQLite.
+/// This is deliberately not a ranking/aggregation over the turn catalogue.
+pub(crate) async fn find_latest_turns_for_threads<C: ConnectionTrait>(
+    db: &C,
+    thread_ids: &[&str],
+    conversation_only: bool,
+) -> Result<Vec<turn::Model>> {
+    anyhow::ensure!(
+        thread_ids.len() <= THREAD_TURN_SNAPSHOT_BATCH_SIZE,
+        "thread turn snapshot batch exceeds its limit"
+    );
+    if thread_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let placeholders = vec!["(?)"; thread_ids.len()].join(", ");
+    let kind_filter = if conversation_only {
+        "AND candidate.turn_kind = ?"
+    } else {
+        ""
+    };
+    let mut values = thread_ids
+        .iter()
+        .map(|id| (*id).into())
+        .collect::<Vec<sea_orm::Value>>();
+    if conversation_only {
+        values.push(turn_kind_to_db(TurnKind::Conversation).into());
+    }
+    let statement = Statement::from_sql_and_values(
+        DatabaseBackend::Sqlite,
+        format!(
+            "WITH selected(thread_id) AS (VALUES {placeholders}) \
+             SELECT latest.* FROM selected CROSS JOIN turn AS latest \
+             WHERE latest.id = (\
+                 SELECT candidate.id FROM turn AS candidate \
+                 INDEXED BY idx_turn_thread_created_id \
+                 WHERE candidate.thread_id = selected.thread_id {kind_filter} \
+                 ORDER BY candidate.created_at DESC, candidate.id DESC LIMIT 1\
+             )"
+        ),
+        values,
+    );
+    let rows = db
+        .query_all_raw(statement)
+        .await
+        .context("failed to query latest thread turn snapshot batch")?;
+    // query_all_raw returns the bounded rows and releases reader capacity
+    // before model decoding or any snapshot/JSON transformation.
+    rows.iter()
+        .map(|row| turn::Model::from_query_result(row, ""))
+        .collect::<Result<Vec<_>, _>>()
+        .context("failed to decode latest thread turn snapshot batch")
+}
+
+/// The shared history order is timestamp, durable creation sequence, legacy
+/// rowid, then ID. The existing (thread_id, created_at, id) index finds a
+/// timestamp bucket; only that bucket needs the sequence/rowid tie-breaker.
+/// This avoids ranking all turns merely to find one boundary.
+struct CliTurnOrderKey {
+    created_at: String,
+    sequence: i64,
+    rowid: i64,
+    id: String,
+}
+
+async fn cli_turn_order_key<C: ConnectionTrait>(
+    db: &C,
+    thread_id: &str,
+    turn_id: &str,
+) -> Result<Option<CliTurnOrderKey>> {
+    let row = db
+        .query_one_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "SELECT t.created_at AS created_at, COALESCE(c.sequence,0) AS sequence, \
+             t.rowid AS legacy_rowid, t.id AS id FROM turn t \
+             LEFT JOIN compaction_turn_creation c ON c.turn_id=t.id \
+             WHERE t.thread_id=? AND t.id=?",
+            vec![thread_id.into(), turn_id.into()],
+        ))
+        .await?;
+    row.map(|row| {
+        Ok(CliTurnOrderKey {
+            created_at: row.try_get("", "created_at")?,
+            sequence: row.try_get("", "sequence")?,
+            rowid: row.try_get("", "legacy_rowid")?,
+            id: row.try_get("", "id")?,
+        })
+    })
+    .transpose()
+}
+
+async fn cli_bucket_ids<C: ConnectionTrait>(
+    db: &C,
+    thread_id: &str,
+    timestamp: &str,
+    after: Option<&CliTurnOrderKey>,
+    descending: bool,
+    limit: usize,
+) -> Result<Vec<String>> {
+    let relation = if after.is_some() {
+        "AND (COALESCE(c.sequence,0),t.rowid,t.id) > (?,?,?)"
+    } else {
+        ""
+    };
+    let direction = if descending { "DESC" } else { "ASC" };
+    let sql = format!(
+        "SELECT t.id AS id FROM turn t LEFT JOIN compaction_turn_creation c ON c.turn_id=t.id \
+         WHERE t.thread_id=? AND t.created_at=? {relation} \
+         ORDER BY COALESCE(c.sequence,0) {direction}, t.rowid {direction}, t.id {direction} LIMIT ?"
+    );
+    let mut values = vec![thread_id.into(), timestamp.into()];
+    if let Some(after) = after {
+        values.extend([
+            after.sequence.into(),
+            after.rowid.into(),
+            after.id.clone().into(),
+        ]);
+    }
+    values.push(i64::try_from(limit)?.into());
+    db.query_all_raw(Statement::from_sql_and_values(
+        DatabaseBackend::Sqlite,
+        sql,
+        values,
+    ))
+    .await?
+    .into_iter()
+    .map(|row| row.try_get::<String>("", "id").map_err(Into::into))
+    .collect()
+}
+
+async fn cli_adjacent_timestamp<C: ConnectionTrait>(
+    db: &C,
+    thread_id: &str,
+    timestamp: Option<&str>,
+    descending: bool,
+) -> Result<Option<String>> {
+    let relation = match (timestamp, descending) {
+        (Some(_), true) => "AND created_at < ?",
+        (Some(_), false) => "AND created_at > ?",
+        (None, _) => "",
+    };
+    let direction = if descending { "DESC" } else { "ASC" };
+    let sql = format!(
+        "SELECT created_at FROM turn WHERE thread_id=? {relation} \
+         ORDER BY created_at {direction} LIMIT 1"
+    );
+    let mut values = vec![thread_id.into()];
+    if let Some(timestamp) = timestamp {
+        values.push(timestamp.into());
+    }
+    db.query_one_raw(Statement::from_sql_and_values(
+        DatabaseBackend::Sqlite,
+        sql,
+        values,
+    ))
+    .await?
+    .map(|row| row.try_get::<String>("", "created_at").map_err(Into::into))
+    .transpose()
+}
+
+pub async fn latest_turn_id_by_creation_order<C: ConnectionTrait>(
+    db: &C,
+    thread_id: &str,
+) -> Result<Option<String>> {
+    let Some(timestamp) = cli_adjacent_timestamp(db, thread_id, None, true).await? else {
+        return Ok(None);
+    };
+    Ok(cli_bucket_ids(db, thread_id, &timestamp, None, true, 1)
+        .await?
+        .into_iter()
+        .next())
+}
+
+pub async fn turn_before_launch_and_intervening_by_creation_order<C: ConnectionTrait>(
+    db: &C,
+    thread_id: &str,
+    launch_turn_id: &str,
+    allowed_task_run_turn_id: &str,
+) -> Result<Option<(Option<String>, bool)>> {
+    let Some(launch) = cli_turn_order_key(db, thread_id, launch_turn_id).await? else {
+        return Ok(None);
+    };
+    let previous_in_bucket = db
+        .query_one_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "SELECT t.id AS id FROM turn t \
+             LEFT JOIN compaction_turn_creation c ON c.turn_id=t.id \
+             WHERE t.thread_id=? AND t.created_at=? \
+               AND (COALESCE(c.sequence,0),t.rowid,t.id) < (?,?,?) \
+             ORDER BY COALESCE(c.sequence,0) DESC,t.rowid DESC,t.id DESC LIMIT 1",
+            vec![
+                thread_id.into(),
+                launch.created_at.clone().into(),
+                launch.sequence.into(),
+                launch.rowid.into(),
+                launch.id.clone().into(),
+            ],
+        ))
+        .await?;
+    let previous = if let Some(row) = previous_in_bucket {
+        Some(row.try_get::<String>("", "id")?)
+    } else if let Some(timestamp) =
+        cli_adjacent_timestamp(db, thread_id, Some(&launch.created_at), true).await?
+    {
+        cli_bucket_ids(db, thread_id, &timestamp, None, true, 1)
+            .await?
+            .into_iter()
+            .next()
+    } else {
+        None
+    };
+    let intervening = db
+        .query_one_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "SELECT (EXISTS(SELECT 1 FROM turn t WHERE t.thread_id=? \
+                AND t.created_at>? AND t.id<>?) OR \
+              EXISTS(SELECT 1 FROM turn t LEFT JOIN compaction_turn_creation c ON c.turn_id=t.id \
+                WHERE t.thread_id=? AND t.created_at=? AND t.id<>? \
+                AND (COALESCE(c.sequence,0),t.rowid,t.id) > (?,?,?))) AS intervening",
+            vec![
+                thread_id.into(),
+                launch.created_at.clone().into(),
+                allowed_task_run_turn_id.into(),
+                thread_id.into(),
+                launch.created_at.into(),
+                allowed_task_run_turn_id.into(),
+                launch.sequence.into(),
+                launch.rowid.into(),
+                launch.id.into(),
+            ],
+        ))
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("CLI intervening-turn query returned no row"))?
+        .try_get::<i64>("", "intervening")?
+        != 0;
+    Ok(Some((previous, intervening)))
+}
+
+pub async fn turn_ids_after_by_creation_order<C: ConnectionTrait>(
+    db: &C,
+    thread_id: &str,
+    source_turn_id: &str,
+) -> Result<Vec<String>> {
+    const MAX_FORK_RETRY_ATTEMPTS: usize = 128;
+    let Some(source) = cli_turn_order_key(db, thread_id, source_turn_id).await? else {
+        return Ok(Vec::new());
+    };
+    let mut rows = cli_bucket_ids(
+        db,
+        thread_id,
+        &source.created_at,
+        Some(&source),
+        false,
+        MAX_FORK_RETRY_ATTEMPTS + 1,
+    )
+    .await?;
+    let mut timestamp = source.created_at;
+    while rows.len() <= MAX_FORK_RETRY_ATTEMPTS {
+        let Some(next) = cli_adjacent_timestamp(db, thread_id, Some(&timestamp), false).await?
+        else {
+            break;
+        };
+        rows.extend(
+            cli_bucket_ids(
+                db,
+                thread_id,
+                &next,
+                None,
+                false,
+                MAX_FORK_RETRY_ATTEMPTS + 1 - rows.len(),
+            )
+            .await?,
+        );
+        timestamp = next;
+    }
+    anyhow::ensure!(
+        rows.len() <= MAX_FORK_RETRY_ATTEMPTS,
+        "CLI fork retry exceeds the bounded attempt scan"
+    );
+    Ok(rows)
+}
+
 pub async fn find_latest_conversation_turn_for_thread<C: ConnectionTrait>(
     db: &C,
     thread_id: &str,
@@ -1382,6 +2012,140 @@ mod tests {
     use sea_orm::{Database, DatabaseConnection, DbBackend};
     use serde_json::json;
 
+    #[tokio::test]
+    async fn cli_predecessor_uses_history_timestamp_sequence_and_legacy_rowid() {
+        let db = Database::connect("sqlite::memory:").await.unwrap();
+        Migrator::up(&db, None).await.unwrap();
+        db.execute_unprepared(
+            "INSERT INTO workspace(id,name,is_active,is_current) VALUES ('ws','fixture',1,1); \
+             INSERT INTO thread(id,workspace_id,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) \
+                 VALUES('thread','ws','','agent','m','p','active','user','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP); \
+             INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES \
+                 ('z','thread','completed','conversation','user','2026-01-01T10:00:00Z',CURRENT_TIMESTAMP), \
+                 ('a','thread','completed','conversation','user','2026-01-01T10:00:00Z',CURRENT_TIMESTAMP), \
+                 ('launch','thread','completed','conversation','user','2026-01-01T10:00:00Z',CURRENT_TIMESTAMP), \
+                 ('backdated','thread','completed','conversation','user','2026-01-01T09:00:00Z',CURRENT_TIMESTAMP), \
+                 ('occurrence','thread','completed','task_run','system','2026-01-01T10:00:00Z',CURRENT_TIMESTAMP), \
+                 ('future','thread','completed','conversation','user','2026-01-01T11:00:00Z',CURRENT_TIMESTAMP)",
+        ).await.unwrap();
+        assert_eq!(
+            turn_before_launch_and_intervening_by_creation_order(
+                &db,
+                "thread",
+                "launch",
+                "occurrence"
+            )
+            .await
+            .unwrap(),
+            Some((Some("a".to_owned()), true)),
+        );
+        // The range query that locates the next timestamp must seek through
+        // an existing thread/timestamp index even when unrelated tail turns
+        // grow. Only the selected second is tie-broken by sequence/rowid.
+        let plan = db
+            .query_all_raw(Statement::from_sql_and_values(
+                DatabaseBackend::Sqlite,
+                "EXPLAIN QUERY PLAN SELECT created_at FROM turn WHERE thread_id=? \
+                 AND created_at>? ORDER BY created_at ASC LIMIT 1",
+                vec!["thread".into(), "2026-01-01T10:00:00Z".into()],
+            ))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.try_get::<String>("", "detail").unwrap())
+            .collect::<Vec<_>>();
+        assert!(
+            plan.iter().any(|detail| {
+                detail.starts_with("SEARCH turn USING COVERING INDEX ")
+                    && detail.contains("(thread_id=? AND created_at>?)")
+            }),
+            "CLI boundary timestamp query must seek rather than rank the full thread: {plan:#?}"
+        );
+        let bucket_plan = db
+            .query_all_raw(Statement::from_sql_and_values(
+                DatabaseBackend::Sqlite,
+                "EXPLAIN QUERY PLAN SELECT t.id FROM turn t \
+                 LEFT JOIN compaction_turn_creation c ON c.turn_id=t.id \
+                 WHERE t.thread_id=? AND t.created_at=? \
+                 ORDER BY COALESCE(c.sequence,0),t.rowid,t.id LIMIT 1",
+                vec!["thread".into(), "2026-01-01T10:00:00Z".into()],
+            ))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.try_get::<String>("", "detail").unwrap())
+            .collect::<Vec<_>>();
+        assert!(
+            bucket_plan.iter().any(|detail| {
+                detail.starts_with("SEARCH t USING")
+                    && detail.contains("(thread_id=? AND created_at=?)")
+            }),
+            "tie-breaking must be confined to the indexed timestamp bucket: {bucket_plan:#?}"
+        );
+        assert_eq!(
+            latest_turn_id_by_creation_order(&db, "thread")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("future")
+        );
+        assert_eq!(
+            turn_ids_after_by_creation_order(&db, "thread", "a")
+                .await
+                .unwrap(),
+            vec!["launch", "occurrence", "future"]
+        );
+        let store = crate::CrudStore::new(db.clone());
+        let history_fence = store.compaction_history_read_fence().await.unwrap();
+        let mut history_turns = store
+            .compaction_history_turn_page("ws", "thread", "", &history_fence)
+            .await
+            .unwrap();
+        history_turns.sort_by(|left, right| {
+            (
+                &left.created_at,
+                left.creation_order,
+                left.legacy_creation_order,
+                &left.id,
+            )
+                .cmp(&(
+                    &right.created_at,
+                    right.creation_order,
+                    right.legacy_creation_order,
+                    &right.id,
+                ))
+        });
+        let history_order = history_turns
+            .iter()
+            .map(|turn| turn.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            history_order,
+            vec!["backdated", "z", "a", "launch", "occurrence", "future"]
+        );
+        let launch_index = history_order
+            .iter()
+            .position(|turn| *turn == "launch")
+            .unwrap();
+        assert_eq!(history_order[launch_index - 1], "a");
+        db.execute_unprepared("DELETE FROM compaction_turn_creation WHERE turn_id IN ('z','a')")
+            .await
+            .unwrap();
+        // Legacy rows use rowid only after their shared timestamp and absent
+        // durable sequence have been accounted for.
+        assert_eq!(
+            turn_before_launch_and_intervening_by_creation_order(
+                &db,
+                "thread",
+                "launch",
+                "occurrence"
+            )
+            .await
+            .unwrap(),
+            Some((Some("a".to_owned()), true)),
+        );
+    }
+
     #[test]
     fn legacy_null_send_mode_is_chat_compatible_but_not_message_mutable() {
         let model = collaboration_test_turn(None, None, None, "[]");
@@ -1487,16 +2251,17 @@ mod tests {
 
         let created_at = fixed_test_datetime();
         let first = agent_message_item("item_zstd", "first payload");
-        upsert_turn_item(
-            &connection,
+        let first = prepare_turn_item_projection(
             "turn_item_zstd",
             &first,
             Some("running"),
             created_at,
             created_at,
         )
-        .await
-        .expect("turn_item insert should work through sqlite-zstd view");
+        .expect("turn_item insert should prepare");
+        upsert_prepared_turn_item(&connection, first)
+            .await
+            .expect("turn_item insert should work through sqlite-zstd view");
 
         let inserted = find_turn_item(&connection, "turn_item_zstd", "item_zstd")
             .await
@@ -1507,16 +2272,17 @@ mod tests {
 
         let updated_at = fixed_later_test_datetime();
         let updated = agent_message_item("item_zstd", "updated payload");
-        upsert_turn_item(
-            &connection,
+        let updated = prepare_turn_item_projection(
             "turn_item_zstd",
             &updated,
             Some("completed"),
             created_at,
             updated_at,
         )
-        .await
-        .expect("turn_item update should work through sqlite-zstd view");
+        .expect("turn_item update should prepare");
+        upsert_prepared_turn_item(&connection, updated)
+            .await
+            .expect("turn_item update should work through sqlite-zstd view");
 
         let stored = find_turn_item(&connection, "turn_item_zstd", "item_zstd")
             .await
@@ -1683,6 +2449,7 @@ mod tests {
             updated_at: now,
             turn_kind: "conversation".to_owned(),
             origin: "user".to_owned(),
+            work_owner: "turn".to_owned(),
             reasoning_effort: None,
             permission_profile_mode: None,
             permission_profile_source: None,

@@ -11,7 +11,10 @@ mod ordered_ingress;
 mod progress;
 mod snapshot;
 
-pub use hub::{DurableEventReceiver, ExecutionEventHub, ExecutionEventHubError};
+pub use hub::{
+    DurableCommitRejection, DurableCommitRejectionKind, DurableEventReceiver, ExecutionEventHub,
+    ExecutionEventHubError,
+};
 pub use observation::{ExecutionTurnObservation, ExecutionTurnStatus};
 pub use ordered_ingress::{
     OrderedEventIngress, OrderedIngressClass, OrderedIngressConfig, OrderedIngressEvent,

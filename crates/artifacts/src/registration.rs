@@ -54,7 +54,6 @@ pub struct ArtifactRegistrationContext {
     pub binding_role: Option<ArtifactRole>,
     pub allowed_roots: Vec<PathBuf>,
     pub max_file_bytes: Option<u64>,
-    pub cleanup_source_after_success: bool,
 }
 
 pub const TURN_ARTIFACT_BUDGET_DEFERRED_REASON: &str = "per-turn artifact budget enforcement is deferred until explicit artifact registration tool session state is introduced";
@@ -93,7 +92,6 @@ impl ArtifactService {
         policy.follow_symlinks = false;
 
         let local_file = read_validated_local_file(candidate.path.as_path(), &policy).await?;
-        let source_path = local_file.canonical_path.clone();
         validate_registration_hints(&candidate, local_file.bytes.as_slice())?;
 
         let declared_mime_type = candidate
@@ -169,10 +167,6 @@ impl ArtifactService {
                 metadata,
             })
             .await?;
-
-        if context.cleanup_source_after_success {
-            let _ = crate::output_dir::cleanup_artifact_output_file(source_path.as_path()).await;
-        }
 
         Ok(summary)
     }
@@ -432,7 +426,6 @@ mod tests {
             binding_role: Some(ArtifactRole::Tool),
             allowed_roots: vec![root.to_path_buf()],
             max_file_bytes: None,
-            cleanup_source_after_success: false,
         }
     }
 

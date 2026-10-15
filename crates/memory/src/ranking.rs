@@ -445,6 +445,7 @@ mod tests {
     ) -> MemorySearchHit {
         MemorySearchHit {
             record: pioneer_protocol::MemoryRecord {
+                recall_eligibility: None,
                 id: id.to_owned(),
                 scope: MemoryScope {
                     kind: MemoryScopeKind::User,

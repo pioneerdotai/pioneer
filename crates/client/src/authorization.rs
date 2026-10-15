@@ -11,8 +11,8 @@ use crate::{
 };
 use pioneer_protocol::{
     AUTHORIZATION_CAPABILITY_SNAPSHOT_SCHEMA_VERSION, AccessChangeKind, AccessChangedNotification,
-    AuthMeResponse, AuthSessionListItem, AuthSessionStatus, AuthorizationCapabilitySnapshot,
-    AuthorizationRolePresentation, AuthorizationThreadCapabilities, DeviceStatus, PrincipalId,
+    AuthMeResponse, AuthSessionListItem, AuthSessionStatus, AuthorizationRolePresentation,
+    AuthorizationThreadCapabilities, DeviceStatus, PrincipalId,
 };
 use std::collections::BTreeMap;
 
@@ -26,7 +26,8 @@ pub enum AuthorizationProjectionAcceptance {
     Incompatible,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 struct AuthorizationProjectionManifest {
     schema_version: u32,
     principal_id: PrincipalId,
@@ -38,7 +39,8 @@ struct AuthorizationProjectionManifest {
 /// Coherent authorization projections for one connection epoch. All shells
 /// feed every scoped response through this store before exposing any bit to UI
 /// consumers.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
 pub struct AuthorizationProjectionStore {
     accepted_revision: Option<u64>,
     manifest: Option<AuthorizationProjectionManifest>,
@@ -47,6 +49,54 @@ pub struct AuthorizationProjectionStore {
 }
 
 impl AuthorizationProjectionStore {
+    /// Compare effective grants, not revision-dependent transport receipts.
+    /// Learning a previously unseen scope is not a change to an existing grant.
+    pub(crate) fn permissions_changed(&self, next: &Self) -> bool {
+        fn semantic_workspace(
+            value: &pioneer_protocol::AuthorizationWorkspaceCapabilitySnapshot,
+        ) -> pioneer_protocol::AuthorizationWorkspaceCapabilitySnapshot {
+            let mut value = value.clone();
+            value.operational_resources.fingerprint.clear();
+            value.execution_draft_policy.fingerprint.clear();
+            value.execution_draft_policy.resources.fingerprint.clear();
+            value
+        }
+        self.manifest.as_ref().is_some_and(|old| {
+            next.manifest.as_ref().is_none_or(|new| {
+                old.schema_version != new.schema_version
+                    || old.principal_id != new.principal_id
+                    || old.role_key != new.role_key
+                    || old.global != new.global
+            })
+        }) || self.workspaces.iter().any(|(id, old)| {
+            next.workspaces
+                .get(id)
+                .is_none_or(|new| semantic_workspace(old) != semantic_workspace(new))
+        }) || self
+            .threads
+            .iter()
+            .any(|(id, old)| next.threads.get(id) != Some(old))
+    }
+
+    pub fn workspace_snapshots(&self) -> BTreeMap<String, AuthorizationCapabilitySnapshot> {
+        self.workspaces
+            .keys()
+            .filter_map(|id| {
+                self.snapshot(Some(id), None)
+                    .map(|value| (id.clone(), value))
+            })
+            .collect()
+    }
+    pub fn thread_snapshots(&self) -> BTreeMap<String, AuthorizationCapabilitySnapshot> {
+        self.threads
+            .iter()
+            .filter_map(|(id, thread)| {
+                self.snapshot(Some(&thread.workspace_id), Some(id))
+                    .map(|value| (id.clone(), value))
+            })
+            .collect()
+    }
+
     pub fn accepted_revision(&self) -> Option<u64> {
         self.accepted_revision
     }
@@ -416,13 +466,15 @@ pub fn thread_presentation_capabilities(
     })
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ThreadAuthorizationScope {
     pub thread_id: String,
     pub workspace_id: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AccessChangedPlan {
     pub authorization_revision: u64,
     pub workspace_id: String,
@@ -503,6 +555,13 @@ pub fn plan_access_changed(
     }
     if workspace_wide {
         effects.push(ClientEffect::RefreshWorkspaceList);
+        if active_workspace_id == Some(notification.workspace_id.as_str()) {
+            // Workspace membership changes can also change provider and CLI
+            // runtime capabilities. Rebuild both catalogs from current-ACL
+            // endpoints instead of retaining a snapshot from the previous
+            // authorization generation.
+            effects.push(ClientEffect::RefreshProviderLists);
+        }
     }
 
     AccessChangedPlan {
@@ -544,7 +603,6 @@ pub fn apply_access_changed_to_client_state(
         return plan;
     }
 
-    state.administration.apply_access_changed(notification);
     state.gateway.authorization_revision = Some(plan.authorization_revision);
     if plan.change == AccessChangeKind::WorkspaceMembership
         && notification.outcome == pioneer_protocol::AccessChangeOutcome::Revoked
@@ -575,8 +633,8 @@ pub fn apply_access_changed_to_client_state(
         .coordinators
         .retain(|thread_id, _| !invalidated_thread_ids.contains(thread_id.as_str()));
     state.threads.placements.retain(|thread_id, placement| {
-        !invalidated_thread_ids.contains(thread_id.as_str())
-            && !(workspace_access_lost && placement.workspace_id == plan.workspace_id)
+        !(invalidated_thread_ids.contains(thread_id.as_str())
+            || workspace_access_lost && placement.workspace_id == plan.workspace_id)
     });
 
     if workspace_access_lost {
@@ -603,15 +661,15 @@ pub fn apply_access_changed_to_client_state(
         .threads
         .last_active_thread_by_workspace
         .retain(|workspace_id, thread_id| {
-            !(workspace_access_lost && workspace_id == &plan.workspace_id)
-                && !invalidated_thread_ids.contains(thread_id.as_str())
+            !(invalidated_thread_ids.contains(thread_id.as_str())
+                || workspace_access_lost && workspace_id == &plan.workspace_id)
         });
     state
         .threads
         .draft_thread_by_workspace
         .retain(|workspace_id, thread_id| {
-            !(workspace_access_lost && workspace_id == &plan.workspace_id)
-                && !invalidated_thread_ids.contains(thread_id.as_str())
+            !(invalidated_thread_ids.contains(thread_id.as_str())
+                || workspace_access_lost && workspace_id == &plan.workspace_id)
         });
 
     if plan.clear_active_thread {
@@ -656,9 +714,6 @@ pub fn apply_access_changed_to_client_state(
         .retain(|thread_id| !invalidated_thread_ids.contains(thread_id.as_str()));
 
     if plan.clear_workspace_capability_projections {
-        state.providers.clear_for_workspace_switch();
-        state.mcp = Default::default();
-        state.skills = Default::default();
         state.threads.start = ThreadStartCoordinator::default();
         state.threads.start_requested = false;
         state.threads.ready_turn_resume_threads.clear();
@@ -670,7 +725,6 @@ pub fn apply_access_changed_to_client_state(
 
 pub fn clear_authorization_revision_for_endpoint_change(state: &mut ClientState) {
     state.gateway.authorization_revision = None;
-    state.administration.clear_for_session_termination();
 }
 
 #[cfg(test)]
@@ -732,6 +786,49 @@ mod tests {
                     capabilities: AuthorizationThreadCapabilities::default(),
                 }
             }),
+        }
+    }
+
+    #[test]
+    fn effective_grants_ignore_receipts_but_detect_every_permission_scope() {
+        let mut old = AuthorizationProjectionStore::default();
+        old.accept(projection_snapshot(
+            7,
+            "role",
+            Some("workspace"),
+            Some("thread"),
+        ));
+        for change in 0..7 {
+            let mut response = projection_snapshot(8, "role", Some("workspace"), Some("thread"));
+            let workspace = response.workspace.as_mut().unwrap();
+            match change {
+                0 => response.role.display_name = "New label".into(),
+                1 => response.global.can_create_workspace = true,
+                2 => workspace.capabilities.can_use_mcp = true,
+                3 => {
+                    workspace.operational_resources.skills.all = true;
+                    workspace.execution_draft_policy.resources =
+                        workspace.operational_resources.clone();
+                }
+                4 => {
+                    workspace
+                        .execution_draft_policy
+                        .mcp_invocation_limits
+                        .max_arguments_bytes += 1
+                }
+                5 => response.thread.as_mut().unwrap().capabilities.can_read = true,
+                6 => {
+                    response.workspace = None;
+                    response.thread = None;
+                }
+                _ => unreachable!(),
+            }
+            let mut next = AuthorizationProjectionStore::default();
+            assert_eq!(
+                next.accept(response),
+                AuthorizationProjectionAcceptance::Accepted
+            );
+            assert_eq!(old.permissions_changed(&next), change != 0, "case {change}");
         }
     }
 
@@ -1277,6 +1374,7 @@ mod tests {
                     thread_ids: vec!["thread_revoked".to_owned()]
                 },
                 ClientEffect::RefreshWorkspaceList,
+                ClientEffect::RefreshProviderLists,
             ]
         );
     }
@@ -1568,3 +1666,5 @@ mod tests {
         assert_eq!(endpoint_b.gateway.authorization_revision, None);
     }
 }
+
+pub use pioneer_protocol::AuthorizationCapabilitySnapshot;

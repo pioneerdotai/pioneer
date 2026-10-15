@@ -1,50 +1,58 @@
 [package]
 name = "pioneer-desktop"
+autotests = false
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
+
+[features]
+default = []
+# Application-owned, bounded diagnostics for an approved non-production runner.
+qualification-diagnostics = ["pioneer-observability/qualification-diagnostics"]
 
 [[bin]]
 name = "pioneer-app"
 path = "src/main.rs"
 
 [dependencies]
+pioneer-desktop-thread.workspace = true
+pioneer-desktop-administration.workspace = true
+pioneer-desktop-providers.workspace = true
+pioneer-desktop-mcp.workspace = true
+pioneer-desktop-skills.workspace = true
+pioneer-desktop-agents-doc.workspace = true
+pioneer-desktop-settings.workspace = true
+pioneer-desktop-onboarding.workspace = true
+pioneer-desktop-workspaces.workspace = true
+pioneer-desktop-update.workspace = true
+pioneer-desktop-task-notifications.workspace = true
 anyhow.workspace = true
-async-trait.workspace = true
 base64.workspace = true
 tracing.workspace = true
-tracing-subscriber.workspace = true
 pioneer-config.workspace = true
 pioneer-client.workspace = true
+pioneer-desktop-foundation.workspace = true
 pioneer-keystore.workspace = true
 pioneer-observability.workspace = true
 pioneer-protocol.workspace = true
-pioneer-tools.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-semver.workspace = true
-sha2.workspace = true
 toml.workspace = true
 zeroize.workspace = true
-gpui.workspace = true
-gpui_platform.workspace = true
 terminal.workspace = true
-gpui-component.workspace = true
-gpui-component-assets.workspace = true
+gpui-kit = { workspace = true, features = ["component", "assets"] }
 rust-i18n.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 futures-util.workspace = true
-chrono.workspace = true
 sys-locale.workspace = true
 rust-embed.workspace = true
 reqwest = { workspace = true, features = ["blocking"] }
 image.workspace = true
 cpal.workspace = true
-syntect.workspace = true
-two-face.workspace = true
-unicode-width.workspace = true
+webbrowser.workspace = true
+url.workspace = true
 
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"
@@ -58,6 +66,9 @@ windows-sys = { workspace = true, features = [
 ] }
 
 [dev-dependencies]
+# Syntax-aware ownership and Render checks use the already locked parser.
+syn = { version = "=2.0.119", features = ["full", "visit"] }
+gpui-kit = { workspace = true, features = ["test-support"] }
 hex.workspace = true
 tempfile.workspace = true
 tokio-tungstenite.workspace = true

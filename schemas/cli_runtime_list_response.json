@@ -3,6 +3,13 @@
   "title": "CLIRuntimeListResponse",
   "type": "object",
   "properties": {
+    "revision": {
+      "description": "Monotonic revision of the authoritative Gateway snapshot for this\nworkspace. Clients use it to reject late list responses that would\notherwise overwrite newer status notifications.",
+      "type": "integer",
+      "format": "uint64",
+      "default": 0,
+      "minimum": 0
+    },
     "runtimes": {
       "type": "array",
       "items": {

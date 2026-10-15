@@ -117,7 +117,11 @@ impl CanonicalAgentActionService {
                     ..
                 } => ResourceAction::TaskDetach,
                 AgentActionIntent::ControlTask {
-                    control: pioneer_protocol::AgentTaskControl::Resume,
+                    control:
+                        pioneer_protocol::AgentTaskControl::Resume
+                        | pioneer_protocol::AgentTaskControl::Pause
+                        | pioneer_protocol::AgentTaskControl::Update
+                        | pioneer_protocol::AgentTaskControl::Reschedule,
                     ..
                 } => ResourceAction::TaskScheduleManage,
                 _ => unreachable!("normalized control kind comes from a control intent"),
@@ -294,7 +298,7 @@ impl CanonicalAgentActionService {
         // A Task action creates a durable aggregate; its concrete occurrence
         // execution is admitted by the scheduler with the persisted Task
         // graph. Reserving a synthetic execution here would double-account
-        // the same work and leave an orphan permit. Direct agent_start, by
+        // the same work and leave an orphan permit. Direct threads_turn_start, by
         // contrast, materializes its child execution in this action.
         let spawned_execution_id = (normalized.kind == AgentActionKind::StartAgent)
             .then(|| execution_id_for_action(&normalized.action_id));

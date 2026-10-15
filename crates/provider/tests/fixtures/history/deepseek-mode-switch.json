@@ -1,0 +1,14 @@
+{
+  "description": "Unexecuted cross-group reproducer: previous thinking tool turn, next request Disabled. G04 must map thinking disabled; G05 retains original provider reasoning state.",
+  "source": "https://api-docs.deepseek.com/guides/thinking_mode/",
+  "provider": "deepseek",
+  "model": "deepseek-flash",
+  "messages": [
+    {"role":"user","content":"start"},
+    {"role":"assistant","content":"","reasoning_content":"prior native reasoning","tool_calls":[{"id":"call","name":"read","arguments":"{}"}],"provider_replay_state":{"provider":"deepseek","model":"deepseek-flash","payload":{"schema_version":1,"assistant_message":{"content":null,"reasoning_content":"prior native reasoning","tool_calls":[{"id":"call","type":"function","function":{"name":"read","arguments":"{}"}}]}}}},
+    {"role":"tool","content":"output","tool_call_id":"call","name":"read"}
+  ],
+  "next_reasoning": "Disabled",
+  "expected_control_after_G04": {"thinking":{"type":"disabled"}},
+  "evidence": "synthetic source-derived fixture, not runtime acceptance; legacy R1 tool capability must be selected from catalog/profile"
+}

@@ -18,6 +18,13 @@ pub struct Model {
     pub restored_at: Option<DateTimeWithTimeZone>,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
+    pub projected_through_sequence: i64,
+    pub receipts_compacted_through_sequence: i64,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub accepted_terminal_event_id: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub accepted_terminal_event_type: Option<String>,
+    pub accepted_terminal_sequence: Option<i64>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

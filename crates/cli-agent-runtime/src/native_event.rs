@@ -3,6 +3,11 @@ use std::fmt;
 use std::fs::File;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt};
 
+/// Provider-neutral disk-backed ceiling for one native JSONL frame. Adapters
+/// with a demonstrated need for a larger recovery window must opt in to their
+/// own narrower contract instead of widening every CLI provider implicitly.
+pub const DEFAULT_MAX_RECOVERY_FRAME_BYTES: usize = 64 * 1024 * 1024;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NativeEventBudget {
@@ -54,7 +59,7 @@ impl NativeEventBudget {
 }
 
 const fn default_max_recovery_frame_bytes() -> usize {
-    64 * 1024 * 1024
+    DEFAULT_MAX_RECOVERY_FRAME_BYTES
 }
 
 const fn min_usize(left: usize, right: usize) -> usize {
@@ -228,9 +233,21 @@ impl Default for BoundedNativeEventCodec {
 
 #[cfg(test)]
 mod tests {
-    use super::{BoundedNativeEventCodec, NativeEventBudget, SpooledNativeFrame};
+    use super::{
+        BoundedNativeEventCodec, DEFAULT_MAX_RECOVERY_FRAME_BYTES, NativeEventBudget,
+        SpooledNativeFrame,
+    };
     use std::io::{Read, Seek, SeekFrom};
     use tokio::io::BufReader;
+
+    #[test]
+    fn default_recovery_ceiling_remains_provider_neutral() {
+        assert_eq!(DEFAULT_MAX_RECOVERY_FRAME_BYTES, 64 * 1024 * 1024);
+        assert_eq!(
+            NativeEventBudget::default().max_recovery_frame_bytes,
+            DEFAULT_MAX_RECOVERY_FRAME_BYTES,
+        );
+    }
 
     #[test]
     fn native_event_budget_intersection_never_widens_admitted_limits() {

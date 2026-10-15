@@ -632,10 +632,12 @@ fn hook_tool_names_to_strings(tool_names: &[HookToolName]) -> Vec<&str> {
 #[derive(Default)]
 struct TestMemoryWriteProvider {
     manifest_calls: Arc<Mutex<usize>>,
+    manifest_failures: Mutex<std::collections::VecDeque<crate::MemoryManifestFailure>>,
     write_calls: Arc<Mutex<usize>>,
     write_params: Arc<Mutex<Vec<MemorySemanticWriteParams>>>,
     write_contexts: Arc<Mutex<Vec<MemoryTurnContext>>>,
     response: Option<MemorySemanticWriteResponse>,
+    failures: Mutex<std::collections::VecDeque<Option<crate::MemoryWriteFailure>>>,
 }
 
 impl TestMemoryWriteProvider {
@@ -671,11 +673,14 @@ impl AgentMemoryWriteProvider for TestMemoryWriteProvider {
         &self,
         _context: MemoryTurnContext,
         _request: MemoryManifestRequest,
-    ) -> Result<MemoryManifest, String> {
+    ) -> Result<MemoryManifest, crate::MemoryManifestFailure> {
         *self
             .manifest_calls
             .lock()
             .expect("manifest call lock poisoned") += 1;
+        if let Some(failure) = self.manifest_failures.lock().unwrap().pop_front() {
+            return Err(failure);
+        }
         Ok(MemoryManifest::default())
     }
 
@@ -683,7 +688,7 @@ impl AgentMemoryWriteProvider for TestMemoryWriteProvider {
         &self,
         context: MemoryTurnContext,
         params: MemorySemanticWriteParams,
-    ) -> Result<MemorySemanticWriteResponse, String> {
+    ) -> Result<MemorySemanticWriteResponse, crate::MemoryWriteFailure> {
         *self.write_calls.lock().expect("write call lock poisoned") += 1;
         self.write_contexts
             .lock()
@@ -693,6 +698,14 @@ impl AgentMemoryWriteProvider for TestMemoryWriteProvider {
             .lock()
             .expect("write params lock poisoned")
             .push(params);
+        if let Some(Some(failure)) = self
+            .failures
+            .lock()
+            .expect("failure sequence lock")
+            .pop_front()
+        {
+            return Err(failure);
+        }
         Ok(self
             .response
             .clone()
@@ -731,12 +744,12 @@ impl TestPostTurnExtractorProvider {
 }
 
 struct TestSequencedPostTurnExtractorProvider {
-    responses: std::sync::Mutex<std::collections::VecDeque<Result<String, String>>>,
+    responses: std::sync::Mutex<std::collections::VecDeque<HookResult<String>>>,
     contexts: Arc<Mutex<Vec<MemoryPostTurnExtractorContext>>>,
 }
 
 impl TestSequencedPostTurnExtractorProvider {
-    fn new(responses: impl IntoIterator<Item = Result<String, String>>) -> Self {
+    fn new(responses: impl IntoIterator<Item = HookResult<String>>) -> Self {
         Self {
             responses: std::sync::Mutex::new(responses.into_iter().collect()),
             contexts: Arc::new(Mutex::new(Vec::new())),
@@ -754,7 +767,7 @@ impl AgentMemoryPostTurnExtractorProvider for TestSequencedPostTurnExtractorProv
         &self,
         context: MemoryPostTurnExtractorContext,
         _request: MemoryPostTurnExtractorRequest,
-    ) -> Result<String, String> {
+    ) -> HookResult<String> {
         self.contexts
             .lock()
             .expect("context lock poisoned")
@@ -763,7 +776,12 @@ impl AgentMemoryPostTurnExtractorProvider for TestSequencedPostTurnExtractorProv
             .lock()
             .expect("post-turn sequenced provider responses lock poisoned")
             .pop_front()
-            .unwrap_or_else(|| Err("no sequenced provider response".to_owned()))
+            .unwrap_or_else(|| {
+                Err(memory_hook_error(
+                    "memory.post_turn_extractor.test_sequence_exhausted",
+                    "no sequenced provider response",
+                ))
+            })
     }
 }
 
@@ -773,7 +791,7 @@ impl AgentMemoryPostTurnExtractorProvider for TestPostTurnExtractorProvider {
         &self,
         context: MemoryPostTurnExtractorContext,
         request: MemoryPostTurnExtractorRequest,
-    ) -> Result<String, String> {
+    ) -> HookResult<String> {
         *self.calls.lock().expect("extractor call lock poisoned") += 1;
         self.contexts
             .lock()
@@ -804,9 +822,12 @@ impl AgentMemoryPostTurnExtractorProvider for TestFailingPostTurnExtractorProvid
         &self,
         _context: MemoryPostTurnExtractorContext,
         _request: MemoryPostTurnExtractorRequest,
-    ) -> Result<String, String> {
+    ) -> HookResult<String> {
         *self.calls.lock().expect("extractor call lock poisoned") += 1;
-        Err("provider unavailable".to_owned())
+        Err(memory_retryable_safe_hook_error(
+            "memory.post_turn_extractor.provider_network_transient",
+            "memory post-turn extractor provider failed",
+        ))
     }
 }
 
@@ -832,6 +853,7 @@ fn test_semantic_write_response() -> MemorySemanticWriteResponse {
 
 fn test_memory_record(id: &str) -> MemoryRecord {
     MemoryRecord {
+        recall_eligibility: None,
         id: id.to_owned(),
         scope: user_scope(),
         namespace: Some("identity".to_owned()),

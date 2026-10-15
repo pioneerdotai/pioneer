@@ -21,6 +21,182 @@
     "context"
   ],
   "$defs": {
+    "ProviderErrorReason": {
+      "description": "Allowlisted OpenRouter Chat Completions metadata.error_type values.\nDiagnostic only: these values must not drive recovery policy.",
+      "type": "string",
+      "enum": [
+        "context_length_exceeded",
+        "max_tokens_exceeded",
+        "token_limit_exceeded",
+        "string_too_long",
+        "authentication",
+        "permission_denied",
+        "payment_required",
+        "rate_limit_exceeded",
+        "provider_overloaded",
+        "provider_unavailable",
+        "invalid_request",
+        "invalid_prompt",
+        "not_found",
+        "precondition_failed",
+        "payload_too_large",
+        "unprocessable",
+        "content_policy_violation",
+        "refusal",
+        "invalid_image",
+        "image_too_large",
+        "image_too_small",
+        "unsupported_image_format",
+        "image_not_found",
+        "image_download_failed",
+        "server",
+        "timeout",
+        "unmapped"
+      ]
+    },
+    "ProviderFailureClass": {
+      "type": "string",
+      "enum": [
+        "network_transient",
+        "rate_limit",
+        "provider_5xx",
+        "auth_expired",
+        "auth_or_permission",
+        "model_not_found",
+        "prompt_too_long",
+        "context_too_large",
+        "max_output_tokens",
+        "stream_stall",
+        "stream_truncated",
+        "empty_response",
+        "provider_rejected",
+        "unsupported_parameter",
+        "unsupported_capability",
+        "unsupported_image_input",
+        "unsupported_tool_calling",
+        "unsupported_streaming",
+        "malformed_provider_request",
+        "invalid_request",
+        "permission_denied",
+        "unknown"
+      ]
+    },
+    "ProviderFailureStage": {
+      "type": "string",
+      "enum": [
+        "connect",
+        "first_chunk",
+        "mid_stream",
+        "finalize"
+      ]
+    },
+    "ProviderRequestId": {
+      "type": "string",
+      "maxLength": 128,
+      "pattern": "^(gen-|req-|cmpl-|chatcmpl-)[A-Za-z0-9_-]+$"
+    },
+    "ProviderTransportKind": {
+      "type": "string",
+      "enum": [
+        "stream",
+        "non_stream",
+        "ws",
+        "sse"
+      ]
+    },
+    "RecoveryDiagnostic": {
+      "type": "object",
+      "properties": {
+        "lastFailure": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RecoveryProviderFailure"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "stopReason": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RecoveryStopReason"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "RecoveryProviderFailure": {
+      "type": "object",
+      "properties": {
+        "class": {
+          "$ref": "#/$defs/ProviderFailureClass"
+        },
+        "errorReason": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProviderErrorReason"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "httpStatus": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "requestId": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProviderRequestId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "retryAfterMs": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "stage": {
+          "$ref": "#/$defs/ProviderFailureStage"
+        },
+        "transport": {
+          "$ref": "#/$defs/ProviderTransportKind"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "class",
+        "stage",
+        "transport"
+      ]
+    },
+    "RecoveryStopReason": {
+      "type": "string",
+      "enum": [
+        "attempts_exhausted",
+        "wall_clock_exhausted",
+        "no_progress",
+        "policy_rejected",
+        "terminal_failure"
+      ]
+    },
     "TaskArtifact": {
       "type": "object",
       "properties": {
@@ -93,6 +269,16 @@
         },
         "message": {
           "type": "string"
+        },
+        "recoveryDiagnostic": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RecoveryDiagnostic"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "required": [

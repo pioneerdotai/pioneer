@@ -478,6 +478,8 @@ impl MessageProcessor {
         {
             Ok(status) => {
                 self.cancel_artifact_streams(&workspace_id, &params.artifact_id);
+                self.notify_html_artifact_changed(&workspace_id, &params.artifact_id)
+                    .await;
                 self.send_artifact_result(
                     connection_id,
                     request_id,
@@ -542,6 +544,8 @@ impl MessageProcessor {
             .await
         {
             Ok(status) => {
+                self.notify_html_artifact_changed(&workspace_id, &params.artifact_id)
+                    .await;
                 self.send_artifact_result(
                     connection_id,
                     request_id,
@@ -729,6 +733,7 @@ fn filter_from_params(params: ArtifactListParams) -> ArtifactListFilter {
         thread_id: params.thread_id,
         thread_ids: Vec::new(),
         authorized_artifact_ids: None,
+        created_by_actor_id: None,
         turn_id: params.turn_id,
         message_id: params.message_id,
         task_id: params.task_id,

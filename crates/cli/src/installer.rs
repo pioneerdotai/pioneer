@@ -12,7 +12,7 @@ use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tempfile::TempDir;
 
 const INSTALLER_HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -81,6 +81,16 @@ pub struct InstallReport {
     pub rollback_performed: bool,
     pub error_code: Option<String>,
     pub warnings: Vec<InstallWarning>,
+    #[serde(default)]
+    pub stage_timings: Vec<InstallStageTiming>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstallStageTiming {
+    pub stage: String,
+    pub started_after_ms: u64,
+    pub duration_ms: u64,
+    pub outcome: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -124,6 +134,8 @@ struct StatusOutput {
 struct StartOutput {
     #[serde(default)]
     warnings: Vec<InstallWarning>,
+    #[serde(default)]
+    stage_timings: Vec<InstallStageTiming>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -134,6 +146,17 @@ struct VersionOutput {
 #[derive(Debug, Deserialize)]
 struct GithubRelease {
     tag_name: String,
+    #[serde(default)]
+    draft: bool,
+    #[serde(default)]
+    prerelease: bool,
+    #[serde(default)]
+    assets: Vec<GithubReleaseAsset>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubReleaseAsset {
+    name: String,
 }
 
 #[derive(Debug, Clone)]
@@ -212,101 +235,174 @@ enum DownloadAttemptFailure {
 }
 
 pub fn run_install(options: InstallOptions) -> Result<InstallReport> {
-    let config = AppConfig::load().context("failed to load app config for install/update")?;
+    let install_started = Instant::now();
+    let mut stage_timings = Vec::new();
+    let config = observe_install_stage(
+        &mut stage_timings,
+        install_started,
+        "installer.config.load",
+        || AppConfig::load().context("failed to load app config for install/update"),
+    )?;
 
-    let source = resolve_install_source(&options)
-        .context("failed to resolve installer source for install/update")?;
+    let source = observe_install_stage(
+        &mut stage_timings,
+        install_started,
+        "installer.source.resolve",
+        || {
+            resolve_install_source(&options)
+                .context("failed to resolve installer source for install/update")
+        },
+    )?;
 
-    let install_root = install_root_path(&config)?;
-    let bin_dir = install_root.join("bin");
-    let target_binary = bin_dir.join(config.install_binary_file_name()?);
-    let staged_binary = bin_dir.join(config.install_staged_binary_file_name()?);
-    let rollback_binary = bin_dir.join(config.install_rollback_binary_file_name()?);
-    fs::create_dir_all(&bin_dir)
-        .with_context(|| format!("failed to create install directory `{}`", bin_dir.display()))?;
+    let (install_root, bin_dir, target_binary, staged_binary, rollback_binary) =
+        observe_install_stage(
+            &mut stage_timings,
+            install_started,
+            "installer.paths.prepare",
+            || {
+                let install_root = install_root_path(&config)?;
+                let bin_dir = install_root.join("bin");
+                let target_binary = bin_dir.join(config.install_binary_file_name()?);
+                let staged_binary = bin_dir.join(config.install_staged_binary_file_name()?);
+                let rollback_binary = bin_dir.join(config.install_rollback_binary_file_name()?);
+                fs::create_dir_all(&bin_dir).with_context(|| {
+                    format!("failed to create install directory `{}`", bin_dir.display())
+                })?;
+                Ok((
+                    install_root,
+                    bin_dir,
+                    target_binary,
+                    staged_binary,
+                    rollback_binary,
+                ))
+            },
+        )?;
 
-    let asset_name = source
-        .asset_path
-        .file_name()
-        .and_then(OsStr::to_str)
-        .context("asset path has no file name")?;
-    let expected_sha = expected_checksum_for_asset(&source.checksums_path, asset_name)?;
-    let actual_sha = sha256_file(&source.asset_path)?;
-    if expected_sha != actual_sha {
-        bail!(
-            "checksum mismatch for {}: expected {}, got {}",
-            asset_name,
-            expected_sha,
-            actual_sha
-        );
-    }
+    observe_install_stage(
+        &mut stage_timings,
+        install_started,
+        "installer.asset.verify",
+        || {
+            let asset_name = source
+                .asset_path
+                .file_name()
+                .and_then(OsStr::to_str)
+                .context("asset path has no file name")?;
+            let expected_sha = expected_checksum_for_asset(&source.checksums_path, asset_name)?;
+            let actual_sha = sha256_file(&source.asset_path)?;
+            if expected_sha != actual_sha {
+                bail!(
+                    "checksum mismatch for {}: expected {}, got {}",
+                    asset_name,
+                    expected_sha,
+                    actual_sha
+                );
+            }
+            Ok(())
+        },
+    )?;
 
-    if staged_binary.exists() {
-        let _ = fs::remove_file(&staged_binary);
-    }
-    unpack_asset_to_binary(&source.asset_path, &staged_binary)?;
-    make_binary_executable(&staged_binary)?;
+    observe_install_stage(
+        &mut stage_timings,
+        install_started,
+        "installer.asset.unpack",
+        || {
+            if staged_binary.exists() {
+                let _ = fs::remove_file(&staged_binary);
+            }
+            unpack_asset_to_binary(&source.asset_path, &staged_binary)?;
+            make_binary_executable(&staged_binary)
+        },
+    )?;
 
     let existing = target_binary.is_file();
-    let mut was_active = false;
-    let mut runtime_home: Option<PathBuf> = None;
-    let mut config_backup_dir: Option<PathBuf> = None;
-    if existing {
-        if let Some(snapshot) = query_gateway_status(&target_binary)? {
-            was_active = snapshot.service_active;
-            runtime_home = snapshot.runtime_home;
-        }
-
-        if let Some(home) = runtime_home.as_ref() {
+    let (was_active, runtime_home) = observe_install_stage(
+        &mut stage_timings,
+        install_started,
+        "installer.current.inspect",
+        || {
+            if !existing {
+                return Ok((false, None));
+            }
+            Ok(query_gateway_status(&target_binary)?
+                .map(|snapshot| (snapshot.service_active, snapshot.runtime_home))
+                .unwrap_or((false, None)))
+        },
+    )?;
+    let config_backup_dir = observe_install_stage(
+        &mut stage_timings,
+        install_started,
+        "installer.config.backup",
+        || {
+            let Some(home) = runtime_home.as_ref() else {
+                return Ok(None);
+            };
             let backup_dir = bin_dir.join(format!("config.rollback.{}", unix_timestamp_secs()?));
             if backup_runtime_toml(home, &backup_dir)? {
-                config_backup_dir = Some(backup_dir);
+                Ok(Some(backup_dir))
+            } else {
+                Ok(None)
             }
-        }
-    }
+        },
+    )?;
 
     let should_start = !options.no_start && (options.force_start || !existing || was_active);
     let mut warnings: Vec<InstallWarning> = Vec::new();
     if was_active {
-        run_gateway_command(
-            &target_binary,
-            &["stop"],
-            &options.managed_by,
-            false,
-            "stop",
-        )?;
-    }
-
-    if rollback_binary.exists() {
-        let _ = fs::remove_file(&rollback_binary);
-    }
-
-    if existing {
-        fs::rename(&target_binary, &rollback_binary).with_context(|| {
-            format!(
-                "failed to move existing binary `{}` to rollback `{}`",
-                target_binary.display(),
-                rollback_binary.display()
+        observe_install_stage(&mut stage_timings, install_started, "service.stop", || {
+            run_gateway_command(
+                &target_binary,
+                &["stop"],
+                &options.managed_by,
+                false,
+                "stop",
             )
         })?;
     }
 
-    if let Err(error) = fs::rename(&staged_binary, &target_binary) {
-        restore_binary_and_config(
-            &target_binary,
-            &rollback_binary,
-            runtime_home.as_deref(),
-            config_backup_dir.as_deref(),
-        );
-        return Err(error).with_context(|| {
-            format!(
-                "failed to replace binary with staged file `{}`",
-                target_binary.display()
-            )
-        });
-    }
+    observe_install_stage(
+        &mut stage_timings,
+        install_started,
+        "installer.binary.replace",
+        || {
+            if rollback_binary.exists() {
+                let _ = fs::remove_file(&rollback_binary);
+            }
 
-    let installed_version = match query_binary_version(&target_binary) {
+            if existing {
+                fs::rename(&target_binary, &rollback_binary).with_context(|| {
+                    format!(
+                        "failed to move existing binary `{}` to rollback `{}`",
+                        target_binary.display(),
+                        rollback_binary.display()
+                    )
+                })?;
+            }
+
+            if let Err(error) = fs::rename(&staged_binary, &target_binary) {
+                restore_binary_and_config(
+                    &target_binary,
+                    &rollback_binary,
+                    runtime_home.as_deref(),
+                    config_backup_dir.as_deref(),
+                );
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to replace binary with staged file `{}`",
+                        target_binary.display()
+                    )
+                });
+            }
+            Ok(())
+        },
+    )?;
+
+    let installed_version = match observe_install_stage(
+        &mut stage_timings,
+        install_started,
+        "installer.binary.version_probe",
+        || query_binary_version(&target_binary),
+    ) {
         Ok(version) => version,
         Err(error) => {
             restore_binary_and_config(
@@ -325,7 +421,12 @@ pub fn run_install(options: InstallOptions) -> Result<InstallReport> {
         }
     };
 
-    let link_result = match ensure_global_command_link(&config, &target_binary) {
+    let link_result = match observe_install_stage(
+        &mut stage_timings,
+        install_started,
+        "installer.command_link.ensure",
+        || ensure_global_command_link(&config, &target_binary),
+    ) {
         Ok(result) => result,
         Err(error) => {
             restore_binary_and_config(
@@ -348,8 +449,21 @@ pub fn run_install(options: InstallOptions) -> Result<InstallReport> {
     warnings.extend(link_result.warnings);
 
     if should_start {
+        let stage_started = Instant::now();
         match run_gateway_start_command(&target_binary, &options.managed_by) {
-            Ok(start_warnings) => warnings.extend(start_warnings),
+            Ok(start_output) => {
+                let nested_offset = duration_millis(stage_started.duration_since(install_started));
+                warnings.extend(start_output.warnings);
+                stage_timings.push(successful_stage_timing(
+                    "service.start",
+                    install_started,
+                    stage_started,
+                ));
+                stage_timings.extend(start_output.stage_timings.into_iter().map(|mut timing| {
+                    timing.started_after_ms = nested_offset.saturating_add(timing.started_after_ms);
+                    timing
+                }));
+            }
             Err(error) => {
                 rollback_and_restore(
                     &target_binary,
@@ -363,6 +477,7 @@ pub fn run_install(options: InstallOptions) -> Result<InstallReport> {
             }
         };
 
+        let stage_started = Instant::now();
         if !wait_for_gateway_health(&target_binary, Duration::from_secs(30)) {
             let _ = run_gateway_command(
                 &target_binary,
@@ -381,13 +496,25 @@ pub fn run_install(options: InstallOptions) -> Result<InstallReport> {
             );
             bail!("gateway failed health check after update; update rolled back");
         }
+        stage_timings.push(successful_stage_timing(
+            "health.wait",
+            install_started,
+            stage_started,
+        ));
     }
 
-    if let Err(error) = persist_install_state(
-        &options.managed_by,
-        &target_binary,
-        &install_root,
-        installed_version.as_str(),
+    if let Err(error) = observe_install_stage(
+        &mut stage_timings,
+        install_started,
+        "installer.state.persist",
+        || {
+            persist_install_state(
+                &options.managed_by,
+                &target_binary,
+                &install_root,
+                installed_version.as_str(),
+            )
+        },
     ) {
         rollback_and_restore(
             &target_binary,
@@ -400,14 +527,28 @@ pub fn run_install(options: InstallOptions) -> Result<InstallReport> {
         bail!("failed to persist install-state: {error:#}; update rolled back");
     }
 
-    if rollback_binary.exists() {
-        let _ = fs::remove_file(&rollback_binary);
-    }
-    if let Some(backup_dir) = config_backup_dir.as_ref() {
-        let _ = fs::remove_dir_all(backup_dir);
-    }
+    observe_install_stage(
+        &mut stage_timings,
+        install_started,
+        "installer.cleanup",
+        || {
+            if rollback_binary.exists() {
+                let _ = fs::remove_file(&rollback_binary);
+            }
+            if let Some(backup_dir) = config_backup_dir.as_ref() {
+                let _ = fs::remove_dir_all(backup_dir);
+            }
+            Ok(())
+        },
+    )?;
 
-    let post_status = query_gateway_status(&target_binary)?.unwrap_or(ServiceSnapshot {
+    let post_status = observe_install_stage(
+        &mut stage_timings,
+        install_started,
+        "installer.post_status.probe",
+        || query_gateway_status(&target_binary),
+    )?
+    .unwrap_or(ServiceSnapshot {
         service_active: false,
         gateway_reachable: false,
         runtime_home: None,
@@ -434,7 +575,42 @@ pub fn run_install(options: InstallOptions) -> Result<InstallReport> {
         rollback_performed: false,
         error_code: None,
         warnings,
+        stage_timings,
     })
+}
+
+fn observe_install_stage<T>(
+    stage_timings: &mut Vec<InstallStageTiming>,
+    install_started: Instant,
+    stage: &'static str,
+    operation: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let stage_started = Instant::now();
+    let result = operation();
+    stage_timings.push(InstallStageTiming {
+        stage: stage.to_owned(),
+        started_after_ms: duration_millis(stage_started.duration_since(install_started)),
+        duration_ms: duration_millis(stage_started.elapsed()),
+        outcome: if result.is_ok() { "ok" } else { "error" }.to_owned(),
+    });
+    result
+}
+
+fn successful_stage_timing(
+    stage: &'static str,
+    install_started: Instant,
+    stage_started: Instant,
+) -> InstallStageTiming {
+    InstallStageTiming {
+        stage: stage.to_owned(),
+        started_after_ms: duration_millis(stage_started.duration_since(install_started)),
+        duration_ms: duration_millis(stage_started.elapsed()),
+        outcome: "ok".to_owned(),
+    }
+}
+
+fn duration_millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 fn resolve_install_source(options: &InstallOptions) -> Result<ResolvedInstallSource> {
@@ -482,8 +658,8 @@ fn resolve_release_install_source(
         .build()
         .context("failed to initialize HTTP client")?;
 
-    let tag = resolve_release_tag(&client, &api_base, channel, version)?;
     let asset_name = gateway_asset_file_name()?;
+    let tag = resolve_release_tag(&client, &api_base, channel, version, asset_name.as_str())?;
     let temp_dir = TempDir::new().context("failed to allocate temporary download directory")?;
     let asset_path = temp_dir.path().join(asset_name.as_str());
     let checksums_path = temp_dir.path().join("SHA256SUMS");
@@ -508,29 +684,28 @@ fn resolve_release_tag(
     api_base: &str,
     channel: ReleaseChannel,
     version: Option<&str>,
+    asset_name: &str,
 ) -> Result<String> {
     if let Some(pinned_version) = version {
-        return Ok(normalize_version_tag(pinned_version));
-    }
-
-    if matches!(channel, ReleaseChannel::Stable) {
-        let url = format!("{api_base}/latest");
+        let tag = normalize_version_tag(pinned_version);
+        let url = format!("{}/tags/{tag}", api_base.trim_end_matches('/'));
         let release = client
             .get(url.as_str())
             .send()
-            .with_context(|| format!("failed to fetch latest release metadata from `{url}`"))?
+            .with_context(|| format!("failed to fetch pinned release metadata from `{url}`"))?
             .error_for_status()
-            .with_context(|| format!("release API request failed for `{url}`"))?
+            .with_context(|| format!("pinned release `{tag}` does not exist"))?
             .json::<GithubRelease>()
-            .context("failed to parse latest release metadata")?;
-        let tag = release.tag_name.trim().to_owned();
-        if tag.is_empty() {
-            bail!("latest release payload does not include `tag_name`");
+            .context("failed to parse pinned release metadata")?;
+        if !release_has_gateway_assets(&release, asset_name) {
+            bail!(
+                "pinned release `{tag}` is not ready: required assets `{asset_name}` and `SHA256SUMS` are not both published"
+            );
         }
-        return Ok(tag);
+        return normalized_release_tag(&release);
     }
 
-    let url = format!("{api_base}?per_page=100");
+    let url = format!("{}?per_page=100", api_base.trim_end_matches('/'));
     let releases = client
         .get(url.as_str())
         .send()
@@ -539,32 +714,69 @@ fn resolve_release_tag(
         .with_context(|| format!("release API request failed for `{url}`"))?
         .json::<Vec<GithubRelease>>()
         .context("failed to parse release list response")?;
+    select_ready_release_tag(channel, releases.iter(), asset_name)
+}
 
-    let needle = format!("-{}", channel.as_str());
-    if let Some(tag) = releases.into_iter().find_map(|release| {
-        let tag = release.tag_name.trim().to_owned();
-        if !tag.is_empty() && tag.contains(needle.as_str()) {
-            Some(tag)
-        } else {
-            None
+fn normalize_version_tag(raw: &str) -> String {
+    raw.trim().to_owned()
+}
+
+fn normalized_release_tag(release: &GithubRelease) -> Result<String> {
+    let tag = release.tag_name.trim();
+    if tag.is_empty() {
+        bail!("release payload does not include `tag_name`");
+    }
+    Ok(tag.to_owned())
+}
+
+fn release_has_gateway_assets(release: &GithubRelease, asset_name: &str) -> bool {
+    let has_gateway = release.assets.iter().any(|asset| asset.name == asset_name);
+    let has_checksums = release
+        .assets
+        .iter()
+        .any(|asset| asset.name == "SHA256SUMS");
+    has_gateway && has_checksums
+}
+
+fn release_matches_channel(release: &GithubRelease, channel: ReleaseChannel) -> bool {
+    if release.draft {
+        return false;
+    }
+    match channel {
+        ReleaseChannel::Stable => !release.prerelease,
+        ReleaseChannel::Beta | ReleaseChannel::Canary => {
+            let needle = format!("-{}", channel.as_str());
+            release.tag_name.trim().contains(needle.as_str())
         }
-    }) {
-        return Ok(tag);
+    }
+}
+
+fn select_ready_release_tag<'a>(
+    channel: ReleaseChannel,
+    releases: impl IntoIterator<Item = &'a GithubRelease>,
+    asset_name: &str,
+) -> Result<String> {
+    let mut matching_release_found = false;
+    for release in releases {
+        if !release_matches_channel(release, channel) {
+            continue;
+        }
+        matching_release_found = true;
+        if release_has_gateway_assets(release, asset_name) {
+            return normalized_release_tag(release);
+        }
     }
 
+    if matching_release_found {
+        bail!(
+            "no fully published `{}` release contains required assets `{asset_name}` and `SHA256SUMS`",
+            channel.as_str()
+        );
+    }
     bail!(
         "failed to find release tag for channel `{}` from release list",
         channel.as_str()
     )
-}
-
-fn normalize_version_tag(raw: &str) -> String {
-    let trimmed = raw.trim();
-    if trimmed.starts_with('v') || trimmed.starts_with('V') {
-        trimmed.to_owned()
-    } else {
-        format!("v{trimmed}")
-    }
 }
 
 fn download_release_asset(client: &Client, url: &str, destination: &Path) -> Result<()> {
@@ -925,10 +1137,7 @@ fn wait_for_gateway_health(binary: &Path, timeout: Duration) -> bool {
     false
 }
 
-fn run_gateway_start_command(
-    binary: &Path,
-    managed_by: &InstallManagedBy,
-) -> Result<Vec<InstallWarning>> {
+fn run_gateway_start_command(binary: &Path, managed_by: &InstallManagedBy) -> Result<StartOutput> {
     let args = ["start", "--json"];
     let mut command = Command::new(binary);
     command.args(args.as_slice());
@@ -942,7 +1151,7 @@ fn run_gateway_start_command(
     })?;
 
     if output.status.success() {
-        return Ok(parse_start_warnings(&output.stdout));
+        return Ok(parse_start_output(&output.stdout));
     }
 
     bail!(
@@ -952,10 +1161,14 @@ fn run_gateway_start_command(
     )
 }
 
-fn parse_start_warnings(stdout: &[u8]) -> Vec<InstallWarning> {
-    serde_json::from_slice::<StartOutput>(stdout)
-        .map(|output| output.warnings)
-        .unwrap_or_default()
+fn parse_start_output(stdout: &[u8]) -> StartOutput {
+    serde_json::from_slice::<StartOutput>(stdout).unwrap_or_else(|_| StartOutput {
+        warnings: vec![InstallWarning::new(
+            "gateway_start_output_parse_failed",
+            "gateway start command succeeded but returned invalid JSON; detailed service stage timings are unavailable",
+        )],
+        stage_timings: Vec::new(),
+    })
 }
 
 fn run_gateway_command(
@@ -1753,9 +1966,11 @@ fn unix_timestamp_secs() -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DownloadRetryPolicy, download_partial_path, download_release_asset_with_policy,
+        DownloadRetryPolicy, GithubRelease, GithubReleaseAsset, ReleaseChannel,
+        download_partial_path, download_release_asset_with_policy,
         ensure_unix_user_path_configured, expected_checksum_for_asset, force_path_update_warning,
-        is_transient_download_error, parse_start_warnings,
+        is_transient_download_error, normalize_version_tag, parse_start_output,
+        select_ready_release_tag,
     };
     use anyhow::Context as _;
     use reqwest::blocking::Client;
@@ -1770,6 +1985,62 @@ mod tests {
     use std::sync::{Mutex, OnceLock};
     use std::thread::{self, JoinHandle};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn install_reports_preserve_transient_download_classification_after_output_failure() {
+        struct FailedWriter(std::io::ErrorKind);
+
+        impl std::io::Write for FailedWriter {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(self.0, "controlled report failure"))
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                panic!("report writer must not flush after a failed write");
+            }
+        }
+
+        for name in ["install", "update", "self-update"] {
+            let (options, _) = crate::parse_install_command_options(name, std::iter::empty())
+                .expect("install command options");
+            for kind in [
+                std::io::ErrorKind::BrokenPipe,
+                std::io::ErrorKind::PermissionDenied,
+            ] {
+                let original = anyhow::Error::new(super::InstallerTransientDownloadError {
+                    url: "https://example.invalid/asset".into(),
+                    attempts: 4,
+                    last_error: "connection timeout".into(),
+                })
+                .context("resolve install source");
+                let error = crate::finish_install_result(
+                    options.command,
+                    Err(original),
+                    true,
+                    &mut FailedWriter(kind),
+                )
+                .expect_err("transient installation failure remains a failed command");
+
+                assert!(is_transient_download_error(&error));
+                assert!(
+                    error
+                        .downcast_ref::<super::InstallerTransientDownloadError>()
+                        .is_some()
+                );
+                assert!(format!("{error:#}").contains("resolve install source"));
+                assert_eq!(
+                    crate::install_error_code(options.command, &format!("{error:#}")),
+                    "download_transient_network_failure"
+                );
+                assert_eq!(
+                    error
+                        .downcast_ref::<crate::InstallFailureReportError>()
+                        .is_some(),
+                    kind != std::io::ErrorKind::BrokenPipe
+                );
+            }
+        }
+    }
 
     #[test]
     fn parses_prefixed_checksum_line() {
@@ -1842,6 +2113,90 @@ mod tests {
     }
 
     #[test]
+    fn release_version_preserves_repository_tag_convention() {
+        assert_eq!(normalize_version_tag(" 0.53.12 "), "0.53.12");
+        assert_eq!(normalize_version_tag("v0.53.12"), "v0.53.12");
+    }
+
+    #[test]
+    fn stable_channel_skips_newer_release_until_gateway_assets_are_ready() {
+        let releases = vec![
+            release("0.53.12", false, &["desktop-update-manifest.json"]),
+            release(
+                "0.53.11",
+                false,
+                &["pioneer-gateway-linux-x86_64.gz", "SHA256SUMS"],
+            ),
+        ];
+
+        let selected = select_ready_release_tag(
+            ReleaseChannel::Stable,
+            releases.iter(),
+            "pioneer-gateway-linux-x86_64.gz",
+        )
+        .expect("previous complete stable release should be selected");
+
+        assert_eq!(selected, "0.53.11");
+    }
+
+    #[test]
+    fn release_selection_requires_both_gateway_and_checksum_assets() {
+        let releases = vec![release(
+            "0.53.12",
+            false,
+            &["pioneer-gateway-linux-x86_64.gz"],
+        )];
+
+        let error = select_ready_release_tag(
+            ReleaseChannel::Stable,
+            releases.iter(),
+            "pioneer-gateway-linux-x86_64.gz",
+        )
+        .expect_err("release without checksums must remain unavailable");
+
+        assert!(format!("{error:#}").contains("no fully published"));
+    }
+
+    #[test]
+    fn stable_channel_ignores_prereleases_even_when_they_are_ready() {
+        let releases = vec![
+            release(
+                "0.54.0-beta.1",
+                true,
+                &["pioneer-gateway-linux-x86_64.gz", "SHA256SUMS"],
+            ),
+            release(
+                "0.53.12",
+                false,
+                &["pioneer-gateway-linux-x86_64.gz", "SHA256SUMS"],
+            ),
+        ];
+
+        let selected = select_ready_release_tag(
+            ReleaseChannel::Stable,
+            releases.iter(),
+            "pioneer-gateway-linux-x86_64.gz",
+        )
+        .expect("stable release should be selected");
+
+        assert_eq!(selected, "0.53.12");
+    }
+
+    fn release(tag_name: &str, prerelease: bool, assets: &[&str]) -> GithubRelease {
+        GithubRelease {
+            tag_name: tag_name.to_owned(),
+            draft: false,
+            prerelease,
+            assets: assets
+                .iter()
+                .map(|name| GithubReleaseAsset {
+                    name: (*name).to_owned(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
     fn release_asset_download_retries_transient_status_and_finalizes_atomically() {
         let body = b"gateway-asset";
         let (url, server) = spawn_http_responses(vec![
@@ -1872,7 +2227,7 @@ mod tests {
         let destination = temp_dir.path().join("gateway.gz");
 
         download_release_asset_with_policy(
-            &test_http_client_with_timeout(Duration::from_millis(50)),
+            &test_http_client(),
             url.as_str(),
             destination.as_path(),
             immediate_retry_policy(2),
@@ -1930,25 +2285,40 @@ mod tests {
     }
 
     #[test]
-    fn parses_start_warnings_from_json() {
-        let warnings = parse_start_warnings(
+    fn parses_start_output_from_json() {
+        let output = parse_start_output(
             br#"{
                 "phase":"started",
                 "warnings":[
                     {"code":"linux_linger_enable_failed","message":"run loginctl"}
+                ],
+                "stage_timings":[
+                    {"stage":"service.manager.activate","started_after_ms":10,"duration_ms":20,"outcome":"ok"}
                 ]
             }"#,
         );
 
-        assert_eq!(warnings.len(), 1);
-        assert_eq!(warnings[0].code, "linux_linger_enable_failed");
-        assert_eq!(warnings[0].message, "run loginctl");
+        assert_eq!(output.warnings.len(), 1);
+        assert_eq!(output.warnings[0].code, "linux_linger_enable_failed");
+        assert_eq!(output.warnings[0].message, "run loginctl");
+        assert_eq!(output.stage_timings.len(), 1);
+        assert_eq!(output.stage_timings[0].stage, "service.manager.activate");
+        assert_eq!(output.stage_timings[0].duration_ms, 20);
     }
 
     #[test]
-    fn ignores_missing_or_invalid_start_warnings() {
-        assert!(parse_start_warnings(br#"{"phase":"started"}"#).is_empty());
-        assert!(parse_start_warnings(b"not json").is_empty());
+    fn handles_missing_or_invalid_start_output_fields() {
+        let missing = parse_start_output(br#"{"phase":"started"}"#);
+        assert!(missing.warnings.is_empty());
+        assert!(missing.stage_timings.is_empty());
+
+        let invalid = parse_start_output(b"not json");
+        assert_eq!(invalid.warnings.len(), 1);
+        assert_eq!(
+            invalid.warnings[0].code,
+            "gateway_start_output_parse_failed"
+        );
+        assert!(invalid.stage_timings.is_empty());
     }
 
     #[cfg(not(windows))]
@@ -2252,22 +2622,19 @@ fi
     fn spawn_timeout_then_success(body: &'static [u8]) -> (String, JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind test HTTP server");
         let address = listener.local_addr().expect("test HTTP server address");
-        let delayed_response = http_response(200, "OK", b"late");
         let success_response = http_response(200, "OK", body);
         let server = thread::spawn(move || {
             let (mut first_stream, _) = listener.accept().expect("accept first HTTP request");
             read_http_request(&mut first_stream);
-            let delayed_writer = thread::spawn(move || {
-                thread::sleep(Duration::from_millis(200));
-                let _ = first_stream.write_all(&delayed_response);
-            });
-
+            // Keep the first connection open without replying until the retry
+            // arrives. This forces a request timeout without racing a sleep
+            // against the client's deadline or starving the successful retry.
             let (mut second_stream, _) = listener.accept().expect("accept retry HTTP request");
             read_http_request(&mut second_stream);
             second_stream
                 .write_all(&success_response)
                 .expect("write successful retry response");
-            delayed_writer.join().expect("delayed response writer");
+            drop(first_stream);
         });
         (format!("http://{address}/asset"), server)
     }
@@ -2290,13 +2657,22 @@ fi
             .set_read_timeout(Some(Duration::from_secs(2)))
             .expect("set request read timeout");
         let mut request = [0_u8; 4096];
-        let read = stream.read(&mut request).expect("read HTTP request");
-        assert!(
-            request[..read]
-                .windows(4)
-                .any(|window| window == b"\r\n\r\n"),
-            "request headers should be complete"
-        );
+        let mut read = 0;
+        // TCP may split headers across reads, even on loopback.
+        while !request[..read]
+            .windows(4)
+            .any(|window| window == b"\r\n\r\n")
+        {
+            assert!(read < request.len(), "request headers exceed fixture limit");
+            let received = stream
+                .read(&mut request[read..])
+                .expect("read HTTP request");
+            assert!(
+                received > 0,
+                "connection closed before request headers completed"
+            );
+            read += received;
+        }
     }
 
     fn http_response(status: u16, reason: &str, body: &[u8]) -> Vec<u8> {

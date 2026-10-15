@@ -5,7 +5,9 @@ use pioneer_protocol::{
     sanitize_runtime_diagnostic_line, sanitize_runtime_diagnostic_lines,
 };
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum CliRuntimeMcpReadinessReason {
     RuntimeNotReady,
     UnsupportedContract,

@@ -9,17 +9,17 @@ use anyhow::{Context, Result, anyhow, bail};
 use pioneer_crud::{
     BLOCK_KIND_APPROVAL, BLOCK_KIND_ASSISTANT_MESSAGE, BLOCK_KIND_DETACHED_TASK_RUN,
     BLOCK_KIND_RUNNING, BLOCK_KIND_SYSTEM, BLOCK_KIND_TURN_WORK, BLOCK_KIND_USER_MESSAGE,
-    CliRuntimePendingRequestListFilter, ProjectionPageAnchor, SEMANTIC_TIMELINE_PROJECTION_VERSION,
-    ThreadTimelineApprovalScope, WORK_VISIBILITY_VISIBLE, approval_block_id,
+    ProjectionPageAnchor, SEMANTIC_TIMELINE_PROJECTION_VERSION, ThreadTimelineApprovalScope,
+    WORK_VISIBILITY_VISIBLE, approval_block_id,
 };
 use pioneer_entity::{thread_timeline_block, turn_work_item_projection, turn_work_projection};
 use pioneer_protocol::{
     CLIRuntimePendingRequest, CLIRuntimePendingRequestStatus, CLIRuntimeRequestKind,
-    TaskThreadLineage, ThreadReadParams, ThreadTimelinePageParams, ThreadTimelinePageResponse,
-    TimelineBlock, TimelineBlockKind, TimelinePageInfo, TimelineReplySummary, Turn, TurnItem,
-    TurnWorkBlock, TurnWorkItem, TurnWorkItemStatus, TurnWorkItemsGetParams,
-    TurnWorkItemsGetResponse, TurnWorkPageParams, TurnWorkPageResponse, TurnWorkPresentation,
-    TurnWorkState, UserInput, UserMessageAttachment,
+    ThreadReadParams, ThreadTimelinePageParams, ThreadTimelinePageResponse, TimelineBlock,
+    TimelineBlockKind, TimelinePageInfo, TimelineReplySummary, Turn, TurnItem, TurnWorkBlock,
+    TurnWorkItem, TurnWorkItemStatus, TurnWorkItemsGetParams, TurnWorkItemsGetResponse,
+    TurnWorkPageParams, TurnWorkPageResponse, TurnWorkPresentation, TurnWorkState, UserInput,
+    UserMessageAttachment,
 };
 
 const TURN_WORK_ITEMS_GET_MAX_IDS: usize = 200;
@@ -93,6 +93,7 @@ struct UserMessageTimelineBatch {
 #[derive(Default)]
 struct AssistantMessageTimelineBatch {
     items: HashMap<(String, String), TurnItem>,
+    html: HashMap<(String, String), Vec<pioneer_protocol::HtmlPublication>>,
     authors: HashMap<String, pioneer_protocol::TurnAuthorSnapshot>,
 }
 
@@ -302,14 +303,42 @@ impl MessageProcessor {
                 return;
             }
         };
+        let include_descendant_pending = matches!(&anchor, ResolvedTimelineAnchor::Newest);
 
+        let trace = pioneer_observability::GatewayOperationTrace::start(
+            pioneer_observability::GatewayOperation::ThreadTimelinePage,
+        );
+        trace.set_variant(match &anchor {
+            ResolvedTimelineAnchor::Newest => {
+                pioneer_observability::GatewayOperationVariant::ThreadTimelineNewest
+            }
+            ResolvedTimelineAnchor::Oldest => {
+                pioneer_observability::GatewayOperationVariant::ThreadTimelineOldest
+            }
+            ResolvedTimelineAnchor::Before(_) => {
+                pioneer_observability::GatewayOperationVariant::ThreadTimelineBefore
+            }
+            ResolvedTimelineAnchor::After(_) => {
+                pioneer_observability::GatewayOperationVariant::ThreadTimelineAfter
+            }
+            ResolvedTimelineAnchor::Around(_) => {
+                pioneer_observability::GatewayOperationVariant::ThreadTimelineAround
+            }
+        });
+
+        let thread_load_stage =
+            trace.stage(pioneer_observability::GatewayOperationStage::ThreadTimelineThreadLoad);
         let thread_model = match self
             .crud_store
             .get_thread_by_id(params.thread_id.as_str())
             .await
         {
-            Ok(Some(thread_model)) => thread_model,
+            Ok(Some(thread_model)) => {
+                thread_load_stage.succeed();
+                thread_model
+            }
             Ok(None) => {
+                drop(thread_load_stage);
                 self.send_error(
                     connection_id,
                     timeline_public_error(
@@ -319,9 +348,11 @@ impl MessageProcessor {
                     ),
                 )
                 .await;
+                trace.finish_failure();
                 return;
             }
             Err(error) => {
+                drop(thread_load_stage);
                 self.send_error(
                     connection_id,
                     timeline_public_error(
@@ -331,6 +362,7 @@ impl MessageProcessor {
                     ),
                 )
                 .await;
+                trace.finish_failure();
                 return;
             }
         };
@@ -340,9 +372,12 @@ impl MessageProcessor {
                 AuthorizationExternalError::NotFound.response(request_id),
             )
             .await;
+            trace.finish_failure();
             return;
         }
 
+        let approval_resolve_stage = trace
+            .stage(pioneer_observability::GatewayOperationStage::ThreadTimelineApprovalResolve);
         let approval_action = crate::authorization::ResourceAction::AgentRequestObserve;
         let approval_gate = crate::authorization::AuthorizationService::new().authorize_action(
             request_context.principal().kind,
@@ -384,9 +419,12 @@ impl MessageProcessor {
             approval_resolution,
             Ok(crate::authorization::ProofResolution::Authorized(_))
         );
+        approval_resolve_stage.succeed();
         let approval_scope = ThreadTimelineApprovalScope {
             can_observe_agent_requests,
         };
+        let rows_load_stage =
+            trace.stage(pioneer_observability::GatewayOperationStage::ThreadTimelineRowsLoad);
         let rows_page = match self
             .load_thread_timeline_rows(
                 params.thread_id.as_str(),
@@ -396,8 +434,12 @@ impl MessageProcessor {
             )
             .await
         {
-            Ok(page) => page,
+            Ok(page) => {
+                rows_load_stage.succeed();
+                page
+            }
             Err(error) => {
+                drop(rows_load_stage);
                 self.send_error(
                     connection_id,
                     timeline_public_error(
@@ -407,17 +449,28 @@ impl MessageProcessor {
                     ),
                 )
                 .await;
+                trace.finish_failure();
                 return;
             }
         };
+        trace.record_items(
+            pioneer_observability::GatewayOperationItemKind::ThreadTimelineProjectionRows,
+            u64::try_from(rows_page.rows.len()).unwrap_or(u64::MAX),
+        );
 
+        let page_info_stage =
+            trace.stage(pioneer_observability::GatewayOperationStage::ThreadTimelinePageInfoBuild);
         let page_info = match self.thread_timeline_page_info(
             rows_page.rows.as_slice(),
             rows_page.has_more_before,
             rows_page.has_more_after,
         ) {
-            Ok(page_info) => page_info,
+            Ok(page_info) => {
+                page_info_stage.succeed();
+                page_info
+            }
             Err(error) => {
+                drop(page_info_stage);
                 self.send_error(
                     connection_id,
                     timeline_public_error(
@@ -427,18 +480,25 @@ impl MessageProcessor {
                     ),
                 )
                 .await;
+                trace.finish_failure();
                 return;
             }
         };
 
         let requested_thread_id = params.thread_id.clone();
         let workspace_id = thread_model.workspace_id.clone();
+        let blocks_materialize_stage = trace
+            .stage(pioneer_observability::GatewayOperationStage::ThreadTimelineBlocksMaterialize);
         let mut blocks = match self
             .thread_timeline_blocks_from_rows(rows_page.rows, Some(&approval_scope))
             .await
         {
-            Ok(blocks) => blocks,
+            Ok(blocks) => {
+                blocks_materialize_stage.succeed();
+                blocks
+            }
             Err(error) => {
+                drop(blocks_materialize_stage);
                 self.send_error(
                     connection_id,
                     timeline_public_error(
@@ -448,36 +508,63 @@ impl MessageProcessor {
                     ),
                 )
                 .await;
+                trace.finish_failure();
                 return;
             }
         };
-        let descendant_pending_blocks = match self
-            .descendant_pending_request_blocks(
-                workspace_id.as_str(),
-                requested_thread_id.as_str(),
-                Some(&approval_scope),
-            )
-            .await
-        {
-            Ok(blocks) => blocks,
-            Err(error) => {
-                self.send_error(
-                    connection_id,
-                    timeline_public_error(
-                        Some(request_id),
-                        INVALID_REQUEST_CODE,
-                        format!("failed to load descendant pending approvals: {error:#}"),
-                    ),
+        trace.record_items(
+            pioneer_observability::GatewayOperationItemKind::ThreadTimelineMaterializedBlocks,
+            u64::try_from(blocks.len()).unwrap_or(u64::MAX),
+        );
+        let descendant_pending_stage = trace.stage(
+            pioneer_observability::GatewayOperationStage::ThreadTimelineDescendantPendingLoad,
+        );
+        let descendant_pending_blocks = if include_descendant_pending {
+            match self
+                .descendant_pending_request_blocks(
+                    workspace_id.as_str(),
+                    requested_thread_id.as_str(),
+                    Some(&approval_scope),
                 )
-                .await;
-                return;
+                .await
+            {
+                Ok(blocks) => blocks,
+                Err(error) => {
+                    drop(descendant_pending_stage);
+                    self.send_error(
+                        connection_id,
+                        timeline_public_error(
+                            Some(request_id),
+                            INVALID_REQUEST_CODE,
+                            format!("failed to load descendant pending approvals: {error:#}"),
+                        ),
+                    )
+                    .await;
+                    trace.finish_failure();
+                    return;
+                }
             }
+        } else {
+            Vec::new()
         };
+        descendant_pending_stage.succeed();
+        trace.record_items(
+            pioneer_observability::GatewayOperationItemKind::ThreadTimelineDescendantPendingBlocks,
+            u64::try_from(descendant_pending_blocks.len()).unwrap_or(u64::MAX),
+        );
         append_timeline_blocks_dedup(&mut blocks, descendant_pending_blocks);
+        trace.record_items(
+            pioneer_observability::GatewayOperationItemKind::ThreadTimelineReturnedBlocks,
+            u64::try_from(blocks.len()).unwrap_or(u64::MAX),
+        );
 
+        let connection_workspace_stage = trace.stage(
+            pioneer_observability::GatewayOperationStage::ThreadTimelineConnectionWorkspaceSet,
+        );
         self.session_manager
             .set_connection_workspace(connection_id, Some(workspace_id.clone()))
             .await;
+        connection_workspace_stage.succeed();
 
         let response_payload = ThreadTimelinePageResponse {
             workspace_id,
@@ -486,9 +573,15 @@ impl MessageProcessor {
             blocks,
             page: page_info,
         };
+        let response_encode_stage =
+            trace.stage(pioneer_observability::GatewayOperationStage::ThreadTimelineResponseEncode);
         let response = match JsonRpcResponse::from_result(request_id, &response_payload) {
-            Ok(response) => response,
+            Ok(response) => {
+                response_encode_stage.succeed();
+                response
+            }
             Err(error) => {
+                drop(response_encode_stage);
                 self.send_error(
                     connection_id,
                     timeline_delivery_error(
@@ -498,17 +591,25 @@ impl MessageProcessor {
                     ),
                 )
                 .await;
+                trace.finish_failure();
                 return;
             }
         };
 
+        let response_send_stage =
+            trace.stage(pioneer_observability::GatewayOperationStage::ThreadTimelineResponseSend);
         if let Err(error) = self.send_json(connection_id, &response).await {
+            drop(response_send_stage);
             warn!(
                 connection_id,
                 error = %format!("{error:#}"),
                 "failed to send thread/timeline/page response"
             );
+            trace.finish_failure();
+            return;
         }
+        response_send_stage.succeed();
+        trace.finish_success();
     }
 
     pub(super) async fn turn_work_page(
@@ -583,7 +684,7 @@ impl MessageProcessor {
                 if projection.thread_id == params.thread_id
                     && projection.workspace_id == authorization.workspace_id() =>
             {
-                projection
+                Some(projection)
             }
             Ok(Some(_)) => {
                 self.send_error(
@@ -602,21 +703,7 @@ impl MessageProcessor {
                 .await;
                 return;
             }
-            Ok(None) => {
-                self.send_error(
-                    connection_id,
-                    timeline_public_error(
-                        Some(request_id),
-                        INVALID_REQUEST_CODE,
-                        format!(
-                            "turn work projection for turn `{}` was not found",
-                            params.turn_id
-                        ),
-                    ),
-                )
-                .await;
-                return;
-            }
+            Ok(None) => None,
             Err(error) => {
                 self.send_error(
                     connection_id,
@@ -629,6 +716,73 @@ impl MessageProcessor {
                 .await;
                 return;
             }
+        };
+
+        let Some(work_projection) = work_projection else {
+            let (source_high_watermark, projection_updated_at_unix_micros) = match self
+                .crud_store
+                .get_turn_event_projection_stream_state(params.turn_id.as_str())
+                .await
+            {
+                Ok(state) => state
+                    .map(|state| {
+                        (
+                            state.projected_through_sequence,
+                            state.updated_at_unix_micros,
+                        )
+                    })
+                    .unwrap_or_default(),
+                Err(error) => {
+                    self.send_error(
+                        connection_id,
+                        timeline_public_error(
+                            Some(request_id),
+                            INVALID_REQUEST_CODE,
+                            format!("failed to load turn work tombstone revision: {error:#}"),
+                        ),
+                    )
+                    .await;
+                    return;
+                }
+            };
+            let workspace_id = authorization.workspace_id().to_owned();
+            self.session_manager
+                .set_connection_workspace(connection_id, Some(workspace_id.clone()))
+                .await;
+            let response_payload = TurnWorkPageResponse {
+                workspace_id,
+                thread_id: params.thread_id,
+                turn_id: params.turn_id,
+                projection_version: SEMANTIC_TIMELINE_PROJECTION_VERSION,
+                source_high_watermark,
+                projection_updated_at_unix_micros,
+                work: None,
+                items: Vec::new(),
+                page: TimelinePageInfo::default(),
+            };
+            let response = match JsonRpcResponse::from_result(request_id, &response_payload) {
+                Ok(response) => response,
+                Err(error) => {
+                    self.send_error(
+                        connection_id,
+                        timeline_delivery_error(
+                            None,
+                            INVALID_REQUEST_CODE,
+                            format!("failed to encode response: {error}"),
+                        ),
+                    )
+                    .await;
+                    return;
+                }
+            };
+            if let Err(error) = self.send_json(connection_id, &response).await {
+                warn!(
+                    connection_id,
+                    error = %format!("{error:#}"),
+                    "failed to send empty turn/work/page response"
+                );
+            }
+            return;
         };
 
         let snapshot = match self
@@ -703,7 +857,7 @@ impl MessageProcessor {
             projection_version: SEMANTIC_TIMELINE_PROJECTION_VERSION,
             source_high_watermark,
             projection_updated_at_unix_micros,
-            work,
+            work: Some(work),
             items: snapshot.items,
             page: page_info,
         };
@@ -1603,6 +1757,7 @@ impl MessageProcessor {
                 .await?
         };
         let mut items = HashMap::new();
+        let mut html = HashMap::new();
         for (turn_id, item_id) in &item_targets {
             let item = turn_items
                 .get(turn_id.as_str())
@@ -1613,13 +1768,42 @@ impl MessageProcessor {
             if !matches!(item, TurnItem::AgentMessage { .. }) {
                 bail!("assistant message timeline target is not an Agent message");
             }
+            let is_final = turn_items
+                .get(turn_id)
+                .and_then(|items| {
+                    items.iter().rev().find(|item| {
+                        matches!(
+                            item,
+                            TurnItem::AgentMessage {
+                                phase: pioneer_protocol::AgentMessagePhase::FinalAnswer,
+                                ..
+                            }
+                        )
+                    })
+                })
+                .is_some_and(|final_item| final_item.item_id() == item_id);
+            if is_final {
+                let publications = self
+                    .html_publications_for_agent_response(
+                        &rows[0].workspace_id,
+                        thread_id,
+                        turn_id,
+                        item_id,
+                    )
+                    .await?;
+                html.insert((turn_id.clone(), item_id.clone()), publications);
+            }
             items.insert((turn_id.clone(), item_id.clone()), item.clone());
         }
 
         let authors = self
             .timeline_row_authors(&turns, turn_ids.as_slice())
             .await?;
-        Ok(AssistantMessageTimelineBatch { items, authors })
+        Ok(AssistantMessageTimelineBatch {
+            items,
+            authors,
+            html,
+        })
     }
 
     async fn timeline_row_authors(
@@ -1633,6 +1817,11 @@ impl MessageProcessor {
         let responses_by_turn = responses
             .iter()
             .map(|response| (response.turn_id.as_str(), response))
+            .collect::<HashMap<_, _>>();
+        let executions_by_turn = pioneer_crud::load_turn_executions_for_turns(&database, turn_ids)
+            .await?
+            .into_iter()
+            .map(|execution| (execution.turn_id.clone(), execution))
             .collect::<HashMap<_, _>>();
         let direct_authors_by_turn = turn_ids
             .iter()
@@ -1672,6 +1861,10 @@ impl MessageProcessor {
         )
         .await?;
         let mut authors = HashMap::new();
+        let mut cli_authors_by_source: HashMap<
+            (String, String),
+            Option<pioneer_protocol::TurnAuthorSnapshot>,
+        > = HashMap::new();
         for turn_id in turn_ids {
             let author = if let Some(response) = responses_by_turn.get(turn_id.as_str()) {
                 projected_by_execution
@@ -1685,6 +1878,63 @@ impl MessageProcessor {
                     .get(*execution_id)
                     .map(|projected| projected.author.clone())
                     .or_else(|| direct_authors_by_turn.get(turn_id.as_str()).cloned())
+            } else if let Some(execution) = executions_by_turn.get(turn_id)
+                && execution.executor_kind == pioneer_crud::TurnExecutorKind::CliRuntime
+                && let Some(runtime_id) = execution.executor_key.as_deref()
+            {
+                let source_key = (execution.workspace_id.clone(), runtime_id.to_owned());
+                if let Some(author) = cli_authors_by_source.get(&source_key) {
+                    author.clone()
+                } else {
+                    let author = if let Some(identity) =
+                        pioneer_crud::load_agent_identity_by_source(
+                            &database,
+                            execution.workspace_id.as_str(),
+                            pioneer_crud::SOURCE_CLI_RUNTIME_INSTANCE,
+                            runtime_id,
+                        )
+                        .await?
+                    {
+                        pioneer_crud::load_current_agent_presentation_snapshot(
+                            &database,
+                            identity.id.as_str(),
+                            identity.source_revision,
+                            identity.source_fingerprint.as_str(),
+                        )
+                        .await?
+                        .map(|presentation| {
+                            let runtime_marker = presentation
+                                .role_label
+                                .as_deref()
+                                .unwrap_or(presentation.nickname.as_str());
+                            let runtime_avatar_revision =
+                                if runtime_marker.eq_ignore_ascii_case("codex") {
+                                    Some(pioneer_protocol::CODEX_AGENT_AVATAR_REVISION.to_owned())
+                                } else if runtime_marker.eq_ignore_ascii_case("claude") {
+                                    Some(pioneer_protocol::CLAUDE_AGENT_AVATAR_REVISION.to_owned())
+                                } else {
+                                    presentation.avatar_revision.clone()
+                                };
+                            pioneer_protocol::TurnAuthorSnapshot {
+                                // Foreground CLI turns have a real runtime executor but no
+                                // AgentExecution. Keep that distinction explicit instead of
+                                // attaching the response to a completed Task execution.
+                                actor: pioneer_protocol::PersistedActorRef::System,
+                                display_name: presentation.display_name,
+                                nickname: presentation.nickname,
+                                // Reserved runtime avatar revisions are the existing
+                                // cross-client presentation discriminator for a real
+                                // CLI executor without an AgentExecution association.
+                                avatar_revision: runtime_avatar_revision,
+                                agent: None,
+                            }
+                        })
+                    } else {
+                        None
+                    };
+                    cli_authors_by_source.insert(source_key, author.clone());
+                    author
+                }
             } else {
                 None
             };
@@ -1704,37 +1954,22 @@ impl MessageProcessor {
         if approval_scope.is_some_and(|scope| !scope.can_observe_agent_requests) {
             return Ok(Vec::new());
         }
-        let descendant_thread_ids = self.descendant_task_thread_ids(thread_id).await?;
-        if descendant_thread_ids.is_empty() {
-            return Ok(Vec::new());
-        }
-
+        let requests = self
+            .crud_store
+            .list_open_cli_runtime_pending_requests_for_descendant_threads(workspace_id, thread_id)
+            .await?;
         let mut blocks = Vec::new();
-        for descendant_thread_id in descendant_thread_ids {
-            let requests = self
-                .crud_store
-                .list_cli_runtime_pending_requests(CliRuntimePendingRequestListFilter {
-                    workspace_id: Some(workspace_id.to_owned()),
-                    thread_id: Some(descendant_thread_id.clone()),
-                    open_only: true,
-                    ..Default::default()
-                })
-                .await?;
-            for request in requests {
-                if cli_runtime_pending_request_visible_to_scope(&request, approval_scope) {
-                    let author = match request.turn_id.as_deref() {
-                        Some(turn_id) => {
-                            self.timeline_agent_author_for_turn(
-                                descendant_thread_id.as_str(),
-                                turn_id,
-                            )
+        for request in requests {
+            if cli_runtime_pending_request_visible_to_scope(&request, approval_scope) {
+                let author = match request.turn_id.as_deref() {
+                    Some(turn_id) => {
+                        self.timeline_agent_author_for_turn(request.thread_id.as_str(), turn_id)
                             .await?
-                        }
-                        None => None,
-                    };
-                    if let Some(block) = pending_request_proxy_block(request, author)? {
-                        blocks.push(block);
                     }
+                    None => None,
+                };
+                if let Some(block) = pending_request_proxy_block(request, author)? {
+                    blocks.push(block);
                 }
             }
         }
@@ -1744,39 +1979,6 @@ impl MessageProcessor {
                 .then_with(|| left.block_id.cmp(&right.block_id))
         });
         Ok(blocks)
-    }
-
-    async fn descendant_task_thread_ids(&self, thread_id: &str) -> Result<Vec<String>> {
-        let root_thread_id = self
-            .crud_store
-            .get_task_thread_lineage(thread_id)
-            .await?
-            .map(|lineage| lineage.root_thread_id)
-            .unwrap_or_else(|| thread_id.to_owned());
-        let lineage_rows = self
-            .crud_store
-            .list_task_thread_lineage_by_root_thread(root_thread_id.as_str())
-            .await?;
-        if lineage_rows.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let parent_by_child = parent_by_child_thread_id(lineage_rows.as_slice());
-        let mut descendants = Vec::new();
-        let mut seen = HashSet::<String>::new();
-        for lineage in lineage_rows {
-            if lineage.child_thread_id != thread_id
-                && timeline_lineage_descends_from(
-                    lineage.child_thread_id.as_str(),
-                    thread_id,
-                    &parent_by_child,
-                )
-                && seen.insert(lineage.child_thread_id.clone())
-            {
-                descendants.push(lineage.child_thread_id);
-            }
-        }
-        Ok(descendants)
     }
 
     async fn thread_timeline_block_from_row(
@@ -1982,6 +2184,11 @@ impl MessageProcessor {
         let markdown = markdown.or_else(|| Some(markdown::parse_markdown_document(text.as_str())));
 
         Ok(TimelineBlockKind::AssistantMessage {
+            html_publications: batch
+                .html
+                .get(&(turn_id.to_owned(), item_id.to_owned()))
+                .cloned()
+                .unwrap_or_default(),
             item_id: id,
             text,
             status: TurnWorkItemStatus::Completed,
@@ -2052,8 +2259,9 @@ impl MessageProcessor {
 
     fn turn_work_item_from_row(
         row: &turn_work_item_projection::Model,
-        item: TurnItem,
+        mut item: TurnItem,
     ) -> Result<TurnWorkItem> {
+        pioneer_protocol::compact_html_timeline_item(&mut item);
         Ok(TurnWorkItem {
             work_item_id: row.work_item_id.clone(),
             item_id: row.item_id.clone(),
@@ -2062,7 +2270,9 @@ impl MessageProcessor {
             source_sequence: row.source_sequence,
             source_updated_at_unix_micros: row.updated_at.timestamp_micros(),
             item_type: item.item_type(),
-            status: parse_turn_work_item_status(row.status.as_str()),
+            status: item
+                .context_compaction_status()
+                .unwrap_or_else(|| parse_turn_work_item_status(row.status.as_str())),
             started_at_unix_ms: row.started_at.map(|value| value.timestamp_millis()),
             completed_at_unix_ms: row.completed_at.map(|value| value.timestamp_millis()),
             item,
@@ -2104,6 +2314,7 @@ impl MessageProcessor {
             .get_agent_work_graph_projection_for_turn(projection.turn_id.as_str())
             .await?;
         Ok(TurnWorkBlock {
+            html_publications: Vec::new(),
             turn_id: projection.turn_id,
             presentation: parse_turn_work_presentation(projection.presentation.as_str()),
             state: parse_turn_work_state(projection.state.as_str()),
@@ -2518,38 +2729,6 @@ fn pending_request_proxy_sort_key(
     )
 }
 
-fn parent_by_child_thread_id(lineage_rows: &[TaskThreadLineage]) -> HashMap<String, String> {
-    let mut parent_by_child = HashMap::new();
-    for lineage in lineage_rows {
-        parent_by_child.insert(
-            lineage.child_thread_id.clone(),
-            lineage.parent_thread_id.clone(),
-        );
-    }
-    parent_by_child
-}
-
-fn timeline_lineage_descends_from(
-    child_thread_id: &str,
-    ancestor_thread_id: &str,
-    parent_by_child: &HashMap<String, String>,
-) -> bool {
-    let mut current = child_thread_id;
-    for _ in 0..=parent_by_child.len() {
-        let Some(parent) = parent_by_child.get(current) else {
-            return false;
-        };
-        if parent == ancestor_thread_id {
-            return true;
-        }
-        if parent == current {
-            return false;
-        }
-        current = parent.as_str();
-    }
-    false
-}
-
 fn append_timeline_blocks_dedup(blocks: &mut Vec<TimelineBlock>, extra: Vec<TimelineBlock>) {
     if extra.is_empty() {
         return;
@@ -2581,6 +2760,47 @@ fn parse_optional_metadata(value: &str) -> Result<Option<JsonValue>> {
 #[cfg(test)]
 mod timeline_handler_unit_tests {
     use super::*;
+
+    #[test]
+    fn compaction_reconnect_uses_durable_lifecycle_even_with_legacy_projection_status() {
+        let now = chrono::DateTime::from_timestamp(1, 0)
+            .unwrap()
+            .fixed_offset();
+        let row = turn_work_item_projection::Model {
+            work_item_id: "work".into(),
+            workspace_id: "ws".into(),
+            thread_id: "thread".into(),
+            turn_id: "turn".into(),
+            item_id: "compaction:one".into(),
+            source_event_id: None,
+            source_sequence: 2,
+            order_key: "2".into(),
+            item_type: "system_event".into(),
+            visibility: "visible".into(),
+            classification: "system_event".into(),
+            status: "completed".into(),
+            started_at: Some(now),
+            completed_at: Some(now),
+            metadata_json: "{}".into(),
+            created_at: now,
+            updated_at: now,
+        };
+        for (status, expected) in [
+            ("cancelled", TurnWorkItemStatus::Cancelled),
+            ("failed", TurnWorkItemStatus::Failed),
+        ] {
+            let item = TurnItem::SystemEvent {
+                id: row.item_id.clone(),
+                level: pioneer_protocol::SystemEventLevel::Info,
+                message: "Context preparation ended".into(),
+                code: Some("agent_context_compaction".into()),
+                details: Some(serde_json::json!({"status":status})),
+            };
+            let projected = MessageProcessor::turn_work_item_from_row(&row, item).unwrap();
+            assert_eq!(projected.status, expected);
+            assert_eq!(projected.work_item_id, row.work_item_id);
+        }
+    }
 
     fn agent_authored_turn() -> Turn {
         let presentation = pioneer_protocol::AgentPresentationSnapshot {

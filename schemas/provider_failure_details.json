@@ -6,6 +6,16 @@
     "class": {
       "$ref": "#/$defs/ProviderFailureClass"
     },
+    "error_reason": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ProviderErrorReason"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "http_status": {
       "type": [
         "integer",
@@ -36,6 +46,16 @@
         "null"
       ]
     },
+    "request_id": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ProviderRequestId"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "retry_after_ms": {
       "type": [
         "integer",
@@ -60,6 +80,39 @@
     "is_recoverable_hint"
   ],
   "$defs": {
+    "ProviderErrorReason": {
+      "description": "Allowlisted OpenRouter Chat Completions metadata.error_type values.\nDiagnostic only: these values must not drive recovery policy.",
+      "type": "string",
+      "enum": [
+        "context_length_exceeded",
+        "max_tokens_exceeded",
+        "token_limit_exceeded",
+        "string_too_long",
+        "authentication",
+        "permission_denied",
+        "payment_required",
+        "rate_limit_exceeded",
+        "provider_overloaded",
+        "provider_unavailable",
+        "invalid_request",
+        "invalid_prompt",
+        "not_found",
+        "precondition_failed",
+        "payload_too_large",
+        "unprocessable",
+        "content_policy_violation",
+        "refusal",
+        "invalid_image",
+        "image_too_large",
+        "image_too_small",
+        "unsupported_image_format",
+        "image_not_found",
+        "image_download_failed",
+        "server",
+        "timeout",
+        "unmapped"
+      ]
+    },
     "ProviderFailureClass": {
       "type": "string",
       "enum": [
@@ -95,6 +148,11 @@
         "mid_stream",
         "finalize"
       ]
+    },
+    "ProviderRequestId": {
+      "type": "string",
+      "maxLength": 128,
+      "pattern": "^(gen-|req-|cmpl-|chatcmpl-)[A-Za-z0-9_-]+$"
     },
     "ProviderTransportKind": {
       "type": "string",

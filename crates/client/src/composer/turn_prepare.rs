@@ -172,7 +172,7 @@ pub fn prepare_composer_turn<TTransport, TFileSystem>(
 ) -> Result<PreparedComposerTurn>
 where
     TTransport: ComposerTurnPrepareTransport,
-    TFileSystem: ClientFileSystem,
+    TFileSystem: ClientFileSystem + ?Sized,
 {
     if request.workspace_id.trim().is_empty() {
         return Err(anyhow!(
@@ -244,7 +244,7 @@ pub fn prepare_voice_composer_snapshot<TTransport, TFileSystem>(
 ) -> Result<PreparedVoiceComposerSnapshot>
 where
     TTransport: ComposerTurnPrepareTransport,
-    TFileSystem: ClientFileSystem,
+    TFileSystem: ClientFileSystem + ?Sized,
 {
     let prepared = prepare_composer_turn(
         transport,

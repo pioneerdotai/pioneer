@@ -5,12 +5,12 @@ use crate::{
     },
     reasoning_registry,
     tools::call::{StreamToolCallAccumulator, StreamToolCallDelta, StreamToolFunctionDelta},
-    tools::parse::{parse_embedded_tool_payload, parse_tool_calls},
-    tools::stream::{IncrementalLineDecoder, sse_data},
+    tools::parse::parse_tool_calls,
+    tools::stream::IncrementalSseDecoder,
     types::{
         ChatRequest, ChatResponse, InputContentType, InputTypeSupport, ProviderCapabilities,
-        ProviderInputCapabilities, ProviderTermination, ProviderTimeoutPolicy, ReasoningConfig,
-        Role, StreamChunk, TokenUsage, ToolChoice, ToolDefinition,
+        ProviderInputCapabilities, ProviderTermination, ProviderTimeoutPolicy, Role, StreamChunk,
+        TokenUsage, ToolChoice, ToolDefinition,
     },
 };
 use anyhow::{Result, anyhow};
@@ -24,11 +24,14 @@ use serde::{Deserialize, Serialize};
 
 use pioneer_protocol::{ProviderModelCapabilities, ProviderModelInfo, ProviderModelLimits};
 
-const DEFAULT_API_VERSION: &str = "2024-08-01-preview";
+// v1 Chat is GA; date-version deployment routes remain explicitly selectable.
+// https://learn.microsoft.com/en-us/rest/api/aifoundry/azureopenai/chat
+pub(crate) const DEFAULT_API_VERSION: &str = "v1";
 
 pub struct AzureOpenAiProvider {
     api_key: String,
     resource_name: String,
+    base_url: Option<String>,
     deployment_name: String,
     api_version: String,
     timeout_policy: ProviderTimeoutPolicy,
@@ -39,6 +42,8 @@ pub struct AzureOpenAiProvider {
 
 #[derive(Debug, Serialize)]
 struct ApiChatRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
     messages: Vec<ApiMessage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
@@ -53,6 +58,10 @@ struct ApiChatRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_effort: Option<String>,
     stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream_options: Option<serde_json::Value>,
+    #[serde(flatten)]
+    generation: crate::generation::Fields,
 }
 
 #[derive(Debug, Serialize)]
@@ -161,6 +170,12 @@ struct ApiToolCallFunction {
 
 #[derive(Debug, Deserialize)]
 struct ApiChatResponse {
+    #[serde(default)]
+    service_tier: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    id: Option<String>,
     choices: Vec<ApiChoice>,
     #[serde(default)]
     usage: Option<ApiUsage>,
@@ -193,18 +208,20 @@ impl ApiResponseMessage {
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct ApiUsage {
-    #[serde(default)]
-    prompt_tokens: Option<u64>,
-    #[serde(default)]
-    completion_tokens: Option<u64>,
-}
+type ApiUsage = crate::usage::ChatUsage;
 
 // ── SSE streaming response types ────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
 struct StreamResponse {
+    #[serde(default)]
+    service_tier: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    usage: Option<ApiUsage>,
     #[serde(default)]
     choices: Vec<StreamChoice>,
     #[serde(default)]
@@ -231,6 +248,30 @@ struct StreamDelta {
     tool_calls: Option<Vec<StreamToolCallDelta>>,
     #[serde(default)]
     function_call: Option<StreamToolFunctionDelta>,
+}
+
+impl StreamDelta {
+    fn has_payload(&self) -> bool {
+        self.content
+            .as_deref()
+            .is_some_and(|value| !value.is_empty())
+            || self
+                .reasoning_content
+                .as_deref()
+                .is_some_and(|value| !value.is_empty())
+            || self
+                .reasoning
+                .as_deref()
+                .is_some_and(|value| !value.is_empty())
+            || self
+                .tool_calls
+                .as_ref()
+                .is_some_and(|calls| calls.iter().any(StreamToolCallDelta::has_payload))
+            || self
+                .function_call
+                .as_ref()
+                .is_some_and(StreamToolFunctionDelta::has_payload)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -288,6 +329,114 @@ struct AzureModelEntry {
 // ── Implementation ──────────────────────────────────────────────────────────
 
 impl AzureOpenAiProvider {
+    fn build_chat_request(
+        request: &ChatRequest,
+        messages: Vec<ApiMessage>,
+        stream: bool,
+    ) -> Result<ApiChatRequest> {
+        Self::build_chat_request_with_catalog(
+            request,
+            messages,
+            stream,
+            crate::catalog::model_catalog().ok().as_deref(),
+        )
+    }
+
+    fn build_chat_request_with_catalog(
+        request: &ChatRequest,
+        messages: Vec<ApiMessage>,
+        stream: bool,
+        catalog: Option<&crate::catalog::ModelCatalog>,
+    ) -> Result<ApiChatRequest> {
+        let generation =
+            crate::generation::chat_fields_from_catalog(catalog, "azure_openai", request)?;
+        Ok(ApiChatRequest {
+            model: None,
+            generation,
+            messages,
+            temperature: None,
+            max_tokens: None,
+            tools: request
+                .tools
+                .as_ref()
+                .map(|tools| Self::convert_tools(tools)),
+            tool_choice: request.tool_choice.clone().map(Self::convert_tool_choice),
+            parallel_tool_calls: request.parallel_tool_calls,
+            reasoning_effort: None,
+            stream,
+            stream_options: stream.then(|| serde_json::json!({"include_usage": true})),
+        })
+    }
+
+    fn build_deployment_chat_request(
+        &self,
+        request: &ChatRequest,
+        messages: Vec<ApiMessage>,
+        stream: bool,
+    ) -> Result<ApiChatRequest> {
+        // Generation rules use the resolved base model; v1 routing uses the deployment.
+        let mut body = Self::build_chat_request(request, messages, stream)?;
+        body.model = self.deployment_model();
+        Ok(body)
+    }
+
+    pub(crate) fn with_version_override(mut self, version: Option<&str>) -> Self {
+        if let Some(version) = version {
+            self.api_version = version.to_owned();
+        }
+        self
+    }
+
+    fn validate_connection(&self, requires_deployment: bool) -> Result<()> {
+        if self.base_url.is_none()
+            && (self.resource_name.is_empty()
+                || !self
+                    .resource_name
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || c == b'-'))
+        {
+            anyhow::bail!(
+                "Azure OpenAI requires AZURE_OPENAI_RESOURCE or an explicit resource/gateway root base URL"
+            );
+        }
+        if requires_deployment && self.deployment_name.trim().is_empty() {
+            anyhow::bail!(
+                "Azure OpenAI requires AZURE_OPENAI_DEPLOYMENT (deployment name, not base model ID)"
+            );
+        }
+        if self.api_version == "v1" {
+            return Ok(());
+        }
+        if self
+            .base_url
+            .as_ref()
+            .is_some_and(|base| base.ends_with("/openai/v1"))
+        {
+            anyhow::bail!(
+                "Azure date-version Chat requires a resource/gateway root, not an openai/v1 prefix"
+            );
+        }
+        let version = self
+            .api_version
+            .strip_suffix("-preview")
+            .unwrap_or(&self.api_version);
+        let bytes = version.as_bytes();
+        if bytes.len() != 10
+            || !bytes.iter().enumerate().all(|(i, c)| {
+                if i == 4 || i == 7 {
+                    *c == b'-'
+                } else {
+                    c.is_ascii_digit()
+                }
+            })
+        {
+            anyhow::bail!(
+                "Azure Chat requires v1 or a date API version (YYYY-MM-DD or YYYY-MM-DD-preview); Responses needs a separate transport"
+            );
+        }
+        Ok(())
+    }
+
     pub fn new(
         api_key: impl Into<String>,
         resource_name: impl Into<String>,
@@ -316,6 +465,19 @@ impl AzureOpenAiProvider {
         )
     }
 
+    pub fn with_base_url_and_timeout_policy(
+        api_key: impl Into<String>,
+        resource_name: impl Into<String>,
+        deployment_name: impl Into<String>,
+        base_url: impl Into<String>,
+        timeout_policy: ProviderTimeoutPolicy,
+    ) -> Self {
+        let mut provider =
+            Self::with_timeout_policy(api_key, resource_name, deployment_name, timeout_policy);
+        provider.base_url = Some(base_url.into().trim_end_matches('/').to_owned());
+        provider
+    }
+
     pub fn with_api_version(
         api_key: impl Into<String>,
         resource_name: impl Into<String>,
@@ -341,6 +503,7 @@ impl AzureOpenAiProvider {
         Self {
             api_key: api_key.into(),
             resource_name: resource_name.into(),
+            base_url: None,
             deployment_name: deployment_name.into(),
             api_version: api_version.into(),
             timeout_policy,
@@ -588,38 +751,306 @@ impl AzureOpenAiProvider {
     }
 
     fn chat_completions_url(&self) -> String {
+        if self.api_version == "v1" {
+            return format!("{}/openai/v1/chat/completions", self.endpoint_root());
+        }
         format!(
-            "https://{}.openai.azure.com/openai/deployments/{}/chat/completions?api-version={}",
-            self.resource_name, self.deployment_name, self.api_version
+            "{}/openai/deployments/{}/chat/completions?api-version={}",
+            self.endpoint_root(),
+            crate::definition::encode_path_segment(&self.deployment_name),
+            self.api_version
         )
     }
 
+    fn build_prepared_chat_request(
+        &self,
+        request: ChatRequest,
+        stream: bool,
+        mut prepared: PreparedProviderMessages,
+    ) -> Result<ApiChatRequest> {
+        use crate::traits::Provider;
+        let request = crate::tools::policy::prepare_request(self.name(), request)?;
+        crate::tools::policy::prepare_history(self.name(), &mut prepared.messages)?;
+        ensure_no_unrendered_attachments(self.name(), &prepared)?;
+        self.build_deployment_chat_request(&request, Self::convert_messages(&prepared)?, stream)
+    }
+
     fn models_url(&self) -> String {
+        if self.api_version == "v1" {
+            return format!("{}/openai/v1/models", self.endpoint_root());
+        }
         format!(
-            "https://{}.openai.azure.com/openai/models?api-version={}",
-            self.resource_name, self.api_version
+            "{}/openai/models?api-version={}",
+            self.endpoint_root(),
+            self.api_version
         )
+    }
+
+    fn endpoint_root(&self) -> String {
+        let root = self
+            .base_url
+            .clone()
+            .unwrap_or_else(|| format!("https://{}.openai.azure.com", self.resource_name));
+        if self.api_version == "v1" {
+            root.strip_suffix("/openai/v1").unwrap_or(&root).to_owned()
+        } else {
+            root
+        }
+    }
+
+    fn deployment_model(&self) -> Option<String> {
+        (self.api_version == "v1").then(|| self.deployment_name.clone())
     }
 
     async fn api_error(response: reqwest::Response) -> anyhow::Error {
         let status = response.status();
-        let body = response
-            .text()
-            .await
-            .unwrap_or_else(|_| "<failed to read error body>".into());
+        let body = match crate::http::read_response_text_bounded(
+            response,
+            16 * 1024,
+            "provider_error_body",
+        )
+        .await
+        {
+            Ok(body) => body,
+            Err(error) => return error,
+        };
         anyhow!("Azure OpenAI API error ({status}): {body}")
     }
 }
 
-fn reasoning_effort_for_azure_openai_request(reasoning: Option<ReasoningConfig>) -> Option<String> {
-    match reasoning {
-        Some(ReasoningConfig::Effort(effort)) => Some(effort.as_str().to_owned()),
-        Some(ReasoningConfig::Disabled) | None => None,
+// The same decoder is used by HTTP transport and in-memory regression fixtures.
+impl AzureOpenAiProvider {
+    #[cfg(test)]
+    pub(super) fn decode_stream(
+        byte_stream: BoxStream<'static, Result<bytes::Bytes>>,
+    ) -> BoxStream<'static, Result<StreamChunk>> {
+        Self::decode_stream_with_request_id(byte_stream, None)
+    }
+
+    fn decode_stream_with_request_id(
+        byte_stream: BoxStream<'static, Result<bytes::Bytes>>,
+        native_request_id: Option<String>,
+    ) -> BoxStream<'static, Result<StreamChunk>> {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<StreamChunk>>(64);
+
+        tokio::spawn(async move {
+            if native_request_id.is_some()
+                && tx
+                    .send(Ok(StreamChunk::usage(
+                        TokenUsage::default().with_request_id(native_request_id.as_deref()),
+                    )))
+                    .await
+                    .is_err()
+            {
+                return;
+            }
+            let mut decoder = IncrementalSseDecoder::default();
+            let mut tool_call_accumulator = StreamToolCallAccumulator::default();
+            let mut terminal_reason = None;
+
+            tokio::pin!(byte_stream);
+
+            while let Some(result) = tokio::select! {
+                biased;
+                _ = tx.closed() => return,
+                result = byte_stream.next() => result,
+            } {
+                let bytes = match result {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        if tx.send(Err(anyhow!(e))).await.is_err() {
+                            return;
+                        }
+                        return;
+                    }
+                };
+
+                let lines = match decoder.push(bytes.as_ref()) {
+                    Ok(lines) => lines,
+                    Err(error) => {
+                        if tx.send(Err(error)).await.is_err() {
+                            return;
+                        }
+                        return;
+                    }
+                };
+                for frame in lines {
+                    let data = frame.data.as_str();
+
+                    if data.trim() == "[DONE]" {
+                        let terminal = terminal_reason
+                            .take()
+                            .map(StreamChunk::final_chunk_with)
+                            .ok_or_else(|| {
+                                crate::failure::ProviderStreamIncomplete::DoneWithoutFinishReason
+                                    .into()
+                            });
+                        let _ = tx.send(terminal).await;
+                        return;
+                    }
+
+                    match serde_json::from_str::<StreamResponse>(data) {
+                        Ok(resp) => {
+                            if terminal_reason.is_some()
+                                && resp.choices.iter().any(|choice| choice.delta.has_payload())
+                            {
+                                let _ = tx
+                                    .send(Err(anyhow!("provider sent payload after finish_reason")))
+                                    .await;
+                                return;
+                            }
+                            if resp.usage.is_some() || resp.id.is_some() {
+                                let usage = resp
+                                    .usage
+                                    .map(|u| u.normalized())
+                                    .unwrap_or_default()
+                                    .with_native_id(resp.id.as_deref())
+                                    .with_reported_model(resp.model.as_deref())
+                                    .with_service_tier(resp.service_tier.as_deref());
+                                if tx.send(Ok(StreamChunk::usage(usage))).await.is_err() {
+                                    return;
+                                }
+                            }
+                            if let Some(error) = resp.error {
+                                let status = error
+                                    .code
+                                    .as_ref()
+                                    .and_then(serde_json::Value::as_u64)
+                                    .and_then(|code| u16::try_from(code).ok());
+                                let outcome = crate::failure::native_chat_stream_error(
+                                    &error.description(),
+                                    status,
+                                );
+                                let _ = tx.send(Err(outcome)).await;
+                                return;
+                            }
+                            for choice in resp.choices {
+                                if terminal_reason.is_some() {
+                                    if choice.finish_reason.as_deref().is_some_and(|reason| {
+                                        Some(ProviderTermination::from_openai_reason(reason))
+                                            != terminal_reason
+                                    }) {
+                                        let _ = tx
+                                            .send(Err(anyhow!(
+                                                "provider changed finish_reason after completion"
+                                            )))
+                                            .await;
+                                        return;
+                                    }
+                                    if choice.delta.has_payload() {
+                                        let _ = tx
+                                            .send(Err(anyhow!(
+                                                "provider sent payload after finish_reason"
+                                            )))
+                                            .await;
+                                        return;
+                                    }
+                                    continue;
+                                }
+                                if let Some(reasoning) =
+                                    choice.delta.reasoning_content.or(choice.delta.reasoning)
+                                {
+                                    if !reasoning.is_empty() {
+                                        if tx
+                                            .send(Ok(StreamChunk::reasoning(reasoning)))
+                                            .await
+                                            .is_err()
+                                        {
+                                            return;
+                                        }
+                                    }
+                                }
+                                if let Some(content) = choice.delta.content {
+                                    if !content.is_empty() {
+                                        if tx.send(Ok(StreamChunk::delta(content))).await.is_err() {
+                                            return;
+                                        }
+                                    }
+                                }
+                                if let Some(tool_calls) = choice.delta.tool_calls {
+                                    tool_call_accumulator.ingest(tool_calls);
+                                }
+                                if let Some(function_call) = choice.delta.function_call {
+                                    tool_call_accumulator.ingest(vec![StreamToolCallDelta {
+                                        index: Some(0),
+                                        id: None,
+                                        function: Some(function_call),
+                                        name: None,
+                                        arguments: None,
+                                    }]);
+                                }
+                                if let Some(reason) = choice.finish_reason {
+                                    let termination =
+                                        ProviderTermination::from_openai_reason(&reason);
+                                    let tool_calls = match tool_call_accumulator.take_tool_calls() {
+                                        Ok(calls) => calls,
+                                        Err(error) => {
+                                            if tx.send(Err(error)).await.is_err() {
+                                                return;
+                                            }
+                                            return;
+                                        }
+                                    };
+                                    if !tool_calls.is_empty() {
+                                        if tx
+                                            .send(Ok(StreamChunk::tool_calls(tool_calls)))
+                                            .await
+                                            .is_err()
+                                        {
+                                            return;
+                                        }
+                                    }
+                                    // Usage may arrive in a later empty-choices frame.
+                                    terminal_reason = Some(termination);
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            if tx
+                                .send(Err(anyhow!("malformed Azure OpenAI SSE frame")))
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                            return;
+                        }
+                    }
+                }
+            }
+
+            let terminal = match decoder.finish() {
+                Err(error) => Err(error),
+                Ok(_) => {
+                    Err(crate::failure::ProviderStreamIncomplete::EofWithoutTerminalMarker.into())
+                }
+            };
+            let _ = tx.send(terminal).await;
+        });
+
+        let chunk_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+        Box::pin(chunk_stream)
     }
 }
 
 #[async_trait]
 impl crate::traits::Provider for AzureOpenAiProvider {
+    fn usage_api(&self) -> &'static str {
+        "azure_deployment_chat_completions"
+    }
+    fn usage_api_version(&self) -> Option<String> {
+        let version = self.api_version.as_str();
+        let date = version.strip_suffix("-preview").unwrap_or(version);
+        (chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").is_ok() && date.len() == 10)
+            .then(|| version.to_owned())
+    }
+    fn usage_route(&self) -> Option<String> {
+        crate::usage::route(
+            &self.chat_completions_url(),
+            "/openai/deployments/{deployment}/chat/completions",
+        )
+    }
+
     fn name(&self) -> &str {
         "azure_openai"
     }
@@ -647,26 +1078,16 @@ impl crate::traits::Provider for AzureOpenAiProvider {
     }
 
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
+        let request = crate::tools::policy::prepare_request(self.name(), request)?;
+        self.validate_connection(true)?;
         let prepared = prepare_messages_for_provider_async(
             self.name(),
+            request.model.as_str(),
             &self.capabilities(),
             request.rendered_messages_with_compiled_prompt().as_slice(),
         )
         .await?;
-        ensure_no_unrendered_attachments(self.name(), &prepared)?;
-        let api_request = ApiChatRequest {
-            messages: Self::convert_messages(&prepared)?,
-            temperature: request.temperature,
-            max_tokens: request.max_tokens,
-            tools: request
-                .tools
-                .as_ref()
-                .map(|tools| Self::convert_tools(tools)),
-            tool_choice: request.tool_choice.map(Self::convert_tool_choice),
-            parallel_tool_calls: request.parallel_tool_calls,
-            reasoning_effort: reasoning_effort_for_azure_openai_request(request.reasoning),
-            stream: false,
-        };
+        let api_request = self.build_prepared_chat_request(request, false, prepared)?;
 
         let request_builder = self
             .client
@@ -681,11 +1102,28 @@ impl crate::traits::Provider for AzureOpenAiProvider {
             return Err(Self::api_error(response).await);
         }
 
-        let api_response: ApiChatResponse = response.json().await?;
-        let usage = api_response.usage.map(|u| TokenUsage {
-            input_tokens: u.prompt_tokens,
-            output_tokens: u.completion_tokens,
-        });
+        let native_request_id = crate::usage::native_id(
+            response
+                .headers()
+                .get("apim-request-id")
+                .and_then(|v| v.to_str().ok()),
+        );
+        let api_response: ApiChatResponse = crate::http::read_response_json_bounded(
+            response,
+            Default::default(),
+            "provider_response",
+        )
+        .await?;
+        let usage = Some(
+            api_response
+                .usage
+                .map(|u| u.normalized())
+                .unwrap_or_default()
+                .with_native_id(api_response.id.as_deref())
+                .with_reported_model(api_response.model.as_deref())
+                .with_service_tier(api_response.service_tier.as_deref())
+                .with_request_id(native_request_id.as_deref()),
+        );
 
         let choice = api_response
             .choices
@@ -698,23 +1136,10 @@ impl crate::traits::Provider for AzureOpenAiProvider {
             .map(ProviderTermination::from_openai_reason)
             .unwrap_or_else(|| ProviderTermination::Unknown("missing_finish_reason".to_owned()));
         let message = choice.message;
-        let raw_content = message.content.clone();
-        let mut text = message.effective_content();
-        let mut tool_calls =
+        let text = message.effective_content();
+        let tool_calls =
             parse_tool_calls(message.tool_calls.as_ref(), message.function_call.as_ref())?;
-        let mut reasoning_content = message.reasoning_content.or(message.reasoning);
-
-        if tool_calls.is_empty() {
-            if let Some(content) = raw_content.as_deref() {
-                if let Some(parsed) = parse_embedded_tool_payload(content)? {
-                    text = parsed.text;
-                    if reasoning_content.is_none() {
-                        reasoning_content = parsed.reasoning_content;
-                    }
-                    tool_calls = parsed.tool_calls;
-                }
-            }
-        }
+        let reasoning_content = message.reasoning_content.or(message.reasoning);
 
         if text.is_empty()
             && tool_calls.is_empty()
@@ -737,26 +1162,16 @@ impl crate::traits::Provider for AzureOpenAiProvider {
         &self,
         request: ChatRequest,
     ) -> Result<BoxStream<'static, Result<StreamChunk>>> {
+        let request = crate::tools::policy::prepare_request(self.name(), request)?;
+        self.validate_connection(true)?;
         let prepared = prepare_messages_for_provider_async(
             self.name(),
+            request.model.as_str(),
             &self.capabilities(),
             request.rendered_messages_with_compiled_prompt().as_slice(),
         )
         .await?;
-        ensure_no_unrendered_attachments(self.name(), &prepared)?;
-        let api_request = ApiChatRequest {
-            messages: Self::convert_messages(&prepared)?,
-            temperature: request.temperature,
-            max_tokens: request.max_tokens,
-            tools: request
-                .tools
-                .as_ref()
-                .map(|tools| Self::convert_tools(tools)),
-            tool_choice: request.tool_choice.map(Self::convert_tool_choice),
-            parallel_tool_calls: request.parallel_tool_calls,
-            reasoning_effort: reasoning_effort_for_azure_openai_request(request.reasoning),
-            stream: true,
-        };
+        let api_request = self.build_prepared_chat_request(request, true, prepared)?;
 
         let request_builder = self
             .client
@@ -770,130 +1185,26 @@ impl crate::traits::Provider for AzureOpenAiProvider {
             return Err(Self::api_error(response).await);
         }
 
-        let byte_stream = response.bytes_stream();
+        let native_request_id = crate::usage::native_id(
+            response
+                .headers()
+                .get("apim-request-id")
+                .and_then(|v| v.to_str().ok()),
+        );
+        let byte_stream = crate::http::bounded_response_stream(
+            response,
+            crate::types::ProviderResponseLimits::default().max_transport_bytes,
+            "provider_stream",
+        );
 
-        let (tx, rx) = tokio::sync::mpsc::channel::<Result<StreamChunk>>(64);
-
-        tokio::spawn(async move {
-            let mut decoder = IncrementalLineDecoder::default();
-            let mut tool_call_accumulator = StreamToolCallAccumulator::default();
-
-            tokio::pin!(byte_stream);
-
-            while let Some(result) = byte_stream.next().await {
-                let bytes = match result {
-                    Ok(bytes) => bytes,
-                    Err(e) => {
-                        let _ = tx.send(Err(anyhow!(e))).await;
-                        return;
-                    }
-                };
-
-                let lines = match decoder.push(bytes.as_ref()) {
-                    Ok(lines) => lines,
-                    Err(error) => {
-                        let _ = tx.send(Err(error)).await;
-                        return;
-                    }
-                };
-                for line in lines {
-                    let line = line.trim();
-                    if line.is_empty() {
-                        continue;
-                    }
-
-                    let Some(data) = sse_data(line) else {
-                        continue;
-                    };
-
-                    if data.trim() == "[DONE]" {
-                        let _ = tx
-                            .send(Err(anyhow!(
-                                "Azure OpenAI stream ended without a finish_reason"
-                            )))
-                            .await;
-                        return;
-                    }
-
-                    match serde_json::from_str::<StreamResponse>(data) {
-                        Ok(resp) => {
-                            if let Some(error) = resp.error {
-                                let _ = tx
-                                    .send(Err(anyhow!(
-                                        "Azure OpenAI stream error: {}",
-                                        error.description()
-                                    )))
-                                    .await;
-                                return;
-                            }
-                            for choice in resp.choices {
-                                if let Some(reasoning) =
-                                    choice.delta.reasoning_content.or(choice.delta.reasoning)
-                                {
-                                    if !reasoning.is_empty() {
-                                        let _ =
-                                            tx.send(Ok(StreamChunk::reasoning(reasoning))).await;
-                                    }
-                                }
-                                if let Some(content) = choice.delta.content {
-                                    if !content.is_empty() {
-                                        let _ = tx.send(Ok(StreamChunk::delta(content))).await;
-                                    }
-                                }
-                                if let Some(tool_calls) = choice.delta.tool_calls {
-                                    tool_call_accumulator.ingest(tool_calls);
-                                }
-                                if let Some(function_call) = choice.delta.function_call {
-                                    tool_call_accumulator.ingest(vec![StreamToolCallDelta {
-                                        index: Some(0),
-                                        id: None,
-                                        function: Some(function_call),
-                                        name: None,
-                                        arguments: None,
-                                    }]);
-                                }
-                                if let Some(reason) = choice.finish_reason {
-                                    let termination =
-                                        ProviderTermination::from_openai_reason(&reason);
-                                    let tool_calls = match tool_call_accumulator.take_tool_calls() {
-                                        Ok(calls) => calls,
-                                        Err(error) => {
-                                            let _ = tx.send(Err(error)).await;
-                                            return;
-                                        }
-                                    };
-                                    if !tool_calls.is_empty() {
-                                        let _ =
-                                            tx.send(Ok(StreamChunk::tool_calls(tool_calls))).await;
-                                    }
-                                    let _ = tx
-                                        .send(Ok(StreamChunk::final_chunk_with(termination)))
-                                        .await;
-                                    return;
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            let _ = tx
-                                .send(Err(anyhow!("malformed Azure OpenAI SSE frame: {e}")))
-                                .await;
-                            return;
-                        }
-                    }
-                }
-            }
-
-            let error = decoder.finish().err().unwrap_or_else(|| {
-                anyhow!("Azure OpenAI stream ended before a provider terminal marker")
-            });
-            let _ = tx.send(Err(error)).await;
-        });
-
-        let chunk_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
-        Ok(Box::pin(chunk_stream))
+        Ok(Self::decode_stream_with_request_id(
+            byte_stream,
+            native_request_id,
+        ))
     }
 
     async fn list_models(&self) -> Result<Vec<ProviderModelInfo>> {
+        self.validate_connection(false)?;
         let request_builder = self
             .client
             .get(self.models_url())
@@ -906,7 +1217,12 @@ impl crate::traits::Provider for AzureOpenAiProvider {
             return Err(Self::api_error(response).await);
         }
 
-        let api_response: ModelsListResponse = response.json().await?;
+        let api_response: ModelsListResponse = crate::http::read_response_json_bounded(
+            response,
+            Default::default(),
+            "provider_response",
+        )
+        .await?;
 
         Ok(api_response
             .data
@@ -933,6 +1249,12 @@ impl crate::traits::Provider for AzureOpenAiProvider {
             })
             .collect())
     }
+
+    async fn warmup(&self) -> Result<crate::ProviderWarmupOutcome> {
+        self.validate_connection(true)?;
+        self.list_models().await?;
+        Ok(crate::ProviderWarmupOutcome::Completed)
+    }
 }
 
 fn apply_azure_openai_reasoning_capabilities(
@@ -941,9 +1263,26 @@ fn apply_azure_openai_reasoning_capabilities(
 ) {
     // Azure deployments can be arbitrary aliases. Until a deployment->base-model
     // mapping exists, only ids that already match OpenAI base model ids are safe.
-    if let Some(reasoning) =
+    if let Some(mut reasoning) =
         reasoning_registry::reasoning_capabilities_for_model("openai", model_or_deployment_id)
     {
+        reasoning.effort_options.retain(|effort| {
+            crate::types::ReasoningEffort::from_str(effort).is_some_and(|effort| {
+                crate::generation::effort_supported_for_profile(
+                    "azure_openai",
+                    model_or_deployment_id,
+                    None,
+                    effort,
+                )
+            })
+        });
+        if reasoning
+            .default_effort
+            .as_ref()
+            .is_some_and(|default| !reasoning.effort_options.contains(default))
+        {
+            reasoning.default_effort = None;
+        }
         capabilities.thinking = reasoning.supported;
         capabilities.reasoning = Some(reasoning);
     }
@@ -951,6 +1290,122 @@ fn apply_azure_openai_reasoning_capabilities(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn azure_discovery_filters_direct_vocabulary_using_actual_chat_profile() {
+        let mut capabilities = ProviderModelCapabilities::default();
+        apply_azure_openai_reasoning_capabilities("gpt-5.2", &mut capabilities);
+        let options = &capabilities.reasoning.as_ref().unwrap().effort_options;
+        assert!(!options.contains(&"xhigh".into()));
+        assert!(options.contains(&"high".into()));
+        for stream in [false, true] {
+            for (effort, valid) in [
+                (ReasoningEffort::High, true),
+                (ReasoningEffort::XHigh, false),
+            ] {
+                let mut request = crate::generation::test_request("gpt-5.2");
+                request.reasoning = Some(ReasoningConfig::Effort(effort));
+                let result = AzureOpenAiProvider::build_chat_request_with_catalog(
+                    &request,
+                    vec![],
+                    stream,
+                    None,
+                );
+                assert_eq!(result.is_ok(), valid);
+                if valid {
+                    let body = serde_json::to_value(result.unwrap()).unwrap();
+                    assert_eq!(body["reasoning_effort"], "high");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn azure_adapter_identity_enforces_platform_chat_effort_after_mapping() {
+        for model in ["gpt-5.6", "gpt-6-sol", "gpt-6-astra"] {
+            let catalog = crate::generation::test_catalog_model(
+                "azure-openai-responses",
+                model,
+                "gpt-5.4",
+                serde_json::json!({"thinkingLevelMap":{"max":"max"}}),
+            );
+            for snapshot in [None, Some(&catalog)] {
+                for stream in [false, true] {
+                    let mut request = crate::generation::test_request(model);
+                    request.reasoning = Some(ReasoningConfig::Effort(ReasoningEffort::Max));
+                    assert!(
+                        AzureOpenAiProvider::build_chat_request_with_catalog(
+                            &request,
+                            vec![],
+                            stream,
+                            snapshot
+                        )
+                        .unwrap_err()
+                        .to_string()
+                        .contains("Responses")
+                    );
+                    request.reasoning = Some(ReasoningConfig::Effort(ReasoningEffort::High));
+                    let body = serde_json::to_value(
+                        AzureOpenAiProvider::build_chat_request_with_catalog(
+                            &request,
+                            vec![],
+                            stream,
+                            snapshot,
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(body["reasoning_effort"], "high");
+                    assert_eq!(body["max_completion_tokens"], 1024);
+                }
+            }
+        }
+        for model in ["o1-mini", "gpt-5.1", "gpt-5.2"] {
+            let mut request = crate::generation::test_request(model);
+            request.reasoning = Some(ReasoningConfig::Effort(if model == "o1-mini" {
+                ReasoningEffort::High
+            } else {
+                ReasoningEffort::XHigh
+            }));
+            for stream in [false, true] {
+                assert!(
+                    AzureOpenAiProvider::build_chat_request_with_catalog(
+                        &request,
+                        vec![],
+                        stream,
+                        None
+                    )
+                    .is_err()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn deployment_alias_does_not_invent_base_model_generation_contract() {
+        let request = crate::generation::test_request("production-deployment");
+        for stream in [false, true] {
+            assert!(
+                AzureOpenAiProvider::build_chat_request(&request, vec![], stream)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("known base model")
+            );
+            let mut known = request.clone();
+            known.model = "gpt-5.4".into();
+            known.reasoning = Some(ReasoningConfig::Disabled);
+            let body = serde_json::to_value(
+                AzureOpenAiProvider::build_chat_request(&known, vec![], stream).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(body["max_completion_tokens"], 1024);
+            assert_eq!(body["reasoning_effort"], "none");
+            assert!(body.get("max_tokens").is_none());
+            assert!(body.get("model").is_none()); // generation helper does not choose routing
+            known.temperature = Some(0.5);
+            known.reasoning = Some(ReasoningConfig::Effort(ReasoningEffort::High));
+            assert!(AzureOpenAiProvider::build_chat_request(&known, vec![], stream).is_err());
+        }
+    }
     use super::*;
     use crate::attachments::prepare_messages_for_provider;
     use crate::traits::Provider;
@@ -958,6 +1413,112 @@ mod tests {
         AttachmentDataSource, ChatMessage, MessageAttachment, MessageContentPart, ReasoningConfig,
         ReasoningEffort,
     };
+
+    #[test]
+    fn actual_azure_identity_preserves_modes_and_parallel_in_both_builders() {
+        let provider = AzureOpenAiProvider::new("unused", "unused", "opaque-deployment");
+        assert_eq!(provider.name(), "azure_openai");
+        for stream in [false, true] {
+            for parallel in [None, Some(true), Some(false)] {
+                for (choice, expected) in [
+                    (ToolChoice::Auto, "auto"),
+                    (ToolChoice::None, "none"),
+                    (ToolChoice::Required, "required"),
+                    (
+                        ToolChoice::Tool {
+                            name: "lookup".into(),
+                        },
+                        "named",
+                    ),
+                ] {
+                    let mut request = crate::tools::policy::test_request();
+                    // Generation uses the base model; routing keeps the opaque deployment.
+                    request.model = "gpt-4o".into();
+                    request.max_tokens = Some(128);
+                    request.tool_choice = Some(choice.clone());
+                    request.parallel_tool_calls = parallel;
+                    let prepared = prepare_messages_for_provider(
+                        provider.name(),
+                        &provider.capabilities(),
+                        &request.messages,
+                    )
+                    .unwrap();
+                    let wire = serde_json::to_value(
+                        provider
+                            .build_prepared_chat_request(request.clone(), stream, prepared)
+                            .unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(wire["stream"], stream);
+                    assert_eq!(wire["max_tokens"], 128);
+                    assert_eq!(
+                        wire.get("model").and_then(serde_json::Value::as_str),
+                        provider.deployment_model().as_deref()
+                    );
+                    assert_eq!(
+                        wire.get("parallel_tool_calls")
+                            .and_then(serde_json::Value::as_bool),
+                        if matches!(choice, ToolChoice::None) {
+                            None
+                        } else {
+                            parallel
+                        }
+                    );
+                    if expected == "named" {
+                        assert_eq!(wire["tool_choice"]["function"]["name"], "lookup");
+                    } else {
+                        assert_eq!(wire["tool_choice"], expected);
+                    }
+                    let canonical =
+                        crate::tools::policy::prepare_request("azure-openai", request.clone())
+                            .unwrap();
+                    let actual =
+                        crate::tools::policy::prepare_request(provider.name(), request).unwrap();
+                    assert_eq!(actual.parallel_tool_calls, canonical.parallel_tool_calls);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn actual_azure_entrypoints_reject_responses_only_tools_before_http() {
+        let provider = AzureOpenAiProvider::new("unused", "unused", "opaque-deployment");
+        for model in ["gpt-6-astra", "gpt-6.1-sol-2026-09-01"] {
+            for parallel in [None, Some(true), Some(false)] {
+                for choice in [
+                    ToolChoice::Auto,
+                    ToolChoice::None,
+                    ToolChoice::Required,
+                    ToolChoice::Tool {
+                        name: "lookup".into(),
+                    },
+                ] {
+                    let mut request = crate::tools::policy::test_request();
+                    request.model = model.into();
+                    request.tool_choice = Some(choice);
+                    request.parallel_tool_calls = parallel;
+                    assert!(
+                        provider
+                            .chat(request.clone())
+                            .await
+                            .err()
+                            .unwrap()
+                            .to_string()
+                            .contains("Responses API")
+                    );
+                    assert!(
+                        provider
+                            .stream_chat(request)
+                            .await
+                            .err()
+                            .unwrap()
+                            .to_string()
+                            .contains("Responses API")
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn creates_with_defaults() {
@@ -969,9 +1530,120 @@ mod tests {
     }
 
     #[test]
+    fn deployment_routing_preserves_generation_controls_in_both_request_modes() {
+        let mut request = crate::generation::test_request("gpt-5.4");
+        request.reasoning = Some(ReasoningConfig::Disabled);
+        for version in ["v1", "2024-08-01-preview"] {
+            let provider = AzureOpenAiProvider::with_api_version(
+                "fixture-key",
+                "fixture-resource",
+                "production-deployment",
+                version,
+            );
+            for stream in [false, true] {
+                let body = serde_json::to_value(
+                    provider
+                        .build_deployment_chat_request(&request, vec![], stream)
+                        .unwrap(),
+                )
+                .unwrap();
+                if version == "v1" {
+                    assert_eq!(body["model"], "production-deployment");
+                } else {
+                    assert!(body.get("model").is_none());
+                    assert!(
+                        provider
+                            .chat_completions_url()
+                            .contains("/deployments/production-deployment/chat/completions")
+                    );
+                }
+                assert_eq!(body["max_completion_tokens"], 1024);
+                assert!(body.get("max_tokens").is_none());
+                assert_eq!(body["reasoning_effort"], "none");
+                assert_eq!(body["stream"], stream);
+                assert_eq!(body.get("stream_options").is_some(), stream);
+                assert!(body.get("temperature").is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn deployment_route_validates_required_configuration_and_version() {
+        let unconfigured = AzureOpenAiProvider::new("dummy-key", "", "");
+        assert!(unconfigured.validate_connection(true).is_err());
+        let provider = AzureOpenAiProvider::with_base_url_and_timeout_policy(
+            "dummy-key",
+            "",
+            "team/deploy +?",
+            "https://example.test/proxy/",
+            ProviderTimeoutPolicy::default(),
+        )
+        .with_version_override(Some("2025-04-01-preview"));
+        assert!(provider.validate_connection(true).is_ok());
+        assert_eq!(
+            provider.chat_completions_url(),
+            "https://example.test/proxy/openai/deployments/team%2Fdeploy%20%2B%3F/chat/completions?api-version=2025-04-01-preview"
+        );
+        for version in ["", "2024-10-21&x=y", "2024/10/21"] {
+            let invalid = AzureOpenAiProvider::with_api_version(
+                "dummy-key",
+                "resource",
+                "deployment",
+                version,
+            );
+            assert!(invalid.validate_connection(true).is_err());
+        }
+        assert!(
+            AzureOpenAiProvider::new("dummy-key", "resource.invalid", "deployment")
+                .validate_connection(true)
+                .is_err()
+        );
+        assert!(
+            AzureOpenAiProvider::new("dummy-key", "resource", "")
+                .validate_connection(true)
+                .is_err()
+        );
+    }
+
+    #[test]
     fn creates_with_custom_api_version() {
         let provider = AzureOpenAiProvider::with_api_version("key", "res", "deploy", "2025-01-01");
         assert_eq!(provider.api_version, "2025-01-01");
+    }
+
+    #[test]
+    fn v1_prefix_and_legacy_version_keep_deployment_in_the_right_place() {
+        let v1 = AzureOpenAiProvider::with_base_url_and_timeout_policy(
+            "dummy-key",
+            "",
+            "named-deployment",
+            "https://example.test/openai/v1/",
+            ProviderTimeoutPolicy::default(),
+        );
+        assert!(v1.validate_connection(true).is_ok());
+        assert_eq!(
+            v1.chat_completions_url(),
+            "https://example.test/openai/v1/chat/completions"
+        );
+        assert_eq!(v1.models_url(), "https://example.test/openai/v1/models");
+        assert_eq!(v1.deployment_model().as_deref(), Some("named-deployment"));
+        let legacy = AzureOpenAiProvider::with_api_version(
+            "dummy-key",
+            "resource",
+            "named-deployment",
+            "2024-08-01-preview",
+        );
+        assert!(legacy.validate_connection(true).is_ok());
+        assert_eq!(
+            legacy.chat_completions_url(),
+            "https://resource.openai.azure.com/openai/deployments/named-deployment/chat/completions?api-version=2024-08-01-preview"
+        );
+        assert_eq!(legacy.deployment_model(), None);
+        assert!(
+            v1.with_version_override(Some("2024-08-01-preview"))
+                .validate_connection(true)
+                .is_err()
+        );
     }
 
     #[test]
@@ -1004,10 +1676,26 @@ mod tests {
         let provider = AzureOpenAiProvider::new("key", "my-resource", "gpt-4o");
         assert_eq!(
             provider.chat_completions_url(),
-            format!(
-                "https://my-resource.openai.azure.com/openai/deployments/gpt-4o/chat/completions?api-version={}",
-                DEFAULT_API_VERSION
-            )
+            "https://my-resource.openai.azure.com/openai/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn custom_gateway_root_routes_chat_and_models_without_resource_name() {
+        let provider = AzureOpenAiProvider::with_base_url_and_timeout_policy(
+            "key",
+            "unused-resource",
+            "deployment",
+            "http://localhost:8080/team/",
+            ProviderTimeoutPolicy::default(),
+        );
+        assert_eq!(
+            provider.chat_completions_url(),
+            "http://localhost:8080/team/openai/v1/chat/completions"
+        );
+        assert_eq!(
+            provider.models_url(),
+            "http://localhost:8080/team/openai/v1/models"
         );
     }
 
@@ -1102,6 +1790,8 @@ mod tests {
     #[test]
     fn api_request_serializes_reasoning_effort_only_when_selected() {
         let request = ApiChatRequest {
+            generation: Default::default(),
+            model: None,
             messages: Vec::new(),
             temperature: None,
             max_tokens: None,
@@ -1110,6 +1800,7 @@ mod tests {
             parallel_tool_calls: None,
             reasoning_effort: Some("high".to_owned()),
             stream: false,
+            stream_options: None,
         };
 
         let json = serde_json::to_value(&request).unwrap();
@@ -1122,18 +1813,14 @@ mod tests {
         let json = serde_json::to_value(&request_without_reasoning).unwrap();
         assert!(json.get("reasoning_effort").is_none());
     }
+}
 
-    #[test]
-    fn reasoning_effort_mapping_omits_disabled_and_serializes_explicit_none() {
-        assert_eq!(
-            reasoning_effort_for_azure_openai_request(Some(ReasoningConfig::disabled())),
-            None
-        );
-        assert_eq!(
-            reasoning_effort_for_azure_openai_request(Some(ReasoningConfig::effort(
-                ReasoningEffort::None
-            ))),
-            Some("none".to_owned())
-        );
+#[cfg(test)]
+mod wire_contract_tests {
+    use super::*;
+    type WireProvider = AzureOpenAiProvider;
+    fn wire_provider() -> WireProvider {
+        WireProvider::new("fixture", "fixture-resource", "fixture-deployment")
     }
+    include!("wire_tests/chat.rs");
 }

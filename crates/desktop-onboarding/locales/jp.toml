@@ -1,0 +1,199 @@
+[common]
+address = "アドレス"
+copy = "コピー"
+name = "名前"
+ok = "OK"
+or = "または"
+activation_code = "アクティベーションコード"
+
+[buttons]
+ok = "OK"
+add = "追加"
+cancel = "キャンセル"
+save = "保存"
+dismiss = "閉じる"
+
+[errors.command]
+exit_status = "終了ステータス %{status}"
+failed_with_output = "`%{command_label}` が失敗しました: %{details}"
+launchctl_print_failed = "`launchctl print` の実行に失敗しました"
+powershell_task_status_failed = "スケジュールタスク状態確認のための powershell 実行に失敗しました"
+run_failed = "`%{command_label}` の実行に失敗しました"
+systemctl_is_active_failed = "`systemctl --user is-active` の実行に失敗しました"
+
+[errors.config]
+connect_timeout_positive = "`desktop.gateway.connect_timeout_ms` は 0 より大きくする必要があります"
+load_app = "アプリ設定の読み込みに失敗しました"
+poll_interval_positive = "`desktop.gateway.poll_interval_ms` は 0 より大きくする必要があります"
+startup_timeout_positive = "`desktop.gateway.startup_timeout_ms` は 0 より大きくする必要があります"
+gateway_field_positive = "`desktop.gateway.%{field}` は 0 より大きくする必要があります"
+ws_ping_interval_positive = "`desktop.gateway.ws_ping_interval_ms` は 0 より大きくする必要があります"
+ws_pong_timeout_positive = "`desktop.gateway.ws_pong_timeout_ms` は 0 より大きくする必要があります"
+ws_reconnect_initial_positive = "`desktop.gateway.ws_reconnect_initial_ms` は 0 より大きくする必要があります"
+ws_reconnect_max_positive = "`desktop.gateway.ws_reconnect_max_ms` は 0 より大きくする必要があります"
+ws_reconnect_initial_le_max = "`desktop.gateway.ws_reconnect_initial_ms` は `desktop.gateway.ws_reconnect_max_ms` 以下である必要があります"
+ws_reconnect_jitter_percent_max = "`desktop.gateway.ws_reconnect_jitter_percent` は 100 以下である必要があります。現在値: %{value}"
+
+[errors.gateway]
+address_conflict_inactive_service = "アドレス `%{listen_addr}` はすでに使用中ですが、設定されたサービス `%{service_name}` は稼働していません。競合プロセス/サービスを停止するか gateway.listen_addr を変更してください"
+address_empty = "ゲートウェイのアドレスは空にできません"
+address_already_exists = "ゲートウェイ `%{address}` はすでに一覧にあります"
+id_not_found = "ゲートウェイ id `%{id}` が見つかりません"
+invalid_address = "無効なゲートウェイアドレス `%{normalized}` です。HTTP(S) URL、host、または host:port を指定してください"
+local_delete_unsupported = "ローカルゲートウェイは一覧から削除できません"
+remote_edit_only = "編集できるのはリモートゲートウェイのみです"
+resolve_empty = "ゲートウェイアドレス `%{listen_addr}` はソケットアドレスに解決されませんでした"
+resolve_failed = "ゲートウェイアドレス `%{listen_addr}` の解決に失敗しました"
+start_command_failed_manual_help = "ローカルゲートウェイを自動でインストールまたは起動できませんでした。再試行し、ローカルのゲートウェイ設定を確認してください"
+startup_timeout = "ゲートウェイサービスは %{startup_timeout_ms}ms 以内に `%{listen_addr}` で到達可能になりませんでした"
+unreachable_verify = "ゲートウェイ `%{address}` に到達できません。アドレスとゲートウェイが起動していることを確認してください"
+validation_timeout_positive = "リモートゲートウェイ検証タイムアウトは正の値である必要があります。現在値: %{timeout_ms} ms"
+
+[errors.registry]
+parse_failed = "ゲートウェイレジストリ `%{path}` の解析に失敗しました"
+read_failed = "ゲートウェイレジストリ `%{path}` の読み込みに失敗しました"
+serialize_failed = "ゲートウェイレジストリのシリアライズに失敗しました"
+unsupported_version = "`%{path}` のゲートウェイレジストリバージョン `%{version}` は未対応です。期待値: `%{current_registry_version}`"
+write_failed = "ゲートウェイレジストリ `%{path}` の書き込みに失敗しました"
+
+[errors.runtime]
+ensure_home = "実行環境のホームディレクトリの準備に失敗しました"
+
+[errors.theme]
+watch_dir_failed = "テーマディレクトリの監視に失敗しました"
+
+[errors.window]
+open_failed = "デスクトップウィンドウを開けませんでした"
+
+[gateway.action]
+add = "ゲートウェイを追加"
+connect_remote = "リモートに接続"
+delete = "削除"
+edit = "ゲートウェイを編集"
+reauthenticate = "再接続"
+start_local = "ローカルゲートウェイを起動"
+
+[gateway.add]
+description = "リモートゲートウェイに接続するか、ローカルゲートウェイを起動します。"
+description_remote_only = "リモートゲートウェイに接続します。"
+title = "ゲートウェイを追加"
+
+[gateway.delete]
+confirm_description = "このデスクトップからゲートウェイを削除します。サーバー上のゲートウェイデータは削除されません。"
+confirm_title = "%{name} を削除しますか?"
+
+[gateway.edit]
+description = "ゲートウェイ接続情報を更新します。"
+title = "%{name} を編集"
+
+[gateway.endpoint]
+local_name = "ローカルゲートウェイ"
+local_with_address = "ローカル - %{address}"
+remote_name = "リモート %{index}"
+remote_with_address = "リモート - %{address}"
+
+[gateway.error]
+with_details = "ゲートウェイエラー: %{error}."
+
+[gateway.initial]
+description = "ゲートウェイアドレスを指定するか、ローカルゲートウェイサービスを起動してください。"
+title = "ゲートウェイに接続"
+
+[gateway.popover]
+no_available = "利用可能なゲートウェイがありません。"
+
+[gateway.reauthenticate]
+description = "保存済みのゲートウェイを変更せずに、このデバイスを再接続するための新しいアクティベーションコードを入力してください。"
+title = "%{name} に再接続"
+
+[gateway.status]
+connected = "ゲートウェイ接続済み"
+connecting = "ゲートウェイ接続中..."
+connecting_named = "%{gateway_name} に接続中..."
+connecting_remote = "リモートゲートウェイに接続中..."
+deleting = "ゲートウェイを削除中..."
+failed_check = "ゲートウェイの状態確認に失敗しました: %{error}"
+local_conflict = "ローカルゲートウェイ競合: アドレスは他のプロセスにより使用されています。"
+local_conflict_at = "%{gateway_address} でローカルゲートウェイ競合: アドレスは他のプロセスにより使用されています。"
+local_stopped = "ローカルゲートウェイは停止しています: %{gateway_address}。ローカルゲートウェイを起動するか、リモートに切り替えてください。"
+not_configured = "ゲートウェイはまだ設定されていません。リモートアドレスを追加するか、ローカルゲートウェイを起動してください。"
+remote_unavailable = "リモートゲートウェイは利用できません: %{gateway_name} (%{gateway_address})"
+saving = "ゲートウェイを保存中..."
+starting_local = "ローカルゲートウェイを起動中..."
+installing = "ゲートウェイをインストール中..."
+updating = "ゲートウェイを更新中..."
+subsystem_failed = "ゲートウェイサブシステムの初期化に失敗しました: %{error}"
+subsystem_not_ready = "ゲートウェイサブシステムは準備できていません"
+unavailable = "ゲートウェイは利用できません"
+
+[gateway.notification]
+path_update_skipped = "ゲートウェイを起動しました。`pioneer` コマンドを使うには、新しいターミナルセッションで %{bin_dir} を PATH に追加する必要がある場合があります。"
+
+[gateway.session_terminal]
+authentication_required = "新しいアクティベーションコードでこのゲートウェイにログインしてください。"
+revoked = "このデバイスのセッションはログアウトまたは取り消されました。もう一度ログインしてください。"
+expired = "このデバイスのセッションは期限切れです。もう一度ログインしてください。"
+compromised = "セキュリティ保護のためセッションを終了しました。もう一度ログインしてください。"
+principal_suspended = "アカウントは停止されています。ゲートウェイ管理者にお問い合わせください。"
+principal_removed = "アカウントはこのゲートウェイから削除されました。"
+gateway_mismatch = "このセッションは別のゲートウェイに属しています。確認して再度ペアリングしてください。"
+storage_failed = "Pioneer はデバイスセッションを安全に保存できませんでした。"
+
+[invitation.join]
+title = "招待"
+one_time_warning = "この招待は一度限りの認証情報です。共有しないでください。"
+loading = "招待を確認中…"
+display_name_label = "表示名"
+display_name_placeholder = "お名前"
+nickname_label = "ニックネーム"
+nickname_placeholder = "your.nickname"
+avatar_label = "プロフィール画像（任意）"
+avatar_choose = "画像を選択"
+accept = "招待を承認"
+gateway = "Gateway: %{name}"
+inviter = "%{name} からの招待"
+workspaces = "ワークスペース: %{names}"
+expires = "Unix時間 %{timestamp} に期限切れ"
+
+[invitation.join.transport]
+secure = "安全に暗号化された接続"
+insecure = "暗号化されていない接続"
+
+[invitation.join.error]
+title = "招待を利用できません"
+invalid = "この招待リンクは無効か、利用できません。"
+unavailable = "この招待は無効、期限切れ、取り消し済み、または利用できません。"
+display_name = "有効な表示名を入力してください。"
+nickname = "ニックネームは2〜32文字のASCII英数字、ピリオド、ハイフン、またはアンダースコアで入力してください。"
+nickname_unavailable = "そのニックネームはすでに使用されています。"
+avatar = "256 KB以下の画像を選択してください。"
+storage = "新しいセッションを安全に保存できませんでした。もう一度お試しください。"
+transport = "Gatewayに接続できませんでした。もう一度お試しください。"
+
+
+[settings.profile]
+read_only = "読み取り専用プロフィール"
+edit_title = "アカウントを編集"
+edit_username_title = "ユーザー名を編集"
+done = "完了"
+first_name = "名"
+last_name = "姓"
+name_hint = "名前を入力し、必要に応じてプロフィール写真を追加してください。"
+change_photo = "写真を変更"
+remove_photo = "写真を削除"
+username = "ユーザー名"
+username_hint = "他のメンバーがあなたを識別できる公開ユーザー名を選択してください。"
+username_rules = "2～32文字の英字、数字、ピリオド、アンダースコア、ハイフンを使用できます。先頭は英字または数字にしてください。"
+error_invalid = "有効な名前とユーザー名を入力してください。"
+error_username_unavailable = "このユーザー名は既に使用されています。"
+error_avatar = "1024 × 1024、256 KB以下のPNG、JPEG、WebP画像を選択してください。"
+error_save = "プロフィールを保存できませんでした。もう一度お試しください。"
+
+[settings.profile.kind]
+superuser = "スーパーユーザー"
+member = "メンバー"
+unknown = "不明なアカウント種別"
+
+
+[invitation.join.actions]
+retry = "再試行"

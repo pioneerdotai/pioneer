@@ -30,10 +30,8 @@ use pioneer_protocol::{
     DeviceId, DeviceStatus, InvitationId, PrincipalKind, PrincipalStatus, RefreshCredentialId,
     RequestId, RoleKey, TokenFamilyId, WorkspaceId, format_device_activation_code, generate_id,
 };
-use sea_orm::{
-    DatabaseConnection, DatabaseTransaction, SqliteTransactionMode, TransactionOptions,
-    TransactionTrait,
-};
+use pioneer_sqlite::SqliteDatabase;
+use sea_orm::{DatabaseTransaction, SqliteTransactionMode, TransactionOptions, TransactionTrait};
 use serde_json::{Value as JsonValue, to_value};
 use subtle::ConstantTimeEq;
 
@@ -62,7 +60,7 @@ const AUTH_MAINTENANCE_BATCH_SIZE: u64 = 256;
 const AUTH_MAINTENANCE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 
 pub(crate) struct GatewayAuthService {
-    database: DatabaseConnection,
+    database: SqliteDatabase,
     config: GatewayAuthConfig,
     identity: Arc<IdentityBootstrapSnapshot>,
     access_issuer: AccessJwtIssuer,
@@ -174,7 +172,7 @@ fn typed_id<T, E>(
 
 impl GatewayAuthService {
     pub(crate) fn new(
-        database: DatabaseConnection,
+        database: impl Into<SqliteDatabase>,
         config: GatewayAuthConfig,
         identity: Arc<IdentityBootstrapSnapshot>,
         access_key: &AuthKeyMaterial,
@@ -187,7 +185,7 @@ impl GatewayAuthService {
                 identity.gateway.id.clone(),
             )?,
             opaque_credentials: OpaqueCredentialFactory::new(credential_hmac_key.as_bytes())?,
-            database,
+            database: database.into().with_critical_writes(),
             config,
             identity,
             disconnect_hooks: std::sync::RwLock::new(Vec::new()),
@@ -207,7 +205,29 @@ impl GatewayAuthService {
     pub(crate) async fn exchange_refresh(
         &self,
         admission: RestrictedAdmission,
+        params: AuthRefreshParams,
+    ) -> Result<AuthRefreshGrant, AuthError> {
+        let trace = pioneer_observability::GatewayOperationTrace::start(
+            pioneer_observability::GatewayOperation::AuthRefresh,
+        );
+        let result = self.exchange_refresh_inner(admission, params, &trace).await;
+        match result {
+            Ok(grant) => {
+                trace.finish_success();
+                Ok(grant)
+            }
+            Err(error) => {
+                trace.finish_failure();
+                Err(error)
+            }
+        }
+    }
+
+    async fn exchange_refresh_inner(
+        &self,
+        admission: RestrictedAdmission,
         mut params: AuthRefreshParams,
+        trace: &pioneer_observability::GatewayOperationTrace,
     ) -> Result<AuthRefreshGrant, AuthError> {
         if !matches!(admission.context(), RestrictedAuthContext::Refresh(_)) {
             return Err(AuthError::new(AuthErrorCode::MethodNotAllowed));
@@ -236,6 +256,9 @@ impl GatewayAuthService {
             .ok_or_else(|| AuthError::new(AuthErrorCode::InvalidCredential))?;
         let access_jti = generate_id(AUTH_DOMAIN_ID_LEN);
 
+        let transaction_acquire_stage = trace.stage(
+            pioneer_observability::GatewayOperationStage::AuthRefreshDatabaseTransactionAcquire,
+        );
         let transaction = self
             .database
             .begin_with_options(TransactionOptions {
@@ -243,7 +266,8 @@ impl GatewayAuthService {
                 ..Default::default()
             })
             .await
-            .map_err(|_| AuthError::new(AuthErrorCode::InvalidCredential))?;
+            .map_err(refresh_transaction_acquire_error)?;
+        transaction_acquire_stage.succeed();
         let session = match load_session(&transaction, &presented.session_id)
             .await
             .map_err(storage_error)?
@@ -735,6 +759,32 @@ impl GatewayAuthService {
         &self,
         principal: &AuthenticatedSessionPrincipal,
     ) -> Result<SessionLeaseSnapshot, AuthError> {
+        self.validate_session_lease_with_trace(principal, None)
+            .await
+    }
+
+    async fn validate_session_lease_with_trace(
+        &self,
+        principal: &AuthenticatedSessionPrincipal,
+        trace: Option<&pioneer_observability::GatewayOperationTrace>,
+    ) -> Result<SessionLeaseSnapshot, AuthError> {
+        self.validate_session_lease_in_scope(principal, trace, &self.database)
+            .await
+    }
+    pub(crate) async fn validate_session_lease_with_database(
+        &self,
+        principal: &AuthenticatedSessionPrincipal,
+        database: &SqliteDatabase,
+    ) -> Result<SessionLeaseSnapshot, AuthError> {
+        self.validate_session_lease_in_scope(principal, None, database)
+            .await
+    }
+    async fn validate_session_lease_in_scope(
+        &self,
+        principal: &AuthenticatedSessionPrincipal,
+        trace: Option<&pioneer_observability::GatewayOperationTrace>,
+        database: &SqliteDatabase,
+    ) -> Result<SessionLeaseSnapshot, AuthError> {
         let now_unix =
             unix_timestamp_secs().map_err(|_| AuthError::new(AuthErrorCode::InvalidCredential))?;
         if now_unix >= principal.access_expires_at_unix {
@@ -743,18 +793,27 @@ impl GatewayAuthService {
         if principal.gateway_id != self.identity.gateway.id {
             return Err(AuthError::new(AuthErrorCode::GatewayIdentityMismatch));
         }
-        let session = load_session(&self.database, &principal.session_id)
-            .await
-            .map_err(storage_error)?
-            .ok_or_else(|| AuthError::new(AuthErrorCode::InvalidCredential))?;
-        let device = load_device(&self.database, &principal.device_id)
-            .await
-            .map_err(storage_error)?
-            .ok_or_else(|| AuthError::new(AuthErrorCode::InvalidCredential))?;
-        let owner = load_principal_by_id(&self.database, &principal.principal_id)
-            .await
-            .map_err(storage_error)?
-            .ok_or_else(|| AuthError::new(AuthErrorCode::InvalidCredential))?;
+        let session = trace_auth_me_database_read(
+            trace,
+            pioneer_observability::GatewayOperationStage::AuthMeSessionLoad,
+            load_session(database, &principal.session_id),
+        )
+        .await?
+        .ok_or_else(|| AuthError::new(AuthErrorCode::InvalidCredential))?;
+        let device = trace_auth_me_database_read(
+            trace,
+            pioneer_observability::GatewayOperationStage::AuthMeDeviceLoad,
+            load_device(database, &principal.device_id),
+        )
+        .await?
+        .ok_or_else(|| AuthError::new(AuthErrorCode::InvalidCredential))?;
+        let owner = trace_auth_me_database_read(
+            trace,
+            pioneer_observability::GatewayOperationStage::AuthMePrincipalLoad,
+            load_principal_by_id(database, &principal.principal_id),
+        )
+        .await?
+        .ok_or_else(|| AuthError::new(AuthErrorCode::InvalidCredential))?;
 
         if session.gateway_id != principal.gateway_id.as_str()
             || session.principal_id != principal.principal_id.as_str()
@@ -783,10 +842,13 @@ impl GatewayAuthService {
         if device.status != "active" {
             return Err(AuthError::new(AuthErrorCode::SessionRevoked));
         }
-        let avatar_revision = load_principal_avatar(&self.database, &principal.principal_id)
-            .await
-            .map_err(storage_error)?
-            .map(|avatar| hex::encode(avatar.content_hash));
+        let avatar_revision = trace_auth_me_database_read(
+            trace,
+            pioneer_observability::GatewayOperationStage::AuthMeAvatarLoad,
+            load_principal_avatar(database, &principal.principal_id),
+        )
+        .await?
+        .map(|avatar| hex::encode(avatar.content_hash));
         Ok(SessionLeaseSnapshot {
             kind: owner.kind,
             role_key: role_key.clone(),
@@ -900,7 +962,23 @@ impl GatewayAuthService {
         &self,
         principal: &AuthenticatedSessionPrincipal,
     ) -> Result<AuthMeResponse, AuthError> {
-        Ok(self.validate_session_lease(principal).await?.me)
+        let trace = pioneer_observability::GatewayOperationTrace::start(
+            pioneer_observability::GatewayOperation::AuthMe,
+        );
+        let result = self
+            .validate_session_lease_with_trace(principal, Some(&trace))
+            .await
+            .map(|snapshot| snapshot.me);
+        match result {
+            Ok(me) => {
+                trace.finish_success();
+                Ok(me)
+            }
+            Err(error) => {
+                trace.finish_failure();
+                Err(error)
+            }
+        }
     }
 
     pub(crate) async fn update_profile(
@@ -1056,8 +1134,8 @@ impl GatewayAuthService {
         now_unix: u64,
         batch_size: u64,
     ) -> Result<u64, AuthError> {
-        let transaction = self
-            .database
+        let database = self.database.maintenance();
+        let transaction = database
             .begin_with_options(TransactionOptions {
                 sqlite_transaction_mode: Some(SqliteTransactionMode::Immediate),
                 ..Default::default()
@@ -1091,8 +1169,8 @@ impl GatewayAuthService {
         now_unix: u64,
         batch_size: u64,
     ) -> Result<u64, AuthError> {
-        let transaction = self
-            .database
+        let database = self.database.maintenance();
+        let transaction = database
             .begin_with_options(TransactionOptions {
                 sqlite_transaction_mode: Some(SqliteTransactionMode::Immediate),
                 ..Default::default()
@@ -2569,8 +2647,39 @@ fn datetime(unix: u64) -> Result<DateTime<FixedOffset>, AuthError> {
         .ok_or_else(|| AuthError::new(AuthErrorCode::InvalidCredential))
 }
 
+async fn trace_auth_me_database_read<T>(
+    trace: Option<&pioneer_observability::GatewayOperationTrace>,
+    stage: pioneer_observability::GatewayOperationStage,
+    read: impl std::future::Future<Output = anyhow::Result<T>>,
+) -> Result<T, AuthError> {
+    let stage = trace.map(|trace| trace.stage(stage));
+    match read.await {
+        Ok(value) => {
+            if let Some(stage) = stage {
+                stage.succeed();
+            }
+            Ok(value)
+        }
+        Err(error) => {
+            drop(stage);
+            Err(storage_error(error))
+        }
+    }
+}
+
 fn storage_error(_error: anyhow::Error) -> AuthError {
     AuthError::new(AuthErrorCode::InvalidCredential)
+}
+
+fn refresh_transaction_acquire_error(error: sea_orm::DbErr) -> AuthError {
+    let error = anyhow::Error::new(error);
+    if pioneer_sqlite::is_anyhow_sqlite_lock(&error)
+        || pioneer_sqlite::is_anyhow_sqlite_pool_timeout(&error)
+    {
+        AuthError::new(AuthErrorCode::TemporarilyUnavailable)
+    } else {
+        AuthError::new(AuthErrorCode::InvalidCredential)
+    }
 }
 
 fn client_kind_from_db(value: &str) -> Result<ClientKind, AuthError> {
@@ -2935,6 +3044,54 @@ mod tests {
             .await,
             1
         );
+    }
+
+    #[tokio::test]
+    async fn refresh_waits_for_one_maintenance_transaction_without_becoming_unavailable() {
+        let (service, _identity) = fixture().await;
+        let initial = service
+            .create_initial_session_with_ids(
+                params("bounded-background-refresh", ClientKind::Desktop),
+                ids(1),
+            )
+            .await
+            .expect("initial session should be created");
+        let database = service.database.maintenance();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let background = tokio::spawn({
+            let entered = entered.clone();
+            async move {
+                let transaction = database.begin().await?;
+                entered.notify_one();
+                tokio::time::sleep(std::time::Duration::from_millis(650)).await;
+                transaction.commit().await?;
+                Ok::<_, sea_orm::DbErr>(())
+            }
+        });
+
+        entered.notified().await;
+        let started = std::time::Instant::now();
+        let rotated = service
+            .exchange_refresh(
+                refresh_admission(initial.refresh_token.expose_secret()),
+                refresh_params(1),
+            )
+            .await
+            .expect("refresh should enter after the bounded background quantum");
+        assert_eq!(rotated.refresh_generation, 1);
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(500),
+            "test must cross the removed 500 ms database acquisition deadline"
+        );
+        assert!(
+            started.elapsed()
+                < std::time::Duration::from_secs(service.config.auth_exchange_timeout_seconds),
+            "refresh must remain within the single end-to-end auth deadline"
+        );
+        background
+            .await
+            .expect("background task should join")
+            .expect("background transaction should succeed");
     }
 
     #[tokio::test]
@@ -5108,13 +5265,26 @@ mod tests {
         let historical_hash = service
             .opaque_credentials
             .fingerprint_device_activation_raw(wrong.as_str());
+        let current_locator = pioneer_protocol::device_activation_locator(wrong.as_str()).unwrap();
+        let historical_locator = pioneer_protocol::DEVICE_ACTIVATION_ALPHABET
+            .iter()
+            .copied()
+            .map(char::from)
+            .find(|candidate| Some(*candidate) != current_locator.chars().next())
+            .unwrap()
+            .to_string();
+        let historical_locator_hash = service
+            .opaque_credentials
+            .fingerprint_device_activation_locator_symbol(historical_locator.as_str())
+            .unwrap();
         service
             .database
             .execute_raw(Statement::from_sql_and_values(
                 service.database.get_database_backend(),
-                "UPDATE auth_session SET activation_token_hash = ? WHERE id = ?",
+                "UPDATE auth_session SET activation_token_hash = ?, activation_locator_hash = ? WHERE id = ?",
                 [
                     historical_hash.to_vec().into(),
+                    historical_locator_hash.to_vec().into(),
                     historical.session_id.to_string().into(),
                 ],
             ))
@@ -5872,7 +6042,7 @@ mod tests {
         }
     }
 
-    async fn count(database: &DatabaseConnection, table: &str) -> i64 {
+    async fn count(database: &impl ConnectionTrait, table: &str) -> i64 {
         database
             .query_one_raw(Statement::from_string(
                 database.get_database_backend(),
@@ -5885,7 +6055,7 @@ mod tests {
             .unwrap()
     }
 
-    async fn count_where(database: &DatabaseConnection, table: &str, condition: &str) -> i64 {
+    async fn count_where(database: &impl ConnectionTrait, table: &str, condition: &str) -> i64 {
         scalar_i64(
             database,
             format!("SELECT COUNT(*) AS value FROM {table} WHERE {condition}").as_str(),
@@ -5893,7 +6063,7 @@ mod tests {
         .await
     }
 
-    async fn scalar_i64(database: &DatabaseConnection, query: &str) -> i64 {
+    async fn scalar_i64(database: &impl ConnectionTrait, query: &str) -> i64 {
         database
             .query_one_raw(Statement::from_string(
                 database.get_database_backend(),
@@ -5906,7 +6076,7 @@ mod tests {
             .unwrap()
     }
 
-    async fn scalar_text(database: &DatabaseConnection, query: &str) -> String {
+    async fn scalar_text(database: &impl ConnectionTrait, query: &str) -> String {
         database
             .query_one_raw(Statement::from_string(
                 database.get_database_backend(),
@@ -5919,7 +6089,7 @@ mod tests {
             .unwrap()
     }
 
-    async fn database_text(database: &DatabaseConnection) -> String {
+    async fn database_text(database: &impl ConnectionTrait) -> String {
         let rows = database
             .query_all_raw(Statement::from_string(
                 database.get_database_backend(),

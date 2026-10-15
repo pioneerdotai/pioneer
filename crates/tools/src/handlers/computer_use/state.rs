@@ -3,8 +3,40 @@ use crate::context::ToolPayload;
 use crate::error::ToolError;
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
+
+fn active_artifact_directories() -> &'static Mutex<HashSet<PathBuf>> {
+    static ACTIVE: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+    ACTIVE.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+#[derive(Debug)]
+pub(crate) struct ActiveArtifactLease {
+    path: PathBuf,
+}
+
+impl ActiveArtifactLease {
+    pub(crate) fn reserve_directory(path: PathBuf) -> std::io::Result<Arc<Self>> {
+        let mut active = active_artifact_directories()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        fs::create_dir(path.as_path())?;
+        active.insert(path.clone());
+        Ok(Arc::new(Self { path }))
+    }
+}
+
+impl Drop for ActiveArtifactLease {
+    fn drop(&mut self) {
+        active_artifact_directories()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.path);
+    }
+}
 
 #[derive(Debug, Default)]
 pub(crate) struct ComputerUseSessionManager {
@@ -32,8 +64,8 @@ fn discover_max_session_id(root: &Path) -> u64 {
     entries
         .filter_map(Result::ok)
         .filter_map(|entry| {
-            let metadata = entry.metadata().ok()?;
-            if !metadata.is_dir() {
+            let file_type = entry.file_type().ok()?;
+            if !file_type.is_dir() || file_type.is_symlink() {
                 return None;
             }
             entry
@@ -243,8 +275,14 @@ pub(crate) fn cleanup_artifacts_sync(
             root.display()
         ))
     })?;
+    // Reservation holds the same registry lock while it creates and leases a
+    // directory. Keeping it for the complete scan/remove cycle closes the
+    // otherwise exploitable create-before-lease cleanup race.
+    let active = active_artifact_directories()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-    let mut entries = scan_session_dirs(root)?;
+    let mut entries = scan_session_dirs(root, &active)?;
     if entries.is_empty() {
         return Ok(());
     }
@@ -261,7 +299,7 @@ pub(crate) fn cleanup_artifacts_sync(
         }
     }
 
-    entries = scan_session_dirs(root)?;
+    entries = scan_session_dirs(root, &active)?;
 
     let mut total_bytes = entries
         .iter()
@@ -291,7 +329,10 @@ struct SessionDirStats {
     size_bytes: u64,
 }
 
-fn scan_session_dirs(root: &Path) -> Result<Vec<SessionDirStats>, ToolError> {
+fn scan_session_dirs(
+    root: &Path,
+    active: &HashSet<PathBuf>,
+) -> Result<Vec<SessionDirStats>, ToolError> {
     let mut sessions = Vec::new();
     let entries = fs::read_dir(root).map_err(|error| {
         ToolError::execution_failed(format!(
@@ -308,11 +349,14 @@ fn scan_session_dirs(root: &Path) -> Result<Vec<SessionDirStats>, ToolError> {
             ))
         })?;
         let path = entry.path();
-        let metadata = match entry.metadata() {
+        let metadata = match fs::symlink_metadata(path.as_path()) {
             Ok(value) => value,
             Err(_) => continue,
         };
-        if !metadata.is_dir() {
+        if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+            continue;
+        }
+        if active.contains(path.as_path()) {
             continue;
         }
 
@@ -344,16 +388,49 @@ fn measure_dir_size(dir: &Path) -> Result<u64, ToolError> {
             ))
         })?;
         let path = entry.path();
-        let metadata = match entry.metadata() {
+        let metadata = match fs::symlink_metadata(path.as_path()) {
             Ok(value) => value,
             Err(_) => continue,
         };
-        if metadata.is_dir() {
+        let file_type = metadata.file_type();
+        if file_type.is_symlink() {
+            continue;
+        }
+        if file_type.is_dir() {
             total = total.saturating_add(measure_dir_size(path.as_path())?);
             continue;
         }
-        total = total.saturating_add(metadata.len());
+        if file_type.is_file() {
+            total = total.saturating_add(metadata.len());
+        }
     }
 
     Ok(total)
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    #[test]
+    fn discovery_and_cleanup_do_not_follow_artifact_symlinks() {
+        let root = tempfile::tempdir().expect("artifact root");
+        let outside = tempfile::tempdir().expect("outside root");
+        fs::write(outside.path().join("secret.bin"), vec![7u8; 1024 * 1024])
+            .expect("outside payload");
+
+        symlink(outside.path(), root.path().join(u64::MAX.to_string()))
+            .expect("numeric session symlink");
+        assert_eq!(discover_max_session_id(root.path()), 0);
+
+        let session = root.path().join("1");
+        fs::create_dir(&session).expect("session");
+        fs::write(session.join("frame.png"), b"frame").expect("frame");
+        symlink(outside.path(), session.join("escape")).expect("nested symlink");
+
+        assert_eq!(measure_dir_size(&session).expect("measure session"), 5);
+        cleanup_artifacts_sync(root.path(), u64::MAX, 5).expect("cleanup artifacts");
+        assert!(outside.path().join("secret.bin").is_file());
+    }
 }

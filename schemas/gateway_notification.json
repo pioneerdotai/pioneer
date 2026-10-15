@@ -775,6 +775,22 @@
       "properties": {
         "kind": {
           "type": "string",
+          "const": "mcp_o_auth_changed"
+        },
+        "params": {
+          "$ref": "#/$defs/McpOAuthNotification"
+        }
+      },
+      "required": [
+        "kind",
+        "params"
+      ]
+    },
+    {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
           "const": "mcp_changed"
         },
         "params": {
@@ -1746,6 +1762,13 @@
             }
           ]
         },
+        "selectedCapabilities": {
+          "description": "Exact normalized capabilities for a durable Task launch. Legacy launches\nuse skill_ids and mcp_server_ids when this field is empty.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TurnCapability"
+          }
+        },
         "skillIds": {
           "type": "array",
           "items": {
@@ -2011,6 +2034,94 @@
         }
       },
       "additionalProperties": false
+    },
+    "AgentWorkGraphProjection": {
+      "type": "object",
+      "properties": {
+        "nodes": {
+          "description": "Stable, bounded nodes in the exact root graph. No prompt, provider,\nmodel, thread title, runtime path, or other private payload is exposed.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/AgentWorkNodeProjection"
+          }
+        },
+        "queuedCount": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "rootExecutionId": {
+          "$ref": "#/$defs/AgentExecutionId"
+        },
+        "runningCount": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "saturated": {
+          "description": "True while one or more authorized nodes are durably queued for\nserver-owned capacity. This is resource state, not an authorization\nfailure and never implies that the whole graph is blocked.",
+          "type": "boolean"
+        },
+        "terminalCount": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "updatedAtUnixMicros": {
+          "description": "Monotonic persisted resource-state timestamp used only to reject stale\ngraph projections racing with live queue/promotion/finalization events.",
+          "type": "integer",
+          "format": "int64"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "rootExecutionId",
+        "updatedAtUnixMicros",
+        "queuedCount",
+        "runningCount",
+        "terminalCount",
+        "saturated",
+        "nodes"
+      ]
+    },
+    "AgentWorkNodeProjection": {
+      "type": "object",
+      "properties": {
+        "executionId": {
+          "$ref": "#/$defs/AgentExecutionId"
+        },
+        "progressLabel": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "progressRevision": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "state": {
+          "$ref": "#/$defs/AgentWorkNodeState"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "executionId",
+        "state",
+        "progressRevision"
+      ]
+    },
+    "AgentWorkNodeState": {
+      "type": "string",
+      "enum": [
+        "queued",
+        "running",
+        "completed",
+        "failed",
+        "cancelled",
+        "blocked"
+      ]
     },
     "ArtifactBindingDirection": {
       "type": "string",
@@ -2844,6 +2955,7 @@
       "enum": [
         "command_approval",
         "file_change_approval",
+        "permission_approval",
         "user_input",
         "other"
       ]
@@ -2878,6 +2990,13 @@
             "null"
           ]
         },
+        "visible_thread_ids": {
+          "description": "Additional ancestor Thread capsules in which this child execution\nrequest is intentionally visible and actionable.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
         "workspace_id": {
           "type": "string"
         }
@@ -2897,6 +3016,18 @@
             "status": {
               "type": "string",
               "const": "approved"
+            }
+          },
+          "required": [
+            "status"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "status": {
+              "type": "string",
+              "const": "approved_for_session"
             }
           },
           "required": [
@@ -3006,6 +3137,13 @@
             "null"
           ]
         },
+        "visible_thread_ids": {
+          "description": "Mirrors the opened notification so clients can remove an ancestor-\nprojected request without waiting for a separate timeline refresh.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
         "workspace_id": {
           "type": "string"
         }
@@ -3020,6 +3158,18 @@
     "CLIRuntimeStatusChangedNotification": {
       "type": "object",
       "properties": {
+        "removed": {
+          "description": "Removes `runtime` from the client snapshot. The runtime payload remains\npresent so older clients safely render it as disabled instead of\nretaining a stale ready entry.",
+          "type": "boolean",
+          "default": false
+        },
+        "revision": {
+          "description": "Monotonic workspace change revision. Every emitted delta has a distinct\nrevision, so clients can detect a dropped notification and reload the\ncomplete authoritative snapshot.",
+          "type": "integer",
+          "format": "uint64",
+          "default": 0,
+          "minimum": 0
+        },
         "runtime": {
           "$ref": "#/$defs/RuntimeSummary"
         },
@@ -3447,17 +3597,6 @@
           "type": "integer",
           "format": "uint64",
           "minimum": 0
-        },
-        "agentWorkGraph": {
-          "description": "Server-owned aggregate state for the root Agent work graph bound to\nthis Turn. Descendant Turns do not repeat the graph projection.",
-          "anyOf": [
-            {
-              "$ref": "#/$defs/AgentWorkGraphProjection"
-            },
-            {
-              "type": "null"
-            }
-          ]
         }
       },
       "required": [
@@ -4283,6 +4422,47 @@
           ]
         },
         {
+          "description": "Structured cells and the original GFM fragment with its used reference\ndefinitions, without Quote/List prefixes.",
+          "type": "object",
+          "properties": {
+            "alignments": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/MarkdownTableAlignment"
+              }
+            },
+            "headers": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/MarkdownInline"
+              }
+            },
+            "rows": {
+              "type": "array",
+              "items": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/$defs/MarkdownInline"
+                }
+              }
+            },
+            "source": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "table"
+            }
+          },
+          "required": [
+            "type",
+            "headers",
+            "rows",
+            "alignments",
+            "source"
+          ]
+        },
+        {
           "type": "object",
           "properties": {
             "type": {
@@ -4459,6 +4639,15 @@
         }
       ]
     },
+    "MarkdownTableAlignment": {
+      "type": "string",
+      "enum": [
+        "none",
+        "left",
+        "center",
+        "right"
+      ]
+    },
     "McpChangedAction": {
       "type": "string",
       "enum": [
@@ -4509,6 +4698,71 @@
       "required": [
         "workspace_id",
         "snapshot_version"
+      ]
+    },
+    "McpOAuthNotification": {
+      "type": "object",
+      "properties": {
+        "authorization_url": {
+          "description": "Authorization URLs contain ephemeral state. Debug must redact them.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "diagnostic": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "flow_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "type": "string"
+        },
+        "scope_kind": {
+          "$ref": "#/$defs/McpScopeKind"
+        },
+        "server_id": {
+          "type": "string"
+        },
+        "state": {
+          "$ref": "#/$defs/McpOAuthState"
+        },
+        "workspace_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "workspace_id",
+        "server_id",
+        "name",
+        "scope_kind",
+        "state"
+      ]
+    },
+    "McpOAuthState": {
+      "type": "string",
+      "enum": [
+        "idle",
+        "preparing",
+        "awaiting_callback",
+        "exchanging",
+        "resolving",
+        "retired",
+        "cleanup_required",
+        "authorized",
+        "auth_required",
+        "insufficient_scope",
+        "denied",
+        "cancelled",
+        "timed_out",
+        "failed"
       ]
     },
     "McpRuntimeState": {
@@ -4934,6 +5188,22 @@
         }
       }
     },
+    "MemoryRecallEligibility": {
+      "type": "object",
+      "properties": {
+        "eligible": {
+          "type": "boolean"
+        },
+        "reason": {
+          "description": "Low-cardinality policy reason, never a payload or identifier.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "eligible",
+        "reason"
+      ]
+    },
     "MemoryRecord": {
       "type": "object",
       "properties": {
@@ -5009,6 +5279,17 @@
         },
         "provenance": {
           "$ref": "#/$defs/MemoryProvenance"
+        },
+        "recall_eligibility": {
+          "description": "Response-only assessment for this read; absence means not assessed.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MemoryRecallEligibility"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "scope": {
           "$ref": "#/$defs/MemoryScope"
@@ -5389,6 +5670,89 @@
         "cli_runtime"
       ]
     },
+    "ProviderErrorReason": {
+      "description": "Allowlisted OpenRouter Chat Completions metadata.error_type values.\nDiagnostic only: these values must not drive recovery policy.",
+      "type": "string",
+      "enum": [
+        "context_length_exceeded",
+        "max_tokens_exceeded",
+        "token_limit_exceeded",
+        "string_too_long",
+        "authentication",
+        "permission_denied",
+        "payment_required",
+        "rate_limit_exceeded",
+        "provider_overloaded",
+        "provider_unavailable",
+        "invalid_request",
+        "invalid_prompt",
+        "not_found",
+        "precondition_failed",
+        "payload_too_large",
+        "unprocessable",
+        "content_policy_violation",
+        "refusal",
+        "invalid_image",
+        "image_too_large",
+        "image_too_small",
+        "unsupported_image_format",
+        "image_not_found",
+        "image_download_failed",
+        "server",
+        "timeout",
+        "unmapped"
+      ]
+    },
+    "ProviderFailureClass": {
+      "type": "string",
+      "enum": [
+        "network_transient",
+        "rate_limit",
+        "provider_5xx",
+        "auth_expired",
+        "auth_or_permission",
+        "model_not_found",
+        "prompt_too_long",
+        "context_too_large",
+        "max_output_tokens",
+        "stream_stall",
+        "stream_truncated",
+        "empty_response",
+        "provider_rejected",
+        "unsupported_parameter",
+        "unsupported_capability",
+        "unsupported_image_input",
+        "unsupported_tool_calling",
+        "unsupported_streaming",
+        "malformed_provider_request",
+        "invalid_request",
+        "permission_denied",
+        "unknown"
+      ]
+    },
+    "ProviderFailureStage": {
+      "type": "string",
+      "enum": [
+        "connect",
+        "first_chunk",
+        "mid_stream",
+        "finalize"
+      ]
+    },
+    "ProviderRequestId": {
+      "type": "string",
+      "maxLength": 128,
+      "pattern": "^(gen-|req-|cmpl-|chatcmpl-)[A-Za-z0-9_-]+$"
+    },
+    "ProviderTransportKind": {
+      "type": "string",
+      "enum": [
+        "stream",
+        "non_stream",
+        "ws",
+        "sse"
+      ]
+    },
     "PublicError": {
       "description": "Stable, bounded failure presentation shared by RPC, voice and task\nexecution surfaces. Raw source chains are never part of this type.",
       "type": "object",
@@ -5488,6 +5852,16 @@
         },
         "error": {
           "$ref": "#/$defs/PublicError"
+        },
+        "recoveryDiagnostic": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RecoveryDiagnostic"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "required": [
@@ -5533,6 +5907,32 @@
         "fallback",
         "mark_failed"
       ]
+    },
+    "RecoveryDiagnostic": {
+      "type": "object",
+      "properties": {
+        "lastFailure": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RecoveryProviderFailure"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "stopReason": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RecoveryStopReason"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
     },
     "RecoveryJobStatus": {
       "type": "string",
@@ -5604,6 +6004,73 @@
             "mode"
           ]
         }
+      ]
+    },
+    "RecoveryProviderFailure": {
+      "type": "object",
+      "properties": {
+        "class": {
+          "$ref": "#/$defs/ProviderFailureClass"
+        },
+        "errorReason": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProviderErrorReason"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "httpStatus": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "requestId": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProviderRequestId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "retryAfterMs": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "stage": {
+          "$ref": "#/$defs/ProviderFailureStage"
+        },
+        "transport": {
+          "$ref": "#/$defs/ProviderTransportKind"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "class",
+        "stage",
+        "transport"
+      ]
+    },
+    "RecoveryStopReason": {
+      "type": "string",
+      "enum": [
+        "attempts_exhausted",
+        "wall_clock_exhausted",
+        "no_progress",
+        "policy_rejected",
+        "terminal_failure"
       ]
     },
     "RecoveryTrigger": {
@@ -6850,6 +7317,17 @@
             "$ref": "#/$defs/TurnFilesystemSandboxEntry"
           }
         },
+        "maxFilesystemKind": {
+          "description": "Distinguishes a restricted cap with zero roots from an unrestricted\ncap, whose bounded-root list is also empty. Legacy records omit this\nfield and are interpreted conservatively by the Gateway.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TurnFilesystemSandboxKind"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "maxNetworkPolicy": {
           "$ref": "#/$defs/TurnNetworkPolicySnapshot"
         },
@@ -7672,6 +8150,16 @@
         },
         "message": {
           "type": "string"
+        },
+        "recoveryDiagnostic": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RecoveryDiagnostic"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "required": [
@@ -9495,6 +9983,13 @@
         "threadId": {
           "type": "string"
         },
+        "turnWorkTombstones": {
+          "description": "Revisioned removals prevent delayed pages or state notifications from\nresurrecting a work row after its authoritative projection disappeared.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TurnWorkTombstone"
+          }
+        },
         "workspaceId": {
           "type": "string"
         }
@@ -10086,17 +10581,28 @@
     "ToolPermissionPolicySnapshot": {
       "type": "object",
       "properties": {
+        "agent_action": {
+          "$ref": "#/$defs/PermissionBehavior"
+        },
         "allowed_paths": {
           "type": "array",
           "items": {
             "type": "string"
           }
         },
+        "allowed_paths_restricted": {
+          "description": "See `allowed_tools_restricted`.  A restricted empty path set is a\ndurable deny-all result, while an unrestricted empty set is the legacy\nwildcard.",
+          "type": "boolean"
+        },
         "allowed_tools": {
           "type": "array",
           "items": {
             "type": "string"
           }
+        },
+        "allowed_tools_restricted": {
+          "description": "`allowed_tools = []` historically means \"no allow-list\".  This bit\npreserves the distinct result of intersecting two disjoint allow-lists:\na restricted empty set must deny every tool rather than reopen all of\nthem.",
+          "type": "boolean"
         },
         "computer_use": {
           "$ref": "#/$defs/PermissionBehavior"
@@ -10125,6 +10631,9 @@
         "mcp_write_or_unknown": {
           "$ref": "#/$defs/PermissionBehavior"
         },
+        "memory_write": {
+          "$ref": "#/$defs/PermissionBehavior"
+        },
         "network": {
           "$ref": "#/$defs/PermissionBehavior"
         },
@@ -10145,7 +10654,9 @@
         "mcp_write_or_unknown",
         "dynamic_skill_tool",
         "computer_use",
-        "task_subagent"
+        "task_subagent",
+        "memory_write",
+        "agent_action"
       ]
     },
     "ToolRecoveryIdempotencyMode": {
@@ -11177,6 +11688,13 @@
         "provenance"
       ]
     },
+    "TurnFilesystemSandboxKind": {
+      "type": "string",
+      "enum": [
+        "restricted",
+        "unrestricted"
+      ]
+    },
     "TurnFilesystemSandboxPath": {
       "oneOf": [
         {
@@ -12195,6 +12713,10 @@
             "display": {
               "$ref": "#/$defs/ToolDisplayPayload"
             },
+            "executionClass": {
+              "description": "Operational supervision semantics declared by the tool contract.\nThis is independent from the presentation-level item type.",
+              "$ref": "#/$defs/TurnItemExecutionClass"
+            },
             "id": {
               "type": "string"
             },
@@ -12271,6 +12793,23 @@
             "display",
             "storage"
           ]
+        }
+      ]
+    },
+    "TurnItemExecutionClass": {
+      "description": "Operational execution semantics persisted with a turn-item attempt.\n\nThis is intentionally independent from [`TurnItemType`]: multiple runtime\noperations may project to the same presentation item while requiring\ndifferent supervision policies.",
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "standard",
+            "context_compaction"
+          ]
+        },
+        {
+          "description": "A durable observation whose lifetime is renewed only by confirmed\nactivity from the external execution it is joining.",
+          "type": "string",
+          "const": "durable_wait"
         }
       ]
     },
@@ -12435,6 +12974,8 @@
         "dynamic_skill_tool",
         "computer_use",
         "task_subagent",
+        "memory_write",
+        "agent_action",
         "internal",
         "unknown"
       ]
@@ -13012,6 +13553,17 @@
             }
           ]
         },
+        "agentWorkGraph": {
+          "description": "Server-owned aggregate state for the root Agent work graph bound to\nthis Turn. Descendant Turns do not repeat the graph projection.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AgentWorkGraphProjection"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "author": {
           "description": "Exact execution whose work this row presents. This is separate from\nthe Turn input author and is required for stable Agent attribution.",
           "anyOf": [
@@ -13220,6 +13772,31 @@
         "turnId",
         "work",
         "reason"
+      ]
+    },
+    "TurnWorkTombstone": {
+      "type": "object",
+      "properties": {
+        "blockId": {
+          "type": "string"
+        },
+        "projectionUpdatedAtUnixMicros": {
+          "type": "integer",
+          "format": "int64",
+          "default": 0
+        },
+        "sourceHighWatermark": {
+          "type": "integer",
+          "format": "int64",
+          "default": 0
+        },
+        "turnId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "turnId",
+        "blockId"
       ]
     },
     "UnknownGatewayNotification": {
@@ -13878,94 +14455,6 @@
       "required": [
         "revision",
         "workspace_id"
-      ]
-    },
-    "AgentWorkGraphProjection": {
-      "type": "object",
-      "properties": {
-        "nodes": {
-          "description": "Stable, bounded nodes in the exact root graph. No prompt, provider,\nmodel, thread title, runtime path, or other private payload is exposed.",
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/AgentWorkNodeProjection"
-          }
-        },
-        "queuedCount": {
-          "type": "integer",
-          "format": "uint64",
-          "minimum": 0
-        },
-        "rootExecutionId": {
-          "$ref": "#/$defs/AgentExecutionId"
-        },
-        "runningCount": {
-          "type": "integer",
-          "format": "uint64",
-          "minimum": 0
-        },
-        "saturated": {
-          "description": "True while one or more authorized nodes are durably queued for\nserver-owned capacity. This is resource state, not an authorization\nfailure and never implies that the whole graph is blocked.",
-          "type": "boolean"
-        },
-        "terminalCount": {
-          "type": "integer",
-          "format": "uint64",
-          "minimum": 0
-        },
-        "updatedAtUnixMicros": {
-          "description": "Monotonic persisted resource-state timestamp used only to reject stale\ngraph projections racing with live queue/promotion/finalization events.",
-          "type": "integer",
-          "format": "int64"
-        }
-      },
-      "additionalProperties": false,
-      "required": [
-        "rootExecutionId",
-        "updatedAtUnixMicros",
-        "queuedCount",
-        "runningCount",
-        "terminalCount",
-        "saturated",
-        "nodes"
-      ]
-    },
-    "AgentWorkNodeProjection": {
-      "type": "object",
-      "properties": {
-        "executionId": {
-          "$ref": "#/$defs/AgentExecutionId"
-        },
-        "progressLabel": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "progressRevision": {
-          "type": "integer",
-          "format": "uint64",
-          "minimum": 0
-        },
-        "state": {
-          "$ref": "#/$defs/AgentWorkNodeState"
-        }
-      },
-      "additionalProperties": false,
-      "required": [
-        "executionId",
-        "state",
-        "progressRevision"
-      ]
-    },
-    "AgentWorkNodeState": {
-      "type": "string",
-      "enum": [
-        "queued",
-        "running",
-        "completed",
-        "failed",
-        "cancelled",
-        "blocked"
       ]
     }
   }

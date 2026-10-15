@@ -1,7 +1,7 @@
 use super::*;
 use crate::authorization::AuthorizationExternalError;
 use anyhow::{Result, anyhow, bail};
-use pioneer_protocol::{TaskDeliveryStatus, TaskGetResponse, TaskRunStatus, ThreadMode};
+use pioneer_protocol::{TaskRunStatus, ThreadMode};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -269,56 +269,53 @@ impl MessageProcessor {
         }
     }
 
-    pub(super) async fn task_run_awaits_origin_thread_delivery(
+    pub(super) async fn task_run_awaits_occurrence_thread_delivery(
         &self,
-        task_response: &TaskGetResponse,
+        task_response: &pioneer_crud::TaskEventContext,
         run_id: &str,
     ) -> Result<bool> {
-        let Some(current) = self
-            .crud_store
-            .get_task(task_response.task.id.as_str())
-            .await?
-        else {
+        let Some(current_run) = self.crud_store.get_task_run(run_id).await? else {
             return Ok(false);
         };
-        if !current
-            .runs
-            .iter()
-            .any(|run| run.id == run_id && run.status == TaskRunStatus::Succeeded)
+        if current_run.task_id != task_response.task.id
+            || current_run.status != TaskRunStatus::Succeeded
         {
             return Ok(false);
         }
-        let deliveries = self
+        let occurrence_thread_id = self
             .crud_store
-            .list_task_deliveries(pioneer_protocol::TaskDeliveriesParams {
-                workspace_id: current.task.workspace_id.clone(),
-                task_id: Some(current.task.id.clone()),
-                run_id: Some(run_id.to_owned()),
-                statuses: vec![TaskDeliveryStatus::Pending, TaskDeliveryStatus::Delivering],
-                limit: Some(100),
-            })
-            .await?;
-        Ok(deliveries.deliveries.iter().any(|delivery| {
-            delivery.mode == TaskDeliveryMode::Thread
-                && delivery.thread_target
-                    == Some(pioneer_protocol::TaskDeliveryThreadTarget::OriginThread)
-        }))
+            .get_turn_location(run_id)
+            .await?
+            .map(|(thread_id, _)| thread_id);
+        self.crud_store
+            .task_run_has_pending_thread_delivery(
+                &task_response.task.workspace_id,
+                &task_response.task.id,
+                run_id,
+                occurrence_thread_id.as_deref(),
+            )
+            .await
     }
 
     pub(super) async fn process_due_task_deliveries(&self, now: i64, limit: u64) -> Result<()> {
-        self.task_runtime
-            .service()
+        let task_service = self.task_runtime.background_control_service();
+        if task_service
             .recover_stuck_deliveries(now, limit)
             .await
-            .map_err(|error| anyhow!("{error:#}"))?;
+            .is_err()
+        {
+            warn!(
+                failure_class = "task_delivery_recovery_gateway_discovery_failed",
+                "delivery recovery unavailable; continuing independent due deliveries"
+            );
+        }
         let deliveries = self.crud_store.list_due_task_deliveries(now, limit).await?;
         for delivery in deliveries {
-            let Some((delivery, attempt)) = self
-                .task_runtime
-                .service()
-                .start_delivery(delivery.id.as_str(), now)
-                .await
-                .map_err(|error| anyhow!("{error:#}"))?
+            let pioneer_crud::TaskDeliveryTransitionOutcome::Applied((delivery, attempt)) =
+                task_service
+                    .start_delivery(delivery.id.as_str(), now)
+                    .await
+                    .map_err(|error| anyhow!("{error:#}"))?
             else {
                 continue;
             };
@@ -337,22 +334,20 @@ impl MessageProcessor {
                 }),
             )
             .await;
-            let execution_result = match execution_result {
-                Ok(Ok(result)) => result,
-                Ok(Err(error)) => Err(anyhow!("task delivery execution task failed: {error}")),
-                Err(_) => Err(anyhow!(
-                    "task delivery execution exceeded its 60 second lease"
-                )),
+            let failure_class = match execution_result {
+                Ok(Ok(Ok(pioneer_crud::TaskDeliveryTransitionOutcome::Applied(()))))
+                | Ok(Ok(Ok(pioneer_crud::TaskDeliveryTransitionOutcome::Superseded))) => None,
+                Ok(Ok(Err(error))) => Some(task_delivery_execution_failure_class(&error)),
+                Ok(Err(_)) => Some("task_delivery_worker_join_failed"),
+                Err(_) => Some("task_delivery_execution_timed_out"),
             };
-            if let Err(error) = execution_result {
+            if let Some(failure_class) = failure_class {
                 let failed_at = now_timestamp_secs();
-                let _ = error;
-                self.task_runtime
-                    .service()
+                task_service
                     .fail_delivery(
                         delivery,
                         attempt,
-                        "task_delivery_execution_failed".to_owned(),
+                        failure_class.to_owned(),
                         None,
                         None,
                         failed_at,
@@ -368,7 +363,7 @@ impl MessageProcessor {
         &self,
         delivery: TaskDelivery,
         attempt: TaskDeliveryAttempt,
-    ) -> Result<()> {
+    ) -> Result<pioneer_crud::TaskDeliveryTransitionOutcome<()>> {
         if delivery.mode != TaskDeliveryMode::None {
             self.ensure_task_delivery_still_authorized(&delivery)
                 .await?;
@@ -379,42 +374,45 @@ impl MessageProcessor {
                     .await
             }
             TaskDeliveryMode::Thread => {
-                let turn_id = match delivery
+                delivery
                     .thread_target
-                    .context("thread delivery has no thread_target")?
-                {
-                    pioneer_protocol::TaskDeliveryThreadTarget::OriginThread => {
-                        self.deliver_to_origin_thread(&delivery).await?
-                    }
-                    pioneer_protocol::TaskDeliveryThreadTarget::CurrentThread
-                    | pioneer_protocol::TaskDeliveryThreadTarget::CollaborationRoot
-                    | pioneer_protocol::TaskDeliveryThreadTarget::ExactThread => {
-                        self.deliver_to_thread(&delivery).await?
-                    }
-                };
+                    .context("thread delivery has no thread_target")?;
+                let turn_id = self.deliver_to_occurrence_thread(&delivery).await?;
                 self.complete_delivery(delivery, attempt, Some(turn_id), None, None, None)
                     .await
             }
             TaskDeliveryMode::UserNotification => {
                 let notification = self.deliver_user_notification(&delivery).await?;
                 let notification_id = notification.notification_id.clone();
-                // The committed exact-recipient inbox row above is the
-                // delivery receipt. Live fanout is deliberately best-effort:
-                // an offline user recovers the same deterministic receipt,
-                // and a crash/retry cannot create a second notification.
-                let _ = self
-                    .send_task_user_notification(
-                        delivery.workspace_id.as_str(),
-                        delivery
-                            .target_user_id
-                            .as_deref()
-                            .context("user notification delivery has no recipient")?,
-                        events::TASK_USER_NOTIFICATION_DELIVERED,
-                        &notification,
+                let outcome = self
+                    .complete_delivery(
+                        delivery.clone(),
+                        attempt,
+                        None,
+                        Some(notification_id),
+                        None,
+                        None,
                     )
-                    .await;
-                self.complete_delivery(delivery, attempt, None, Some(notification_id), None, None)
-                    .await
+                    .await?;
+                if matches!(
+                    outcome,
+                    pioneer_crud::TaskDeliveryTransitionOutcome::Applied(())
+                ) {
+                    // Live fanout follows the owned completion. The exact
+                    // recipient inbox remains the durable notification receipt.
+                    let _ = self
+                        .send_task_user_notification(
+                            delivery.workspace_id.as_str(),
+                            delivery
+                                .target_user_id
+                                .as_deref()
+                                .context("user notification delivery has no recipient")?,
+                            events::TASK_USER_NOTIFICATION_DELIVERED,
+                            &notification,
+                        )
+                        .await;
+                }
+                Ok(outcome)
             }
             TaskDeliveryMode::Webhook => self.deliver_webhook(delivery, attempt).await,
         }
@@ -559,9 +557,10 @@ impl MessageProcessor {
         delivered_notification_id: Option<String>,
         http_status: Option<u16>,
         response_fingerprint: Option<String>,
-    ) -> Result<()> {
-        self.task_runtime
-            .service()
+    ) -> Result<pioneer_crud::TaskDeliveryTransitionOutcome<()>> {
+        let outcome = self
+            .task_runtime
+            .background_control_service()
             .complete_delivery(
                 delivery,
                 attempt,
@@ -573,7 +572,14 @@ impl MessageProcessor {
             )
             .await
             .map_err(|error| anyhow!("{error:#}"))?;
-        Ok(())
+        Ok(match outcome {
+            pioneer_crud::TaskDeliveryTransitionOutcome::Applied(_) => {
+                pioneer_crud::TaskDeliveryTransitionOutcome::Applied(())
+            }
+            pioneer_crud::TaskDeliveryTransitionOutcome::Superseded => {
+                pioneer_crud::TaskDeliveryTransitionOutcome::Superseded
+            }
+        })
     }
 
     async fn prepare_task_delivery_agent_action(
@@ -805,14 +811,14 @@ impl MessageProcessor {
         Ok(notification)
     }
 
-    async fn deliver_to_origin_thread(&self, delivery: &TaskDelivery) -> Result<String> {
+    async fn deliver_to_occurrence_thread(&self, delivery: &TaskDelivery) -> Result<String> {
         let thread_id = delivery
             .target_thread_id
             .as_deref()
-            .ok_or_else(|| anyhow!("origin thread delivery has no target_thread_id"))?;
+            .ok_or_else(|| anyhow!("thread delivery has no target_thread_id"))?;
 
         if let Some(parent_turn_id) = self
-            .lineage_parent_turn_for_origin_delivery(delivery, thread_id)
+            .lineage_occurrence_turn_for_delivery(delivery, thread_id)
             .await?
         {
             let agent_action = self
@@ -839,7 +845,7 @@ impl MessageProcessor {
         self.deliver_to_thread(delivery).await
     }
 
-    async fn lineage_parent_turn_for_origin_delivery(
+    pub(super) async fn lineage_occurrence_turn_for_delivery(
         &self,
         delivery: &TaskDelivery,
         target_thread_id: &str,
@@ -860,6 +866,21 @@ impl MessageProcessor {
             if parent_thread_id == target_thread_id {
                 return Ok(lineage.created_by_turn_id);
             }
+        }
+
+        // Agent runs materialize their visible TaskRun occurrence before the
+        // hidden child is admitted. If admission fails at that boundary there
+        // is deliberately no child lineage yet, but the occurrence is already
+        // the canonical error presentation in the parent thread. Reuse it so
+        // delivery does not add a second, generic failure Turn beside the card.
+        if let Some((workspace_id, occurrence)) = self
+            .crud_store
+            .get_turn(target_thread_id, delivery.run_id.as_str())
+            .await?
+            && workspace_id == delivery.workspace_id
+            && occurrence.turn_kind == pioneer_protocol::TurnKind::TaskRun
+        {
+            return Ok(Some(delivery.run_id.clone()));
         }
 
         Ok(None)
@@ -1098,7 +1119,7 @@ impl MessageProcessor {
                     Some("in_progress"),
                 )
                 .await;
-                self.ingest_committed_thread_item(&item_completed).await;
+                self.kick_native_turn_event_deliveries();
                 self.send_notification_to_thread_subscribers(
                     thread_id,
                     events::ITEM_COMPLETED,
@@ -1248,9 +1269,9 @@ impl MessageProcessor {
         )
         .await;
 
-        // Delivery projects an already-produced result into the target conversation. Index the
-        // committed projection directly; do not run another turn or post-turn memory extractor.
-        self.ingest_committed_thread_item(&completed).await;
+        // The canonical transaction already saved an episodic delivery. Wake
+        // that consumer once; a direct ingest here would duplicate delivery.
+        self.kick_native_turn_event_deliveries();
         self.send_notification_to_thread_subscribers(thread_id, events::ITEM_COMPLETED, &completed)
             .await;
         self.notify_semantic_timeline_item_changed(
@@ -1268,7 +1289,7 @@ impl MessageProcessor {
         &self,
         delivery: TaskDelivery,
         attempt: TaskDeliveryAttempt,
-    ) -> Result<()> {
+    ) -> Result<pioneer_crud::TaskDeliveryTransitionOutcome<()>> {
         let webhook_url = delivery
             .webhook_url
             .as_deref()
@@ -1290,8 +1311,9 @@ impl MessageProcessor {
             self.complete_delivery(delivery, attempt, None, None, Some(status.as_u16()), None)
                 .await
         } else {
-            self.task_runtime
-                .service()
+            let outcome = self
+                .task_runtime
+                .background_control_service()
                 .fail_delivery(
                     delivery,
                     attempt,
@@ -1302,7 +1324,14 @@ impl MessageProcessor {
                 )
                 .await
                 .map_err(|error| anyhow!("{error:#}"))?;
-            Ok(())
+            Ok(match outcome {
+                pioneer_crud::TaskDeliveryTransitionOutcome::Applied(_) => {
+                    pioneer_crud::TaskDeliveryTransitionOutcome::Applied(())
+                }
+                pioneer_crud::TaskDeliveryTransitionOutcome::Superseded => {
+                    pioneer_crud::TaskDeliveryTransitionOutcome::Superseded
+                }
+            })
         }
     }
 
@@ -1323,6 +1352,47 @@ impl MessageProcessor {
             "childTurnId": child_anchor.child_turn_id,
             "occurredAt": delivery.updated_at,
         }))
+    }
+}
+
+fn task_delivery_execution_failure_class(error: &anyhow::Error) -> &'static str {
+    for cause in error.chain() {
+        match cause.downcast_ref::<pioneer_crud::TerminalTaskDeliveryCommitError>() {
+            Some(pioneer_crud::TerminalTaskDeliveryCommitError::OccurrenceActorMismatch) => {
+                return "task_delivery_occurrence_actor_mismatch";
+            }
+            Some(
+                pioneer_crud::TerminalTaskDeliveryCommitError::OccurrenceTerminalStatusMismatch,
+            ) => return "task_delivery_occurrence_terminal_mismatch",
+            None => {}
+        }
+    }
+    "task_delivery_execution_failed"
+}
+
+#[cfg(test)]
+mod delivery_failure_class_tests {
+    use super::task_delivery_execution_failure_class;
+
+    #[test]
+    fn occurrence_mismatch_keeps_a_safe_low_cardinality_failure_class() {
+        let error = anyhow::Error::new(
+            pioneer_crud::TerminalTaskDeliveryCommitError::OccurrenceTerminalStatusMismatch,
+        )
+        .context("projection commit failed");
+
+        assert_eq!(
+            task_delivery_execution_failure_class(&error),
+            "task_delivery_occurrence_terminal_mismatch"
+        );
+
+        let actor_error = anyhow::Error::new(
+            pioneer_crud::TerminalTaskDeliveryCommitError::OccurrenceActorMismatch,
+        );
+        assert_eq!(
+            task_delivery_execution_failure_class(&actor_error),
+            "task_delivery_occurrence_actor_mismatch"
+        );
     }
 }
 
@@ -1425,6 +1495,9 @@ fn delivery_result_item(delivery: &TaskDelivery) -> TurnItem {
 }
 
 fn task_delivery_failure_message(error: &pioneer_protocol::TaskError) -> String {
+    if let Some(message) = error.recovery_public_message() {
+        return message;
+    }
     match error.code.as_str() {
         "task_executor_start_failed" => "Scheduled task could not start.".to_owned(),
         _ => "Scheduled task failed.".to_owned(),
@@ -1491,5 +1564,61 @@ fn is_private_ip(ip: IpAddr) -> bool {
                 || matches!(ip.segments()[0] & 0xffc0, 0xfe80)
                 || ip == Ipv6Addr::LOCALHOST
         }
+    }
+}
+
+#[cfg(test)]
+mod recovery_failure_tests {
+    #[test]
+    fn existing_delivery_turn_uses_typed_recovery_reason_and_keeps_fallback() {
+        let mut error = pioneer_protocol::TaskError {
+            code: "child_turn_failed".to_owned(),
+            message: "private response /secret HTTP 401".to_owned(),
+            class: pioneer_protocol::TaskErrorClass::Unknown,
+            details: None,
+            failed_run_id: None,
+            recovery_diagnostic: None,
+        };
+        assert_eq!(
+            super::task_delivery_failure_message(&error),
+            "Scheduled task failed."
+        );
+        let diagnostic = pioneer_protocol::RecoveryDiagnostic {
+            last_failure: Some(pioneer_protocol::RecoveryProviderFailure {
+                error_reason: None,
+                request_id: None,
+                class: pioneer_protocol::ProviderFailureClass::AuthOrPermission,
+                stage: pioneer_protocol::ProviderFailureStage::Connect,
+                transport: pioneer_protocol::ProviderTransportKind::NonStream,
+                http_status: Some(403),
+                retry_after_ms: None,
+            }),
+            stop_reason: Some(pioneer_protocol::RecoveryStopReason::AttemptsExhausted),
+        };
+        error.recovery_diagnostic = Some(diagnostic.clone());
+        assert_eq!(
+            super::task_delivery_failure_message(&error),
+            diagnostic.public_message()
+        );
+        let public = crate::task_projection::project_error(&error);
+        assert_eq!(public.error.message, diagnostic.public_message());
+        assert_eq!(public.class, pioneer_protocol::TaskErrorClass::Unknown);
+        assert_eq!(
+            public.error.code,
+            pioneer_protocol::PublicErrorCode::Internal
+        );
+        assert!(!public.error.retryable);
+        assert!(!serde_json::to_string(&public).unwrap().contains("/secret"));
+        error.recovery_diagnostic.as_mut().unwrap().stop_reason = None;
+        assert_eq!(
+            super::task_delivery_failure_message(&error),
+            "Scheduled task failed."
+        );
+        assert!(
+            !crate::task_projection::project_error(&error)
+                .error
+                .message
+                .contains("HTTP")
+        );
     }
 }

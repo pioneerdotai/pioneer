@@ -47,83 +47,33 @@ pub fn normalize_tool_arguments_from_schema(
     schema: &JsonValue,
 ) -> Result<ToolArgumentNormalization, ToolError> {
     let mut coercions = Vec::new();
-    let normalized = normalize_value(arguments, schema, schema, "$", &mut coercions)?;
+    let normalized = normalize_value(arguments, schema, schema, "$", &mut coercions, false)?;
     Ok(ToolArgumentNormalization {
         arguments: normalized,
         coercions,
     })
 }
 
-pub fn normalize_tool_arguments_for_tool(
-    tool_name: &str,
+// Builtins keep a failed coercion's original value for schema validation, so
+// one malformed field cannot prevent normalization/validation of its siblings.
+pub(crate) fn normalize_builtin_arguments(
     arguments: JsonValue,
     schema: &JsonValue,
 ) -> Result<ToolArgumentNormalization, ToolError> {
-    let mut normalized = normalize_tool_arguments_from_schema(arguments, schema)?;
-    normalize_tool_specific_aliases(tool_name, &mut normalized)?;
-    Ok(normalized)
+    let mut coercions = Vec::new();
+    let arguments = normalize_value(arguments, schema, schema, "$", &mut coercions, true)?;
+    Ok(ToolArgumentNormalization {
+        arguments,
+        coercions,
+    })
 }
 
-fn normalize_tool_specific_aliases(
-    tool_name: &str,
-    normalization: &mut ToolArgumentNormalization,
-) -> Result<(), ToolError> {
-    if tool_name != "write_file" {
-        return Ok(());
-    }
-
-    let Some(object) = normalization.arguments.as_object_mut() else {
-        return Ok(());
-    };
-
-    move_alias_to_canonical(object, &mut normalization.coercions, "file_path", "path");
-    move_alias_to_canonical(object, &mut normalization.coercions, "filename", "path");
-    move_alias_to_canonical(object, &mut normalization.coercions, "contents", "content");
-    move_alias_to_canonical(object, &mut normalization.coercions, "text", "content");
-    validate_write_file_known_fields(object)?;
-    Ok(())
-}
-
-fn move_alias_to_canonical(
-    object: &mut JsonMap<String, JsonValue>,
-    coercions: &mut Vec<ToolArgumentCoercion>,
-    alias: &str,
-    canonical: &str,
-) {
-    if object.contains_key(canonical) {
-        return;
-    }
-
-    let Some(value) = object.remove(alias) else {
-        return;
-    };
-    object.insert(canonical.to_owned(), value);
-    coercions.push(ToolArgumentCoercion {
-        path: "$".to_owned(),
-        from: alias.to_owned(),
-        to: canonical.to_owned(),
-    });
-}
-
-fn validate_write_file_known_fields(object: &JsonMap<String, JsonValue>) -> Result<(), ToolError> {
-    for key in object.keys() {
-        if !matches!(
-            key.as_str(),
-            "path"
-                | "content"
-                | "create_dirs"
-                | "overwrite"
-                | "read_observation_id"
-                | "expected_sha256"
-                | "expected_mtime_ms"
-        ) {
-            return Err(ToolError::invalid_arguments(format!(
-                "write_file unknown field `{key}`"
-            )));
-        }
-    }
-
-    Ok(())
+pub fn normalize_tool_arguments_for_tool(
+    _tool_name: &str,
+    arguments: JsonValue,
+    schema: &JsonValue,
+) -> Result<ToolArgumentNormalization, ToolError> {
+    normalize_tool_arguments_from_schema(arguments, schema)
 }
 
 fn normalize_value(
@@ -132,20 +82,32 @@ fn normalize_value(
     root_schema: &JsonValue,
     path: &str,
     coercions: &mut Vec<ToolArgumentCoercion>,
+    retain_invalid_values: bool,
 ) -> Result<JsonValue, ToolError> {
     let schema = resolve_schema(schema, root_schema).unwrap_or(schema);
     let shape = expected_shape(schema, root_schema);
 
     let value = match value {
         JsonValue::String(raw) if should_try_stringified_json(shape) => {
-            parse_stringified_json_for_shape(raw.as_str(), shape, path, coercions)?
+            match parse_stringified_json_for_shape(raw.as_str(), shape, path, coercions) {
+                Ok(parsed) => parsed,
+                Err(_) if retain_invalid_values => JsonValue::String(raw),
+                Err(error) => return Err(error),
+            }
         }
         other => other,
     };
 
     match value {
         JsonValue::Object(mut object) => {
-            normalize_object_fields(&mut object, schema, root_schema, path, coercions)?;
+            normalize_object_fields(
+                &mut object,
+                schema,
+                root_schema,
+                path,
+                coercions,
+                retain_invalid_values,
+            )?;
             Ok(JsonValue::Object(object))
         }
         JsonValue::Array(items) => {
@@ -161,6 +123,7 @@ fn normalize_value(
                         root_schema,
                         &format!("{path}[{index}]"),
                         coercions,
+                        retain_invalid_values,
                     )?);
                 } else {
                     normalized_items.push(item);
@@ -178,6 +141,7 @@ fn normalize_object_fields(
     root_schema: &JsonValue,
     path: &str,
     coercions: &mut Vec<ToolArgumentCoercion>,
+    retain_invalid_values: bool,
 ) -> Result<(), ToolError> {
     let Some(properties) = schema.get("properties").and_then(JsonValue::as_object) else {
         return Ok(());
@@ -196,8 +160,14 @@ fn normalize_object_fields(
         } else {
             format!("{path}.{key}")
         };
-        let normalized =
-            normalize_value(value, property_schema, root_schema, &child_path, coercions)?;
+        let normalized = normalize_value(
+            value,
+            property_schema,
+            root_schema,
+            &child_path,
+            coercions,
+            retain_invalid_values,
+        )?;
         object.insert(key, normalized);
     }
 
@@ -363,107 +333,5 @@ mod tests {
         .expect("ambiguous schema should not fail");
         assert_eq!(normalized.arguments["value"], "{\"kind\":\"cron\"}");
         assert!(normalized.coercions.is_empty());
-    }
-
-    fn write_file_schema() -> JsonValue {
-        json!({
-            "type": "object",
-            "properties": {
-                "path": { "type": "string" },
-                "content": { "type": "string" },
-                "create_dirs": { "type": "boolean" },
-                "overwrite": { "type": "boolean" },
-                "read_observation_id": { "type": "string" },
-                "expected_sha256": { "type": "string" },
-                "expected_mtime_ms": { "type": "integer" }
-            },
-            "required": ["path", "content"],
-            "additionalProperties": false
-        })
-    }
-
-    #[test]
-    fn write_file_aliases_normalize_to_canonical_arguments() {
-        let normalized = normalize_tool_arguments_for_tool(
-            "write_file",
-            json!({
-                "file_path": "docs/example.md",
-                "contents": "hello"
-            }),
-            &write_file_schema(),
-        )
-        .expect("aliases should normalize");
-
-        assert_eq!(normalized.arguments["path"], "docs/example.md");
-        assert_eq!(normalized.arguments["content"], "hello");
-        assert!(normalized.arguments.get("file_path").is_none());
-        assert!(normalized.arguments.get("contents").is_none());
-        assert_eq!(normalized.coercions.len(), 2);
-    }
-
-    #[test]
-    fn write_file_filename_and_text_aliases_normalize_to_canonical_arguments() {
-        let normalized = normalize_tool_arguments_for_tool(
-            "write_file",
-            json!({
-                "filename": "notes.txt",
-                "text": "hello"
-            }),
-            &write_file_schema(),
-        )
-        .expect("aliases should normalize");
-
-        assert_eq!(normalized.arguments["path"], "notes.txt");
-        assert_eq!(normalized.arguments["content"], "hello");
-    }
-
-    #[test]
-    fn write_file_unknown_fields_are_rejected_after_alias_normalization() {
-        let error = normalize_tool_arguments_for_tool(
-            "write_file",
-            json!({
-                "file_path": "notes.txt",
-                "contents": "hello",
-                "mode": "append"
-            }),
-            &write_file_schema(),
-        )
-        .expect_err("unknown write_file fields should fail");
-
-        assert!(error.to_string().contains("unknown field `mode`"));
-    }
-
-    #[test]
-    fn write_file_canonical_field_does_not_hide_alias_extra_field() {
-        let error = normalize_tool_arguments_for_tool(
-            "write_file",
-            json!({
-                "path": "canonical.txt",
-                "file_path": "alias.txt",
-                "content": "hello"
-            }),
-            &write_file_schema(),
-        )
-        .expect_err("alias should remain unknown when canonical already exists");
-
-        assert!(error.to_string().contains("unknown field `file_path`"));
-    }
-
-    #[test]
-    fn write_file_alias_normalization_does_not_leak_to_other_tools() {
-        let normalized = normalize_tool_arguments_for_tool(
-            "other_tool",
-            json!({
-                "file_path": "notes.txt",
-                "contents": "hello"
-            }),
-            &write_file_schema(),
-        )
-        .expect("other tools should not use write_file aliases");
-
-        assert_eq!(normalized.arguments["file_path"], "notes.txt");
-        assert_eq!(normalized.arguments["contents"], "hello");
-        assert!(normalized.arguments.get("path").is_none());
-        assert!(normalized.arguments.get("content").is_none());
     }
 }

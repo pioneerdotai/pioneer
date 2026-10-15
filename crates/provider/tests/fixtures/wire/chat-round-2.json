@@ -1,0 +1,23 @@
+{
+  "id": "fixture-2",
+  "object": "chat.completion",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "tool_calls": [
+          {
+            "id": "clock_2",
+            "type": "function",
+            "function": {
+              "name": "clock",
+              "arguments": "{}"
+            }
+          }
+        ]
+      },
+      "finish_reason": "tool_calls"
+    }
+  ]
+}

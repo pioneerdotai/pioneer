@@ -75,6 +75,10 @@ impl MessageProcessor {
             McpScopeKind::User => "default".to_owned(),
         };
 
+        let lifecycle = self
+            .mcp_service
+            .installation_lifecycle_guard(scope_kind.as_str(), &scope_key, params.name.trim())
+            .await;
         let mut record = match self
             .crud_store
             .find_mcp_server_installation(
@@ -228,6 +232,7 @@ impl MessageProcessor {
         )
         .await;
 
+        drop(lifecycle);
         if let Err(error) = self
             .mcp_service
             .reload_workspace(workspace_id.as_str())

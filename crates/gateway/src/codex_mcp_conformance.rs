@@ -188,7 +188,7 @@ pub async fn run_codex_mcp_deterministic_conformance() -> Result<CodexMcpDetermi
             == Some(json!({
                 "permissions": requested_permissions,
                 "scope": "turn",
-                "strictAutoReview": false,
+                "strictAutoReview": true,
             }));
     let stale_approval_fallback_denied =
         codex_native_approval_fallback_response(json!({}), false).is_none();

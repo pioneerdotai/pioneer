@@ -49,7 +49,7 @@ fn project_builtin(input: ToolProjectionInput<'_>) -> ToolResultEnvelope {
         "web_fetch" => project_web_fetch(input),
         "web_search" => project_web_search(input),
         "download_url" | "download" => project_download(input),
-        "apply_patch" | "write_file" | "edit_file" => project_file_change(input),
+        "apply_patch" => project_file_change(input),
         "read_file" => project_read_file(input),
         "read_skill" => project_read_skill(input),
         "list_dir" => project_list_dir(input),
@@ -318,22 +318,15 @@ fn project_file_change(input: ToolProjectionInput<'_>) -> ToolResultEnvelope {
         .unwrap_or_default();
     let metadata = serde_json::json!({
         "changedFiles": changed_files,
-        "operation": input.raw_output_json.get("operation").cloned().unwrap_or(JsonValue::Null),
-        "matches": input.raw_output_json.get("matches").cloned().unwrap_or(JsonValue::Null),
-        "matchesReplaced": input.raw_output_json.get("matches_replaced").cloned().unwrap_or(JsonValue::Null),
-        "replaceAll": input.raw_output_json.get("replace_all").cloned().unwrap_or(JsonValue::Null),
-        "bytesBefore": input.raw_output_json.get("bytes_before").cloned().unwrap_or(JsonValue::Null),
-        "bytesAfter": input.raw_output_json.get("bytes_after").cloned().unwrap_or(JsonValue::Null),
-        "bytesWritten": input.raw_output_json.get("bytes_written").cloned().unwrap_or(JsonValue::Null),
-        "sha256Before": input.raw_output_json.get("sha256_before").cloned().unwrap_or(JsonValue::Null),
-        "sha256": input.raw_output_json.get("sha256").cloned().unwrap_or(JsonValue::Null),
-        "oldStringBytes": input.raw_output_json.get("old_string_bytes").cloned().unwrap_or(JsonValue::Null),
-        "newStringBytes": input.raw_output_json.get("new_string_bytes").cloned().unwrap_or(JsonValue::Null),
-        "oldStringSha256": input.raw_output_json.get("old_string_sha256").cloned().unwrap_or(JsonValue::Null),
-        "newStringSha256": input.raw_output_json.get("new_string_sha256").cloned().unwrap_or(JsonValue::Null),
-        "lineEndingMode": input.raw_output_json.get("line_ending_mode").cloned().unwrap_or(JsonValue::Null),
-        "exitCode": input.raw_output_json.get("exit_code").cloned().unwrap_or(JsonValue::Null),
-        "truncated": input.raw_output_json.get("truncated").cloned().unwrap_or(JsonValue::Bool(false)),
+        "status": input.raw_output_json.get("status").cloned().unwrap_or(JsonValue::Null),
+        "success": input.raw_output_json.get("success").cloned().unwrap_or(JsonValue::Null),
+        "exact": input.raw_output_json.get("exact").cloned().unwrap_or(JsonValue::Null),
+        "historyBearing": input.raw_output_json.get("history_bearing").cloned().unwrap_or(JsonValue::Null),
+        "changes": input.raw_output_json.get("changes").cloned().unwrap_or_else(|| serde_json::json!([])),
+        "sideEffects": input.raw_output_json.get("side_effects").cloned().unwrap_or_else(|| serde_json::json!({})),
+        "failedStage": input.raw_output_json.get("failed_stage").cloned().unwrap_or(JsonValue::Null),
+        "error": input.raw_output_json.get("error").cloned().unwrap_or(JsonValue::Null),
+        "tracking": input.raw_output_json.get("tracking").cloned().unwrap_or_else(|| serde_json::json!({})),
         "outputHash": sha256_hex(input.raw_output_text.as_bytes()),
     });
     let file_count = metadata
@@ -345,11 +338,7 @@ fn project_file_change(input: ToolProjectionInput<'_>) -> ToolResultEnvelope {
         if file_count == 0 {
             format!("{} completed", input.tool_name)
         } else {
-            file_change_title(
-                input.tool_name,
-                metadata.get("operation").and_then(JsonValue::as_str),
-                file_count,
-            )
+            file_change_title(input.tool_name, file_count)
         },
         metadata
             .get("changedFiles")
@@ -363,80 +352,166 @@ fn project_file_change(input: ToolProjectionInput<'_>) -> ToolResultEnvelope {
             })
             .unwrap_or_default(),
         metadata.clone(),
-        metadata
-            .get("truncated")
-            .and_then(JsonValue::as_bool)
-            .unwrap_or(false),
+        false,
     );
+    // The native gateway needs the immutable record reference to finish its
+    // durable projection even when the model/storage policy is summary-only.
+    // This envelope contains hashes, paths and record identity only; exact
+    // source bytes never cross the model/event storage boundary.  Keep this
+    // small trusted control envelope in metadata for apply_patch, while all
+    // other file tools continue to obey their normal storage policy.
+    let storage =
+        if input.tool_name == "apply_patch" && input.raw_output_json.get("history").is_some() {
+            let mut metadata_with_history = metadata.clone();
+            if let Some(history) = input.raw_output_json.get("history")
+                && let Some(object) = metadata_with_history.as_object_mut()
+            {
+                object.insert("patchHistory".to_owned(), history.clone());
+            }
+            ToolStoragePayload::Metadata {
+                metadata: ToolMetadata::from_json(metadata_with_history),
+            }
+        } else {
+            storage_for_policy(input.output_policy, summary.clone(), metadata)
+        };
     envelope(
         &input,
         file_change_llm_view(&input),
         display_for_policy(input.output_policy, summary.clone()),
-        storage_for_policy(input.output_policy, summary, metadata),
+        storage,
         recovery_view(&input),
     )
 }
 
-fn file_change_title(tool_name: &str, operation: Option<&str>, file_count: usize) -> String {
-    let verb = match operation {
-        Some("created") => "created",
-        Some("overwritten") => "overwrote",
-        Some("edited") => "edited",
-        _ => "changed",
-    };
-    format!("{tool_name} {verb} {file_count} file(s)")
+fn file_change_title(tool_name: &str, file_count: usize) -> String {
+    format!("{tool_name} changed {file_count} file(s)")
 }
 
 fn file_change_llm_view(input: &ToolProjectionInput<'_>) -> ToolResultView {
-    let value = match input.tool_name {
-        "write_file" => serde_json::json!({
-            "ok": input.raw_output_json.get("ok").cloned().unwrap_or(JsonValue::Bool(input.success)),
-            "status": input.raw_output_json.get("status").cloned().unwrap_or(JsonValue::Null),
-            "operation": input.raw_output_json.get("operation").cloned().unwrap_or(JsonValue::Null),
-            "path": input.raw_output_json.get("path").cloned().unwrap_or(JsonValue::Null),
-            "resolved_path": input.raw_output_json.get("resolved_path").cloned().unwrap_or(JsonValue::Null),
-            "bytes_written": input.raw_output_json.get("bytes_written").cloned().unwrap_or(JsonValue::Null),
-            "sha256": input.raw_output_json.get("sha256").cloned().unwrap_or(JsonValue::Null),
-            "file_observation": input.raw_output_json.get("file_observation").cloned().unwrap_or(JsonValue::Null),
-            "created_dirs": input.raw_output_json.get("created_dirs").cloned().unwrap_or_else(|| serde_json::json!([])),
-            "changed_files": input.raw_output_json.get("changed_files").cloned().unwrap_or_else(|| serde_json::json!([])),
+    let raw = input.raw_output_json;
+    let mut value = serde_json::Map::new();
+    value.insert(
+        "status".to_owned(),
+        raw.get("status").cloned().unwrap_or_else(|| {
+            JsonValue::String(if input.success { "applied" } else { "failed" }.to_owned())
         }),
-        "edit_file" => serde_json::json!({
-            "ok": input.raw_output_json.get("ok").cloned().unwrap_or(JsonValue::Bool(input.success)),
-            "status": input.raw_output_json.get("status").cloned().unwrap_or(JsonValue::Null),
-            "operation": input.raw_output_json.get("operation").cloned().unwrap_or(JsonValue::Null),
-            "path": input.raw_output_json.get("path").cloned().unwrap_or(JsonValue::Null),
-            "resolved_path": input.raw_output_json.get("resolved_path").cloned().unwrap_or(JsonValue::Null),
-            "matches_replaced": input.raw_output_json.get("matches_replaced").cloned().unwrap_or(JsonValue::Null),
-            "replace_all": input.raw_output_json.get("replace_all").cloned().unwrap_or(JsonValue::Null),
-            "bytes_before": input.raw_output_json.get("bytes_before").cloned().unwrap_or(JsonValue::Null),
-            "bytes_after": input.raw_output_json.get("bytes_after").cloned().unwrap_or(JsonValue::Null),
-            "bytes_written": input.raw_output_json.get("bytes_written").cloned().unwrap_or(JsonValue::Null),
-            "sha256_before": input.raw_output_json.get("sha256_before").cloned().unwrap_or(JsonValue::Null),
-            "sha256": input.raw_output_json.get("sha256").cloned().unwrap_or(JsonValue::Null),
-            "old_string_bytes": input.raw_output_json.get("old_string_bytes").cloned().unwrap_or(JsonValue::Null),
-            "new_string_bytes": input.raw_output_json.get("new_string_bytes").cloned().unwrap_or(JsonValue::Null),
-            "old_string_sha256": input.raw_output_json.get("old_string_sha256").cloned().unwrap_or(JsonValue::Null),
-            "new_string_sha256": input.raw_output_json.get("new_string_sha256").cloned().unwrap_or(JsonValue::Null),
-            "line_ending_mode": input.raw_output_json.get("line_ending_mode").cloned().unwrap_or(JsonValue::Null),
-            "file_observation": input.raw_output_json.get("file_observation").cloned().unwrap_or(JsonValue::Null),
-            "changed_files": input.raw_output_json.get("changed_files").cloned().unwrap_or_else(|| serde_json::json!([])),
-        }),
-        _ => return llm_view_for_policy(input),
+    );
+    value.insert("success".to_owned(), JsonValue::Bool(input.success));
+    value.insert(
+        "changed_files".to_owned(),
+        raw.get("changed_files")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!([])),
+    );
+
+    let changes = raw
+        .get("changes")
+        .and_then(JsonValue::as_array)
+        .map(|changes| {
+            changes
+                .iter()
+                .filter_map(compact_file_change)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    value.insert("changes".to_owned(), JsonValue::Array(changes));
+
+    if let Some(error) = raw.get("error").and_then(compact_file_change_error) {
+        value.insert("error".to_owned(), error);
+    } else if input.success {
+        value.insert(
+            "message".to_owned(),
+            JsonValue::String("Patch applied successfully.".to_owned()),
+        );
+    }
+
+    if input.tool_name == "apply_patch"
+        && let Some(validation) = raw.get("validation")
+    {
+        value.insert("validation".to_owned(), validation.clone());
+    }
+
+    if let Some(side_effects) = raw.get("side_effects").and_then(compact_file_side_effects) {
+        value.insert("side_effects".to_owned(), side_effects);
+    }
+
+    bounded_model_json(input, JsonValue::Object(value))
+}
+
+fn bounded_model_json(input: &ToolProjectionInput<'_>, value: JsonValue) -> ToolResultView {
+    let view = ToolResultView::Json {
+        value,
+        truncated: false,
     };
     match input.output_policy.llm {
         LlmOutputPolicy::Full { max_bytes } | LlmOutputPolicy::Structured { max_bytes } => {
-            ToolResultView::Json {
-                value,
-                truncated: false,
-            }
-            .bounded_to_bytes(max_bytes)
+            view.bounded_to_bytes(max_bytes)
         }
-        LlmOutputPolicy::SummaryOnly => ToolResultView::Json {
-            value,
-            truncated: false,
-        },
+        LlmOutputPolicy::SummaryOnly => view,
     }
+}
+
+fn compact_file_change(change: &JsonValue) -> Option<JsonValue> {
+    let object = change.as_object()?;
+    let mut compact = serde_json::Map::new();
+    for key in ["operation_index", "kind", "source_path", "destination_path"] {
+        if let Some(value) = object.get(key)
+            && !value.is_null()
+        {
+            compact.insert(key.to_owned(), value.clone());
+        }
+    }
+    (!compact.is_empty()).then_some(JsonValue::Object(compact))
+}
+
+fn compact_file_change_error(error: &JsonValue) -> Option<JsonValue> {
+    let object = error.as_object()?;
+    let mut compact = serde_json::Map::new();
+    for key in [
+        "code",
+        "stage",
+        "message",
+        "operation_index",
+        "path",
+        "path_truncated",
+        "retryability",
+        "next_action",
+        "retry_same_patch",
+    ] {
+        if let Some(value) = object.get(key)
+            && !value.is_null()
+        {
+            compact.insert(key.to_owned(), value.clone());
+        }
+    }
+    (!compact.is_empty()).then_some(JsonValue::Object(compact))
+}
+
+fn compact_file_side_effects(side_effects: &JsonValue) -> Option<JsonValue> {
+    let object = side_effects.as_object()?;
+    let residual = object
+        .get("residual_directories")
+        .filter(|value| value.as_array().is_some_and(|items| !items.is_empty()));
+    let warnings = object
+        .get("metadata_warnings")
+        .filter(|value| value.as_array().is_some_and(|items| !items.is_empty()));
+    let exact = object
+        .get("exact")
+        .and_then(JsonValue::as_bool)
+        .unwrap_or(true);
+    if residual.is_none() && warnings.is_none() && exact {
+        return None;
+    }
+
+    let mut compact = serde_json::Map::new();
+    if let Some(residual) = residual {
+        compact.insert("residual_directories".to_owned(), residual.clone());
+    }
+    if let Some(warnings) = warnings {
+        compact.insert("metadata_warnings".to_owned(), warnings.clone());
+    }
+    compact.insert("exact".to_owned(), JsonValue::Bool(exact));
+    Some(JsonValue::Object(compact))
 }
 
 fn project_read_file(input: ToolProjectionInput<'_>) -> ToolResultEnvelope {
@@ -447,17 +522,23 @@ fn project_read_file(input: ToolProjectionInput<'_>) -> ToolResultEnvelope {
         .unwrap_or(JsonValue::Null);
     let content = input
         .raw_output_json
-        .get("output")
+        .get("text")
+        .or_else(|| input.raw_output_json.get("output"))
         .and_then(JsonValue::as_str)
         .unwrap_or(input.raw_output_text);
     let metadata = serde_json::json!({
         "path": path,
         "startLine": input.raw_output_json.get("start_line").cloned().unwrap_or(JsonValue::Null),
         "endLine": input.raw_output_json.get("end_line").cloned().unwrap_or(JsonValue::Null),
+        "nextLine": input.raw_output_json.get("next_line").cloned().unwrap_or(JsonValue::Null),
+        "cursor": input.raw_output_json.get("cursor").cloned().unwrap_or(JsonValue::Null),
+        "continuation": input.raw_output_json.get("continuation").cloned().unwrap_or(JsonValue::Null),
+        "range": input.raw_output_json.get("range").cloned().unwrap_or(JsonValue::Null),
         "maxBytes": input.raw_output_json.get("max_bytes").cloned().unwrap_or(JsonValue::Null),
         "truncated": input.raw_output_json.get("truncated").cloned().unwrap_or(JsonValue::Bool(false)),
-        "contentHash": sha256_hex(content.as_bytes()),
-        "bytes": content.len(),
+        "version": input.raw_output_json.get("version").cloned().unwrap_or(JsonValue::Null),
+        "contentHash": input.raw_output_json.get("version").cloned().unwrap_or(JsonValue::Null),
+        "bytes": input.raw_output_json.get("bytes").cloned().unwrap_or_else(|| JsonValue::from(content.len())),
     });
     let summary = summary(
         metadata
@@ -474,12 +555,28 @@ fn project_read_file(input: ToolProjectionInput<'_>) -> ToolResultEnvelope {
     );
     envelope(
         &input,
-        llm_view_for_policy(&input),
+        read_file_llm_view(&input),
         ToolDisplayPayload::Summary(summary),
         ToolStoragePayload::Metadata {
             metadata: ToolMetadata::from_json(metadata),
         },
         recovery_view(&input),
+    )
+}
+
+fn read_file_llm_view(input: &ToolProjectionInput<'_>) -> ToolResultView {
+    let raw = input.raw_output_json;
+    bounded_model_json(
+        input,
+        serde_json::json!({
+            "path": raw.get("path").cloned().unwrap_or(JsonValue::Null),
+            "text": raw.get("text").or_else(|| raw.get("output")).cloned().unwrap_or_else(|| JsonValue::String(input.raw_output_text.to_owned())),
+            "start_line": raw.get("start_line").cloned().unwrap_or(JsonValue::Null),
+            "end_line": raw.get("end_line").cloned().unwrap_or(JsonValue::Null),
+            "truncated": raw.get("truncated").cloned().unwrap_or(JsonValue::Bool(false)),
+            "continuation": raw.get("continuation").cloned().unwrap_or(JsonValue::Null),
+            "next_line": raw.get("next_line").cloned().unwrap_or(JsonValue::Null),
+        }),
     )
 }
 
@@ -523,6 +620,19 @@ fn project_read_skill(input: ToolProjectionInput<'_>) -> ToolResultEnvelope {
     )
 }
 
+fn list_dir_llm_view(input: &ToolProjectionInput<'_>) -> ToolResultView {
+    let raw = input.raw_output_json;
+    bounded_model_json(
+        input,
+        serde_json::json!({
+            "root": raw.get("root").cloned().unwrap_or(JsonValue::Null),
+            "entries": raw.get("entries").cloned().unwrap_or_else(|| serde_json::json!([])),
+            "truncated": raw.get("truncated").cloned().unwrap_or(JsonValue::Bool(false)),
+            "has_more": raw.get("has_more").cloned().unwrap_or(JsonValue::Bool(false)),
+        }),
+    )
+}
+
 fn project_list_dir(input: ToolProjectionInput<'_>) -> ToolResultEnvelope {
     let entries = input
         .raw_output_json
@@ -551,7 +661,7 @@ fn project_list_dir(input: ToolProjectionInput<'_>) -> ToolResultEnvelope {
     );
     envelope(
         &input,
-        llm_view_for_policy(&input),
+        list_dir_llm_view(&input),
         ToolDisplayPayload::Summary(summary),
         ToolStoragePayload::Metadata {
             metadata: ToolMetadata::from_json(metadata),
@@ -560,28 +670,100 @@ fn project_list_dir(input: ToolProjectionInput<'_>) -> ToolResultEnvelope {
     )
 }
 
+fn grep_files_llm_view(input: &ToolProjectionInput<'_>) -> ToolResultView {
+    let raw = input.raw_output_json;
+    let mut value = serde_json::Map::new();
+    for key in [
+        "status",
+        "path",
+        "engine",
+        "output",
+        "truncated",
+        "skipped_large_files",
+        "match_count",
+        "message",
+        "reason",
+        "next_action",
+        "suggestions",
+        "retryableByModel",
+        "retrySameArguments",
+    ] {
+        if let Some(field) = raw.get(key)
+            && !field.is_null()
+        {
+            value.insert(key.to_owned(), field.clone());
+        }
+    }
+    if !value.contains_key("output") {
+        let output = raw
+            .get("stdout")
+            .or_else(|| raw.get("stderr"))
+            .and_then(JsonValue::as_str)
+            .unwrap_or(input.raw_output_text);
+        if !output.is_empty() {
+            value.insert("output".to_owned(), JsonValue::String(output.to_owned()));
+        }
+    }
+    bounded_model_json(input, JsonValue::Object(value))
+}
+
 fn project_grep_files(input: ToolProjectionInput<'_>) -> ToolResultEnvelope {
+    let status = input
+        .raw_output_json
+        .get("status")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("failed");
     let stdout = input
         .raw_output_json
         .get("stdout")
         .and_then(JsonValue::as_str)
         .unwrap_or_default();
-    let match_count = stdout
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .count();
+    let match_count = input
+        .raw_output_json
+        .get("match_count")
+        .and_then(JsonValue::as_u64)
+        .map(|count| count as usize)
+        .unwrap_or_else(|| {
+            stdout
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .count()
+        });
     let metadata = serde_json::json!({
         "status": input.raw_output_json.get("status").cloned().unwrap_or(JsonValue::Null),
         "engine": input.raw_output_json.get("engine").cloned().unwrap_or(JsonValue::Null),
         "path": input.raw_output_json.get("path").cloned().unwrap_or(JsonValue::Null),
-        "exitCode": input.raw_output_json.get("exit_code").cloned().unwrap_or(JsonValue::Null),
         "truncated": input.raw_output_json.get("truncated").cloned().unwrap_or(JsonValue::Bool(false)),
         "matchCount": match_count,
         "resultHash": sha256_hex(input.raw_output_text.as_bytes()),
     });
+    let (title, lines) = match status {
+        "ok" => (
+            "grep_files completed",
+            vec![format!("{match_count} match line(s)")],
+        ),
+        "no_matches" => ("grep_files completed", vec!["No matches".to_owned()]),
+        "partial" => (
+            "grep_files incomplete",
+            vec![format!(
+                "{match_count} match line(s); results were truncated or files were skipped"
+            )],
+        ),
+        _ => (
+            "grep_files could not complete",
+            vec![
+                input
+                    .raw_output_json
+                    .get("message")
+                    .and_then(JsonValue::as_str)
+                    .unwrap_or("Search did not complete")
+                    .to_owned(),
+            ],
+        ),
+    };
     let summary = summary(
-        "grep_files completed",
-        vec![format!("{match_count} match line(s)")],
+        title,
+        lines,
         metadata.clone(),
         metadata
             .get("truncated")
@@ -590,7 +772,7 @@ fn project_grep_files(input: ToolProjectionInput<'_>) -> ToolResultEnvelope {
     );
     envelope(
         &input,
-        llm_view_for_policy(&input),
+        grep_files_llm_view(&input),
         ToolDisplayPayload::Summary(summary),
         ToolStoragePayload::Metadata {
             metadata: ToolMetadata::from_json(metadata),
@@ -1533,6 +1715,343 @@ mod tests {
     }
 
     #[test]
+    fn apply_patch_projection_keeps_the_model_facade_small_and_history_internal() {
+        let payload = serde_json::json!({
+            "schema_version": 1,
+            "status": "applied",
+            "success": true,
+            "exact": true,
+            "history_bearing": true,
+            "changed_files": ["/workspace/src/main.rs"],
+            "changes": [{
+                "operation_index": 0,
+                "commit_step": 1,
+                "sequence": 0,
+                "kind": "modify",
+                "source_path": "/workspace/src/main.rs",
+                "before_hash": "SECRET_BEFORE_HASH",
+                "after_hash": "SECRET_AFTER_HASH",
+                "before_bytes": 10,
+                "after_bytes": 12
+            }],
+            "side_effects": {
+                "created_directories": [],
+                "residual_directories": [],
+                "metadata_warnings": [],
+                "exact": true
+            },
+            "failed_stage": null,
+            "error": null,
+            "tracking": {
+                "status": "recorded_and_projected",
+                "authority": "native_patch_engine",
+                "record_id": "SECRET_RECORD_ID"
+            },
+            "history": {
+                "authority": "native_patch_engine",
+                "record_id": "SECRET_RECORD_ID",
+                "plan_fingerprint": "SECRET_PLAN_FINGERPRINT"
+            }
+        });
+        let raw = payload.to_string();
+        let envelope = project_tool_result(ToolProjectionInput {
+            call_id: "call_apply_patch",
+            tool_name: "apply_patch",
+            arguments: &serde_json::json!({"patch": "*** Begin Patch\n*** End Patch"}),
+            raw_output_text: &raw,
+            raw_output_json: &payload,
+            success: true,
+            outcome: &ok_outcome(),
+            output_policy: &ToolOutputPolicySnapshot::for_tool_name("apply_patch"),
+            output_projection: &ToolOutputProjectionKind::Builtin,
+        });
+
+        let model = serde_json::to_string(&envelope.llm_view).unwrap();
+        assert!(model.contains("Patch applied successfully"));
+        assert!(model.contains("/workspace/src/main.rs"));
+        for internal in [
+            "history",
+            "tracking",
+            "SECRET_RECORD_ID",
+            "SECRET_PLAN_FINGERPRINT",
+            "SECRET_BEFORE_HASH",
+            "SECRET_AFTER_HASH",
+            "commit_step",
+        ] {
+            assert!(
+                !model.contains(internal),
+                "model facade leaked internal field `{internal}`"
+            );
+        }
+
+        let storage = serde_json::to_string(&envelope.storage).unwrap();
+        assert!(storage.contains("patchHistory"));
+        assert!(storage.contains("SECRET_PLAN_FINGERPRINT"));
+    }
+
+    #[test]
+    fn apply_patch_projection_exposes_the_concrete_recovery_action() {
+        let payload = serde_json::json!({
+            "status": "rejected",
+            "success": false,
+            "changed_files": [],
+            "changes": [],
+            "error": {
+                "code": "source_missing",
+                "stage": "resolve",
+                "message": "source `/workspace/missing.txt` does not exist",
+                "operation_index": 0,
+                "path": "/workspace/missing.txt",
+                "retryability": "never",
+                "next_action": "Read or list `/workspace` and submit a new patch with the exact existing path.",
+                "retry_same_patch": false,
+                "guard_horizon": "source"
+            },
+            "tracking": { "authority": "untracked" }
+        });
+        let raw = payload.to_string();
+        let outcome = ToolOutcome::recoverable(
+            ToolErrorClass::InvalidArguments,
+            "Read or list `/workspace` and submit a new patch with the exact existing path.",
+            false,
+            None,
+        );
+        let envelope = project_tool_result(ToolProjectionInput {
+            call_id: "call_apply_patch_error",
+            tool_name: "apply_patch",
+            arguments: &serde_json::json!({"patch": "invalid"}),
+            raw_output_text: &raw,
+            raw_output_json: &payload,
+            success: false,
+            outcome: &outcome,
+            output_policy: &ToolOutputPolicySnapshot::for_tool_name("apply_patch"),
+            output_projection: &ToolOutputProjectionKind::Builtin,
+        });
+
+        let model = serde_json::to_string(&envelope.llm_view).unwrap();
+        assert!(model.contains("source_missing"));
+        assert!(model.contains("/workspace/missing.txt"));
+        assert!(model.contains("Read or list"));
+        assert!(model.contains("retry_same_patch"));
+        assert!(!model.contains("guard_horizon"));
+        assert!(!model.contains("tracking"));
+    }
+
+    #[test]
+    fn apply_patch_projection_keeps_validation_codes_ranges_and_completeness() {
+        let payload = serde_json::json!({
+            "status": "rejected", "success": false, "changed_files": [], "changes": [],
+            "error": {"code": "patch_syntax_error", "stage": "parse", "message": "missing +",
+                "next_action": "Fix the listed lines.", "retry_same_patch": false},
+            "validation": {
+                "stage": "syntax", "syntax_complete": false, "later_stages_checked": false,
+                "unchecked_from_line": 7, "stop_reason": "ambiguous_structure",
+                "observed_violations": 2, "shown_violations": 2, "display_truncated": false,
+                "diagnostics": [{"code": "missing_add_prefix", "column": 1,
+                    "operation_index": 0, "operation": "add", "path": "a.txt",
+                    "message": "Add File lines must start with +", "lines": [{"start": 3, "end": 4}]}]
+            }
+        });
+        let outcome = ToolOutcome::recoverable(
+            ToolErrorClass::InvalidArguments,
+            "Fix the listed lines.",
+            true,
+            Some("syntax scan stopped at line 7".to_owned()),
+        );
+        let envelope = project_tool_result(ToolProjectionInput {
+            call_id: "call_validation",
+            tool_name: "apply_patch",
+            arguments: &serde_json::json!({"patch": "invalid"}),
+            raw_output_text: &payload.to_string(),
+            raw_output_json: &payload,
+            success: false,
+            outcome: &outcome,
+            output_policy: &ToolOutputPolicySnapshot::for_tool_name("apply_patch"),
+            output_projection: &ToolOutputProjectionKind::Builtin,
+        });
+        let model = envelope.llm_payload();
+        assert_eq!(
+            model["validation"]["diagnostics"][0]["code"],
+            "missing_add_prefix"
+        );
+        assert_eq!(model["validation"]["diagnostics"][0]["lines"][0]["end"], 4);
+        assert_eq!(model["validation"]["unchecked_from_line"], 7);
+        assert_eq!(model["tool_outcome"]["incomplete"], true);
+    }
+
+    #[test]
+    fn escaped_path_diagnostic_survives_the_model_projection() {
+        use crate::apply_patch::file_mutation::{PatchLimits, PatchRequest, PatchRequestSource};
+        use crate::apply_patch::{ExecutionReport, parse_validated, project_execution_report};
+
+        let path = "\"".repeat(PatchLimits::default().max_path_bytes as usize);
+        let patch = format!("*** Begin Patch\n*** Add File: {path}\nwrong\n*** End Patch");
+        let request = PatchRequest::from_provider_text(
+            &patch,
+            PatchRequestSource::NativeFreeform,
+            PatchLimits::default(),
+        )
+        .unwrap();
+        let failure = parse_validated(&request, PatchLimits::default()).unwrap_err();
+        let payload = serde_json::to_value(project_execution_report(
+            ExecutionReport::rejected_parse_failure(&failure),
+        ))
+        .unwrap();
+        let outcome = ToolOutcome::recoverable(
+            ToolErrorClass::InvalidArguments,
+            "Correct the listed issue.",
+            false,
+            None,
+        );
+        let envelope = project_tool_result(ToolProjectionInput {
+            call_id: "call_large_path",
+            tool_name: "apply_patch",
+            arguments: &serde_json::json!({"patch": "invalid"}),
+            raw_output_text: &payload.to_string(),
+            raw_output_json: &payload,
+            success: false,
+            outcome: &outcome,
+            output_policy: &ToolOutputPolicySnapshot::for_tool_name("apply_patch"),
+            output_projection: &ToolOutputProjectionKind::Builtin,
+        });
+        let model = envelope.llm_payload();
+        assert_eq!(
+            model["validation"]["diagnostics"][0]["code"],
+            "missing_add_prefix"
+        );
+        assert_eq!(
+            model["validation"]["diagnostics"][0]["lines"][0]["start"],
+            3
+        );
+        assert_eq!(model["validation"]["diagnostics"][0]["operation_index"], 0);
+        assert_eq!(
+            model["validation"]["diagnostics"][0]["path_truncated"],
+            true
+        );
+        assert_eq!(model["error"]["path_truncated"], true);
+    }
+
+    #[test]
+    fn native_file_read_projection_keeps_content_but_hides_internal_tokens_and_duplicates() {
+        let payload = serde_json::json!({
+            "path": "/workspace/src/main.rs",
+            "resolved_path": "/workspace/src/main.rs",
+            "relative_path": "src/main.rs",
+            "cwd": "/workspace",
+            "authorized_root": "/workspace",
+            "start_line": 1,
+            "end_line": 1,
+            "next_line": null,
+            "continuation": null,
+            "truncated": false,
+            "version": "SECRET_VERSION_TOKEN",
+            "text": "fn main() {}\n",
+            "output": "SECRET_DUPLICATE_RENDERING"
+        });
+        let raw = payload.to_string();
+        let envelope = project_tool_result(ToolProjectionInput {
+            call_id: "call_read_file",
+            tool_name: "read_file",
+            arguments: &serde_json::json!({"path": "src/main.rs"}),
+            raw_output_text: &raw,
+            raw_output_json: &payload,
+            success: true,
+            outcome: &ok_outcome(),
+            output_policy: &ToolOutputPolicySnapshot::for_tool_name("read_file"),
+            output_projection: &ToolOutputProjectionKind::Builtin,
+        });
+
+        let model = serde_json::to_string(&envelope.llm_view).unwrap();
+        assert!(model.contains("/workspace/src/main.rs"));
+        assert!(model.contains("fn main()"));
+        assert!(!model.contains("SECRET_VERSION_TOKEN"));
+        assert!(!model.contains("SECRET_DUPLICATE_RENDERING"));
+        assert!(!model.contains("authorized_root"));
+    }
+
+    #[test]
+    fn native_list_and_grep_projections_return_only_actionable_model_fields() {
+        let list_payload = serde_json::json!({
+            "root": "/workspace",
+            "relative_root": ".",
+            "cwd": "/workspace",
+            "authorized_root": "/workspace",
+            "truncated": true,
+            "has_more": true,
+            "entries": [{"path": "/workspace/src", "kind": "dir"}]
+        });
+        let list_raw = list_payload.to_string();
+        let list = project_tool_result(ToolProjectionInput {
+            call_id: "call_list_dir",
+            tool_name: "list_dir",
+            arguments: &serde_json::json!({"path": "."}),
+            raw_output_text: &list_raw,
+            raw_output_json: &list_payload,
+            success: true,
+            outcome: &ok_outcome(),
+            output_policy: &ToolOutputPolicySnapshot::for_tool_name("list_dir"),
+            output_projection: &ToolOutputProjectionKind::Builtin,
+        });
+        let list_model = serde_json::to_string(&list.llm_view).unwrap();
+        assert!(list_model.contains("/workspace/src"));
+        assert!(list_model.contains("has_more"));
+        assert!(!list_model.contains("authorized_root"));
+        assert!(!list_model.contains("relative_root"));
+
+        let grep_payload = serde_json::json!({
+            "status": "ok",
+            "engine": "fff",
+            "path": "/workspace/src",
+            "truncated": false,
+            "stdout": "SECRET_DUPLICATE_STDOUT",
+            "stderr": "SECRET_INTERNAL_STDERR",
+            "output": "/workspace/src/main.rs:1:fn main() {}"
+        });
+        let grep_raw = grep_payload.to_string();
+        let grep = project_tool_result(ToolProjectionInput {
+            call_id: "call_grep_files",
+            tool_name: "grep_files",
+            arguments: &serde_json::json!({"pattern": "main", "path": "/workspace/src"}),
+            raw_output_text: &grep_raw,
+            raw_output_json: &grep_payload,
+            success: true,
+            outcome: &ok_outcome(),
+            output_policy: &ToolOutputPolicySnapshot::for_tool_name("grep_files"),
+            output_projection: &ToolOutputProjectionKind::Builtin,
+        });
+        let grep_model = serde_json::to_string(&grep.llm_view).unwrap();
+        assert!(grep_model.contains("/workspace/src/main.rs"));
+        assert!(!grep_model.contains("SECRET_DUPLICATE_STDOUT"));
+        assert!(!grep_model.contains("SECRET_INTERNAL_STDERR"));
+    }
+
+    #[test]
+    fn incomplete_grep_is_not_displayed_as_zero_matches() {
+        let payload = serde_json::json!({
+            "status": "needs_narrowing",
+            "reason": "timeout",
+            "message": "The search timed out",
+            "path": "/workspace"
+        });
+        let raw = payload.to_string();
+        let projected = project_tool_result(ToolProjectionInput {
+            call_id: "call_unavailable",
+            tool_name: "grep_files",
+            arguments: &serde_json::json!({"pattern": "needle", "glob": "*.rs"}),
+            raw_output_text: &raw,
+            raw_output_json: &payload,
+            success: false,
+            outcome: &ok_outcome(),
+            output_policy: &ToolOutputPolicySnapshot::for_tool_name("grep_files"),
+            output_projection: &ToolOutputProjectionKind::Builtin,
+        });
+        let display = serde_json::to_string(&projected.display).unwrap();
+        assert!(display.contains("could not complete"));
+        assert!(display.contains("The search timed out"));
+        assert!(!display.contains("0 match line"));
+    }
+
+    #[test]
     fn computer_use_projection_compacts_accessibility_nodes_outside_llm_view() {
         let payload = serde_json::json!({
             "action": "snapshot",
@@ -1737,195 +2256,6 @@ mod tests {
         assert!(storage.contains("\"trace\""));
         assert!(storage.contains("element_stale"));
         assert!(storage.contains("suggested_fallbacks"));
-    }
-
-    #[test]
-    fn write_file_create_projection_uses_file_change_metadata() {
-        let payload = serde_json::json!({
-            "ok": true,
-            "status": "completed",
-            "operation": "created",
-            "path": "docs/example.md",
-            "resolved_path": "/tmp/project/docs/example.md",
-            "bytes_written": 5,
-            "sha256": "abc123",
-            "file_observation": {
-                "id": "write_file:call_write_create",
-                "path": "/tmp/project/docs/example.md",
-                "bytes": 5,
-                "sha256": "abc123",
-                "mtime_ms": 1234,
-                "complete": true,
-                "source_tool_call_id": "call_write_create"
-            },
-            "created_dirs": [],
-            "changed_files": ["/tmp/project/docs/example.md"],
-            "content": "SECRET_WRITE_FILE_CONTENT"
-        });
-        let envelope = project_tool_result(ToolProjectionInput {
-            call_id: "call_write_create",
-            tool_name: "write_file",
-            arguments: &serde_json::json!({"path": "docs/example.md"}),
-            raw_output_text: "write_file completed: created /tmp/project/docs/example.md, 5 bytes.",
-            raw_output_json: &payload,
-            success: true,
-            outcome: &ok_outcome(),
-            output_policy: &ToolOutputPolicySnapshot::for_tool_name("write_file"),
-            output_projection: &ToolOutputProjectionKind::Builtin,
-        });
-
-        let ToolDisplayPayload::Summary(display_summary) = &envelope.display else {
-            panic!("write_file should use summary display");
-        };
-        assert_eq!(display_summary.title, "write_file created 1 file(s)");
-        assert_eq!(
-            display_summary.lines,
-            vec!["/tmp/project/docs/example.md".to_owned()]
-        );
-        let metadata = display_summary.metadata.to_json();
-        assert_eq!(metadata["operation"], "created");
-        assert_eq!(metadata["bytesWritten"], 5);
-        assert_eq!(metadata["sha256"], "abc123");
-        assert_eq!(metadata["changedFiles"][0], "/tmp/project/docs/example.md");
-
-        assert!(
-            !serde_json::to_string(&envelope.llm_view)
-                .unwrap()
-                .contains("SECRET_WRITE_FILE_CONTENT")
-        );
-        assert!(
-            !serde_json::to_string(&envelope.display)
-                .unwrap()
-                .contains("SECRET_WRITE_FILE_CONTENT")
-        );
-        assert!(
-            !serde_json::to_string(&envelope.storage)
-                .unwrap()
-                .contains("SECRET_WRITE_FILE_CONTENT")
-        );
-    }
-
-    #[test]
-    fn write_file_overwrite_projection_uses_operation_bytes_and_sha() {
-        let payload = serde_json::json!({
-            "ok": true,
-            "status": "completed",
-            "operation": "overwritten",
-            "path": "/tmp/project/src/lib.rs",
-            "resolved_path": "/tmp/project/src/lib.rs",
-            "bytes_written": 12,
-            "sha256": "def456",
-            "file_observation": {
-                "id": "write_file:call_write_overwrite",
-                "path": "/tmp/project/src/lib.rs",
-                "bytes": 12,
-                "sha256": "def456",
-                "mtime_ms": 5678,
-                "complete": true,
-                "source_tool_call_id": "call_write_overwrite"
-            },
-            "created_dirs": [],
-            "changed_files": ["/tmp/project/src/lib.rs"]
-        });
-        let envelope = project_tool_result(ToolProjectionInput {
-            call_id: "call_write_overwrite",
-            tool_name: "write_file",
-            arguments: &serde_json::json!({"path": "/tmp/project/src/lib.rs"}),
-            raw_output_text: "write_file completed: overwritten /tmp/project/src/lib.rs, 12 bytes.",
-            raw_output_json: &payload,
-            success: true,
-            outcome: &ok_outcome(),
-            output_policy: &ToolOutputPolicySnapshot::for_tool_name("write_file"),
-            output_projection: &ToolOutputProjectionKind::Builtin,
-        });
-
-        let ToolStoragePayload::Metadata { metadata } = &envelope.storage else {
-            panic!("write_file should use metadata-only storage");
-        };
-        let metadata = metadata.to_json();
-
-        let ToolDisplayPayload::Summary(display_summary) = &envelope.display else {
-            panic!("write_file overwrite should use summary display");
-        };
-        assert_eq!(display_summary.title, "write_file overwrote 1 file(s)");
-
-        assert_eq!(metadata["operation"], "overwritten");
-        assert_eq!(metadata["bytesWritten"], 12);
-        assert_eq!(metadata["sha256"], "def456");
-        assert_eq!(metadata["changedFiles"][0], "/tmp/project/src/lib.rs");
-    }
-
-    #[test]
-    fn edit_file_projection_does_not_echo_sensitive_strings() {
-        let payload = serde_json::json!({
-            "ok": true,
-            "status": "completed",
-            "operation": "edited",
-            "path": "/tmp/project/src/lib.rs",
-            "resolved_path": "/tmp/project/src/lib.rs",
-            "matches_replaced": 1,
-            "replace_all": false,
-            "bytes_before": 44,
-            "bytes_after": 45,
-            "bytes_written": 45,
-            "sha256_before": "before123",
-            "sha256": "after456",
-            "old_string_bytes": 31,
-            "new_string_bytes": 31,
-            "old_string_sha256": "oldhash",
-            "new_string_sha256": "newhash",
-            "line_ending_mode": "lf",
-            "changed_files": ["/tmp/project/src/lib.rs"],
-            "old_string": "SECRET_EDIT_OLD_SENTINEL",
-            "new_string": "SECRET_EDIT_NEW_SENTINEL",
-            "content": "SECRET_EDIT_FINAL_SENTINEL"
-        });
-        let envelope = project_tool_result(ToolProjectionInput {
-            call_id: "call_edit_projection",
-            tool_name: "edit_file",
-            arguments: &serde_json::json!({"path": "/tmp/project/src/lib.rs"}),
-            raw_output_text: "edit_file completed: edited /tmp/project/src/lib.rs, replaced 1 occurrence, 45 bytes.",
-            raw_output_json: &payload,
-            success: true,
-            outcome: &ok_outcome(),
-            output_policy: &ToolOutputPolicySnapshot::for_tool_name("edit_file"),
-            output_projection: &ToolOutputProjectionKind::Builtin,
-        });
-        let rendered = serde_json::to_string(&envelope).expect("envelope should serialize");
-
-        assert!(!rendered.contains("SECRET_EDIT_OLD_SENTINEL"));
-        assert!(!rendered.contains("SECRET_EDIT_NEW_SENTINEL"));
-        assert!(!rendered.contains("SECRET_EDIT_FINAL_SENTINEL"));
-        assert!(rendered.contains("matches_replaced"));
-        assert!(rendered.contains("old_string_sha256"));
-
-        let ToolDisplayPayload::Summary(display_summary) = &envelope.display else {
-            panic!("edit_file should use summary display");
-        };
-        assert_eq!(display_summary.title, "edit_file edited 1 file(s)");
-        assert_eq!(
-            display_summary.lines,
-            vec!["/tmp/project/src/lib.rs".to_owned()]
-        );
-
-        let ToolStoragePayload::Metadata { metadata } = &envelope.storage else {
-            panic!("edit_file should use metadata-only storage");
-        };
-        let metadata = metadata.to_json();
-        assert_eq!(metadata["operation"], "edited");
-        assert_eq!(metadata["matchesReplaced"], 1);
-        assert_eq!(metadata["replaceAll"], false);
-        assert_eq!(metadata["bytesBefore"], 44);
-        assert_eq!(metadata["bytesAfter"], 45);
-        assert_eq!(metadata["bytesWritten"], 45);
-        assert_eq!(metadata["sha256Before"], "before123");
-        assert_eq!(metadata["sha256"], "after456");
-        assert_eq!(metadata["oldStringBytes"], 31);
-        assert_eq!(metadata["newStringBytes"], 31);
-        assert_eq!(metadata["oldStringSha256"], "oldhash");
-        assert_eq!(metadata["newStringSha256"], "newhash");
-        assert_eq!(metadata["lineEndingMode"], "lf");
-        assert_eq!(metadata["changedFiles"][0], "/tmp/project/src/lib.rs");
     }
 
     #[test]

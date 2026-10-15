@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "McpOAuthResponse",
+  "type": "object",
+  "properties": {
+    "accepted": {
+      "description": "Operation accepted; completion and durable authorization arrive via notifications.",
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "accepted"
+  ]
+}

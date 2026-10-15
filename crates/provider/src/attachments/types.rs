@@ -90,7 +90,9 @@ impl Default for AttachmentSecurityPolicy {
         Self {
             enforce_path_allowlist: false,
             allowed_path_roots: Vec::new(),
-            allow_url_sources: true,
+            // Remote ingestion is opt-in and is additionally constrained by
+            // an explicit domain allowlist.
+            allow_url_sources: false,
             allow_http: false,
             allow_private_network: false,
             max_url_redirects: 3,

@@ -48,7 +48,6 @@ pub struct ActiveThreadSnapshot {
     pub history_loaded: bool,
     pub in_flight_turn_id: Option<String>,
     pub phase: ActiveThreadPhaseSnapshot,
-    pub status: ActiveThreadStatusSnapshot,
 }
 
 impl Default for ActiveThreadSnapshot {
@@ -61,12 +60,32 @@ impl Default for ActiveThreadSnapshot {
             history_loaded: false,
             in_flight_turn_id: None,
             phase: ActiveThreadPhaseSnapshot::Idle,
-            status: ActiveThreadStatusSnapshot::Ready,
         }
     }
 }
 
 impl ActiveThreadSnapshot {
+    /// Project one mounted thread using the same selectors as the aggregate snapshot.
+    /// The caller supplies immutable scoped inputs, without copying other threads.
+    pub fn from_coordinator(
+        thread_id: Option<&str>,
+        coordinator: Option<&ThreadCoordinator>,
+        is_draft: bool,
+    ) -> Self {
+        let coordinator = coordinator.filter(|_| thread_id.is_some());
+        let conversation = coordinator.map(|value| &value.conversation);
+        Self {
+            thread_id: thread_id.map(str::to_owned),
+            workspace_id: coordinator.map(|value| value.workspace_id.clone()),
+            is_draft: thread_id.is_some() && is_draft,
+            history_loading: coordinator.is_some_and(|value| value.history_loading),
+            history_loaded: coordinator.is_some_and(|value| value.history_loaded),
+            in_flight_turn_id: conversation
+                .and_then(|value| value.in_flight_turn_id().map(str::to_owned)),
+            phase: selectors::active_thread_phase_snapshot(conversation),
+        }
+    }
+
     pub fn has_in_flight_turn(&self) -> bool {
         self.in_flight_turn_id.is_some()
     }
@@ -95,21 +114,6 @@ pub enum ActiveThreadPhaseSnapshot {
     Cancelled,
 }
 
-#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-pub enum ActiveThreadStatusSnapshot {
-    GatewayDisconnected,
-    StartingThread,
-    FinishingTurn,
-    TurnRunning { turn_id: String },
-    PreviousTurnFailed,
-    TurnCancelled,
-    TurnCompleted,
-    Ready,
-    StartingTurn,
-    AgentProcessing,
-}
-
 #[derive(Clone, Copy)]
 pub struct ClientSnapshotInput<'a> {
     pub active_thread_id: Option<&'a str>,
@@ -123,7 +127,6 @@ pub struct ClientSnapshotInput<'a> {
     pub thread_start_in_progress: bool,
     pub pending_thread_id: Option<&'a str>,
     pub coordinators: &'a HashMap<String, ThreadCoordinator>,
-    pub gateway_connected: bool,
 }
 
 impl ClientSnapshot {
@@ -140,7 +143,6 @@ impl ClientSnapshot {
             thread_start_in_progress: state.threads.start.in_progress,
             pending_thread_id: state.threads.start.pending_thread_id.as_deref(),
             coordinators: &state.threads.coordinators,
-            gateway_connected: state.gateway.ws_connection_id.is_some(),
         })
     }
 
@@ -167,21 +169,6 @@ impl ClientSnapshot {
             input.pending_thread_id,
         );
         let has_any_in_flight_turn = selectors::has_any_in_flight_turn_in(input.coordinators);
-        let active_conversation =
-            selectors::active_thread_conversation(input.active_thread_id, input.coordinators);
-        let active_thread_workspace_id = input
-            .active_thread_id
-            .and_then(|thread_id| {
-                selectors::thread_workspace_id_from(input.coordinators, thread_id)
-            })
-            .map(str::to_owned);
-        let active_thread_status = selectors::active_thread_status_snapshot(
-            input.gateway_connected,
-            input.active_thread_id,
-            has_in_flight_thread_start,
-            active_conversation,
-        );
-        let active_thread_phase = selectors::active_thread_phase_snapshot(active_conversation);
 
         Self {
             workspace: WorkspaceSnapshot {
@@ -199,23 +186,13 @@ impl ClientSnapshot {
                 has_known_threads_for_active_workspace,
                 loading: input.thread_list_loading,
             },
-            active_thread: ActiveThreadSnapshot {
-                thread_id: input.active_thread_id.map(str::to_owned),
-                workspace_id: active_thread_workspace_id,
-                is_draft: input.active_thread_id.is_some()
-                    && input.active_thread_id == input.draft_thread_id,
-                history_loading: input.active_thread_id.is_some_and(|thread_id| {
-                    selectors::is_thread_history_loading(input.coordinators, thread_id)
-                }),
-                history_loaded: input.active_thread_id.is_some_and(|thread_id| {
-                    selectors::is_thread_history_loaded(input.coordinators, thread_id)
-                }),
-                in_flight_turn_id: input.active_thread_id.and_then(|thread_id| {
-                    selectors::in_flight_turn_id_for_thread_in(input.coordinators, thread_id)
-                }),
-                phase: active_thread_phase,
-                status: active_thread_status,
-            },
+            active_thread: ActiveThreadSnapshot::from_coordinator(
+                input.active_thread_id,
+                input
+                    .active_thread_id
+                    .and_then(|id| input.coordinators.get(id)),
+                input.active_thread_id == input.draft_thread_id,
+            ),
             has_in_flight_thread_start,
             has_any_in_flight_turn,
         }
@@ -265,6 +242,52 @@ mod tests {
     }
 
     #[test]
+    fn scoped_snapshot_preserves_running_cancel_and_disconnected_presentation() {
+        use crate::conversation::ConversationEvent;
+        let mut coordinator = ThreadCoordinator::new(thread("thread_a", "ws_a", 1));
+        coordinator.history_loading = true;
+        coordinator.history_loaded = true;
+        coordinator
+            .conversation
+            .apply(ConversationEvent::LocalTurnStartRequested {
+                thread_id: "thread_a".into(),
+                turn_id: "turn_a".into(),
+                pending_request_id: "request_a".into(),
+                mode: ThreadMode::Agent,
+                user_text: "hello".into(),
+                attachments: vec![],
+            });
+        coordinator
+            .conversation
+            .apply(ConversationEvent::LocalTurnStartAccepted {
+                thread_id: "thread_a".into(),
+                turn_id: "turn_a".into(),
+                pending_request_id: "request_a".into(),
+                mode: ThreadMode::Agent,
+            });
+        let running =
+            ActiveThreadSnapshot::from_coordinator(Some("thread_a"), Some(&coordinator), false);
+        assert_eq!(running.phase, ActiveThreadPhaseSnapshot::Running);
+        assert!(running.can_request_turn_cancel(true));
+        assert!(!running.can_request_turn_cancel(false));
+        assert!(running.history_loading && running.history_loaded);
+        coordinator
+            .conversation
+            .apply(ConversationEvent::LocalTurnCancelRequested {
+                thread_id: "thread_a".into(),
+                turn_id: "turn_a".into(),
+            });
+        let cancelling =
+            ActiveThreadSnapshot::from_coordinator(Some("thread_a"), Some(&coordinator), false);
+        assert!(cancelling.is_cancelling_turn());
+        assert!(!cancelling.can_request_turn_cancel(true));
+        let unmounted = ActiveThreadSnapshot::from_coordinator(None, Some(&coordinator), true);
+        assert_eq!(unmounted.workspace_id, None);
+        assert!(!unmounted.has_in_flight_turn());
+        assert!(!unmounted.is_draft);
+    }
+
+    #[test]
     fn client_snapshot_projects_workspace_and_thread_list_dtos() {
         let workspaces = vec![
             workspace("ws_a", true, true),
@@ -301,7 +324,6 @@ mod tests {
             thread_start_in_progress: false,
             pending_thread_id: None,
             coordinators: &coordinators,
-            gateway_connected: true,
         });
 
         assert_eq!(
@@ -316,10 +338,6 @@ mod tests {
         assert_eq!(
             snapshot.active_thread.phase,
             ActiveThreadPhaseSnapshot::Idle
-        );
-        assert_eq!(
-            snapshot.active_thread.status,
-            ActiveThreadStatusSnapshot::Ready
         );
         assert!(!snapshot.active_thread.has_in_flight_turn());
         assert!(!snapshot.active_thread.can_request_turn_cancel(true));

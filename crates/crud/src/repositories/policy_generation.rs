@@ -3,11 +3,11 @@ use pioneer_protocol::{
     AuthorizationChangeKind, AuthorizationChangeScope, AuthorizationProjectionChangedNotification,
     PolicyGeneration,
 };
-use sea_orm::{ConnectionTrait, DatabaseConnection, DbBackend, Statement, TransactionTrait};
+use sea_orm::{ConnectionTrait, DbBackend, Statement, TransactionSession, TransactionTrait};
 
 const STATE_ROW: &str = "SELECT generation, code_policy_fingerprint FROM authorization_policy_state WHERE singleton_id = 1";
 
-pub async fn current_policy_generation(db: &DatabaseConnection) -> Result<PolicyGeneration> {
+pub async fn current_policy_generation<C: ConnectionTrait>(db: &C) -> Result<PolicyGeneration> {
     current_policy_generation_on(db).await
 }
 
@@ -23,13 +23,19 @@ pub async fn current_policy_generation_on<C: ConnectionTrait>(db: &C) -> Result<
     generation_from_i64(row.try_get("", "generation")?)
 }
 
-pub async fn ensure_code_policy_generation(
-    db: &DatabaseConnection,
+pub async fn ensure_code_policy_generation<D>(
+    db: &D,
     fingerprint: &str,
-) -> Result<AuthorizationProjectionChangedNotification> {
+) -> Result<AuthorizationProjectionChangedNotification>
+where
+    D: TransactionTrait,
+{
     if fingerprint.len() != 64 || !fingerprint.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         bail!("authorization policy fingerprint must be a SHA-256 hex digest");
     }
+    let affected = AuthorizationChangeScope::Global;
+    let affected_scope_json = serde_json::to_string(&affected)
+        .context("failed to serialize authorization change scope")?;
     let transaction = db
         .begin()
         .await
@@ -59,9 +65,9 @@ pub async fn ensure_code_policy_generation(
     let notification = AuthorizationProjectionChangedNotification {
         policy_generation: generation,
         change: AuthorizationChangeKind::CodePolicy,
-        affected: AuthorizationChangeScope::Global,
+        affected,
     };
-    insert_change_if_absent(&transaction, &notification).await?;
+    insert_change_if_absent(&transaction, &notification, affected_scope_json.as_str()).await?;
     transaction
         .commit()
         .await
@@ -69,11 +75,16 @@ pub async fn ensure_code_policy_generation(
     Ok(notification)
 }
 
-pub async fn append_authorization_change(
-    db: &DatabaseConnection,
+pub async fn append_authorization_change<D>(
+    db: &D,
     change: AuthorizationChangeKind,
     affected: AuthorizationChangeScope,
-) -> Result<AuthorizationProjectionChangedNotification> {
+) -> Result<AuthorizationProjectionChangedNotification>
+where
+    D: TransactionTrait,
+{
+    let affected_scope_json = serde_json::to_string(&affected)
+        .context("failed to serialize authorization change scope")?;
     let transaction = db
         .begin()
         .await
@@ -96,7 +107,7 @@ pub async fn append_authorization_change(
         change,
         affected,
     };
-    insert_change_if_absent(&transaction, &notification).await?;
+    insert_change_if_absent(&transaction, &notification, affected_scope_json.as_str()).await?;
     transaction
         .commit()
         .await
@@ -106,8 +117,8 @@ pub async fn append_authorization_change(
 
 /// Reads the durable, ordered change feed for missed-event reconciliation.
 /// The feed carries only typed, payload-safe invalidation scopes.
-pub async fn list_authorization_changes_after(
-    db: &DatabaseConnection,
+pub async fn list_authorization_changes_after<C: ConnectionTrait>(
+    db: &C,
     after: Option<PolicyGeneration>,
     limit: usize,
 ) -> Result<Vec<AuthorizationProjectionChangedNotification>> {
@@ -147,16 +158,15 @@ pub async fn list_authorization_changes_after(
 async fn insert_change_if_absent<C: ConnectionTrait>(
     db: &C,
     notification: &AuthorizationProjectionChangedNotification,
+    scope_json: &str,
 ) -> Result<()> {
-    let scope_json = serde_json::to_string(&notification.affected)
-        .context("failed to serialize authorization change scope")?;
     db.execute_raw(Statement::from_sql_and_values(
         DbBackend::Sqlite,
         "INSERT OR IGNORE INTO authorization_change_feed(generation, change_kind, affected_scope_json, created_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP)",
         [
             generation_i64(notification.policy_generation).into(),
             change_kind_name(notification.change).into(),
-            scope_json.into(),
+            scope_json.to_owned().into(),
         ],
     ))
     .await

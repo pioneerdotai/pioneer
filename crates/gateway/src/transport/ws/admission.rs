@@ -343,6 +343,10 @@ mod tests {
         drop(recovered);
         assert_eq!(limiter.test_observation(first_address), (0, 0, 1));
 
+        let retryable = limiter.try_acquire(first_address).unwrap();
+        drop(retryable);
+        assert_eq!(limiter.test_observation(first_address), (0, 0, 1));
+
         let permits = (0..MAX_AUTH_IN_FLIGHT_GLOBAL)
             .map(|index| {
                 let octet_2 = ((index / (254 * 254)) % 254 + 1) as u8;

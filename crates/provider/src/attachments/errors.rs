@@ -31,6 +31,15 @@ impl AttachmentPipelineError {
         )
     }
 
+    pub fn declared_size_mismatch(declared: u64, actual: usize, label: &str) -> Self {
+        Self::new(
+            "ATTACHMENT_SIZE_MISMATCH",
+            format!(
+                "attachment `{label}` declared {declared} bytes but materialized {actual} bytes"
+            ),
+        )
+    }
+
     pub fn attachment_count_exceeded(count: usize, max_count: usize) -> Self {
         Self::new(
             "ATTACHMENT_COUNT_EXCEEDED",

@@ -1,0 +1,1213 @@
+//! Authoritative Gateway settings and request generations for one Client.
+use crate::core::{ClientCore, ClientGeneration, ClientScope};
+use pioneer_protocol::{
+    GatewaySettingsGetResponse, GatewaySettingsSnapshot, GatewaySettingsUpdate,
+    GatewaySettingsUpdateResponse,
+};
+
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize)]
+pub struct GatewaySettingsStore {
+    pub settings: Option<GatewaySettingsSnapshot>,
+    pub workspace_id: Option<String>,
+    pub voice_input: Option<pioneer_protocol::GatewayVoiceInputSettings>,
+    pub vector_refill_refresh_requested: bool,
+    pub loading: bool,
+    pub saving: bool,
+    pub error: Option<String>,
+}
+
+impl ClientCore {
+    pub(crate) fn gateway_http_generation(&self) -> Option<u64> {
+        self.transport_runtime()
+            .ws_command_sender()
+            .current_gateway_http_access()
+            .ok()
+            .map(|access| access.generation)
+    }
+
+    pub(crate) fn observe_gateway_settings(&self, event: &crate::transport::ws::GatewayWsEvent) {
+        let crate::transport::ws::GatewayWsEvent::Notification { notification, .. } = event else {
+            return;
+        };
+        if !self
+            .transport_runtime()
+            .ws_command_sender()
+            .gateway_state_event_is_current(event)
+        {
+            return;
+        }
+        self.reduce_settings_notification(notification);
+    }
+
+    fn reduce_settings_notification(&self, notification: &pioneer_protocol::GatewayNotification) {
+        use pioneer_protocol::GatewayNotification;
+        let mut owner = self
+            .identity_authorization
+            .lock()
+            .expect("identity owner poisoned");
+        if self.is_stopped() {
+            return;
+        }
+        let before = owner.settings.clone();
+        match notification {
+            GatewayNotification::GatewayRemoteAccessStatusChanged(change) => {
+                owner.settings_notifications[0] = owner.settings_notifications[0]
+                    .checked_add(1)
+                    .expect("settings notification generation exhausted");
+                if let Some(settings) = owner.settings.settings.as_mut() {
+                    settings.remote_access.status = change.status.clone();
+                }
+            }
+            GatewayNotification::GatewayThreadEpisodicVectorRefillStatusChanged(change) => {
+                let workspace_matches =
+                    self.settings_workspace().as_deref() == Some(change.workspace_id.as_str());
+                let loaded_settings_match = owner.settings.settings.is_some()
+                    && owner.settings.workspace_id.as_deref() == Some(change.workspace_id.as_str());
+                let pending_request_matches = (owner.settings.loading || owner.settings.saving)
+                    && owner.settings_request_workspace.as_deref()
+                        == Some(change.workspace_id.as_str());
+                if !workspace_matches || (!loaded_settings_match && !pending_request_matches) {
+                    return;
+                }
+                owner.settings_notifications[1] = owner.settings_notifications[1]
+                    .checked_add(1)
+                    .expect("settings notification generation exhausted");
+                if pending_request_matches && !loaded_settings_match {
+                    owner
+                        .settings_request_vector_refill_notifications
+                        .push(change.clone());
+                }
+                let refresh = if loaded_settings_match {
+                    let settings = owner
+                        .settings
+                        .settings
+                        .as_mut()
+                        .expect("matching settings snapshot disappeared");
+                    let refresh = apply_vector_refill_notification(
+                        &mut settings.thread_episodic.vector_search,
+                        change,
+                    );
+                    refresh
+                } else {
+                    vector_refill_notification_is_terminal(change)
+                };
+                owner.settings.vector_refill_refresh_requested |= refresh;
+            }
+            GatewayNotification::GatewayVoiceInputStatusChanged(change) => {
+                owner.settings_notifications[2] = owner.settings_notifications[2]
+                    .checked_add(1)
+                    .expect("settings notification generation exhausted");
+                owner.settings.voice_input = Some(change.settings.clone());
+                if let Some(settings) = owner.settings.settings.as_mut() {
+                    settings.voice_input = change.settings.clone();
+                }
+                owner.settings.error = None;
+            }
+            _ => return,
+        }
+        if owner.settings != before {
+            self.publish_gateway_settings(&owner.settings);
+        }
+        let refresh = owner.settings.vector_refill_refresh_requested
+            && !before.vector_refill_refresh_requested;
+        drop(owner);
+        if refresh {
+            self.settings_intent(crate::settings::runtime::SettingsIntent::Refresh);
+        }
+    }
+
+    pub fn gateway_settings(&self) -> GatewaySettingsStore {
+        self.identity_authorization
+            .lock()
+            .expect("identity owner poisoned")
+            .settings
+            .clone()
+    }
+
+    pub fn request_gateway_settings(&self) -> anyhow::Result<ClientGeneration> {
+        self.request_gateway_settings_scoped(None)
+    }
+    pub(crate) fn request_gateway_settings_for_epoch(
+        &self,
+        epoch: &crate::settings::runtime::SettingsEpoch,
+    ) -> anyhow::Result<ClientGeneration> {
+        self.request_gateway_settings_scoped(Some(epoch))
+    }
+    fn request_gateway_settings_scoped(
+        &self,
+        expected: Option<&crate::settings::runtime::SettingsEpoch>,
+    ) -> anyhow::Result<ClientGeneration> {
+        let mut owner = self
+            .identity_authorization
+            .lock()
+            .expect("identity owner poisoned");
+        anyhow::ensure!(!self.is_stopped(), "Client runtime is stopped");
+        let workspace = self.settings_workspace();
+        anyhow::ensure!(
+            expected.is_none_or(|epoch| epoch.matches_owner(&owner, workspace.clone())),
+            "Settings action scope was replaced"
+        );
+        let connection = self.gateway_http_generation();
+        anyhow::ensure!(
+            owner.connection_matches(connection),
+            "Settings connection scope was replaced"
+        );
+        owner.settings_request = owner
+            .settings_request
+            .checked_add(1)
+            .expect("settings generation exhausted");
+        owner.settings_request_connection = connection;
+        owner.settings_request_workspace = workspace;
+        owner.settings_request_notifications = owner.settings_notifications;
+        owner.settings_request_vector_refill_notifications.clear();
+        owner.settings.vector_refill_refresh_requested = false;
+        owner.settings.loading = true;
+        owner.settings.error = None;
+        self.publish_gateway_settings(&owner.settings);
+        Ok(ClientGeneration::new(owner.settings_request))
+    }
+
+    pub(crate) fn finish_gateway_settings(
+        &self,
+        generation: ClientGeneration,
+        result: &mut anyhow::Result<GatewaySettingsSnapshot>,
+    ) -> bool {
+        let mut owner = self
+            .identity_authorization
+            .lock()
+            .expect("identity owner poisoned");
+        if self.is_stopped()
+            || owner.settings_request != generation.get()
+            || (!owner.settings.loading && !owner.settings.saving)
+            || owner.settings_request_connection != self.gateway_http_generation()
+            || owner.settings_request_workspace != self.settings_workspace()
+        {
+            return false;
+        }
+        owner.settings.loading = false;
+        owner.settings.saving = false;
+        let pending_vector_refill_notifications =
+            std::mem::take(&mut owner.settings_request_vector_refill_notifications);
+        match result {
+            Ok(settings) => {
+                let delivered = owner.settings_notifications;
+                let requested = owner.settings_request_notifications;
+                if let Some(current) = &owner.settings.settings {
+                    if delivered[0] != requested[0] {
+                        settings.remote_access.status = current.remote_access.status.clone();
+                    }
+                    if delivered[1] != requested[1] {
+                        let target = &mut settings.thread_episodic.vector_search;
+                        if owner.settings.workspace_id == owner.settings_request_workspace {
+                            let latest = &current.thread_episodic.vector_search;
+                            target.refill_status = latest.refill_status;
+                            target.local_model_status = latest.local_model_status;
+                            target.downloaded_bytes = latest.downloaded_bytes;
+                            target.total_bytes = latest.total_bytes;
+                        } else {
+                            for notification in &pending_vector_refill_notifications {
+                                apply_vector_refill_notification(target, notification);
+                            }
+                        }
+                    }
+                } else if delivered[1] != requested[1] {
+                    for notification in &pending_vector_refill_notifications {
+                        apply_vector_refill_notification(
+                            &mut settings.thread_episodic.vector_search,
+                            notification,
+                        );
+                    }
+                }
+                if delivered[2] != requested[2] {
+                    if let Some(voice) = &owner.settings.voice_input {
+                        settings.voice_input = voice.clone();
+                    }
+                }
+                owner.settings.voice_input = Some(settings.voice_input.clone());
+                owner.settings.workspace_id = owner.settings_request_workspace.clone();
+                owner.settings.settings = Some(settings.clone());
+                owner.settings.error = None;
+            }
+            Err(_) => owner.settings.error = Some("settings_load_failed".into()),
+        }
+        self.publish_gateway_settings(&owner.settings);
+        true
+    }
+
+    pub fn refresh_gateway_settings(&self) -> anyhow::Result<GatewaySettingsGetResponse> {
+        let generation = self.request_gateway_settings()?;
+        self.load_gateway_settings(generation)
+    }
+
+    pub fn load_gateway_settings(
+        &self,
+        generation: ClientGeneration,
+    ) -> anyhow::Result<GatewaySettingsGetResponse> {
+        let connection = {
+            let owner = self
+                .identity_authorization
+                .lock()
+                .expect("identity owner poisoned");
+            anyhow::ensure!(
+                !self.is_stopped()
+                    && owner.settings_request == generation.get()
+                    && owner.settings.loading
+                    && owner.settings_request_workspace == self.settings_workspace(),
+                "Settings request is no longer pending"
+            );
+            owner.settings_request_connection
+        };
+        let sender = self.transport_runtime().ws_command_sender();
+        let mut result = connection
+            .ok_or_else(|| anyhow::anyhow!("Settings connection unavailable"))
+            .and_then(|connection| {
+                crate::transport::ws::command_sender::gateway_settings_get(
+                    &sender.requests_for_connection(connection),
+                )
+            })
+            .map(|response| response.settings);
+        anyhow::ensure!(
+            self.finish_gateway_settings(generation, &mut result),
+            "Settings response belongs to a superseded authorization generation"
+        );
+        result.map(|settings| GatewaySettingsGetResponse { settings })
+    }
+
+    pub fn update_gateway_settings(
+        &self,
+        update: GatewaySettingsUpdate,
+    ) -> anyhow::Result<GatewaySettingsUpdateResponse> {
+        let generation = self.prepare_gateway_settings_update(None)?;
+        self.execute_gateway_settings_update(generation, update)
+    }
+
+    pub fn prepare_gateway_settings_update(
+        &self,
+        optimistic: Option<GatewaySettingsSnapshot>,
+    ) -> anyhow::Result<ClientGeneration> {
+        self.prepare_gateway_settings_update_scoped(optimistic, None)
+    }
+    pub(crate) fn prepare_gateway_settings_update_for_epoch(
+        &self,
+        epoch: &crate::settings::runtime::SettingsEpoch,
+    ) -> anyhow::Result<ClientGeneration> {
+        self.prepare_gateway_settings_update_scoped(None, Some(epoch))
+    }
+    fn prepare_gateway_settings_update_scoped(
+        &self,
+        optimistic: Option<GatewaySettingsSnapshot>,
+        expected: Option<&crate::settings::runtime::SettingsEpoch>,
+    ) -> anyhow::Result<ClientGeneration> {
+        let mut owner = self
+            .identity_authorization
+            .lock()
+            .expect("identity owner poisoned");
+        anyhow::ensure!(!self.is_stopped(), "Client runtime is stopped");
+        let workspace = self.settings_workspace();
+        anyhow::ensure!(
+            expected.is_none_or(|epoch| epoch.matches_owner(&owner, workspace.clone())),
+            "Settings action scope was replaced"
+        );
+        let connection = self.gateway_http_generation();
+        anyhow::ensure!(
+            owner.connection_matches(connection),
+            "Settings connection scope was replaced"
+        );
+        owner.settings_request = owner
+            .settings_request
+            .checked_add(1)
+            .expect("settings generation exhausted");
+        owner.settings_request_connection = connection;
+        owner.settings_request_workspace = workspace;
+        owner.settings_request_notifications = owner.settings_notifications;
+        owner.settings_request_vector_refill_notifications.clear();
+        owner.settings.vector_refill_refresh_requested = false;
+        owner.settings.saving = true;
+        owner.settings.error = None;
+        if let Some(snapshot) = optimistic {
+            owner.settings.settings = Some(snapshot);
+        }
+        self.publish_gateway_settings(&owner.settings);
+        Ok(ClientGeneration::new(owner.settings_request))
+    }
+
+    pub fn execute_gateway_settings_update(
+        &self,
+        generation: ClientGeneration,
+        update: GatewaySettingsUpdate,
+    ) -> anyhow::Result<GatewaySettingsUpdateResponse> {
+        let connection = {
+            let owner = self
+                .identity_authorization
+                .lock()
+                .expect("identity owner poisoned");
+            anyhow::ensure!(
+                !self.is_stopped()
+                    && owner.settings_request == generation.get()
+                    && owner.settings.saving
+                    && owner.settings_request_workspace == self.settings_workspace(),
+                "Settings update is no longer pending"
+            );
+            owner.settings_request_connection
+        };
+        let sender = self.transport_runtime().ws_command_sender();
+        let mut result = connection
+            .ok_or_else(|| anyhow::anyhow!("Settings connection unavailable"))
+            .and_then(|connection| {
+                crate::transport::ws::command_sender::gateway_settings_update(
+                    &sender.requests_for_connection(connection),
+                    update,
+                )
+            })
+            .map(|response| response.settings);
+        anyhow::ensure!(
+            self.finish_gateway_settings(generation, &mut result),
+            "Settings update belongs to a superseded authorization generation"
+        );
+        result.map(|settings| GatewaySettingsUpdateResponse { settings })
+    }
+
+    fn publish_gateway_settings(&self, settings: &GatewaySettingsStore) {
+        self.publish_settings_pages_locked(settings);
+        use crate::core::{
+            ClientMutationAuthority, ClientRevisions, ContentRevision, DomainRevision,
+            PresentationRevision, ScopedRevision,
+        };
+        let revision = self.snapshot(&ClientScope::Settings).map_or(1, |snapshot| {
+            snapshot
+                .revisions()
+                .scoped()
+                .get()
+                .checked_add(1)
+                .expect("settings revision exhausted")
+        });
+        self.publish(
+            &ClientMutationAuthority { _private: () },
+            ClientScope::Settings,
+            ClientRevisions::new(
+                DomainRevision::new(revision),
+                PresentationRevision::new(revision),
+                ContentRevision::ZERO,
+                ScopedRevision::new(revision),
+            ),
+            std::sync::Arc::new(settings.clone()),
+            vec![],
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn snapshot(keepawake: bool) -> GatewaySettingsSnapshot {
+        GatewaySettingsSnapshot {
+            self_improvement_status: None,
+            general: pioneer_protocol::GatewayGeneralSettings {
+                compaction_model: Default::default(),
+                keepawake,
+                ..Default::default()
+            },
+            memory: Default::default(),
+            self_improvement: Default::default(),
+            thread_episodic: Default::default(),
+            cli_runtimes: Default::default(),
+            remote_access: Default::default(),
+            voice_input: Default::default(),
+        }
+    }
+
+    fn snapshot_with_refill(
+        status: pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus,
+    ) -> GatewaySettingsSnapshot {
+        let mut settings = snapshot(false);
+        settings.thread_episodic.vector_search.provider =
+            Some(pioneer_protocol::GatewayThreadEpisodicVectorProvider::Local);
+        settings.thread_episodic.vector_search.refill_status = status;
+        settings
+    }
+
+    fn select_workspace(core: &ClientCore, workspace_id: Option<&str>) {
+        core.navigate(
+            crate::navigation::NavigationIntent::SelectWorkspace {
+                workspace_id: workspace_id.map(str::to_owned),
+            },
+            None,
+        );
+    }
+
+    fn refill_notification(
+        workspace_id: &str,
+        status: pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus,
+        local_model_status: Option<pioneer_protocol::GatewayThreadEpisodicVectorLocalModelStatus>,
+        downloaded_bytes: Option<u64>,
+        total_bytes: Option<u64>,
+    ) -> pioneer_protocol::GatewayNotification {
+        pioneer_protocol::GatewayNotification::GatewayThreadEpisodicVectorRefillStatusChanged(
+            pioneer_protocol::GatewayThreadEpisodicVectorRefillStatusChangedNotification {
+                workspace_id: workspace_id.into(),
+                status,
+                local_model_status,
+                downloaded_bytes,
+                total_bytes,
+            },
+        )
+    }
+
+    fn settings_notification_generations(core: &ClientCore) -> [u64; 3] {
+        core.identity_authorization
+            .lock()
+            .expect("identity owner poisoned")
+            .settings_notifications
+    }
+
+    fn settings_revision(core: &ClientCore) -> u64 {
+        core.snapshot(&ClientScope::Settings)
+            .expect("settings publication")
+            .revisions()
+            .scoped()
+            .get()
+    }
+
+    fn settings_page_revision(
+        core: &ClientCore,
+        page: crate::settings::runtime::SettingsPage,
+    ) -> u64 {
+        core.snapshot(&ClientScope::SettingsPage { page })
+            .expect("settings page publication")
+            .revisions()
+            .scoped()
+            .get()
+    }
+
+    #[test]
+    fn voice_ingress_publishes_once_and_stale_or_stopped_ingress_cannot_restore_settings() {
+        let core = ClientCore::new();
+        let settings = pioneer_protocol::GatewayVoiceInputSettings {
+            enabled: true,
+            ..Default::default()
+        };
+        let notification = pioneer_protocol::GatewayNotification::GatewayVoiceInputStatusChanged(
+            pioneer_protocol::GatewayVoiceInputStatusChangedNotification {
+                settings: settings.clone(),
+            },
+        );
+        core.reduce_settings_notification(&notification);
+        let accepted = core.snapshot(&ClientScope::Settings).unwrap();
+        assert_eq!(core.gateway_settings().voice_input, Some(settings));
+        core.reduce_settings_notification(&notification);
+        assert_eq!(
+            accepted.revisions(),
+            core.snapshot(&ClientScope::Settings).unwrap().revisions()
+        );
+        core.invalidate_authorization_revision(1);
+        core.observe_gateway_settings(&crate::transport::ws::GatewayWsEvent::Notification {
+            connection_id: 17,
+            notification: notification.clone(),
+        });
+        assert_eq!(core.gateway_settings(), GatewaySettingsStore::default());
+        core.shutdown();
+        core.reduce_settings_notification(&notification);
+        assert_eq!(core.gateway_settings(), GatewaySettingsStore::default());
+        assert!(core.snapshot(&ClientScope::Settings).is_none());
+    }
+
+    #[test]
+    fn delayed_settings_response_preserves_newer_voice_ingress_in_both_owner_and_result() {
+        let core = ClientCore::new();
+        let request = core.request_gateway_settings().unwrap();
+        let voice = pioneer_protocol::GatewayVoiceInputSettings {
+            enabled: true,
+            ..Default::default()
+        };
+        core.reduce_settings_notification(
+            &pioneer_protocol::GatewayNotification::GatewayVoiceInputStatusChanged(
+                pioneer_protocol::GatewayVoiceInputStatusChangedNotification {
+                    settings: voice.clone(),
+                },
+            ),
+        );
+        let mut response = Ok(snapshot(false));
+        assert!(core.finish_gateway_settings(request, &mut response));
+        assert_eq!(response.unwrap().voice_input, voice);
+        assert_eq!(core.gateway_settings().settings.unwrap().voice_input, voice);
+    }
+
+    #[test]
+    fn terminal_refill_during_a_settings_request_keeps_one_followup_refresh_pending() {
+        let core = ClientCore::new();
+        select_workspace(&core, Some("synthetic-workspace"));
+        let initial = core.request_gateway_settings().unwrap();
+        assert!(core.finish_gateway_settings(initial, &mut Ok(snapshot(false))));
+        let pending = core.request_gateway_settings().unwrap();
+        core.reduce_settings_notification(
+            &pioneer_protocol::GatewayNotification::GatewayThreadEpisodicVectorRefillStatusChanged(
+                pioneer_protocol::GatewayThreadEpisodicVectorRefillStatusChangedNotification {
+                    workspace_id: "synthetic-workspace".into(),
+                    status: pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Complete,
+                    local_model_status: None,
+                    downloaded_bytes: None,
+                    total_bytes: None,
+                },
+            ),
+        );
+        assert!(core.gateway_settings().vector_refill_refresh_requested);
+        assert!(core.finish_gateway_settings(pending, &mut Ok(snapshot(false))));
+        assert!(core.gateway_settings().vector_refill_refresh_requested);
+        let followup = core.request_gateway_settings().unwrap();
+        assert!(!core.gateway_settings().vector_refill_refresh_requested);
+        assert!(core.finish_gateway_settings(followup, &mut Ok(snapshot(false))));
+        assert!(!core.gateway_settings().vector_refill_refresh_requested);
+    }
+
+    #[test]
+    fn foreign_refill_cannot_change_loaded_settings_generations_refresh_or_publications() {
+        let core = crate::catalog_test_support::settings_model_picker_client();
+        let initial = core.request_gateway_settings().unwrap();
+        let mut pioneer = snapshot_with_refill(
+            pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Running,
+        );
+        pioneer.thread_episodic.vector_search.local_model_status =
+            pioneer_protocol::GatewayThreadEpisodicVectorLocalModelStatus::Downloading;
+        pioneer.thread_episodic.vector_search.downloaded_bytes = Some(128);
+        pioneer.thread_episodic.vector_search.total_bytes = Some(512);
+        assert!(core.finish_gateway_settings(initial, &mut Ok(pioneer)));
+
+        let before = core.gateway_settings();
+        let generations = settings_notification_generations(&core);
+        let revision = settings_revision(&core);
+        let page_revision =
+            settings_page_revision(&core, crate::settings::runtime::SettingsPage::Memory);
+        core.reduce_settings_notification(&refill_notification(
+            "personal",
+            pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Failed,
+            Some(pioneer_protocol::GatewayThreadEpisodicVectorLocalModelStatus::Failed),
+            Some(999),
+            Some(1000),
+        ));
+
+        assert_eq!(core.gateway_settings(), before);
+        assert_eq!(settings_notification_generations(&core), generations);
+        assert_eq!(settings_revision(&core), revision);
+        assert_eq!(
+            settings_page_revision(&core, crate::settings::runtime::SettingsPage::Memory),
+            page_revision
+        );
+    }
+
+    #[test]
+    fn own_refill_progress_and_terminal_statuses_keep_the_refresh_lifecycle() {
+        let core = crate::catalog_test_support::settings_model_picker_client();
+        let initial = core.request_gateway_settings().unwrap();
+        assert!(core.finish_gateway_settings(
+            initial,
+            &mut Ok(snapshot_with_refill(
+                pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Required,
+            )),
+        ));
+
+        core.reduce_settings_notification(&refill_notification(
+            "workspace",
+            pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Running,
+            Some(pioneer_protocol::GatewayThreadEpisodicVectorLocalModelStatus::Downloading),
+            Some(256),
+            Some(1024),
+        ));
+        let running = core.gateway_settings();
+        let vector = &running.settings.unwrap().thread_episodic.vector_search;
+        assert_eq!(
+            vector.refill_status,
+            pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Running
+        );
+        assert_eq!(vector.downloaded_bytes, Some(256));
+        assert_eq!(vector.total_bytes, Some(1024));
+        assert!(!running.vector_refill_refresh_requested);
+
+        core.reduce_settings_notification(&refill_notification(
+            "workspace",
+            pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Complete,
+            None,
+            None,
+            None,
+        ));
+        assert!(core.gateway_settings().vector_refill_refresh_requested);
+        let refresh = core.request_gateway_settings().unwrap();
+        assert!(!core.gateway_settings().vector_refill_refresh_requested);
+        assert!(core.finish_gateway_settings(
+            refresh,
+            &mut Ok(snapshot_with_refill(
+                pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Complete,
+            )),
+        ));
+
+        core.reduce_settings_notification(&refill_notification(
+            "workspace",
+            pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Failed,
+            None,
+            None,
+            None,
+        ));
+        assert!(core.gateway_settings().vector_refill_refresh_requested);
+    }
+
+    #[test]
+    fn foreign_refill_during_request_cannot_override_the_http_response() {
+        let core = ClientCore::new();
+        select_workspace(&core, Some("pioneer"));
+        let initial = core.request_gateway_settings().unwrap();
+        assert!(core.finish_gateway_settings(
+            initial,
+            &mut Ok(snapshot_with_refill(
+                pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Running,
+            )),
+        ));
+        let request = core.request_gateway_settings().unwrap();
+        let generations = settings_notification_generations(&core);
+        core.reduce_settings_notification(&refill_notification(
+            "personal",
+            pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Failed,
+            Some(pioneer_protocol::GatewayThreadEpisodicVectorLocalModelStatus::Failed),
+            None,
+            None,
+        ));
+        let mut response = Ok(snapshot_with_refill(
+            pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Required,
+        ));
+        assert!(core.finish_gateway_settings(request, &mut response));
+
+        assert_eq!(settings_notification_generations(&core), generations);
+        assert_eq!(
+            response
+                .unwrap()
+                .thread_episodic
+                .vector_search
+                .refill_status,
+            pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Required
+        );
+        assert_eq!(
+            core.gateway_settings()
+                .settings
+                .unwrap()
+                .thread_episodic
+                .vector_search
+                .refill_status,
+            pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Required
+        );
+    }
+
+    #[test]
+    fn own_refill_during_request_survives_a_delayed_http_response() {
+        let core = ClientCore::new();
+        select_workspace(&core, Some("pioneer"));
+        let request = core.request_gateway_settings().unwrap();
+        core.reduce_settings_notification(&refill_notification(
+            "pioneer",
+            pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Running,
+            Some(pioneer_protocol::GatewayThreadEpisodicVectorLocalModelStatus::Downloading),
+            Some(384),
+            Some(2048),
+        ));
+        let mut response = Ok(snapshot_with_refill(
+            pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Required,
+        ));
+        assert!(core.finish_gateway_settings(request, &mut response));
+
+        let response = response.unwrap().thread_episodic.vector_search;
+        assert_eq!(
+            response.refill_status,
+            pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Running
+        );
+        assert_eq!(response.downloaded_bytes, Some(384));
+        assert_eq!(response.total_bytes, Some(2048));
+        assert_eq!(
+            core.gateway_settings()
+                .settings
+                .unwrap()
+                .thread_episodic
+                .vector_search,
+            response
+        );
+    }
+
+    #[test]
+    fn workspace_switch_keeps_old_snapshot_isolated_until_new_settings_finish() {
+        let core = ClientCore::new();
+        select_workspace(&core, Some("workspace-a"));
+        let initial = core.request_gateway_settings().unwrap();
+        assert!(core.finish_gateway_settings(
+            initial,
+            &mut Ok(snapshot_with_refill(
+                pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Complete,
+            )),
+        ));
+        select_workspace(&core, Some("workspace-b"));
+        let request = core.request_gateway_settings().unwrap();
+        let generations = settings_notification_generations(&core);
+        let request_revision = settings_revision(&core);
+
+        core.reduce_settings_notification(&refill_notification(
+            "workspace-a",
+            pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Failed,
+            None,
+            None,
+            None,
+        ));
+        assert_eq!(settings_notification_generations(&core), generations);
+        core.reduce_settings_notification(&refill_notification(
+            "workspace-b",
+            pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Running,
+            Some(pioneer_protocol::GatewayThreadEpisodicVectorLocalModelStatus::Downloading),
+            Some(64),
+            Some(128),
+        ));
+        assert_eq!(
+            settings_notification_generations(&core)[1],
+            generations[1] + 1
+        );
+        assert_eq!(settings_revision(&core), request_revision);
+        let during_request = core.gateway_settings();
+        assert_eq!(during_request.workspace_id.as_deref(), Some("workspace-a"));
+        assert_eq!(
+            during_request
+                .settings
+                .unwrap()
+                .thread_episodic
+                .vector_search
+                .refill_status,
+            pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Complete
+        );
+
+        assert!(core.finish_gateway_settings(
+            request,
+            &mut Ok(snapshot_with_refill(
+                pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Required,
+            )),
+        ));
+        let workspace_b = core.gateway_settings();
+        assert_eq!(workspace_b.workspace_id.as_deref(), Some("workspace-b"));
+        let vector = &workspace_b.settings.unwrap().thread_episodic.vector_search;
+        assert_eq!(
+            vector.refill_status,
+            pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Running
+        );
+        assert_eq!(vector.downloaded_bytes, Some(64));
+    }
+
+    #[test]
+    fn refill_requires_a_selected_workspace_and_a_loaded_or_pending_scope() {
+        let core = ClientCore::new();
+        core.reduce_settings_notification(&refill_notification(
+            "workspace-a",
+            pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Running,
+            None,
+            None,
+            None,
+        ));
+        assert_eq!(core.gateway_settings(), GatewaySettingsStore::default());
+        assert!(core.snapshot(&ClientScope::Settings).is_none());
+
+        select_workspace(&core, Some("workspace-a"));
+        core.reduce_settings_notification(&refill_notification(
+            "workspace-a",
+            pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Running,
+            None,
+            None,
+            None,
+        ));
+        assert_eq!(core.gateway_settings(), GatewaySettingsStore::default());
+        assert!(core.snapshot(&ClientScope::Settings).is_none());
+
+        let request = core.request_gateway_settings().unwrap();
+        core.reduce_settings_notification(&refill_notification(
+            "workspace-b",
+            pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Failed,
+            None,
+            None,
+            None,
+        ));
+        core.reduce_settings_notification(&refill_notification(
+            "workspace-a",
+            pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Running,
+            Some(pioneer_protocol::GatewayThreadEpisodicVectorLocalModelStatus::Downloading),
+            Some(32),
+            Some(96),
+        ));
+        assert!(core.finish_gateway_settings(
+            request,
+            &mut Ok(snapshot_with_refill(
+                pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Required,
+            )),
+        ));
+        let loaded = core.gateway_settings();
+        assert_eq!(loaded.workspace_id.as_deref(), Some("workspace-a"));
+        assert_eq!(
+            loaded
+                .settings
+                .unwrap()
+                .thread_episodic
+                .vector_search
+                .refill_status,
+            pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Running
+        );
+    }
+
+    #[test]
+    fn stale_connection_and_stopped_state_still_reject_refill_ingress() {
+        let core = ClientCore::new();
+        select_workspace(&core, Some("workspace"));
+        let initial = core.request_gateway_settings().unwrap();
+        assert!(core.finish_gateway_settings(
+            initial,
+            &mut Ok(snapshot_with_refill(
+                pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Required,
+            )),
+        ));
+        let before = core.gateway_settings();
+        core.observe_gateway_settings(&crate::transport::ws::GatewayWsEvent::Notification {
+            connection_id: 17,
+            notification: refill_notification(
+                "workspace",
+                pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Running,
+                None,
+                None,
+                None,
+            ),
+        });
+        assert_eq!(core.gateway_settings(), before);
+
+        core.shutdown();
+        core.reduce_settings_notification(&refill_notification(
+            "workspace",
+            pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Running,
+            None,
+            None,
+            None,
+        ));
+        assert_eq!(core.gateway_settings(), GatewaySettingsStore::default());
+    }
+
+    #[test]
+    fn queued_progress_events_reduce_in_order_before_a_terminal_response() {
+        for terminal in [
+            pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Complete,
+            pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Failed,
+        ] {
+            let core = ClientCore::new();
+            select_workspace(&core, Some("workspace"));
+            let request = core.request_gateway_settings().unwrap();
+            for downloaded_bytes in [16, 64] {
+                core.reduce_settings_notification(&refill_notification(
+                    "workspace",
+                    pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Running,
+                    Some(
+                        pioneer_protocol::GatewayThreadEpisodicVectorLocalModelStatus::Downloading,
+                    ),
+                    Some(downloaded_bytes),
+                    Some(128),
+                ));
+            }
+            core.reduce_settings_notification(&refill_notification(
+                "workspace",
+                terminal,
+                None,
+                None,
+                None,
+            ));
+
+            let mut response = Ok(snapshot_with_refill(
+                pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Required,
+            ));
+            assert!(core.finish_gateway_settings(request, &mut response));
+            let vector = response.unwrap().thread_episodic.vector_search;
+            assert_eq!(vector.refill_status, terminal);
+            assert_eq!(vector.downloaded_bytes, None);
+            assert_eq!(vector.total_bytes, None);
+        }
+    }
+
+    #[test]
+    fn authorization_reset_discards_queued_refill_events() {
+        let core = ClientCore::new();
+        select_workspace(&core, Some("workspace"));
+        let stale = core.request_gateway_settings().unwrap();
+        core.reduce_settings_notification(&refill_notification(
+            "workspace",
+            pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Running,
+            Some(pioneer_protocol::GatewayThreadEpisodicVectorLocalModelStatus::Downloading),
+            Some(48),
+            Some(128),
+        ));
+        core.invalidate_authorization_revision(1);
+        assert!(
+            core.identity_authorization
+                .lock()
+                .expect("identity owner poisoned")
+                .settings_request_vector_refill_notifications
+                .is_empty()
+        );
+        assert!(!core.finish_gateway_settings(
+            stale,
+            &mut Ok(snapshot_with_refill(
+                pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Required,
+            )),
+        ));
+
+        let current = core.request_gateway_settings().unwrap();
+        assert!(core.finish_gateway_settings(
+            current,
+            &mut Ok(snapshot_with_refill(
+                pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Required,
+            )),
+        ));
+        assert_eq!(
+            core.gateway_settings()
+                .settings
+                .unwrap()
+                .thread_episodic
+                .vector_search
+                .refill_status,
+            pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Required
+        );
+    }
+
+    #[test]
+    fn replacement_request_keeps_only_its_own_refill_events() {
+        let core = ClientCore::new();
+        select_workspace(&core, Some("workspace"));
+        let stale = core.request_gateway_settings().unwrap();
+        core.reduce_settings_notification(&refill_notification(
+            "workspace",
+            pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Running,
+            Some(pioneer_protocol::GatewayThreadEpisodicVectorLocalModelStatus::Downloading),
+            Some(16),
+            Some(128),
+        ));
+
+        let current = core.request_gateway_settings().unwrap();
+        core.reduce_settings_notification(&refill_notification(
+            "workspace",
+            pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Running,
+            Some(pioneer_protocol::GatewayThreadEpisodicVectorLocalModelStatus::Downloading),
+            Some(96),
+            Some(128),
+        ));
+        assert!(!core.finish_gateway_settings(
+            stale,
+            &mut Ok(snapshot_with_refill(
+                pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Failed,
+            )),
+        ));
+        let mut response = Ok(snapshot_with_refill(
+            pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Required,
+        ));
+        assert!(core.finish_gateway_settings(current, &mut response));
+        let vector = response.unwrap().thread_episodic.vector_search;
+        assert_eq!(
+            vector.refill_status,
+            pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Running
+        );
+        assert_eq!(vector.downloaded_bytes, Some(96));
+        assert_eq!(vector.total_bytes, Some(128));
+    }
+
+    #[test]
+    fn failed_request_discards_its_queued_refill_events() {
+        let core = ClientCore::new();
+        select_workspace(&core, Some("workspace"));
+        let failed = core.request_gateway_settings().unwrap();
+        core.reduce_settings_notification(&refill_notification(
+            "workspace",
+            pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Running,
+            Some(pioneer_protocol::GatewayThreadEpisodicVectorLocalModelStatus::Downloading),
+            Some(80),
+            Some(128),
+        ));
+        let mut failure: anyhow::Result<GatewaySettingsSnapshot> =
+            Err(anyhow::anyhow!("synthetic failure"));
+        assert!(core.finish_gateway_settings(failed, &mut failure));
+        assert!(
+            core.identity_authorization
+                .lock()
+                .expect("identity owner poisoned")
+                .settings_request_vector_refill_notifications
+                .is_empty()
+        );
+
+        let retry = core.request_gateway_settings().unwrap();
+        assert!(core.finish_gateway_settings(
+            retry,
+            &mut Ok(snapshot_with_refill(
+                pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Required,
+            )),
+        ));
+        assert_eq!(
+            core.gateway_settings()
+                .settings
+                .unwrap()
+                .thread_episodic
+                .vector_search
+                .refill_status,
+            pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Required
+        );
+    }
+
+    #[test]
+    fn settings_save_uses_the_same_refill_workspace_scope() {
+        let core = ClientCore::new();
+        select_workspace(&core, Some("workspace"));
+        let initial = core.request_gateway_settings().unwrap();
+        let loaded = snapshot_with_refill(
+            pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Required,
+        );
+        assert!(core.finish_gateway_settings(initial, &mut Ok(loaded.clone())));
+
+        let save = core
+            .prepare_gateway_settings_update(Some(loaded.clone()))
+            .unwrap();
+        let generations = settings_notification_generations(&core);
+        core.reduce_settings_notification(&refill_notification(
+            "other-workspace",
+            pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Failed,
+            None,
+            None,
+            None,
+        ));
+        assert_eq!(settings_notification_generations(&core), generations);
+        core.reduce_settings_notification(&refill_notification(
+            "workspace",
+            pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Running,
+            Some(pioneer_protocol::GatewayThreadEpisodicVectorLocalModelStatus::Downloading),
+            Some(40),
+            Some(160),
+        ));
+        let mut response = Ok(loaded);
+        assert!(core.finish_gateway_settings(save, &mut response));
+        let vector = response.unwrap().thread_episodic.vector_search;
+        assert_eq!(
+            vector.refill_status,
+            pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Running
+        );
+        assert_eq!(vector.downloaded_bytes, Some(40));
+        assert_eq!(vector.total_bytes, Some(160));
+    }
+
+    #[test]
+    fn remote_access_notification_remains_global_without_a_workspace() {
+        let core = ClientCore::new();
+        let initial = core.request_gateway_settings().unwrap();
+        assert!(core.finish_gateway_settings(initial, &mut Ok(snapshot(false))));
+        let generations = settings_notification_generations(&core);
+        core.reduce_settings_notification(
+            &pioneer_protocol::GatewayNotification::GatewayRemoteAccessStatusChanged(
+                pioneer_protocol::GatewayRemoteAccessStatusChangedNotification {
+                    status: pioneer_protocol::GatewayRemoteAccessStatusSnapshot {
+                        state: pioneer_protocol::GatewayRemoteAccessState::Connected,
+                        error_kind: None,
+                        message: None,
+                        updated_at_unix: Some(1),
+                    },
+                },
+            ),
+        );
+
+        assert_eq!(
+            settings_notification_generations(&core)[0],
+            generations[0] + 1
+        );
+        assert_eq!(
+            core.gateway_settings()
+                .settings
+                .unwrap()
+                .remote_access
+                .status
+                .state,
+            pioneer_protocol::GatewayRemoteAccessState::Connected
+        );
+    }
+
+    #[test]
+    fn superseded_load_cannot_overwrite_an_optimistic_update_or_its_authoritative_result() {
+        let core = ClientCore::new();
+        let load = core.request_gateway_settings().unwrap();
+        let save = core
+            .prepare_gateway_settings_update(Some(snapshot(true)))
+            .unwrap();
+        assert!(!core.finish_gateway_settings(load, &mut Ok(snapshot(false))));
+        assert!(core.gateway_settings().settings.unwrap().general.keepawake);
+        assert!(core.finish_gateway_settings(save, &mut Ok(snapshot(true))));
+        let before = core.snapshot(&ClientScope::Settings).unwrap();
+        assert!(!core.finish_gateway_settings(save, &mut Ok(snapshot(true))));
+        assert!(std::sync::Arc::ptr_eq(
+            &before.snapshot(),
+            &core.snapshot(&ClientScope::Settings).unwrap().snapshot()
+        ));
+        assert!(!core.gateway_settings().saving);
+    }
+
+    #[test]
+    fn authorization_fence_clears_loading_and_rejects_late_settings_failure() {
+        let core = ClientCore::new();
+        let request = core.request_gateway_settings().unwrap();
+        assert!(core.gateway_settings().loading);
+        core.invalidate_authorization_revision(3);
+        assert_eq!(core.gateway_settings(), GatewaySettingsStore::default());
+        assert!(
+            !core.finish_gateway_settings(request, &mut Err(anyhow::anyhow!("synthetic failure")))
+        );
+        let publication = core
+            .snapshot(&ClientScope::Settings)
+            .unwrap()
+            .typed::<GatewaySettingsStore>()
+            .unwrap();
+        assert_eq!(
+            publication.payload().as_ref(),
+            &GatewaySettingsStore::default()
+        );
+    }
+}
+
+pub fn apply_vector_refill_notification(
+    vector_search: &mut pioneer_protocol::GatewayThreadEpisodicVectorSearchSettings,
+    notification: &pioneer_protocol::GatewayThreadEpisodicVectorRefillStatusChangedNotification,
+) -> bool {
+    vector_search.refill_status = notification.status;
+    if let Some(local_model_status) = notification.local_model_status {
+        vector_search.local_model_status = local_model_status;
+        if local_model_status
+            == pioneer_protocol::GatewayThreadEpisodicVectorLocalModelStatus::Downloading
+        {
+            vector_search.downloaded_bytes = notification.downloaded_bytes;
+            vector_search.total_bytes = notification.total_bytes;
+        } else {
+            vector_search.downloaded_bytes = None;
+            vector_search.total_bytes = None;
+        }
+    } else if notification.status
+        == pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Running
+        && vector_search.provider
+            == Some(pioneer_protocol::GatewayThreadEpisodicVectorProvider::Local)
+        && vector_search.local_model_status
+            != pioneer_protocol::GatewayThreadEpisodicVectorLocalModelStatus::Installed
+    {
+        vector_search.local_model_status =
+            pioneer_protocol::GatewayThreadEpisodicVectorLocalModelStatus::Downloading;
+    }
+
+    let terminal = vector_refill_notification_is_terminal(notification);
+    if terminal {
+        vector_search.downloaded_bytes = None;
+        vector_search.total_bytes = None;
+    }
+    terminal
+}
+
+fn vector_refill_notification_is_terminal(
+    notification: &pioneer_protocol::GatewayThreadEpisodicVectorRefillStatusChangedNotification,
+) -> bool {
+    matches!(
+        notification.status,
+        pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Complete
+            | pioneer_protocol::GatewayThreadEpisodicVectorRefillStatus::Failed
+    )
+}

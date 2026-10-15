@@ -1,0 +1,37 @@
+{
+  "content": [
+    {
+      "type": "thinking",
+      "thinking": "first",
+      "signature": "signed-1"
+    },
+    {
+      "type": "text",
+      "text": "before",
+      "citations": []
+    },
+    {
+      "type": "tool_use",
+      "id": "a",
+      "name": "first",
+      "input": {}
+    },
+    {
+      "type": "redacted_thinking",
+      "data": "opaque-redacted"
+    },
+    {
+      "type": "text",
+      "text": "between"
+    },
+    {
+      "type": "tool_use",
+      "id": "b",
+      "name": "second",
+      "input": {
+        "x": 2
+      }
+    }
+  ],
+  "stop_reason": "tool_use"
+}

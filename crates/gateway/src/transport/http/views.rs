@@ -2,8 +2,10 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::body::{Body, Bytes};
 use axum::extract::{ConnectInfo, OriginalUri, Path, State};
-use axum::http::{HeaderMap, Method};
+use axum::http::header::{CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_TYPE, RANGE};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::response::Response;
 use pioneer_artifacts::ArtifactError;
 use pioneer_protocol::RequestId;
@@ -18,7 +20,17 @@ use super::content::{ContentResponsePolicy, serve_authorized_content};
 use super::errors::{HttpError, HttpErrorKind};
 use super::state::GatewayHttpState;
 use crate::artifact_delivery::{ArtifactDeliveryError, ArtifactDeliveryService};
-use crate::view_grants::{ViewGrantError, ViewGrantLease};
+use crate::thread_file_delivery::{ThreadFileDeliveryError, ThreadFileDeliveryService};
+use crate::view_grants::{
+    ArtifactViewGrantScope, ThreadFileViewGrantScope, ViewGrantError, ViewGrantLease,
+    ViewGrantSubject,
+};
+
+const REQUEST_ID_HEADER: HeaderName = HeaderName::from_static("pioneer-request-id");
+const X_CONTENT_TYPE_OPTIONS: HeaderName = HeaderName::from_static("x-content-type-options");
+const CONTENT_SECURITY_POLICY: HeaderName = HeaderName::from_static("content-security-policy");
+const REFERRER_POLICY: HeaderName = HeaderName::from_static("referrer-policy");
+const THREAD_FILE_BODY_CHUNK_BYTES: usize = 64 * 1024;
 
 #[derive(Deserialize)]
 pub(super) struct ViewGrantPath {
@@ -114,18 +126,37 @@ pub(super) async fn view_grant_route(
         ),
         CanonicalMethod::binary("storage/view"),
     );
+    match lease.grant.scope.subject.clone() {
+        ViewGrantSubject::Artifact(scope) => {
+            serve_artifact_view(state, context, request_id, method, headers, lease, scope).await
+        }
+        ViewGrantSubject::ThreadFile(scope) => {
+            serve_thread_file_view(state, context, request_id, method, headers, lease, scope).await
+        }
+    }
+}
+
+async fn serve_artifact_view(
+    state: GatewayHttpState,
+    context: AuthenticatedRequestContext,
+    request_id: RequestId,
+    method: Method,
+    headers: HeaderMap,
+    lease: ViewGrantLease,
+    scope: ArtifactViewGrantScope,
+) -> Result<Response, HttpError> {
     let service = ArtifactDeliveryService::new(state.message_processor.clone());
     let content_result = tokio::time::timeout(
         state.http_streams.limits().open_timeout(),
         async {
-            match lease.grant.scope.projection_kind {
+            match scope.projection_kind {
                 Some(projection_kind) => {
                     service
                         .authorize_exact_projection(
                             &context,
-                            lease.grant.scope.workspace_id.as_str(),
-                            lease.grant.scope.artifact_id.as_str(),
-                            lease.grant.scope.version_id.as_str(),
+                            scope.workspace_id.as_str(),
+                            scope.artifact_id.as_str(),
+                            scope.version_id.as_str(),
                             projection_kind,
                         )
                         .await
@@ -134,9 +165,9 @@ pub(super) async fn view_grant_route(
                     service
                         .authorize_exact_content(
                             &context,
-                            lease.grant.scope.workspace_id.as_str(),
-                            lease.grant.scope.artifact_id.as_str(),
-                            lease.grant.scope.version_id.as_str(),
+                            scope.workspace_id.as_str(),
+                            scope.artifact_id.as_str(),
+                            scope.version_id.as_str(),
                         )
                         .await
                 }
@@ -151,7 +182,7 @@ pub(super) async fn view_grant_route(
         map_view_content_error(error, request_id.clone())
     })?;
     validate_bound_snapshot(
-        &lease,
+        &scope,
         content.snapshot().sha256(),
         content.snapshot().workspace_id(),
         content.snapshot().artifact_id(),
@@ -180,6 +211,80 @@ pub(super) async fn view_grant_route(
     .await
 }
 
+async fn serve_thread_file_view(
+    state: GatewayHttpState,
+    context: AuthenticatedRequestContext,
+    request_id: RequestId,
+    method: Method,
+    headers: HeaderMap,
+    lease: ViewGrantLease,
+    scope: ThreadFileViewGrantScope,
+) -> Result<Response, HttpError> {
+    if headers.contains_key(RANGE) {
+        return Err(HttpError::new(
+            HttpErrorKind::RangeNotSatisfiable {
+                complete_length: scope.size_bytes,
+            },
+            request_id,
+        ));
+    }
+    let service = ThreadFileDeliveryService::new(state.message_processor.clone());
+    let content = tokio::time::timeout(
+        state.http_streams.limits().open_timeout(),
+        service.authorize_and_read(&context, &scope),
+    )
+    .await
+    .map_err(|_| HttpError::service_unavailable(request_id.clone()))?
+    .map_err(|error| map_thread_file_error(error, request_id.clone()))?;
+    if lease.invalidated() {
+        return Err(HttpError::not_found(request_id));
+    }
+
+    let length = content.bytes.len() as u64;
+    let body = if method == Method::GET && !content.bytes.is_empty() {
+        thread_file_body(content.bytes, lease)
+    } else {
+        Body::empty()
+    };
+    let mut response = Response::builder()
+        .status(StatusCode::OK)
+        .body(body)
+        .map_err(|_| HttpError::new(HttpErrorKind::Internal, request_id.clone()))?;
+    let response_headers = response.headers_mut();
+    insert_view_header(
+        response_headers,
+        CONTENT_LENGTH,
+        length.to_string().as_str(),
+        &request_id,
+    )?;
+    insert_view_header(
+        response_headers,
+        CONTENT_TYPE,
+        content.content_type.as_str(),
+        &request_id,
+    )?;
+    insert_view_header(
+        response_headers,
+        CONTENT_DISPOSITION,
+        safe_inline_disposition(content.file_name.as_str()).as_str(),
+        &request_id,
+    )?;
+    response_headers.insert(CACHE_CONTROL, HeaderValue::from_static("private, no-store"));
+    response_headers.insert(X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+    response_headers.insert(
+        CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static("sandbox; default-src 'none'"),
+    );
+    response_headers.insert(REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
+    insert_view_header(
+        response_headers,
+        REQUEST_ID_HEADER,
+        request_id.as_str(),
+        &request_id,
+    )?;
+    Ok(response)
+}
+
 fn record_view_grant_route_rejection(request_id: &RequestId, reason_code: &'static str) {
     tracing::debug!(
         event = "view_grant_lifecycle",
@@ -190,7 +295,7 @@ fn record_view_grant_route_rejection(request_id: &RequestId, reason_code: &'stat
 }
 
 fn validate_bound_snapshot(
-    lease: &ViewGrantLease,
+    scope: &ArtifactViewGrantScope,
     sha256: &str,
     workspace_id: &str,
     artifact_id: &str,
@@ -198,13 +303,84 @@ fn validate_bound_snapshot(
 ) -> Result<(), ()> {
     let mut actual_sha256 = [0_u8; 32];
     if hex::decode_to_slice(sha256, &mut actual_sha256).is_err()
-        || actual_sha256 != lease.grant.scope.artifact_sha256
-        || workspace_id != lease.grant.scope.workspace_id
-        || artifact_id != lease.grant.scope.artifact_id
-        || version_id != lease.grant.scope.version_id
+        || actual_sha256 != scope.artifact_sha256
+        || workspace_id != scope.workspace_id
+        || artifact_id != scope.artifact_id
+        || version_id != scope.version_id
     {
         return Err(());
     }
+    Ok(())
+}
+
+fn map_thread_file_error(error: ThreadFileDeliveryError, request_id: RequestId) -> HttpError {
+    match error {
+        ThreadFileDeliveryError::Denied
+        | ThreadFileDeliveryError::InvalidReference
+        | ThreadFileDeliveryError::OutsideWorkspace
+        | ThreadFileDeliveryError::NotFound
+        | ThreadFileDeliveryError::NotText
+        | ThreadFileDeliveryError::TooLarge => HttpError::not_found(request_id),
+        ThreadFileDeliveryError::AuthorizationUnavailable
+        | ThreadFileDeliveryError::Unavailable => HttpError::service_unavailable(request_id),
+    }
+}
+
+fn thread_file_body(bytes: Vec<u8>, lease: ViewGrantLease) -> Body {
+    struct State {
+        bytes: Bytes,
+        offset: usize,
+        lease: ViewGrantLease,
+    }
+
+    let stream = futures_util::stream::unfold(
+        State {
+            bytes: Bytes::from(bytes),
+            offset: 0,
+            lease,
+        },
+        |mut state| async move {
+            if state.lease.invalidated() || state.offset >= state.bytes.len() {
+                return None;
+            }
+            let end = state
+                .offset
+                .saturating_add(THREAD_FILE_BODY_CHUNK_BYTES)
+                .min(state.bytes.len());
+            let chunk = state.bytes.slice(state.offset..end);
+            state.offset = end;
+            Some((Ok::<Bytes, std::io::Error>(chunk), state))
+        },
+    );
+    Body::from_stream(stream)
+}
+
+fn safe_inline_disposition(file_name: &str) -> String {
+    let fallback = file_name
+        .chars()
+        .take(180)
+        .map(|character| {
+            if character.is_ascii_alphanumeric()
+                || matches!(character, ' ' | '.' | '_' | '-' | '(' | ')')
+            {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    format!("inline; filename=\"{fallback}\"")
+}
+
+fn insert_view_header(
+    headers: &mut HeaderMap,
+    name: HeaderName,
+    value: &str,
+    request_id: &RequestId,
+) -> Result<(), HttpError> {
+    let value = HeaderValue::from_str(value)
+        .map_err(|_| HttpError::new(HttpErrorKind::Internal, request_id.clone()))?;
+    headers.insert(name, value);
     Ok(())
 }
 

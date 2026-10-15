@@ -8,6 +8,8 @@ authors.workspace = true
 [features]
 default = []
 schema = ["dep:schemars"]
+test-support = []
+qualification-diagnostics = ["pioneer-observability/qualification-diagnostics"]
 
 [[bin]]
 name = "schema"
@@ -23,11 +25,12 @@ hex.workspace = true
 libc.workspace = true
 mime_guess.workspace = true
 pioneer-protocol.workspace = true
+pioneer-observability.workspace = true
 pioneer-skills.workspace = true
 qrcode.workspace = true
 reqwest.workspace = true
 schemars = { workspace = true, optional = true }
-serde.workspace = true
+serde = { workspace = true, features = ["rc"] }
 serde_json.workspace = true
 sha2.workspace = true
 shell-words.workspace = true
@@ -50,6 +53,7 @@ tempfile.workspace = true
 [package.metadata.pioneer-client]
 forbidden-dependencies = [
   "gpui",
+  "gpui-kit",
   "gpui-component",
   "terminal",
   "pioneer-gateway",

@@ -12,6 +12,7 @@ hex.workspace = true
 libc.workspace = true
 process-wrap.workspace = true
 pioneer-protocol.workspace = true
+pioneer-observability.workspace = true
 pioneer-runtime-events.workspace = true
 serde.workspace = true
 serde_json.workspace = true

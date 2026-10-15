@@ -20,6 +20,46 @@ fn task_authorization_unavailable(
     crate::authorization::AuthorizationExternalError::Unavailable.response(request_id)
 }
 
+// Shared Task completion also serves revision. Preserve its reporting ownership
+// before the generic RPC path can format the internal source chain.
+fn task_revision_error_response(
+    request_id: RequestId,
+    mut error: anyhow::Error,
+) -> JsonRpcErrorResponse {
+    if let Some(failure) = error.downcast_mut::<pioneer_tasks::TaskStartFailure>() {
+        // Completion supplies a public error; retain a safe fallback for typed
+        // preparation errors that reach this boundary before completion.
+        if failure.public_error().is_none() {
+            let mut public_error = crate::public_error::build_public_error(
+                pioneer_protocol::PublicErrorCode::Internal,
+                pioneer_protocol::PublicErrorStage::Admission,
+            );
+            if let Some(correlation) = &failure.descriptor().correlation_id {
+                public_error.correlation_id = correlation.clone();
+            }
+            let placeholder = pioneer_tasks::TaskStartFailure::new(
+                failure.descriptor().stage,
+                failure.descriptor().cause,
+            );
+            *failure = std::mem::replace(failure, placeholder).with_public_error(public_error);
+        }
+        failure.report_in_place();
+        return crate::public_error::rpc_error_from_public_error(
+            Some(request_id),
+            INVALID_REQUEST_CODE,
+            failure
+                .public_error()
+                .expect("checked public error")
+                .clone(),
+        );
+    }
+    task_public_error(
+        Some(request_id),
+        pioneer_protocol::PublicErrorStage::Persistence,
+        format!("failed to revise task result: {error:#}"),
+    )
+}
+
 fn task_public_error(
     request_id: Option<RequestId>,
     stage: pioneer_protocol::PublicErrorStage,
@@ -127,6 +167,18 @@ impl MessageProcessor {
             root_thread.model.as_str(),
             None,
         )?;
+        let contract = self
+            .crud_store
+            .get_task_actor_contract(task_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Agent Task actor contract is unavailable"))?;
+        let launch = contract
+            .launch
+            .ok_or_else(|| anyhow::anyhow!("Agent Task launch is unavailable"))?;
+        if !launch.execution.selected_capabilities.is_empty() {
+            request.capabilities =
+                super::agent_action_tools::task_launch_selection_capabilities(&launch.execution)?;
+        }
         request.capabilities = self
             .normalize_turn_skill_capabilities(
                 response.task.workspace_id.as_str(),
@@ -145,7 +197,7 @@ impl MessageProcessor {
                     .authority_fingerprint_for_workspace(
                         response.task.workspace_id.as_str(),
                         request.provider.as_str(),
-                    )
+                    )?
                     .as_str()
                     .to_owned(),
             );
@@ -288,12 +340,13 @@ impl MessageProcessor {
                 else {
                     self.send_error(
                         request_context.connection_id(),
-                        crate::public_error::agent_rpc_error(
+                        crate::public_error::expected_agent_rpc_error(
                             Some(request_id.clone()),
                             INVALID_PARAMS_CODE,
                             pioneer_protocol::PublicErrorCode::InvalidInput,
                             pioneer_protocol::PublicErrorStage::Admission,
-                            "thread delivery requires delivery_policy.thread_id",
+                            "task_create",
+                            "invalid_delivery_policy",
                         ),
                     )
                     .await;
@@ -494,28 +547,24 @@ impl MessageProcessor {
         )
     }
 
+    #[cfg(test)]
     pub(crate) async fn task_create_context_for_params(
         &self,
         params: &TaskCreateParams,
     ) -> anyhow::Result<pioneer_tasks::TaskCreateContext> {
+        self.task_create_context_for_destination(params, None, None)
+            .await
+    }
+
+    pub(crate) async fn task_create_context_for_destination(
+        &self,
+        params: &TaskCreateParams,
+        accepted_destination: Option<&str>,
+        principal: Option<&crate::auth::AuthenticatedSessionPrincipal>,
+    ) -> anyhow::Result<pioneer_tasks::TaskCreateContext> {
         if params.trigger.spec.kind() != pioneer_protocol::TaskTriggerKind::Immediate {
             return Ok(pioneer_tasks::TaskCreateContext::default());
         }
-        let attachment = params
-            .lifecycle_policy
-            .as_ref()
-            .map(|policy| policy.attachment)
-            .unwrap_or_else(|| {
-                if params.created_by_turn_id.is_some() {
-                    pioneer_protocol::TaskAttachmentMode::Attached
-                } else {
-                    pioneer_protocol::TaskAttachmentMode::Detached
-                }
-            });
-        if attachment != pioneer_protocol::TaskAttachmentMode::Detached {
-            return Ok(pioneer_tasks::TaskCreateContext::default());
-        }
-
         // Keep snapshot identity identical to the executor's restoration rule:
         // Composer work is sourced by its replayed launch turn, while ordinary
         // Tasks fall back to the turn that created them.
@@ -525,25 +574,22 @@ impl MessageProcessor {
             .and_then(|metadata| metadata.composer_work.as_ref())
             .map(|composer_work| composer_work.launch.turn_id.as_str())
             .or(params.created_by_turn_id.as_deref());
-        let Some(source_turn_id) = source_turn_id else {
-            // An immediate detached Task without a creator turn is frozen by
-            // the executor at run admission, where the run identity exists.
-            return Ok(pioneer_tasks::TaskCreateContext::default());
-        };
-        let conversation_thread_id = params
-            .created_by_thread_id
-            .clone()
+        let conversation_thread_id = accepted_destination
+            .map(str::to_owned)
+            .or_else(|| params.created_by_thread_id.clone())
             .or_else(|| {
                 (params.owner_kind == pioneer_protocol::TaskOwnerKind::Thread)
                     .then(|| params.owner_id.clone())
                     .flatten()
-            })
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "immediate detached Task `{}` has no conversation thread to snapshot",
-                    params.title
-                )
-            })?;
+            });
+        let Some(conversation_thread_id) = conversation_thread_id else {
+            anyhow::ensure!(
+                source_turn_id.is_none(),
+                "Task creator turn has no conversation thread"
+            );
+            // Workspace-owned Tasks acquire their execution root at admission.
+            return Ok(pioneer_tasks::TaskCreateContext::default());
+        };
         let thread = self
             .crud_store
             .get_thread_by_id(conversation_thread_id.as_str())
@@ -558,34 +604,50 @@ impl MessageProcessor {
                 "Task conversation thread `{conversation_thread_id}` belongs to another workspace"
             );
         }
-        let fallback_model = params
+        let composer = params
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.composer_work.as_ref());
+        let default_policy = crate::compaction::frozen::default_task_context_policy();
+        let policy = params
             .agent_spec
             .as_ref()
-            .and_then(|spec| spec.model.as_deref())
-            .unwrap_or(thread.model.as_str());
-        let fallback_model_provider = params
-            .agent_spec
-            .as_ref()
-            .and_then(|spec| spec.model_provider.as_deref())
-            .unwrap_or(thread.model_provider.as_str());
-        let history = self
-            .load_conversation_history_for_workspace_in_execution_excluding_turn(
+            .and_then(|spec| spec.context_policy.as_ref())
+            .unwrap_or(&default_policy);
+        let mut prepared_history = if let Some(principal) = principal {
+            self.capture_authorized_task_basis_prepared(
+                self.crud_store.as_ref(),
+                principal,
                 params.workspace_id.as_str(),
                 conversation_thread_id.as_str(),
+                source_turn_id,
+                composer.map(|work| work.launch.turn_id.as_str()),
+                composer.is_none().then_some(policy),
+            )
+            .await
+        } else {
+            // Unauthenticated fixture construction has no authority to adopt
+            // foreign Task output. Product callers supply their current actor.
+            crate::compaction::frozen::capture_execution_basis_prepared_with_outputs(
+                self.crud_store.as_ref(),
+                params.workspace_id.as_str(),
                 conversation_thread_id.as_str(),
                 source_turn_id,
-                Some(source_turn_id),
-                Some(fallback_model),
-                Some(fallback_model_provider),
+                composer.map(|work| work.launch.turn_id.as_str()),
+                composer.is_none().then_some(policy),
+                None,
             )
-            .await;
+            .await
+        }
+        .context("failed to freeze Task conversation sources")?;
 
+        let history_json = serde_json::to_string(&prepared_history.descriptor)?;
         Ok(pioneer_tasks::TaskCreateContext {
+            conversation_frozen_hold: prepared_history.frozen_hold.take().map(std::sync::Arc::new),
             conversation_snapshot: Some(pioneer_tasks::TaskRunConversationSnapshotSeed {
                 conversation_thread_id,
-                source_turn_id: Some(source_turn_id.to_owned()),
-                history_json: serde_json::to_string(&history)
-                    .context("failed to serialize detached Task conversation snapshot")?,
+                source_turn_id: source_turn_id.map(str::to_owned),
+                history_json,
             }),
             ..Default::default()
         })
@@ -654,12 +716,13 @@ impl MessageProcessor {
                     Ok(_) => {
                         self.send_error(
                             connection_id,
-                            crate::public_error::agent_rpc_error(
+                            crate::public_error::expected_agent_rpc_error(
                                 Some(request_id),
                                 INVALID_REQUEST_CODE,
                                 pioneer_protocol::PublicErrorCode::NotFound,
                                 pioneer_protocol::PublicErrorStage::Admission,
-                                "task creator turn does not belong to the authorized initiating thread",
+                                "task_create",
+                                "creator_turn_scope_mismatch",
                             ),
                         )
                         .await;
@@ -717,7 +780,7 @@ impl MessageProcessor {
             .map(|proof| proof.collaboration_root_thread_id())
             .or(current_thread_id);
         if let Some(policy) = params.delivery_policy.as_mut()
-            && let Err(error) = crate::task_delivery_policy::resolve_task_delivery_policy(
+            && let Err(_error) = crate::task_delivery_policy::resolve_task_delivery_policy(
                 policy,
                 crate::task_delivery_policy::TaskDeliveryThreadContext {
                     current_thread_id,
@@ -728,12 +791,13 @@ impl MessageProcessor {
         {
             self.send_error(
                 connection_id,
-                crate::public_error::agent_rpc_error(
+                crate::public_error::expected_agent_rpc_error(
                     Some(request_id),
                     INVALID_PARAMS_CODE,
                     pioneer_protocol::PublicErrorCode::InvalidInput,
                     pioneer_protocol::PublicErrorStage::Admission,
-                    error,
+                    "task_create",
+                    "invalid_delivery_policy",
                 ),
             )
             .await;
@@ -760,12 +824,13 @@ impl MessageProcessor {
             else {
                 self.send_error(
                     connection_id,
-                    crate::public_error::agent_rpc_error(
+                    crate::public_error::expected_agent_rpc_error(
                         Some(request_id),
                         INVALID_REQUEST_CODE,
                         pioneer_protocol::PublicErrorCode::InvalidInput,
                         pioneer_protocol::PublicErrorStage::Admission,
-                        "agent task requires an exact initiating thread",
+                        "task_create",
+                        "missing_initiating_thread",
                     ),
                 )
                 .await;
@@ -835,15 +900,16 @@ impl MessageProcessor {
                     None,
                 ) {
                     Ok(request) => request,
-                    Err(error) => {
+                    Err(_error) => {
                         self.send_error(
                             connection_id,
-                            crate::public_error::agent_rpc_error(
+                            crate::public_error::expected_agent_rpc_error(
                                 Some(request_id),
                                 INVALID_REQUEST_CODE,
                                 pioneer_protocol::PublicErrorCode::InvalidInput,
                                 pioneer_protocol::PublicErrorStage::Admission,
-                                format!("invalid task execution intent: {error}"),
+                                "task_create",
+                                "invalid_execution_intent",
                             ),
                         )
                         .await;
@@ -855,15 +921,31 @@ impl MessageProcessor {
                 Some(pioneer_protocol::AgentExecutionBackend::CLIAgentRuntime { .. })
                     | Some(pioneer_protocol::AgentExecutionBackend::ACPAgentRuntime { .. })
             ) {
-                execution_request.provider_authority_fingerprint = Some(
-                    self.provider_registry
-                        .authority_fingerprint_for_workspace(
-                            params.workspace_id.as_str(),
-                            execution_request.provider.as_str(),
+                let authority = match self.provider_registry.authority_fingerprint_for_workspace(
+                    params.workspace_id.as_str(),
+                    execution_request.provider.as_str(),
+                ) {
+                    Ok(authority) => authority,
+                    Err(error) => {
+                        tracing::warn!(
+                            error = %format!("{error:#}"),
+                            "provider authority resolution failed during task admission"
+                        );
+                        self.send_error(
+                            connection_id,
+                            task_authorization_unavailable(
+                                request_id,
+                                ResourceAction::TaskCreate,
+                                "execution_intent",
+                                "execution",
+                            ),
                         )
-                        .as_str()
-                        .to_owned(),
-                );
+                        .await;
+                        return;
+                    }
+                };
+                execution_request.provider_authority_fingerprint =
+                    Some(authority.as_str().to_owned());
             }
             let policy_revision = match self.authorization_invalidation_hub.current_revision().await
             {
@@ -1024,7 +1106,10 @@ impl MessageProcessor {
                     .expect("admitted Task role must have a Task resource budget"),
             });
         }
-        let mut context = match self.task_create_context_for_params(&params).await {
+        let mut context = match self
+            .task_create_context_for_destination(&params, None, Some(request_context.principal()))
+            .await
+        {
             Ok(context) => context,
             Err(error) => {
                 self.send_error(
@@ -1502,11 +1587,7 @@ impl MessageProcessor {
             Err(error) => {
                 self.send_error(
                     connection_id,
-                    task_public_error(
-                        Some(request_id),
-                        pioneer_protocol::PublicErrorStage::Persistence,
-                        format!("failed to revise task result: {error:#}"),
-                    ),
+                    task_revision_error_response(request_id, error),
                 )
                 .await;
             }
@@ -1950,5 +2031,83 @@ impl MessageProcessor {
                 );
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod task_revision_failure_tests {
+    use super::*;
+    use pioneer_tasks::{TaskStartCause, TaskStartFailure, TaskStartStage};
+
+    #[test]
+    fn revision_rpc_reports_unreported_typed_errors_once_and_keeps_projection() {
+        for (cause, code, expected_events) in [
+            (
+                TaskStartCause::Unclassified,
+                pioneer_protocol::PublicErrorCode::Internal,
+                1,
+            ),
+            (
+                TaskStartCause::Policy,
+                pioneer_protocol::PublicErrorCode::PolicyDenied,
+                0,
+            ),
+            (
+                TaskStartCause::Validation,
+                pioneer_protocol::PublicErrorCode::InvalidInput,
+                0,
+            ),
+        ] {
+            for already_reported in [false, true] {
+                let ((response, public), events) =
+                    crate::public_error::test_support::capture_events(|| {
+                        let public = crate::public_error::build_public_error(
+                            code,
+                            pioneer_protocol::PublicErrorStage::Admission,
+                        );
+                        let failure = TaskStartFailure::new(TaskStartStage::CliAdmission, cause)
+                            .with_public_error(public.clone());
+                        let failure = if already_reported {
+                            failure.report()
+                        } else {
+                            failure
+                        };
+                        let request_id = RequestId::new("R".repeat(21)).unwrap();
+                        let response = task_revision_error_response(
+                            request_id.clone(),
+                            anyhow::Error::new(failure).context("PRIVATE_REVISION_CONTEXT"),
+                        );
+                        assert_eq!(response.id, Some(request_id));
+                        (response, public)
+                    });
+                assert_eq!(events.len(), expected_events);
+                assert_eq!(response.error.message, public.message);
+                assert_eq!(
+                    response.error.data.unwrap()["public_error"],
+                    serde_json::to_value(&public).unwrap()
+                );
+                assert!(
+                    !serde_json::to_string(&events)
+                        .unwrap()
+                        .contains("PRIVATE_REVISION_CONTEXT")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn independent_revision_failure_retains_its_own_error_diagnostic() {
+        let (_, events) = crate::public_error::test_support::capture_events(|| {
+            task_revision_error_response(
+                RequestId::new("R".repeat(21)).unwrap(),
+                anyhow::anyhow!("independent revision persistence failure"),
+            );
+        });
+        assert_eq!(events.len(), 1);
+        assert!(
+            serde_json::to_string(&events)
+                .unwrap()
+                .contains("independent revision persistence failure")
+        );
     }
 }

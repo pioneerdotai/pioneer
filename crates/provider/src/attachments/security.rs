@@ -71,13 +71,23 @@ pub fn parse_and_validate_url(
     policy: &AttachmentSecurityPolicy,
 ) -> Result<Url> {
     if !policy.allow_url_sources {
-        let _ = enforce_or_dry_run(
+        enforce_or_dry_run(
             provider_name,
-            format!("url:{raw_url}").as_str(),
+            "url:[redacted]",
             "URL attachment sources are disabled by policy",
             policy,
             AttachmentPipelineError::url_source_blocked("url sources disabled"),
         )?;
+    }
+    if policy.url_allowed_domains.is_empty() {
+        return enforce_or_dry_run(
+            provider_name,
+            "url:[redacted]",
+            "URL attachment sources require a non-empty domain allowlist",
+            policy,
+            AttachmentPipelineError::url_source_blocked("URL domain allowlist is empty"),
+        )
+        .map(|_| Url::parse("https://invalid.invalid").expect("static URL"));
     }
 
     let parsed = Url::parse(raw_url)
@@ -91,11 +101,22 @@ pub fn validate_url(
     url: &Url,
     policy: &AttachmentSecurityPolicy,
 ) -> Result<()> {
+    if !url.username().is_empty() || url.password().is_some() {
+        return enforce_or_dry_run(
+            provider_name,
+            "url:[redacted]",
+            "URL userinfo is forbidden",
+            policy,
+            AttachmentPipelineError::url_source_blocked("URL userinfo is forbidden"),
+        )
+        .map(|_| ());
+    }
+
     let scheme = url.scheme().to_ascii_lowercase();
     if scheme != "https" && !(policy.allow_http && scheme == "http") {
         return enforce_or_dry_run(
             provider_name,
-            format!("url:{url}").as_str(),
+            safe_url_label(url).as_str(),
             format!("URL scheme `{scheme}` is not allowed").as_str(),
             policy,
             AttachmentPipelineError::url_source_blocked("scheme not allowed"),
@@ -111,6 +132,40 @@ pub fn validate_url(
     resolve_and_validate_host(provider_name, host, url.port_or_known_default(), policy)?;
 
     Ok(())
+}
+
+pub fn validate_redirect(
+    provider_name: &str,
+    previous: &Url,
+    next: &Url,
+    policy: &AttachmentSecurityPolicy,
+) -> Result<()> {
+    if previous.scheme().eq_ignore_ascii_case("https") && next.scheme().eq_ignore_ascii_case("http")
+    {
+        return enforce_or_dry_run(
+            provider_name,
+            "url:[redacted]",
+            "HTTPS to HTTP redirect downgrade is forbidden",
+            policy,
+            AttachmentPipelineError::url_redirect_blocked(
+                "HTTPS to HTTP redirect downgrade is forbidden",
+            ),
+        )
+        .map(|_| ());
+    }
+    validate_url(provider_name, next, policy)
+}
+
+pub fn safe_url_label(url: &Url) -> String {
+    format!("url:{}", safe_url_origin(url))
+}
+
+pub fn safe_url_origin(url: &Url) -> String {
+    let host = url.host_str().unwrap_or("invalid-host");
+    match url.port() {
+        Some(port) => format!("{}://{host}:{port}", url.scheme()),
+        None => format!("{}://{host}", url.scheme()),
+    }
 }
 
 pub fn validate_host_name(
@@ -173,6 +228,23 @@ pub fn resolve_and_validate_host_addresses(
     port: Option<u16>,
     policy: &AttachmentSecurityPolicy,
 ) -> Result<Vec<SocketAddr>> {
+    resolve_and_validate_host_addresses_with(provider_name, host, port, policy, |host, port| {
+        (host, port)
+            .to_socket_addrs()
+            .map(|addresses| addresses.collect())
+    })
+}
+
+fn resolve_and_validate_host_addresses_with<F>(
+    provider_name: &str,
+    host: &str,
+    port: Option<u16>,
+    policy: &AttachmentSecurityPolicy,
+    resolve: F,
+) -> Result<Vec<SocketAddr>>
+where
+    F: FnOnce(&str, u16) -> std::io::Result<Vec<SocketAddr>>,
+{
     let port = port.unwrap_or(443);
 
     if let Ok(ip) = host.parse::<IpAddr>() {
@@ -180,7 +252,7 @@ pub fn resolve_and_validate_host_addresses(
         return Ok(vec![SocketAddr::new(ip, port)]);
     }
 
-    let resolved = (host, port).to_socket_addrs().map_err(|error| {
+    let resolved = resolve(host, port).map_err(|error| {
         AttachmentPipelineError::url_source_blocked(format!("dns resolve failed: {error}"))
     })?;
 
@@ -245,9 +317,8 @@ fn enforce_or_dry_run(
     error: AttachmentPipelineError,
 ) -> Result<bool> {
     observability::emit_security_blocked(provider_name, source, reason, policy.dry_run);
-    if policy.dry_run {
-        return Ok(true);
-    }
+    // `dry_run` controls audit presentation only. A security decision must
+    // never turn into permission to perform the side effect it rejected.
     Err(error.into())
 }
 
@@ -295,11 +366,135 @@ mod tests {
     }
 
     #[test]
+    fn dry_run_never_authorizes_a_blocked_side_effect() {
+        let mut policy = AttachmentSecurityPolicy::default();
+        policy.dry_run = true;
+        let error = resolve_and_validate_host("test", "127.0.0.1", Some(80), &policy)
+            .expect_err("audit mode must remain fail closed");
+        assert!(error.to_string().contains("URL_SOURCE_BLOCKED"));
+    }
+
+    #[test]
+    fn url_sources_require_explicit_enablement_and_allowlist() {
+        let policy = AttachmentSecurityPolicy::default();
+        assert!(parse_and_validate_url("test", "https://example.com/a", &policy).is_err());
+
+        let mut enabled = policy;
+        enabled.allow_url_sources = true;
+        assert!(parse_and_validate_url("test", "https://example.com/a", &enabled).is_err());
+    }
+
+    #[test]
+    fn rejects_url_userinfo_without_exposing_it() {
+        let mut policy = AttachmentSecurityPolicy::default();
+        policy.allow_url_sources = true;
+        policy.url_allowed_domains = vec!["example.com".to_owned()];
+        let secret = "do-not-log-this";
+        let error = parse_and_validate_url(
+            "test",
+            format!("https://user:{secret}@example.com/a?token={secret}").as_str(),
+            &policy,
+        )
+        .expect_err("userinfo must be rejected");
+        assert!(!format!("{error:#}").contains(secret));
+    }
+
+    #[test]
+    fn rejects_https_to_http_redirect_even_when_http_is_enabled() {
+        let mut policy = AttachmentSecurityPolicy::default();
+        policy.allow_url_sources = true;
+        policy.allow_http = true;
+        policy.allow_private_network = true;
+        policy.url_allowed_domains = vec!["example.com".to_owned()];
+        let previous = Url::parse("https://example.com/a").unwrap();
+        let next = Url::parse("http://example.com/b").unwrap();
+        assert!(validate_redirect("test", &previous, &next, &policy).is_err());
+    }
+
+    #[test]
     fn allows_private_ip_when_policy_permits() {
         let mut policy = AttachmentSecurityPolicy::default();
         policy.allow_private_network = true;
         resolve_and_validate_host("test", "127.0.0.1", Some(80), &policy)
             .expect("private IP should be allowed");
+    }
+
+    #[test]
+    fn rejects_connected_peer_from_a_dns_rebinding_decision() {
+        let policy = AttachmentSecurityPolicy::default();
+        let pinned = [SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)),
+            80,
+        )];
+        let rebound_peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 80);
+
+        let error = validate_connected_peer("test", rebound_peer, &pinned, &policy)
+            .expect_err("a peer outside the pinned DNS result must fail closed");
+
+        assert!(error.to_string().contains("URL_SOURCE_BLOCKED"));
+        assert!(error.to_string().contains("private IP blocked"));
+    }
+
+    #[test]
+    fn rejects_public_peer_that_does_not_match_the_pinned_dns_address() {
+        let mut policy = AttachmentSecurityPolicy::default();
+        policy.allow_private_network = true;
+        let pinned = [SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)),
+            443,
+        )];
+        let different_peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 9)), 443);
+
+        let error = validate_connected_peer("test", different_peer, &pinned, &policy)
+            .expect_err("a connected peer must match the pinned DNS result");
+
+        assert!(
+            error
+                .to_string()
+                .contains("connected peer does not match the pinned DNS decision")
+        );
+    }
+
+    #[test]
+    fn controlled_dns_mixed_public_private_answer_fails_closed() {
+        let policy = AttachmentSecurityPolicy::default();
+        let result = resolve_and_validate_host_addresses_with(
+            "test",
+            "controlled.invalid",
+            Some(443),
+            &policy,
+            |_, port| {
+                Ok(vec![
+                    SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)), port),
+                    SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port),
+                ])
+            },
+        );
+        assert!(
+            result.is_err(),
+            "one forbidden DNS candidate must reject the decision"
+        );
+    }
+
+    #[test]
+    fn controlled_dns_rebinding_cannot_change_the_pinned_peer_decision() {
+        let mut policy = AttachmentSecurityPolicy::default();
+        policy.allow_private_network = true;
+        let pinned = resolve_and_validate_host_addresses_with(
+            "test",
+            "controlled.invalid",
+            Some(443),
+            &policy,
+            |_, port| {
+                Ok(vec![SocketAddr::new(
+                    IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)),
+                    port,
+                )])
+            },
+        )
+        .unwrap();
+        let rebound = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 443);
+        assert!(validate_connected_peer("test", rebound, &pinned, &policy).is_err());
     }
 
     #[test]

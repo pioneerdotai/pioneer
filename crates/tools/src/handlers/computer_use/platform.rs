@@ -1,5 +1,6 @@
 use super::model::{AppHandle, AppMeta, AppTarget};
 use crate::error::ToolError;
+use crate::process_policy::ProcessEnvironmentPlan;
 #[cfg(target_os = "macos")]
 use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -24,48 +25,59 @@ pub(crate) struct RunningAppInfo {
 pub(crate) fn launch_app_target(
     target: &AppTarget,
     launch_command: Option<&str>,
+    environment: &ProcessEnvironmentPlan,
 ) -> Result<(), ToolError> {
     let plan = launch_command_plan(target, launch_command)?;
-    run_command_plan(&plan, "launch")
+    run_command_plan(&plan, "launch", environment)
 }
 
-pub(crate) fn activate_app(app: &AppHandle) -> Result<(), ToolError> {
+pub(crate) fn activate_app(
+    app: &AppHandle,
+    environment: &ProcessEnvironmentPlan,
+) -> Result<(), ToolError> {
     #[cfg(not(target_os = "macos"))]
     {
         // xa11y does not currently expose a cross-platform foreground/activate API.
         // Keep app resolution semantic and avoid synthetic clicks; explicit input_* actions
         // may still require the user to foreground the app on Windows/Linux.
         let _ = app;
+        let _ = environment;
         return Ok(());
     }
 
     #[cfg(target_os = "macos")]
     {
         let plan = activation_command_plan(app)?;
-        run_command_plan(&plan, "activate")
+        run_command_plan(&plan, "activate", environment)
     }
 }
 
-pub(crate) fn open_path(path: &Path) -> Result<(), ToolError> {
+pub(crate) fn open_path(
+    path: &Path,
+    environment: &ProcessEnvironmentPlan,
+) -> Result<(), ToolError> {
     let plan = open_path_command_plan(path)?;
-    run_command_plan(&plan, "open path")
+    run_command_plan(&plan, "open path", environment)
 }
 
-pub(crate) fn reveal_path(path: &Path) -> Result<(), ToolError> {
+pub(crate) fn reveal_path(
+    path: &Path,
+    environment: &ProcessEnvironmentPlan,
+) -> Result<(), ToolError> {
     let plan = reveal_path_command_plan(path)?;
-    run_command_plan(&plan, "reveal path")
+    run_command_plan(&plan, "reveal path", environment)
 }
 
-pub(crate) fn open_url(url: &Url) -> Result<(), ToolError> {
+pub(crate) fn open_url(url: &Url, environment: &ProcessEnvironmentPlan) -> Result<(), ToolError> {
     let plan = open_url_command_plan(url)?;
-    run_command_plan(&plan, "open URL")
+    run_command_plan(&plan, "open URL", environment)
 }
 
-pub(crate) fn enrich_app_identity(app: AppMeta) -> AppMeta {
+pub(crate) fn enrich_app_identity(app: AppMeta, environment: &ProcessEnvironmentPlan) -> AppMeta {
     let Some(pid) = app.pid else {
         return app;
     };
-    let Some(info) = running_app_info_by_pid()
+    let Some(info) = running_app_info_by_pid(environment)
         .into_iter()
         .find(|info| info.pid == Some(pid))
     else {
@@ -88,14 +100,15 @@ pub(crate) fn enrich_app_identity(app: AppMeta) -> AppMeta {
     }
 }
 
-pub(crate) fn running_app_info_by_pid() -> Vec<RunningAppInfo> {
+pub(crate) fn running_app_info_by_pid(environment: &ProcessEnvironmentPlan) -> Vec<RunningAppInfo> {
     #[cfg(target_os = "macos")]
     {
-        return macos_running_app_info();
+        return macos_running_app_info(environment);
     }
 
     #[cfg(not(target_os = "macos"))]
     {
+        let _ = environment;
         Vec::new()
     }
 }
@@ -118,7 +131,10 @@ pub(crate) fn app_bundle_path_from_path(path: &Path) -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 
-pub(crate) fn enrich_launch_target(target: &AppTarget) -> AppTarget {
+pub(crate) fn enrich_launch_target(
+    target: &AppTarget,
+    environment: &ProcessEnvironmentPlan,
+) -> AppTarget {
     #[cfg(target_os = "macos")]
     {
         let mut enriched = target.clone();
@@ -139,13 +155,15 @@ pub(crate) fn enrich_launch_target(target: &AppTarget) -> AppTarget {
             {
                 if let Some(bundle_path) = macos_find_app_bundle_by_name(name) {
                     if needs_bundle_id {
-                        enriched.bundle_id = macos_bundle_identifier(bundle_path.as_path());
+                        enriched.bundle_id =
+                            macos_bundle_identifier(bundle_path.as_path(), environment);
                     }
                     if needs_executable_path {
                         enriched.executable_path =
-                            macos_bundle_executable_path(bundle_path.as_path()).or_else(|| {
-                                Some(bundle_path.as_os_str().to_string_lossy().into_owned())
-                            });
+                            macos_bundle_executable_path(bundle_path.as_path(), environment)
+                                .or_else(|| {
+                                    Some(bundle_path.as_os_str().to_string_lossy().into_owned())
+                                });
                     }
                 }
             }
@@ -155,6 +173,7 @@ pub(crate) fn enrich_launch_target(target: &AppTarget) -> AppTarget {
 
     #[cfg(not(target_os = "macos"))]
     {
+        let _ = environment;
         target.clone()
     }
 }
@@ -598,13 +617,19 @@ fn find_app_bundle_exact(
 }
 
 #[cfg(target_os = "macos")]
-fn macos_bundle_identifier(bundle_path: &Path) -> Option<String> {
-    macos_bundle_plist_value(bundle_path, "CFBundleIdentifier")
+fn macos_bundle_identifier(
+    bundle_path: &Path,
+    environment: &ProcessEnvironmentPlan,
+) -> Option<String> {
+    macos_bundle_plist_value(bundle_path, "CFBundleIdentifier", environment)
 }
 
 #[cfg(target_os = "macos")]
-fn macos_bundle_executable_path(bundle_path: &Path) -> Option<String> {
-    let executable = macos_bundle_plist_value(bundle_path, "CFBundleExecutable")?;
+fn macos_bundle_executable_path(
+    bundle_path: &Path,
+    environment: &ProcessEnvironmentPlan,
+) -> Option<String> {
+    let executable = macos_bundle_plist_value(bundle_path, "CFBundleExecutable", environment)?;
     Some(
         bundle_path
             .join("Contents")
@@ -617,13 +642,18 @@ fn macos_bundle_executable_path(bundle_path: &Path) -> Option<String> {
 }
 
 #[cfg(target_os = "macos")]
-fn macos_bundle_plist_value(bundle_path: &Path, key: &str) -> Option<String> {
+fn macos_bundle_plist_value(
+    bundle_path: &Path,
+    key: &str,
+    environment: &ProcessEnvironmentPlan,
+) -> Option<String> {
     let info_plist = bundle_path.join("Contents").join("Info.plist");
-    let output = Command::new("/usr/bin/plutil")
+    let mut command = Command::new("/usr/bin/plutil");
+    command
         .args(["-extract", key, "raw", "-o", "-"])
-        .arg(info_plist.as_path())
-        .output()
-        .ok()?;
+        .arg(info_plist.as_path());
+    environment.apply_to_std_command(&mut command);
+    let output = command.output().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -633,18 +663,22 @@ fn macos_bundle_plist_value(bundle_path: &Path, key: &str) -> Option<String> {
     (!value.is_empty()).then_some(value)
 }
 
-fn run_command_plan(plan: &CommandPlan, purpose: &str) -> Result<(), ToolError> {
+fn run_command_plan(
+    plan: &CommandPlan,
+    purpose: &str,
+    environment: &ProcessEnvironmentPlan,
+) -> Result<(), ToolError> {
     if plan.wait_for_exit {
-        let output = Command::new(plan.program.as_str())
-            .args(plan.args.iter().map(String::as_str))
-            .output()
-            .map_err(|error| {
-                ToolError::execution_failed(format!(
-                    "failed to {purpose} computer_use target with `{} {}`: {error}",
-                    plan.program,
-                    plan.args.join(" ")
-                ))
-            })?;
+        let mut command = Command::new(plan.program.as_str());
+        command.args(plan.args.iter().map(String::as_str));
+        environment.apply_to_std_command(&mut command);
+        let output = command.output().map_err(|error| {
+            ToolError::execution_failed(format!(
+                "failed to {purpose} computer_use target with `{} {}`: {error}",
+                plan.program,
+                plan.args.join(" ")
+            ))
+        })?;
         if output.status.success() {
             return Ok(());
         }
@@ -668,25 +702,26 @@ fn run_command_plan(plan: &CommandPlan, purpose: &str) -> Result<(), ToolError> 
         )));
     }
 
-    let mut child = Command::new(plan.program.as_str())
-        .args(plan.args.iter().map(String::as_str))
-        .spawn()
-        .map_err(|error| {
-            ToolError::execution_failed(format!(
-                "failed to {purpose} computer_use target with `{} {}`: {error}",
-                plan.program,
-                plan.args.join(" ")
-            ))
-        })?;
+    let mut command = Command::new(plan.program.as_str());
+    command.args(plan.args.iter().map(String::as_str));
+    environment.apply_to_std_command(&mut command);
+    let mut child = command.spawn().map_err(|error| {
+        ToolError::execution_failed(format!(
+            "failed to {purpose} computer_use target with `{} {}`: {error}",
+            plan.program,
+            plan.args.join(" ")
+        ))
+    })?;
     let _ = child.try_wait();
     Ok(())
 }
 
 #[cfg(target_os = "macos")]
-fn macos_running_app_info() -> Vec<RunningAppInfo> {
-    let output = Command::new("/usr/bin/lsappinfo")
-        .arg("visibleProcessList")
-        .output();
+fn macos_running_app_info(environment: &ProcessEnvironmentPlan) -> Vec<RunningAppInfo> {
+    let mut command = Command::new("/usr/bin/lsappinfo");
+    command.arg("visibleProcessList");
+    environment.apply_to_std_command(&mut command);
+    let output = command.output();
     let Ok(output) = output else {
         return Vec::new();
     };
@@ -696,21 +731,25 @@ fn macos_running_app_info() -> Vec<RunningAppInfo> {
     let visible = String::from_utf8_lossy(output.stdout.as_slice());
     parse_lsappinfo_visible_process_list(visible.as_ref())
         .into_iter()
-        .filter_map(|(asn, name)| macos_running_app_info_for_asn(asn.as_str(), name))
+        .filter_map(|(asn, name)| macos_running_app_info_for_asn(asn.as_str(), name, environment))
         .collect()
 }
 
 #[cfg(target_os = "macos")]
-fn macos_running_app_info_for_asn(asn: &str, visible_name: String) -> Option<RunningAppInfo> {
-    let output = Command::new("/usr/bin/lsappinfo")
-        .args([
-            "info",
-            "-only",
-            "pid,bundleid,bundlepath,executablepath,LSDisplayName",
-            asn,
-        ])
-        .output()
-        .ok()?;
+fn macos_running_app_info_for_asn(
+    asn: &str,
+    visible_name: String,
+    environment: &ProcessEnvironmentPlan,
+) -> Option<RunningAppInfo> {
+    let mut command = Command::new("/usr/bin/lsappinfo");
+    command.args([
+        "info",
+        "-only",
+        "pid,bundleid,bundlepath,executablepath,LSDisplayName",
+        asn,
+    ]);
+    environment.apply_to_std_command(&mut command);
+    let output = command.output().ok()?;
     if !output.status.success() {
         return None;
     }

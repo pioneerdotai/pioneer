@@ -73,6 +73,17 @@
         "binary_path": {
           "type": "string"
         },
+        "compaction_model": {
+          "description": "Workspace override. Omission in updates preserves the stored value;\nan explicit Inherit removes it without affecting other workspaces.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GatewayModelSelection"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "display_name": {
           "type": "string"
         },
@@ -124,10 +135,30 @@
     "GatewayGeneralSettingsUpdate": {
       "type": "object",
       "properties": {
+        "compaction_model": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GatewayModelSelection"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "keepawake": {
           "type": [
             "boolean",
             "null"
+          ]
+        },
+        "model_catalog_proxy": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GatewayModelCatalogProxyUpdate"
+            },
+            {
+              "type": "null"
+            }
           ]
         },
         "preflight_model": {
@@ -221,6 +252,67 @@
         "strict_diagnostics_enabled"
       ]
     },
+    "GatewayModelCatalogProxyUpdate": {
+      "type": "object",
+      "properties": {
+        "proxy_url": {
+          "description": "`Some` configures/replaces the proxy; `None` clears it. The value is\nconsumed by Gateway's keystore layer and is never persisted in settings.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "GatewayModelSelection": {
+      "description": "Inherit is a real absence of an override. It never stores a resolved fallback.\nThe tagged value also distinguishes an explicit reset from an omitted update.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "source": {
+              "type": "string",
+              "const": "inherit"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "source"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "instance": {
+              "type": "string"
+            },
+            "model": {
+              "type": "string"
+            },
+            "reasoning_effort": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "source": {
+              "type": "string",
+              "const": "explicit"
+            },
+            "transport": {
+              "$ref": "#/$defs/ModelSelectionTransport"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "source",
+            "transport",
+            "instance",
+            "model"
+          ]
+        }
+      ]
+    },
     "GatewayRemoteAccessSettingsUpdate": {
       "type": "object",
       "properties": {
@@ -258,6 +350,13 @@
         },
         "provider": {
           "type": "string"
+        },
+        "reasoning_effort": {
+          "description": "None delegates to the provider; `none` explicitly disables reasoning.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "additionalProperties": false,
@@ -600,6 +699,14 @@
           "type": "boolean"
         }
       }
+    },
+    "ModelSelectionTransport": {
+      "type": "string",
+      "enum": [
+        "api",
+        "codex",
+        "claude"
+      ]
     },
     "VoiceInputSettingsPlanRejection": {
       "type": "string",

@@ -13,3 +13,6 @@ pub use timeout::{
     TimeoutRecoveryClassification, TimeoutSupervisor, timeout_recovery_suppression_context,
     timeout_requires_runtime_evidence,
 };
+
+#[cfg(test)]
+pub(crate) use recovery::recovered_final_origin_for_test;

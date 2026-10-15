@@ -1,3 +1,5 @@
+use crate::apply_patch::file_mutation::PatchLimits;
+use crate::apply_patch::normalize_native_patch_payload;
 use crate::context::{
     ExecCommandArgs, LocalShellPayload, ToolCallSource, ToolInvocation, ToolPayload, WriteStdinArgs,
 };
@@ -19,11 +21,14 @@ use crate::visibility::{
     compute_final_tool_visibility, materialized_dynamic_extension_tool_names,
 };
 use pioneer_protocol::{TurnExecutionSecuritySnapshot, TurnItemExecutionClass};
+use pioneer_provider::{NativePatchPayload, NativePatchWireShape};
 use serde_json::Value as JsonValue;
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 use tokio_util::sync::CancellationToken;
+
+const APPLY_PATCH_ARGUMENT_OVERHEAD_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct RawToolCall {
@@ -57,10 +62,12 @@ impl ToolCall {
 pub struct ToolRouter {
     registry: ToolRegistry,
     specs: HashMap<String, ConfiguredToolSpec>,
+    argument_validators: HashMap<String, OnceLock<Result<jsonschema::Validator, ()>>>,
     visibility: ToolVisibilitySnapshot,
     event_bus: ToolEventBus,
     turn_id: String,
     blocked_tool_names: Arc<RwLock<BTreeMap<String, String>>>,
+    native_patch_wire_shape: Arc<RwLock<NativePatchWireShape>>,
 }
 
 impl ToolRouter {
@@ -89,6 +96,11 @@ impl ToolRouter {
         turn_id: impl Into<String>,
         blocked_tool_names: Arc<RwLock<BTreeMap<String, String>>>,
     ) -> Self {
+        let argument_validators = specs
+            .iter()
+            .filter(|spec| builtin_schema_arguments(spec))
+            .map(|spec| (spec.spec.name.clone(), OnceLock::new()))
+            .collect();
         let specs = specs
             .into_iter()
             .map(|spec| (spec.spec.name.clone(), spec))
@@ -96,10 +108,15 @@ impl ToolRouter {
         Self {
             registry,
             specs,
+            argument_validators,
             visibility,
             event_bus,
             turn_id: turn_id.into(),
             blocked_tool_names,
+            // Pioneer API providers currently use strict JSON functions.
+            // A true free-form provider must explicitly freeze that shape for
+            // the turn before its catalog is exposed.
+            native_patch_wire_shape: Arc::new(RwLock::new(NativePatchWireShape::JsonFunction)),
         }
     }
 
@@ -112,6 +129,20 @@ impl ToolRouter {
             .write()
             .expect("tool router blocked tool map lock poisoned") =
             blocked_tool_names.into_iter().collect();
+    }
+
+    pub fn set_native_patch_wire_shape(&self, shape: NativePatchWireShape) {
+        *self
+            .native_patch_wire_shape
+            .write()
+            .expect("tool router native patch wire-shape lock poisoned") = shape;
+    }
+
+    fn native_patch_wire_shape(&self) -> NativePatchWireShape {
+        *self
+            .native_patch_wire_shape
+            .read()
+            .expect("tool router native patch wire-shape lock poisoned")
     }
 
     fn blocked_tool_names_snapshot(&self) -> BTreeMap<String, String> {
@@ -237,7 +268,7 @@ impl ToolRouter {
             }
         };
 
-        let (payload, argument_coercions) = match Self::parse_payload(
+        let (payload, argument_coercions) = match self.parse_payload(
             &configured,
             call.tool_name.as_str(),
             call.arguments.as_str(),
@@ -314,6 +345,7 @@ impl ToolRouter {
             recovery: call.recovery,
             permission_metadata: call.permission_metadata,
             execution_security_snapshot,
+            apply_patch_preflight: None,
             cancellation,
         };
         orchestrator
@@ -322,18 +354,63 @@ impl ToolRouter {
     }
 
     fn parse_payload(
+        &self,
         configured: &ConfiguredToolSpec,
         tool_name: &str,
         arguments: &str,
     ) -> Result<(ToolPayload, Vec<crate::ToolArgumentCoercion>), ToolError> {
-        match configured.spec.payload_kind {
-            PayloadKind::Function => {
-                let parsed = parse_json_arguments(arguments)?;
-                let normalized = normalize_tool_arguments_for_tool(
-                    tool_name,
+        // Validate before deriving execution metadata or entering permission /
+        // handler execution. Custom payloads retain their dedicated parsers.
+        let builtin = builtin_schema_arguments(configured);
+        let parsed_builtin = if builtin {
+            let parsed = parse_json_arguments(arguments).map_err(|_| {
+                ToolError::invalid_arguments("builtin_argument_json_parse_error: expected valid JSON; validationComplete=false")
+            })?;
+            let normalized = if configured.spec.payload_kind == PayloadKind::Function {
+                crate::argument_normalizer::normalize_builtin_arguments(
                     parsed,
                     &configured.spec.parameters,
-                )?;
+                )?
+            } else {
+                crate::ToolArgumentNormalization {
+                    arguments: parsed,
+                    coercions: Vec::new(),
+                }
+            };
+            let validator = self
+                .argument_validators
+                .get(tool_name)
+                .expect("builtin validator slot")
+                .get_or_init(|| {
+                    crate::builtin_argument_validator::compile(&configured.spec.parameters)
+                })
+                .as_ref()
+                .map_err(|_| {
+                    ToolError::internal(
+                        "builtin argument schema unavailable; validationComplete=false",
+                    )
+                })?;
+            crate::builtin_argument_validator::validate(
+                &normalized.arguments,
+                &configured.spec.parameters,
+                validator,
+            )?;
+            Some(normalized)
+        } else {
+            None
+        };
+        match configured.spec.payload_kind {
+            PayloadKind::Function => {
+                let normalized = if let Some(normalized) = parsed_builtin {
+                    normalized
+                } else {
+                    let parsed = parse_json_arguments(arguments)?;
+                    normalize_tool_arguments_for_tool(
+                        tool_name,
+                        parsed,
+                        &configured.spec.parameters,
+                    )?
+                };
                 if tool_name == REQUEST_TOOLS_TOOL_NAME {
                     parse_request_tools_domains(&normalized.arguments)
                         .map_err(ToolError::invalid_arguments)?;
@@ -377,25 +454,20 @@ impl ToolRouter {
                 }
             }
             PayloadKind::LocalShell => {
-                let parsed = parse_json_arguments(arguments)?;
+                let parsed = match parsed_builtin {
+                    Some(normalized) => normalized.arguments,
+                    None => parse_json_arguments(arguments)?,
+                };
                 if tool_name == "write_stdin" {
-                    let args =
-                        serde_json::from_value::<WriteStdinArgs>(parsed).map_err(|error| {
-                            ToolError::invalid_arguments(format!(
-                                "failed to parse write_stdin arguments: {error}"
-                            ))
-                        })?;
+                    let args = serde_json::from_value::<WriteStdinArgs>(parsed)
+                        .map_err(|error| residual_decode_error(builtin, "write_stdin", error))?;
                     Ok((
                         ToolPayload::LocalShell(LocalShellPayload::WriteStdin(args)),
                         Vec::new(),
                     ))
                 } else {
-                    let args =
-                        serde_json::from_value::<ExecCommandArgs>(parsed).map_err(|error| {
-                            ToolError::invalid_arguments(format!(
-                                "failed to parse {tool_name} arguments: {error}"
-                            ))
-                        })?;
+                    let args = serde_json::from_value::<ExecCommandArgs>(parsed)
+                        .map_err(|error| residual_decode_error(builtin, tool_name, error))?;
                     Ok((
                         ToolPayload::LocalShell(LocalShellPayload::ExecCommand(args)),
                         Vec::new(),
@@ -403,7 +475,10 @@ impl ToolRouter {
                 }
             }
             PayloadKind::ToolSearch => {
-                let parsed = parse_json_arguments(arguments)?;
+                let parsed = match parsed_builtin {
+                    Some(normalized) => normalized.arguments,
+                    None => parse_json_arguments(arguments)?,
+                };
                 let query = parsed
                     .get("query")
                     .and_then(JsonValue::as_str)
@@ -426,25 +501,58 @@ impl ToolRouter {
                 ))
             }
             PayloadKind::Custom => {
+                if tool_name == "apply_patch" {
+                    let max_argument_bytes =
+                        usize::try_from(PatchLimits::default().max_patch_bytes)
+                            .unwrap_or(usize::MAX)
+                            .saturating_add(APPLY_PATCH_ARGUMENT_OVERHEAD_BYTES);
+                    if arguments.len() > max_argument_bytes {
+                        return Err(ToolError::invalid_arguments(
+                            "apply_patch arguments exceed the bounded input limit",
+                        ));
+                    }
+                    let shape = self.native_patch_wire_shape();
+                    let request = match shape {
+                        NativePatchWireShape::Freeform => normalize_native_patch_payload(
+                            NativePatchPayload::Freeform(arguments),
+                            NativePatchWireShape::Freeform,
+                            PatchLimits::default(),
+                        ),
+                        NativePatchWireShape::JsonFunction => {
+                            let parsed =
+                                serde_json::from_str::<JsonValue>(arguments).map_err(|_| {
+                                    ToolError::invalid_arguments(
+                                        "apply_patch requires the frozen JSON `{patch}` wire shape",
+                                    )
+                                })?;
+                            normalize_native_patch_payload(
+                                NativePatchPayload::Json(&parsed),
+                                NativePatchWireShape::JsonFunction,
+                                PatchLimits::default(),
+                            )
+                        }
+                        NativePatchWireShape::Unavailable => {
+                            return Err(ToolError::NotVisible(
+                                "apply_patch is unavailable for the frozen provider capability"
+                                    .to_owned(),
+                            ));
+                        }
+                    }
+                    .map_err(|error| {
+                        ToolError::invalid_arguments(format!(
+                            "invalid apply_patch wire payload: {error}"
+                        ))
+                    })?;
+                    return Ok((
+                        ToolPayload::Custom {
+                            input: request.patch,
+                        },
+                        Vec::new(),
+                    ));
+                }
                 let parsed = parse_json_arguments(arguments)
                     .unwrap_or_else(|_| JsonValue::String(arguments.to_owned()));
-                if let Some(input) = parsed.get("input").and_then(JsonValue::as_str) {
-                    return Ok((
-                        ToolPayload::Custom {
-                            input: input.to_owned(),
-                        },
-                        Vec::new(),
-                    ));
-                }
                 if let Some(input) = parsed.get("patch").and_then(JsonValue::as_str) {
-                    return Ok((
-                        ToolPayload::Custom {
-                            input: input.to_owned(),
-                        },
-                        Vec::new(),
-                    ));
-                }
-                if let Some(input) = parsed.as_str() {
                     return Ok((
                         ToolPayload::Custom {
                             input: input.to_owned(),
@@ -521,6 +629,28 @@ impl ToolRouter {
     }
 }
 
+// MCP catalog bindings and dynamic skill provenance are materialized by the
+// existing providers, independently of names and output projection policies.
+fn builtin_schema_arguments(configured: &ConfiguredToolSpec) -> bool {
+    matches!(
+        configured.spec.payload_kind,
+        PayloadKind::Function | PayloadKind::LocalShell | PayloadKind::ToolSearch
+    ) && matches!(configured.payload_binding, ToolPayloadBinding::Function)
+        && configured.spec.permission_metadata.dynamic_skill.is_none()
+}
+
+fn residual_decode_error(builtin: bool, tool_name: &str, error: serde_json::Error) -> ToolError {
+    if builtin {
+        // Schema-valid mathematical integers may still fail serde's u64
+        // representation requirements. Preserve rejection without echoing values.
+        ToolError::invalid_arguments(
+            "builtin_argument_deserialization_error: arguments could not be decoded according to the tool contract",
+        )
+    } else {
+        ToolError::invalid_arguments(format!("failed to parse {tool_name} arguments: {error}"))
+    }
+}
+
 fn parse_json_arguments(arguments: &str) -> Result<JsonValue, ToolError> {
     let trimmed = arguments.trim();
     if trimmed.is_empty() {
@@ -569,13 +699,6 @@ mod tests {
             .into_iter()
             .find(|configured| configured.spec.name == REQUEST_TOOLS_TOOL_NAME)
             .expect("request_tools builtin spec should exist")
-    }
-
-    fn write_file_configured_spec() -> ConfiguredToolSpec {
-        crate::builtin_tool_specs()
-            .into_iter()
-            .find(|configured| configured.spec.name == "write_file")
-            .expect("write_file builtin spec should exist")
     }
 
     fn router_with_specs(specs: Vec<ConfiguredToolSpec>) -> ToolRouter {
@@ -646,6 +769,7 @@ mod tests {
             PayloadKind::Custom,
             ExecutionClass::Exclusive,
         )]);
+        router.set_native_patch_wire_shape(NativePatchWireShape::Freeform);
         let patch = "*** Begin Patch\n*** Add File: a.txt\n+hello\n*** End Patch";
         let call = router
             .build_tool_call(RawToolCall {
@@ -661,6 +785,81 @@ mod tests {
             ToolPayload::Custom { input } => assert_eq!(input, patch),
             other => panic!("unexpected payload: {other:?}"),
         }
+    }
+
+    #[test]
+    fn frozen_apply_patch_wire_shape_is_not_auto_detected() {
+        let router = router_with_specs(vec![configured_spec(
+            "apply_patch",
+            PayloadKind::Custom,
+            ExecutionClass::MutationScoped,
+        )]);
+        let patch = "*** Begin Patch\n*** Add File: a.txt\n+hello\n*** End Patch";
+
+        router.set_native_patch_wire_shape(NativePatchWireShape::JsonFunction);
+        let json_call = router
+            .build_tool_call(RawToolCall {
+                call_id: "call_json".to_owned(),
+                tool_name: "apply_patch".to_owned(),
+                arguments: serde_json::json!({"patch": patch}).to_string(),
+            })
+            .expect("the frozen JSON shape must accept exactly `{patch}`");
+        assert!(matches!(json_call.payload, ToolPayload::Custom { .. }));
+        assert!(matches!(
+            router.build_tool_call(RawToolCall {
+                call_id: "call_raw_denied".to_owned(),
+                tool_name: "apply_patch".to_owned(),
+                arguments: patch.to_owned(),
+            }),
+            Err(ToolError::InvalidArguments(_))
+        ));
+
+        router.set_native_patch_wire_shape(NativePatchWireShape::Freeform);
+        assert!(
+            router
+                .build_tool_call(RawToolCall {
+                    call_id: "call_raw".to_owned(),
+                    tool_name: "apply_patch".to_owned(),
+                    arguments: patch.to_owned(),
+                })
+                .is_ok()
+        );
+        let json_text = serde_json::json!({"patch": patch}).to_string();
+        let raw_json_text = router
+            .build_tool_call(RawToolCall {
+                call_id: "call_json_as_raw".to_owned(),
+                tool_name: "apply_patch".to_owned(),
+                arguments: json_text.clone(),
+            })
+            .expect("free-form input is never reinterpreted as a JSON wrapper");
+        assert!(matches!(
+            raw_json_text.payload,
+            ToolPayload::Custom { input } if input == json_text
+        ));
+    }
+
+    #[test]
+    fn build_tool_call_rejects_oversized_apply_patch_envelope_before_json_parse() {
+        let router = router_with_specs(vec![configured_spec(
+            "apply_patch",
+            PayloadKind::Custom,
+            ExecutionClass::MutationScoped,
+        )]);
+        let oversized = "x".repeat(
+            usize::try_from(PatchLimits::default().max_patch_bytes)
+                .unwrap()
+                .saturating_add(APPLY_PATCH_ARGUMENT_OVERHEAD_BYTES)
+                .saturating_add(1),
+        );
+        let error = router
+            .build_tool_call(RawToolCall {
+                call_id: "call_oversized_patch".to_owned(),
+                tool_name: "apply_patch".to_owned(),
+                arguments: oversized,
+            })
+            .expect_err("oversized patch input must fail before payload parsing");
+
+        assert!(matches!(error, ToolError::InvalidArguments(_)));
     }
 
     #[test]
@@ -716,101 +915,125 @@ mod tests {
             })
             .expect_err("plain string should be rejected for object field");
 
-        assert!(error.to_string().contains("$.trigger"));
-        assert!(error.to_string().contains("must be a JSON object"));
+        assert!(error.to_string().contains("$/trigger"));
+        assert!(error.to_string().contains(r#""expected":"object""#));
     }
 
     #[test]
-    fn build_tool_call_normalizes_write_file_alias_arguments() {
-        let router = router_with_specs(vec![write_file_configured_spec()]);
-
-        let call = router
-            .build_tool_call(RawToolCall {
-                call_id: "call_write_alias".to_owned(),
-                tool_name: "write_file".to_owned(),
-                arguments: r#"{"file_path":"docs/example.md","contents":"hello"}"#.to_owned(),
-            })
-            .expect("write_file aliases should parse");
-
-        match call.payload {
-            ToolPayload::Function { arguments } => {
-                assert_eq!(arguments["path"], "docs/example.md");
-                assert_eq!(arguments["content"], "hello");
-                assert!(arguments.get("file_path").is_none());
-                assert!(arguments.get("contents").is_none());
-            }
-            other => panic!("unexpected payload: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn build_tool_call_normalizes_write_file_filename_and_text_aliases() {
-        let router = router_with_specs(vec![write_file_configured_spec()]);
-
-        let call = router
-            .build_tool_call(RawToolCall {
-                call_id: "call_write_alias_2".to_owned(),
-                tool_name: "write_file".to_owned(),
-                arguments: r#"{"filename":"notes.txt","text":"hello"}"#.to_owned(),
-            })
-            .expect("write_file aliases should parse");
-
-        match call.payload {
-            ToolPayload::Function { arguments } => {
-                assert_eq!(arguments["path"], "notes.txt");
-                assert_eq!(arguments["content"], "hello");
-            }
-            other => panic!("unexpected payload: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn build_tool_call_rejects_write_file_unknown_fields_after_alias_normalization() {
-        let router = router_with_specs(vec![write_file_configured_spec()]);
-
+    fn mcp_keeps_legacy_normalization_and_does_not_acquire_builtin_validation() {
+        let schema = serde_json::json!({"type": "object", "properties": {
+            "a": {"type": "array"}, "b": {"type": "array"}, "n": {"type": "integer"}
+        }});
+        let mut spec = configured_function_spec_with_schema("external", schema);
+        spec.spec.payload_kind = PayloadKind::Mcp;
+        spec.payload_binding = ToolPayloadBinding::Mcp {
+            server_id: "server".into(),
+            server_name: "server".into(),
+            raw_tool_name: "external".into(),
+            catalog_version: "1".into(),
+            snapshot_version: 1,
+            read_only_hint: None,
+            destructive_hint: None,
+            open_world_hint: None,
+        };
+        let router = router_with_specs(vec![spec]);
         let error = router
             .build_tool_call(RawToolCall {
-                call_id: "call_write_unknown".to_owned(),
-                tool_name: "write_file".to_owned(),
-                arguments: r#"{"file_path":"docs/example.md","contents":"hello","mode":"append"}"#
-                    .to_owned(),
+                call_id: "c".into(),
+                tool_name: "external".into(),
+                arguments: r#"{"a":"bad","b":"bad"}"#.into(),
             })
-            .expect_err("unknown write_file field should fail");
-
-        assert!(matches!(error, ToolError::InvalidArguments(_)));
-        assert!(error.to_string().contains("unknown field `mode`"));
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("$.a"));
+        assert!(!error.contains("$.b"));
+        assert!(!error.contains("builtin_argument_schema_error"));
+        let call = router
+            .build_tool_call(RawToolCall {
+                call_id: "c".into(),
+                tool_name: "external".into(),
+                arguments: r#"{"a":"[]","n":false}"#.into(),
+            })
+            .unwrap();
+        match call.payload {
+            ToolPayload::Mcp { arguments, .. } => {
+                assert_eq!(arguments["a"], serde_json::json!([]));
+                assert_eq!(arguments["n"], false);
+            }
+            _ => panic!("expected MCP payload"),
+        }
     }
 
     #[test]
-    fn build_tool_call_does_not_apply_write_file_aliases_to_other_tools() {
-        let router = router_with_specs(vec![configured_function_spec_with_schema(
-            "other_tool",
+    fn dynamic_skill_provenance_keeps_legacy_argument_path() {
+        let mut spec = configured_function_spec_with_schema(
+            "dynamic",
             serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string" },
-                    "content": { "type": "string" }
-                }
+                "type": "object", "properties": {"n": {"type": "integer"}}
             }),
-        )]);
-
-        let call = router
+        );
+        spec.spec.permission_metadata.dynamic_skill = Some(crate::DynamicSkillPermissionMetadata {
+            kind: crate::DynamicSkillPermissionKind::FunctionProxy,
+            skill_id: pioneer_protocol::SkillId::new("mvg02zVNGWuw5z5C4nYDo").unwrap(),
+            skill_owner: None,
+            skill_slug: "fixture".into(),
+            skill_fingerprint: "fixture".into(),
+            source_kind: "fixture".into(),
+            trust_level: "fixture".into(),
+            target_tool: None,
+            configured_method: None,
+            configured_url: None,
+        });
+        let router = router_with_specs(vec![spec]);
+        assert!(!router.argument_validators.contains_key("dynamic"));
+        router
             .build_tool_call(RawToolCall {
-                call_id: "call_other_alias".to_owned(),
-                tool_name: "other_tool".to_owned(),
-                arguments: r#"{"file_path":"docs/example.md","contents":"hello"}"#.to_owned(),
+                call_id: "c".into(),
+                tool_name: "dynamic".into(),
+                arguments: r#"{"n":false}"#.into(),
             })
-            .expect("other tool should parse without write_file aliases");
+            .expect("dynamic schema validation is unchanged");
+    }
 
-        match call.payload {
-            ToolPayload::Function { arguments } => {
-                assert_eq!(arguments["file_path"], "docs/example.md");
-                assert_eq!(arguments["contents"], "hello");
-                assert!(arguments.get("path").is_none());
-                assert!(arguments.get("content").is_none());
-            }
-            other => panic!("unexpected payload: {other:?}"),
-        }
+    #[test]
+    fn shell_arguments_are_validated_together_before_serde_decode() {
+        let spec = crate::builtin_tool_specs()
+            .into_iter()
+            .find(|spec| spec.spec.name == "exec_command")
+            .unwrap();
+        let router = router_with_specs(vec![spec]);
+        let error = router
+            .build_tool_call(RawToolCall {
+                call_id: "c".into(),
+                tool_name: "exec_command".into(),
+                arguments: r#"{"command":false,"tty":1,"yield_time_ms":"bad"}"#.into(),
+            })
+            .unwrap_err();
+        let ToolError::InvalidArguments(message) = error else {
+            panic!("expected arguments error")
+        };
+        let diagnostics: JsonValue = serde_json::from_str(&message).unwrap();
+        assert_eq!(diagnostics["diagnostics"].as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn builtin_json_parse_failure_cannot_echo_values_or_claim_field_validation() {
+        let router = router_with_specs(vec![configured_function_spec_with_schema(
+            "builtin",
+            serde_json::json!({"type": "object"}),
+        )]);
+        let error = router
+            .build_tool_call(RawToolCall {
+                call_id: "c".into(),
+                tool_name: "builtin".into(),
+                arguments: r#"{"secret": secret-provider-message}"#.into(),
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("json_parse_error"));
+        assert!(error.contains("validationComplete=false"));
+        assert!(!error.contains("secret"));
+        assert!(!error.contains("diagnostics"));
     }
 
     #[test]

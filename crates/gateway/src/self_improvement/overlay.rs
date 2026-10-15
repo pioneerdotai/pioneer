@@ -81,9 +81,9 @@ pub(crate) async fn load_scoped_agent_skill_overlay(
         match eligibility {
             pioneer_crud::MemberLearnedVersionEligibility::Eligible => eligible.push(entry),
             pioneer_crud::MemberLearnedVersionEligibility::Ineligible(
-                pioneer_crud::LearnedVersionIneligibleReason::SourceNotWorkspaceVisible,
+                pioneer_crud::LearnedVersionIneligibleReason::SourceThreadIneligible,
             ) => {
-                crate::authorization::record_private_self_improvement_source_rejection();
+                crate::authorization::record_ineligible_self_improvement_source_rejection();
             }
             pioneer_crud::MemberLearnedVersionEligibility::Ineligible(_) => {}
         }
@@ -199,8 +199,10 @@ mod tests {
                     source_upper_inclusive: 1,
                     learner_provider: "provider".to_owned(),
                     learner_model: "model".to_owned(),
+                    learner_reasoning_effort: None,
                     reviewer_provider: "provider".to_owned(),
                     reviewer_model: "model".to_owned(),
+                    reviewer_reasoning_effort: None,
                     pipeline_contract_version: "self-improvement-v1".to_owned(),
                 },
                 NOW + 1,
@@ -227,12 +229,18 @@ mod tests {
                         effective_enabled: true,
                         learner_provider: "provider".to_owned(),
                         learner_model: "model".to_owned(),
+                        learner_reasoning_effort: None,
                         reviewer_provider: "provider".to_owned(),
                         reviewer_model: "model".to_owned(),
+                        reviewer_reasoning_effort: None,
                         pipeline_contract_version: "self-improvement-v1".to_owned(),
                     },
                     outcome: SelfImprovementFinalOutcome::AcceptedCreate(
                         AcceptedAgentSkillCreate {
+                            evidence_time: Some(pioneer_crud::AgentSkillEvidenceTime {
+                                confirmed_at_unix: NOW,
+                                latest_at_unix: NOW,
+                            }),
                             skill_id: SkillId::new("AAAAAAAAAAAAAAAAAAAAA")
                                 .expect("valid skill ID"),
                             version_id: "111111111111111111111".to_owned(),
@@ -291,7 +299,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn member_overlay_requires_explicit_policy_and_workspace_only_provenance() {
+    async fn member_overlay_accepts_private_sources_with_workspace_membership_and_policy() {
         use pioneer_crud::WorkspaceSkillPolicyRecord;
         use sea_orm::ConnectionTrait;
 
@@ -363,11 +371,12 @@ mod tests {
             )
             .await
             .expect("source thread must become private");
-        assert!(
+        assert_eq!(
             load_scoped_agent_skill_overlay(&store, &principal_id, WORKSPACE)
                 .await
-                .expect("private provenance must fail closed without error")
-                .is_empty()
+                .expect("private source skills must remain available to workspace members")
+                .len(),
+            1
         );
         store
             .database_connection()

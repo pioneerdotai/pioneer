@@ -397,7 +397,29 @@ pub(crate) static NORMAL_METHOD_REGISTRY: &[MethodAuthorizationEntry] = &[
         Read,
     ),
     method_entry(THREAD_GET, ThreadRead, Thread, NotFound, Read),
+    method_entry(
+        THREADS_TOOLS_RESULT_READ,
+        ThreadRead,
+        Thread,
+        NotFound,
+        Read,
+    ),
     method_entry(THREAD_TIMELINE_PAGE, ThreadRead, Thread, NotFound, Read),
+    method_entry(
+        THREAD_FILE_VIEW_GRANT_CREATE,
+        ThreadRead,
+        Thread,
+        NotFound,
+        Read,
+    ),
+    method_entry(THREAD_PATCH_STEPS_PAGE, ThreadRead, Thread, NotFound, Read),
+    method_entry(
+        THREAD_FILE_PATCH_HISTORY_PAGE,
+        ThreadRead,
+        Thread,
+        NotFound,
+        Read,
+    ),
     method_entry(THREAD_READ, ThreadRead, Thread, NotFound, Mutation),
     method_entry(THREAD_UNSUBSCRIBE, ThreadRead, Thread, NotFound, Mutation),
     dynamic_method_entry(
@@ -427,6 +449,27 @@ pub(crate) static NORMAL_METHOD_REGISTRY: &[MethodAuthorizationEntry] = &[
     method_entry(TURN_RESUME, AgentExecutionResume, Turn, NotFound, Execution),
     method_entry(TURN_GET, AgentExecutionObserve, Turn, NotFound, Read),
     method_entry(TURN_ITEMS_PAGE, AgentExecutionObserve, Turn, NotFound, Read),
+    method_entry(
+        TURN_PATCH_STEPS_PAGE,
+        AgentExecutionObserve,
+        Turn,
+        NotFound,
+        Read,
+    ),
+    method_entry(
+        TURN_PATCH_RECORD_GET,
+        AgentExecutionObserve,
+        Turn,
+        NotFound,
+        Read,
+    ),
+    method_entry(
+        TURN_PATCH_DIFF_GET,
+        AgentExecutionObserve,
+        Turn,
+        NotFound,
+        Read,
+    ),
     method_entry(TURN_WORK_PAGE, AgentExecutionObserve, Turn, NotFound, Read),
     method_entry(
         TURN_WORK_ITEMS_GET,
@@ -707,6 +750,7 @@ pub(crate) static NORMAL_METHOD_REGISTRY: &[MethodAuthorizationEntry] = &[
     ),
     method_entry(MCP_LIST, McpDiscover, Workspace, NotFound, Read),
     method_entry(MCP_INSTALL, McpManage, Capability, Forbidden, Management),
+    method_entry(MCP_OAUTH, McpManage, Capability, Forbidden, Management),
     method_entry(MCP_POLICY_SET, McpManage, Capability, Forbidden, Management),
     method_entry(
         MCP_SERVER_RESTART,
@@ -1042,6 +1086,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn oauth_rpc_requires_installation_management_and_keeps_capability_disclosure() {
+        let oauth = normal_method_entry(methods::MCP_OAUTH).unwrap();
+        let install = normal_method_entry(methods::MCP_INSTALL).unwrap();
+        assert_eq!(oauth.action, ResourceAction::McpManage);
+        assert_eq!(oauth.resolver, install.resolver);
+        assert_eq!(oauth.disclosure, DisclosurePolicy::Forbidden);
+        assert_eq!(oauth.audit, AuthorizationAuditClass::Management);
+    }
+
+    #[test]
     fn normal_registry_exactly_matches_the_authoritative_protocol_method_set() {
         validate_method_registry(NORMAL_METHOD_REGISTRY).expect("valid method registry");
         let registry = NORMAL_METHOD_REGISTRY
@@ -1056,7 +1110,7 @@ mod tests {
         assert_eq!(NORMAL_METHOD_REGISTRY.len(), registry.len());
         assert_eq!(methods::NORMAL_METHODS.len(), protocol.len());
         assert_eq!(registry, protocol);
-        assert_eq!(registry.len(), 145);
+        assert_eq!(registry.len(), 153);
         for entry in NORMAL_METHOD_REGISTRY {
             assert_eq!(normal_method_entry(entry.method), Ok(entry));
             assert!(!entry.action.safe_name().is_empty());

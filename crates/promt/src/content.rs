@@ -34,14 +34,16 @@ pub const ASSISTANT_SAFETY_LINES: [&str; 3] = [
 pub const TOOL_RECOVERY_POLICY_PROMPT: &str = "When a tool result indicates failure (especially shell exec with non-zero `exit_code`, `timed_out=true`, or explicit error output), do not treat it as final. First diagnose the failure from tool output, then run a corrected tool call when needed. For web tasks prefer this chain: web_search -> web_fetch -> download_url (to save artifacts). Only provide a final answer after tools succeed or after you clearly explain why retry is not possible.";
 
 pub const TOOL_USAGE_POLICY_PROMPT: &str = concat!(
-    "- Use `write_file` to create a complete file from UTF-8 content or replace a file with complete known contents.\n",
-    "- Before replacing an existing file, call `read_file` for the complete current file unless exact `expected_sha256` or `expected_mtime_ms` preconditions are already available.\n",
-    "- Use `edit_file` for precise edits to an existing file whose contents are valid UTF-8, such as source code, configs, Markdown, JSON, or YAML, after a complete `read_file` or exact explicit preconditions.\n",
-    "- For `edit_file`, copy the exact file text into `old_string` without `read_file` line-number prefixes or tabs; include enough surrounding context for a unique match.\n",
-    "- Leave `replace_all` false unless every exact occurrence should be replaced.\n",
+    "- The filesystem hierarchy is: `read_file` for bounded/paginated text inspection, `list_dir` for directory discovery, `grep_files` for scoped text search, and `apply_patch` as the only general text mutator.\n",
+    "- Use `apply_patch` for source code, Markdown, JSON, YAML, configs, notes, and ordinary UTF-8 text. Its current description and input schema contain the complete Add/Update/Move/Delete syntax, call format, and examples; follow them exactly and do not invent directives or look for a second general writer.\n",
+    "- Filesystem paths may be relative to the current working directory or absolute when they are inside a root authorized for this turn. The current directory and authorized roots are supplied for each turn and can differ between turns.\n",
+    "- Read unfamiliar files before updating them and include enough unchanged context for a unique match. A pure rename is `Update File` followed by `Move to` with no hunk.\n",
+    "- If a patch fails, follow its concrete diagnostic and corrected example. Re-read after stale or ambiguous context, and never retry the same failed patch unchanged.\n",
+    "- `full access` removes approval dialogs only. It does not disable path/sandbox checks, parser limits, cancellation, or filesystem permissions.\n",
+    "- Use the appropriate formatter, generator, compiler, or migration command when it owns the output; do not hand-edit generated files merely to force a desired result.\n",
     "- Use `write_stdin` only to send input to an already-running `exec_command` session; do not use it to create or edit files.\n",
-    "- Do not use `exec_command`, sed, perl, or shell heredocs for ordinary file edits when `edit_file`, `write_file`, or `apply_patch` are available.\n",
-    "- Use `apply_patch` for coordinated diff-style patches, especially multi-file changes or changes where reviewing a unified diff is clearer than a single exact replacement.",
+    "- Do not use `exec_command`, sed, perl, or shell heredocs for ordinary file edits when `apply_patch` is available.\n",
+    "- Review the structured patch result; never assume a failed or partial patch was fully applied.",
 );
 
 pub const ARTIFACT_OUTPUT_CONTRACT_PROMPT: &str = concat!(
@@ -224,21 +226,32 @@ mod tests {
     }
 
     #[test]
-    fn tool_usage_policy_distinguishes_file_write_tools() {
-        assert!(TOOL_USAGE_POLICY_PROMPT.contains("`write_file`"));
-        assert!(TOOL_USAGE_POLICY_PROMPT.contains("`edit_file`"));
+    fn tool_usage_policy_identifies_one_text_mutator() {
         assert!(TOOL_USAGE_POLICY_PROMPT.contains("`read_file`"));
         assert!(TOOL_USAGE_POLICY_PROMPT.contains("source code"));
         assert!(TOOL_USAGE_POLICY_PROMPT.contains("configs"));
-        assert!(TOOL_USAGE_POLICY_PROMPT.contains("valid UTF-8"));
-        assert!(TOOL_USAGE_POLICY_PROMPT.contains("complete current file"));
-        assert!(TOOL_USAGE_POLICY_PROMPT.contains("without `read_file` line-number prefixes"));
-        assert!(TOOL_USAGE_POLICY_PROMPT.contains("`replace_all` false"));
+        assert!(TOOL_USAGE_POLICY_PROMPT.contains("complete Add/Update/Move/Delete syntax"));
+        assert!(TOOL_USAGE_POLICY_PROMPT.contains("A pure rename"));
+        assert!(TOOL_USAGE_POLICY_PROMPT.contains("authorized roots"));
         assert!(TOOL_USAGE_POLICY_PROMPT.contains("`write_stdin` only"));
         assert!(TOOL_USAGE_POLICY_PROMPT.contains("`exec_command`, sed, perl"));
         assert!(TOOL_USAGE_POLICY_PROMPT.contains("ordinary file edits"));
         assert!(TOOL_USAGE_POLICY_PROMPT.contains("`apply_patch`"));
-        assert!(TOOL_USAGE_POLICY_PROMPT.contains("coordinated diff-style patches"));
-        assert!(!TOOL_USAGE_POLICY_PROMPT.contains("partial edits"));
+        assert!(TOOL_USAGE_POLICY_PROMPT.contains("structured patch result"));
+        assert!(!TOOL_USAGE_POLICY_PROMPT.contains("write_file"));
+        assert!(!TOOL_USAGE_POLICY_PROMPT.contains("edit_file"));
+        assert!(!TOOL_USAGE_POLICY_PROMPT.contains("If-Match"));
+        assert!(!TOOL_USAGE_POLICY_PROMPT.contains("If-Destination"));
+        assert!(!TOOL_USAGE_POLICY_PROMPT.contains("AppliedPatchLog"));
+        assert!(
+            !TOOL_USAGE_POLICY_PROMPT
+                .to_ascii_lowercase()
+                .contains("codex")
+        );
+        assert!(
+            !TOOL_USAGE_POLICY_PROMPT
+                .to_ascii_lowercase()
+                .contains("proposal")
+        );
     }
 }

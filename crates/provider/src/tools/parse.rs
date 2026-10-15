@@ -2,13 +2,6 @@ use crate::types::ProviderToolCall;
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
 
-#[derive(Debug, Clone)]
-pub(crate) struct EmbeddedToolPayload {
-    pub text: String,
-    pub reasoning_content: Option<String>,
-    pub tool_calls: Vec<ProviderToolCall>,
-}
-
 pub(crate) fn parse_tool_calls(
     tool_calls: Option<&Value>,
     function_call: Option<&Value>,
@@ -25,42 +18,6 @@ pub(crate) fn parse_tool_calls(
     }
 
     Ok(parsed)
-}
-
-pub(crate) fn parse_embedded_tool_payload(content: &str) -> Result<Option<EmbeddedToolPayload>> {
-    let Ok(value) = serde_json::from_str::<Value>(content) else {
-        return Ok(None);
-    };
-    let Some(object) = value.as_object() else {
-        return Ok(None);
-    };
-    if !object.contains_key("tool_calls") && !object.contains_key("function_call") {
-        return Ok(None);
-    }
-
-    let tool_calls = parse_tool_calls(object.get("tool_calls"), object.get("function_call"))?;
-    if tool_calls.is_empty() {
-        return Ok(None);
-    }
-
-    let text = object
-        .get("content")
-        .or_else(|| object.get("text"))
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_owned();
-
-    let reasoning_content = object
-        .get("reasoning_content")
-        .or_else(|| object.get("reasoning"))
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned);
-
-    Ok(Some(EmbeddedToolPayload {
-        text,
-        reasoning_content,
-        tool_calls,
-    }))
 }
 
 fn parse_tool_calls_from_value(value: &Value) -> Result<Vec<ProviderToolCall>> {
@@ -175,37 +132,23 @@ mod tests {
     }
 
     #[test]
-    fn parse_embedded_tool_payload_extracts_content_and_calls() {
-        let content = r#"{
-            "content": "running tool",
-            "tool_calls": [{
-                "id": "call_9",
-                "name": "read_file",
-                "arguments": "{\"path\":\"Cargo.toml\"}"
-            }]
-        }"#;
-
-        let parsed = parse_embedded_tool_payload(content)
-            .expect("payload should be valid")
-            .expect("payload should parse");
-        assert_eq!(parsed.text, "running tool");
-        assert_eq!(parsed.tool_calls.len(), 1);
-        assert_eq!(parsed.tool_calls[0].id, "call_9");
-        assert_eq!(parsed.tool_calls[0].name, "read_file");
-    }
-
-    #[test]
-    fn malformed_embedded_tool_payload_is_not_downgraded_to_plain_text() {
+    fn assistant_content_with_tool_like_json_remains_plain_text() {
         let content = r#"{
             "content": "fallback",
             "tool_calls": [{
                 "id": "call_1",
                 "name": "shell",
-                "arguments": "{"
+                "arguments": "{}"
             }]
         }"#;
 
-        let error = parse_embedded_tool_payload(content).unwrap_err();
-        assert!(error.to_string().contains("arguments"));
+        let value: Value = serde_json::from_str(content).expect("content is valid JSON");
+        assert!(
+            parse_tool_calls(None, None)
+                .expect("missing native fields are not a tool call")
+                .is_empty()
+        );
+        assert_eq!(value["content"], "fallback");
+        assert!(value.get("tool_calls").is_some());
     }
 }

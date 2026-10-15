@@ -65,6 +65,8 @@ pub enum TurnWorkState {
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct TurnWorkBlock {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub html_publications: Vec<crate::HtmlPublication>,
     pub turn_id: String,
     pub presentation: TurnWorkPresentation,
     pub state: TurnWorkState,
@@ -137,6 +139,9 @@ pub enum TimelineBlockKind {
     },
     #[serde(rename_all = "camelCase")]
     AssistantMessage {
+        /// Exact HTML content of this canonical response; source ownership is unchanged.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        html_publications: Vec<crate::HtmlPublication>,
         item_id: String,
         text: String,
         #[serde(default = "completed_turn_work_item_status")]
@@ -279,10 +284,24 @@ pub struct TurnWorkPageResponse {
     pub source_high_watermark: i64,
     #[serde(default)]
     pub projection_updated_at_unix_micros: i64,
-    pub work: TurnWorkBlock,
+    /// `None` is an authoritative tombstone: the Turn exists, but it does not
+    /// own a work projection (for example, a detached Task owns the work).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work: Option<TurnWorkBlock>,
     #[serde(default)]
     pub items: Vec<TurnWorkItem>,
     pub page: TimelinePageInfo,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnWorkTombstone {
+    pub turn_id: String,
+    pub block_id: String,
+    #[serde(default)]
+    pub source_high_watermark: i64,
+    #[serde(default)]
+    pub projection_updated_at_unix_micros: i64,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
@@ -328,6 +347,10 @@ pub struct ThreadTimelineBlocksChangedNotification {
     pub changed_block_ids: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub removed_block_ids: Vec<String>,
+    /// Revisioned removals prevent delayed pages or state notifications from
+    /// resurrecting a work row after its authoritative projection disappeared.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub turn_work_tombstones: Vec<TurnWorkTombstone>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub before_cursor: Option<TimelineCursor>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

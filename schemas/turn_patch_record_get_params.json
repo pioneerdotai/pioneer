@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TurnPatchRecordGetParams",
+  "type": "object",
+  "properties": {
+    "selector": {
+      "$ref": "#/$defs/PatchRecordSelector"
+    },
+    "threadId": {
+      "type": "string"
+    },
+    "turnId": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "threadId",
+    "turnId",
+    "selector"
+  ],
+  "$defs": {
+    "PatchRecordSelector": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "record_id"
+            },
+            "recordId": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "recordId"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "invocationId": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "const": "invocation"
+            }
+          },
+          "required": [
+            "kind",
+            "invocationId"
+          ]
+        }
+      ]
+    }
+  }
+}

@@ -538,10 +538,62 @@ fn task_value_str(value: &TaskValue) -> Option<&str> {
 
 fn task_artifact_error(message: impl Into<String>, failed_run_id: Option<String>) -> TaskError {
     TaskError {
+        recovery_diagnostic: None,
         code: "task_artifact_invalid".to_owned(),
         message: message.into(),
         class: TaskErrorClass::Validation,
         details: None,
         failed_run_id,
     }
+}
+
+/// HTML authored by this successful execution is response content, even when
+/// the model's final text does not repeat an artifact handle.
+pub(super) async fn include_html_response_artifacts(
+    processor: &MessageProcessor,
+    workspace: &str,
+    execution: &TaskRunTurn,
+    mut result: TaskResult,
+) -> Result<TaskResult> {
+    // These provenance keys are Gateway-owned, never model-authored metadata.
+    for artifact in &mut result.artifacts {
+        if let Some(TaskValue::Object(metadata)) = &mut artifact.metadata {
+            metadata.remove("htmlSourceThreadId");
+            metadata.remove("htmlSourceTurnId");
+        }
+    }
+    for publication in processor
+        .html_publications_for_response_turn(workspace, &execution.thread_id, &execution.turn_id)
+        .await?
+    {
+        if publication.artifact.status != pioneer_protocol::ArtifactStatus::Ready {
+            continue;
+        }
+        let metadata = Some(TaskValue::Object(BTreeMap::from([
+            (
+                "htmlSourceThreadId".into(),
+                TaskValue::String(publication.thread_id.clone()),
+            ),
+            (
+                "htmlSourceTurnId".into(),
+                TaskValue::String(publication.turn_id.clone()),
+            ),
+        ])));
+        if let Some(existing) = result.artifacts.iter_mut().find(|artifact| {
+            artifact.artifact_id.as_ref() == Some(&publication.artifact.artifact_id)
+                && artifact.version_id == publication.artifact.version_id
+        }) {
+            existing.metadata = metadata;
+            continue;
+        }
+        result.artifacts.push(TaskArtifact {
+            artifact_id: Some(publication.artifact.artifact_id.clone()),
+            version_id: publication.artifact.version_id.clone(),
+            path: None,
+            url: None,
+            mime_type: publication.artifact.mime_type.clone(),
+            metadata,
+        });
+    }
+    Ok(result)
 }

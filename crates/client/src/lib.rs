@@ -71,18 +71,22 @@ pub mod agents_doc;
 pub mod artifacts;
 pub mod authorization;
 pub mod avatars;
+pub mod cache;
 pub mod cli_runtime;
 pub mod composer;
 pub mod contracts;
 pub mod conversation;
+pub mod core;
 mod error;
 pub mod gateway;
 pub mod ids;
 mod local_file;
 pub mod mcp;
+pub mod navigation;
 pub mod notifications;
 pub mod platform;
 pub mod providers;
+pub mod request_state;
 pub mod rpc;
 pub mod runtime;
 pub mod schema;
@@ -99,3 +103,6 @@ pub mod voice;
 pub mod workspaces;
 
 pub use error::{ClientError, ClientResult};
+
+#[cfg(any(test, feature = "test-support"))]
+pub mod catalog_test_support;

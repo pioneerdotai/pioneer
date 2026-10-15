@@ -7,13 +7,216 @@ use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::sea_query::OnConflict;
 use sea_orm::sea_query::{Alias, Expr, ExprTrait, Query};
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, EntityTrait, FromQueryResult, QueryFilter, QueryOrder,
-    QuerySelect, Set,
+    ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set,
 };
+use std::error::Error as StdError;
+use std::fmt;
 
 use crate::task_events::{AppendedTaskEvent, TaskEventAppendStatus, TaskEventPayload};
 
 const DB_ID_LEN: usize = 21;
+
+#[derive(Clone, Debug)]
+pub struct PreparedTaskEvent {
+    id: String,
+    task_id: String,
+    run_id: Option<String>,
+    thread_id: Option<String>,
+    turn_id: Option<String>,
+    event_type: String,
+    idempotency_key: Option<String>,
+    payload_json: String,
+    payload: TaskEventPayload,
+    semantically_matching_existing: Option<SemanticallyMatchingExistingTaskEvent>,
+    pub(crate) gate_payloads: Option<super::native_terminal_effect_outbox::PreparedGatePayloads>,
+    candidate_gate_resolution:
+        Option<super::native_terminal_effect_outbox::PreparedCandidateGateResolution>,
+    candidate_projection: Option<super::task_result_candidate::PreparedTaskResultCandidate>,
+    review_projection: Option<super::task_result_review_event::PreparedTaskResultReviewEvent>,
+    delivery_authority: Option<super::task_actor_contract::PreparedTaskDeliveryAuthority>,
+    projection: crate::task_projector::PreparedTaskProjection,
+    delivery_boundary: Option<crate::task_projector::PreparedDeliveryAuthorityBoundary>,
+}
+
+#[derive(Clone, Debug)]
+struct SemanticallyMatchingExistingTaskEvent {
+    id: String,
+    payload: TaskEventPayload,
+}
+
+#[derive(Debug)]
+struct TaskEventIdempotencyPreflightRace {
+    idempotency_key: String,
+}
+
+impl fmt::Display for TaskEventIdempotencyPreflightRace {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "task event idempotency key `{}` changed after preflight",
+            self.idempotency_key
+        )
+    }
+}
+
+impl StdError for TaskEventIdempotencyPreflightRace {}
+
+pub(crate) fn is_idempotency_preflight_race(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<TaskEventIdempotencyPreflightRace>()
+            .is_some()
+    })
+}
+
+impl PreparedTaskEvent {
+    pub fn prepare(payload: TaskEventPayload) -> Result<Self> {
+        let projection = crate::task_projector::PreparedTaskProjection::prepare(&payload)?;
+        let candidate_projection = match &payload {
+            TaskEventPayload::TaskResultCandidateCreated { candidate }
+            | TaskEventPayload::TaskResultCandidateAccepted { candidate, .. }
+            | TaskEventPayload::TaskResultCandidateRejected { candidate, .. }
+            | TaskEventPayload::TaskResultCandidateCancelled { candidate, .. } => Some(
+                super::task_result_candidate::prepare_protocol_candidate(candidate)?,
+            ),
+            _ => None,
+        };
+        let review_projection = match &payload {
+            TaskEventPayload::TaskResultReviewEventRecorded { review_event } => {
+                Some(super::task_result_review_event::prepare_protocol_review_event(review_event)?)
+            }
+            _ => None,
+        };
+        let task_id = payload.task_id().to_owned();
+        let run_id = payload.run_id().map(str::to_owned);
+        let thread_id = payload.thread_id().map(str::to_owned);
+        let turn_id = payload.turn_id().map(str::to_owned);
+        let event_type = payload.event_type().to_owned();
+        let idempotency_key = payload.idempotency_key();
+        let payload_json =
+            serde_json::to_string(&payload).context("failed to serialize task event payload")?;
+        Ok(Self {
+            id: generate_id(DB_ID_LEN),
+            task_id,
+            run_id,
+            thread_id,
+            turn_id,
+            event_type,
+            idempotency_key,
+            payload_json,
+            payload,
+            semantically_matching_existing: None,
+            gate_payloads: None,
+            candidate_gate_resolution: None,
+            candidate_projection,
+            review_projection,
+            delivery_authority: None,
+            projection,
+            delivery_boundary: None,
+        })
+    }
+
+    pub async fn preflight_idempotency<C: ConnectionTrait>(mut self, db: &C) -> Result<Self> {
+        let Some(idempotency_key) = self.idempotency_key.as_deref() else {
+            return Ok(self);
+        };
+        if let Some(existing) =
+            find_event_by_idempotency_key(db, &self.task_id, idempotency_key).await?
+        {
+            let existing = existing_event_outcome(existing, &self.payload, idempotency_key)?;
+            self.semantically_matching_existing = Some(SemanticallyMatchingExistingTaskEvent {
+                id: existing.id,
+                payload: existing.payload,
+            });
+        }
+        Ok(self)
+    }
+
+    pub(crate) fn validate_delivery_start_fields(&self) -> Result<()> {
+        self.projection.validate_delivery_start_fields()
+    }
+
+    pub(crate) fn validate_delivery_fields(&self) -> Result<()> {
+        self.projection.validate_delivery_fields()
+    }
+
+    pub(crate) fn with_delivery_rows(
+        mut self,
+        delivery: pioneer_entity::task_delivery::Model,
+        attempt: Option<pioneer_entity::task_delivery_attempt::Model>,
+    ) -> Self {
+        self.projection = self.projection.with_delivery_rows(delivery, attempt);
+        self
+    }
+
+    pub(crate) fn validate_delivery_identity(
+        &self,
+        row: &pioneer_entity::task_delivery::Model,
+    ) -> Result<()> {
+        self.projection.validate_delivery_identity(row)
+    }
+
+    pub(crate) fn set_delivery_boundary(
+        &mut self,
+        boundary: crate::task_projector::PreparedDeliveryAuthorityBoundary,
+    ) {
+        self.delivery_boundary = Some(boundary);
+    }
+
+    pub(crate) fn take_delivery_boundary(
+        &mut self,
+    ) -> Option<crate::task_projector::PreparedDeliveryAuthorityBoundary> {
+        self.delivery_boundary.take()
+    }
+
+    pub(crate) fn take_delivery_authority(
+        &mut self,
+    ) -> Option<super::task_actor_contract::PreparedTaskDeliveryAuthority> {
+        self.delivery_authority.take()
+    }
+
+    pub(crate) fn payload(&self) -> &TaskEventPayload {
+        &self.payload
+    }
+
+    pub(crate) fn with_candidate_gate_resolution(
+        mut self,
+        prepared: Option<super::native_terminal_effect_outbox::PreparedCandidateGateResolution>,
+    ) -> Self {
+        self.candidate_gate_resolution = prepared;
+        self
+    }
+
+    pub(crate) fn candidate_projection(
+        &self,
+    ) -> Option<&super::task_result_candidate::PreparedTaskResultCandidate> {
+        self.candidate_projection.as_ref()
+    }
+
+    pub(crate) fn with_candidate_projection(
+        mut self,
+        prepared: Option<super::task_result_candidate::PreparedTaskResultCandidate>,
+    ) -> Self {
+        self.candidate_projection = prepared;
+        self
+    }
+
+    pub(crate) fn with_review_projection(
+        mut self,
+        prepared: Option<super::task_result_review_event::PreparedTaskResultReviewEvent>,
+    ) -> Self {
+        self.review_projection = prepared;
+        self
+    }
+
+    pub(crate) fn with_delivery_authority(
+        mut self,
+        prepared: Option<super::task_actor_contract::PreparedTaskDeliveryAuthority>,
+    ) -> Self {
+        self.delivery_authority = prepared;
+        self
+    }
+}
 
 pub async fn append_event<C: ConnectionTrait>(
     db: &C,
@@ -21,22 +224,50 @@ pub async fn append_event<C: ConnectionTrait>(
     created_at: DateTimeWithTimeZone,
     idempotency_key: Option<&str>,
 ) -> Result<AppendedTaskEvent> {
-    let task_id = payload.task_id().to_owned();
-    if let Some(idempotency_key) = idempotency_key
+    let mut prepared = PreparedTaskEvent::prepare(payload.clone())?;
+    prepared.idempotency_key = idempotency_key.map(str::to_owned);
+    let prepared = prepared.preflight_idempotency(db).await?;
+    append_prepared_event(db, prepared, created_at).await
+}
+
+pub async fn append_prepared_event<C: ConnectionTrait>(
+    db: &C,
+    prepared: PreparedTaskEvent,
+    created_at: DateTimeWithTimeZone,
+) -> Result<AppendedTaskEvent> {
+    if let Some(idempotency_key) = prepared.idempotency_key.as_deref()
         && let Some(existing) =
-            find_event_by_idempotency_key(db, task_id.as_str(), idempotency_key).await?
+            find_event_by_idempotency_key(db, prepared.task_id.as_str(), idempotency_key).await?
     {
-        return existing_event_outcome(existing, payload, idempotency_key);
+        return existing_event_outcome_after_preflight(
+            existing,
+            &prepared.payload,
+            prepared.payload_json.as_str(),
+            prepared.semantically_matching_existing.as_ref(),
+            idempotency_key,
+        );
     }
 
-    let run_id = payload.run_id().map(str::to_owned);
-    let thread_id = payload.thread_id().map(str::to_owned);
-    let turn_id = payload.turn_id().map(str::to_owned);
-    let event_type = payload.event_type().to_owned();
-    let payload_json =
-        serde_json::to_string(payload).context("failed to serialize task event payload")?;
+    let PreparedTaskEvent {
+        id,
+        task_id,
+        run_id,
+        thread_id,
+        turn_id,
+        event_type,
+        idempotency_key,
+        payload_json,
+        payload,
+        semantically_matching_existing,
+        gate_payloads: _,
+        candidate_gate_resolution,
+        candidate_projection,
+        review_projection,
+        delivery_authority,
+        projection,
+        delivery_boundary: _,
+    } = prepared;
     let sequence = next_sequence_for_task(db, task_id.as_str()).await?;
-    let id = generate_id(DB_ID_LEN);
 
     let mut insert = Query::insert();
     insert
@@ -61,17 +292,23 @@ pub async fn append_event<C: ConnectionTrait>(
             turn_id.clone().into(),
             sequence.into(),
             event_type.clone().into(),
-            idempotency_key.map(str::to_owned).into(),
-            payload_json.into(),
+            idempotency_key.clone().into(),
+            payload_json.clone().into(),
             created_at.into(),
         ]);
 
     if let Err(error) = db.execute(&insert).await {
-        if let Some(idempotency_key) = idempotency_key
+        if let Some(idempotency_key) = idempotency_key.as_deref()
             && let Some(existing) =
                 find_event_by_idempotency_key(db, task_id.as_str(), idempotency_key).await?
         {
-            return existing_event_outcome(existing, payload, idempotency_key);
+            return existing_event_outcome_after_preflight(
+                existing,
+                &payload,
+                payload_json.as_str(),
+                semantically_matching_existing.as_ref(),
+                idempotency_key,
+            );
         }
         return Err(error).context("failed to append task event");
     }
@@ -84,17 +321,77 @@ pub async fn append_event<C: ConnectionTrait>(
         turn_id,
         sequence,
         event_type,
-        idempotency_key: idempotency_key.map(str::to_owned),
-        payload: payload.clone(),
+        idempotency_key,
+        payload,
         workspace_id: None,
         root_task_id: None,
         parent_task_id: None,
         created_at,
         append_status: TaskEventAppendStatus::Inserted,
+        candidate_gate_resolution,
+        candidate_projection,
+        review_projection,
+        delivery_authority,
+        projection,
     })
 }
 
-async fn find_event_by_idempotency_key<C: ConnectionTrait>(
+fn existing_event_outcome_after_preflight(
+    model: task_event::Model,
+    attempted_payload: &TaskEventPayload,
+    attempted_payload_json: &str,
+    preflight: Option<&SemanticallyMatchingExistingTaskEvent>,
+    idempotency_key: &str,
+) -> Result<AppendedTaskEvent> {
+    let payload = if model.payload_json == attempted_payload_json {
+        attempted_payload.clone()
+    } else if let Some(preflight) = preflight.filter(|preflight| preflight.id == model.id) {
+        preflight.payload.clone()
+    } else {
+        // Deserializing and semantically comparing an unexpected row can be
+        // arbitrarily CPU-heavy. Release the writer and let the operation's
+        // next preflight resolve it through the reader pool instead.
+        return Err(TaskEventIdempotencyPreflightRace {
+            idempotency_key: idempotency_key.to_owned(),
+        }
+        .into());
+    };
+    Ok(appended_task_event_from_known_payload(
+        model,
+        payload,
+        TaskEventAppendStatus::AlreadyExists,
+    ))
+}
+
+fn appended_task_event_from_known_payload(
+    model: task_event::Model,
+    payload: TaskEventPayload,
+    append_status: TaskEventAppendStatus,
+) -> AppendedTaskEvent {
+    AppendedTaskEvent {
+        id: model.id,
+        task_id: model.task_id,
+        run_id: model.run_id,
+        thread_id: model.thread_id,
+        turn_id: model.turn_id,
+        sequence: model.sequence,
+        event_type: model.event_type,
+        idempotency_key: model.idempotency_key,
+        payload,
+        workspace_id: None,
+        root_task_id: None,
+        parent_task_id: None,
+        created_at: model.created_at,
+        append_status,
+        candidate_gate_resolution: None,
+        candidate_projection: None,
+        review_projection: None,
+        delivery_authority: None,
+        projection: Default::default(),
+    }
+}
+
+pub(crate) async fn find_event_by_idempotency_key<C: ConnectionTrait>(
     db: &C,
     task_id: &str,
     idempotency_key: &str,
@@ -115,6 +412,7 @@ fn existing_event_outcome(
     let existing = appended_task_event_from_model(model, TaskEventAppendStatus::AlreadyExists)?;
     if existing.payload != *attempted_payload
         && !equivalent_cancelled_terminal_payload(&existing.payload, attempted_payload)
+        && !equivalent_replayed_task_run_turn_terminal_payload(&existing.payload, attempted_payload)
     {
         anyhow::bail!(
             "task event idempotency key `{}` already exists with a different payload",
@@ -122,6 +420,51 @@ fn existing_event_outcome(
         );
     }
     Ok(existing)
+}
+
+fn equivalent_replayed_task_run_turn_terminal_payload(
+    existing: &TaskEventPayload,
+    attempted: &TaskEventPayload,
+) -> bool {
+    let (existing_turn, existing_error, attempted_turn, attempted_error) =
+        match (existing, attempted) {
+            (
+                TaskEventPayload::TaskRunTurnFailed {
+                    task_run_turn: existing_turn,
+                    error: existing_error,
+                },
+                TaskEventPayload::TaskRunTurnFailed {
+                    task_run_turn: attempted_turn,
+                    error: attempted_error,
+                },
+            )
+            | (
+                TaskEventPayload::TaskRunTurnBlocked {
+                    task_run_turn: existing_turn,
+                    error: existing_error,
+                },
+                TaskEventPayload::TaskRunTurnBlocked {
+                    task_run_turn: attempted_turn,
+                    error: attempted_error,
+                },
+            ) => (
+                existing_turn,
+                existing_error,
+                attempted_turn,
+                attempted_error,
+            ),
+            _ => return false,
+        };
+
+    if existing_error != attempted_error {
+        return false;
+    }
+
+    let mut existing_turn = existing_turn.clone();
+    let mut attempted_turn = attempted_turn.clone();
+    existing_turn.completed_at = None;
+    attempted_turn.completed_at = None;
+    existing_turn == attempted_turn
 }
 
 fn equivalent_cancelled_terminal_payload(
@@ -168,6 +511,25 @@ fn terminal_outcome(payload: &TaskEventPayload) -> Option<TerminalOutcome> {
     }
 }
 
+pub(crate) async fn find_queued_delivery_for_run<C: ConnectionTrait>(
+    db: &C,
+    run_id: &str,
+) -> Result<Option<task_event::Model>> {
+    let mut rows = task_event::Entity::find()
+        .filter(task_event::Column::RunId.eq(run_id.to_owned()))
+        .filter(
+            task_event::Column::EventType
+                .eq(pioneer_protocol::constants::events::TASK_DELIVERY_QUEUED),
+        )
+        .limit(2)
+        .all(db)
+        .await?;
+    if rows.len() > 1 {
+        anyhow::bail!("terminal Task run has multiple queued deliveries");
+    }
+    Ok(rows.pop())
+}
+
 pub async fn list_events_for_task<C: ConnectionTrait>(
     db: &C,
     task_id: &str,
@@ -200,29 +562,77 @@ pub async fn list_event_task_ids<C: ConnectionTrait>(db: &C) -> Result<Vec<Strin
         .context("failed to query task event task ids")
 }
 
-pub async fn list_pending_fanout_task_ids<C: ConnectionTrait>(
-    db: &C,
-    after_task_id: Option<&str>,
-    limit: u64,
-) -> Result<Vec<String>> {
-    let mut query = task_event_fanout_cursor::Entity::find()
+pub(crate) fn fanout_metadata_query(
+    task_id: &str,
+    after: i64,
+    limit: usize,
+) -> sea_orm::Select<task_event::Entity> {
+    // Bundled SQLite 3.51.3 recognizes the direct column argument and sets
+    // OP_Column's OPFLAG_BYTELENARG. No CAST/content conversion before budget.
+    task_event::Entity::find()
         .select_only()
-        .column(task_event_fanout_cursor::Column::TaskId)
-        .filter(Expr::cust(
-            "EXISTS (SELECT 1 FROM task_event AS pending_event \
-             WHERE pending_event.task_id = task_event_fanout_cursor.task_id \
-             AND pending_event.sequence > task_event_fanout_cursor.last_sequence)",
-        ));
-    if let Some(after_task_id) = after_task_id {
-        query = query.filter(task_event_fanout_cursor::Column::TaskId.gt(after_task_id.to_owned()));
-    }
-    query
-        .order_by_asc(task_event_fanout_cursor::Column::TaskId)
-        .limit(std::cmp::max(limit, 1))
-        .into_tuple::<String>()
+        .columns([task_event::Column::Id, task_event::Column::Sequence])
+        .column_as(Expr::cust("octet_length(payload_json)"), "payload_bytes")
+        .filter(task_event::Column::TaskId.eq(task_id))
+        .filter(task_event::Column::Sequence.gt(after))
+        .order_by_asc(task_event::Column::Sequence)
+        .limit(limit.min(128) as u64)
+}
+
+/// First fetch IDs/sequence/byte lengths, then only an admissible prefix.
+/// Oversized immutable events are supported singly, with no new domain limit.
+pub(crate) async fn fanout_page<C: ConnectionTrait>(
+    db: &C,
+    task_id: &str,
+    after: i64,
+    limit: usize,
+    bytes_left: &mut usize,
+    allow_oversized: bool,
+) -> Result<super::task_event_fanout::TaskEventFanoutPage<task_event::Model>> {
+    let bytes = *bytes_left;
+    let metadata = fanout_metadata_query(task_id, after, limit)
+        .into_tuple::<(String, i64, i64)>()
         .all(db)
-        .await
-        .context("failed to query task event fanout backlog")
+        .await?;
+    use super::task_event_fanout::TaskEventFanoutPage;
+    let mut ids = Vec::new();
+    let mut used = 0usize;
+    for (id, _, length) in metadata {
+        let length = usize::try_from(length).context("invalid task event byte length")?;
+        if length > bytes.saturating_sub(used) {
+            if ids.is_empty()
+                && allow_oversized
+                && length > super::task_event_fanout::TASK_EVENT_FANOUT_BYTE_BUDGET
+            {
+                ids.push(id);
+                used = length;
+            }
+            if ids.is_empty() {
+                return Ok(TaskEventFanoutPage::BudgetDeferred);
+            }
+            break;
+        }
+        used = used.saturating_add(length);
+        ids.push(id);
+    }
+    if ids.is_empty() {
+        return Ok(TaskEventFanoutPage::Prefix {
+            events: Vec::new(),
+            bytes: 0,
+        });
+    }
+    // Charge before the full read: an error or unwind cannot reuse bytes
+    // whose payload may already have been fetched. No reader is held here.
+    *bytes_left = bytes_left.saturating_sub(used);
+    let rows = task_event::Entity::find()
+        .filter(task_event::Column::Id.is_in(ids))
+        .order_by_asc(task_event::Column::Sequence)
+        .all(db)
+        .await?;
+    Ok(TaskEventFanoutPage::Prefix {
+        events: rows,
+        bytes: used,
+    })
 }
 
 pub async fn find_fanout_cursor<C: ConnectionTrait>(db: &C, task_id: &str) -> Result<Option<i64>> {
@@ -317,43 +727,6 @@ pub async fn advance_fanout_cursor<C: ConnectionTrait>(
     Ok(())
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, FromQueryResult)]
-pub struct MissingFanoutCursorHighWatermark {
-    pub task_id: String,
-    pub last_sequence: i64,
-}
-
-pub async fn list_missing_fanout_cursor_high_watermarks<C: ConnectionTrait>(
-    db: &C,
-    limit: u64,
-) -> Result<Vec<MissingFanoutCursorHighWatermark>> {
-    let tasks_with_cursors = Query::select()
-        .column(task_event_fanout_cursor::Column::TaskId)
-        .from(task_event_fanout_cursor::Entity)
-        .to_owned();
-    let materialized_tasks = Query::select()
-        .column(task::Column::Id)
-        .from(task::Entity)
-        .to_owned();
-
-    task_event::Entity::find()
-        .select_only()
-        .column(task_event::Column::TaskId)
-        .column_as(
-            Expr::col(task_event::Column::Sequence).max(),
-            "last_sequence",
-        )
-        .filter(task_event::Column::TaskId.in_subquery(materialized_tasks))
-        .filter(task_event::Column::TaskId.not_in_subquery(tasks_with_cursors))
-        .group_by(task_event::Column::TaskId)
-        .order_by_asc(task_event::Column::TaskId)
-        .limit(std::cmp::max(limit, 1))
-        .into_model::<MissingFanoutCursorHighWatermark>()
-        .all(db)
-        .await
-        .context("failed to list task event fanout cursor backfill candidates")
-}
-
 pub async fn list_events_for_run<C: ConnectionTrait>(
     db: &C,
     run_id: &str,
@@ -424,6 +797,11 @@ pub(crate) fn appended_task_event_from_model(
         parent_task_id: None,
         created_at: model.created_at,
         append_status,
+        candidate_gate_resolution: None,
+        candidate_projection: None,
+        review_projection: None,
+        delivery_authority: None,
+        projection: Default::default(),
     })
 }
 
@@ -449,4 +827,94 @@ async fn next_sequence_for_task<C: ConnectionTrait>(db: &C, task_id: &str) -> Re
         .unwrap_or(0);
 
     Ok(max_sequence + 1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pioneer_protocol::{
+        TaskError, TaskErrorClass, TaskRunTurn, TaskRunTurnKind, TaskRunTurnStatus,
+    };
+
+    fn terminal_turn(status: TaskRunTurnStatus, completed_at: i64) -> TaskRunTurn {
+        TaskRunTurn {
+            id: "task-run-turn-1".to_owned(),
+            task_id: "task-1".to_owned(),
+            run_id: "run-1".to_owned(),
+            execution_id: Some("execution-1".to_owned()),
+            thread_id: "thread-1".to_owned(),
+            turn_id: "turn-1".to_owned(),
+            kind: TaskRunTurnKind::Initial,
+            round: 0,
+            sequence: 0,
+            status,
+            reviews_candidate_id: None,
+            requested_by_candidate_id: None,
+            requested_by_review_event_id: None,
+            created_at: 10,
+            started_at: Some(11),
+            completed_at: Some(completed_at),
+        }
+    }
+
+    fn cancelled_error() -> TaskError {
+        TaskError {
+            recovery_diagnostic: None,
+            code: "task_cli_runtime_start_superseded".to_owned(),
+            message: "task run became terminal before activation".to_owned(),
+            class: TaskErrorClass::Cancelled,
+            details: None,
+            failed_run_id: Some("run-1".to_owned()),
+        }
+    }
+
+    #[test]
+    fn repeated_blocked_turn_terminalization_ignores_only_completion_time() {
+        let existing = TaskEventPayload::TaskRunTurnBlocked {
+            task_run_turn: terminal_turn(TaskRunTurnStatus::Blocked, 20),
+            error: Some(cancelled_error()),
+        };
+        let replay = TaskEventPayload::TaskRunTurnBlocked {
+            task_run_turn: terminal_turn(TaskRunTurnStatus::Blocked, 30),
+            error: Some(cancelled_error()),
+        };
+
+        assert!(equivalent_replayed_task_run_turn_terminal_payload(
+            &existing, &replay
+        ));
+    }
+
+    #[test]
+    fn repeated_failed_turn_terminalization_ignores_only_completion_time() {
+        let existing = TaskEventPayload::TaskRunTurnFailed {
+            task_run_turn: terminal_turn(TaskRunTurnStatus::Failed, 20),
+            error: Some(cancelled_error()),
+        };
+        let replay = TaskEventPayload::TaskRunTurnFailed {
+            task_run_turn: terminal_turn(TaskRunTurnStatus::Failed, 30),
+            error: Some(cancelled_error()),
+        };
+
+        assert!(equivalent_replayed_task_run_turn_terminal_payload(
+            &existing, &replay
+        ));
+    }
+
+    #[test]
+    fn repeated_turn_terminalization_rejects_meaningful_payload_changes() {
+        let existing = TaskEventPayload::TaskRunTurnBlocked {
+            task_run_turn: terminal_turn(TaskRunTurnStatus::Blocked, 20),
+            error: Some(cancelled_error()),
+        };
+        let mut different_error = cancelled_error();
+        different_error.code = "different_reason".to_owned();
+        let replay = TaskEventPayload::TaskRunTurnBlocked {
+            task_run_turn: terminal_turn(TaskRunTurnStatus::Blocked, 30),
+            error: Some(different_error),
+        };
+
+        assert!(!equivalent_replayed_task_run_turn_terminal_payload(
+            &existing, &replay
+        ));
+    }
 }

@@ -9,7 +9,7 @@ use std::str::FromStr;
 use crate::TaskRuntimeResult;
 
 const DEFAULT_RUN_ALL_MISSED_MAX_COUNT: u32 = 32;
-const MAX_CATCH_UP_SCAN_COUNT: usize = 10_000;
+const CRON_SEARCH_SECONDS: i64 = 366 * 24 * 60 * 60;
 const MAX_TASK_DEPENDENCIES: usize = 128;
 const MIN_TASK_INTERVAL_SECONDS: i64 = 10;
 
@@ -227,9 +227,7 @@ fn missed_scan_limit(policy: TaskTriggerCatchUpPolicy) -> usize {
             .max_count
             .unwrap_or(DEFAULT_RUN_ALL_MISSED_MAX_COUNT)
             .max(1) as usize,
-        TaskTriggerCatchUpMode::RunOnceForLatestMissed | TaskTriggerCatchUpMode::SkipMissed => {
-            MAX_CATCH_UP_SCAN_COUNT
-        }
+        TaskTriggerCatchUpMode::RunOnceForLatestMissed | TaskTriggerCatchUpMode::SkipMissed => 1,
     }
 }
 
@@ -273,6 +271,22 @@ fn missed_fire_times(
         };
     }
 
+    if let TaskTriggerSpec::Cron {
+        cron_expr,
+        timezone,
+        ..
+    } = &trigger.spec
+        && matches!(
+            catch_up_policy_for_trigger(trigger).mode,
+            TaskTriggerCatchUpMode::RunOnceForLatestMissed | TaskTriggerCatchUpMode::SkipMissed
+        )
+    {
+        // Seek from now instead of enumerating the entire missed history.
+        // Walk UTC minutes so both occurrences of a repeated local time are
+        // ordered correctly, and nonexistent local times are never emitted.
+        return latest_cron_fire(cron_expr, timezone, first_due_at, now).map(|latest| vec![latest]);
+    }
+
     let mut fire_times = Vec::new();
     let mut current = first_due_at;
     while current <= now && fire_times.len() < limit {
@@ -284,18 +298,6 @@ fn missed_fire_times(
             bail!("trigger `{}` did not advance after fire", trigger.id);
         }
         current = next;
-    }
-    if current <= now
-        && matches!(
-            catch_up_policy_for_trigger(trigger).mode,
-            TaskTriggerCatchUpMode::RunOnceForLatestMissed | TaskTriggerCatchUpMode::SkipMissed
-        )
-    {
-        bail!(
-            "trigger `{}` catch-up scan exceeded {} missed fires",
-            trigger.id,
-            MAX_CATCH_UP_SCAN_COUNT
-        );
     }
     Ok(fire_times)
 }
@@ -332,7 +334,7 @@ fn next_cron_fire(expr: &str, timezone: &str, now: i64) -> TaskRuntimeResult<i64
     let spec = CronSpec::parse(expr)?;
     let tz = validate_timezone(timezone)?;
     let mut candidate = now.saturating_add(60 - now.rem_euclid(60));
-    let limit = now.saturating_add(366 * 24 * 60 * 60);
+    let limit = now.saturating_add(CRON_SEARCH_SECONDS);
     while candidate <= limit {
         let utc = Utc
             .timestamp_opt(candidate, 0)
@@ -351,6 +353,38 @@ fn next_cron_fire(expr: &str, timezone: &str, now: i64) -> TaskRuntimeResult<i64
         candidate = candidate.saturating_add(60);
     }
     bail!("cron expression did not produce a fire time within one year")
+}
+
+fn latest_cron_fire(
+    expr: &str,
+    timezone: &str,
+    first_due_at: i64,
+    now: i64,
+) -> TaskRuntimeResult<i64> {
+    let spec = CronSpec::parse(expr)?;
+    let tz = validate_timezone(timezone)?;
+    let mut candidate = now.saturating_sub(now.rem_euclid(60));
+    // Keep the existing one-year cron search horizon. Its cost is bounded
+    // independently of downtime and does not hold any database resource.
+    let limit = first_due_at.max(now.saturating_sub(CRON_SEARCH_SECONDS));
+    while candidate >= limit {
+        let utc = Utc
+            .timestamp_opt(candidate, 0)
+            .single()
+            .context("failed to build UTC timestamp")?;
+        let local = utc.with_timezone(&tz);
+        if spec.matches(
+            i64::from(local.minute()),
+            i64::from(local.hour()),
+            i64::from(local.day()),
+            i64::from(local.month()),
+            i64::from(local.weekday().num_days_from_sunday()),
+        ) {
+            return Ok(candidate);
+        }
+        candidate = candidate.saturating_sub(60);
+    }
+    bail!("cron expression did not produce a missed fire time within one year")
 }
 
 #[derive(Debug, Clone)]
@@ -454,4 +488,176 @@ fn parse_cron_value(value: &str, min: i64, max: i64) -> TaskRuntimeResult<i64> {
         bail!("cron value `{parsed}` is outside {min}..={max}");
     }
     Ok(parsed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pioneer_protocol::TaskTriggerStatus;
+
+    fn cron_trigger(
+        expr: &str,
+        timezone: &str,
+        first_due_at: i64,
+        catch_up_policy: Option<TaskTriggerCatchUpPolicy>,
+    ) -> TaskTrigger {
+        TaskTrigger {
+            id: "cron_test".to_owned(),
+            task_id: "task_test".to_owned(),
+            status: TaskTriggerStatus::Active,
+            spec: TaskTriggerSpec::Cron {
+                cron_expr: expr.to_owned(),
+                timezone: timezone.to_owned(),
+                catch_up_policy,
+            },
+            next_fire_at: Some(first_due_at),
+            last_fire_at: None,
+            created_at: first_due_at,
+            updated_at: first_due_at,
+        }
+    }
+
+    fn utc(year: i32, month: u32, day: u32, hour: u32, minute: u32) -> i64 {
+        Utc.with_ymd_and_hms(year, month, day, hour, minute, 0)
+            .single()
+            .unwrap()
+            .timestamp()
+    }
+
+    #[test]
+    fn cron_latest_and_skip_recover_at_scan_boundary_and_after_years() {
+        let first = utc(2020, 1, 1, 0, 0);
+        let latest_fires = [
+            first + (10_000 - 1) * 60,
+            first + (10_001 - 1) * 60,
+            first + (100_000 - 1) * 60,
+            utc(2026, 10, 2, 12, 34),
+        ];
+        for policy in [None, Some(TaskTriggerCatchUpPolicy::skip_missed())] {
+            let trigger = cron_trigger("* * * * *", "UTC", first, policy);
+            for latest in latest_fires {
+                for now in [latest, latest + 59] {
+                    let plan = TaskTriggerCalculator::catch_up_plan(&trigger, now).unwrap();
+                    assert_eq!(plan.last_fire_at, Some(latest));
+                    assert_eq!(plan.next_fire_at, Some(latest + 60));
+                    assert_eq!(
+                        plan.fire_times,
+                        if policy.is_some() {
+                            vec![]
+                        } else {
+                            vec![latest]
+                        }
+                    );
+                    assert!(!plan.exhausted);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cron_run_all_keeps_oldest_first_and_bounded_resume_cursor() {
+        let first = utc(2020, 1, 1, 0, 0);
+        let mut trigger = cron_trigger(
+            "* * * * *",
+            "UTC",
+            first,
+            Some(TaskTriggerCatchUpPolicy::run_all_missed(4)),
+        );
+        let now = first + 20_000 * 60;
+        let plan = TaskTriggerCalculator::catch_up_plan(&trigger, now).unwrap();
+        assert_eq!(
+            plan.fire_times,
+            vec![first, first + 60, first + 120, first + 180]
+        );
+        trigger.next_fire_at = plan.next_fire_at;
+        trigger.last_fire_at = plan.last_fire_at;
+        let resumed = TaskTriggerCalculator::catch_up_plan(&trigger, now).unwrap();
+        assert_eq!(
+            resumed.fire_times,
+            vec![first + 240, first + 300, first + 360, first + 420]
+        );
+    }
+
+    #[test]
+    fn cron_latest_preserves_both_occurrences_during_dst_fallback() {
+        let first = utc(2024, 11, 3, 5, 30);
+        let second = utc(2024, 11, 3, 6, 30);
+        let trigger = cron_trigger("30 1 * * *", "America/New_York", first, None);
+        let between = TaskTriggerCalculator::catch_up_plan(&trigger, second - 15 * 60).unwrap();
+        assert_eq!(between.fire_times, vec![first]);
+        assert_eq!(between.next_fire_at, Some(second));
+        let after = TaskTriggerCalculator::catch_up_plan(&trigger, second + 15 * 60).unwrap();
+        assert_eq!(after.fire_times, vec![second]);
+        assert_eq!(after.next_fire_at, Some(utc(2024, 11, 4, 6, 30)));
+    }
+
+    #[test]
+    fn cron_latest_does_not_invent_a_fire_during_dst_spring_forward() {
+        let first = utc(2024, 3, 9, 7, 30);
+        let trigger = cron_trigger("30 2 * * *", "America/New_York", first, None);
+        let plan = TaskTriggerCalculator::catch_up_plan(&trigger, utc(2024, 3, 10, 8, 0)).unwrap();
+        assert_eq!(plan.fire_times, vec![first]);
+        assert_eq!(plan.next_fire_at, Some(utc(2024, 3, 11, 6, 30)));
+    }
+
+    #[test]
+    fn cron_latest_does_not_replay_before_its_due_timestamp() {
+        let first = utc(2026, 10, 2, 12, 34);
+        let trigger = cron_trigger("* * * * *", "UTC", first, None);
+        let before = TaskTriggerCalculator::catch_up_plan(&trigger, first - 1).unwrap();
+        assert!(before.fire_times.is_empty());
+        assert_eq!(before.next_fire_at, Some(first));
+        let due = TaskTriggerCalculator::catch_up_plan(&trigger, first).unwrap();
+        assert_eq!(due.fire_times, vec![first]);
+    }
+
+    #[test]
+    fn cron_latest_and_skip_match_forward_schedule_for_representative_specs() {
+        let cases = [
+            ("*/17 * * * *", "UTC", utc(2024, 2, 29, 12, 0)),
+            ("0 */6 * * *", "Europe/Moscow", utc(2026, 1, 1, 0, 0)),
+            ("0 7 * * 1-5", "America/New_York", utc(2024, 11, 3, 6, 45)),
+            ("0 0 1 * *", "UTC", utc(2026, 1, 1, 0, 0)),
+            // Lord Howe changes its UTC offset by thirty minutes.
+            ("45 1 * * *", "Australia/Lord_Howe", utc(2024, 4, 6, 15, 30)),
+            ("15 2 * * *", "Australia/Lord_Howe", utc(2024, 10, 5, 16, 0)),
+        ];
+        for (expr, timezone, now) in cases {
+            let now = now + 37;
+            let first = next_cron_fire(expr, timezone, now - 3 * 24 * 60 * 60).unwrap();
+            assert!(first <= now, "{expr} {timezone} must have a missed firing");
+            let mut latest = first;
+            let mut next = first;
+            while next <= now {
+                latest = next;
+                next = next_cron_fire(expr, timezone, latest).unwrap();
+            }
+            for policy in [None, Some(TaskTriggerCatchUpPolicy::skip_missed())] {
+                let trigger = cron_trigger(expr, timezone, first, policy);
+                let plan = TaskTriggerCalculator::catch_up_plan(&trigger, now).unwrap();
+                assert_eq!(plan.last_fire_at, Some(latest), "{expr} {timezone} {now}");
+                assert_eq!(plan.next_fire_at, Some(next), "{expr} {timezone} {now}");
+                assert_eq!(
+                    plan.fire_times,
+                    if policy.is_some() {
+                        vec![]
+                    } else {
+                        vec![latest]
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cron_sparse_annual_schedule_recovers_after_years() {
+        let first = utc(2020, 1, 1, 0, 0);
+        let latest = utc(2026, 1, 1, 0, 0);
+        let now = utc(2026, 10, 2, 12, 34);
+        let trigger = cron_trigger("0 0 1 1 *", "UTC", first, None);
+        let plan = TaskTriggerCalculator::catch_up_plan(&trigger, now).unwrap();
+        assert_eq!(plan.fire_times, vec![latest]);
+        assert_eq!(plan.last_fire_at, Some(latest));
+        assert_eq!(plan.next_fire_at, Some(utc(2027, 1, 1, 0, 0)));
+    }
 }

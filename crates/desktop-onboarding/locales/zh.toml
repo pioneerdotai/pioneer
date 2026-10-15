@@ -1,0 +1,199 @@
+[common]
+address = "地址"
+copy = "复制"
+name = "名称"
+ok = "确定"
+or = "或"
+activation_code = "激活码"
+
+[buttons]
+ok = "OK"
+add = "添加"
+cancel = "取消"
+save = "保存"
+dismiss = "关闭"
+
+[errors.command]
+exit_status = "退出状态 %{status}"
+failed_with_output = "`%{command_label}` 执行失败：%{details}"
+launchctl_print_failed = "无法运行 `launchctl print`"
+powershell_task_status_failed = "无法运行 powershell 检查计划任务状态"
+run_failed = "无法运行 `%{command_label}`"
+systemctl_is_active_failed = "无法运行 `systemctl --user is-active`"
+
+[errors.config]
+connect_timeout_positive = "`desktop.gateway.connect_timeout_ms` 必须大于 0"
+load_app = "无法加载应用配置"
+poll_interval_positive = "`desktop.gateway.poll_interval_ms` 必须大于 0"
+startup_timeout_positive = "`desktop.gateway.startup_timeout_ms` 必须大于 0"
+gateway_field_positive = "`desktop.gateway.%{field}` 必须大于 0"
+ws_ping_interval_positive = "`desktop.gateway.ws_ping_interval_ms` 必须大于 0"
+ws_pong_timeout_positive = "`desktop.gateway.ws_pong_timeout_ms` 必须大于 0"
+ws_reconnect_initial_positive = "`desktop.gateway.ws_reconnect_initial_ms` 必须大于 0"
+ws_reconnect_max_positive = "`desktop.gateway.ws_reconnect_max_ms` 必须大于 0"
+ws_reconnect_initial_le_max = "`desktop.gateway.ws_reconnect_initial_ms` 必须小于或等于 `desktop.gateway.ws_reconnect_max_ms`"
+ws_reconnect_jitter_percent_max = "`desktop.gateway.ws_reconnect_jitter_percent` 必须小于或等于 100，当前为 %{value}"
+
+[errors.gateway]
+address_conflict_inactive_service = "地址 `%{listen_addr}` 已被占用，但配置的服务 `%{service_name}` 未激活；请停止冲突进程/服务或修改 gateway.listen_addr"
+address_empty = "网关地址不能为空"
+address_already_exists = "网关 `%{address}` 已在网关列表中"
+id_not_found = "未找到网关 id `%{id}`"
+invalid_address = "网关地址 `%{normalized}` 无效；应为 HTTP(S) URL、host 或 host:port"
+local_delete_unsupported = "无法从网关列表中删除本地网关"
+remote_edit_only = "只能编辑远程网关"
+resolve_empty = "网关地址 `%{listen_addr}` 未解析到任何套接字地址"
+resolve_failed = "无法解析网关地址 `%{listen_addr}`"
+start_command_failed_manual_help = "无法自动安装或启动本地网关；请重试并检查本地网关配置"
+startup_timeout = "在 %{startup_timeout_ms}ms 内，网关服务未在 `%{listen_addr}` 变为可达"
+unreachable_verify = "网关 `%{address}` 不可达；请检查地址并确认网关正在运行"
+validation_timeout_positive = "远程网关验证超时必须为正数，当前为 %{timeout_ms} ms"
+
+[errors.registry]
+parse_failed = "无法解析网关注册表 `%{path}`"
+read_failed = "无法读取网关注册表 `%{path}`"
+serialize_failed = "无法序列化网关注册表"
+unsupported_version = "`%{path}` 中的网关注册表版本 `%{version}` 不受支持；期望 `%{current_registry_version}`"
+write_failed = "无法写入网关注册表 `%{path}`"
+
+[errors.runtime]
+ensure_home = "无法准备运行环境主目录"
+
+[errors.theme]
+watch_dir_failed = "无法监视主题目录"
+
+[errors.window]
+open_failed = "无法打开桌面窗口"
+
+[gateway.action]
+add = "添加网关"
+connect_remote = "连接远程网关"
+delete = "删除"
+edit = "编辑网关"
+reauthenticate = "重新连接"
+start_local = "启动本地网关"
+
+[gateway.add]
+description = "连接远程网关或启动本地网关。"
+description_remote_only = "连接远程网关。"
+title = "添加网关"
+
+[gateway.delete]
+confirm_description = "这只会从此桌面客户端移除网关，不会删除服务器上的网关数据。"
+confirm_title = "删除 %{name}？"
+
+[gateway.edit]
+description = "更新网关连接详情。"
+title = "编辑 %{name}"
+
+[gateway.endpoint]
+local_name = "本地网关"
+local_with_address = "本地 - %{address}"
+remote_name = "远程 %{index}"
+remote_with_address = "远程 - %{address}"
+
+[gateway.error]
+with_details = "网关错误：%{error}。"
+
+[gateway.initial]
+description = "请填写网关地址，或启动本地网关服务。"
+title = "连接网关"
+
+[gateway.popover]
+no_available = "没有可用网关。"
+
+[gateway.reauthenticate]
+description = "输入新的激活码，在不更改已保存网关的情况下重新连接此设备。"
+title = "重新连接 %{name}"
+
+[gateway.status]
+connected = "网关已连接"
+connecting = "正在连接网关..."
+connecting_named = "正在连接到 %{gateway_name}..."
+connecting_remote = "正在连接远程网关..."
+deleting = "正在删除网关..."
+failed_check = "检查网关状态失败：%{error}"
+local_conflict = "本地网关冲突：地址被其他进程占用。"
+local_conflict_at = "本地网关在 %{gateway_address} 冲突：地址被其他进程占用。"
+local_stopped = "本地网关已停止：%{gateway_address}。请启动本地网关或切换到远程。"
+not_configured = "网关尚未配置。请添加远程地址或启动本地网关。"
+remote_unavailable = "远程网关不可用：%{gateway_name} (%{gateway_address})"
+saving = "正在保存网关..."
+starting_local = "正在启动本地网关..."
+installing = "正在安装网关..."
+updating = "正在更新网关..."
+subsystem_failed = "网关子系统初始化失败：%{error}"
+subsystem_not_ready = "网关子系统尚未就绪"
+unavailable = "网关不可用"
+
+[gateway.notification]
+path_update_skipped = "网关已启动。对于 `pioneer` 命令，你可能需要在新的终端会话中将 %{bin_dir} 手动加入 PATH。"
+
+[gateway.session_terminal]
+authentication_required = "请使用新的激活码登录此网关。"
+revoked = "此设备会话已退出或被撤销。请重新登录以继续。"
+expired = "此设备会话已过期。请重新登录以继续。"
+compromised = "出于安全原因，此会话已关闭。请重新登录以继续。"
+principal_suspended = "你的账户已暂停，请联系网关管理员。"
+principal_removed = "你的账户已从此网关移除。"
+gateway_mismatch = "此会话属于另一个网关。请确认网关并重新配对。"
+storage_failed = "Pioneer 无法安全保存此设备会话。"
+
+[invitation.join]
+title = "邀请"
+one_time_warning = "此邀请是一次性凭据。请勿分享。"
+loading = "正在检查邀请…"
+display_name_label = "显示名称"
+display_name_placeholder = "你的名称"
+nickname_label = "昵称"
+nickname_placeholder = "your.nickname"
+avatar_label = "个人资料图片（可选）"
+avatar_choose = "选择图片"
+accept = "接受邀请"
+gateway = "Gateway：%{name}"
+inviter = "%{name} 邀请了你"
+workspaces = "工作区：%{names}"
+expires = "Unix 时间 %{timestamp} 过期"
+
+[invitation.join.transport]
+secure = "安全加密连接"
+insecure = "未加密连接"
+
+[invitation.join.error]
+title = "邀请不可用"
+invalid = "此邀请链接无效或不可用。"
+unavailable = "此邀请无效、已过期、已撤销或不可用。"
+display_name = "请输入有效的显示名称。"
+nickname = "昵称必须由 2–32 个 ASCII 字母、数字、句点、连字符或下划线组成。"
+nickname_unavailable = "该昵称已被使用。"
+avatar = "请选择不超过 256 KB 的图片。"
+storage = "无法安全保存新会话。请重试。"
+transport = "无法连接 Gateway。请重试。"
+
+
+[settings.profile]
+read_only = "只读个人资料"
+edit_title = "编辑账户"
+edit_username_title = "编辑用户名"
+done = "完成"
+first_name = "名字"
+last_name = "姓氏"
+name_hint = "输入你的姓名，并可选择添加个人照片。"
+change_photo = "更换照片"
+remove_photo = "移除照片"
+username = "用户名"
+username_hint = "选择一个公开用户名，让其他成员能够识别你。"
+username_rules = "可使用 2–32 个字母、数字、句点、下划线或连字符，并且必须以字母或数字开头。"
+error_invalid = "请输入有效姓名和用户名。"
+error_username_unavailable = "该用户名已被使用。"
+error_avatar = "请选择不超过 1024 × 1024 和 256 KB 的 PNG、JPEG 或 WebP 图片。"
+error_save = "无法保存资料，请重试。"
+
+[settings.profile.kind]
+superuser = "超级用户"
+member = "成员"
+unknown = "未知账户类型"
+
+
+[invitation.join.actions]
+retry = "重试"

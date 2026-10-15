@@ -7,3 +7,13 @@ pub mod health;
 pub mod notifications;
 pub mod presentation;
 pub mod upload;
+
+pub mod store;
+
+pub mod upload_flow;
+
+pub mod operations;
+
+pub mod types;
+
+pub mod route;

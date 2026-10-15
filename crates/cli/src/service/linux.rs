@@ -7,37 +7,51 @@ use tracing::info;
 
 use pioneer_config::InstallManagedBy;
 
-use super::{GatewayServiceWarning, SERVICE_MODE_ARG, ServiceSettings};
+use super::{GatewayServiceStartReport, GatewayServiceWarning, SERVICE_MODE_ARG, ServiceSettings};
 
 const LINUX_LINGER_WARNING_CODE: &str = "linux_linger_enable_failed";
 
-pub fn start_gateway_service(settings: &ServiceSettings) -> Result<Vec<GatewayServiceWarning>> {
-    let warnings = ensure_persistent_user_service(settings)?;
-    let service_unit = service_unit(settings.service_name.as_str());
-    let service_path = user_service_path(service_unit.as_str())?;
-    let service_dir = service_path
-        .parent()
-        .context("failed to get systemd service directory")?;
-    let executable = env::current_exe().context("failed to determine current executable path")?;
+pub fn start_gateway_service(
+    settings: &ServiceSettings,
+    report: &mut GatewayServiceStartReport,
+) -> Result<Vec<GatewayServiceWarning>> {
+    let warnings = report.observe("service.persistence.prepare", || {
+        ensure_persistent_user_service(settings)
+    })?;
+    let service_unit = report.observe("service.definition.prepare", || {
+        let service_unit = service_unit(settings.service_name.as_str());
+        let service_path = user_service_path(service_unit.as_str())?;
+        let service_dir = service_path
+            .parent()
+            .context("failed to get systemd service directory")?;
+        let executable =
+            env::current_exe().context("failed to determine current executable path")?;
 
-    fs::create_dir_all(service_dir).with_context(|| {
-        format!(
-            "failed to create systemd service directory at {}",
-            service_dir.display()
-        )
+        fs::create_dir_all(service_dir).with_context(|| {
+            format!(
+                "failed to create systemd service directory at {}",
+                service_dir.display()
+            )
+        })?;
+
+        let service_path_env = super::resolve_service_path();
+        let service_content =
+            render_linux_systemd_service(&executable, service_path_env.as_deref());
+        fs::write(&service_path, service_content).with_context(|| {
+            format!(
+                "failed to write systemd service file at {}",
+                service_path.display()
+            )
+        })?;
+        Ok(service_unit)
     })?;
 
-    let service_path_env = super::resolve_service_path();
-    let service_content = render_linux_systemd_service(&executable, service_path_env.as_deref());
-    fs::write(&service_path, service_content).with_context(|| {
-        format!(
-            "failed to write systemd service file at {}",
-            service_path.display()
-        )
+    report.observe("service.manager.reload", || {
+        run_systemctl_user(&["daemon-reload"])
     })?;
-
-    run_systemctl_user(&["daemon-reload"])?;
-    run_systemctl_user(&["enable", "--now", service_unit.as_str()])?;
+    report.observe("service.manager.enable_activate", || {
+        run_systemctl_user(&["enable", "--now", service_unit.as_str()])
+    })?;
 
     info!(
         service = settings.service_name.as_str(),

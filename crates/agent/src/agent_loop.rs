@@ -1,21 +1,23 @@
 use super::{
     ActiveTurnRequest, AgentCommand, AgentEventHub, AgentMcpToolProvider, AgentStartError,
-    AgentThreadControlPlane, ExecutionCheckpointContext, TaskToolProvider, TaskTurnContext,
-    ToolLoopConfig, TurnExecutionControl, TurnExecutionUsageCounters, TurnFinalizationProvider,
-    TurnTaskCompletion, TurnTaskFailure, TurnTaskSuccess, TurnToolProvider,
+    AgentThreadControlPlane, ExecutionCheckpointContext, NativeRuntimeDependencies,
+    NativeTurnRuntimeSnapshot, TaskToolProvider, ToolLoopConfig, TurnExecutionControl,
+    TurnExecutionUsageCounters, TurnFinalizationProvider, TurnTaskCompletion, TurnTaskFailure,
+    TurnTaskSuccess, TurnToolProvider,
 };
 use crate::chat;
 use crate::hooks::{
-    AgentPostTurnHookDispatchPolicy, AgentToolBundleArtifactStore, AgentTurnHookContext,
-    AgentTurnPostTurnHookDispatch, AgentTurnPostTurnSummary, DeferredTaskPostTurnDispatchStore,
-    EffectiveTurnPolicySet, EffectiveTurnPromptContextSet,
+    AgentToolBundleArtifactStore, AgentTurnHookContext, AgentTurnPostTurnHookDispatch,
+    AgentTurnPostTurnSummary, EffectiveTurnPolicySet, EffectiveTurnPromptContextSet,
 };
 use futures_util::FutureExt;
 use pioneer_hooks::{HookRuntime, TurnPostTurnStatus};
 use pioneer_protocol::{
-    AgentDurableEvent, ExecutionWindowStatus, RecoveryAttemptContext, ThreadMode, TurnCapability,
-    TurnExecutionSecuritySnapshot, TurnExecutionWindowBlockedNotification,
-    TurnExecutionWindowContinuedNotification, TurnPermissionProfileSnapshot, UserInput,
+    AgentDurableEvent, ExecutionWindowStatus, NativeTerminalEffectGate, NativeTerminalEffectKind,
+    NativeTerminalEffectPayload, NativeTerminalEffectPreparation, NativeTerminalEffectSpec,
+    RecoveryAttemptContext, ThreadMode, TurnCapability, TurnExecutionSecuritySnapshot,
+    TurnExecutionWindowBlockedNotification, TurnExecutionWindowContinuedNotification,
+    TurnPermissionProfileSnapshot, UserInput,
 };
 use pioneer_provider::{ChatMessage, Provider, ProviderRegistry};
 use pioneer_tools::{ExecutionWindowAdmissionDecision, decide_execution_window_admission};
@@ -23,11 +25,11 @@ use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
 use std::sync::Arc;
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, sleep, timeout};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
 // Tool dispatch uses a one-second cleanup grace.  The parent Turn must wait
 // longer than that before resorting to a hard abort, otherwise dropping the
@@ -179,6 +181,9 @@ fn recovery_execution_window_admission_error(
         ExecutionWindowTotalBudgetDecision::Continue { .. } => None,
         ExecutionWindowTotalBudgetDecision::Block(block) => Some(
             super::AgentControlError::ExecutionWindowContinuationBlocked {
+                stop_reason: (block.kind
+                    == ExecutionWindowTotalBudgetBlockKind::MaxConsecutiveNoProgressWindows)
+                    .then_some(pioneer_protocol::RecoveryStopReason::NoProgress),
                 reason: block.reason,
             },
         ),
@@ -197,16 +202,7 @@ pub(super) async fn run_agent_loop(
     thread_id: String,
     workspace_id: String,
     provider_registry: Arc<ProviderRegistry>,
-    tool_loop_config: ToolLoopConfig,
-    mcp_tool_provider: Option<Arc<dyn AgentMcpToolProvider>>,
-    turn_tool_provider: Option<Arc<dyn TurnToolProvider>>,
-    turn_finalization_provider: Option<Arc<dyn TurnFinalizationProvider>>,
-    task_tool_provider: Option<Arc<dyn TaskToolProvider>>,
-    hook_runtime: Option<Arc<HookRuntime>>,
-    tool_bundle_artifacts: Option<Arc<AgentToolBundleArtifactStore>>,
-    permission_approval_broker: Arc<RwLock<Arc<dyn pioneer_tools::PermissionApprovalBroker>>>,
-    post_turn_hook_dispatch_policy: AgentPostTurnHookDispatchPolicy,
-    deferred_task_post_turn_dispatches: Arc<DeferredTaskPostTurnDispatchStore>,
+    runtime_dependencies: Arc<NativeRuntimeDependencies>,
     command_tx: mpsc::Sender<AgentCommand>,
     mut command_rx: mpsc::Receiver<AgentCommand>,
     event_hub: Arc<AgentEventHub>,
@@ -218,32 +214,104 @@ pub(super) async fn run_agent_loop(
     // unexpectedly, dropping a bare JoinHandle would detach provider/tool
     // work and leave it without a consumer for its terminal command.
     let mut active_turn_task: Option<ActiveTurnTask> = None;
+    let mut context_fence: Option<OwnedContextFence> = None;
     let mut active_turn_control: Option<TurnExecutionControl> = None;
     let mut active_turn_request: Option<ActiveTurnRequest> = None;
     let mut last_turn_request: Option<ActiveTurnRequest> = None;
+    let mut active_runtime_snapshot: Option<NativeTurnRuntimeSnapshot> = None;
+    let mut last_runtime_snapshot: Option<NativeTurnRuntimeSnapshot> = None;
     let mut active_turn_run_id: Option<u64> = None;
     let mut active_recovery: Option<RecoveryAttemptContext> = None;
     let mut last_turn_observation: Option<(String, super::ExecutionTurnObservation)> = None;
     let mut next_turn_run_id: u64 = 1;
 
-    macro_rules! commit_or_stop {
-        ($event:expr $(,)?) => {
-            if !publish_loop_durable_event(
-                event_hub.as_ref(),
-                $event,
-                active_turn_control
-                    .as_ref()
-                    .map(TurnExecutionControl::cancellation_token),
-            )
-            .await
-            {
-                error!(
-                    thread_id = %thread_id,
-                    "stopping agent loop after durable event commit was exhausted"
-                );
-                return;
+    macro_rules! handle_loop_commit {
+        ($outcome:expr) => {
+            let outcome = $outcome;
+            let outcome = if outcome == LoopDurableCommitOutcome::CooperativeCancellation
+                && active_turn_id.as_deref().is_some_and(|turn_id|
+                    active_turn_control.as_ref().is_some_and(|control| control.has_durable_cancellation(turn_id))) {
+                LoopDurableCommitOutcome::SupersededByDurableInterruption
+            } else { outcome };
+            match outcome {
+                LoopDurableCommitOutcome::Committed => {}
+                LoopDurableCommitOutcome::SupersededByDurableInterruption => {
+                    if let Some(control) = active_turn_control.as_ref() { control.cancel_all_attempts(); }
+                    if let Some(task) = active_turn_task.take() {
+                        wait_for_turn_task_shutdown(task.into_join_handle()).await;
+                    }
+                    if let Some(turn_id) = active_turn_id.clone() {
+                        record_turn_observation!(turn_id, super::ExecutionTurnObservation {
+                            status: super::ExecutionTurnStatus::Interrupted,
+                            message: None,
+                        });
+                    }
+                    clear_active_turn_control!();
+                    active_turn_request = None;
+                    active_recovery = None;
+                    last_turn_request = None;
+                    last_runtime_snapshot = None;
+                    continue;
+                }
+                LoopDurableCommitOutcome::CooperativeCancellation => {
+                    // Cooperative process control alone is not a durable result.
+                    debug!(thread_id = %thread_id, "stopping agent loop after cooperative commit cancellation");
+                    return;
+                }
+                LoopDurableCommitOutcome::PermanentRejection { .. } => {
+                    // The publisher emitted the one ERROR for this refusal.
+                    debug!(thread_id = %thread_id, "stopping agent loop after permanent durable event rejection");
+                    return;
+                }
             }
         };
+    }
+
+    macro_rules! commit_or_stop {
+        ($event:expr $(,)?) => {
+            handle_loop_commit!(
+                publish_loop_durable_event(
+                    event_hub.as_ref(),
+                    $event,
+                    active_turn_control
+                        .as_ref()
+                        .map(TurnExecutionControl::cancellation_token)
+                )
+                .await
+            );
+        };
+    }
+
+    // Cooperative cancellation must not cancel a terminal commit.
+    macro_rules! commit_terminal_or_stop {
+        ($event:expr $(,)?) => {
+            handle_loop_commit!(publish_loop_durable_event(event_hub.as_ref(), $event, None).await);
+        };
+    }
+
+    macro_rules! prepare_terminal_effects_or_stop {
+        ($turn_id:expr, $run_id:expr, $snapshot:expr, $dispatch:expr, $cleanup:expr $(,)?) => {{
+            let Some(snapshot) = $snapshot else {
+                error!(
+                    thread_id = %thread_id,
+                    turn_id = %$turn_id,
+                    "terminal transition lost its immutable runtime snapshot"
+                );
+                return;
+            };
+            let preparation = terminal_effect_preparation(
+                workspace_id.as_str(),
+                thread_id.as_str(),
+                $turn_id.as_str(),
+                $run_id,
+                snapshot,
+                $dispatch,
+                $cleanup,
+            );
+            commit_terminal_or_stop!(AgentDurableEvent::NativeTerminalEffectsPrepared {
+                preparation,
+            });
+        }};
     }
 
     macro_rules! clear_active_turn_control {
@@ -254,6 +322,7 @@ pub(super) async fn run_agent_loop(
             active_turn_id = None;
             active_turn_run_id = None;
             active_turn_control = None;
+            active_runtime_snapshot = None;
         }};
     }
 
@@ -268,6 +337,31 @@ pub(super) async fn run_agent_loop(
     }
 
     while let Some(command) = command_rx.recv().await {
+        // Retain the completed turn's Stop fence without owning background
+        // preparation. Durable registration already happened before provider
+        // execution and the Gateway worker owns all later work.
+        let stop_check = matches!(
+            &command,
+            AgentCommand::StartTurn { .. }
+                | AgentCommand::StartRecoveryAttempt { .. }
+                | AgentCommand::StartRestoredRecoveryTurn { .. }
+                | AgentCommand::Shutdown
+        ) || matches!(&command, AgentCommand::CancelTurn { turn_id, .. }
+                if context_fence.as_ref().is_some_and(|check| check.session.context.turn_id == *turn_id));
+        let cancelled_context_check = matches!(&command, AgentCommand::CancelTurn { turn_id, .. }
+            if context_fence.as_ref().is_some_and(|check| check.session.context.turn_id == *turn_id));
+        let context_stop_error = if stop_check && let Some(check) = context_fence.take() {
+            check
+                .stop(!matches!(&command, AgentCommand::Shutdown))
+                .await
+                .err()
+                .map(|error| error.to_string())
+        } else {
+            None
+        };
+        if context_stop_error.is_some() {
+            tracing::warn!("context Stop fence could not be persisted");
+        }
         match command {
             AgentCommand::StartTurn {
                 turn_id,
@@ -289,10 +383,16 @@ pub(super) async fn run_agent_loop(
                 execution_security_snapshot,
                 ack,
             } => {
+                if let Some(outcome) = ack.completed() {
+                    let _ = ack.send(outcome);
+                    continue;
+                }
                 if active_turn_id.is_some() {
                     let _ = ack.send(Err(AgentStartError::TurnAlreadyRunning));
                     continue;
                 }
+
+                let runtime_snapshot = runtime_dependencies.snapshot().await;
 
                 let execution_window_index = execution_checkpoint_context
                     .as_ref()
@@ -361,15 +461,17 @@ pub(super) async fn run_agent_loop(
                     continue;
                 }
 
+                let run_id = next_turn_run_id;
+                next_turn_run_id = next_turn_run_id.saturating_add(1);
+
                 active_turn_id = Some(turn_id.clone());
                 active_turn_request = Some(turn_request.clone());
                 last_turn_request = Some(turn_request.clone());
+                active_runtime_snapshot = Some(runtime_snapshot.clone());
+                last_runtime_snapshot = Some(runtime_snapshot.clone());
                 active_recovery = None;
                 last_turn_observation = None;
                 let task_recovery = None;
-
-                let run_id = next_turn_run_id;
-                next_turn_run_id = next_turn_run_id.saturating_add(1);
 
                 let turn_control = TurnExecutionControl::new(command_tx.clone(), run_id);
                 active_turn_control = Some(turn_control.clone());
@@ -383,14 +485,7 @@ pub(super) async fn run_agent_loop(
                     thread_id.clone(),
                     workspace_id.clone(),
                     provider_registry.clone(),
-                    tool_loop_config.clone(),
-                    mcp_tool_provider.clone(),
-                    turn_tool_provider.clone(),
-                    turn_finalization_provider.clone(),
-                    task_tool_provider.clone(),
-                    hook_runtime.clone(),
-                    tool_bundle_artifacts.clone(),
-                    permission_approval_broker.clone(),
+                    runtime_snapshot,
                     provider,
                     turn_request,
                     turn_control,
@@ -404,6 +499,7 @@ pub(super) async fn run_agent_loop(
                 turn_id,
                 run_id,
                 completion,
+                context_session,
             } => {
                 if active_turn_id.as_deref() != Some(turn_id.as_str()) {
                     continue;
@@ -413,6 +509,7 @@ pub(super) async fn run_agent_loop(
                 }
 
                 let turn_request_snapshot = active_turn_request.clone();
+                let runtime_snapshot = active_runtime_snapshot.clone();
                 let recovery = active_recovery.clone();
                 active_turn_task = None;
 
@@ -423,14 +520,14 @@ pub(super) async fn run_agent_loop(
 
                 match result {
                     Ok(TurnTaskSuccess::Completed) => {
-                        record_turn_observation!(
+                        prepare_terminal_effects_or_stop!(
                             turn_id,
-                            super::ExecutionTurnObservation {
-                                status: super::ExecutionTurnStatus::Completed,
-                                message: None,
-                            },
+                            run_id,
+                            runtime_snapshot.as_ref(),
+                            post_turn_dispatch,
+                            None,
                         );
-                        commit_or_stop!(AgentDurableEvent::TurnCompleted {
+                        commit_terminal_or_stop!(AgentDurableEvent::TurnCompleted {
                             thread_id: thread_id.clone(),
                             turn_id: turn_id.clone(),
                             recovery: recovery.clone(),
@@ -440,22 +537,25 @@ pub(super) async fn run_agent_loop(
                         // durable terminal event proves that the recovered Turn
                         // reached an observable terminal state.
                         if let Some(recovery) = recovery.clone() {
-                            commit_or_stop!(AgentDurableEvent::RecoveryAttemptSucceeded {
+                            commit_terminal_or_stop!(AgentDurableEvent::RecoveryAttemptSucceeded {
                                 thread_id: thread_id.clone(),
                                 turn_id: turn_id.clone(),
                                 recovery,
                             },);
                         }
+                        record_turn_observation!(
+                            turn_id,
+                            super::ExecutionTurnObservation {
+                                status: super::ExecutionTurnStatus::Completed,
+                                message: None,
+                            },
+                        );
                         clear_active_turn_control!();
                         active_turn_request = None;
                         active_recovery = None;
-                        maybe_dispatch_post_turn_hook(
-                            hook_runtime.clone(),
-                            post_turn_hook_dispatch_policy,
-                            deferred_task_post_turn_dispatches.as_ref(),
-                            post_turn_dispatch,
-                        )
-                        .await;
+                        if let Some(session) = context_session {
+                            context_fence = Some(OwnedContextFence { session });
+                        }
                     }
                     Ok(TurnTaskSuccess::NeedsContinuation(continuation)) => {
                         debug!(
@@ -469,13 +569,6 @@ pub(super) async fn run_agent_loop(
                             let blocked_reason =
                                 "execution window continuation could not resume: active turn request missing"
                                     .to_owned();
-                            record_turn_observation!(
-                                turn_id,
-                                super::ExecutionTurnObservation {
-                                    status: super::ExecutionTurnStatus::Blocked,
-                                    message: Some(blocked_reason.clone()),
-                                },
-                            );
                             commit_or_stop!(AgentDurableEvent::TurnExecutionWindowBlocked {
                                 notification: TurnExecutionWindowBlockedNotification {
                                     workspace_id: workspace_id.clone(),
@@ -501,18 +594,45 @@ pub(super) async fn run_agent_loop(
                                     blocked_at_unix_ms: chrono::Local::now().timestamp_millis(),
                                 },
                             },);
-                            commit_or_stop!(AgentDurableEvent::TurnBlocked {
+                            prepare_terminal_effects_or_stop!(
+                                turn_id,
+                                run_id,
+                                runtime_snapshot.as_ref(),
+                                None,
+                                Some(format!("parent turn blocked: {blocked_reason}")),
+                            );
+                            commit_terminal_or_stop!(AgentDurableEvent::TurnBlocked {
                                 thread_id: thread_id.clone(),
                                 turn_id: turn_id.clone(),
-                                reason: blocked_reason,
+                                reason: blocked_reason.clone(),
                                 recovery,
                             },);
+                            record_turn_observation!(
+                                turn_id,
+                                super::ExecutionTurnObservation {
+                                    status: super::ExecutionTurnStatus::Blocked,
+                                    message: Some(blocked_reason),
+                                },
+                            );
                             clear_active_turn_control!();
                             active_turn_request = None;
                             active_recovery = None;
                             continue;
                         };
-                        let total_budget = tool_loop_config.execution_windows.total.normalized();
+                        let Some(runtime_snapshot_for_continuation) = runtime_snapshot.as_ref()
+                        else {
+                            error!(
+                                thread_id = %thread_id,
+                                turn_id = %turn_id,
+                                "turn continuation lost its immutable runtime snapshot"
+                            );
+                            return;
+                        };
+                        let total_budget = runtime_snapshot_for_continuation
+                            .tool_loop_config
+                            .execution_windows
+                            .total
+                            .normalized();
                         next_turn_request
                             .execution_usage
                             .observe_checkpoint_payload(&continuation.checkpoint_payload);
@@ -525,13 +645,6 @@ pub(super) async fn run_agent_loop(
                             }
                             ExecutionWindowTotalBudgetDecision::Block(block) => {
                                 let blocked_reason = block.reason.clone();
-                                record_turn_observation!(
-                                    turn_id,
-                                    super::ExecutionTurnObservation {
-                                        status: super::ExecutionTurnStatus::Blocked,
-                                        message: Some(blocked_reason.clone()),
-                                    },
-                                );
                                 commit_or_stop!(AgentDurableEvent::TurnExecutionWindowBlocked {
                                     notification: TurnExecutionWindowBlockedNotification {
                                         workspace_id: workspace_id.clone(),
@@ -556,12 +669,34 @@ pub(super) async fn run_agent_loop(
                                         blocked_at_unix_ms: chrono::Local::now().timestamp_millis(),
                                     },
                                 },);
-                                commit_or_stop!(AgentDurableEvent::TurnBlocked {
+                                let blocked_dispatch = synthesize_post_turn_failure_dispatch(
+                                    workspace_id.as_str(),
+                                    thread_id.as_str(),
+                                    turn_id.as_str(),
+                                    turn_request_snapshot.as_ref(),
+                                    TurnPostTurnStatus::Blocked,
+                                    blocked_reason.clone(),
+                                );
+                                prepare_terminal_effects_or_stop!(
+                                    turn_id,
+                                    run_id,
+                                    runtime_snapshot.as_ref(),
+                                    blocked_dispatch,
+                                    Some(format!("parent turn blocked: {blocked_reason}")),
+                                );
+                                commit_terminal_or_stop!(AgentDurableEvent::TurnBlocked {
                                     thread_id: thread_id.clone(),
                                     turn_id: turn_id.clone(),
-                                    reason: blocked_reason,
+                                    reason: blocked_reason.clone(),
                                     recovery,
                                 },);
+                                record_turn_observation!(
+                                    turn_id,
+                                    super::ExecutionTurnObservation {
+                                        status: super::ExecutionTurnStatus::Blocked,
+                                        message: Some(blocked_reason),
+                                    },
+                                );
                                 clear_active_turn_control!();
                                 active_turn_request = None;
                                 active_recovery = None;
@@ -592,19 +727,34 @@ pub(super) async fn run_agent_loop(
                                     "failed to recreate provider `{}` for execution window continuation: {error}",
                                     next_turn_request.provider_name
                                 );
+                                let failure_dispatch = synthesize_post_turn_failure_dispatch(
+                                    workspace_id.as_str(),
+                                    thread_id.as_str(),
+                                    turn_id.as_str(),
+                                    turn_request_snapshot.as_ref(),
+                                    TurnPostTurnStatus::Failed,
+                                    failure_message.clone(),
+                                );
+                                prepare_terminal_effects_or_stop!(
+                                    turn_id,
+                                    run_id,
+                                    runtime_snapshot.as_ref(),
+                                    failure_dispatch,
+                                    Some(format!("parent turn failed: {failure_message}")),
+                                );
+                                commit_terminal_or_stop!(AgentDurableEvent::TurnFailed {
+                                    thread_id: thread_id.clone(),
+                                    turn_id: turn_id.clone(),
+                                    error: failure_message.clone(),
+                                    recovery,
+                                },);
                                 record_turn_observation!(
                                     turn_id,
                                     super::ExecutionTurnObservation {
                                         status: super::ExecutionTurnStatus::Failed,
-                                        message: Some(failure_message.clone()),
+                                        message: Some(failure_message),
                                     },
                                 );
-                                commit_or_stop!(AgentDurableEvent::TurnFailed {
-                                    thread_id: thread_id.clone(),
-                                    turn_id: turn_id.clone(),
-                                    error: failure_message,
-                                    recovery,
-                                },);
                                 clear_active_turn_control!();
                                 active_turn_request = None;
                                 active_recovery = None;
@@ -654,7 +804,18 @@ pub(super) async fn run_agent_loop(
                         control_plane.activate(turn_id.clone(), run_id, turn_control.clone());
                         active_turn_request = Some(next_turn_request.clone());
                         last_turn_request = Some(next_turn_request.clone());
+                        active_runtime_snapshot = runtime_snapshot.clone();
+                        last_runtime_snapshot = runtime_snapshot.clone();
                         active_recovery = None;
+
+                        let Some(runtime_snapshot) = runtime_snapshot.clone() else {
+                            error!(
+                                thread_id = %thread_id,
+                                turn_id = %turn_id,
+                                "turn continuation lost its immutable runtime snapshot"
+                            );
+                            return;
+                        };
 
                         active_turn_task = Some(ActiveTurnTask::new(spawn_turn_task(
                             command_tx.clone(),
@@ -662,14 +823,7 @@ pub(super) async fn run_agent_loop(
                             thread_id.clone(),
                             workspace_id.clone(),
                             provider_registry.clone(),
-                            tool_loop_config.clone(),
-                            mcp_tool_provider.clone(),
-                            turn_tool_provider.clone(),
-                            turn_finalization_provider.clone(),
-                            task_tool_provider.clone(),
-                            hook_runtime.clone(),
-                            tool_bundle_artifacts.clone(),
-                            permission_approval_broker.clone(),
+                            runtime_snapshot,
                             provider,
                             next_turn_request,
                             turn_control,
@@ -678,31 +832,7 @@ pub(super) async fn run_agent_loop(
                         )));
                     }
                     Err(TurnTaskFailure::Terminal(error)) => {
-                        record_turn_observation!(
-                            turn_id,
-                            super::ExecutionTurnObservation {
-                                status: super::ExecutionTurnStatus::Failed,
-                                message: Some(error.clone()),
-                            },
-                        );
                         let error_for_dispatch = error.clone();
-                        commit_or_stop!(AgentDurableEvent::TurnFailed {
-                            thread_id: thread_id.clone(),
-                            turn_id: turn_id.clone(),
-                            error,
-                            recovery,
-                        },);
-                        clear_active_turn_control!();
-                        active_turn_request = None;
-                        active_recovery = None;
-                        cleanup_attached_tasks(
-                            task_tool_provider.as_ref(),
-                            workspace_id.as_str(),
-                            thread_id.as_str(),
-                            turn_id.as_str(),
-                            format!("parent turn failed: {error_for_dispatch}"),
-                        )
-                        .await;
                         let failure_dispatch = post_turn_dispatch.or_else(|| {
                             synthesize_post_turn_failure_dispatch(
                                 workspace_id.as_str(),
@@ -710,35 +840,35 @@ pub(super) async fn run_agent_loop(
                                 turn_id.as_str(),
                                 turn_request_snapshot.as_ref(),
                                 TurnPostTurnStatus::Failed,
-                                error_for_dispatch,
+                                error_for_dispatch.clone(),
                             )
                         });
-                        maybe_dispatch_post_turn_hook(
-                            hook_runtime.clone(),
-                            post_turn_hook_dispatch_policy,
-                            deferred_task_post_turn_dispatches.as_ref(),
+                        prepare_terminal_effects_or_stop!(
+                            turn_id,
+                            run_id,
+                            runtime_snapshot.as_ref(),
                             failure_dispatch,
-                        )
-                        .await;
-                    }
-                    Err(TurnTaskFailure::Blocked(reason)) => {
+                            Some(format!("parent turn failed: {error_for_dispatch}")),
+                        );
+                        commit_terminal_or_stop!(AgentDurableEvent::TurnFailed {
+                            thread_id: thread_id.clone(),
+                            turn_id: turn_id.clone(),
+                            error,
+                            recovery,
+                        },);
                         record_turn_observation!(
                             turn_id,
                             super::ExecutionTurnObservation {
-                                status: super::ExecutionTurnStatus::Blocked,
-                                message: Some(reason.clone()),
+                                status: super::ExecutionTurnStatus::Failed,
+                                message: Some(error_for_dispatch),
                             },
                         );
-                        let reason_for_dispatch = reason.clone();
-                        commit_or_stop!(AgentDurableEvent::TurnBlocked {
-                            thread_id: thread_id.clone(),
-                            turn_id: turn_id.clone(),
-                            reason,
-                            recovery,
-                        },);
                         clear_active_turn_control!();
                         active_turn_request = None;
                         active_recovery = None;
+                    }
+                    Err(TurnTaskFailure::Blocked(reason)) => {
+                        let reason_for_dispatch = reason.clone();
                         let blocked_dispatch = post_turn_dispatch.or_else(|| {
                             synthesize_post_turn_failure_dispatch(
                                 workspace_id.as_str(),
@@ -749,13 +879,29 @@ pub(super) async fn run_agent_loop(
                                 reason_for_dispatch,
                             )
                         });
-                        maybe_dispatch_post_turn_hook(
-                            hook_runtime.clone(),
-                            post_turn_hook_dispatch_policy,
-                            deferred_task_post_turn_dispatches.as_ref(),
+                        prepare_terminal_effects_or_stop!(
+                            turn_id,
+                            run_id,
+                            runtime_snapshot.as_ref(),
                             blocked_dispatch,
-                        )
-                        .await;
+                            Some(format!("parent turn blocked: {reason}")),
+                        );
+                        commit_terminal_or_stop!(AgentDurableEvent::TurnBlocked {
+                            thread_id: thread_id.clone(),
+                            turn_id: turn_id.clone(),
+                            reason: reason.clone(),
+                            recovery,
+                        },);
+                        record_turn_observation!(
+                            turn_id,
+                            super::ExecutionTurnObservation {
+                                status: super::ExecutionTurnStatus::Blocked,
+                                message: Some(reason),
+                            },
+                        );
+                        clear_active_turn_control!();
+                        active_turn_request = None;
+                        active_recovery = None;
                     }
                     Err(TurnTaskFailure::ProviderFailure {
                         item_id,
@@ -769,7 +915,26 @@ pub(super) async fn run_agent_loop(
                                 failure.class, failure.stage
                             )
                         });
-                        commit_or_stop!(AgentDurableEvent::ProviderFailureDetected {
+                        let failure_dispatch = post_turn_dispatch.or_else(|| {
+                            synthesize_post_turn_failure_dispatch(
+                                workspace_id.as_str(),
+                                thread_id.as_str(),
+                                turn_id.as_str(),
+                                turn_request_snapshot.as_ref(),
+                                TurnPostTurnStatus::ProviderFailure,
+                                failure_message.clone(),
+                            )
+                        });
+                        prepare_terminal_effects_or_stop!(
+                            turn_id,
+                            run_id,
+                            runtime_snapshot.as_ref(),
+                            failure_dispatch,
+                            Some(format!(
+                                "parent turn recovery terminalized after provider failure: {failure_message}"
+                            )),
+                        );
+                        commit_terminal_or_stop!(AgentDurableEvent::ProviderFailureDetected {
                             thread_id: thread_id.clone(),
                             turn_id: turn_id.clone(),
                             item_id,
@@ -780,23 +945,6 @@ pub(super) async fn run_agent_loop(
                         clear_active_turn_control!();
                         active_turn_request = None;
                         active_recovery = None;
-                        let failure_dispatch = post_turn_dispatch.or_else(|| {
-                            synthesize_post_turn_failure_dispatch(
-                                workspace_id.as_str(),
-                                thread_id.as_str(),
-                                turn_id.as_str(),
-                                turn_request_snapshot.as_ref(),
-                                TurnPostTurnStatus::ProviderFailure,
-                                failure_message,
-                            )
-                        });
-                        maybe_dispatch_post_turn_hook(
-                            hook_runtime.clone(),
-                            post_turn_hook_dispatch_policy,
-                            deferred_task_post_turn_dispatches.as_ref(),
-                            failure_dispatch,
-                        )
-                        .await;
                     }
                 }
             }
@@ -827,6 +975,10 @@ pub(super) async fn run_agent_loop(
                 item_id,
                 ack,
             } => {
+                if let Some(outcome) = ack.completed() {
+                    let _ = ack.send(outcome);
+                    continue;
+                }
                 if active_turn_id.is_none() {
                     let _ = ack.send(Err(super::AgentControlError::NoActiveTurn));
                     continue;
@@ -854,6 +1006,17 @@ pub(super) async fn run_agent_loop(
                 reason,
                 ack,
             } => {
+                if let Some(outcome) = ack.completed() {
+                    let _ = ack.send(outcome);
+                    continue;
+                }
+                if cancelled_context_check {
+                    let _ = ack.send(match context_stop_error {
+                        Some(error) => Err(super::AgentControlError::Internal(error)),
+                        None => Ok(()),
+                    });
+                    continue;
+                }
                 if active_turn_id.is_none() {
                     let _ = ack.send(Err(super::AgentControlError::NoActiveTurn));
                     continue;
@@ -864,55 +1027,85 @@ pub(super) async fn run_agent_loop(
                 }
 
                 if let Some(control) = active_turn_control.as_ref() {
-                    control.cancel_all_attempts().await;
+                    control.cancel_all_attempts();
                 }
+
+                // The caller is acknowledging process-control admission, not
+                // waiting for a second terminal lifecycle publication. The
+                // Gateway has already committed Interrupted before issuing
+                // this command, while the actor must remain free to finish
+                // cooperative shutdown and its durable terminal obligations.
+                let _ = ack.send(Ok(()));
 
                 if let Some(task) = active_turn_task.take() {
                     wait_for_turn_task_shutdown(task.into_join_handle()).await;
                 }
                 let turn_request_snapshot = active_turn_request.clone();
+                let runtime_snapshot = active_runtime_snapshot.clone();
                 let recovery = active_recovery.clone();
+                let reason_for_dispatch = reason.clone();
+                let durable_cancellation = active_turn_control
+                    .as_ref()
+                    .is_some_and(|control| control.has_durable_cancellation(&turn_id));
+                if !durable_cancellation {
+                    // A direct caller may cancel during the initial registration
+                    // ACK. Finish registration from the captured turn context;
+                    // no cancellation token is treated as a durable receipt.
+                    let Some(snapshot) = runtime_snapshot.as_ref() else {
+                        error!(
+                            commit_error_code = "cancellation_context_missing",
+                            event_kind = "turn_interrupted",
+                            "native cancellation lost its immutable runtime context"
+                        );
+                        return;
+                    };
+                    let context_dispatch = synthesize_post_turn_failure_dispatch(
+                        &workspace_id,
+                        &thread_id,
+                        &turn_id,
+                        turn_request_snapshot.as_ref(),
+                        TurnPostTurnStatus::Interrupted,
+                        String::new(),
+                    );
+                    let preparation = crate::post_turn::identify_native_cancellation(
+                        terminal_effect_preparation(
+                            &workspace_id,
+                            &thread_id,
+                            &turn_id,
+                            active_turn_run_id.unwrap_or(0),
+                            snapshot,
+                            context_dispatch,
+                            Some(String::new()),
+                        ),
+                    );
+                    commit_terminal_or_stop!(
+                        AgentDurableEvent::NativeCancellationContextPrepared {
+                            preparation,
+                            initial_turn: recovery.is_none()
+                                && turn_request_snapshot
+                                    .as_ref()
+                                    .is_some_and(|r| r.execution_window_index == 1),
+                        }
+                    );
+                    commit_terminal_or_stop!(AgentDurableEvent::TurnInterrupted {
+                        thread_id: thread_id.clone(),
+                        turn_id: turn_id.clone(),
+                        reason,
+                        recovery,
+                    },);
+                }
                 record_turn_observation!(
                     turn_id,
                     super::ExecutionTurnObservation {
                         status: super::ExecutionTurnStatus::Interrupted,
-                        message: Some(reason.clone()),
+                        message: Some(reason_for_dispatch),
                     },
                 );
-                let reason_for_dispatch = reason.clone();
-                commit_or_stop!(AgentDurableEvent::TurnInterrupted {
-                    thread_id: thread_id.clone(),
-                    turn_id: turn_id.clone(),
-                    reason,
-                    recovery,
-                },);
                 clear_active_turn_control!();
                 active_turn_request = None;
                 active_recovery = None;
-                cleanup_attached_tasks(
-                    task_tool_provider.as_ref(),
-                    workspace_id.as_str(),
-                    thread_id.as_str(),
-                    turn_id.as_str(),
-                    format!("parent turn cancelled: {reason_for_dispatch}"),
-                )
-                .await;
-                let _ = ack.send(Ok(()));
-                let interrupted_dispatch = synthesize_post_turn_failure_dispatch(
-                    workspace_id.as_str(),
-                    thread_id.as_str(),
-                    turn_id.as_str(),
-                    turn_request_snapshot.as_ref(),
-                    TurnPostTurnStatus::Interrupted,
-                    reason_for_dispatch,
-                );
-                maybe_dispatch_post_turn_hook(
-                    hook_runtime.clone(),
-                    post_turn_hook_dispatch_policy,
-                    deferred_task_post_turn_dispatches.as_ref(),
-                    interrupted_dispatch,
-                )
-                .await;
+                last_turn_request = None;
+                last_runtime_snapshot = None;
             }
             AgentCommand::ObserveTurn { turn_id, ack } => {
                 let observation = if active_turn_id.as_deref() == Some(turn_id.as_str()) {
@@ -927,26 +1120,35 @@ pub(super) async fn run_agent_loop(
                             (observed_turn_id == &turn_id).then(|| observation.clone())
                         })
                 };
-                let _ = ack.send(observation);
+                let _ = ack.send(Ok(observation));
             }
             AgentCommand::StartRecoveryAttempt { request, ack } => {
+                if let Some(outcome) = ack.completed() {
+                    let _ = ack.send(outcome);
+                    continue;
+                }
                 if active_turn_id.is_none()
                     && !request.item_type.is_tool_item()
                     && let Some(turn_request) = last_turn_request.clone()
+                    && let Some(runtime_snapshot) = last_runtime_snapshot.clone()
                     && turn_request.turn_id == request.turn_id
                 {
                     let mut turn_request = turn_request;
 
                     super::apply_recovery_adjustments(&mut turn_request, &request);
-                    if let Some(error) =
-                        recovery_execution_window_admission_error(&turn_request, &tool_loop_config)
-                    {
+                    if let Some(error) = recovery_execution_window_admission_error(
+                        &turn_request,
+                        &runtime_snapshot.tool_loop_config,
+                    ) {
                         let _ = ack.send(Err(error));
                         continue;
                     }
 
                     if request.refresh_provider_auth {
-                        provider_registry.invalidate(turn_request.provider_name.as_str());
+                        provider_registry.invalidate_workspace_provider(
+                            workspace_id.as_str(),
+                            turn_request.provider_name.as_str(),
+                        );
                     }
 
                     let provider = match provider_registry.get_or_create_for_workspace(
@@ -987,6 +1189,8 @@ pub(super) async fn run_agent_loop(
 
                     active_turn_request = Some(turn_request.clone());
                     last_turn_request = Some(turn_request.clone());
+                    active_runtime_snapshot = Some(runtime_snapshot.clone());
+                    last_runtime_snapshot = Some(runtime_snapshot.clone());
                     let recovery = recovery_context(&request);
                     active_recovery = Some(recovery.clone());
 
@@ -996,14 +1200,7 @@ pub(super) async fn run_agent_loop(
                         thread_id.clone(),
                         workspace_id.clone(),
                         provider_registry.clone(),
-                        tool_loop_config.clone(),
-                        mcp_tool_provider.clone(),
-                        turn_tool_provider.clone(),
-                        turn_finalization_provider.clone(),
-                        task_tool_provider.clone(),
-                        hook_runtime.clone(),
-                        tool_bundle_artifacts.clone(),
-                        permission_approval_broker.clone(),
+                        runtime_snapshot,
                         provider,
                         turn_request,
                         turn_control,
@@ -1049,17 +1246,27 @@ pub(super) async fn run_agent_loop(
                     continue;
                 };
                 let mut turn_request = turn_request;
+                let Some(runtime_snapshot) = active_runtime_snapshot.clone() else {
+                    let _ = ack.send(Err(super::AgentControlError::Internal(
+                        "active turn runtime snapshot is missing".to_owned(),
+                    )));
+                    continue;
+                };
 
                 super::apply_recovery_adjustments(&mut turn_request, &request);
-                if let Some(error) =
-                    recovery_execution_window_admission_error(&turn_request, &tool_loop_config)
-                {
+                if let Some(error) = recovery_execution_window_admission_error(
+                    &turn_request,
+                    &runtime_snapshot.tool_loop_config,
+                ) {
                     let _ = ack.send(Err(error));
                     continue;
                 }
 
                 if request.refresh_provider_auth {
-                    provider_registry.invalidate(turn_request.provider_name.as_str());
+                    provider_registry.invalidate_workspace_provider(
+                        workspace_id.as_str(),
+                        turn_request.provider_name.as_str(),
+                    );
                 }
 
                 let provider = match provider_registry.get_or_create_for_workspace(
@@ -1080,8 +1287,15 @@ pub(super) async fn run_agent_loop(
                 // owner.  A provider/auth failure must leave the old executor
                 // alive rather than creating a process-local ghost Turn.
                 if let Some(control) = active_turn_control.as_ref() {
-                    control.cancel_all_attempts().await;
+                    control.cancel_all_attempts();
                 }
+
+                // Provider resolution and recovery admission have succeeded,
+                // so ownership of the restart has transferred to this actor.
+                // ACK that acceptance before waiting through the cooperative
+                // shutdown grace period; subsequent hand-off failures are
+                // durable Turn failures, not ambiguous control-plane timeouts.
+                let _ = ack.send(Ok(()));
                 if let Some(task) = active_turn_task.take() {
                     wait_for_turn_task_shutdown(task.into_join_handle()).await;
                 }
@@ -1095,18 +1309,39 @@ pub(super) async fn run_agent_loop(
                 .await
                 {
                     let recovery = active_recovery.clone();
-                    commit_or_stop!(AgentDurableEvent::TurnFailed {
+                    let failure_message =
+                        format!("failed to persist recovery execution-window handoff: {error}");
+                    let failure_dispatch = synthesize_post_turn_failure_dispatch(
+                        workspace_id.as_str(),
+                        thread_id.as_str(),
+                        request.turn_id.as_str(),
+                        Some(&turn_request),
+                        TurnPostTurnStatus::Failed,
+                        failure_message.clone(),
+                    );
+                    prepare_terminal_effects_or_stop!(
+                        request.turn_id,
+                        active_turn_run_id.unwrap_or(0),
+                        Some(&runtime_snapshot),
+                        failure_dispatch,
+                        Some(format!("parent turn failed: {failure_message}")),
+                    );
+                    commit_terminal_or_stop!(AgentDurableEvent::TurnFailed {
                         thread_id: thread_id.clone(),
                         turn_id: request.turn_id.clone(),
-                        error: format!(
-                            "failed to persist recovery execution-window handoff: {error}"
-                        ),
+                        error: failure_message.clone(),
                         recovery,
                     },);
+                    record_turn_observation!(
+                        request.turn_id,
+                        super::ExecutionTurnObservation {
+                            status: super::ExecutionTurnStatus::Failed,
+                            message: Some(failure_message),
+                        },
+                    );
                     clear_active_turn_control!();
                     active_turn_request = None;
                     active_recovery = None;
-                    let _ = ack.send(Err(error));
                     continue;
                 }
 
@@ -1116,6 +1351,8 @@ pub(super) async fn run_agent_loop(
                 last_turn_observation = None;
                 active_turn_request = Some(turn_request.clone());
                 last_turn_request = Some(turn_request.clone());
+                active_runtime_snapshot = Some(runtime_snapshot.clone());
+                last_runtime_snapshot = Some(runtime_snapshot.clone());
                 let recovery = recovery_context(&request);
                 active_recovery = Some(recovery.clone());
 
@@ -1129,28 +1366,23 @@ pub(super) async fn run_agent_loop(
                     thread_id.clone(),
                     workspace_id.clone(),
                     provider_registry.clone(),
-                    tool_loop_config.clone(),
-                    mcp_tool_provider.clone(),
-                    turn_tool_provider.clone(),
-                    turn_finalization_provider.clone(),
-                    task_tool_provider.clone(),
-                    hook_runtime.clone(),
-                    tool_bundle_artifacts.clone(),
-                    permission_approval_broker.clone(),
+                    runtime_snapshot,
                     provider,
                     turn_request,
                     turn_control,
                     Some(recovery),
                     run_id,
                 )));
-
-                let _ = ack.send(Ok(()));
             }
             AgentCommand::StartRestoredRecoveryTurn {
                 turn_request,
                 recovery_request,
                 ack,
             } => {
+                if let Some(outcome) = ack.completed() {
+                    let _ = ack.send(outcome);
+                    continue;
+                }
                 if active_turn_id.is_some() {
                     let _ = ack.send(Err(super::AgentControlError::TurnAlreadyRunning));
                     continue;
@@ -1159,6 +1391,8 @@ pub(super) async fn run_agent_loop(
                     let _ = ack.send(Err(super::AgentControlError::TurnMismatch));
                     continue;
                 }
+
+                let runtime_snapshot = runtime_dependencies.snapshot().await;
 
                 let mut active_request = ActiveTurnRequest {
                     turn_id: turn_request.turn_id.clone(),
@@ -1185,15 +1419,19 @@ pub(super) async fn run_agent_loop(
                 };
 
                 super::apply_recovery_adjustments(&mut active_request, &recovery_request);
-                if let Some(error) =
-                    recovery_execution_window_admission_error(&active_request, &tool_loop_config)
-                {
+                if let Some(error) = recovery_execution_window_admission_error(
+                    &active_request,
+                    &runtime_snapshot.tool_loop_config,
+                ) {
                     let _ = ack.send(Err(error));
                     continue;
                 }
 
                 if recovery_request.refresh_provider_auth {
-                    provider_registry.invalidate(active_request.provider_name.as_str());
+                    provider_registry.invalidate_workspace_provider(
+                        workspace_id.as_str(),
+                        active_request.provider_name.as_str(),
+                    );
                 }
 
                 let provider = match provider_registry.get_or_create_for_workspace(
@@ -1223,8 +1461,15 @@ pub(super) async fn run_agent_loop(
 
                 let run_id = next_turn_run_id;
                 next_turn_run_id = next_turn_run_id.saturating_add(1);
-                let turn_control = TurnExecutionControl::new(command_tx.clone(), run_id);
+                let mut turn_control = TurnExecutionControl::new(command_tx.clone(), run_id);
                 let recovery = recovery_context(&recovery_request);
+                turn_control.restored_recovery = Some((
+                    format!(
+                        "{}:terminal-effects:{run_id}:{}:recovery:{}",
+                        active_request.turn_id, runtime_snapshot.generation, recovery.attempt_id
+                    ),
+                    recovery.clone(),
+                ));
 
                 active_turn_id = Some(active_request.turn_id.clone());
                 active_turn_run_id = Some(run_id);
@@ -1236,6 +1481,8 @@ pub(super) async fn run_agent_loop(
                 );
                 active_turn_request = Some(active_request.clone());
                 last_turn_request = Some(active_request.clone());
+                active_runtime_snapshot = Some(runtime_snapshot.clone());
+                last_runtime_snapshot = Some(runtime_snapshot.clone());
                 active_recovery = Some(recovery.clone());
 
                 active_turn_task = Some(ActiveTurnTask::new(spawn_turn_task(
@@ -1244,14 +1491,7 @@ pub(super) async fn run_agent_loop(
                     thread_id.clone(),
                     workspace_id.clone(),
                     provider_registry.clone(),
-                    tool_loop_config.clone(),
-                    mcp_tool_provider.clone(),
-                    turn_tool_provider.clone(),
-                    turn_finalization_provider.clone(),
-                    task_tool_provider.clone(),
-                    hook_runtime.clone(),
-                    tool_bundle_artifacts.clone(),
-                    permission_approval_broker.clone(),
+                    runtime_snapshot,
                     provider,
                     active_request,
                     turn_control,
@@ -1261,9 +1501,16 @@ pub(super) async fn run_agent_loop(
 
                 let _ = ack.send(Ok(()));
             }
+            AgentCommand::DurableStartRejected { turn_id, run_id } => {
+                if active_turn_id.as_deref() == Some(&turn_id) && active_turn_run_id == Some(run_id)
+                {
+                    // Registration emitted the single safe ERROR. No provider ran.
+                    return;
+                }
+            }
             AgentCommand::Shutdown => {
                 if let Some(control) = active_turn_control.as_ref() {
-                    control.cancel_all_attempts().await;
+                    control.cancel_all_attempts();
                 }
                 if let Some(task) = active_turn_task.take() {
                     wait_for_turn_task_shutdown(task.into_join_handle()).await;
@@ -1280,14 +1527,7 @@ fn spawn_turn_task(
     thread_id: String,
     workspace_id: String,
     provider_registry: Arc<ProviderRegistry>,
-    tool_loop_config: ToolLoopConfig,
-    mcp_tool_provider: Option<Arc<dyn AgentMcpToolProvider>>,
-    turn_tool_provider: Option<Arc<dyn TurnToolProvider>>,
-    turn_finalization_provider: Option<Arc<dyn TurnFinalizationProvider>>,
-    task_tool_provider: Option<Arc<dyn TaskToolProvider>>,
-    hook_runtime: Option<Arc<HookRuntime>>,
-    tool_bundle_artifacts: Option<Arc<AgentToolBundleArtifactStore>>,
-    permission_approval_broker: Arc<RwLock<Arc<dyn pioneer_tools::PermissionApprovalBroker>>>,
+    runtime_snapshot: NativeTurnRuntimeSnapshot,
     provider: Arc<dyn Provider>,
     turn_request: ActiveTurnRequest,
     turn_control: TurnExecutionControl,
@@ -1295,8 +1535,104 @@ fn spawn_turn_task(
     run_id: u64,
 ) -> JoinHandle<()> {
     tokio::spawn(turn_flow_future(async move {
-        let permission_approval_broker = permission_approval_broker.read().await.clone();
+        // Admission ACK remains process control; provider/tool work cannot begin
+        // until its immutable cancellation description has a durable ACK.
+        let initial_turn = recovery.is_none() && turn_request.execution_window_index == 1;
+        let cancellation_dispatch = if initial_turn {
+            synthesize_post_turn_failure_dispatch(
+                &workspace_id,
+                &thread_id,
+                &turn_request.turn_id,
+                Some(&turn_request),
+                TurnPostTurnStatus::Interrupted,
+                String::new(),
+            )
+        } else {
+            None
+        };
+        let mut cancellation_context =
+            crate::post_turn::identify_native_cancellation(terminal_effect_preparation(
+                &workspace_id,
+                &thread_id,
+                &turn_request.turn_id,
+                run_id,
+                &runtime_snapshot,
+                cancellation_dispatch,
+                Some(String::new()),
+            ));
+        if !initial_turn {
+            cancellation_context.effects.clear();
+        }
+        if let Some((batch_id, _)) = turn_control.restored_recovery.as_ref() {
+            // The durable delivery identity must distinguish restored attempts,
+            // even when a replacement actor restarts its local run counter.
+            cancellation_context.batch_id = batch_id.clone();
+        }
+        match publish_loop_durable_event(
+            &event_hub,
+            AgentDurableEvent::NativeCancellationContextPrepared {
+                preparation: cancellation_context,
+                initial_turn,
+            },
+            Some(turn_control.cancellation_token()),
+        )
+        .await
+        {
+            LoopDurableCommitOutcome::Committed => {}
+            LoopDurableCommitOutcome::PermanentRejection { .. } => {
+                let _ = command_tx
+                    .send(AgentCommand::DurableStartRejected {
+                        turn_id: turn_request.turn_id.clone(),
+                        run_id,
+                    })
+                    .await;
+                return;
+            }
+            _ => return,
+        }
+
+        let NativeTurnRuntimeSnapshot {
+            context_controller,
+            generation: _,
+            tool_loop_config,
+            mcp_tool_provider,
+            turn_tool_provider,
+            turn_finalization_provider,
+            task_tool_provider,
+            task_cleanup_runtime_contract: _,
+            hook_runtime,
+            tool_bundle_artifacts,
+            post_turn_hook_dispatch_policy: _,
+            interrupted_hook_snapshot: _,
+            permission_approval_broker,
+        } = runtime_snapshot;
+        let missing_context_recovery = turn_request.execution_options.context_overflow_recovery
+            && context_controller.is_none();
+        let context_session = context_controller.map(|controller| {
+            Arc::new(crate::compaction::controller::NativeContextSession::new(
+                crate::compaction::controller::NativeContext {
+                    overflow_recovery: turn_request.execution_options.context_overflow_recovery,
+                    recovery_deadline_ms: turn_request
+                        .execution_options
+                        .context_recovery_deadline_ms,
+                    workspace_id: workspace_id.clone(),
+                    thread_id: thread_id.clone(),
+                    turn_id: turn_request.turn_id.clone(),
+                    conversation_thread_id: turn_request
+                        .hook_runtime_context
+                        .conversation_thread_id
+                        .clone(),
+                    provider_instance: turn_request.provider_name.clone(),
+                    provider: provider.clone(),
+                    events: event_hub.clone(),
+                    cancellation: turn_control.cancellation_token(),
+                },
+                controller,
+            ))
+        });
         let result = AssertUnwindSafe(turn_flow_future(execute_turn_flow(
+            missing_context_recovery,
+            context_session.clone(),
             thread_id.clone(),
             turn_request.turn_id.clone(),
             workspace_id,
@@ -1357,9 +1693,31 @@ fn spawn_turn_task(
                 turn_id: turn_request.turn_id,
                 run_id,
                 completion: result,
+                context_session,
             })
             .await;
     }))
+}
+
+struct OwnedContextFence {
+    session: Arc<crate::compaction::controller::NativeContextSession>,
+}
+impl OwnedContextFence {
+    async fn stop(self, persist_stop: bool) -> anyhow::Result<()> {
+        // User cancellation/new input still fences durable background work.
+        let fence = if persist_stop {
+            self.session.stop().await
+        } else {
+            Ok(())
+        };
+        self.session.context.cancellation.cancel();
+        fence
+    }
+}
+impl Drop for OwnedContextFence {
+    fn drop(&mut self) {
+        self.session.context.cancellation.cancel();
+    }
 }
 
 struct ActiveTurnTask {
@@ -1436,6 +1794,8 @@ fn recovery_context(request: &super::RecoveryAttemptRequest) -> RecoveryAttemptC
 }
 
 async fn execute_turn_flow(
+    missing_context_recovery: bool,
+    context_session: Option<Arc<crate::compaction::controller::NativeContextSession>>,
     thread_id: String,
     turn_id: String,
     workspace_id: String,
@@ -1476,6 +1836,14 @@ async fn execute_turn_flow(
     recovery: Option<RecoveryAttemptContext>,
     event_hub: Arc<AgentEventHub>,
 ) -> TurnTaskCompletion {
+    if missing_context_recovery {
+        return TurnTaskCompletion {
+            result: Err(TurnTaskFailure::Blocked(
+                "context recovery runtime is unavailable".into(),
+            )),
+            post_turn_dispatch: None,
+        };
+    }
     match mode {
         ThreadMode::Message => TurnTaskCompletion {
             result: Err(TurnTaskFailure::Terminal(
@@ -1484,44 +1852,50 @@ async fn execute_turn_flow(
             )),
             post_turn_dispatch: None,
         },
-        ThreadMode::Chat | ThreadMode::Agent => turn_flow_future(chat::execute_chat_turn_flow(
-            thread_id,
-            turn_id,
-            workspace_id,
-            mode,
-            provider_registry,
-            provider,
-            model,
-            hook_runtime_context,
-            reasoning,
-            workspace_skill_policies,
-            skill_catalog,
-            agent_skill_overlay,
-            input,
-            capabilities,
-            resolved_artifacts,
-            runtime_environment,
-            history,
-            retained_provider_history,
-            execution_window_index,
-            execution_checkpoint_context,
-            permission_profile,
-            execution_security_snapshot,
-            force_non_stream,
-            disable_tool_calling,
-            continue_generation_hint,
-            tool_loop_config,
-            mcp_tool_provider,
-            turn_tool_provider,
-            turn_finalization_provider,
-            task_tool_provider,
-            hook_runtime,
-            tool_bundle_artifacts,
-            permission_approval_broker,
-            turn_control,
-            recovery,
-            event_hub,
-        ))
+        ThreadMode::Chat | ThreadMode::Agent => turn_flow_future(
+            pioneer_observability::turn_startup::scope(
+                Some(turn_id.clone()),
+                chat::execute_chat_turn_flow(
+                    context_session,
+                    thread_id,
+                    turn_id,
+                    workspace_id,
+                    mode,
+                    provider_registry,
+                    provider,
+                    model,
+                    hook_runtime_context,
+                    reasoning,
+                    workspace_skill_policies,
+                    skill_catalog,
+                    agent_skill_overlay,
+                    input,
+                    capabilities,
+                    resolved_artifacts,
+                    runtime_environment,
+                    history,
+                    retained_provider_history,
+                    execution_window_index,
+                    execution_checkpoint_context,
+                    permission_profile,
+                    execution_security_snapshot,
+                    force_non_stream,
+                    disable_tool_calling,
+                    continue_generation_hint,
+                    tool_loop_config,
+                    mcp_tool_provider,
+                    turn_tool_provider,
+                    turn_finalization_provider,
+                    task_tool_provider,
+                    hook_runtime,
+                    tool_bundle_artifacts,
+                    permission_approval_broker,
+                    turn_control,
+                    recovery,
+                    event_hub,
+                ),
+            ),
+        )
         .await
         .map(|outcome| match outcome {
             chat::ChatTurnOutcome::Completed { post_turn_dispatch } => TurnTaskCompletion {
@@ -1558,11 +1932,61 @@ async fn execute_turn_flow(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoopDurableCommitOutcome {
+    Committed,
+    CooperativeCancellation,
+    SupersededByDurableInterruption,
+    PermanentRejection { code: &'static str, attempt: u32 },
+}
+
+fn loop_durable_event_kind(event: &AgentDurableEvent) -> &'static str {
+    match event {
+        AgentDurableEvent::ToolOutputRecorded { .. } => "tool_output_recorded",
+        AgentDurableEvent::PromptManifestCompiled { .. } => "prompt_manifest_compiled",
+        AgentDurableEvent::TurnSkillsResolved { .. } => "turn_skills_resolved",
+        AgentDurableEvent::TurnCapabilitiesResolved { .. } => "turn_capabilities_resolved",
+        AgentDurableEvent::SkillAuditEvents { .. } => "skill_audit_events",
+        AgentDurableEvent::TurnPermissionAudit { .. } => "turn_permission_audit",
+        AgentDurableEvent::TurnLlmContextAppended { .. } => "turn_llm_context_appended",
+        AgentDurableEvent::TurnProviderHistoryAppended { .. } => "turn_provider_history_appended",
+        AgentDurableEvent::ItemStarted { .. } => "item_started",
+        AgentDurableEvent::ItemCompleted { .. } => "item_completed",
+        AgentDurableEvent::TurnFinalizationPrepared { .. } => "turn_finalization_prepared",
+        AgentDurableEvent::ItemToolRetryScheduled { .. } => "item_tool_retry_scheduled",
+        AgentDurableEvent::ItemToolRetryResolved { .. } => "item_tool_retry_resolved",
+        AgentDurableEvent::ItemToolRetryExhausted { .. } => "item_tool_retry_exhausted",
+        AgentDurableEvent::TurnToolLoopBudgetExceeded { .. } => "turn_tool_loop_budget_exceeded",
+        AgentDurableEvent::TurnExecutionWindowStarted { .. } => "turn_execution_window_started",
+        AgentDurableEvent::TurnExecutionWindowExhausted { .. } => "turn_execution_window_exhausted",
+        AgentDurableEvent::TurnExecutionWindowCheckpointed { .. } => {
+            "turn_execution_window_checkpointed"
+        }
+        AgentDurableEvent::TurnExecutionWindowContinued { .. } => "turn_execution_window_continued",
+        AgentDurableEvent::TurnExecutionWindowBlocked { .. } => "turn_execution_window_blocked",
+        AgentDurableEvent::ProviderFailureDetected { .. } => "provider_failure_detected",
+        AgentDurableEvent::RecoveryAttemptSucceeded { .. } => "recovery_attempt_succeeded",
+        AgentDurableEvent::NativeCancellationContextPrepared { .. } => {
+            "native_cancellation_context_prepared"
+        }
+        AgentDurableEvent::NativeTerminalEffectsPrepared { .. } => {
+            "native_terminal_effects_prepared"
+        }
+        AgentDurableEvent::TurnCompleted { .. } => "turn_completed",
+        AgentDurableEvent::TurnFailed { .. } => "turn_failed",
+        AgentDurableEvent::TurnBlocked { .. } => "turn_blocked",
+        AgentDurableEvent::TurnInterrupted { .. } => "turn_interrupted",
+        AgentDurableEvent::TaskEvent { .. } => "task_event",
+        AgentDurableEvent::ThreadLineageCreated { .. } => "thread_lineage_created",
+    }
+}
+
 async fn publish_loop_durable_event(
     event_hub: &AgentEventHub,
     event: AgentDurableEvent,
     cancellation: Option<CancellationToken>,
-) -> bool {
+) -> LoopDurableCommitOutcome {
+    let event_kind = loop_durable_event_kind(&event);
     const COMMIT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(30);
     let mut attempt = 0_u32;
     loop {
@@ -1573,24 +1997,66 @@ async fn publish_loop_durable_event(
         );
         let result = if let Some(cancellation) = cancellation.as_ref() {
             tokio::select! {
-                _ = cancellation.cancelled() => return false,
+                _ = cancellation.cancelled() => return LoopDurableCommitOutcome::CooperativeCancellation,
                 result = commit => result,
             }
         } else {
             commit.await
         };
         match result {
-            Ok(Ok(())) => return true,
-            Ok(Err(error)) => error!(
-                attempt,
-                error = %error,
-                "durable agent-loop event remains pending after rejected commit"
-            ),
-            Err(_) => error!(
-                attempt,
-                timeout_seconds = COMMIT_ATTEMPT_TIMEOUT.as_secs(),
-                "durable agent-loop event remains pending after commit attempt timed out"
-            ),
+            Ok(Ok(())) => return LoopDurableCommitOutcome::Committed,
+            Ok(Err(pioneer_runtime_events::ExecutionEventHubError::CommitRejected(rejection)))
+                if rejection.kind() == pioneer_runtime_events::DurableCommitRejectionKind::SupersededByDurableInterruption =>
+            {
+                return LoopDurableCommitOutcome::SupersededByDurableInterruption;
+            }
+            Ok(Err(pioneer_runtime_events::ExecutionEventHubError::CommitRejected(rejection)))
+                if !rejection.is_retryable() =>
+            {
+                error!(
+                    attempt,
+                    commit_error_code = rejection.code(),
+                    event_kind,
+                    "durable agent-loop event was permanently rejected"
+                );
+                return LoopDurableCommitOutcome::PermanentRejection {
+                    code: rejection.code(),
+                    attempt,
+                };
+            }
+            Ok(Err(error)) => {
+                // One error event identifies one continuous outage period;
+                // sparse warnings remain useful breadcrumbs without sending
+                // every retry to Sentry.
+                if attempt == 8 {
+                    error!(
+                        attempt,
+                        error = %error,
+                        "durable agent-loop event remains pending during a commit outage"
+                    );
+                } else if attempt.is_power_of_two() {
+                    warn!(
+                        attempt,
+                        error = %error,
+                        "retrying durable agent-loop event after transient commit rejection"
+                    );
+                }
+            }
+            Err(_) => {
+                if attempt == 8 {
+                    error!(
+                        attempt,
+                        timeout_seconds = COMMIT_ATTEMPT_TIMEOUT.as_secs(),
+                        "durable agent-loop event remains pending during a commit outage"
+                    );
+                } else if attempt.is_power_of_two() {
+                    warn!(
+                        attempt,
+                        timeout_seconds = COMMIT_ATTEMPT_TIMEOUT.as_secs(),
+                        "retrying durable agent-loop event after commit attempt timed out"
+                    );
+                }
+            }
         }
 
         // A terminal/checkpoint boundary cannot be converted to process-local
@@ -1602,7 +2068,7 @@ async fn publish_loop_durable_event(
             .min(30_000);
         if let Some(cancellation) = cancellation.as_ref() {
             tokio::select! {
-                _ = cancellation.cancelled() => return false,
+                _ = cancellation.cancelled() => return LoopDurableCommitOutcome::CooperativeCancellation,
                 _ = sleep(Duration::from_millis(delay_ms)) => {}
             }
         } else {
@@ -1647,22 +2113,73 @@ async fn publish_recovery_execution_window_continued(
         })
 }
 
-async fn maybe_dispatch_post_turn_hook(
-    hook_runtime: Option<Arc<HookRuntime>>,
-    policy: AgentPostTurnHookDispatchPolicy,
-    deferred_task_post_turn_dispatches: &DeferredTaskPostTurnDispatchStore,
-    dispatch: Option<AgentTurnPostTurnHookDispatch>,
-) {
-    let Some(dispatch) = dispatch else {
-        return;
-    };
-    if !policy.should_dispatch(dispatch.status()) {
-        return;
+fn terminal_effect_preparation(
+    workspace_id: &str,
+    thread_id: &str,
+    turn_id: &str,
+    run_id: u64,
+    runtime_snapshot: &NativeTurnRuntimeSnapshot,
+    post_turn_dispatch: Option<AgentTurnPostTurnHookDispatch>,
+    cleanup_reason: Option<String>,
+) -> NativeTerminalEffectPreparation {
+    const MAX_ATTEMPTS: u16 = 5;
+    const MAX_CLEANUP_REASON_CHARS: usize = 4_096;
+
+    let mut effects = Vec::with_capacity(2);
+    if runtime_snapshot.hook_runtime.is_some()
+        && let Some(dispatch) = post_turn_dispatch
+        && runtime_snapshot
+            .post_turn_hook_dispatch_policy
+            .should_dispatch(dispatch.status())
+    {
+        effects.push(if dispatch.status() == TurnPostTurnStatus::Interrupted {
+            crate::post_turn::prepare_interrupted_dispatch_effect(
+                turn_id,
+                runtime_snapshot.interrupted_hook_snapshot.as_deref(),
+                dispatch,
+            )
+        } else {
+            crate::post_turn::prepare_dispatch_effect(
+                turn_id,
+                runtime_snapshot
+                    .hook_runtime
+                    .as_ref()
+                    .expect("checked hook runtime"),
+                dispatch,
+            )
+        });
     }
 
-    deferred_task_post_turn_dispatches
-        .defer(hook_runtime, dispatch)
-        .await;
+    if runtime_snapshot.task_tool_provider.is_some()
+        && let Some(reason) = cleanup_reason
+    {
+        let runtime_contract = runtime_snapshot
+            .task_cleanup_runtime_contract
+            .clone()
+            .expect("task cleanup provider and runtime contract are captured atomically");
+        effects.push(NativeTerminalEffectSpec {
+            effect_id: format!("{turn_id}:terminal-effect:attached-task-cleanup"),
+            effect_kind: NativeTerminalEffectKind::AttachedTaskCleanup,
+            gate: NativeTerminalEffectGate::TerminalCommit,
+            payload: NativeTerminalEffectPayload::AttachedTaskCleanup {
+                reason: reason.chars().take(MAX_CLEANUP_REASON_CHARS).collect(),
+                runtime_contract,
+            },
+            max_attempts: MAX_ATTEMPTS,
+        });
+    }
+
+    NativeTerminalEffectPreparation {
+        batch_id: format!(
+            "{turn_id}:terminal-effects:{run_id}:{}",
+            runtime_snapshot.generation
+        ),
+        workspace_id: workspace_id.to_owned(),
+        thread_id: thread_id.to_owned(),
+        turn_id: turn_id.to_owned(),
+        runtime_generation: runtime_snapshot.generation,
+        effects,
+    }
 }
 
 fn synthesize_post_turn_failure_dispatch(
@@ -1712,34 +2229,193 @@ fn turn_request_user_text(input: &[UserInput]) -> String {
     parts.join("\n")
 }
 
-async fn cleanup_attached_tasks(
-    provider: Option<&Arc<dyn TaskToolProvider>>,
-    workspace_id: &str,
-    thread_id: &str,
-    turn_id: &str,
-    reason: String,
-) {
-    let Some(provider) = provider else {
-        return;
-    };
-    let _ = provider
-        .cleanup_attached_tasks(
-            TaskTurnContext {
-                workspace_id: workspace_id.to_owned(),
-                thread_id: thread_id.to_owned(),
-                turn_id: turn_id.to_owned(),
-            },
-            reason,
-        )
-        .await;
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
         ExecutionWindowTotalBudgetBlockKind, ExecutionWindowTotalBudgetDecision,
-        TurnExecutionUsageCounters, decide_execution_window_total_budget,
+        LoopDurableCommitOutcome, TurnExecutionUsageCounters, decide_execution_window_total_budget,
+        publish_loop_durable_event,
     };
+    use pioneer_protocol::AgentDurableEvent;
+    use pioneer_runtime_events::{DurableCommitRejection, ExecutionEventHub};
+    use std::sync::Arc;
+    use tokio::time::{Duration, timeout};
+
+    fn completed_event(turn_id: &str) -> AgentDurableEvent {
+        AgentDurableEvent::TurnCompleted {
+            thread_id: "thread_1".to_owned(),
+            turn_id: turn_id.to_owned(),
+            recovery: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn permanent_durable_commit_rejection_stops_terminal_retry() {
+        let hub = Arc::new(ExecutionEventHub::with_capacity(4, 4));
+        let mut receiver = hub.take_durable_receiver().await.expect("receiver");
+        let publisher = {
+            let hub = hub.clone();
+            tokio::spawn(async move {
+                publish_loop_durable_event(&hub, completed_event("turn_permanent"), None).await
+            })
+        };
+
+        receiver.recv().await.expect("first attempt");
+        receiver.acknowledge_last(Err(DurableCommitRejection::permanent(
+            "execution_fenced",
+            "durable event no longer has execution authority",
+        )));
+
+        assert_eq!(
+            timeout(Duration::from_secs(1), publisher)
+                .await
+                .expect("permanent rejection should stop immediately")
+                .expect("publisher task"),
+            LoopDurableCommitOutcome::PermanentRejection {
+                code: "execution_fenced",
+                attempt: 1
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn retryable_durable_commit_rejection_preserves_event_until_ack() {
+        let hub = Arc::new(ExecutionEventHub::with_capacity(4, 4));
+        let mut receiver = hub.take_durable_receiver().await.expect("receiver");
+        let publisher = {
+            let hub = hub.clone();
+            tokio::spawn(async move {
+                publish_loop_durable_event(&hub, completed_event("turn_retryable"), None).await
+            })
+        };
+
+        receiver.recv().await.expect("first attempt");
+        receiver.acknowledge_last(Err(DurableCommitRejection::retryable(
+            "storage_temporarily_unavailable",
+            "storage is temporarily unavailable",
+        )));
+        timeout(Duration::from_secs(1), receiver.recv())
+            .await
+            .expect("retry deadline")
+            .expect("retry attempt");
+        receiver.acknowledge_last(Ok(()));
+
+        assert_eq!(
+            timeout(Duration::from_secs(1), publisher)
+                .await
+                .expect("retry should finish")
+                .expect("publisher task"),
+            LoopDurableCommitOutcome::Committed
+        );
+    }
+
+    #[tokio::test]
+    async fn cooperative_cancellation_is_not_a_durable_ack() {
+        let hub = ExecutionEventHub::with_capacity(4, 4);
+        let token = tokio_util::sync::CancellationToken::new();
+        token.cancel();
+        assert_eq!(
+            publish_loop_durable_event(&hub, completed_event("cancelled"), Some(token)).await,
+            LoopDurableCommitOutcome::CooperativeCancellation
+        );
+    }
+
+    #[tokio::test]
+    async fn confirmed_supersession_is_distinct_from_permanent_rejection() {
+        let hub = Arc::new(ExecutionEventHub::with_capacity(4, 4));
+        let mut receiver = hub.take_durable_receiver().await.unwrap();
+        let publisher = {
+            let hub = hub.clone();
+            tokio::spawn(async move {
+                publish_loop_durable_event(&hub, completed_event("superseded"), None).await
+            })
+        };
+        receiver.recv().await.unwrap();
+        receiver.acknowledge_last(Err(
+            DurableCommitRejection::superseded_by_durable_interruption(),
+        ));
+        assert_eq!(
+            publisher.await.unwrap(),
+            LoopDurableCommitOutcome::SupersededByDurableInterruption
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timeout_preserves_event_and_retries_until_ack() {
+        let hub = Arc::new(ExecutionEventHub::with_capacity(4, 4));
+        let mut receiver = hub.take_durable_receiver().await.unwrap();
+        let publisher = {
+            let hub = hub.clone();
+            tokio::spawn(async move {
+                publish_loop_durable_event(&hub, completed_event("timeout"), None).await
+            })
+        };
+        let first = receiver.recv().await.unwrap();
+        tokio::time::advance(Duration::from_secs(30)).await;
+        let second = receiver.recv().await.unwrap();
+        assert_eq!(first, second);
+        receiver.acknowledge_last(Ok(()));
+        assert_eq!(
+            publisher.await.unwrap(),
+            LoopDurableCommitOutcome::Committed
+        );
+    }
+
+    #[test]
+    fn real_sentry_mapper_captures_one_safe_rejection_and_no_supersession() {
+        use tracing_subscriber::prelude::*;
+        const CANARY: &str = "private-user-payload-canary";
+        // Keep two independent dispatchers alive: tracing-core's single-dispatch
+        // fast path computes new callsite interest from the registering thread's
+        // default. Parallel publisher tests have no default subscriber and can
+        // otherwise cache Interest::never for our shared ERROR callsite. Neither
+        // dispatcher is installed globally; only this thread uses the Sentry one.
+        let interest_guard = tracing::Dispatch::new(tracing_subscriber::registry());
+        let events = sentry::test::with_captured_events(|| {
+            let subscriber = tracing::Dispatch::new(
+                tracing_subscriber::registry().with(pioneer_observability::sentry_tracing_layer()),
+            );
+            tracing::dispatcher::with_default(&subscriber, || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(async {
+                        for rejection in [
+                            DurableCommitRejection::superseded_by_durable_interruption(),
+                            DurableCommitRejection::permanent(
+                                "execution_fenced",
+                                "execution ownership was rejected",
+                            ),
+                            DurableCommitRejection::permanent(
+                                "native_preparation_rejected",
+                                "immutable preparation conflicts",
+                            ),
+                        ] {
+                            let hub = ExecutionEventHub::with_capacity(4, 4);
+                            let mut receiver = hub.take_durable_receiver().await.unwrap();
+                            let publish =
+                                publish_loop_durable_event(&hub, completed_event(CANARY), None);
+                            let acknowledge = async {
+                                receiver.recv().await.unwrap();
+                                receiver.acknowledge_last(Err(rejection));
+                            };
+                            let _ = tokio::join!(publish, acknowledge);
+                        }
+                    });
+            });
+        });
+        drop(interest_guard);
+        assert_eq!(events.len(), 2);
+        for event in events {
+            assert_eq!(event.level, sentry::Level::Error);
+            let encoded = serde_json::to_string(&event).unwrap();
+            assert!(!encoded.contains(CANARY));
+            assert!(encoded.contains("commit_error_code"));
+            assert!(encoded.contains("event_kind"));
+            assert!(!encoded.contains("exhausted"));
+        }
+    }
 
     fn total_budget(
         max_windows_per_turn: u32,

@@ -31,6 +31,10 @@
           "type": "string",
           "const": "item_heartbeat"
         },
+        "source": {
+          "$ref": "#/$defs/ItemHeartbeatSource",
+          "default": "owner_lease"
+        },
         "thread_id": {
           "type": "string"
         },
@@ -199,6 +203,13 @@
         "generic"
       ]
     },
+    "ItemHeartbeatSource": {
+      "type": "string",
+      "enum": [
+        "owner_lease",
+        "confirmed_external_activity"
+      ]
+    },
     "MarkdownBlock": {
       "oneOf": [
         {
@@ -289,6 +300,47 @@
           "required": [
             "type",
             "text"
+          ]
+        },
+        {
+          "description": "Structured cells and the original GFM fragment with its used reference\ndefinitions, without Quote/List prefixes.",
+          "type": "object",
+          "properties": {
+            "alignments": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/MarkdownTableAlignment"
+              }
+            },
+            "headers": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/MarkdownInline"
+              }
+            },
+            "rows": {
+              "type": "array",
+              "items": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/$defs/MarkdownInline"
+                }
+              }
+            },
+            "source": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "table"
+            }
+          },
+          "required": [
+            "type",
+            "headers",
+            "rows",
+            "alignments",
+            "source"
           ]
         },
         {
@@ -466,6 +518,15 @@
             "url"
           ]
         }
+      ]
+    },
+    "MarkdownTableAlignment": {
+      "type": "string",
+      "enum": [
+        "none",
+        "left",
+        "center",
+        "right"
       ]
     },
     "TurnItemType": {

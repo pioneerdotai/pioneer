@@ -21,12 +21,17 @@ impl HookHandler for MemoryPostTurnExtractorHook {
     }
 
     fn capabilities(&self) -> HookCapabilities {
-        memory_post_turn_extractor_capabilities(self.extractor_provider.is_some())
+        memory_post_turn_extractor_capabilities(
+            &self.config,
+            self.write_provider.is_some(),
+            self.extractor_provider.is_some(),
+        )
     }
 
     async fn execute(&self, request: HookHandlerRequest) -> HookResult<HookHandlerResponse> {
         let input = turn_post_turn_input(&request)?;
         let config = self.config.normalized();
+        let durable_terminal_effect = memory_durable_terminal_effect_claim(&request.context)?;
         let mut response = HookHandlerResponse::default();
 
         let policy = match memory_turn_policy_from_hook_policy_set(&request.policy_set) {
@@ -71,6 +76,12 @@ impl HookHandler for MemoryPostTurnExtractorHook {
         }
 
         let Some(write_provider) = self.write_provider.as_ref() else {
+            if durable_terminal_effect.is_some() {
+                return Err(memory_retryable_safe_hook_error(
+                    "memory.post_turn_extractor.write_provider_unavailable",
+                    "memory post-turn extractor write provider is unavailable",
+                ));
+            }
             response
                 .diagnostics
                 .push(memory_post_turn_provider_skip_diagnostic(
@@ -80,6 +91,12 @@ impl HookHandler for MemoryPostTurnExtractorHook {
             return Ok(response);
         };
         let Some(extractor_provider) = self.extractor_provider.as_ref() else {
+            if durable_terminal_effect.is_some() {
+                return Err(memory_retryable_safe_hook_error(
+                    "memory.post_turn_extractor.provider_unavailable",
+                    "memory post-turn extractor provider is unavailable",
+                ));
+            }
             response
                 .diagnostics
                 .push(memory_post_turn_provider_skip_diagnostic(
@@ -90,6 +107,22 @@ impl HookHandler for MemoryPostTurnExtractorHook {
         };
 
         let context = memory_turn_context_from_post_turn_request(&request, input, &config)?;
+
+        // External runtimes have no ProviderRegistry-backed thread model.
+        // Do not invent a fallback provider (or retry an invalid configuration).
+        if config.model.as_ref().or(input.model.as_ref()).is_none()
+            || config
+                .provider_name
+                .as_ref()
+                .or(input.model_provider.as_ref())
+                .is_none()
+        {
+            response.diagnostics.push(memory_safe_warning_diagnostic(
+                "memory.post_turn_extractor.model_unavailable",
+                "Post-turn extraction requires an API model: select a custom proactive-writes model when the turn runs through CLI.",
+            ));
+            return Ok(response);
+        }
 
         let manifest = match write_provider
             .load_memory_manifest(
@@ -102,45 +135,83 @@ impl HookHandler for MemoryPostTurnExtractorHook {
             .await
         {
             Ok(manifest) => manifest,
-            Err(_) => {
-                response
-                    .diagnostics
-                    .push(memory_post_turn_provider_skip_diagnostic(
-                        "manifest_failed",
-                        "memory post-turn extractor skipped: manifest loading failed",
-                    ));
+            Err(failure) => {
+                let error = memory_manifest_hook_error(failure);
+                tracing::warn!(
+                    target: "pioneer::memory_post_turn_extractor",
+                    stage = "manifest_load",
+                    durable = durable_terminal_effect.is_some(),
+                    failure_class = failure.class_name(),
+                    failure_stage = failure.stage.as_str(),
+                    sqlite_primary_code = failure.sqlite_primary_code,
+                    sqlite_extended_code = failure.sqlite_extended_code,
+                    "memory post-turn extractor manifest load failed"
+                );
+                if durable_terminal_effect.is_some() {
+                    return Err(error);
+                }
+                let mut diagnostic = memory_post_turn_provider_skip_diagnostic(
+                    "manifest_failed",
+                    "memory post-turn extractor skipped: manifest loading failed",
+                );
+                diagnostic.metadata.insert(
+                    hook_metadata_key("manifest_failure_code"),
+                    HookValue::Text(failure.code().to_owned()),
+                );
+                for (key, value) in error.metadata {
+                    diagnostic.metadata.insert(key, HookValue::Text(value));
+                }
+                response.diagnostics.push(diagnostic);
                 return Ok(response);
             }
         };
 
-        let primary_extractor_context = memory_post_turn_extractor_context_from_turn(
+        let extractor_context = memory_post_turn_extractor_context_from_turn(
             &context,
             config.model.clone().or_else(|| input.model.clone()),
             config
                 .provider_name
                 .clone()
                 .or_else(|| input.model_provider.clone()),
+            durable_terminal_effect.clone(),
         );
         let extractor_request =
             memory_post_turn_extractor_request_from_input(input, manifest, &config);
 
-        let extraction = match extract_post_turn_memory_with_thread_model_retry(
+        let extraction = match extract_post_turn_memory_once(
             extractor_provider.as_ref(),
-            primary_extractor_context,
-            input,
+            extractor_context.clone(),
             extractor_request,
             &config,
         )
         .await
         {
             Ok(extraction) => extraction,
-            Err(MemoryPostTurnExtractorFailure::ProviderFailed) => {
-                return Err(memory_retryable_safe_hook_error(
-                    "memory.post_turn_extractor.provider_failed",
-                    "memory post-turn extractor provider failed",
-                ));
-            }
+            Err(MemoryPostTurnExtractorFailure::ProviderFailed(error)) => return Err(error),
             Err(MemoryPostTurnExtractorFailure::InvalidJson(error)) => {
+                if durable_terminal_effect.is_some() {
+                    let mut hook_error = memory_hook_error(
+                        "memory.post_turn_extractor.invalid_json",
+                        format!("memory post-turn extractor returned invalid JSON: {error}"),
+                    )
+                    .with_safe_for_user(true);
+                    for (key, value) in [
+                        ("provider", extractor_context.model_provider.clone()),
+                        ("model", extractor_context.model.clone()),
+                        ("failure_stage", Some("response_json_parse".to_owned())),
+                        ("failure_class", Some(error.category.as_str().to_owned())),
+                        ("parse_category", Some(error.category.as_str().to_owned())),
+                        ("parse_line", Some(error.line.to_string())),
+                        ("parse_column", Some(error.column.to_string())),
+                    ] {
+                        if let Some(value) = value {
+                            hook_error.metadata.insert(hook_metadata_key(key), value);
+                        }
+                    }
+                    // An alternate provider has not established fresh provenance.
+                    // Only Gateway's pre-checkpoint fresh failure authorizes retry.
+                    return Err(hook_error);
+                }
                 response.diagnostics.push(memory_safe_warning_diagnostic(
                     "memory.post_turn_extractor.invalid_json",
                     format!("memory post-turn extractor returned invalid JSON: {error}"),
@@ -148,9 +219,6 @@ impl HookHandler for MemoryPostTurnExtractorHook {
                 return Ok(response);
             }
         };
-        response.diagnostics.extend(hook_diagnostics_from_strings(
-            extraction.diagnostics.as_slice(),
-        ));
         let extractor_model = extraction.model;
         let extractor_model_provider = extraction.model_provider;
         let parsed = extraction.parsed;
@@ -164,6 +232,8 @@ impl HookHandler for MemoryPostTurnExtractorHook {
             .diagnostics
             .extend(hook_diagnostics_from_strings(parsed.diagnostics.as_slice()));
 
+        let mut write_failure: Option<(crate::MemoryWriteFailure, usize)> = None;
+        let mut failure_counts = BTreeMap::new();
         for (index, fact) in parsed.facts.into_iter().enumerate() {
             let Some(params) = memory_semantic_write_params_from_extracted_fact(
                 index,
@@ -191,20 +261,73 @@ impl HookHandler for MemoryPostTurnExtractorHook {
                     stats.write_success_count += 1;
                     stats.observe_write_response(&write_response);
                 }
-                Err(_) => {
+                Err(error) => {
                     stats.write_failure_count += 1;
-                    response.diagnostics.push(memory_safe_warning_diagnostic(
-                        "memory.post_turn_extractor.write_failed",
+                    *failure_counts.entry(error.class()).or_insert(0_usize) += 1;
+                    // A permanent rejection must not hide another fact's transient failure.
+                    if write_failure.is_none() || error.retryable() {
+                        write_failure = Some((error, index));
+                    }
+                    tracing::warn!(
+                        target: "pioneer::memory_post_turn_extractor",
+                        stage = "semantic_write",
+                        durable = durable_terminal_effect.is_some(),
+                        extractor_provider = ?extractor_model_provider.as_deref(),
+                        extractor_model = ?extractor_model.as_deref(),
+                        fact_index = index.min(255),
+                        failure_class = error.class(),
+                        failure_stage = "semantic_write",
+                        "memory post-turn extractor semantic write failed"
+                    );
+                    let mut diagnostic = memory_safe_warning_diagnostic(
+                        error.code(),
                         "memory post-turn extractor semantic write failed",
-                    ));
+                    );
+                    for (key, value) in semantic_write_hook_error(
+                        error,
+                        index,
+                        extractor_model.as_deref(),
+                        extractor_model_provider.as_deref(),
+                        &stats,
+                    )
+                    .metadata
+                    {
+                        diagnostic.metadata.insert(key, HookValue::Text(value));
+                    }
+                    response.diagnostics.push(diagnostic);
                 }
+            }
+        }
+
+        if let Some((failure, index)) = write_failure {
+            let mut error = semantic_write_hook_error(
+                failure,
+                index,
+                extractor_model.as_deref(),
+                extractor_model_provider.as_deref(),
+                &stats,
+            );
+            for (class, count) in failure_counts {
+                error.metadata.insert(
+                    HookMetadataKey::new(format!("write_failure_{class}_count"))
+                        .expect("bounded static failure class key"),
+                    count.to_string(),
+                );
+            }
+            if durable_terminal_effect.is_some() {
+                return Err(error);
+            }
+            for (key, value) in error.metadata {
+                response.metadata.insert(key, HookValue::Text(value));
             }
         }
 
         response
             .diagnostics
             .push(memory_post_turn_stats_diagnostic(&stats));
-        response.metadata = memory_post_turn_stats_metadata(&stats);
+        response
+            .metadata
+            .extend(memory_post_turn_stats_metadata(&stats));
         Ok(response)
     }
 }
@@ -213,60 +336,11 @@ struct MemoryPostTurnExtractionOutcome {
     parsed: MemoryPostTurnParsedFacts,
     model: Option<String>,
     model_provider: Option<String>,
-    diagnostics: Vec<String>,
 }
 
 enum MemoryPostTurnExtractorFailure {
-    ProviderFailed,
-    InvalidJson(String),
-}
-
-impl MemoryPostTurnExtractorFailure {
-    fn diagnostic_code(&self) -> &'static str {
-        match self {
-            Self::ProviderFailed => "memory.post_turn_extractor.provider_failed",
-            Self::InvalidJson(_) => "memory.post_turn_extractor.invalid_json",
-        }
-    }
-}
-
-async fn extract_post_turn_memory_with_thread_model_retry(
-    extractor_provider: &dyn AgentMemoryPostTurnExtractorProvider,
-    primary_context: MemoryPostTurnExtractorContext,
-    input: &TurnPostTurnHookInput,
-    request: MemoryPostTurnExtractorRequest,
-    config: &MemoryPostTurnExtractorConfig,
-) -> Result<MemoryPostTurnExtractionOutcome, MemoryPostTurnExtractorFailure> {
-    match extract_post_turn_memory_once(
-        extractor_provider,
-        primary_context.clone(),
-        request.clone(),
-        config,
-    )
-    .await
-    {
-        Ok(outcome) => Ok(outcome),
-        Err(primary_failure) => {
-            let Some(retry_context) = post_turn_thread_model_retry_context(&primary_context, input)
-            else {
-                return Err(primary_failure);
-            };
-            match extract_post_turn_memory_once(extractor_provider, retry_context, request, config)
-                .await
-            {
-                Ok(mut outcome) => {
-                    outcome
-                        .diagnostics
-                        .push("memory.post_turn_extractor.thread_model_retry_used".to_owned());
-                    outcome
-                        .diagnostics
-                        .push(primary_failure.diagnostic_code().to_owned());
-                    Ok(outcome)
-                }
-                Err(retry_failure) => Err(retry_failure),
-            }
-        }
-    }
+    ProviderFailed(HookError),
+    InvalidJson(MemoryPostTurnResponseFormatError),
 }
 
 async fn extract_post_turn_memory_once(
@@ -278,31 +352,83 @@ async fn extract_post_turn_memory_once(
     let raw_json = extractor_provider
         .extract_post_turn_memory_json(context.clone(), request)
         .await
-        .map_err(|_| MemoryPostTurnExtractorFailure::ProviderFailed)?;
-    let parsed = parse_memory_post_turn_extractor_json(raw_json.as_str(), config)
-        .map_err(MemoryPostTurnExtractorFailure::InvalidJson)?;
+        .map_err(|error| {
+            tracing::warn!(
+                target: "pioneer::memory_post_turn_extractor",
+                stage = "extractor_provider",
+                durable = context.durable_terminal_effect.is_some(),
+                provider = ?context.model_provider.as_deref(),
+                model = ?context.model.as_deref(),
+                error_code = %error.code,
+                retryable = error.retryable,
+                "memory post-turn extractor provider execution failed"
+            );
+            MemoryPostTurnExtractorFailure::ProviderFailed(error)
+        })?;
+    let parsed =
+        parse_memory_post_turn_extractor_json(raw_json.as_str(), config).map_err(|error| {
+            tracing::warn!(
+                target: "pioneer::memory_post_turn_extractor",
+                stage = "response_json_parse",
+                durable = context.durable_terminal_effect.is_some(),
+                provider = ?context.model_provider.as_deref(),
+                model = ?context.model.as_deref(),
+                response_bytes = raw_json.len(),
+                response_sha256 = %post_turn_extractor_response_sha256(raw_json.as_str()),
+                error = %error,
+                "memory post-turn extractor response JSON parse failed"
+            );
+            MemoryPostTurnExtractorFailure::InvalidJson(error)
+        })?;
     Ok(MemoryPostTurnExtractionOutcome {
         parsed,
         model: context.model,
         model_provider: context.model_provider,
-        diagnostics: Vec::new(),
     })
 }
 
-fn post_turn_thread_model_retry_context(
-    primary_context: &MemoryPostTurnExtractorContext,
-    input: &TurnPostTurnHookInput,
-) -> Option<MemoryPostTurnExtractorContext> {
-    let turn_model = input.model.clone()?;
-    let turn_model_provider = input.model_provider.clone()?;
-    if primary_context.model.as_deref() == Some(turn_model.as_str())
-        && primary_context.model_provider.as_deref() == Some(turn_model_provider.as_str())
-    {
-        return None;
-    }
+fn post_turn_extractor_response_sha256(response: &str) -> String {
+    use sha2::{Digest, Sha256};
 
-    let mut retry_context = primary_context.clone();
-    retry_context.model = Some(turn_model);
-    retry_context.model_provider = Some(turn_model_provider);
-    Some(retry_context)
+    hex::encode(Sha256::digest(response.as_bytes()))
+}
+
+fn semantic_write_hook_error(
+    failure: crate::MemoryWriteFailure,
+    fact_index: usize,
+    model: Option<&str>,
+    provider: Option<&str>,
+    stats: &MemoryPostTurnExtractorStats,
+) -> HookError {
+    let mut error = memory_hook_error(
+        failure.code(),
+        "memory post-turn extractor failed to persist one or more semantic writes",
+    )
+    .with_safe_for_user(true)
+    .with_retryable(failure.retryable());
+    for (key, value) in [
+        ("failure_class", failure.class().to_owned()),
+        ("failure_stage", "semantic_write".to_owned()),
+        ("fact_index", fact_index.min(255).to_string()),
+        ("write_failure_count", stats.write_failure_count.to_string()),
+        ("write_success_count", stats.write_success_count.to_string()),
+        (
+            "validation_rejected_count",
+            stats.validation_rejected_count.to_string(),
+        ),
+    ] {
+        error.metadata.insert(
+            HookMetadataKey::new(key).expect("static metadata key"),
+            value,
+        );
+    }
+    for (key, value, limit) in [("model", model, 160), ("provider", provider, 80)] {
+        if let Some(value) = value {
+            error.metadata.insert(
+                HookMetadataKey::new(key).expect("static metadata key"),
+                value.trim().chars().take(limit).collect(),
+            );
+        }
+    }
+    error
 }

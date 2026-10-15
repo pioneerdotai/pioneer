@@ -4,16 +4,22 @@ use crate::authorization::{
     AuthorizationExternalError, AuthorizationService, AuthorizedTurn,
     ExecutionAuthorizationAdmission, RuntimeDraftCreator, RuntimeDraftMaterialization,
 };
-use crate::cli_runtime::config::{
-    claude_account_probe_config_from_instance, codex_account_probe_config_from_instance,
-};
-use pioneer_cli_agent_runtime::claude::{ClaudeModelSnapshot, ClaudeProbe};
-use pioneer_cli_agent_runtime::codex::{CodexModelListProbeStatus, CodexModelSnapshot, CodexProbe};
+use pioneer_observability::turn_startup::{Stage, scope_current_stage, stage_sync};
 use pioneer_protocol::{
     AgentExecutionBackend, CLIAgentRuntimeKind, UserInput, VoiceError, VoiceErrorKind,
     VoiceSessionOutcome, VoiceSessionResultNotification,
 };
 use serde_json::json;
+
+#[cfg(test)]
+struct CliHistoryMonitorDrop(Arc<AtomicU64>);
+
+#[cfg(test)]
+impl Drop for CliHistoryMonitorDrop {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
 
 pub(super) struct PreparedApiProviderTurnStart {
     outcome: crate::thread::TurnStartOutcome,
@@ -36,9 +42,11 @@ pub(super) enum ApiProviderTurnAdmission {
 }
 
 #[derive(Debug)]
-pub(super) struct TurnStartFailure {
+pub(crate) struct TurnStartFailure {
     public_code: pioneer_protocol::PublicErrorCode,
     diagnostic: String,
+    expected_failure: Option<&'static str>,
+    task_failure: Option<pioneer_tasks::TaskStartFailure>,
 }
 
 impl TurnStartFailure {
@@ -46,11 +54,80 @@ impl TurnStartFailure {
         Self {
             public_code,
             diagnostic: diagnostic.into(),
+            expected_failure: None,
+            task_failure: None,
         }
+    }
+
+    fn expected(mut self, failure_class: &'static str) -> Self {
+        self.expected_failure = Some(failure_class);
+        self
+    }
+
+    fn with_task_cause(mut self, cause: pioneer_tasks::TaskStartCause) -> Self {
+        self.task_failure = Some(pioneer_tasks::TaskStartFailure::new(
+            pioneer_tasks::TaskStartStage::CliAdmission,
+            cause,
+        ));
+        self
+    }
+
+    pub(super) fn internal_typed(
+        stage: pioneer_tasks::TaskStartStage,
+        error: anyhow::Error,
+    ) -> Self {
+        let mut failure = Self::internal(format!("{error:#}"));
+        failure.task_failure = Some(pioneer_tasks::TaskStartFailure::from_error(stage, error));
+        failure
+    }
+
+    fn into_task_failure(
+        self,
+    ) -> (
+        pioneer_protocol::PublicError,
+        pioneer_tasks::TaskStartFailure,
+    ) {
+        let public_error = crate::public_error::build_public_error(
+            self.public_code,
+            pioneer_protocol::PublicErrorStage::Admission,
+        );
+        let failure = self
+            .task_failure
+            .unwrap_or_else(|| {
+                pioneer_tasks::TaskStartFailure::new(
+                    pioneer_tasks::TaskStartStage::CliAdmission,
+                    pioneer_tasks::TaskStartCause::Unclassified,
+                )
+            })
+            .with_public_error(public_error.clone())
+            .report();
+        (public_error, failure)
+    }
+
+    fn into_public_error(self) -> pioneer_protocol::PublicError {
+        let public_error = crate::public_error::build_public_error(
+            self.public_code,
+            pioneer_protocol::PublicErrorStage::Admission,
+        );
+        match self.expected_failure {
+            Some(failure_class) => crate::public_error::report_expected_failure(
+                &public_error,
+                "turn_start",
+                failure_class,
+            ),
+            None => crate::public_error::report_agent_failure(&public_error, self.diagnostic),
+        }
+        public_error
     }
 
     fn invalid_input(diagnostic: impl Into<String>) -> Self {
         Self::new(pioneer_protocol::PublicErrorCode::InvalidInput, diagnostic)
+    }
+
+    pub(super) fn protocol_invalid_input(diagnostic: impl Into<String>) -> Self {
+        Self::invalid_input(diagnostic)
+            .expected("invalid_input")
+            .with_task_cause(pioneer_tasks::TaskStartCause::Validation)
     }
 
     fn policy_denied(diagnostic: impl Into<String>) -> Self {
@@ -63,9 +140,11 @@ impl TurnStartFailure {
 
     fn conflict(diagnostic: impl Into<String>) -> Self {
         Self::new(pioneer_protocol::PublicErrorCode::Conflict, diagnostic)
+            .expected("admission_conflict")
+            .with_task_cause(pioneer_tasks::TaskStartCause::Refusal)
     }
 
-    fn internal(diagnostic: impl Into<String>) -> Self {
+    pub(super) fn internal(diagnostic: impl Into<String>) -> Self {
         Self::new(pioneer_protocol::PublicErrorCode::Internal, diagnostic)
     }
 
@@ -168,12 +247,10 @@ fn public_turn_start_error(
     failure: impl Into<TurnStartFailure>,
 ) -> JsonRpcErrorResponse {
     let failure = failure.into();
-    crate::public_error::agent_rpc_error(
+    crate::public_error::rpc_error_from_public_error(
         Some(request_id),
         INVALID_REQUEST_CODE,
-        failure.public_code,
-        pioneer_protocol::PublicErrorStage::Admission,
-        failure.diagnostic,
+        failure.into_public_error(),
     )
 }
 
@@ -273,6 +350,24 @@ fn native_turn_admission_digest(
     Ok(hex::encode(Sha256::digest(canonical)))
 }
 
+fn cli_runtime_session_authorization_scope_fingerprint(
+    context: &crate::authorization::ExecutionAuthorizationContext,
+    security: &pioneer_protocol::TurnExecutionSecuritySnapshot,
+) -> anyhow::Result<String> {
+    use sha2::{Digest, Sha256};
+
+    let authorization = context.cli_runtime_collaboration_scope_fingerprint()?;
+    let canonical = serde_json::to_vec(&(
+        authorization,
+        &security.permission_profile,
+        &security.authority_cap,
+        &security.approval,
+        &security.backend,
+    ))
+    .context("failed to encode CLI runtime session authorization scope")?;
+    Ok(hex::encode(Sha256::digest(canonical)))
+}
+
 fn validate_root_agent_launch_matches_turn(
     params: &TurnStartParams,
 ) -> Result<(), TurnStartFailure> {
@@ -319,13 +414,13 @@ pub(super) fn validate_root_agent_launch_capabilities(
     let mut launch_skills = launch.execution.skill_ids.clone();
     launch_skills.sort_by(|left, right| left.as_str().cmp(right.as_str()));
     if launch_skills.windows(2).any(|pair| pair[0] == pair[1]) {
-        return Err(TurnStartFailure::invalid_input(
+        return Err(TurnStartFailure::protocol_invalid_input(
             "root Agent launch contains duplicate Skills",
         ));
     }
     launch_skills.dedup();
     if selected_skills != launch_skills {
-        return Err(TurnStartFailure::invalid_input(
+        return Err(TurnStartFailure::protocol_invalid_input(
             "root Agent launch Skills differ from the Turn capabilities",
         ));
     }
@@ -352,13 +447,13 @@ pub(super) fn validate_root_agent_launch_capabilities(
     let mut launch_mcp = launch.execution.mcp_server_ids.clone();
     launch_mcp.sort();
     if launch_mcp.windows(2).any(|pair| pair[0] == pair[1]) {
-        return Err(TurnStartFailure::invalid_input(
+        return Err(TurnStartFailure::protocol_invalid_input(
             "root Agent launch contains duplicate MCP servers",
         ));
     }
     launch_mcp.dedup();
     if selected_mcp != launch_mcp {
-        return Err(TurnStartFailure::invalid_input(
+        return Err(TurnStartFailure::protocol_invalid_input(
             "root Agent launch MCP selection differs from the Turn capabilities",
         ));
     }
@@ -372,6 +467,7 @@ async fn persist_admitted_turn_start(
     params: &TurnStartParams,
     materialization: &crate::thread::TurnStartMaterialization,
     reasoning_effort: Option<&str>,
+    work_owner: pioneer_crud::TurnWorkOwner,
     actor: pioneer_protocol::PersistedActorRef,
     audit_event: pioneer_protocol::TurnPermissionAuditEvent,
     execution_authority: ExecutionEnvelopeSource<'_>,
@@ -477,25 +573,37 @@ async fn persist_admitted_turn_start(
         params.execution_backend.as_ref(),
         materialization,
     )?;
-    crud_store
-        .materialize_authorized_turn_start_with_reasoning_effort_and_permission_audit(
-            &materialization.thread,
-            materialization.sandbox_mode,
-            &materialization.turn,
-            &materialization.input,
-            reasoning_effort,
-            actor,
-            audit_event,
-            authority_envelope_json.as_str(),
-            runtime_draft,
-            Some(admission),
-            Some(execution),
-            execution_security_snapshot,
-            security_audit_events,
-            execution_graph,
-            agent_turn_response,
-        )
-        .await
+    // The admitted Turn and its execution graph form one durable transaction,
+    // but the transaction does not need to inherit the RPC dispatch poll stack.
+    // Own its inputs and poll the complete commit from a fresh runtime task.
+    let crud_store = crud_store.clone();
+    let materialization = materialization.clone();
+    let reasoning_effort = reasoning_effort.map(str::to_owned);
+    let execution_security_snapshot = execution_security_snapshot.clone();
+    message_fresh_task(async move {
+        crud_store
+            .materialize_authorized_turn_start_with_reasoning_effort_and_permission_audit(
+                &materialization.thread,
+                materialization.sandbox_mode,
+                &materialization.turn,
+                &materialization.input,
+                reasoning_effort.as_deref(),
+                work_owner,
+                actor,
+                audit_event,
+                authority_envelope_json.as_str(),
+                runtime_draft,
+                Some(admission),
+                Some(execution),
+                &execution_security_snapshot,
+                security_audit_events,
+                execution_graph,
+                agent_turn_response,
+            )
+            .await
+    })
+    .await
+    .map_err(|error| anyhow::anyhow!("admitted turn/start persistence task failed: {error}"))?
 }
 
 pub(super) fn new_turn_execution(
@@ -537,9 +645,9 @@ pub(super) fn new_turn_execution(
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct NormalizedTurnCapabilities {
+pub(crate) struct NormalizedTurnCapabilities {
     pub(super) presentation: Vec<pioneer_protocol::TurnCapability>,
-    pub(super) execution: Vec<pioneer_protocol::TurnCapability>,
+    pub(crate) execution: Vec<pioneer_protocol::TurnCapability>,
     pub(super) pack_names: HashMap<pioneer_protocol::SkillPackId, String>,
 }
 
@@ -551,6 +659,7 @@ pub(super) struct PreparedCliRuntimeNativeTurnStart {
     native_thread_id: String,
     turn_start_params: crate::cli_runtime::manager::CLIAgentRuntimeTurnStartParams,
     request_timeout_ms: u64,
+    continuation_head: Option<crate::cli_runtime::thread_binding::CliRuntimeDeliveredTurn>,
 }
 
 struct PreparedCliRuntimeCombinedPreflight {
@@ -561,6 +670,13 @@ struct PreparedCliRuntimeCombinedPreflight {
         Option<crate::cli_runtime::claude_mcp::ClaudeMcpSessionLaunchProjection>,
     opencode_mcp_launch_projection:
         Option<crate::cli_runtime::opencode_mcp::OpenCodeMcpSessionLaunchProjection>,
+    max_input_tokens: Option<u64>,
+}
+
+struct PreparedCliRuntimeDelivery {
+    frozen_hold: Option<pioneer_crud::FrozenReadHold>,
+    plan: pioneer_promt::CompiledInstructionDeliveryPlan,
+    sent_context_basis: Option<crate::cli_runtime::thread_binding::CliRuntimeSentContextBasis>,
 }
 
 struct CliRuntimeAdmissionPhase {
@@ -569,7 +685,9 @@ struct CliRuntimeAdmissionPhase {
     normalized_pack_names: HashMap<pioneer_protocol::SkillPackId, String>,
     manager: std::sync::Arc<crate::cli_runtime::manager::CLIAgentRuntimeManager>,
     continuation_thread_id: String,
-    context_thread_id: String,
+    continuation_head: Option<crate::cli_runtime::thread_binding::CliRuntimeDeliveredTurn>,
+    continuation_context_basis: Option<crate::cli_runtime::thread_binding::CliRuntimeContextBasis>,
+    bootstrap_provider_context: bool,
     session_key: crate::cli_runtime::manager::CLIAgentRuntimeSessionKey,
     session_turn_lease: tokio::sync::OwnedMutexGuard<()>,
     combined_preflight: crate::cli_runtime::skills::CliRuntimeCombinedPreflightPlan,
@@ -579,6 +697,7 @@ struct CliRuntimeAdmissionPhase {
         Option<crate::cli_runtime::claude_mcp::ClaudeMcpSessionLaunchProjection>,
     opencode_mcp_launch_projection:
         Option<crate::cli_runtime::opencode_mcp::OpenCodeMcpSessionLaunchProjection>,
+    max_input_tokens: Option<u64>,
 }
 
 struct CliRuntimeStartedPhase {
@@ -677,9 +796,9 @@ pub(super) enum TurnStartSuccessResponse {
         context_thread_id: String,
         task_run_id: String,
         execution_id: String,
-        conversation_history: Vec<ChatMessage>,
         agent_author: Option<pioneer_protocol::TurnAuthorSnapshot>,
         agent_turn_response: pioneer_crud::AgentTurnResponseInput,
+        admitted_outcome: Option<Box<crate::thread::TurnStartOutcome>>,
         completion: std::sync::Arc<
             std::sync::Mutex<
                 Option<
@@ -693,7 +812,6 @@ pub(super) enum TurnStartSuccessResponse {
         execution_security_snapshot: pioneer_protocol::TurnExecutionSecuritySnapshot,
         continuation_thread_id: String,
         context_thread_id: String,
-        conversation_history: Vec<ChatMessage>,
         agent_author: pioneer_protocol::TurnAuthorSnapshot,
         completion: std::sync::Arc<
             std::sync::Mutex<
@@ -797,20 +915,6 @@ impl TurnStartSuccessResponse {
         }
     }
 
-    fn task_conversation_history(&self) -> Option<&[ChatMessage]> {
-        match self {
-            Self::Task {
-                conversation_history,
-                ..
-            }
-            | Self::DurableAgent {
-                conversation_history,
-                ..
-            } => Some(conversation_history.as_slice()),
-            Self::TurnStart | Self::VoiceSessionFinalizeAccepted { .. } => None,
-        }
-    }
-
     fn complete_task(&self, result: anyhow::Result<PreparedCliRuntimeNativeTurnStart>) -> bool {
         let completion = match self {
             Self::Task { completion, .. } | Self::DurableAgent { completion, .. } => completion,
@@ -853,6 +957,15 @@ fn execution_backend_allows_agent_skill_overlay(
     )
 }
 
+// Recovery resumes the same Turn without taking its retained lease again.
+// A separate, short-lived transition mutex in the same session ownership map
+// therefore fences resume/native admission against background terminal effects.
+#[derive(Default)]
+pub(super) struct CliRuntimeSessionTurnLocks {
+    lease: Arc<tokio::sync::Mutex<()>>,
+    transition: Arc<tokio::sync::Mutex<()>>,
+}
+
 impl MessageProcessor {
     #[allow(clippy::too_many_arguments)]
     async fn admit_composite_execution_request(
@@ -873,7 +986,8 @@ impl MessageProcessor {
         {
             return Err(TurnStartFailure::policy_denied(
                 "execution target differs from the authorized thread".to_owned(),
-            ));
+            )
+            .with_task_cause(pioneer_tasks::TaskStartCause::Policy));
         }
         let provider_authority_fingerprint = match params.execution_backend.as_ref() {
             Some(AgentExecutionBackend::CLIAgentRuntime { .. })
@@ -881,6 +995,11 @@ impl MessageProcessor {
             _ => Some(
                 self.provider_registry
                     .authority_fingerprint_for_workspace(workspace_id, provider)
+                    .map_err(|error| {
+                        TurnStartFailure::unavailable(format!(
+                            "provider authority could not be resolved: {error:#}"
+                        ))
+                    })?
                     .as_str()
                     .to_owned(),
             ),
@@ -978,7 +1097,8 @@ impl MessageProcessor {
             if !pioneer_skills::effective_policy_for_skill(skill, &policy_set).enabled {
                 return Err(TurnStartFailure::policy_denied(format!(
                     "skill `{skill_id}` is not enabled for workspace `{workspace_id}`"
-                )));
+                ))
+                .with_task_cause(pioneer_tasks::TaskStartCause::Policy));
             }
 
             match skill.identity.source_kind {
@@ -1084,211 +1204,214 @@ impl MessageProcessor {
         Ok(catalog)
     }
 
-    pub(super) async fn normalize_turn_skill_capabilities(
+    pub(crate) async fn normalize_turn_skill_capabilities(
         &self,
         workspace_id: &str,
         capabilities: &[pioneer_protocol::TurnCapability],
     ) -> Result<NormalizedTurnCapabilities, TurnStartFailure> {
-        use pioneer_protocol::{TurnCapability, TurnCapabilityKind};
+        scope_current_stage(Stage::SkillsNormalize, async {
+            use pioneer_protocol::{TurnCapability, TurnCapabilityKind};
 
-        let _skills_guard = self.acquire_skills_write_lock().await;
-        let mut presentation = Vec::with_capacity(capabilities.len());
-        let mut full_pack_ids = HashSet::new();
-        let mut pack_children = HashMap::new();
-        let mut pack_names = HashMap::new();
+            let _skills_guard = self.acquire_skills_write_lock().await;
+            let mut presentation = Vec::with_capacity(capabilities.len());
+            let mut full_pack_ids = HashSet::new();
+            let mut pack_children = HashMap::new();
+            let mut pack_names = HashMap::new();
 
-        for capability in capabilities {
-            match &capability.kind {
-                TurnCapabilityKind::Skill { skill_id, pack_id } => {
-                    let installation = self
-                        .crud_store
-                        .find_skill_installation(skill_id)
-                        .await
-                        .map_err(|error| {
-                            TurnStartFailure::unavailable(format!(
-                                "failed to load skill `{skill_id}` installation: {error:#}"
-                            ))
-                        })?;
-                    let Some(installation) = installation else {
-                        if let Some(requested_pack_id) = pack_id {
+            for capability in capabilities {
+                match &capability.kind {
+                    TurnCapabilityKind::Skill { skill_id, pack_id } => {
+                        let installation = self
+                            .crud_store
+                            .find_skill_installation(skill_id)
+                            .await
+                            .map_err(|error| {
+                                TurnStartFailure::unavailable(format!(
+                                    "failed to load skill `{skill_id}` installation: {error:#}"
+                                ))
+                            })?;
+                        let Some(installation) = installation else {
+                            if let Some(requested_pack_id) = pack_id {
+                                return Err(TurnStartFailure::invalid_input(format!(
+                                    "skill `{skill_id}` is not a member of pack `{requested_pack_id}`"
+                                )));
+                            }
+                            presentation.push(TurnCapability {
+                                id: capability.id.clone(),
+                                label: capability.label.clone(),
+                                kind: TurnCapabilityKind::Skill {
+                                    skill_id: skill_id.clone(),
+                                    pack_id: None,
+                                },
+                            });
+                            continue;
+                        };
+                        if installation.source_kind != "system"
+                            && installation.scope_key != workspace_id
+                        {
                             return Err(TurnStartFailure::invalid_input(format!(
-                                "skill `{skill_id}` is not a member of pack `{requested_pack_id}`"
+                                "skill `{skill_id}` is not installed in workspace `{workspace_id}`"
                             )));
                         }
+
+                        let authoritative_pack_id = installation.pack_id.clone();
+                        if let Some(requested_pack_id) = pack_id {
+                            if authoritative_pack_id.as_ref() != Some(requested_pack_id) {
+                                return Err(TurnStartFailure::invalid_input(format!(
+                                    "skill `{skill_id}` is not a member of pack `{requested_pack_id}`"
+                                )));
+                            }
+                        }
+                        if let Some(authoritative_pack_id) = authoritative_pack_id.as_ref() {
+                            if installation.scope_key != workspace_id {
+                                return Err(TurnStartFailure::invalid_input(format!(
+                                    "skill `{skill_id}` pack membership is outside workspace `{workspace_id}`"
+                                )));
+                            }
+                            let parent = self
+                                .crud_store
+                                .find_skill_pack_installation(workspace_id, authoritative_pack_id)
+                                .await
+                                .map_err(|error| {
+                                    TurnStartFailure::unavailable(format!(
+                                        "failed to load skill pack `{authoritative_pack_id}`: {error:#}"
+                                    ))
+                                })?
+                                .ok_or_else(|| {
+                                    TurnStartFailure::invalid_input(format!(
+                                        "skill `{skill_id}` references missing pack `{authoritative_pack_id}`"
+                                    ))
+                                })?;
+                            pack_names.insert(authoritative_pack_id.clone(), parent.name);
+                        }
+
                         presentation.push(TurnCapability {
                             id: capability.id.clone(),
                             label: capability.label.clone(),
                             kind: TurnCapabilityKind::Skill {
                                 skill_id: skill_id.clone(),
-                                pack_id: None,
+                                pack_id: authoritative_pack_id,
                             },
                         });
-                        continue;
-                    };
-                    if installation.source_kind != "system"
-                        && installation.scope_key != workspace_id
-                    {
-                        return Err(TurnStartFailure::invalid_input(format!(
-                            "skill `{skill_id}` is not installed in workspace `{workspace_id}`"
-                        )));
                     }
-
-                    let authoritative_pack_id = installation.pack_id.clone();
-                    if let Some(requested_pack_id) = pack_id {
-                        if authoritative_pack_id.as_ref() != Some(requested_pack_id) {
+                    TurnCapabilityKind::SkillPack { pack_id } => {
+                        if !full_pack_ids.insert(pack_id.clone()) {
                             return Err(TurnStartFailure::invalid_input(format!(
-                                "skill `{skill_id}` is not a member of pack `{requested_pack_id}`"
-                            )));
-                        }
-                    }
-                    if let Some(authoritative_pack_id) = authoritative_pack_id.as_ref() {
-                        if installation.scope_key != workspace_id {
-                            return Err(TurnStartFailure::invalid_input(format!(
-                                "skill `{skill_id}` pack membership is outside workspace `{workspace_id}`"
+                                "skill pack `{pack_id}` is selected more than once"
                             )));
                         }
                         let parent = self
                             .crud_store
-                            .find_skill_pack_installation(workspace_id, authoritative_pack_id)
+                            .find_skill_pack_installation(workspace_id, pack_id)
                             .await
                             .map_err(|error| {
                                 TurnStartFailure::unavailable(format!(
-                                    "failed to load skill pack `{authoritative_pack_id}`: {error:#}"
+                                    "failed to load skill pack `{pack_id}`: {error:#}"
                                 ))
                             })?
                             .ok_or_else(|| {
                                 TurnStartFailure::invalid_input(format!(
-                                    "skill `{skill_id}` references missing pack `{authoritative_pack_id}`"
+                                    "skill pack `{pack_id}` was not found in workspace `{workspace_id}`"
                                 ))
                             })?;
-                        pack_names.insert(authoritative_pack_id.clone(), parent.name);
+                        pack_names.insert(pack_id.clone(), parent.name);
+                        let children = self
+                            .crud_store
+                            .list_skill_installations_for_pack(workspace_id, pack_id)
+                            .await
+                            .map_err(|error| {
+                                TurnStartFailure::unavailable(format!(
+                                    "failed to load children for skill pack `{pack_id}`: {error:#}"
+                                ))
+                            })?;
+                        if children.is_empty() {
+                            return Err(TurnStartFailure::invalid_input(format!(
+                                "skill pack `{pack_id}` is empty"
+                            )));
+                        }
+                        if children.iter().any(|child| {
+                            child.scope_key != workspace_id
+                                || child.pack_id.as_ref() != Some(pack_id)
+                                || child.pack_member_key.as_deref().is_none_or(str::is_empty)
+                        }) {
+                            return Err(TurnStartFailure::invalid_input(format!(
+                                "skill pack `{pack_id}` has invalid authoritative membership"
+                            )));
+                        }
+                        pack_children.insert(pack_id.clone(), children);
+                        presentation.push(capability.clone());
                     }
-
-                    presentation.push(TurnCapability {
-                        id: capability.id.clone(),
-                        label: capability.label.clone(),
-                        kind: TurnCapabilityKind::Skill {
-                            skill_id: skill_id.clone(),
-                            pack_id: authoritative_pack_id,
-                        },
-                    });
-                }
-                TurnCapabilityKind::SkillPack { pack_id } => {
-                    if !full_pack_ids.insert(pack_id.clone()) {
-                        return Err(TurnStartFailure::invalid_input(format!(
-                            "skill pack `{pack_id}` is selected more than once"
-                        )));
+                    TurnCapabilityKind::McpServer { .. } | TurnCapabilityKind::McpTool { .. } => {
+                        presentation.push(capability.clone());
                     }
-                    let parent = self
-                        .crud_store
-                        .find_skill_pack_installation(workspace_id, pack_id)
-                        .await
-                        .map_err(|error| {
-                            TurnStartFailure::unavailable(format!(
-                                "failed to load skill pack `{pack_id}`: {error:#}"
-                            ))
-                        })?
-                        .ok_or_else(|| {
-                            TurnStartFailure::invalid_input(format!(
-                                "skill pack `{pack_id}` was not found in workspace `{workspace_id}`"
-                            ))
-                        })?;
-                    pack_names.insert(pack_id.clone(), parent.name);
-                    let children = self
-                        .crud_store
-                        .list_skill_installations_for_pack(workspace_id, pack_id)
-                        .await
-                        .map_err(|error| {
-                            TurnStartFailure::unavailable(format!(
-                                "failed to load children for skill pack `{pack_id}`: {error:#}"
-                            ))
-                        })?;
-                    if children.is_empty() {
-                        return Err(TurnStartFailure::invalid_input(format!(
-                            "skill pack `{pack_id}` is empty"
-                        )));
-                    }
-                    if children.iter().any(|child| {
-                        child.scope_key != workspace_id
-                            || child.pack_id.as_ref() != Some(pack_id)
-                            || child.pack_member_key.as_deref().is_none_or(str::is_empty)
-                    }) {
-                        return Err(TurnStartFailure::invalid_input(format!(
-                            "skill pack `{pack_id}` has invalid authoritative membership"
-                        )));
-                    }
-                    pack_children.insert(pack_id.clone(), children);
-                    presentation.push(capability.clone());
-                }
-                TurnCapabilityKind::McpServer { .. } | TurnCapabilityKind::McpTool { .. } => {
-                    presentation.push(capability.clone());
                 }
             }
-        }
 
-        let mut execution = Vec::new();
-        let mut seen_skill_ids = HashSet::new();
-        for capability in &presentation {
-            match &capability.kind {
-                TurnCapabilityKind::Skill { skill_id, pack_id } => {
-                    if pack_id
-                        .as_ref()
-                        .is_some_and(|pack_id| full_pack_ids.contains(pack_id))
-                    {
-                        return Err(TurnStartFailure::invalid_input(format!(
-                            "skill pack and child `{skill_id}` cannot be selected together"
-                        )));
-                    }
-                    if !seen_skill_ids.insert(skill_id.clone()) {
-                        return Err(TurnStartFailure::invalid_input(format!(
-                            "skill `{skill_id}` is selected more than once"
-                        )));
-                    }
-                    execution.push(TurnCapability {
-                        id: pioneer_protocol::skill_capability_key(skill_id),
-                        label: if pack_id.is_some() {
-                            None
-                        } else {
-                            capability.label.clone()
-                        },
-                        kind: TurnCapabilityKind::Skill {
-                            skill_id: skill_id.clone(),
-                            pack_id: None,
-                        },
-                    });
-                }
-                TurnCapabilityKind::SkillPack { pack_id } => {
-                    let children = pack_children
-                        .get(pack_id)
-                        .expect("validated skill pack children");
-                    for child in children {
-                        if !seen_skill_ids.insert(child.skill_id.clone()) {
+            let mut execution = Vec::new();
+            let mut seen_skill_ids = HashSet::new();
+            for capability in &presentation {
+                match &capability.kind {
+                    TurnCapabilityKind::Skill { skill_id, pack_id } => {
+                        if pack_id
+                            .as_ref()
+                            .is_some_and(|pack_id| full_pack_ids.contains(pack_id))
+                        {
                             return Err(TurnStartFailure::invalid_input(format!(
-                                "skill `{}` is duplicated after pack expansion",
-                                child.skill_id
+                                "skill pack and child `{skill_id}` cannot be selected together"
+                            )));
+                        }
+                        if !seen_skill_ids.insert(skill_id.clone()) {
+                            return Err(TurnStartFailure::invalid_input(format!(
+                                "skill `{skill_id}` is selected more than once"
                             )));
                         }
                         execution.push(TurnCapability {
-                            id: pioneer_protocol::skill_capability_key(&child.skill_id),
-                            label: None,
+                            id: pioneer_protocol::skill_capability_key(skill_id),
+                            label: if pack_id.is_some() {
+                                None
+                            } else {
+                                capability.label.clone()
+                            },
                             kind: TurnCapabilityKind::Skill {
-                                skill_id: child.skill_id.clone(),
+                                skill_id: skill_id.clone(),
                                 pack_id: None,
                             },
                         });
                     }
-                }
-                TurnCapabilityKind::McpServer { .. } | TurnCapabilityKind::McpTool { .. } => {
-                    execution.push(capability.clone());
+                    TurnCapabilityKind::SkillPack { pack_id } => {
+                        let children = pack_children
+                            .get(pack_id)
+                            .expect("validated skill pack children");
+                        for child in children {
+                            if !seen_skill_ids.insert(child.skill_id.clone()) {
+                                return Err(TurnStartFailure::invalid_input(format!(
+                                    "skill `{}` is duplicated after pack expansion",
+                                    child.skill_id
+                                )));
+                            }
+                            execution.push(TurnCapability {
+                                id: pioneer_protocol::skill_capability_key(&child.skill_id),
+                                label: None,
+                                kind: TurnCapabilityKind::Skill {
+                                    skill_id: child.skill_id.clone(),
+                                    pack_id: None,
+                                },
+                            });
+                        }
+                    }
+                    TurnCapabilityKind::McpServer { .. } | TurnCapabilityKind::McpTool { .. } => {
+                        execution.push(capability.clone());
+                    }
                 }
             }
-        }
 
-        Ok(NormalizedTurnCapabilities {
-            presentation,
-            execution,
-            pack_names,
+            Ok(NormalizedTurnCapabilities {
+                presentation,
+                execution,
+                pack_names,
+            })
         })
+        .await
     }
 
     pub(super) fn turn_start<'a>(
@@ -1387,6 +1510,10 @@ impl MessageProcessor {
                 .await;
                 return;
             }
+            pioneer_observability::turn_startup::thread_role(
+                &params.turn_id,
+                thread.origin_kind == pioneer_protocol::ThreadOriginKind::TaskRun,
+            );
             if thread.origin_kind.composer_execution_mode()
                 == pioneer_protocol::ThreadComposerExecutionMode::DetachedTask
             {
@@ -1572,126 +1699,47 @@ impl MessageProcessor {
             let admission_entry_point =
                 crate::authorization::ExecutionAdmissionEntryPoint::DetachedTask;
             let turn_id = params.turn_id.clone();
+            pioneer_observability::turn_startup::delegated(&turn_id);
+            let _startup_create = pioneer_observability::turn_startup::stage(
+                &turn_id,
+                pioneer_observability::turn_startup::Stage::DelegationCreate,
+            );
             // Keep Composer admission, durable materialization, detached Task
             // creation, and finalization in separate heap-backed futures. Polling
             // the complete lifecycle as one state machine stacks its large frame
             // on top of the database projector and can exhaust a standard Tokio
             // worker stack.
-            let started_phase = message_future(async {
-                let normalized_capabilities = match self
-                    .normalize_turn_skill_capabilities(
-                        thread.workspace_id.as_str(),
-                        params.capabilities.as_slice(),
-                    )
-                    .await
-                {
-                    Ok(normalized) => normalized,
-                    Err(message) => {
-                        self.send_turn_start_failure(
-                            connection_id,
-                            request_id.clone(),
-                            &success_response,
-                            thread.id.as_str(),
-                            turn_id.as_str(),
-                            message,
-                        )
-                        .await;
-                        return None;
-                    }
-                };
-                if execution_admission.uses_scoped_collaboration_policy()
-                    && let Err(message) = self
-                        .enforce_scoped_skill_capability_projection(
+            let started_phase =
+                message_future(scope_current_stage(Stage::ComposerPrepare, async {
+                    let normalized_capabilities = match self
+                        .normalize_turn_skill_capabilities(
                             thread.workspace_id.as_str(),
-                            normalized_capabilities.execution.as_slice(),
+                            params.capabilities.as_slice(),
                         )
                         .await
-                {
-                    self.send_turn_start_failure(
-                        connection_id,
-                        request_id.clone(),
-                        &success_response,
-                        thread.id.as_str(),
-                        turn_id.as_str(),
-                        message,
-                    )
-                    .await;
-                    return None;
-                }
-                if let Err(error) =
-                    super::message_turn::normalize_turn_collaboration_params(&mut params)
-                {
-                    self.send_turn_start_failure(
-                        connection_id,
-                        request_id.clone(),
-                        &success_response,
-                        thread.id.as_str(),
-                        turn_id.as_str(),
-                        format!("invalid Turn collaboration metadata: {error}"),
-                    )
-                    .await;
-                    return None;
-                }
-                let resolved_permission_profile = execution_admission
-                    .uses_scoped_collaboration_policy()
-                    .then(|| {
-                        let requested = pioneer_protocol::resolve_turn_permission_profile(
-                            params.permission_profile.as_ref(),
-                        );
-                        execution_admission.cap_permission_profile(&requested)
-                    });
-                if let Some(profile) = resolved_permission_profile.as_ref() {
-                    params.permission_profile =
-                        Some(pioneer_protocol::TurnPermissionProfileSelection {
-                            mode: profile.mode,
-                        });
-                }
-                // The detached Task must replay the exact presentation selected in the
-                // Composer. Skill packs are expanded only at the execution boundary;
-                // persisting the expanded capabilities here would make the child
-                // message render every pack member as an individually selected skill.
-                let launch = params.clone();
-                params.capabilities = normalized_capabilities.execution.clone();
-                if let Err(failure) = validate_root_agent_launch_capabilities(&params) {
-                    self.send_turn_start_failure(
-                        connection_id,
-                        request_id.clone(),
-                        &success_response,
-                        thread.id.as_str(),
-                        turn_id.as_str(),
-                        failure,
-                    )
-                    .await;
-                    return None;
-                }
-                if let Err(error) = self
-                    .validate_turn_artifact_user_inputs(
-                        thread.workspace_id.as_str(),
-                        thread.id.as_str(),
-                        params.input.as_slice(),
-                    )
-                    .await
-                {
-                    self.send_turn_start_failure(
-                        connection_id,
-                        request_id.clone(),
-                        &success_response,
-                        thread.id.as_str(),
-                        turn_id.as_str(),
-                        format!("failed to validate artifact input: {error:#}"),
-                    )
-                    .await;
-                    return None;
-                }
-                let skill_catalog = match self
-                    .validate_turn_skill_capabilities(
-                        thread.workspace_id.as_str(),
-                        params.capabilities.as_slice(),
-                    )
-                    .await
-                {
-                    Ok(catalog) => catalog,
-                    Err(message) => {
+                    {
+                        Ok(normalized) => normalized,
+                        Err(message) => {
+                            self.send_turn_start_failure(
+                                connection_id,
+                                request_id.clone(),
+                                &success_response,
+                                thread.id.as_str(),
+                                turn_id.as_str(),
+                                message,
+                            )
+                            .await;
+                            return None;
+                        }
+                    };
+                    if execution_admission.uses_scoped_collaboration_policy()
+                        && let Err(message) = self
+                            .enforce_scoped_skill_capability_projection(
+                                thread.workspace_id.as_str(),
+                                normalized_capabilities.execution.as_slice(),
+                            )
+                            .await
+                    {
                         self.send_turn_start_failure(
                             connection_id,
                             request_id.clone(),
@@ -1703,8 +1751,93 @@ impl MessageProcessor {
                         .await;
                         return None;
                     }
-                };
-                let capability_attachments =
+                    if let Err(error) =
+                        super::message_turn::normalize_turn_collaboration_params(&mut params)
+                    {
+                        self.send_turn_start_failure(
+                            connection_id,
+                            request_id.clone(),
+                            &success_response,
+                            thread.id.as_str(),
+                            turn_id.as_str(),
+                            format!("invalid Turn collaboration metadata: {error}"),
+                        )
+                        .await;
+                        return None;
+                    }
+                    let resolved_permission_profile = execution_admission
+                        .uses_scoped_collaboration_policy()
+                        .then(|| {
+                            let requested = pioneer_protocol::resolve_turn_permission_profile(
+                                params.permission_profile.as_ref(),
+                            );
+                            execution_admission.cap_permission_profile(&requested)
+                        });
+                    if let Some(profile) = resolved_permission_profile.as_ref() {
+                        params.permission_profile =
+                            Some(pioneer_protocol::TurnPermissionProfileSelection {
+                                mode: profile.mode,
+                            });
+                    }
+                    // The detached Task must replay the exact presentation selected in the
+                    // Composer. Skill packs are expanded only at the execution boundary;
+                    // persisting the expanded capabilities here would make the child
+                    // message render every pack member as an individually selected skill.
+                    let launch = params.clone();
+                    params.capabilities = normalized_capabilities.execution.clone();
+                    if let Err(failure) = validate_root_agent_launch_capabilities(&params) {
+                        self.send_turn_start_failure(
+                            connection_id,
+                            request_id.clone(),
+                            &success_response,
+                            thread.id.as_str(),
+                            turn_id.as_str(),
+                            failure,
+                        )
+                        .await;
+                        return None;
+                    }
+                    if let Err(error) = self
+                        .validate_turn_artifact_user_inputs(
+                            thread.workspace_id.as_str(),
+                            thread.id.as_str(),
+                            params.input.as_slice(),
+                        )
+                        .await
+                    {
+                        self.send_turn_start_failure(
+                            connection_id,
+                            request_id.clone(),
+                            &success_response,
+                            thread.id.as_str(),
+                            turn_id.as_str(),
+                            format!("failed to validate artifact input: {error:#}"),
+                        )
+                        .await;
+                        return None;
+                    }
+                    let skill_catalog = match self
+                        .validate_turn_skill_capabilities(
+                            thread.workspace_id.as_str(),
+                            params.capabilities.as_slice(),
+                        )
+                        .await
+                    {
+                        Ok(catalog) => catalog,
+                        Err(message) => {
+                            self.send_turn_start_failure(
+                                connection_id,
+                                request_id.clone(),
+                                &success_response,
+                                thread.id.as_str(),
+                                turn_id.as_str(),
+                                message,
+                            )
+                            .await;
+                            return None;
+                        }
+                    };
+                    let capability_attachments =
             match super::agent_runtime::user_message_attachments_from_capabilities_and_catalog(
                 normalized_capabilities.presentation.as_slice(),
                 &skill_catalog,
@@ -1725,112 +1858,117 @@ impl MessageProcessor {
                 }
             };
 
-                // Preserve the exact client launch for Task replay, but admit the
-                // parent message with the canonical provider selected by its
-                // execution backend. CLI clients intentionally omit `model_provider`,
-                // so leaving the field empty here would keep the parent's previous
-                // API provider even though the detached child runs in Codex/Claude.
-                canonicalize_cli_runtime_model_provider(&mut params);
-                let author = match super::message_turn::resolve_turn_author_snapshot(
-                    self.crud_store.as_ref(),
-                    &request_actor,
-                )
-                .await
-                {
-                    Ok(author) => author,
-                    Err(error) => {
-                        self.send_turn_start_failure(
-                            connection_id,
-                            request_id.clone(),
-                            &success_response,
-                            thread.id.as_str(),
-                            turn_id.as_str(),
-                            format!("failed to resolve Turn author: {error:#}"),
-                        )
-                        .await;
-                        return None;
-                    }
-                };
-                let mentions = match super::message_turn::resolve_turn_collaboration_metadata(
-                    self.crud_store.as_ref(),
-                    &request_actor,
-                    &params,
-                )
-                .await
-                {
-                    Ok(mentions) => mentions,
-                    Err(error) => {
-                        self.send_turn_start_failure(
-                            connection_id,
-                            request_id.clone(),
-                            &success_response,
-                            thread.id.as_str(),
-                            turn_id.as_str(),
-                            format!("invalid Turn collaboration metadata: {error}"),
-                        )
-                        .await;
-                        return None;
-                    }
-                };
-                let outcome_result = match resolved_permission_profile {
-                    Some(profile) => {
-                        self.thread_manager
-                            .turn_start_with_user_metadata_and_permission_profile(
+                    // Preserve the exact client launch for Task replay, but admit the
+                    // parent message with the canonical provider selected by its
+                    // execution backend. CLI clients intentionally omit `model_provider`,
+                    // so leaving the field empty here would keep the parent's previous
+                    // API provider even though the detached child runs in Codex/Claude.
+                    canonicalize_cli_runtime_model_provider(&mut params);
+                    let author = match super::message_turn::resolve_turn_author_snapshot(
+                        self.crud_store.as_ref(),
+                        &request_actor,
+                    )
+                    .await
+                    {
+                        Ok(author) => author,
+                        Err(error) => {
+                            self.send_turn_start_failure(
                                 connection_id,
-                                params,
-                                profile,
-                                author,
-                                mentions,
+                                request_id.clone(),
+                                &success_response,
+                                thread.id.as_str(),
+                                turn_id.as_str(),
+                                format!("failed to resolve Turn author: {error:#}"),
                             )
-                            .await
-                    }
-                    None => {
-                        self.thread_manager
-                            .turn_start_with_user_metadata(connection_id, params, author, mentions)
-                            .await
-                    }
-                };
-                let outcome = match outcome_result {
-                    Ok(outcome) => outcome,
-                    Err(error) => {
-                        self.send_turn_start_failure(
-                            connection_id,
-                            request_id.clone(),
-                            &success_response,
-                            thread.id.as_str(),
-                            turn_id.as_str(),
-                            format!("failed to admit Composer message: {error:#}"),
-                        )
-                        .await;
-                        return None;
-                    }
-                };
-                let profile_audit = match self.turn_profile_selected_audit_event(&outcome) {
-                    Ok(event) => event,
-                    Err(error) => {
-                        self.thread_manager
-                            .rollback_turn_start(outcome.rollback_context.clone())
                             .await;
-                        self.send_turn_start_failure(
-                            connection_id,
-                            request_id.clone(),
-                            &success_response,
-                            thread.id.as_str(),
-                            turn_id.as_str(),
-                            format!("failed to resolve Composer permission profile: {error:#}"),
-                        )
-                        .await;
-                        return None;
-                    }
-                };
-                Some(ComposerDetachedStartedPhase {
-                    launch,
-                    outcome,
-                    capability_attachments,
-                    profile_audit,
-                })
-            })
-            .await;
+                            return None;
+                        }
+                    };
+                    let mentions = match super::message_turn::resolve_turn_collaboration_metadata(
+                        self.crud_store.as_ref(),
+                        &request_actor,
+                        &params,
+                    )
+                    .await
+                    {
+                        Ok(mentions) => mentions,
+                        Err(error) => {
+                            self.send_turn_start_failure(
+                                connection_id,
+                                request_id.clone(),
+                                &success_response,
+                                thread.id.as_str(),
+                                turn_id.as_str(),
+                                format!("invalid Turn collaboration metadata: {error}"),
+                            )
+                            .await;
+                            return None;
+                        }
+                    };
+                    let outcome_result = match resolved_permission_profile {
+                        Some(profile) => {
+                            self.thread_manager
+                                .turn_start_with_user_metadata_and_permission_profile(
+                                    connection_id,
+                                    params,
+                                    profile,
+                                    author,
+                                    mentions,
+                                )
+                                .await
+                        }
+                        None => {
+                            self.thread_manager
+                                .turn_start_with_user_metadata(
+                                    connection_id,
+                                    params,
+                                    author,
+                                    mentions,
+                                )
+                                .await
+                        }
+                    };
+                    let outcome = match outcome_result {
+                        Ok(outcome) => outcome,
+                        Err(error) => {
+                            self.send_turn_start_failure(
+                                connection_id,
+                                request_id.clone(),
+                                &success_response,
+                                thread.id.as_str(),
+                                turn_id.as_str(),
+                                format!("failed to admit Composer message: {error:#}"),
+                            )
+                            .await;
+                            return None;
+                        }
+                    };
+                    let profile_audit = match self.turn_profile_selected_audit_event(&outcome) {
+                        Ok(event) => event,
+                        Err(error) => {
+                            self.thread_manager
+                                .rollback_turn_start(outcome.rollback_context.clone())
+                                .await;
+                            self.send_turn_start_failure(
+                                connection_id,
+                                request_id.clone(),
+                                &success_response,
+                                thread.id.as_str(),
+                                turn_id.as_str(),
+                                format!("failed to resolve Composer permission profile: {error:#}"),
+                            )
+                            .await;
+                            return None;
+                        }
+                    };
+                    Some(ComposerDetachedStartedPhase {
+                        launch,
+                        outcome,
+                        capability_attachments,
+                        profile_audit,
+                    })
+                }))
+                .await;
             let Some(ComposerDetachedStartedPhase {
                 launch,
                 outcome,
@@ -1840,46 +1978,22 @@ impl MessageProcessor {
             else {
                 return;
             };
-            let materialized_phase = message_future(async {
-                if let Err(message) = self
-                    .admit_composite_execution_request(
-                        &mut execution_admission,
-                        admission_entry_point,
-                        vec![crate::authorization::ResourceAction::TaskCreate],
-                        outcome.started_notification.workspace_id.as_str(),
-                        outcome.started_notification.thread_id.as_str(),
-                        outcome.materialization.thread.model_provider.as_str(),
-                        outcome.materialization.thread.model.as_str(),
-                        &launch,
-                        outcome.materialization.capabilities.as_slice(),
-                    )
-                    .await
-                {
-                    self.thread_manager
-                        .rollback_turn_start(outcome.rollback_context.clone())
-                        .await;
-                    self.send_turn_start_failure(
-                        connection_id,
-                        request_id.clone(),
-                        &success_response,
-                        thread.id.as_str(),
-                        turn_id.as_str(),
-                        message,
-                    )
-                    .await;
-                    return None;
-                }
-                let security_snapshot = match self
-                    .resolve_turn_execution_security_snapshot(
-                        &launch,
-                        &outcome,
-                        None,
-                        ExecutionEnvelopeSource::Fresh(&execution_admission),
-                    )
-                    .await
-                {
-                    Ok(snapshot) => snapshot,
-                    Err(failure) => {
+            let materialized_phase =
+                message_future(scope_current_stage(Stage::ComposerMaterialize, async {
+                    if let Err(message) = self
+                        .admit_composite_execution_request(
+                            &mut execution_admission,
+                            admission_entry_point,
+                            vec![crate::authorization::ResourceAction::TaskCreate],
+                            outcome.started_notification.workspace_id.as_str(),
+                            outcome.started_notification.thread_id.as_str(),
+                            outcome.materialization.thread.model_provider.as_str(),
+                            outcome.materialization.thread.model.as_str(),
+                            &launch,
+                            outcome.materialization.capabilities.as_slice(),
+                        )
+                        .await
+                    {
                         self.thread_manager
                             .rollback_turn_start(outcome.rollback_context.clone())
                             .await;
@@ -1889,85 +2003,111 @@ impl MessageProcessor {
                             &success_response,
                             thread.id.as_str(),
                             turn_id.as_str(),
-                            failure,
+                            message,
                         )
                         .await;
                         return None;
                     }
-                };
-                let security_audit_events = self.turn_security_audit_events_for_turn(
-                    outcome.started_notification.workspace_id.as_str(),
-                    outcome.started_notification.thread_id.as_str(),
-                    outcome.started_notification.turn.id.as_str(),
-                    &security_snapshot,
-                );
-                if let Err(error) = persist_admitted_turn_start(
-                    self.crud_store.as_ref(),
-                    self.provider_registry.as_ref(),
-                    self.turn_execution_owner_id.as_ref(),
-                    &launch,
-                    &outcome.materialization,
-                    requested_reasoning_effort(&launch).as_deref(),
-                    request_actor.clone(),
-                    profile_audit,
-                    ExecutionEnvelopeSource::Fresh(&execution_admission),
-                    None,
-                    &security_snapshot,
-                    security_audit_events,
-                    None,
-                    None,
-                )
-                .await
-                {
-                    self.thread_manager
-                        .rollback_turn_start(outcome.rollback_context.clone())
-                        .await;
-                    self.send_turn_start_failure(
-                        connection_id,
-                        request_id.clone(),
-                        &success_response,
-                        thread.id.as_str(),
-                        turn_id.as_str(),
-                        format!("failed to persist Composer message: {error:#}"),
+                    let security_snapshot = match self
+                        .resolve_turn_execution_security_snapshot(
+                            &launch,
+                            &outcome,
+                            None,
+                            ExecutionEnvelopeSource::Fresh(&execution_admission),
+                        )
+                        .await
+                    {
+                        Ok(snapshot) => snapshot,
+                        Err(failure) => {
+                            self.thread_manager
+                                .rollback_turn_start(outcome.rollback_context.clone())
+                                .await;
+                            self.send_turn_start_failure(
+                                connection_id,
+                                request_id.clone(),
+                                &success_response,
+                                thread.id.as_str(),
+                                turn_id.as_str(),
+                                failure,
+                            )
+                            .await;
+                            return None;
+                        }
+                    };
+                    let security_audit_events = self.turn_security_audit_events_for_turn(
+                        outcome.started_notification.workspace_id.as_str(),
+                        outcome.started_notification.thread_id.as_str(),
+                        outcome.started_notification.turn.id.as_str(),
+                        &security_snapshot,
+                    );
+                    if let Err(error) = persist_admitted_turn_start(
+                        self.crud_store.as_ref(),
+                        self.provider_registry.as_ref(),
+                        self.turn_execution_owner_id.as_ref(),
+                        &launch,
+                        &outcome.materialization,
+                        requested_reasoning_effort(&launch).as_deref(),
+                        pioneer_crud::TurnWorkOwner::DetachedTask,
+                        request_actor.clone(),
+                        profile_audit,
+                        ExecutionEnvelopeSource::Fresh(&execution_admission),
+                        None,
+                        &security_snapshot,
+                        security_audit_events,
+                        None,
+                        None,
                     )
-                    .await;
-                    return None;
-                }
-                self.complete_runtime_draft_materialization(ExecutionEnvelopeSource::Fresh(
-                    &execution_admission,
-                ))
-                .await;
-                if let Err(error) = self
-                    .register_execution_lease(outcome.started_notification.turn.id.as_str())
                     .await
-                {
-                    let message = format!("failed to register execution lease: {error:#}");
-                    self.mark_turn_blocked(
-                        thread.id.clone(),
-                        launch.turn_id.clone(),
-                        message.clone(),
-                    )
+                    {
+                        self.thread_manager
+                            .rollback_turn_start(outcome.rollback_context.clone())
+                            .await;
+                        self.send_turn_start_failure(
+                            connection_id,
+                            request_id.clone(),
+                            &success_response,
+                            thread.id.as_str(),
+                            turn_id.as_str(),
+                            format!("failed to persist Composer message: {error:#}"),
+                        )
+                        .await;
+                        return None;
+                    }
+                    self.complete_runtime_draft_materialization(ExecutionEnvelopeSource::Fresh(
+                        &execution_admission,
+                    ))
                     .await;
-                    self.send_turn_start_failure(
-                        connection_id,
-                        request_id.clone(),
-                        &success_response,
-                        thread.id.as_str(),
-                        turn_id.as_str(),
-                        TurnStartFailure::internal(message),
-                    )
-                    .await;
-                    return None;
-                }
+                    if let Err(error) = self
+                        .register_execution_lease(outcome.started_notification.turn.id.as_str())
+                        .await
+                    {
+                        let message = format!("failed to register execution lease: {error:#}");
+                        self.mark_turn_blocked(
+                            thread.id.clone(),
+                            launch.turn_id.clone(),
+                            message.clone(),
+                        )
+                        .await;
+                        self.send_turn_start_failure(
+                            connection_id,
+                            request_id.clone(),
+                            &success_response,
+                            thread.id.as_str(),
+                            turn_id.as_str(),
+                            TurnStartFailure::internal(message),
+                        )
+                        .await;
+                        return None;
+                    }
 
-                Some(ComposerDetachedMaterializedPhase {
-                    launch,
-                    outcome,
-                    capability_attachments,
-                    security_snapshot,
-                })
-            })
-            .await;
+                    Some(ComposerDetachedMaterializedPhase {
+                        launch,
+                        outcome,
+                        capability_attachments,
+                        security_snapshot,
+                    })
+                }))
+                .await;
             let Some(ComposerDetachedMaterializedPhase {
                 launch,
                 outcome,
@@ -1977,6 +2117,44 @@ impl MessageProcessor {
             else {
                 return;
             };
+            // Materialization has released all DB capacity. Publish the exact
+            // committed user lifecycle before the Task service can start/fanout
+            // its occurrence; do not wait for the optional native outbox.
+            if let Err(error) = self
+                .emit_user_message_item_lifecycle_with_live_delivery(
+                    thread.workspace_id.as_str(),
+                    thread.id.as_str(),
+                    turn_id.as_str(),
+                    outcome.materialization.input.as_slice(),
+                    capability_attachments.as_slice(),
+                    true,
+                )
+                .await
+            {
+                self.mark_turn_blocked(
+                    thread.id.clone(),
+                    turn_id.clone(),
+                    format!("failed to publish Composer user message: {error:#}"),
+                )
+                .await;
+                self.send_turn_start_failure(
+                    connection_id,
+                    request_id.clone(),
+                    &success_response,
+                    thread.id.as_str(),
+                    turn_id.as_str(),
+                    format!("failed to publish Composer user message: {error:#}"),
+                )
+                .await;
+                return;
+            }
+            #[cfg(test)]
+            self.completed_history_preparation_barrier
+                .wait_if_armed(
+                    "__detached_composer_before_task_create__",
+                    &tokio_util::sync::CancellationToken::new(),
+                )
+                .await;
             let task_created_phase = message_future(async {
                 let first_text = first_user_text(launch.input.as_slice());
                 let goal = first_text
@@ -1988,41 +2166,8 @@ impl MessageProcessor {
                 let title = goal.chars().take(96).collect::<String>();
                 let permission_profile = outcome.materialization.turn.permission_profile.clone();
                 let task_model_provider = outcome.materialization.thread.model_provider.clone();
-                // Freeze the causally closed parent branch before the Task becomes
-                // visible to the scheduler. A later sibling message must not change
-                // the context of this run, even if execution starts later.
-                let frozen_history = self
-                    .load_conversation_history_for_workspace_in_execution_excluding_turn(
-                        thread.workspace_id.as_str(),
-                        thread.id.as_str(),
-                        thread.id.as_str(),
-                        launch.turn_id.as_str(),
-                        Some(launch.turn_id.as_str()),
-                        Some(outcome.materialization.thread.model.as_str()),
-                        Some(task_model_provider.as_str()),
-                    )
-                    .await;
-                let frozen_history_json = match serde_json::to_string(&frozen_history) {
-                    Ok(history_json) => history_json,
-                    Err(error) => {
-                        self.mark_turn_blocked(
-                            thread.id.clone(),
-                            launch.turn_id.clone(),
-                            format!("failed to freeze Composer task history: {error:#}"),
-                        )
-                        .await;
-                        self.send_turn_start_failure(
-                            connection_id,
-                            request_id.clone(),
-                            &success_response,
-                            thread.id.as_str(),
-                            turn_id.as_str(),
-                            format!("failed to freeze Composer task history: {error:#}"),
-                        )
-                        .await;
-                        return None;
-                    }
-                };
+                // Persist the Composer launch here; context preparation belongs to
+                // the durable child execution, not the connection-owned request.
                 let mut task_params = pioneer_protocol::TaskCreateParams {
                     workspace_id: thread.workspace_id.clone(),
                     owner_kind: pioneer_protocol::TaskOwnerKind::Thread,
@@ -2129,7 +2274,7 @@ impl MessageProcessor {
                             return None;
                         }
                     };
-                let (canonical_launch, resolved_launch) =
+                let (mut canonical_launch, resolved_launch) =
                     match super::agent_action_tools::resolve_workspace_task_launch(
                         self,
                         thread.workspace_id.as_str(),
@@ -2152,6 +2297,18 @@ impl MessageProcessor {
                             return None;
                         }
                     };
+                if let Err(error) = super::agent_action_tools::pin_launch_selection_capabilities(
+                    &mut canonical_launch,
+                    outcome.materialization.capabilities.as_slice(),
+                ) {
+                    self.mark_turn_blocked(
+                        thread.id.clone(),
+                        launch.turn_id.clone(),
+                        format!("failed to freeze Composer Task capabilities: {error:#}"),
+                    )
+                    .await;
+                    return None;
+                }
                 task_params.launch = Some(canonical_launch.clone());
                 let agent_authorization_grant = match resolved_launch.as_ref() {
                     Some((identity, profile)) => {
@@ -2234,11 +2391,6 @@ impl MessageProcessor {
                         .map(|(identity, _)| identity.clone()),
                     resolved_launch_profile: resolved_launch.map(|(_, profile)| profile),
                     agent_authorization_grant,
-                    conversation_snapshot: Some(pioneer_tasks::TaskRunConversationSnapshotSeed {
-                        conversation_thread_id: thread.id.clone(),
-                        source_turn_id: Some(launch.turn_id.clone()),
-                        history_json: frozen_history_json,
-                    }),
                     execution_admission: Some(pioneer_tasks::TaskExecutionAdmissionSeed {
                         workspace_id: task_execution_context.workspace_id().to_owned(),
                         root_thread_id: task_execution_context.root_thread_id().to_owned(),
@@ -2359,6 +2511,14 @@ impl MessageProcessor {
         entry_point: crate::authorization::ExecutionAdmissionEntryPoint,
         mut execution_admission: ExecutionAuthorizationAdmission,
     ) -> Result<ApiProviderTurnAdmission, TurnStartFailure> {
+        pioneer_observability::turn_startup::set_runtime(
+            &params.turn_id,
+            pioneer_observability::turn_startup::Runtime::Native,
+        );
+        let _startup_stage = pioneer_observability::turn_startup::stage(
+            &params.turn_id,
+            pioneer_observability::turn_startup::Stage::NativePrepare,
+        );
         let allow_agent_skill_overlay =
             execution_backend_allows_agent_skill_overlay(params.execution_backend.as_ref());
         let thread = self
@@ -2371,12 +2531,17 @@ impl MessageProcessor {
                     params.thread_id.trim()
                 ))
             })?;
-        let normalized_capabilities = self
-            .normalize_turn_skill_capabilities(
+        let normalized_capabilities = {
+            let _startup_part = pioneer_observability::turn_startup::stage(
+                &params.turn_id,
+                pioneer_observability::turn_startup::Stage::Skills,
+            );
+            self.normalize_turn_skill_capabilities(
                 thread.workspace_id.as_str(),
                 params.capabilities.as_slice(),
             )
-            .await?;
+            .await?
+        };
         if execution_admission.uses_scoped_collaboration_policy() {
             self.enforce_scoped_skill_capability_projection(
                 thread.workspace_id.as_str(),
@@ -2482,6 +2647,9 @@ impl MessageProcessor {
         .map_err(|error| {
             TurnStartFailure::invalid_input(format!("invalid Turn collaboration metadata: {error}"))
         })?;
+        let startup_persist = pioneer_observability::turn_startup::current_stage(
+            pioneer_observability::turn_startup::Stage::Persist,
+        );
         let outcome_result = match resolved_permission_profile {
             Some(profile) => {
                 self.thread_manager
@@ -2500,6 +2668,7 @@ impl MessageProcessor {
                     .await
             }
         };
+        drop(startup_persist);
         let outcome = outcome_result.map_err(|error| {
             TurnStartFailure::internal(format!("failed to start turn: {error:#}"))
         })?;
@@ -2522,19 +2691,25 @@ impl MessageProcessor {
                 return Err(TurnStartFailure::invalid_input(message));
             }
         };
-        let skill_catalog = match self
-            .validate_turn_skill_capabilities(
-                outcome.started_notification.workspace_id.as_str(),
-                outcome.materialization.capabilities.as_slice(),
-            )
-            .await
-        {
-            Ok(catalog) => catalog,
-            Err(message) => {
-                self.thread_manager
-                    .rollback_turn_start(outcome.rollback_context.clone())
-                    .await;
-                return Err(message);
+        let skill_catalog = {
+            let _startup_part = pioneer_observability::turn_startup::stage(
+                &outcome.started_notification.turn.id,
+                pioneer_observability::turn_startup::Stage::Skills,
+            );
+            match self
+                .validate_turn_skill_capabilities(
+                    outcome.started_notification.workspace_id.as_str(),
+                    outcome.materialization.capabilities.as_slice(),
+                )
+                .await
+            {
+                Ok(catalog) => catalog,
+                Err(message) => {
+                    self.thread_manager
+                        .rollback_turn_start(outcome.rollback_context.clone())
+                        .await;
+                    return Err(message);
+                }
             }
         };
         let mut agent_skill_overlay = if allow_agent_skill_overlay
@@ -2630,21 +2805,27 @@ impl MessageProcessor {
                 )));
             }
         };
-        let execution_security_snapshot = match self
-            .resolve_turn_execution_security_snapshot(
-                &security_params,
-                &outcome,
-                None,
-                ExecutionEnvelopeSource::Fresh(&execution_admission),
-            )
-            .await
-        {
-            Ok(snapshot) => snapshot,
-            Err(failure) => {
-                self.thread_manager
-                    .rollback_turn_start(outcome.rollback_context.clone())
-                    .await;
-                return Err(failure);
+        let execution_security_snapshot = {
+            let _startup_part = pioneer_observability::turn_startup::stage(
+                &outcome.started_notification.turn.id,
+                pioneer_observability::turn_startup::Stage::Security,
+            );
+            match self
+                .resolve_turn_execution_security_snapshot(
+                    &security_params,
+                    &outcome,
+                    None,
+                    ExecutionEnvelopeSource::Fresh(&execution_admission),
+                )
+                .await
+            {
+                Ok(snapshot) => snapshot,
+                Err(failure) => {
+                    self.thread_manager
+                        .rollback_turn_start(outcome.rollback_context.clone())
+                        .await;
+                    return Err(failure);
+                }
             }
         };
         let security_audit_events = self.turn_security_audit_events_for_turn(
@@ -2706,6 +2887,7 @@ impl MessageProcessor {
             &security_params,
             &outcome.materialization,
             effective_reasoning_effort.as_deref(),
+            pioneer_crud::TurnWorkOwner::Turn,
             request_actor,
             profile_selected_audit,
             ExecutionEnvelopeSource::Fresh(&execution_admission),
@@ -2809,13 +2991,32 @@ impl MessageProcessor {
             .await;
             return Err(TurnStartFailure::unavailable(message));
         }
-        let history = self
-            .load_conversation_history_for_workspace(
+        let history = {
+            let _startup_part = pioneer_observability::turn_startup::stage(
+                &outcome.started_notification.turn.id,
+                pioneer_observability::turn_startup::Stage::History,
+            );
+            self.load_conversation_history_for_workspace(
                 outcome.started_notification.workspace_id.as_str(),
                 outcome.started_notification.thread_id.as_str(),
                 outcome.started_notification.turn.id.as_str(),
             )
-            .await;
+            .await
+        };
+        let history = match history {
+            Ok(history) => history,
+            Err(_) => {
+                let message =
+                    "Conversation history is unavailable; turn preparation paused".to_owned();
+                self.mark_turn_blocked(
+                    outcome.started_notification.thread_id.clone(),
+                    outcome.started_notification.turn.id.clone(),
+                    message.clone(),
+                )
+                .await;
+                return Err(TurnStartFailure::unavailable(message));
+            }
+        };
         let workspace_skill_policies = match self
             .crud_store
             .list_workspace_skill_policies(outcome.started_notification.workspace_id.as_str())
@@ -2853,45 +3054,59 @@ impl MessageProcessor {
                 return Err(TurnStartFailure::unavailable(message));
             }
         };
-        let resolved_artifacts = match self
-            .resolve_provider_artifact_inputs(
-                outcome.started_notification.workspace_id.as_str(),
-                outcome.materialization.input.as_slice(),
-            )
-            .await
-        {
-            Ok(resolved_artifacts) => resolved_artifacts,
-            Err(error) => {
-                self.mark_turn_blocked(
-                    outcome.started_notification.thread_id.clone(),
-                    outcome.started_notification.turn.id.clone(),
-                    format!("failed to resolve artifact input for provider: {error:#}"),
+        let resolved_artifacts = {
+            let _startup_part = pioneer_observability::turn_startup::stage(
+                &outcome.started_notification.turn.id,
+                pioneer_observability::turn_startup::Stage::Artifacts,
+            );
+            match self
+                .resolve_provider_artifact_inputs(
+                    outcome.started_notification.workspace_id.as_str(),
+                    outcome.materialization.input.as_slice(),
                 )
-                .await;
-                return Err(TurnStartFailure::unavailable(format!(
-                    "failed to resolve artifact input for provider: {error:#}"
-                )));
+                .await
+            {
+                Ok(resolved_artifacts) => resolved_artifacts,
+                Err(error) => {
+                    self.mark_turn_blocked(
+                        outcome.started_notification.thread_id.clone(),
+                        outcome.started_notification.turn.id.clone(),
+                        format!("failed to resolve artifact input for provider: {error:#}"),
+                    )
+                    .await;
+                    return Err(TurnStartFailure::unavailable(format!(
+                        "failed to resolve artifact input for provider: {error:#}"
+                    )));
+                }
             }
         };
-        let runtime_environment = match self
-            .create_artifact_output_environment(
-                outcome.started_notification.workspace_id.as_str(),
-                outcome.started_notification.thread_id.as_str(),
-                outcome.started_notification.turn.id.as_str(),
-            )
-            .await
-        {
-            Ok(runtime_environment) => runtime_environment.into_iter().collect::<HashMap<_, _>>(),
-            Err(error) => {
-                self.mark_turn_blocked(
-                    outcome.started_notification.thread_id.clone(),
-                    outcome.started_notification.turn.id.clone(),
-                    format!("failed to prepare artifact output directory: {error:#}"),
+        let runtime_environment = {
+            let _startup_part = pioneer_observability::turn_startup::stage(
+                &outcome.started_notification.turn.id,
+                pioneer_observability::turn_startup::Stage::Environment,
+            );
+            match self
+                .create_artifact_output_environment(
+                    outcome.started_notification.workspace_id.as_str(),
+                    outcome.started_notification.thread_id.as_str(),
+                    outcome.started_notification.turn.id.as_str(),
                 )
-                .await;
-                return Err(TurnStartFailure::unavailable(format!(
-                    "failed to prepare artifact output directory: {error:#}"
-                )));
+                .await
+            {
+                Ok(runtime_environment) => {
+                    runtime_environment.into_iter().collect::<HashMap<_, _>>()
+                }
+                Err(error) => {
+                    self.mark_turn_blocked(
+                        outcome.started_notification.thread_id.clone(),
+                        outcome.started_notification.turn.id.clone(),
+                        format!("failed to prepare artifact output directory: {error:#}"),
+                    )
+                    .await;
+                    return Err(TurnStartFailure::unavailable(format!(
+                        "failed to prepare artifact output directory: {error:#}"
+                    )));
+                }
             }
         };
         let hook_runtime_context = scoped_principal_id.map_or_else(
@@ -3162,7 +3377,10 @@ impl MessageProcessor {
                 outcome.started_notification.thread_id.as_str(),
                 outcome.started_notification.turn.id.as_str(),
             )
-            .await;
+            .await
+            .map_err(|_| {
+                "Conversation history is unavailable; turn preparation paused".to_owned()
+            })?;
         let workspace_skill_policies = self
             .crud_store
             .list_workspace_skill_policies(outcome.started_notification.workspace_id.as_str())
@@ -3235,6 +3453,27 @@ impl MessageProcessor {
         })
     }
 
+    #[cfg(test)]
+    pub(super) async fn send_turn_start_failure_for_test(
+        &self,
+        connection_id: ConnectionId,
+        request_id: RequestId,
+        success_response: &TurnStartSuccessResponse,
+        thread_id: &str,
+        turn_id: &str,
+        failure: TurnStartFailure,
+    ) {
+        self.send_turn_start_failure(
+            connection_id,
+            request_id,
+            success_response,
+            thread_id,
+            turn_id,
+            failure,
+        )
+        .await;
+    }
+
     async fn send_turn_start_failure(
         &self,
         connection_id: ConnectionId,
@@ -3245,11 +3484,12 @@ impl MessageProcessor {
         failure: impl Into<TurnStartFailure>,
     ) {
         let failure = failure.into();
-        let public_error = crate::public_error::map_agent_failure(
-            failure.public_code,
-            pioneer_protocol::PublicErrorStage::Admission,
-            failure.diagnostic,
-        );
+        let (public_error, task_failure) = if success_response.is_task() {
+            let (public_error, task_failure) = failure.into_task_failure();
+            (public_error, Some(task_failure))
+        } else {
+            (failure.into_public_error(), None)
+        };
         match success_response {
             TurnStartSuccessResponse::TurnStart => {
                 self.send_error(
@@ -3291,8 +3531,12 @@ impl MessageProcessor {
                 )
                 .await;
             }
-            TurnStartSuccessResponse::Task { .. }
-            | TurnStartSuccessResponse::DurableAgent { .. } => {
+            TurnStartSuccessResponse::Task { .. } => {
+                success_response.complete_task(Err(anyhow::Error::new(
+                    task_failure.expect("Task reporting produced a typed failure"),
+                )));
+            }
+            TurnStartSuccessResponse::DurableAgent { .. } => {
                 let encoded = serde_json::to_string(&public_error)
                     .unwrap_or_else(|_| public_error.correlation_id.clone());
                 success_response.complete_task(Err(anyhow::anyhow!(encoded)));
@@ -3313,41 +3557,47 @@ impl MessageProcessor {
         context_thread_id: String,
         task_run_id: String,
         execution_id: String,
-        conversation_history: Vec<ChatMessage>,
         agent_author: pioneer_protocol::TurnAuthorSnapshot,
         agent_turn_response: pioneer_crud::AgentTurnResponseInput,
+        admitted_outcome: Option<crate::thread::TurnStartOutcome>,
     ) -> anyhow::Result<PreparedCliRuntimeNativeTurnStart> {
-        let (sender, receiver) = tokio::sync::oneshot::channel();
-        let response = TurnStartSuccessResponse::Task {
-            permission_profile,
-            execution_security_snapshot,
-            continuation_thread_id,
-            context_thread_id,
-            task_run_id,
-            execution_id,
-            conversation_history,
-            agent_author: Some(agent_author),
-            agent_turn_response,
-            completion: std::sync::Arc::new(std::sync::Mutex::new(Some(sender))),
-        };
-        self.turn_start_cli_runtime(
-            0,
-            RequestId::new(generate_id(pioneer_protocol::REQUEST_ID_LEN))
-                .expect("generated request id must have protocol length"),
-            pioneer_protocol::PersistedActorRef::System,
-            params,
-            runtime_id,
-            runtime_kind,
-            TurnExecutionAuthority::Durable {
-                context: execution_authorization_context,
-                revalidation: std::sync::Arc::new(execution_authorization_revalidation),
-            },
-            response,
-        )
-        .await;
-        receiver
-            .await
-            .context("task CLI runtime preparation ended without a result")?
+        scope_current_stage(Stage::TaskCliPrepare, async {
+            #[cfg(test)]
+            self.task_cli_preparation_attempts
+                .fetch_add(1, Ordering::SeqCst);
+            let (sender, receiver) = tokio::sync::oneshot::channel();
+            let response = TurnStartSuccessResponse::Task {
+                permission_profile,
+                execution_security_snapshot,
+                continuation_thread_id,
+                context_thread_id,
+                task_run_id,
+                execution_id,
+                agent_author: Some(agent_author),
+                agent_turn_response,
+                admitted_outcome: admitted_outcome.map(Box::new),
+                completion: std::sync::Arc::new(std::sync::Mutex::new(Some(sender))),
+            };
+            self.turn_start_cli_runtime(
+                0,
+                RequestId::new(generate_id(pioneer_protocol::REQUEST_ID_LEN))
+                    .expect("generated request id must have protocol length"),
+                pioneer_protocol::PersistedActorRef::System,
+                params,
+                runtime_id,
+                runtime_kind,
+                TurnExecutionAuthority::Durable {
+                    context: execution_authorization_context,
+                    revalidation: std::sync::Arc::new(execution_authorization_revalidation),
+                },
+                response,
+            )
+            .await;
+            receiver
+                .await
+                .context("task CLI runtime preparation ended without a result")?
+        })
+        .await
     }
 
     pub(super) async fn prepare_committed_agent_cli_runtime_turn(
@@ -3360,7 +3610,6 @@ impl MessageProcessor {
         execution_authorization_context: crate::authorization::ExecutionAuthorizationContext,
         continuation_thread_id: String,
         context_thread_id: String,
-        conversation_history: Vec<ChatMessage>,
         agent_author: pioneer_protocol::TurnAuthorSnapshot,
     ) -> anyhow::Result<PreparedCliRuntimeNativeTurnStart> {
         let execution_authorization_revalidation = self
@@ -3385,7 +3634,6 @@ impl MessageProcessor {
             execution_security_snapshot,
             continuation_thread_id,
             context_thread_id,
-            conversation_history,
             agent_author,
             completion: std::sync::Arc::new(std::sync::Mutex::new(Some(sender))),
         };
@@ -3433,33 +3681,36 @@ impl MessageProcessor {
         &self,
         prepared: PreparedCliRuntimeNativeTurnStart,
     ) -> anyhow::Result<()> {
-        let turn_id = prepared.outcome.started_notification.turn.id.clone();
-        if !self
-            .publish_turn_start_success(
-                &prepared.outcome,
-                prepared.user_message_capability_attachments.as_slice(),
-            )
-            .await
-        {
-            self.release_cli_runtime_session_turn_lease(turn_id.as_str())
-                .await;
-            let thread_id = prepared.outcome.started_notification.thread_id.clone();
-            let reason = "failed to publish task CLI runtime turn start".to_owned();
+        scope_current_stage(Stage::ChildActivate, async {
+            let turn_id = prepared.outcome.started_notification.turn.id.clone();
             if !self
-                .report_turn_failure(
-                    thread_id.clone(),
-                    turn_id.clone(),
-                    TurnFailureRecoveryKind::TaskDispatch,
-                    reason.clone(),
+                .publish_turn_start_success(
+                    &prepared.outcome,
+                    prepared.user_message_capability_attachments.as_slice(),
                 )
                 .await
             {
-                self.mark_turn_blocked(thread_id, turn_id, reason).await;
+                self.release_cli_runtime_session_turn_lease(turn_id.as_str())
+                    .await;
+                let thread_id = prepared.outcome.started_notification.thread_id.clone();
+                let reason = "failed to publish task CLI runtime turn start".to_owned();
+                if !self
+                    .report_turn_failure(
+                        thread_id.clone(),
+                        turn_id.clone(),
+                        TurnFailureRecoveryKind::TaskDispatch,
+                        reason.clone(),
+                    )
+                    .await
+                {
+                    self.mark_turn_blocked(thread_id, turn_id, reason).await;
+                }
+                anyhow::bail!("failed to publish task CLI runtime turn start");
             }
-            anyhow::bail!("failed to publish task CLI runtime turn start");
-        }
-        self.spawn_prepared_cli_runtime_native_turn(prepared);
-        Ok(())
+            self.spawn_prepared_cli_runtime_native_turn(prepared);
+            Ok(())
+        })
+        .await
     }
 
     pub(super) async fn abort_prepared_task_cli_runtime_turn(
@@ -3495,18 +3746,78 @@ impl MessageProcessor {
         requested_mcp: bool,
         provider_claim_matches: bool,
     ) -> MessageFuture<'a, Result<PreparedCliRuntimeCombinedPreflight, TurnStartFailure>> {
-        message_future(async move {
-            let mcp_projection = match self
-                .mcp_service
-                .resolve_mcp_turn_projection(&pioneer_agent::AgentMcpMaterializationRequest {
-                    workspace_id: thread.workspace_id.clone(),
-                    turn_id: params.turn_id.clone(),
-                    explicit_servers: capability_partition.mcp_servers.clone(),
-                    explicit_tools: capability_partition.mcp_tools.clone(),
-                })
-                .await
+        message_future(scope_current_stage(Stage::CliPreflight, async move {
+            #[cfg(test)]
+            if let Some(failure) = self.task_cli_admission_failure.lock().unwrap().take() {
+                return Err(failure);
+            }
+            let readiness_snapshot = {
+                let _startup_part = pioneer_observability::turn_startup::stage(
+                    &params.turn_id,
+                    pioneer_observability::turn_startup::Stage::ReadinessWait,
+                );
+                let readiness = self
+                    .cli_runtime_probe_snapshot(thread.workspace_id.as_str(), runtime_id)
+                    .await;
+                #[cfg(test)]
+                let readiness = {
+                    let injected = self.task_cli_readiness_failure.lock().unwrap().take();
+                    injected.map_or(readiness, Err)
+                };
+                readiness
+                    .map_err(|error| {
+                        TurnStartFailure::internal_typed(
+                            pioneer_tasks::TaskStartStage::CliAdmission,
+                            error.context("failed to load CLI runtime readiness snapshot"),
+                        )
+                    })?
+                    .ok_or_else(|| {
+                        TurnStartFailure::internal(format!(
+                            "CLI runtime `{runtime_id}` is absent from the readiness snapshot"
+                        ))
+                    })?
+            };
+            let readiness_summary = readiness_snapshot.summary;
+            let max_input_tokens = readiness_snapshot.models.as_ref().and_then(|snapshot| {
+                let selected_model = params.model.as_deref().unwrap_or(thread.model.as_str());
+                snapshot
+                    .result
+                    .models
+                    .iter()
+                    .find(|model| model.id == selected_model)
+                    .and_then(|model| model.max_input_tokens)
+            });
+            let cached_mcp_readiness = readiness_snapshot.mcp_readiness;
+            if !matches!(readiness_summary.status, RuntimeStatus::Ready) {
+                return Err(TurnStartFailure::invalid_input(format!(
+                    "CLI runtime `{runtime_id}` is not ready: {}",
+                    cli_runtime_unavailable_reason(&readiness_summary.status)
+                )));
+            }
+
+            let (max_tools, max_total_schema_bytes) = self.mcp_service.projection_limit_values();
+            let mcp_projection = match scope_current_stage(
+                Stage::CliMcpResolve,
+                self.mcp_service.resolve_mcp_turn_projection(
+                    &pioneer_agent::AgentMcpMaterializationRequest {
+                        workspace_id: thread.workspace_id.clone(),
+                        turn_id: params.turn_id.clone(),
+                        explicit_servers: capability_partition.mcp_servers.clone(),
+                        explicit_tools: capability_partition.mcp_tools.clone(),
+                    },
+                ),
+            )
+            .await
             {
-                Ok(projection) => Some(projection),
+                Ok(projection) => Some(
+                    projection
+                        .with_html_tools(crate::turn_mcp::McpProjectionLimits {
+                            max_tools,
+                            max_total_schema_bytes,
+                            ..crate::turn_mcp::McpProjectionLimits::default()
+                        })
+                        .map_err(|error| TurnStartFailure::internal(error.to_string()))?,
+                ),
                 Err(error) => {
                     let code = match error.reason {
                         pioneer_agent::AgentMcpMaterializationFailureReason::ExplicitCapabilityRejected => {
@@ -3554,13 +3865,15 @@ impl MessageProcessor {
                 (Vec::new(), Vec::new())
             } else {
                 let preflight_started = std::time::Instant::now();
-                let resolved = match self
-                    .resolve_cli_runtime_skill_attachments(
+                let resolved = match scope_current_stage(
+                    Stage::CliSkillsPlan,
+                    self.resolve_cli_runtime_skill_attachments(
                         thread.workspace_id.as_str(),
                         attachments,
                         &projected_mcp_availability,
-                    )
-                    .await
+                    ),
+                )
+                .await
                 {
                     Ok(resolved) => resolved,
                     Err(error) => {
@@ -3668,14 +3981,14 @@ impl MessageProcessor {
             let mut claude_mcp_launch_projection = None;
             let mut opencode_mcp_launch_projection = None;
             if let Some(projection) = plan.mcp_projection.as_ref() {
-                let has_mcp_projection = requested_mcp || !projection.tools.is_empty();
+                // Managed Claude always receives the reserved first-party
+                // filesystem facade, even when the user selected no external
+                // MCP server.  Codex keeps its provider-owned aggregate path
+                // and therefore retains the old requested/selected gate.
+                let has_mcp_projection = requested_mcp
+                    || !projection.tools.is_empty()
+                    || runtime_kind == CLIAgentRuntimeKind::Claude;
                 if has_mcp_projection {
-                    let readiness_summary = self
-                        .cli_runtime_live_summary_from_instance(
-                            thread.workspace_id.as_str(),
-                            runtime_config.clone(),
-                        )
-                        .await;
                     let validation =
                         crate::cli_mcp_client_validation::validate_cli_mcp_client_request_durably(
                             &self.crud_store,
@@ -3689,10 +4002,7 @@ impl MessageProcessor {
                                 target: cli_mcp_client_target(runtime_kind),
                                 has_mcp_projection,
                                 provider_claim_matches,
-                                runtime_snapshot_current: matches!(
-                                    readiness_summary.status,
-                                    RuntimeStatus::Ready | RuntimeStatus::Degraded { .. }
-                                ),
+                                runtime_snapshot_current: true,
                                 runtime_supports_mcp_tools: readiness_summary
                                     .capabilities
                                     .supports_mcp_tools,
@@ -3728,42 +4038,27 @@ impl MessageProcessor {
                         );
                         return Err(TurnStartFailure::internal(format!("{code}: {message}")));
                     }
-                    let (max_tools, max_schema_bytes) = self.mcp_service.projection_limit_values();
-                    #[cfg(test)]
-                    let readiness_override = self.cli_mcp_readiness_override_for_tests();
-                    #[cfg(not(test))]
-                    let readiness_override: Option<
-                        pioneer_protocol::CliMcpAdapterReadiness,
-                    > = None;
+                    let readiness = cached_mcp_readiness.clone().ok_or_else(|| {
+                        TurnStartFailure::unavailable(
+                            "cli_runtime.mcp.readiness_unavailable: Gateway MCP readiness snapshot is not available",
+                        )
+                    })?;
+                    if !readiness.supported {
+                        let diagnostic = readiness
+                            .diagnostics
+                            .iter()
+                            .find(|diagnostic| diagnostic.code.starts_with("cli_runtime.mcp."));
+                        return Err(TurnStartFailure::unavailable(format!(
+                            "{}: {}",
+                            diagnostic
+                                .map(|diagnostic| diagnostic.code.as_str())
+                                .unwrap_or("cli_runtime.mcp.readiness_unavailable"),
+                            diagnostic
+                                .map(|diagnostic| diagnostic.message.as_str())
+                                .unwrap_or("MCP tool readiness is not available")
+                        )));
+                    }
                     if runtime_kind == CLIAgentRuntimeKind::Codex {
-                        let readiness = match readiness_override {
-                            Some(readiness) => readiness,
-                            None => crate::cli_runtime::mcp::readiness::codex_mcp_readiness_for_instance(
-                                runtime_config,
-                                self.artifact_runtime_home.as_path(),
-                                matches!(readiness_summary.status, RuntimeStatus::Ready),
-                                readiness_summary.version.as_deref(),
-                                readiness_summary.proxy_url.as_deref(),
-                                max_tools,
-                                max_schema_bytes,
-                            )
-                            .await,
-                        };
-                        if !readiness.supported {
-                            let diagnostic = readiness
-                                .diagnostics
-                                .iter()
-                                .find(|diagnostic| diagnostic.code.starts_with("cli_runtime.mcp."));
-                            return Err(TurnStartFailure::unavailable(format!(
-                                "{}: {}",
-                                diagnostic
-                                    .map(|diagnostic| diagnostic.code.as_str())
-                                    .unwrap_or("cli_runtime.mcp.readiness_unavailable"),
-                                diagnostic
-                                    .map(|diagnostic| diagnostic.message.as_str())
-                                    .unwrap_or("MCP tool readiness is not available")
-                            )));
-                        }
                         codex_mcp_launch_projection = Some(
                             crate::cli_runtime::codex_mcp::build_codex_mcp_session_launch_projection(
                                 projection.clone(),
@@ -3776,34 +4071,6 @@ impl MessageProcessor {
                             })?,
                         );
                     } else if runtime_kind == CLIAgentRuntimeKind::Claude {
-                        let readiness = match readiness_override {
-                            Some(readiness) => readiness,
-                            None => crate::cli_runtime::mcp::readiness::claude_mcp_readiness_for_instance(
-                                runtime_config,
-                                self.artifact_runtime_home.as_path(),
-                                matches!(readiness_summary.status, RuntimeStatus::Ready),
-                                readiness_summary.version.as_deref(),
-                                readiness_summary.proxy_url.as_deref(),
-                                max_tools,
-                                max_schema_bytes,
-                            )
-                            .await,
-                        };
-                        if !readiness.supported {
-                            let diagnostic = readiness
-                                .diagnostics
-                                .iter()
-                                .find(|diagnostic| diagnostic.code.starts_with("cli_runtime.mcp."));
-                            return Err(TurnStartFailure::unavailable(format!(
-                                "{}: {}",
-                                diagnostic
-                                    .map(|diagnostic| diagnostic.code.as_str())
-                                    .unwrap_or("cli_runtime.mcp.readiness_unavailable"),
-                                diagnostic
-                                    .map(|diagnostic| diagnostic.message.as_str())
-                                    .unwrap_or("MCP tool readiness is not available")
-                            )));
-                        }
                         claude_mcp_launch_projection = Some(
                             crate::cli_runtime::claude_mcp::build_claude_mcp_session_launch_projection(
                                 projection.clone(),
@@ -3861,8 +4128,9 @@ impl MessageProcessor {
                 codex_mcp_launch_projection,
                 claude_mcp_launch_projection,
                 opencode_mcp_launch_projection,
+                max_input_tokens,
             })
-        })
+        }))
     }
 
     pub(super) fn turn_start_cli_runtime<'a>(
@@ -3874,9 +4142,9 @@ impl MessageProcessor {
         runtime_id: String,
         runtime_kind: CLIAgentRuntimeKind,
         mut execution_authority: TurnExecutionAuthority,
-        success_response: TurnStartSuccessResponse,
+        mut success_response: TurnStartSuccessResponse,
     ) -> MessageFuture<'a, ()> {
-        message_future(async move {
+        message_future(scope_current_stage(Stage::CliPrepare, async move {
             // A hidden Task CLI turn is still authored by the admitted agent.
             // The transport request itself is System-owned, so prefer the
             // immutable author snapshot carried by the Task response before
@@ -3899,7 +4167,23 @@ impl MessageProcessor {
                     crate::authorization::ExecutionAdmissionEntryPoint::AgentTurnStart
                 }
             };
+            let already_materialized = matches!(
+                &success_response,
+                TurnStartSuccessResponse::Task {
+                    admitted_outcome: Some(_),
+                    ..
+                }
+            );
             let response_turn_id = params.turn_id.clone();
+            pioneer_observability::turn_startup::set_runtime(
+                &response_turn_id,
+                match runtime_kind {
+                    CLIAgentRuntimeKind::Codex => {
+                        pioneer_observability::turn_startup::Runtime::Codex
+                    }
+                    _ => pioneer_observability::turn_startup::Runtime::Claude,
+                },
+            );
             let response_thread_id = params.thread_id.clone();
             let submitted_model_provider = params.model_provider.clone();
             macro_rules! send_turn_start_failure {
@@ -3957,7 +4241,7 @@ impl MessageProcessor {
             // separate heap-backed futures. Combining this entire lifecycle in one
             // async state machine creates a poll frame large enough to exhaust a
             // standard Tokio worker stack before ordinary callees can run.
-            let admission_phase = message_future(async {
+            let admission_phase = message_future(scope_current_stage(Stage::CliAdmission, async {
 
             let Some(thread) = self
                 .thread_manager
@@ -4080,9 +4364,6 @@ impl MessageProcessor {
             let continuation_thread_id = success_response
                 .continuation_thread_id(thread.id.as_str())
                 .to_owned();
-            let context_thread_id = success_response
-                .context_thread_id(thread.id.as_str())
-                .to_owned();
             let session_key = match crate::cli_runtime::manager::CLIAgentRuntimeSessionKey::new(
                 thread.workspace_id.as_str(),
                 runtime_id.as_str(),
@@ -4095,7 +4376,7 @@ impl MessageProcessor {
                 }
             };
             let session_turn_mutex = self.cli_runtime_session_turn_mutex(&session_key).await;
-            let session_turn_lease = if success_response.is_task() {
+            let session_turn_lease = { let _startup_part = pioneer_observability::turn_startup::stage(&response_turn_id, pioneer_observability::turn_startup::Stage::CliSessionWait); if success_response.is_task() {
                 let lock = session_turn_mutex.lock_owned();
                 tokio::pin!(lock);
                 let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(5));
@@ -4141,7 +4422,7 @@ impl MessageProcessor {
                         return None;
                     }
                 }
-            };
+            } };
             let mut blocker_poll_count = 0_u32;
             loop {
                 match self
@@ -4211,11 +4492,472 @@ impl MessageProcessor {
                     }
                 }
             }
+            let transition_mutex = self.cli_runtime_session_transition_mutex(&session_key).await;
+            let _transition = scope_current_stage(Stage::CliTransitionWait, transition_mutex.lock()).await;
+            // Session ownership serializes both provider use and continuity
+            // decisions. Re-read the durable binding and persisted thread head
+            // after waiting: an in-memory Thread snapshot can be empty after a
+            // cold seed or stale after another owner completed while we waited.
+            let mut persisted_context_binding = match self
+                .crud_store
+                .get_cli_runtime_thread_binding(continuation_thread_id.as_str())
+                .await
+            {
+                Ok(binding) => binding,
+                Err(error) => {
+                    send_turn_start_failure!(format!(
+                        "failed to inspect CLI runtime context continuity: {error:#}"
+                    ));
+                    return None;
+                }
+            };
+            if let Some(pending) = persisted_context_binding.as_ref()
+                && pending.status == "fork_pending"
+            {
+                let recovered: anyhow::Result<Option<pioneer_crud::CliRuntimeThreadBindingRecord>> = async {
+                    anyhow::ensure!(pending.runtime_id == runtime_id
+                        && pending.runtime_kind == "codex"
+                        && pending.workspace_id == thread.workspace_id,
+                        "pending CLI fork belongs to a different runtime or workspace");
+                    let intent = crate::cli_runtime::thread_binding::pending_codex_fork_intent(pending)?
+                        .context("pending Codex fork has no recoverable marker")?;
+                    let source = self.crud_store.get_cli_runtime_turn_binding(intent.source_turn_id.as_str()).await?
+                        .context("pending Codex fork source turn is missing")?;
+                    anyhow::ensure!(source.status == "completed"
+                        && source.native_thread_id == pending.native_thread_id
+                        && source.native_turn_id.as_deref() == Some(intent.boundary_turn_id.as_str())
+                        && source.native_thread_id == pending.native_root_thread_id.as_deref().unwrap_or_default()
+                        && source.thread_id == pending.thread_id
+                        && source.continuation_thread_id != source.thread_id,
+                        "pending Codex fork source or boundary changed");
+                    // Closing the old management process is the fence after an
+                    // RPC timeout: it can no longer commit a late fork while
+                    // the fresh process enumerates durable provider threads.
+                    manager.close_session(&session_key).await?;
+                    let proxy_url = self.cli_runtime_proxy_url(thread.workspace_id.as_str(), runtime_id.as_str()).await;
+                    let management = manager.existing_or_start_management(
+                        session_key.clone(),
+                        crate::cli_runtime::manager::CLIAgentRuntimeSessionStartOptions {
+                            cwd: Some(std::path::PathBuf::from(source.cwd.as_deref()
+                                .context("Codex fork source has no authorized working directory")?)),
+                            env: crate::cli_runtime::config::proxy_env(proxy_url.as_deref()),
+                            ..Default::default()
+                        },
+                    ).await?;
+                    let found = management.session().find_marked_fork(
+                        pending.native_thread_id.as_str(),
+                        intent.boundary_turn_id.as_str(),
+                        intent.marker.as_str(),
+                    ).await?;
+                    if let Some(fork) = found {
+                        anyhow::ensure!(fork.native_thread_id != pending.native_thread_id,
+                            "reconciled Codex fork returned its source thread");
+                        let cursor = crate::cli_runtime::thread_binding::confirmed_codex_fork_cursor(
+                            pending, fork.native_thread_id.as_str(),
+                        )?;
+                        return self.crud_store.confirm_marked_cli_fork_intent(
+                            pending, fork.native_thread_id.as_str(),
+                            fork.native_cwd.or_else(|| pending.native_cwd.clone()),
+                            fork.native_model.or_else(|| pending.native_model.clone()),
+                            cursor, chrono::Utc::now().fixed_offset(),
+                        ).await.map(Some);
+                    }
+                    anyhow::ensure!(self.crud_store.discard_rejected_cli_fork_intent(
+                        pending.thread_id.as_str(), pending.runtime_id.as_str(),
+                        pending.native_thread_id.as_str(), pending.resume_cursor_json.as_str(),
+                    ).await?, "pending Codex fork changed during reconciliation");
+                    Ok(None)
+                }.await;
+                match recovered {
+                    Ok(binding) => persisted_context_binding = binding,
+                    Err(error) => {
+                        send_turn_start_failure!(format!("failed to reconcile pending Codex fork: {error:#}"));
+                        return None;
+                    }
+                }
+            }
+            // A Composer Task answers the already admitted parent input from
+            // its service child. By this point the parent's Composer Turn and
+            // TaskRun occurrence are durable, but neither is a *prior*
+            // conversation turn. Compare the provider frontier with the head
+            // immediately before that launch. Reject any intervening parent
+            // work rather than silently resuming past a Native answer.
+            let composer_launch_id = if continuation_thread_id != thread.id {
+                match success_response.task_queue_identity() {
+                    Some((run_id, _)) => {
+                        let run = match self.crud_store.get_task_run(run_id).await {
+                            Ok(Some(run)) => run,
+                            Ok(None) => {
+                                send_turn_start_failure!("Composer TaskRun is missing".to_owned());
+                                return None;
+                            }
+                            Err(error) => {
+                                send_turn_start_failure!(format!("failed to load Composer TaskRun: {error:#}"));
+                                return None;
+                            }
+                        };
+                        match self.crud_store.get_task_record(run.task_id.as_str()).await {
+                            Ok(Some(task)) => task.metadata.as_ref()
+                                .and_then(|metadata| metadata.composer_work.as_ref())
+                                .map(|work| (work.launch.turn_id.clone(), run_id.to_owned())),
+                            Ok(None) => {
+                                send_turn_start_failure!("Composer Task is missing".to_owned());
+                                return None;
+                            }
+                            Err(error) => {
+                                send_turn_start_failure!(format!("failed to load Composer Task: {error:#}"));
+                                return None;
+                            }
+                        }
+                    }
+                    None => None,
+                }
+            } else {
+                None
+            };
+            // An early-materialized independent child must not treat its own
+            // queued input as already delivered conversation history.
+            let latest_parent_turn = if already_materialized && continuation_thread_id == thread.id {
+                self.crud_store.turn_before_launch_and_intervening_by_creation_order(
+                    continuation_thread_id.as_str(), &response_turn_id, &response_turn_id,
+                ).await.and_then(|position| match position {
+                    Some((previous, false)) => Ok(previous),
+                    _ => anyhow::bail!("queued child conversation changed before CLI preparation"),
+                })
+            } else {
+                self.crud_store.latest_turn_id_by_creation_order(continuation_thread_id.as_str()).await
+            };
+            let latest_parent_turn_id = match latest_parent_turn {
+                Ok(id) => id,
+                Err(error) => {
+                    send_turn_start_failure!(format!("failed to order CLI continuation turns: {error:#}"));
+                    return None;
+                }
+            };
+            let previous_parent_id = if let Some((launch_id, run_id)) = composer_launch_id.as_ref() {
+                match self.crud_store.turn_before_launch_and_intervening_by_creation_order(
+                    continuation_thread_id.as_str(), launch_id, run_id,
+                ).await {
+                    Ok(Some((previous, false))) => previous,
+                    Ok(Some((_, true))) => {
+                        send_turn_start_failure!("parent conversation changed after Composer launch".to_owned());
+                        return None;
+                    }
+                    Ok(None) => {
+                        send_turn_start_failure!("Composer launch is missing from parent history".to_owned());
+                        return None;
+                    }
+                    Err(error) => {
+                        send_turn_start_failure!(format!("failed to order Composer continuation: {error:#}"));
+                        return None;
+                    }
+                }
+            } else { latest_parent_turn_id.clone() };
+            let previous_parent_id = match crate::cli_runtime::thread_binding::previous_delivered_parent_turn(
+                self.crud_store.as_ref(), continuation_thread_id.as_str(), previous_parent_id,
+            ).await {
+                Ok(previous) => previous,
+                Err(error) => {
+                    send_turn_start_failure!(format!("failed to resolve CLI continuation before undispatched attempts: {error:#}"));
+                    return None;
+                }
+            };
+            let previous_parent_turn = match previous_parent_id.as_deref() {
+                Some(id) => match self.crud_store.get_turn(continuation_thread_id.as_str(), id).await {
+                    Ok(Some((_, turn))) => Some(turn),
+                    Ok(None) => {
+                        send_turn_start_failure!("ordered CLI continuation turn is missing".to_owned());
+                        return None;
+                    }
+                    Err(error) => {
+                        send_turn_start_failure!(format!("failed to load CLI continuation turn: {error:#}"));
+                        return None;
+                    }
+                },
+                None => None,
+            };
+            let previous_turn = previous_parent_turn
+                .as_ref()
+                .map(|turn| {
+                    (
+                        turn.id.as_str(),
+                        turn.message_revision,
+                        turn.message_deleted,
+                    )
+                });
+            let mut previous_cli_turn_binding = match previous_turn {
+                Some((turn_id, _, _)) => match self
+                    .crud_store
+                    .get_cli_runtime_turn_binding(turn_id)
+                    .await
+                {
+                    Ok(binding) => binding,
+                    Err(error) => {
+                        send_turn_start_failure!(format!(
+                            "failed to inspect prior CLI turn: {error:#}"
+                        ));
+                        return None;
+                    }
+                },
+                None => None,
+            };
+            let mut previous_composer_source = false;
+            if previous_cli_turn_binding.is_none()
+                && let Some(parent_turn) = previous_parent_turn.as_ref()
+                && parent_turn.turn_kind == pioneer_protocol::TurnKind::TaskRun
+                && parent_turn.status == TurnStatus::Completed
+                && let Some(run) = match self.crud_store.get_task_run(parent_turn.id.as_str()).await {
+                    Ok(run) => run,
+                    Err(error) => {
+                        send_turn_start_failure!(format!("failed to inspect previous Composer run: {error:#}"));
+                        return None;
+                    }
+                }
+            {
+                let task = match self.crud_store.get_task_record(run.task_id.as_str()).await {
+                    Ok(task) => task,
+                    Err(error) => {
+                        send_turn_start_failure!(format!("failed to inspect previous Composer task: {error:#}"));
+                        return None;
+                    }
+                };
+                if task.as_ref().and_then(|task| task.metadata.as_ref())
+                    .and_then(|metadata| metadata.composer_work.as_ref()).is_some()
+                {
+                    let anchor = match self.crud_store.get_task_run_child_anchor(run.id.as_str()).await {
+                        Ok(anchor) => anchor,
+                        Err(error) => {
+                            send_turn_start_failure!(format!("failed to inspect previous Composer answer: {error:#}"));
+                            return None;
+                        }
+                    };
+                    if let Some(child_turn_id) = anchor.child_turn_id {
+                        previous_cli_turn_binding = match self.crud_store
+                            .get_cli_runtime_turn_binding(child_turn_id.as_str()).await {
+                            Ok(binding) => binding,
+                            Err(error) => {
+                                send_turn_start_failure!(format!("failed to inspect previous Composer CLI answer: {error:#}"));
+                                return None;
+                            }
+                        };
+                        previous_composer_source = previous_cli_turn_binding.as_ref().is_some_and(|source| {
+                            source.continuation_thread_id == continuation_thread_id
+                                && source.thread_id == anchor.child_thread_id.as_deref().unwrap_or_default()
+                                && source.status == "completed"
+                        });
+                    }
+                }
+            }
+            if let Some(binding) = persisted_context_binding.as_ref()
+                && binding.status == "active"
+            {
+                let source = match crate::cli_runtime::thread_binding::prepared_child_fork_source(binding) {
+                    Ok(source) => source,
+                    Err(error) => {
+                        send_turn_start_failure!(format!("failed to inspect confirmed fork boundary: {error:#}"));
+                        return None;
+                    }
+                };
+                if let Some((source_turn_id, _)) = source
+                {
+                let source_exists = match self.crud_store.get_turn(continuation_thread_id.as_str(), source_turn_id.as_str()).await {
+                    Ok(source) => source.is_some(),
+                    Err(error) => {
+                        send_turn_start_failure!(format!("failed to load confirmed fork source: {error:#}"));
+                        return None;
+                    }
+                };
+                if source_exists {
+                // A confirmed fork can survive an error after Pioneer has
+                // materialized a new child Turn but before provider start.
+                // Only blocked CLI attempts with no provider turn may be
+                // skipped. In particular, a completed Native turn must force
+                // a fresh history bridge instead of reopening the old fork.
+                let attempt_ids = match self.crud_store.turn_ids_after_by_creation_order(
+                    continuation_thread_id.as_str(), source_turn_id.as_str(),
+                ).await {
+                    Ok(ids) => ids,
+                    Err(error) => {
+                        send_turn_start_failure!(format!("failed to inspect CLI fork retry order: {error:#}"));
+                        return None;
+                    }
+                };
+                let mut undelivered_cli_attempts = true;
+                for attempt_id in &attempt_ids {
+                    let Some((_, attempt)) = (match self.crud_store.get_turn(continuation_thread_id.as_str(), attempt_id.as_str()).await {
+                        Ok(turn) => turn,
+                        Err(error) => {
+                            send_turn_start_failure!(format!("failed to load prepared fork attempt: {error:#}"));
+                            return None;
+                        }
+                    }) else {
+                        undelivered_cli_attempts = false;
+                        break;
+                    };
+                    if attempt.status != TurnStatus::Blocked {
+                        undelivered_cli_attempts = false;
+                        break;
+                    }
+                    let execution = match self.crud_store.get_turn_execution(attempt.id.as_str()).await {
+                        Ok(execution) => execution,
+                        Err(error) => {
+                            send_turn_start_failure!(format!("failed to inspect prepared fork retry: {error:#}"));
+                            return None;
+                        }
+                    };
+                    let turn_binding = match self.crud_store.get_cli_runtime_turn_binding(attempt.id.as_str()).await {
+                        Ok(binding) => binding,
+                        Err(error) => {
+                            send_turn_start_failure!(format!("failed to inspect prepared fork attempt: {error:#}"));
+                            return None;
+                        }
+                    };
+                    if !execution.is_some_and(|execution| execution.executor_kind == pioneer_crud::TurnExecutorKind::CliRuntime)
+                        || turn_binding.as_ref().is_some_and(|attempt_binding| {
+                            attempt_binding.native_turn_id.is_some()
+                                || attempt_binding.native_thread_id != binding.native_thread_id
+                        })
+                    {
+                        undelivered_cli_attempts = false;
+                        break;
+                    }
+                }
+                if undelivered_cli_attempts {
+                    previous_cli_turn_binding = match self.crud_store
+                        .get_cli_runtime_turn_binding(source_turn_id.as_str()).await {
+                        Ok(source) => source,
+                        Err(error) => {
+                            send_turn_start_failure!(format!("failed to recover confirmed fork source: {error:#}"));
+                            return None;
+                        }
+                    };
+                }
+                }
+                }
+            }
+            let failed_resume_basis = if previous_parent_turn.as_ref().is_some_and(|turn| {
+                matches!(turn.status, TurnStatus::Blocked | TurnStatus::Failed | TurnStatus::Interrupted)
+            })
+                && let Some(binding) = persisted_context_binding.as_ref()
+                && binding.runtime_id == runtime_id
+                && binding.runtime_kind == cli_runtime_protocol_kind_label(runtime_kind)
+            {
+                match crate::cli_runtime::thread_binding::failed_context_basis_from_binding(
+                    self.crud_store.as_ref(), binding, previous_turn,
+                ).await {
+                    Ok(basis) => basis,
+                    Err(error) => {
+                        send_turn_start_failure!(format!("failed to validate prior CLI attempt: {error:#}"));
+                        return None;
+                    }
+                }
+            } else { None };
+            let failed_resume = failed_resume_basis.is_some();
+            let modern_service_basis = if previous_composer_source
+                && let Some(binding) = persisted_context_binding.as_ref()
+                && binding.status == "active"
+                && binding.runtime_id == runtime_id
+                && binding.runtime_kind == cli_runtime_protocol_kind_label(runtime_kind)
+            {
+                match crate::cli_runtime::thread_binding::service_child_context_basis_from_binding(
+                    self.crud_store.as_ref(), binding, previous_turn,
+                ).await {
+                    Ok(basis) => basis,
+                    Err(error) => {
+                        send_turn_start_failure!(format!("failed to validate service child CLI continuity: {error:#}"));
+                        return None;
+                    }
+                }
+            } else { None };
+            let modern_service_receipt = modern_service_basis.is_some();
+            let modern_own_basis = if modern_service_receipt { None } else if let Some(binding) = persisted_context_binding.as_ref()
+                && binding.status == "active"
+                && binding.runtime_id == runtime_id
+                && binding.runtime_kind == cli_runtime_protocol_kind_label(runtime_kind)
+            {
+                match crate::cli_runtime::thread_binding::current_context_basis_from_binding(
+                    self.crud_store.as_ref(), binding, thread.workspace_id.as_str(),
+                    continuation_thread_id.as_str(), previous_turn,
+                ).await {
+                    Ok(basis) => basis,
+                    Err(error) => {
+                        send_turn_start_failure!(format!("failed to validate CLI runtime context continuity: {error:#}"));
+                        return None;
+                    }
+                }
+            } else { None };
+            let current_receipt = modern_own_basis.is_some();
+            let continuation_context_basis = if let Some(basis) = failed_resume_basis.or(modern_service_basis).or(modern_own_basis) {
+                Some(basis)
+            } else if let (Some(binding), Some(source)) = (
+                persisted_context_binding.as_ref(), previous_cli_turn_binding.as_ref(),
+            ) {
+                if binding.runtime_id == runtime_id
+                    && binding.runtime_kind == cli_runtime_protocol_kind_label(runtime_kind)
+                    && binding.native_thread_id == source.native_thread_id
+                    && source.continuation_thread_id == continuation_thread_id
+                    && source.status == "completed"
+                    && (previous_composer_source || source.thread_id == continuation_thread_id)
+                {
+                    match crate::cli_runtime::thread_binding::completed_context_basis_from_turn_binding(
+                        self.crud_store.as_ref(), source,
+                    ).await {
+                        Ok(Some(basis)) => match crate::cli_runtime::thread_binding::completed_context_basis_is_current(
+                            self.crud_store.as_ref(), thread.workspace_id.as_str(), &basis,
+                        ).await {
+                            Ok(true) => Some(basis),
+                            Ok(false) => None,
+                            Err(error) => {
+                                send_turn_start_failure!(format!("failed to validate legacy CLI context: {error:#}"));
+                                return None;
+                            }
+                        },
+                        Ok(None) => None,
+                        Err(error) => {
+                            send_turn_start_failure!(format!("failed to recover legacy CLI context: {error:#}"));
+                            return None;
+                        }
+                    }
+                } else { None }
+            } else { None };
+            if persisted_context_binding.is_none()
+                && previous_cli_turn_binding.is_none()
+                && let Some((turn_id, _, _)) = previous_turn
+            {
+                let prior_execution = match self.crud_store.get_turn_execution(turn_id).await {
+                    Ok(execution) => execution,
+                    Err(error) => {
+                        send_turn_start_failure!(format!(
+                            "failed to inspect prior runtime: {error:#}"
+                        ));
+                        return None;
+                    }
+                };
+                if prior_execution.is_some_and(|execution| {
+                    execution.executor_kind == pioneer_crud::TurnExecutorKind::CliRuntime
+                }) && !previous_parent_turn.as_ref().is_some_and(|turn| {
+                    matches!(turn.status, TurnStatus::Blocked | TurnStatus::Interrupted)
+                }) {
+                    // A completed CLI answer without its provider binding has
+                    // no provable continuation. A terminal failed attempt has
+                    // no accepted provider answer: bridge the accepted Pioneer
+                    // history into a fresh session on the next start.
+                    send_turn_start_failure!(
+                        "existing CLI conversation has no recoverable provider binding or fork boundary"
+                            .to_owned()
+                    );
+                    return None;
+                }
+            }
+            // Resolve all deterministic launch constraints before creating a
+            // provider fork. A failed skill/MCP preflight must not strand a
+            // durable but unused branch.
             let PreparedCliRuntimeCombinedPreflight {
                 plan: combined_preflight,
                 codex_mcp_launch_projection,
                 claude_mcp_launch_projection,
                 opencode_mcp_launch_projection,
+                max_input_tokens,
             } = match self
                 .prepare_cli_runtime_combined_preflight(
                     &thread,
@@ -4235,21 +4977,305 @@ impl MessageProcessor {
                     return None;
                 }
             };
+            let mut forked_child = false;
+            let fork_source_basis_current = if let Some(source) = previous_cli_turn_binding.as_ref()
+                && source.thread_id == continuation_thread_id
+                && source.continuation_thread_id != continuation_thread_id
+                && source.runtime_id == runtime_id
+                && source.runtime_kind == cli_runtime_protocol_kind_label(runtime_kind)
+            {
+                match crate::cli_runtime::thread_binding::completed_context_basis_from_turn_binding(
+                    self.crud_store.as_ref(), source,
+                ).await {
+                    Ok(Some(basis)) => match crate::cli_runtime::thread_binding::completed_context_basis_is_current(
+                        self.crud_store.as_ref(), thread.workspace_id.as_str(), &basis,
+                    ).await {
+                        Ok(current) => current,
+                        Err(error) => {
+                            send_turn_start_failure!(format!("failed to validate CLI fork source: {error:#}"));
+                            return None;
+                        }
+                    },
+                    Ok(None) => false,
+                    Err(error) => {
+                        send_turn_start_failure!(format!("failed to reconstruct CLI fork source: {error:#}"));
+                        return None;
+                    }
+                }
+            } else { false };
+            let claude_fork_boundary = if fork_source_basis_current
+                && runtime_kind == CLIAgentRuntimeKind::Claude
+            {
+                match crate::cli_runtime::thread_binding::claude_assistant_record_boundary(
+                    self.crud_store.as_ref(), previous_cli_turn_binding.as_ref().expect("checked fork source"),
+                ).await {
+                    Ok(boundary) => boundary,
+                    Err(error) => {
+                        send_turn_start_failure!(format!("failed to inspect Claude fork boundary: {error:#}"));
+                        return None;
+                    }
+                }
+            } else { None };
+            let bounded_fork_available = fork_source_basis_current
+                && (runtime_kind != CLIAgentRuntimeKind::Claude
+                    || (claude_fork_boundary.is_some()
+                        && previous_cli_turn_binding
+                            .as_ref()
+                            .is_some_and(|source| source.cwd.is_some())));
+            if persisted_context_binding.is_none()
+                && bounded_fork_available
+                && matches!(success_response, TurnStartSuccessResponse::TurnStart)
+                && let Some(source) = previous_cli_turn_binding.as_ref()
+                && source.thread_id == continuation_thread_id
+                && source.continuation_thread_id != continuation_thread_id
+                && source.runtime_id == runtime_id
+                && source.runtime_kind == cli_runtime_protocol_kind_label(runtime_kind)
+            {
+                let fork_result: anyhow::Result<()> = scope_current_stage(Stage::CliFork, async {
+                    let lineage = self
+                        .crud_store
+                        .get_task_thread_lineage(continuation_thread_id.as_str())
+                        .await?
+                        .context("CLI child has no durable parent lineage")?;
+                    anyhow::ensure!(
+                        lineage.parent_thread_id == source.continuation_thread_id,
+                        "CLI child provider source does not match its durable parent"
+                    );
+                    anyhow::ensure!(
+                        source.status == "completed"
+                            && source.workspace_id == thread.workspace_id
+                            && source.runtime_id == runtime_id
+                            && source.runtime_kind == cli_runtime_protocol_kind_label(runtime_kind),
+                        "CLI child source is not a completed turn in the selected provider"
+                    );
+                    let boundary = source.native_turn_id.as_deref().context(
+                        "CLI child source has no durable provider turn boundary",
+                    )?;
+                    if runtime_kind == CLIAgentRuntimeKind::Claude {
+                        let boundary_message_uuid = claude_fork_boundary
+                            .context("Claude bounded fork has no verified transcript UUID")?;
+                        let source_session_id = uuid::Uuid::parse_str(source.native_thread_id.as_str())
+                            .context("Claude child source session ID is invalid")?;
+                        let prepared = crate::cli_runtime::thread_binding::prepare_claude_provider_session(
+                            self.crud_store.as_ref(),
+                            crate::cli_runtime::thread_binding::ClaudeProviderSessionPrepareRequest {
+                                workspace_id: thread.workspace_id.clone(),
+                                thread_id: continuation_thread_id.clone(),
+                                runtime_id: runtime_id.clone(),
+                                cwd: source.cwd.clone().context("Claude fork source has no working directory")?,
+                                model: Some(thread.model.clone()),
+                                force_new: false,
+                                fork: Some(crate::cli_runtime::thread_binding::ClaudeProviderForkSource {
+                                    source_session_id,
+                                    source_turn_id: source.turn_id.clone(),
+                                    boundary_message_uuid,
+                                }),
+                                prepared_at: chrono::Utc::now().fixed_offset(),
+                            },
+                        ).await?;
+                        anyhow::ensure!(matches!(prepared, crate::cli_runtime::continuation::CliProviderContinuation::ClaudeFork { .. }),
+                            "Claude child fork preparation did not retain its source boundary");
+                        return Ok(());
+                    }
+                    let proxy_url = self
+                        .cli_runtime_proxy_url(thread.workspace_id.as_str(), runtime_id.as_str())
+                        .await;
+                    let management = manager
+                        .existing_or_start_management(
+                            session_key.clone(),
+                            crate::cli_runtime::manager::CLIAgentRuntimeSessionStartOptions {
+                                cwd: Some(std::path::PathBuf::from(source.cwd.as_deref()
+                                    .context("Codex fork source has no authorized working directory")?)),
+                                env: crate::cli_runtime::config::proxy_env(proxy_url.as_deref()),
+                                ..Default::default()
+                            },
+                        )
+                        .await?;
+                    let now = chrono::Utc::now().fixed_offset();
+                    let fork_marker = format!("pioneer-cli-fork:{}", uuid::Uuid::new_v4());
+                    // The pending row is a durable fence. If the process stops
+                    // after the provider creates its fork but before we save
+                    // its ID, a retry fails visibly instead of creating an
+                    // unrelated second fork or starting an empty session.
+                    let pending = pioneer_crud::NewCliRuntimeThreadBinding {
+                        thread_id: continuation_thread_id.clone(),
+                        workspace_id: thread.workspace_id.clone(),
+                        runtime_id: runtime_id.clone(),
+                        runtime_kind: "codex".to_owned(),
+                        native_thread_id: source.native_thread_id.clone(),
+                        native_session_id: None,
+                        native_root_thread_id: Some(source.native_thread_id.clone()),
+                        native_cwd: source.cwd.clone(),
+                        native_model: source.model.clone(),
+                        resume_cursor_json: pioneer_crud::serialize_cli_runtime_json(
+                            &serde_json::json!({
+                                "forkSourceTurnId": source.turn_id,
+                                "forkBoundaryTurnId": boundary,
+                                "forkMarker": fork_marker,
+                            }),
+                        )?,
+                        status: "fork_pending".to_owned(),
+                        created_at: now,
+                        updated_at: now,
+                    };
+                    anyhow::ensure!(self.crud_store
+                        .insert_cli_fork_intent_if_absent(pending.clone())
+                        .await?, "another CLI fork binding won the durable intent race");
+                    let fork = match management
+                        .session()
+                        .fork_thread(crate::cli_runtime::manager::CLIAgentRuntimeThreadForkRequest {
+                            source_logical_thread_id: source.continuation_thread_id.clone(),
+                            native_thread_id: source.native_thread_id.clone(),
+                            last_turn_id: Some(boundary.to_owned()),
+                            thread_source: Some(fork_marker.clone()),
+                        })
+                        .await {
+                        Ok(fork) => fork,
+                        Err(error) => {
+                            let proven_rejection = error.chain().any(|cause| {
+                                cause.downcast_ref::<pioneer_cli_agent_runtime::codex::CodexJsonlRpcClientError>()
+                                    .is_some_and(|rpc| rpc.proves_fork_not_created())
+                            });
+                            if proven_rejection {
+                                anyhow::ensure!(
+                                    self.crud_store.discard_rejected_cli_fork_intent(
+                                        continuation_thread_id.as_str(),
+                                        runtime_id.as_str(),
+                                        source.native_thread_id.as_str(),
+                                        pending.resume_cursor_json.as_str(),
+                                    ).await?,
+                                    "rejected CLI fork intent changed before cleanup"
+                                );
+                                anyhow::bail!("Codex rejected the bounded child fork before creating a branch: {error:#}");
+                            }
+                            anyhow::bail!("Codex fork outcome is unknown; the durable intent is preserved for verified resolution: {error:#}");
+                        }
+                    };
+                    anyhow::ensure!(
+                        fork.native_thread_id != source.native_thread_id,
+                        "CLI fork returned the source provider conversation"
+                    );
+                    let durable_pending = self.crud_store
+                        .get_cli_runtime_thread_binding(continuation_thread_id.as_str()).await?
+                        .context("Codex fork intent vanished before commit")?;
+                    anyhow::ensure!(durable_pending.resume_cursor_json == pending.resume_cursor_json,
+                        "Codex fork intent changed before provider result commit");
+                    self.crud_store.confirm_marked_cli_fork_intent(
+                        &durable_pending,
+                        fork.native_thread_id.as_str(),
+                        fork.native_cwd.or(pending.native_cwd),
+                        fork.native_model.or(pending.native_model),
+                        crate::cli_runtime::thread_binding::confirmed_codex_fork_cursor(
+                            &durable_pending, fork.native_thread_id.as_str(),
+                        )?,
+                        chrono::Utc::now().fixed_offset(),
+                    ).await?;
+                    Ok(())
+                })
+                .await;
+                if let Err(error) = fork_result {
+                    send_turn_start_failure!(format!(
+                        "failed to prepare bounded CLI child fork: {error:#}"
+                    ));
+                    return None;
+                }
+                forked_child = true;
+            }
+            let prepared_child_fork = bounded_fork_available && match (
+                persisted_context_binding.as_ref(),
+                previous_cli_turn_binding.as_ref(),
+            ) {
+                (Some(binding), Some(source)) => match async {
+                    if runtime_kind == CLIAgentRuntimeKind::Claude {
+                        crate::cli_runtime::thread_binding::binding_has_prepared_claude_fork(
+                            self.crud_store.as_ref(), binding, source,
+                        ).await
+                    } else {
+                        crate::cli_runtime::thread_binding::binding_has_prepared_child_fork(binding, source)
+                    }
+                }.await {
+                    Ok(prepared) => prepared,
+                    Err(error) => {
+                        send_turn_start_failure!(format!("failed to inspect prepared CLI fork: {error:#}"));
+                        return None;
+                    }
+                },
+                _ => false,
+            };
+            let (receipt_conflicts_with_head, receipt_covers_head) = match persisted_context_binding.as_ref() {
+                Some(binding) => match crate::cli_runtime::thread_binding::provider_receipt_head_state(binding, previous_turn) {
+                    Ok(state) => state,
+                    Err(error) => {
+                        send_turn_start_failure!(format!(
+                            "failed to inspect CLI provider receipt: {error:#}"
+                        ));
+                        return None;
+                    }
+                },
+                None => (false, false),
+            };
+            let service_child_continuation = modern_service_receipt;
+            let bootstrap_provider_context = match persisted_context_binding.as_ref() {
+                _ if forked_child || prepared_child_fork => false,
+                _ if service_child_continuation || failed_resume => false,
+                Some(binding) if previous_composer_source
+                    && continuation_context_basis.is_some()
+                    && binding.status == "active" => false,
+                Some(binding) if !receipt_conflicts_with_head && !receipt_covers_head
+                    && binding.status == "active"
+                    && binding.workspace_id == thread.workspace_id
+                    && binding.thread_id == continuation_thread_id
+                    && binding.runtime_id == runtime_id
+                    && binding.runtime_kind == cli_runtime_protocol_kind_label(runtime_kind)
+                    && previous_cli_turn_binding.as_ref().is_some_and(|source| {
+                        source.status == "completed"
+                            && source.native_thread_id == binding.native_thread_id
+                            && source.native_turn_id.is_some()
+                            && source.continuation_thread_id == continuation_thread_id
+                    })
+                    && continuation_context_basis.is_some() => false,
+                Some(binding) if binding.runtime_id == runtime_id
+                    && binding.runtime_kind == cli_runtime_protocol_kind_label(runtime_kind) => !current_receipt,
+                Some(_) => true,
+                None => true,
+            };
+            let continuation_head = match latest_parent_turn_id.as_deref() {
+                Some(id) => match self.crud_store.get_turn(continuation_thread_id.as_str(), id).await {
+                    Ok(Some((_, turn))) => Some(crate::cli_runtime::thread_binding::CliRuntimeDeliveredTurn {
+                        turn_id: turn.id,
+                        thread_id: None,
+                        message_revision: turn.message_revision,
+                        message_deleted: turn.message_deleted,
+                    }),
+                    Ok(None) => {
+                        send_turn_start_failure!("ordered CLI continuation head is missing".to_owned());
+                        return None;
+                    }
+                    Err(error) => {
+                        send_turn_start_failure!(format!("failed to load CLI continuation head: {error:#}"));
+                        return None;
+                    }
+                },
+                None => None,
+            };
             Some(CliRuntimeAdmissionPhase {
                 thread,
                 normalized_presentation_capabilities,
                 normalized_pack_names,
                 manager,
                 continuation_thread_id,
-                context_thread_id,
+                continuation_head,
+                continuation_context_basis,
+                bootstrap_provider_context,
                 session_key,
                 session_turn_lease,
                 combined_preflight,
                 codex_mcp_launch_projection,
                 claude_mcp_launch_projection,
                 opencode_mcp_launch_projection,
+                max_input_tokens,
             })
-            })
+            }))
             .await;
             let Some(CliRuntimeAdmissionPhase {
                 thread,
@@ -4257,18 +5283,21 @@ impl MessageProcessor {
                 normalized_pack_names,
                 manager,
                 continuation_thread_id,
-                context_thread_id,
+                continuation_head,
+                continuation_context_basis,
+                bootstrap_provider_context,
                 session_key,
                 session_turn_lease,
                 combined_preflight,
                 codex_mcp_launch_projection,
                 claude_mcp_launch_projection,
                 opencode_mcp_launch_projection,
+                max_input_tokens,
             }) = admission_phase
             else {
                 return;
             };
-            let started_phase = message_future(async {
+            let started_phase = message_future(scope_current_stage(Stage::CliTurnPrepare, async {
             let proxy_url = match self
                 .prepare_cli_runtime_proxy_url(thread.workspace_id.as_str(), runtime_id.as_str())
                 .await
@@ -4303,7 +5332,7 @@ impl MessageProcessor {
                 ));
                 return None;
             }
-            let resolved_artifacts = match self
+            let resolved_artifacts = { let _startup_part = pioneer_observability::turn_startup::stage(&response_turn_id, pioneer_observability::turn_startup::Stage::Artifacts); match self
                 .resolve_provider_artifact_inputs(
                     thread.workspace_id.as_str(),
                     params.input.as_slice(),
@@ -4317,7 +5346,7 @@ impl MessageProcessor {
                     ));
                     return None;
                 }
-            };
+            } };
             let input_mapping = match match runtime_kind {
                 CLIAgentRuntimeKind::Codex => {
                     crate::cli_runtime::input_mapping::map_codex_turn_input_from_pioneer(
@@ -4348,6 +5377,27 @@ impl MessageProcessor {
                 success_response.task_permission_profile().map(|profile| {
                     pioneer_protocol::TurnPermissionProfileSelection { mode: profile.mode }
                 });
+            if let Err(error) =
+                super::message_turn::normalize_turn_collaboration_params(&mut params)
+            {
+                send_turn_start_failure!(format!("invalid Turn collaboration metadata: {error}"));
+                return None;
+            }
+            let resolved_permission_profile = match &execution_authority {
+                TurnExecutionAuthority::Fresh(admission)
+                    if admission.uses_scoped_collaboration_policy() =>
+                {
+                    let requested = pioneer_protocol::resolve_turn_permission_profile(
+                        params.permission_profile.as_ref(),
+                    );
+                    Some(admission.cap_permission_profile(&requested))
+                }
+                TurnExecutionAuthority::Fresh(_) | TurnExecutionAuthority::Durable { .. } => None,
+            };
+            if let Some(profile) = resolved_permission_profile.as_ref() {
+                params.permission_profile =
+                    Some(pioneer_protocol::TurnPermissionProfileSelection { mode: profile.mode });
+            }
             let permission_adapter =
                 crate::cli_runtime::permissions::adapt_cli_runtime_permissions_for_turn(
                     runtime_kind,
@@ -4393,27 +5443,6 @@ impl MessageProcessor {
                 .as_ref()
                 .and_then(|options| options.summary.clone());
 
-            if let Err(error) =
-                super::message_turn::normalize_turn_collaboration_params(&mut params)
-            {
-                send_turn_start_failure!(format!("invalid Turn collaboration metadata: {error}"));
-                return None;
-            }
-            let resolved_permission_profile = match &execution_authority {
-                TurnExecutionAuthority::Fresh(admission)
-                    if admission.uses_scoped_collaboration_policy() =>
-                {
-                    let requested = pioneer_protocol::resolve_turn_permission_profile(
-                        params.permission_profile.as_ref(),
-                    );
-                    Some(admission.cap_permission_profile(&requested))
-                }
-                TurnExecutionAuthority::Fresh(_) | TurnExecutionAuthority::Durable { .. } => None,
-            };
-            if let Some(profile) = resolved_permission_profile.as_ref() {
-                params.permission_profile =
-                    Some(pioneer_protocol::TurnPermissionProfileSelection { mode: profile.mode });
-            }
             let security_params = params.clone();
             #[cfg(test)]
             self.cli_runtime_skill_preflight_test_events
@@ -4447,7 +5476,13 @@ impl MessageProcessor {
                     return None;
                 }
             };
-            let outcome_result = if let Some(permission_profile) =
+            let admitted_outcome = match &mut success_response {
+                TurnStartSuccessResponse::Task { admitted_outcome, .. } => admitted_outcome.take(),
+                _ => None,
+            };
+            let outcome_result = if let Some(outcome) = admitted_outcome {
+                Ok(*outcome)
+            } else if let Some(permission_profile) =
                 success_response.task_permission_profile()
             {
                 if let Some(agent_author) = success_response.task_agent_author() {
@@ -4494,9 +5529,11 @@ impl MessageProcessor {
                 )
                 .await
             {
-                self.thread_manager
-                    .rollback_turn_start(outcome.rollback_context.clone())
-                    .await;
+                if !already_materialized {
+                    self.thread_manager
+                        .rollback_turn_start(outcome.rollback_context.clone())
+                        .await;
+                }
                 send_turn_start_failure!(message);
                 return None;
             }
@@ -4508,9 +5545,11 @@ impl MessageProcessor {
                 ) {
                     Ok(attachments) => attachments,
                     Err(error) => {
-                        self.thread_manager
-                            .rollback_turn_start(outcome.rollback_context.clone())
-                            .await;
+                        if !already_materialized {
+                            self.thread_manager
+                                .rollback_turn_start(outcome.rollback_context.clone())
+                                .await;
+                        }
                         send_turn_start_failure!(format!(
                             "failed to snapshot selected skill presentation: {error:#}"
                         ));
@@ -4531,9 +5570,11 @@ impl MessageProcessor {
             {
                 Ok(effort) => effort,
                 Err(message) => {
-                    self.thread_manager
-                        .rollback_turn_start(outcome.rollback_context.clone())
-                        .await;
+                    if !already_materialized {
+                        self.thread_manager
+                            .rollback_turn_start(outcome.rollback_context.clone())
+                            .await;
+                    }
                     send_turn_start_failure!(message);
                     return None;
                 }
@@ -4551,7 +5592,7 @@ impl MessageProcessor {
                 cli_runtime_summary,
                 security_params,
             })
-            })
+            }))
             .await;
             let Some(CliRuntimeStartedPhase {
                 outcome,
@@ -4569,7 +5610,7 @@ impl MessageProcessor {
             else {
                 return;
             };
-            let materialized_phase = message_future(async {
+            let materialized_phase = message_future(scope_current_stage(Stage::CliMaterialize, async {
             let mut installed_skills =
                 Vec::with_capacity(combined_preflight.skill_install_plans.len());
             if let TurnExecutionAuthority::Fresh(admission) = &mut execution_authority
@@ -4587,38 +5628,44 @@ impl MessageProcessor {
                     )
                     .await
             {
-                self.thread_manager
-                    .rollback_turn_start(outcome.rollback_context.clone())
-                    .await;
+                if !already_materialized {
+                    self.thread_manager
+                        .rollback_turn_start(outcome.rollback_context.clone())
+                        .await;
+                }
                 send_turn_start_failure!(message);
                 return None;
             }
             let profile_selected_audit = match self.turn_profile_selected_audit_event(&outcome) {
                 Ok(event) => event,
                 Err(error) => {
-                    self.thread_manager
-                        .rollback_turn_start(outcome.rollback_context.clone())
-                        .await;
+                    if !already_materialized {
+                        self.thread_manager
+                            .rollback_turn_start(outcome.rollback_context.clone())
+                            .await;
+                    }
                     send_turn_start_failure!(format!(
                         "failed to resolve turn permission profile: {error:#}"
                     ));
                     return None;
                 }
             };
-            let security_snapshot = match self
-                .resolve_turn_execution_security_snapshot(
+            let security_snapshot = match scope_current_stage(Stage::CliSecurity,
+                self.resolve_turn_execution_security_snapshot(
                     &security_params,
                     &outcome,
                     success_response.task_execution_security_snapshot(),
                     execution_authority.source(),
-                )
+                ))
                 .await
             {
                 Ok(snapshot) => snapshot,
                 Err(failure) => {
-                    self.thread_manager
-                        .rollback_turn_start(outcome.rollback_context.clone())
-                        .await;
+                    if !already_materialized {
+                        self.thread_manager
+                            .rollback_turn_start(outcome.rollback_context.clone())
+                            .await;
+                    }
                     send_turn_start_failure!(failure);
                     return None;
                 }
@@ -4652,9 +5699,11 @@ impl MessageProcessor {
                     ) {
                         Ok(authority) => authority,
                         Err(error) => {
-                            self.thread_manager
-                                .rollback_turn_start(outcome.rollback_context.clone())
-                                .await;
+                            if !already_materialized {
+                                self.thread_manager
+                                    .rollback_turn_start(outcome.rollback_context.clone())
+                                    .await;
+                            }
                             send_turn_start_failure!(format!(
                                 "failed to finalize root CLI Agent authority: {error:#}"
                             ));
@@ -4679,9 +5728,11 @@ impl MessageProcessor {
                     {
                         Ok(prepared) => Some(prepared),
                         Err(error) => {
-                            self.thread_manager
-                                .rollback_turn_start(outcome.rollback_context.clone())
-                                .await;
+                            if !already_materialized {
+                                self.thread_manager
+                                    .rollback_turn_start(outcome.rollback_context.clone())
+                                    .await;
+                            }
                             send_turn_start_failure!(format!(
                                 "failed to admit root CLI Agent execution: {error:#}"
                             ));
@@ -4698,20 +5749,25 @@ impl MessageProcessor {
             let execution_graph = prepared_root_execution
                 .as_ref()
                 .map(|prepared| prepared.graph.clone());
-            let materialization_result = {
+            let materialization_result = if already_materialized {
+                // The shared Task admission already committed input, authority,
+                // security and execution atomically before exposing the child.
+                Ok(Ok(None))
+            } else {
                 let crud_store = self.crud_store.clone();
                 let provider_registry = self.provider_registry.clone();
                 let execution_owner_id = self.turn_execution_owner_id.clone();
                 let materialization = outcome.materialization.clone();
                 let effective_reasoning_effort = effective_cli_runtime_effort.clone();
                 let workflow = message_future(async move {
-                    persist_admitted_turn_start(
+                    scope_current_stage(Stage::CliPersist, persist_admitted_turn_start(
                         crud_store.as_ref(),
                         provider_registry.as_ref(),
                         execution_owner_id.as_ref(),
                         &materialization_params,
                         &materialization,
                         effective_reasoning_effort.as_deref(),
+                        pioneer_crud::TurnWorkOwner::Turn,
                         request_actor,
                         profile_selected_audit,
                         materialization_authority.source(),
@@ -4720,7 +5776,7 @@ impl MessageProcessor {
                         security_audit_events,
                         execution_graph,
                         agent_turn_response,
-                    )
+                    ))
                     .await
                 });
                 message_fresh_task(workflow).await
@@ -4734,9 +5790,11 @@ impl MessageProcessor {
             let graph_result = match materialization_result {
                 Ok(result) => result,
                 Err(error) => {
-                    self.thread_manager
-                        .rollback_turn_start(outcome.rollback_context.clone())
-                        .await;
+                    if !already_materialized {
+                        self.thread_manager
+                            .rollback_turn_start(outcome.rollback_context.clone())
+                            .await;
+                    }
 
                     send_turn_start_failure!(format!(
                         "failed to persist CLI runtime turn/start state and permission audit: {error:#}"
@@ -4900,7 +5958,7 @@ impl MessageProcessor {
                 };
                 if persisted.turn_id != outcome.started_notification.turn.id
                     || persisted.manifest_hash != projection.manifest_hash
-                    || persisted.tool_count != projection.tools.len()
+                    || persisted.tool_count != provider_bindings.len().max(projection.tools.len())
                 {
                     self.mark_turn_blocked(
                         outcome.started_notification.thread_id.clone(),
@@ -4972,7 +6030,8 @@ impl MessageProcessor {
 
             for plan in &combined_preflight.skill_install_plans {
                 let install_started = std::time::Instant::now();
-                match self.install_one_cli_runtime_skill(plan).await {
+                match scope_current_stage(Stage::CliSkillsInstall, self.install_one_cli_runtime_skill(plan))
+                .await {
                     Ok(result) => {
                         let result_name = match result.status {
                             crate::cli_runtime::skills::CliRuntimeSkillInstallStatus::Current => {
@@ -5060,7 +6119,7 @@ impl MessageProcessor {
                 installed_skills,
                 native_event_budget,
             })
-            })
+            }))
             .await;
             let Some(CliRuntimeMaterializedPhase {
                 security_snapshot,
@@ -5114,16 +6173,30 @@ impl MessageProcessor {
                 .iter()
                 .map(|skill| skill.install_name.clone())
                 .collect::<Vec<_>>();
-            let delivery_plan = match self
+            let PreparedCliRuntimeDelivery {
+                frozen_hold: cli_basis_hold,
+                plan: delivery_plan,
+                sent_context_basis,
+            } = match self
                 .compile_cli_runtime_delivery_plan_for_turn(
                     runtime_id.as_str(),
                     runtime_kind,
                     &outcome,
                     continuation_thread_id.as_str(),
-                    context_thread_id.as_str(),
+                    bootstrap_provider_context,
                     combined_preflight.mcp_projection.as_ref(),
+                    match &execution_authority {
+                        TurnExecutionAuthority::Fresh(admission) => admission.root_thread_id(),
+                        TurnExecutionAuthority::Durable { context, .. } => context.root_thread_id(),
+                    },
                     selected_skill_names.as_slice(),
-                    success_response.task_conversation_history(),
+                    continuation_context_basis.as_ref(),
+                    &mut input_mapping,
+                    security_snapshot.sandbox.cwd.as_str(),
+                    max_input_tokens,
+                    3,
+                    u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0)
+                        .saturating_add(pioneer_compaction::OPERATION_MILLIS),
                 )
                 .await
             {
@@ -5141,11 +6214,58 @@ impl MessageProcessor {
                     return;
                 }
             };
-            crate::cli_runtime::context::prepend_cli_turn_context_input(
-                &mut input_mapping,
-                &delivery_plan,
-                cli_runtime_context_label(runtime_kind),
-            );
+            if let Some(sent) = sent_context_basis.as_ref() {
+                let revalidation = scope_current_stage(Stage::CliContextRevalidate, crate::cli_runtime::thread_binding::completed_context_basis_is_current(
+                    self.crud_store.as_ref(),
+                    outcome.started_notification.workspace_id.as_str(),
+                    &sent.completed,
+                ))
+                .await;
+                #[cfg(test)]
+                let revalidation = {
+                    let injected = self.task_cli_history_revalidation_failure.lock().unwrap().take();
+                    injected.map_or(revalidation, Err)
+                };
+                match revalidation {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        self.mark_turn_blocked(
+                            outcome.started_notification.thread_id.clone(),
+                            outcome.started_notification.turn.id.clone(),
+                            "CLI accepted history changed before provider start".to_owned(),
+                        ).await;
+                        send_turn_start_failure!("CLI accepted history changed before provider start; retry will rebuild its context".to_owned());
+                        return;
+                    }
+                    Err(error) => {
+                        if success_response.is_task() {
+                            // Build and report once before the existing Blocked
+                            // transition. The same value then owns completion.
+                            let (_, failure) = TurnStartFailure::internal_typed(
+                                pioneer_tasks::TaskStartStage::CliPreparation,
+                                error.context("failed to revalidate CLI accepted history"),
+                            ).into_task_failure();
+                            self.mark_task_turn_blocked_on_start_failure(
+                                outcome.started_notification.thread_id.clone(),
+                                outcome.started_notification.turn.id.clone(),
+                                failure.descriptor(),
+                            ).await;
+                            success_response.complete_task(Err(anyhow::Error::new(failure)));
+                        } else {
+                            self.mark_turn_blocked(
+                                outcome.started_notification.thread_id.clone(),
+                                outcome.started_notification.turn.id.clone(),
+                                format!("failed to revalidate CLI accepted history: {error:#}"),
+                            ).await;
+                            send_turn_start_failure!(TurnStartFailure::internal_typed(
+                                pioneer_tasks::TaskStartStage::CliPreparation,
+                                error.context("failed to revalidate CLI accepted history"),
+                            ));
+                        }
+                        return;
+                    }
+                }
+            }
             let elevated_instructions = match pioneer_cli_agent_runtime::instructions::CLIRuntimeElevatedInstructions::try_new(
                 delivery_plan.provider_instructions.text.clone(),
                 delivery_plan.provider_instructions.fingerprint.clone(),
@@ -5185,19 +6305,83 @@ impl MessageProcessor {
                 ));
                 return;
             }
+            let execution_authorization_context = match self
+                .load_turn_execution_authorization_context(
+                    outcome.started_notification.turn.id.as_str(),
+                )
+                .await
+            {
+                Ok(context) => context,
+                Err(error) => {
+                    self.mark_turn_blocked(
+                        outcome.started_notification.thread_id.clone(),
+                        outcome.started_notification.turn.id.clone(),
+                        format!(
+                            "failed to bind CLI runtime session authorization scope: {error:#}"
+                        ),
+                    )
+                    .await;
+                    send_turn_start_failure!(format!(
+                        "failed to bind CLI runtime session authorization scope: {error:#}"
+                    ));
+                    return;
+                }
+            };
+            let authorization_scope_fingerprint =
+                match cli_runtime_session_authorization_scope_fingerprint(
+                    &execution_authorization_context,
+                    &security_snapshot,
+                ) {
+                    Ok(fingerprint) => fingerprint,
+                    Err(error) => {
+                        self.mark_turn_blocked(
+                            outcome.started_notification.thread_id.clone(),
+                            outcome.started_notification.turn.id.clone(),
+                            format!(
+                                "failed to fingerprint CLI runtime session authorization scope: {error:#}"
+                            ),
+                        )
+                        .await;
+                        send_turn_start_failure!(format!(
+                            "failed to fingerprint CLI runtime session authorization scope: {error:#}"
+                        ));
+                        return;
+                    }
+                };
             let native_cwd = security_snapshot.sandbox.cwd.clone();
             let proxy_env = crate::cli_runtime::config::proxy_env(proxy_url.as_deref());
             let session_options = crate::cli_runtime::manager::CLIAgentRuntimeSessionStartOptions {
                 cwd: Some(std::path::PathBuf::from(native_cwd.as_str())),
                 approval_policy: Some(effective_approval_policy.clone()),
+                authorization_scope_fingerprint: Some(authorization_scope_fingerprint),
                 env: proxy_env,
-                enable_user_skills: matches!(runtime_kind, CLIAgentRuntimeKind::Claude)
-                    && !installed_skills.is_empty(),
+                selected_skills: if matches!(runtime_kind, CLIAgentRuntimeKind::Claude) {
+                    installed_skills
+                        .iter()
+                        .map(crate::cli_runtime::skills::CliRuntimeSelectedSkill::from)
+                        .collect()
+                } else {
+                    Vec::new()
+                },
                 elevated_instructions: matches!(runtime_kind, CLIAgentRuntimeKind::Claude)
                     .then_some(elevated_instructions.clone()),
                 ..Default::default()
             };
-            let session_result = match runtime_kind {
+            if bootstrap_provider_context
+                && let Err(error) = manager.close_session(&session_key).await
+            {
+                self.mark_turn_blocked(
+                    outcome.started_notification.thread_id.clone(),
+                    outcome.started_notification.turn.id.clone(),
+                    format!("failed to close stale CLI provider session: {error:#}"),
+                )
+                .await;
+                send_turn_start_failure!(format!(
+                    "failed to close stale CLI provider session: {error:#}"
+                ));
+                return;
+            }
+            let session_result = { let _startup_part = pioneer_observability::turn_startup::stage(&response_turn_id, pioneer_observability::turn_startup::Stage::CliAcquire); match runtime_kind {
                 CLIAgentRuntimeKind::Codex | CLIAgentRuntimeKind::OpenCode => {
                     let persisted_binding = match self
                         .crud_store
@@ -5225,8 +6409,12 @@ impl MessageProcessor {
                                 && binding.runtime_kind
                                     == cli_runtime_protocol_kind_label(runtime_kind) =>
                         {
-                            Some(binding.native_thread_id)
+                            (!bootstrap_provider_context).then_some(binding.native_thread_id)
                         }
+                        Some(binding)
+                            if bootstrap_provider_context
+                                && binding.workspace_id == outcome.started_notification.workspace_id
+                                && binding.status == "active" => None,
                         Some(_) => {
                             self.mark_turn_blocked(
                                 outcome.started_notification.thread_id.clone(),
@@ -5293,6 +6481,8 @@ impl MessageProcessor {
                             runtime_id: runtime_id.clone(),
                             cwd: native_cwd.clone(),
                             model: Some(outcome.materialization.thread.model.clone()),
+                            force_new: bootstrap_provider_context,
+                            fork: None,
                             prepared_at: chrono::Utc::now().fixed_offset(),
                         },
                     )
@@ -5339,6 +6529,20 @@ impl MessageProcessor {
                         provider_session_id,
                     )
                     .with_native_event_budget(native_event_budget),
+                    crate::cli_runtime::continuation::CliProviderContinuation::ClaudeFork {
+                        source_session_id,
+                        boundary_message_uuid,
+                        provider_session_id,
+                    } => crate::cli_runtime::continuation::CliSessionLaunchSpec::claude_fork(
+                        session_options,
+                        claude_mcp_launch_projection
+                            .clone()
+                            .map(crate::cli_runtime::continuation::CliMcpSessionLaunch::Claude)
+                            .unwrap_or(crate::cli_runtime::continuation::CliMcpSessionLaunch::Disabled),
+                        source_session_id,
+                        boundary_message_uuid,
+                        provider_session_id,
+                    ).with_native_event_budget(native_event_budget),
                     crate::cli_runtime::continuation::CliProviderContinuation::CodexRpcThread {
                         ..
                     } => unreachable!("Claude preparation returned a Codex continuation"),
@@ -5350,7 +6554,7 @@ impl MessageProcessor {
                     .get_or_start_with_launch_spec(session_key.clone(), launch_spec)
                     .await
                 }
-            };
+            } };
             let session_handle = match session_result {
                 Ok(handle) => handle,
                 Err(error) => {
@@ -5377,7 +6581,7 @@ impl MessageProcessor {
                 serde_json::json!(cli_runtime_thread_sandbox_label(sandbox_policy))
             });
             let native_thread =
-                match crate::cli_runtime::thread_binding::open_cli_runtime_thread_binding(
+                { let _startup_part = pioneer_observability::turn_startup::stage(&response_turn_id, pioneer_observability::turn_startup::Stage::CliThread); match crate::cli_runtime::thread_binding::open_cli_runtime_thread_binding(
                     self.crud_store.as_ref(),
                     &cli_session,
                     crate::cli_runtime::thread_binding::CLIAgentRuntimeThreadBindingOpenRequest {
@@ -5391,7 +6595,8 @@ impl MessageProcessor {
                         sandbox: thread_sandbox_label,
                         permissions: provider_permissions_id.clone(),
                         service_tier: None,
-                        resume_existing: cli_runtime_supports_durable_thread_resume(runtime_kind),
+                        resume_existing: !bootstrap_provider_context
+                            && cli_runtime_supports_durable_thread_resume(runtime_kind),
                         request_timeout: std::time::Duration::from_millis(
                             runtime_config.request_timeout_ms,
                         ),
@@ -5413,8 +6618,15 @@ impl MessageProcessor {
                         ));
                         return;
                     }
-                };
+                } };
             let input_mapping_json = match pioneer_crud::serialize_cli_runtime_json(&input_mapping)
+                .and_then(|json| match sent_context_basis.as_ref() {
+                    Some(basis) => crate::cli_runtime::thread_binding::persist_sent_context_basis_in_input_mapping(
+                        json.as_str(),
+                        basis,
+                    ),
+                    None => Ok(json),
+                })
             {
                 Ok(input_mapping_json) => input_mapping_json,
                 Err(error) => {
@@ -5453,6 +6665,8 @@ impl MessageProcessor {
                 ));
                 return;
             }
+            // Sent mapping is now the durable root; provider awaits need no temporary pin.
+            drop(cli_basis_hold);
             let native_turn_input = match serde_json::to_value(&input_mapping.input) {
                 Ok(input) => input,
                 Err(error) => {
@@ -5526,6 +6740,7 @@ impl MessageProcessor {
                 native_thread_id,
                 turn_start_params: native_turn_start_params,
                 request_timeout_ms: runtime_config.request_timeout_ms,
+                continuation_head,
             };
 
             let success_sent = match &success_response {
@@ -5604,7 +6819,7 @@ impl MessageProcessor {
             }
             })
             .await;
-        })
+        }))
     }
 
     pub(super) fn spawn_prepared_cli_runtime_native_turn(
@@ -5612,11 +6827,15 @@ impl MessageProcessor {
         prepared: PreparedCliRuntimeNativeTurnStart,
     ) {
         let processor = self.clone();
-        let _handle = tokio::spawn(async move {
-            processor
-                .start_prepared_cli_runtime_native_turn(prepared)
-                .await;
-        });
+        let startup_key = Some(prepared.outcome.started_notification.turn.id.clone());
+        let _handle = tokio::spawn(pioneer_observability::turn_startup::scope(
+            startup_key,
+            async move {
+                processor
+                    .start_prepared_cli_runtime_native_turn(prepared)
+                    .await;
+            },
+        ));
     }
 
     async fn start_prepared_cli_runtime_native_turn(
@@ -5631,24 +6850,43 @@ impl MessageProcessor {
             native_thread_id,
             turn_start_params,
             request_timeout_ms,
+            continuation_head,
         } = prepared;
         let pioneer_turn_id = outcome.started_notification.turn.id.clone();
-        let mcp_metadata = match cli_session
-            .prepare_mcp_turn(
-                outcome.started_notification.thread_id.as_str(),
-                pioneer_turn_id.as_str(),
-            )
-            .await
-        {
-            Ok(metadata) => metadata,
-            Err(error) => {
-                self.mark_turn_blocked(
-                    outcome.started_notification.thread_id.clone(),
-                    pioneer_turn_id,
-                    format!("failed to reserve CLI MCP turn lease: {error:#}"),
+        let transition_mutex = self
+            .cli_runtime_session_transition_mutex(session_instance.key())
+            .await;
+        let transition = Arc::new(transition_mutex.lock_owned().await);
+        self.interrupt_completed_history_for_new_input(
+            &outcome.started_notification.workspace_id,
+            &outcome.started_notification.thread_id,
+        )
+        .await;
+        let mcp_metadata = {
+            let _startup_part = pioneer_observability::turn_startup::stage(
+                &pioneer_turn_id,
+                pioneer_observability::turn_startup::Stage::CliMcp,
+            );
+            match cli_session
+                .prepare_mcp_turn(
+                    outcome.started_notification.thread_id.as_str(),
+                    pioneer_turn_id.as_str(),
                 )
-                .await;
-                return;
+                .await
+            {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    self.mark_turn_blocked_with_transition(
+                        outcome.started_notification.thread_id.clone(),
+                        pioneer_turn_id.clone(),
+                        format!("failed to reserve CLI MCP turn lease: {error:#}"),
+                        Some(transition.clone()),
+                    )
+                    .await;
+                    self.release_cli_runtime_session_turn_lease(pioneer_turn_id.as_str())
+                        .await;
+                    return;
+                }
             }
         };
         if let Some(metadata) = mcp_metadata {
@@ -5658,12 +6896,15 @@ impl MessageProcessor {
                     let _ = cli_session
                         .terminal_mcp_turn(pioneer_turn_id.as_str())
                         .await;
-                    self.mark_turn_blocked(
+                    self.mark_turn_blocked_with_transition(
                         outcome.started_notification.thread_id.clone(),
-                        pioneer_turn_id,
+                        pioneer_turn_id.clone(),
                         "CLI MCP session generation exceeds durable range".to_owned(),
+                        Some(transition.clone()),
                     )
                     .await;
+                    self.release_cli_runtime_session_turn_lease(pioneer_turn_id.as_str())
+                        .await;
                     return;
                 }
             };
@@ -5674,12 +6915,15 @@ impl MessageProcessor {
                         let _ = cli_session
                             .terminal_mcp_turn(pioneer_turn_id.as_str())
                             .await;
-                        self.mark_turn_blocked(
+                        self.mark_turn_blocked_with_transition(
                             outcome.started_notification.thread_id.clone(),
-                            pioneer_turn_id,
+                            pioneer_turn_id.clone(),
                             "CLI MCP activation generation exceeds durable range".to_owned(),
+                            Some(transition.clone()),
                         )
                         .await;
+                        self.release_cli_runtime_session_turn_lease(pioneer_turn_id.as_str())
+                            .await;
                         return;
                     }
                 };
@@ -5702,22 +6946,120 @@ impl MessageProcessor {
                 let _ = cli_session
                     .terminal_mcp_turn(pioneer_turn_id.as_str())
                     .await;
-                self.mark_turn_blocked(
+                self.mark_turn_blocked_with_transition(
                     outcome.started_notification.thread_id.clone(),
-                    pioneer_turn_id,
+                    pioneer_turn_id.clone(),
                     format!("failed to persist CLI MCP turn lease: {error:#}"),
+                    Some(transition.clone()),
                 )
                 .await;
+                self.release_cli_runtime_session_turn_lease(pioneer_turn_id.as_str())
+                    .await;
                 return;
             }
         }
-        let native_turn = match cli_session
+        #[cfg(test)]
+        self.completed_history_preparation_barrier
+            .wait_if_armed(
+                "__cli_predispatch__",
+                &tokio_util::sync::CancellationToken::new(),
+            )
+            .await;
+        #[cfg(test)]
+        let injected_read_failure = self
+            .predispatch_cli_turn_read_failures
+            .lock()
+            .await
+            .remove(pioneer_turn_id.as_str());
+        let turn_state = {
+            #[cfg(test)]
+            if injected_read_failure {
+                Err(anyhow::anyhow!("injected predispatch turn read failure"))
+            } else {
+                self.crud_store
+                    .get_turn(
+                        outcome.started_notification.thread_id.as_str(),
+                        pioneer_turn_id.as_str(),
+                    )
+                    .await
+            }
+            #[cfg(not(test))]
+            {
+                self.crud_store
+                    .get_turn(
+                        outcome.started_notification.thread_id.as_str(),
+                        pioneer_turn_id.as_str(),
+                    )
+                    .await
+            }
+        };
+        let cancellation_requested = self.user_turn_cancel_intents.lock().await.contains_key(&(
+            outcome.started_notification.thread_id.clone(),
+            pioneer_turn_id.clone(),
+        ));
+        let predispatch_failure = match &turn_state {
+            Err(error) => Some(format!(
+                "failed to recheck CLI turn before dispatch: {error:#}"
+            )),
+            Ok(None) => Some("CLI turn disappeared before provider dispatch".to_owned()),
+            Ok(Some((_, turn)))
+                if turn.status == TurnStatus::InProgress
+                    && self.cli_history_shutdown.is_cancelled() =>
+            {
+                Some("CLI runtime shut down before provider dispatch".to_owned())
+            }
+            _ => None,
+        };
+        if predispatch_failure.is_some()
+            || !matches!(&turn_state, Ok(Some((_, turn))) if turn.status == TurnStatus::InProgress)
+            || cancellation_requested
+        {
+            let _ = cli_session
+                .terminal_mcp_turn(pioneer_turn_id.as_str())
+                .await;
+            if let Some(reason) = predispatch_failure {
+                self.fail_initial_cli_runtime_turn_attempt(
+                    pioneer_turn_id.as_str(),
+                    reason.clone(),
+                )
+                .await;
+                if turn_state.is_err()
+                    || matches!(&turn_state, Ok(Some((_, turn))) if turn.status == TurnStatus::InProgress)
+                {
+                    // The failed read is not evidence that the canonical Turn
+                    // is terminal. The conditional finish path rechecks its
+                    // state and preserves a concurrent cancel/completion.
+                    self.mark_turn_blocked_with_transition(
+                        outcome.started_notification.thread_id.clone(),
+                        pioneer_turn_id.clone(),
+                        reason.clone(),
+                        Some(transition.clone()),
+                    )
+                    .await;
+                } else {
+                    warn!(
+                        turn_id = pioneer_turn_id.as_str(),
+                        reason, "CLI dispatch rejected before provider start"
+                    );
+                }
+            }
+            self.release_cli_runtime_session_turn_lease(pioneer_turn_id.as_str())
+                .await;
+            return;
+        }
+        pioneer_observability::turn_startup::dispatched(&pioneer_turn_id);
+        let _startup_dispatch = pioneer_observability::turn_startup::stage(
+            &pioneer_turn_id,
+            pioneer_observability::turn_startup::Stage::CliDispatch,
+        );
+        let native_turn_result = cli_session
             .start_turn(
                 turn_start_params,
                 std::time::Duration::from_millis(request_timeout_ms),
             )
-            .await
-        {
+            .await;
+        drop(_startup_dispatch);
+        let native_turn = match native_turn_result {
             Ok(native_turn) => native_turn,
             Err(error) => {
                 let _ = cli_session
@@ -5728,10 +7070,11 @@ impl MessageProcessor {
                     format!("failed to start native CLI runtime turn: {error:#}"),
                 )
                 .await;
-                self.mark_turn_blocked(
+                self.mark_turn_blocked_with_transition(
                     outcome.started_notification.thread_id.clone(),
                     pioneer_turn_id,
                     format!("failed to start CLI runtime turn: {error:#}"),
+                    Some(transition.clone()),
                 )
                 .await;
                 return;
@@ -5761,10 +7104,11 @@ impl MessageProcessor {
                     format!("failed to persist native CLI runtime owner: {error:#}"),
                 )
                 .await;
-                self.mark_turn_blocked(
+                self.mark_turn_blocked_with_transition(
                     outcome.started_notification.thread_id.clone(),
                     outcome.started_notification.turn.id.clone(),
                     format!("failed to persist CLI runtime native turn id: {error:#}"),
+                    Some(transition.clone()),
                 )
                 .await;
                 let _ = cli_session
@@ -5773,6 +7117,48 @@ impl MessageProcessor {
                 return;
             }
         };
+        // A provider context is resumable only after start_turn returned a
+        // native turn and that exact ownership was made durable. Persisting
+        // earlier could suppress bootstrap after cancellation or transport
+        // failure; persisting later would resend the accepted user input after
+        // a Gateway restart.
+        if let Err(error) = crate::cli_runtime::thread_binding::record_cli_runtime_context_receipt(
+            self.crud_store.as_ref(),
+            turn_binding.continuation_thread_id.as_str(),
+            native_thread_id.as_str(),
+            outcome.started_notification.turn.id.as_str(),
+            outcome.started_notification.turn.message_revision,
+            outcome.started_notification.turn.message_deleted,
+            (turn_binding.thread_id != turn_binding.continuation_thread_id)
+                .then_some(continuation_head)
+                .flatten(),
+            chrono::Utc::now().fixed_offset(),
+        )
+        .await
+        {
+            let _ = cli_session
+                .terminal_mcp_turn(pioneer_turn_id.as_str())
+                .await;
+            self.fail_initial_cli_runtime_turn_attempt(
+                turn_binding.turn_id.as_str(),
+                format!("failed to confirm CLI context delivery: {error:#}"),
+            )
+            .await;
+            self.mark_turn_blocked_with_transition(
+                outcome.started_notification.thread_id.clone(),
+                outcome.started_notification.turn.id.clone(),
+                format!("failed to confirm CLI runtime context delivery: {error:#}"),
+                Some(transition.clone()),
+            )
+            .await;
+            let _ = cli_session
+                .interrupt_turn(
+                    Some(native_thread_id.as_str()),
+                    Some(native_turn_id.as_str()),
+                )
+                .await;
+            return;
+        }
         self.notify_semantic_timeline_turn_state_changed(
             turn_binding.workspace_id.as_str(),
             turn_binding.thread_id.as_str(),
@@ -5789,10 +7175,11 @@ impl MessageProcessor {
                 let _ = cli_session
                     .terminal_mcp_turn(pioneer_turn_id.as_str())
                     .await;
-                self.mark_turn_blocked(
+                self.mark_turn_blocked_with_transition(
                     outcome.started_notification.thread_id.clone(),
                     outcome.started_notification.turn.id.clone(),
                     "CLI runtime native turn started without a durable attempt".to_owned(),
+                    Some(transition.clone()),
                 )
                 .await;
                 let _ = cli_session
@@ -5807,10 +7194,11 @@ impl MessageProcessor {
                 let _ = cli_session
                     .terminal_mcp_turn(pioneer_turn_id.as_str())
                     .await;
-                self.mark_turn_blocked(
+                self.mark_turn_blocked_with_transition(
                     outcome.started_notification.thread_id.clone(),
                     outcome.started_notification.turn.id.clone(),
                     format!("failed to load CLI runtime attempt after native start: {error:#}"),
+                    Some(transition.clone()),
                 )
                 .await;
                 let _ = cli_session
@@ -5834,10 +7222,11 @@ impl MessageProcessor {
                 format!("failed to open CLI runtime execution window: {error:#}"),
             )
             .await;
-            self.mark_turn_blocked(
+            self.mark_turn_blocked_with_transition(
                 outcome.started_notification.thread_id.clone(),
                 outcome.started_notification.turn.id.clone(),
                 format!("failed to open CLI runtime execution window: {error:#}"),
+                Some(transition.clone()),
             )
             .await;
             let _ = cli_session
@@ -5870,14 +7259,18 @@ impl MessageProcessor {
                     Some(native_turn_id.as_str()),
                 )
                 .await;
-            self.mark_turn_blocked(
+            self.mark_turn_blocked_with_transition(
                 outcome.started_notification.thread_id.clone(),
                 pioneer_turn_id,
                 format!("failed to activate CLI MCP turn lease: {error:#}"),
+                Some(transition.clone()),
             )
             .await;
             return;
         }
+        // Native admission and MCP activation are complete. Buffered events
+        // enter through the ordinary consumer, which owns its terminal transition.
+        drop(transition);
         if turn_binding.runtime_kind == "codex" {
             self.bind_buffered_codex_root_execution_segments(
                 &session_instance,
@@ -6406,12 +7799,60 @@ impl MessageProcessor {
                 };
             }
         };
+        let authorization_scope_fingerprint =
+            match cli_runtime_session_authorization_scope_fingerprint(
+                &authorization_context,
+                &security_snapshot,
+            ) {
+                Ok(fingerprint) => fingerprint,
+                Err(error) => {
+                    return CliRuntimeLaunchSpecRestore::InvalidBinding {
+                        diagnostic: format!(
+                            "CLI runtime continuation authorization scope is invalid: {error:#}"
+                        ),
+                    };
+                }
+            };
+        let selected_skills = if matches!(runtime_kind, CLIAgentRuntimeKind::Claude) {
+            let frozen_bindings = skill_bindings
+                .iter()
+                .map(|binding| pioneer_protocol::TurnSkillBinding {
+                    skill_id: binding.skill_id.clone(),
+                    skill_owner: binding.skill_owner.clone(),
+                    skill_slug: binding.skill_slug.clone(),
+                    skill_version: binding.skill_version.clone(),
+                    fingerprint: binding.fingerprint.clone(),
+                    source_kind: binding.source_kind.clone(),
+                    resolved_reason: binding.resolved_reason.clone(),
+                })
+                .collect::<Vec<_>>();
+            let receipt_path = self
+                .artifact_runtime_home
+                .join(pioneer_skills::EXTERNAL_RUNTIME_RECEIPT_FILE_NAME);
+            match crate::cli_runtime::skills::restore_cli_runtime_selected_skills(
+                &runtime,
+                runtime_kind,
+                frozen_bindings.as_slice(),
+                receipt_path.as_path(),
+            ) {
+                Ok(selected) => selected,
+                Err(error) => {
+                    return CliRuntimeLaunchSpecRestore::InvalidBinding {
+                        diagnostic: format!(
+                            "failed to restore exact Claude skill projection: {error:#}"
+                        ),
+                    };
+                }
+            }
+        } else {
+            Vec::new()
+        };
         let session_options = crate::cli_runtime::manager::CLIAgentRuntimeSessionStartOptions {
             cwd: Some(std::path::PathBuf::from(native_cwd.as_str())),
             approval_policy: binding.approval_policy.clone(),
+            authorization_scope_fingerprint: Some(authorization_scope_fingerprint),
             env: crate::cli_runtime::config::proxy_env(proxy_url.as_deref()),
-            enable_user_skills: matches!(runtime_kind, CLIAgentRuntimeKind::Claude)
-                && !skill_bindings.is_empty(),
+            selected_skills,
             elevated_instructions: matches!(runtime_kind, CLIAgentRuntimeKind::Claude)
                 .then_some(elevated_instructions.clone()),
             ..Default::default()
@@ -6517,6 +7958,86 @@ impl MessageProcessor {
         })
     }
 
+    // Both recovery paths must restore control before reporting success or
+    // taking an idempotent running-attempt exit. Database reads inherit the
+    // caller's reconciliation scope and finish before notification fanout.
+    pub(super) async fn restore_cli_runtime_recovery_turn_snapshot(
+        &self,
+        binding: &pioneer_crud::CliRuntimeTurnBindingRecord,
+    ) -> Result<(), CliRuntimeRecoveryStartFailure> {
+        let Some((workspace_id, turn)) = self
+            .crud_store
+            .get_turn(binding.thread_id.as_str(), binding.turn_id.as_str())
+            .await?
+        else {
+            return Err(CliRuntimeRecoveryStartFailure::InvalidBinding {
+                diagnostic: format!("Pioneer turn `{}` is missing", binding.turn_id),
+            });
+        };
+        if workspace_id != binding.workspace_id {
+            return Err(CliRuntimeRecoveryStartFailure::InvalidBinding {
+                diagnostic: "saved Pioneer turn belongs to a different workspace".into(),
+            });
+        }
+        if turn.status != TurnStatus::InProgress {
+            return Err(CliRuntimeRecoveryStartFailure::InvalidBinding {
+                diagnostic: format!(
+                    "Pioneer turn `{}` is `{}` and cannot restore CLI recovery",
+                    binding.turn_id,
+                    format!("{:?}", turn.status).to_ascii_lowercase()
+                ),
+            });
+        }
+        // Recovery continues the original Pioneer Turn, but after a Gateway
+        // restart thread/start may have loaded only an idle, turnless seed.
+        // The caller holds the CLI session transition gate shared with
+        // cancellation and terminal delivery. Existing subscribers need
+        // a domain snapshot; execution-window/native events cannot restore it.
+        self.ensure_runtime_turn_loaded_for_lifecycle(
+            binding.workspace_id.as_str(),
+            binding.thread_id.as_str(),
+            &turn,
+        )
+        .await?;
+        let thread = self
+            .thread_manager
+            .thread_get(binding.thread_id.as_str())
+            .await
+            .context("recovered Pioneer thread is not loaded")?;
+        if thread.workspace_id != binding.workspace_id {
+            return Err(CliRuntimeRecoveryStartFailure::InvalidBinding {
+                diagnostic: "recovered Pioneer thread belongs to a different workspace".into(),
+            });
+        }
+        let current_turn = thread
+            .turns
+            .iter()
+            .find(|turn| turn.id == binding.turn_id)
+            .context("recovered Pioneer turn is not loaded")?;
+        let current_status = current_turn.status;
+        // Publish the current merged runtime state, never the saved running
+        // seed: restoration deliberately preserves a turn already finalized
+        // in memory, along with other turns and authenticated subscribers.
+        self.send_notification_to_thread_subscribers(
+            binding.thread_id.as_str(),
+            events::THREAD_UPDATED,
+            &ThreadUpdatedNotification {
+                thread,
+                placement: None,
+            },
+        )
+        .await;
+        if current_status != TurnStatus::InProgress {
+            return Err(CliRuntimeRecoveryStartFailure::InvalidBinding {
+                diagnostic: format!(
+                    "Pioneer turn `{}` is no longer running in memory",
+                    binding.turn_id
+                ),
+            });
+        }
+        Ok(())
+    }
+
     pub(super) async fn start_cli_runtime_recovery_attempt(
         &self,
         request: crate::resilience::CliRuntimeRecoveryAttemptRequest,
@@ -6530,25 +8051,13 @@ impl MessageProcessor {
                 return Err(CliRuntimeRecoveryStartFailure::InvalidBinding { diagnostic });
             }
         };
+        let transition_mutex = self
+            .cli_runtime_session_transition_mutex(&restored.session_key)
+            .await;
+        let _transition = transition_mutex.lock().await;
         let binding = restored.binding.clone();
-        let Some((_workspace_id, turn)) = self
-            .crud_store
-            .get_turn(binding.thread_id.as_str(), binding.turn_id.as_str())
-            .await?
-        else {
-            return Err(CliRuntimeRecoveryStartFailure::InvalidBinding {
-                diagnostic: format!("Pioneer turn `{}` is missing", binding.turn_id),
-            });
-        };
-        if turn.status != TurnStatus::InProgress {
-            return Err(CliRuntimeRecoveryStartFailure::InvalidBinding {
-                diagnostic: format!(
-                    "Pioneer turn `{}` is `{}` and cannot start CLI recovery",
-                    binding.turn_id,
-                    format!("{:?}", turn.status).to_ascii_lowercase()
-                ),
-            });
-        }
+        self.restore_cli_runtime_recovery_turn_snapshot(&binding)
+            .await?;
         if let Some(existing) = self
             .crud_store
             .get_cli_runtime_turn_attempt_by_recovery_attempt(request.recovery_attempt_id.as_str())
@@ -6587,6 +8096,58 @@ impl MessageProcessor {
                         ),
                     });
                 }
+            }
+        }
+        if self
+            .crud_store
+            .has_pending_cli_runtime_terminal_event(&binding.turn_id)
+            .await?
+        {
+            return Err(CliRuntimeRecoveryStartFailure::Unavailable {
+                diagnostic: "accepted native outcome awaits delivery".into(),
+            });
+        }
+        let terminal_source = self
+            .crud_store
+            .cli_runtime_turn_terminal_guard_by_id(&binding.turn_id)
+            .await?
+            .and_then(|snapshot| snapshot.terminal_event_source())
+            .map(|source| {
+                let id = source.terminal_delivery_id();
+                (source, id, self.turn_execution_owner_id.to_string())
+            });
+        let recovery_authority = self
+            .load_turn_execution_authorization_context(&binding.turn_id)
+            .await?;
+        let prepared_at = chrono::Utc::now().fixed_offset();
+        let (prepared_binding, attempt) = self
+            .crud_store
+            .prepare_cli_runtime_recovery_turn_attempt(
+                binding.turn_id.as_str(),
+                pioneer_protocol::generate_id(21),
+                request.job_id.clone(),
+                request.recovery_attempt_id.clone(),
+                request.execution_window_index,
+                request.previous_failure_reason.clone(),
+                prepared_at,
+                terminal_source,
+            )
+            .await?;
+        match attempt.status {
+            pioneer_crud::CliRuntimeTurnAttemptStatus::Running
+                if attempt.native_turn_id.is_some() =>
+            {
+                return Ok(false);
+            }
+            pioneer_crud::CliRuntimeTurnAttemptStatus::Starting => {}
+            status => {
+                return Err(CliRuntimeRecoveryStartFailure::InvalidBinding {
+                    diagnostic: format!(
+                        "CLI runtime recovery attempt `{}` is `{}` and cannot start",
+                        attempt.id,
+                        status.as_str()
+                    ),
+                });
             }
         }
         let manager = self
@@ -6635,36 +8196,6 @@ impl MessageProcessor {
                 .context("failed to reset Codex Goal before recovery")?;
         }
 
-        let prepared_at = chrono::Utc::now().fixed_offset();
-        let (prepared_binding, attempt) = self
-            .crud_store
-            .prepare_cli_runtime_recovery_turn_attempt(
-                binding.turn_id.as_str(),
-                pioneer_protocol::generate_id(21),
-                request.job_id.clone(),
-                request.recovery_attempt_id.clone(),
-                request.execution_window_index,
-                request.previous_failure_reason.clone(),
-                prepared_at,
-            )
-            .await?;
-        match attempt.status {
-            pioneer_crud::CliRuntimeTurnAttemptStatus::Running
-                if attempt.native_turn_id.is_some() =>
-            {
-                return Ok(false);
-            }
-            pioneer_crud::CliRuntimeTurnAttemptStatus::Starting => {}
-            status => {
-                return Err(CliRuntimeRecoveryStartFailure::InvalidBinding {
-                    diagnostic: format!(
-                        "CLI runtime recovery attempt `{}` is `{}` and cannot start",
-                        attempt.id,
-                        status.as_str()
-                    ),
-                });
-            }
-        }
         if let Err(error) = self
             .publish_cli_runtime_attempt_window_started(
                 session_handle.instance(),
@@ -6685,7 +8216,10 @@ impl MessageProcessor {
             .start_turn(
                 crate::cli_runtime::manager::CLIAgentRuntimeTurnStartParams {
                     native_thread_id: prepared_binding.native_thread_id.clone(),
-                    input: crate::cli_runtime::turn_recovery::cli_runtime_recovery_turn_input(),
+                    input: crate::cli_runtime::turn_recovery::cli_runtime_recovery_turn_input(
+                        recovery_authority.root_thread_id(),
+                        &prepared_binding.thread_id,
+                    ),
                     cwd: Some(restored.native_cwd.clone()),
                     model: prepared_binding.model.clone(),
                     approval_policy: prepared_binding.approval_policy.clone(),
@@ -6738,6 +8272,7 @@ impl MessageProcessor {
             .await;
             return Err(error.into());
         }
+        drop(_transition);
         if prepared_binding.runtime_kind == "codex" {
             self.bind_buffered_codex_root_execution_segments(
                 session_handle.instance(),
@@ -6950,10 +8485,41 @@ impl MessageProcessor {
         key: &crate::cli_runtime::manager::CLIAgentRuntimeSessionKey,
     ) -> Arc<tokio::sync::Mutex<()>> {
         let mut mutexes = self.cli_runtime_session_turn_mutexes.lock().await;
-        mutexes
-            .entry(key.clone())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone()
+        mutexes.entry(key.clone()).or_default().lease.clone()
+    }
+
+    // Unlike the retained Turn lease, this gate covers one transition, including
+    // its external terminal effects. Recovery of the same Turn uses it too.
+    pub(super) async fn cli_runtime_session_transition_mutex(
+        &self,
+        key: &crate::cli_runtime::manager::CLIAgentRuntimeSessionKey,
+    ) -> Arc<tokio::sync::Mutex<()>> {
+        let mut mutexes = self.cli_runtime_session_turn_mutexes.lock().await;
+        mutexes.entry(key.clone()).or_default().transition.clone()
+    }
+
+    pub(super) async fn cli_runtime_turn_resume_transition(
+        &self,
+        turn_id: &str,
+    ) -> anyhow::Result<Option<tokio::sync::OwnedMutexGuard<()>>> {
+        let Some(binding) = self
+            .crud_store
+            .get_cli_runtime_turn_binding(turn_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let key = crate::cli_runtime::manager::CLIAgentRuntimeSessionKey::new(
+            binding.workspace_id,
+            binding.runtime_id,
+            binding.continuation_thread_id,
+        )?;
+        Ok(Some(
+            self.cli_runtime_session_transition_mutex(&key)
+                .await
+                .lock_owned()
+                .await,
+        ))
     }
 
     async fn keep_task_cli_runtime_queue_alive(
@@ -7029,64 +8595,110 @@ impl MessageProcessor {
         resolved_override: Option<pioneer_protocol::TurnExecutionSecuritySnapshot>,
         execution_authority: ExecutionEnvelopeSource<'_>,
     ) -> Result<pioneer_protocol::TurnExecutionSecuritySnapshot, TurnStartFailure> {
-        let permission_profile = self
-            .materialized_turn_permission_profile(&outcome.materialization.turn)
-            .map_err(|error| {
-                TurnStartFailure::internal(format!(
-                    "failed to resolve turn permission profile for security snapshot: {error:#}"
-                ))
-            })?;
-        let mut snapshot = if let Some(snapshot) = resolved_override {
-            snapshot
-        } else {
-            let workspace_id = outcome.started_notification.workspace_id.clone();
-            let cwd = std::env::current_dir().map_err(|error| {
-                TurnStartFailure::internal(format!("failed to resolve turn cwd: {error}"))
-            })?;
-            let input_context = crate::turn_security::TurnSecurityResolverInputContext {
-                workspace_id: workspace_id.clone(),
-                cwd: Some(cwd),
-                project_roots: Vec::new(),
-                app_read_roots: Vec::new(),
-                effective_model_provider: outcome.materialization.thread.model_provider.clone(),
-                resolved_permission_profile: permission_profile,
-                parent_cap: None,
-                managed_policy: crate::turn_security::TurnSecurityManagedPolicyInput::default(),
-                created_at_unix_ms: now_timestamp_secs().saturating_mul(1000),
-            };
-            let resolver_input =
-                crate::turn_security::TurnSecurityResolverInput::from_turn_start_params(
-                    params,
-                    input_context,
-                )
+        scope_current_stage(Stage::SecurityResolve, async {
+            let permission_profile = self
+                .materialized_turn_permission_profile(&outcome.materialization.turn)
                 .map_err(|error| {
                     TurnStartFailure::internal(format!(
-                        "failed to build turn execution security resolver input: {error:#}"
+                        "failed to resolve turn permission profile for security snapshot: {error:#}"
                     ))
                 })?;
-            crate::turn_security::resolve_turn_execution_security(&resolver_input).map_err(
-                |error| {
-                    TurnStartFailure::internal(format!(
-                        "failed to resolve turn execution security snapshot: {error:#}"
-                    ))
-                },
-            )?
-        };
-        snapshot.authority_cap.resource_binding_revision = execution_authority.policy_revision();
-        self.log_turn_security_snapshot(
-            outcome.started_notification.workspace_id.as_str(),
-            outcome.started_notification.thread_id.as_str(),
-            outcome.started_notification.turn.id.as_str(),
-            &snapshot,
-        );
-        if let pioneer_protocol::TurnSecurityEnforcementStatus::Unavailable { reason } =
-            &snapshot.enforcement
+            let mut snapshot = if let Some(snapshot) = resolved_override {
+                snapshot
+            } else {
+                let workspace_id = outcome.started_notification.workspace_id.clone();
+                let cwd = std::env::current_dir().map_err(|error| {
+                    TurnStartFailure::internal(format!("failed to resolve turn cwd: {error}"))
+                })?;
+                let input_context = crate::turn_security::TurnSecurityResolverInputContext {
+                    workspace_id: workspace_id.clone(),
+                    cwd: Some(cwd),
+                    project_roots: Vec::new(),
+                    app_read_roots: Vec::new(),
+                    effective_model_provider: outcome.materialization.thread.model_provider.clone(),
+                    resolved_permission_profile: permission_profile,
+                    parent_cap: None,
+                    managed_policy: crate::turn_security::TurnSecurityManagedPolicyInput::default(),
+                    created_at_unix_ms: now_timestamp_secs().saturating_mul(1000),
+                };
+                let resolver_input =
+                    crate::turn_security::TurnSecurityResolverInput::from_turn_start_params(
+                        params,
+                        input_context,
+                    )
+                    .map_err(|error| {
+                        TurnStartFailure::internal(format!(
+                            "failed to build turn execution security resolver input: {error:#}"
+                        ))
+                    })?;
+                crate::turn_security::resolve_turn_execution_security(&resolver_input).map_err(
+                    |error| {
+                        TurnStartFailure::internal(format!(
+                            "failed to resolve turn execution security snapshot: {error:#}"
+                        ))
+                    },
+                )?
+            };
+            snapshot.authority_cap.resource_binding_revision =
+                execution_authority.policy_revision();
+            self.add_native_turn_runtime_sandbox_roots(
+                &mut snapshot,
+                outcome.started_notification.workspace_id.as_str(),
+                outcome.started_notification.thread_id.as_str(),
+                outcome.started_notification.turn.id.as_str(),
+            )
+            .map_err(|error| {
+                TurnStartFailure::internal(format!(
+                    "failed to resolve native runtime sandbox roots: {error:#}"
+                ))
+            })?;
+            self.log_turn_security_snapshot(
+                outcome.started_notification.workspace_id.as_str(),
+                outcome.started_notification.thread_id.as_str(),
+                outcome.started_notification.turn.id.as_str(),
+                &snapshot,
+            );
+            if let pioneer_protocol::TurnSecurityEnforcementStatus::Unavailable { reason } =
+                &snapshot.enforcement
+            {
+                return Err(TurnStartFailure::unavailable(format!(
+                    "turn execution security unavailable: {reason}"
+                )));
+            }
+            Ok(snapshot)
+        })
+        .await
+    }
+
+    pub(crate) fn add_native_turn_runtime_sandbox_roots(
+        &self,
+        snapshot: &mut pioneer_protocol::TurnExecutionSecuritySnapshot,
+        workspace_id: &str,
+        thread_id: &str,
+        turn_id: &str,
+    ) -> anyhow::Result<()> {
+        if snapshot.backend.execution_backend
+            != pioneer_protocol::TurnSecurityExecutionBackendKind::Native
+            || snapshot.sandbox.filesystem.kind
+                == pioneer_protocol::TurnFilesystemSandboxKind::Unrestricted
         {
-            return Err(TurnStartFailure::unavailable(format!(
-                "turn execution security unavailable: {reason}"
-            )));
+            return Ok(());
         }
-        Ok(snapshot)
+
+        for root in self.turn_security_app_read_roots(workspace_id)? {
+            crate::turn_security::add_native_runtime_read_root(snapshot, root.as_path());
+        }
+        let artifact_output_root = pioneer_artifacts::artifact_output_dir_path(
+            self.artifact_runtime_home.join("artifacts").as_path(),
+            workspace_id,
+            thread_id,
+            turn_id,
+        )?;
+        crate::turn_security::add_native_runtime_write_root(
+            snapshot,
+            artifact_output_root.as_path(),
+        );
+        Ok(())
     }
 
     pub(crate) async fn load_turn_execution_authorization_context(
@@ -7269,53 +8881,710 @@ impl MessageProcessor {
         }
     }
 
+    /// Publish a normal Pioneer checkpoint before a provider switch needs to
+    /// serialize a large historical projection. The active input remains out
+    /// of the completed-history selection; a single oversized input is never
+    /// summarized or silently trimmed.
+    async fn monitor_cli_history_turn(
+        &self,
+        thread_id: &str,
+        active_turn_id: &str,
+    ) -> anyhow::Result<()> {
+        loop {
+            let live = self
+                .crud_store
+                .get_turn(thread_id, active_turn_id)
+                .await?
+                .is_some_and(|(_, turn)| turn.status == TurnStatus::InProgress);
+            let requested = self
+                .user_turn_cancel_intents
+                .lock()
+                .await
+                .contains_key(&(thread_id.to_owned(), active_turn_id.to_owned()));
+            if !live || requested || self.cli_history_shutdown.is_cancelled() {
+                anyhow::bail!("CLI history preparation was cancelled with its turn");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    pub(super) async fn capture_cli_transfer_projection(
+        &self,
+        workspace_id: &str,
+        thread_id: &str,
+        active_turn_id: &str,
+        deadline_ms: u64,
+    ) -> anyhow::Result<crate::compaction::frozen::PreparedHistory> {
+        scope_current_stage(Stage::CliHistory, async {
+            let history_store = ordinary_history_store(self.crud_store.as_ref());
+            #[cfg(test)]
+            self.cli_transfer_capture_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let remaining_ms = deadline_ms.saturating_sub(
+                u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(u64::MAX),
+            );
+            let deadline = tokio::time::sleep(std::time::Duration::from_millis(remaining_ms));
+            tokio::pin!(deadline);
+            let cancelled = self.monitor_cli_history_turn(thread_id, active_turn_id);
+            tokio::pin!(cancelled);
+            #[cfg(test)]
+            tokio::select! { biased;
+                result = &mut cancelled => return Err(result.err().unwrap_or_else(|| anyhow::anyhow!("CLI history monitor ended unexpectedly"))),
+                _ = &mut deadline => anyhow::bail!("CLI history preparation exceeded the turn deadline"),
+                _ = self.completed_history_preparation_barrier.wait_if_armed(
+                    "__cli_before_accepted_capture__", &self.cli_history_shutdown,
+                ) => {},
+            }
+            tokio::select! { biased;
+                result = &mut cancelled => Err(result.err().unwrap_or_else(|| anyhow::anyhow!("CLI history monitor ended unexpectedly"))),
+                _ = &mut deadline => anyhow::bail!("CLI history preparation exceeded the turn deadline"),
+                prepared = async {
+                    let mut prepared = self.capture_current_context_basis_prepared(
+                        &history_store, workspace_id, thread_id, active_turn_id, Some(active_turn_id),
+                    ).await?;
+                    // Use the shared projector before sizing or sending CLI history.
+                    // The frozen descriptor remains the accepted authority boundary.
+                    prepared.project_accepted_checkpoints(&history_store, workspace_id, thread_id).await?;
+                    Ok(prepared)
+                } => prepared,
+            }
+        })
+        .await
+    }
+
+    pub(super) async fn compact_cli_transfer_history(
+        &self,
+        workspace_id: &str,
+        thread_id: &str,
+        active_turn_id: &str,
+        runtime_id: &str,
+        runtime_kind: CLIAgentRuntimeKind,
+        model: &str,
+        max_input_tokens: Option<u64>,
+        attempt: u32,
+        deadline_ms: u64,
+        codex_history_budget: Option<crate::cli_runtime::context::CodexTransferHistoryBudget>,
+        accepted: crate::compaction::frozen::PreparedHistory,
+    ) -> anyhow::Result<()> {
+        scope_current_stage(Stage::CliCompaction, async {
+            let cancellation = tokio_util::sync::CancellationToken::new();
+            let _cancel_on_drop = cancellation.clone().drop_guard();
+            let remaining_ms = deadline_ms.saturating_sub(
+                u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(u64::MAX),
+            );
+            #[cfg(not(test))]
+            let deadline = tokio::time::sleep(std::time::Duration::from_millis(remaining_ms));
+            #[cfg(test)]
+            let deadline = async {
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(remaining_ms)) => {},
+                    _ = self.cli_transfer_test_deadline.notified() => {},
+                }
+            };
+            tokio::pin!(deadline);
+            #[cfg(test)]
+            let monitor = {
+                let marker = CliHistoryMonitorDrop(self.cli_history_monitor_drops.clone());
+                async move {
+                    let _marker = marker;
+                    self.monitor_cli_history_turn(thread_id, active_turn_id)
+                        .await
+                }
+            };
+            #[cfg(not(test))]
+            let monitor = self.monitor_cli_history_turn(thread_id, active_turn_id);
+            let mut monitor = Box::pin(monitor);
+            #[cfg(test)]
+            tokio::select! { biased;
+                cancelled = &mut monitor => return Err(cancelled.err().unwrap_or_else(|| anyhow::anyhow!("CLI history monitor ended unexpectedly"))),
+                _ = &mut deadline => anyhow::bail!("CLI history preparation exceeded the turn deadline"),
+                _ = self.completed_history_preparation_barrier.wait_if_armed(
+                    "__cli_accepted_transfer__", &cancellation,
+                ) => {},
+            }
+            // The caller passes the exact accepted execution projection used for
+            // its provider frame. Re-capturing here could revive an older revision
+            // or a different checkpoint between admission and publication.
+            let transport = match runtime_kind {
+                CLIAgentRuntimeKind::Codex => pioneer_compaction::Transport::Codex,
+                CLIAgentRuntimeKind::Claude => pioneer_compaction::Transport::Claude,
+            };
+            let current = pioneer_compaction::ModelSelection {
+                transport,
+                instance: runtime_id.to_owned(),
+                model: model.to_owned(),
+                effort: None,
+            };
+            let settings = self.compaction_settings_for_workspace(workspace_id)?;
+            let cli_override = self
+                .workspace_compaction_settings
+                .read()
+                .map_err(|_| anyhow::anyhow!("workspace compaction settings unavailable"))?
+                .get(workspace_id)
+                .and_then(|workspace| workspace.cli_overrides.get(runtime_id).cloned());
+            let catalog_provider = if runtime_kind == CLIAgentRuntimeKind::Codex {
+                "openai-codex"
+            } else {
+                "anthropic"
+            };
+            let limits = pioneer_provider::catalog::model_catalog()?.limits(catalog_provider, model);
+            let fraction = 2_u64.saturating_pow(attempt.saturating_add(1));
+            let desired = limits
+                .context_window
+                .checked_div(fraction)
+                .unwrap_or(0)
+                .min(max_input_tokens.unwrap_or(u64::MAX))
+                .min((crate::cli_runtime::context::MAX_CLI_TURN_INPUT_FRAME_BYTES / 8) as u64)
+                .max(1);
+            let fixed_input_tokens = limits.context_window.saturating_sub(desired);
+            let codex_history_budget = codex_history_budget
+                .map(|budget| budget.with_token_target(desired, fraction));
+            let transfer_store = ordinary_history_store(self.crud_store.as_ref());
+            let owner = std::sync::Arc::new(self.clone());
+            let hub = std::sync::Arc::new(pioneer_runtime_events::ExecutionEventHub::new());
+            let mut progress = hub.subscribe_live();
+            let observer = std::sync::Arc::new(crate::compaction::HubCompactionObserver {
+                hub: hub.clone(),
+                processor: std::sync::Arc::downgrade(&owner),
+                lifecycle_store: transfer_store.clone(),
+                workspace: workspace_id.to_owned(),
+                thread: thread_id.to_owned(),
+                turn: active_turn_id.to_owned(),
+            });
+            let mut diagnostic = pioneer_crud::compaction::HistoryCheckDiagnostic::default();
+            // This transfer blocks the current turn. Its history registration and
+            // checkpoint writes use the request's ordinary class even when a Task
+            // correctness transition gave this processor Critical writes.
+            let outcome = {
+                let work = crate::compaction::prepare_completed_history_owned(
+                    self,
+                    &transfer_store,
+                    workspace_id,
+                    thread_id,
+                    active_turn_id,
+                    &current,
+                    &settings,
+                    cli_override.as_ref(),
+                    observer,
+                    cancellation.clone(),
+                    crate::compaction::ContextWorkPriority::Foreground,
+                    Some(deadline_ms),
+                    None,
+                    fixed_input_tokens,
+                    codex_history_budget,
+                    std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                    Some(accepted),
+                    &mut diagnostic,
+                );
+                tokio::pin!(work);
+                #[cfg(test)]
+                let mut observed_progress = false;
+                'work: loop {
+                    #[cfg(test)]
+                    if observed_progress {
+                        self.completed_history_preparation_barrier
+                            .wait_if_armed("__cli_before_outer_poll__", &cancellation)
+                            .await;
+                    }
+                    tokio::select! { biased;
+                        cancelled = &mut monitor => {
+                            drop(monitor);
+                            #[cfg(test)]
+                            self.cli_history_monitor_cleanup_drops.store(
+                                self.cli_history_monitor_drops.load(Ordering::SeqCst),
+                                Ordering::SeqCst,
+                            );
+                            cancellation.cancel();
+                            let _ = work.await;
+                            break 'work Err(cancelled.err().unwrap_or_else(|| anyhow::anyhow!("CLI history monitor ended unexpectedly")));
+                        },
+                        _ = &mut deadline => {
+                            drop(monitor);
+                            #[cfg(test)]
+                            self.cli_history_monitor_cleanup_drops.store(
+                                self.cli_history_monitor_drops.load(Ordering::SeqCst),
+                                Ordering::SeqCst,
+                            );
+                            cancellation.cancel();
+                            let _ = work.await;
+                            break 'work Err(anyhow::anyhow!("CLI history preparation exceeded the turn deadline"));
+                        },
+                        event = progress.recv() => if let Ok(event) = event {
+                            #[cfg(test)]
+                            if matches!(&event, pioneer_protocol::AgentProgressEvent::ItemHeartbeat { .. }) {
+                                self.completed_history_preparation_barrier
+                                    .wait_if_armed("__cli_before_progress_update__", &cancellation)
+                                    .await;
+                            }
+                            enum ProgressRace<T> {
+                                Updated,
+                                Finished(T),
+                                Stopped(anyhow::Error),
+                            }
+                            let mut update = Box::pin(self.handle_progress_agent_event(event));
+                            let race =
+                                tokio::select! { biased;
+                                    cancelled = &mut monitor => {
+                                        ProgressRace::Stopped(cancelled.err().unwrap_or_else(|| anyhow::anyhow!("CLI history monitor ended unexpectedly")))
+                                    },
+                                    _ = &mut deadline => {
+                                        ProgressRace::Stopped(anyhow::anyhow!("CLI history preparation exceeded the turn deadline"))
+                                    },
+                                    outcome = &mut work => ProgressRace::Finished(outcome),
+                                    _ = &mut update => ProgressRace::Updated,
+                                };
+                            // This is the owned future. Dropping only a Pin<&mut _>
+                            // would leave a writer reservation alive while the
+                            // cancelled runner needs that writer for cleanup.
+                            drop(update);
+                            match race {
+                                ProgressRace::Updated => {
+                                    #[cfg(test)]
+                                    { observed_progress = true; }
+                                },
+                                ProgressRace::Finished(outcome) => {
+                                    drop(monitor);
+                                    break 'work outcome;
+                                },
+                                ProgressRace::Stopped(error) => {
+                                    drop(monitor);
+                                    #[cfg(test)]
+                                    self.cli_history_monitor_cleanup_drops.store(
+                                        self.cli_history_monitor_drops.load(Ordering::SeqCst),
+                                        Ordering::SeqCst,
+                                    );
+                                    cancellation.cancel();
+                                    let _ = work.await;
+                                    break 'work Err(error);
+                                }
+                            }
+                        },
+                        outcome = &mut work => {
+                            drop(monitor);
+                            break 'work outcome;
+                        },
+                    }
+                }
+            };
+            hub.shutdown_progress().await;
+            let outcome = outcome?;
+            anyhow::ensure!(
+                matches!(
+                    outcome,
+                    pioneer_crud::compaction::HistoryCheckOutcome::Compacted
+                        | pioneer_crud::compaction::HistoryCheckOutcome::Fits
+                ),
+                "CLI history preparation could not publish a usable checkpoint: {} ({})",
+                outcome.as_str(),
+                diagnostic.code,
+            );
+            Ok(())
+        })
+        .await
+    }
+
     async fn compile_cli_runtime_delivery_plan_for_turn(
         &self,
         runtime_id: &str,
         runtime_kind: CLIAgentRuntimeKind,
         outcome: &crate::thread::TurnStartOutcome,
         continuation_thread_id: &str,
-        context_thread_id: &str,
+        bootstrap_provider_context: bool,
         mcp_projection: Option<&crate::turn_mcp::ResolvedMcpTurnProjection>,
+        initiating_thread_id: &str,
         selected_skill_names: &[String],
-        frozen_history: Option<&[ChatMessage]>,
-    ) -> anyhow::Result<pioneer_promt::CompiledInstructionDeliveryPlan> {
-        let native_cwd = self
-            .crud_store
-            .get_cli_runtime_thread_binding(continuation_thread_id)
-            .await?
-            .and_then(|binding| binding.native_cwd);
-        let history = match frozen_history {
-            Some(history) => history.to_vec(),
-            None => {
-                self.load_conversation_history_for_workspace(
-                    outcome.started_notification.workspace_id.as_str(),
-                    context_thread_id,
-                    outcome.started_notification.turn.id.as_str(),
-                )
-                .await
+        continuation_context_basis: Option<
+            &crate::cli_runtime::thread_binding::CliRuntimeContextBasis,
+        >,
+        input_mapping: &mut pioneer_cli_agent_runtime::input::CLIRuntimeTurnInputMapping,
+        runtime_cwd: &str,
+        max_input_tokens: Option<u64>,
+        remaining_compactions: u32,
+        history_deadline_ms: u64,
+    ) -> anyhow::Result<PreparedCliRuntimeDelivery> {
+        scope_current_stage(Stage::CliDeliveryPlan, async {
+            let original_input = input_mapping.clone();
+            let persisted_binding = self
+                .crud_store
+                .get_cli_runtime_thread_binding(continuation_thread_id)
+                .await?;
+            let native_cwd = persisted_binding
+                .as_ref()
+                .and_then(|binding| binding.native_cwd.clone())
+                .or_else(|| Some(runtime_cwd.to_owned()));
+            let permission_profile =
+                self.materialized_turn_permission_profile(&outcome.materialization.turn)?;
+            let pending_turn = crate::cli_runtime::thread_binding::CliRuntimeDeliveredTurn {
+                turn_id: outcome.started_notification.turn.id.clone(),
+                thread_id: Some(outcome.started_notification.thread_id.clone()),
+                message_revision: outcome.started_notification.turn.message_revision,
+                message_deleted: outcome.started_notification.turn.message_deleted,
+            };
+            let (history, mut sent_context_basis, mut accepted_projection) =
+                if bootstrap_provider_context {
+                    // One authoritative preparation supplies the bytes sent to the
+                    // provider, their exact direct sources, and the separately
+                    // accepted authority boundary. Keeping those together prevents an
+                    // edit between preparation and completion from being mistaken for
+                    // delivered context without reviving covered raw leaves.
+                    let accepted = self
+                        .capture_cli_transfer_projection(
+                            outcome.started_notification.workspace_id.as_str(),
+                            outcome.started_notification.thread_id.as_str(),
+                            outcome.started_notification.turn.id.as_str(),
+                            history_deadline_ms,
+                        )
+                        .await?;
+                    let direct_sources = crate::compaction::frozen::frozen_history_projection_sources(
+                        self.crud_store.as_ref(),
+                        outcome.started_notification.workspace_id.as_str(),
+                        &accepted.descriptor,
+                        Some(&accepted.messages),
+                    )
+                    .await?;
+                    let history = self
+                        .materialize_historical_artifacts(
+                            outcome.started_notification.workspace_id.as_str(),
+                            accepted.messages.clone(),
+                        )
+                        .await?;
+                    let completed = crate::cli_runtime::thread_binding::cli_runtime_context_basis(
+                        outcome.started_notification.thread_id.as_str(),
+                        outcome.started_notification.thread_id.as_str(),
+                        serde_json::to_string(&accepted.descriptor)?,
+                        &direct_sources,
+                    );
+                    (
+                        Some(history),
+                        Some(
+                            crate::cli_runtime::thread_binding::CliRuntimeSentContextBasis {
+                                completed,
+                                pending_turn: pending_turn.clone(),
+                            },
+                        ),
+                        Some(accepted),
+                    )
+                } else {
+                    // A completed provider turn can outlive the separate receipt
+                    // update. Its durable sent mapping is newer than a start-only
+                    // cursor carrying the previous completed basis.
+                    let mut completed = continuation_context_basis.cloned();
+                    if completed.is_none() {
+                        completed = persisted_binding
+                        .as_ref()
+                        .map(crate::cli_runtime::thread_binding::completed_context_basis_from_binding)
+                        .transpose()?
+                        .flatten();
+                    }
+                    if completed.is_none()
+                        && let Some(binding) = persisted_binding.as_ref()
+                        && let Some((source_turn_id, boundary)) =
+                            crate::cli_runtime::thread_binding::prepared_child_fork_source(binding)?
+                    {
+                        let source = self
+                            .crud_store
+                            .get_cli_runtime_turn_binding(source_turn_id.as_str())
+                            .await?
+                            .context("prepared CLI fork source turn is missing")?;
+                        let verified_fork = if runtime_kind == CLIAgentRuntimeKind::Claude {
+                            crate::cli_runtime::thread_binding::binding_has_prepared_claude_fork(
+                                self.crud_store.as_ref(),
+                                binding,
+                                &source,
+                            )
+                            .await?
+                        } else {
+                            crate::cli_runtime::thread_binding::binding_has_prepared_child_fork(
+                                binding, &source,
+                            )?
+                        };
+                        anyhow::ensure!(
+                            verified_fork
+                                && (runtime_kind == CLIAgentRuntimeKind::Claude
+                                    || source.native_turn_id.as_deref() == Some(boundary.as_str())),
+                            "prepared CLI fork source or boundary changed"
+                        );
+                        completed =
+                        crate::cli_runtime::thread_binding::completed_context_basis_from_turn_binding(
+                            self.crud_store.as_ref(),
+                            &source,
+                        )
+                        .await?;
+                    }
+                    let basis = completed.map(|completed| {
+                        crate::cli_runtime::thread_binding::CliRuntimeSentContextBasis {
+                            completed,
+                            pending_turn,
+                        }
+                    });
+                    (None, basis, None)
+                };
+            let continuity_hold = if accepted_projection.is_none() {
+                if let Some(sent) = &sent_context_basis {
+                    crate::compaction::frozen::acquire_history_json(self.crud_store.as_ref(),
+                        outcome.started_notification.workspace_id.as_str(), &sent.completed.history_json).await?
+                } else { None }
+            } else { None };
+            if continuation_thread_id != outcome.started_notification.thread_id
+                && let Some(sent) = sent_context_basis.as_mut()
+            {
+                // A Composer service child sends the parent launch's current
+                // input. Record both the launch and its occurrence in the same
+                // inherited guard; later edits of either cannot be hidden by a
+                // successful newer provider turn.
+                if let Some(run_turn) = self
+                    .crud_store
+                    .get_task_run_turn_by_turn(
+                        outcome.started_notification.thread_id.as_str(),
+                        outcome.started_notification.turn.id.as_str(),
+                    )
+                    .await?
+                    && let Some(run) = self
+                        .crud_store
+                        .get_task_run(run_turn.run_id.as_str())
+                        .await?
+                    && let Some(task) = self
+                        .crud_store
+                        .get_task_record(run.task_id.as_str())
+                        .await?
+                    && let Some(work) = task
+                        .metadata
+                        .as_ref()
+                        .and_then(|metadata| metadata.composer_work.as_ref())
+                {
+                    let (_, launch) = self
+                        .crud_store
+                        .get_turn(continuation_thread_id, work.launch.turn_id.as_str())
+                        .await?
+                        .context("Composer launch is missing from continuation parent")?;
+                    let (_, occurrence) = self
+                        .crud_store
+                        .get_turn(continuation_thread_id, run.id.as_str())
+                        .await?
+                        .context("Composer occurrence is missing from continuation parent")?;
+                    anyhow::ensure!(
+                        occurrence.turn_kind == pioneer_protocol::TurnKind::TaskRun,
+                        "Composer occurrence is not a TaskRun turn"
+                    );
+                    for turn in [&launch, &occurrence] {
+                        if sent.completed.delivered_turns.iter().all(|delivered| {
+                            delivered.turn_id != turn.id
+                                || delivered.thread_id.as_deref() != Some(continuation_thread_id)
+                        }) {
+                            sent.completed.delivered_turns.push(
+                                crate::cli_runtime::thread_binding::CliRuntimeDeliveredTurn {
+                                    turn_id: turn.id.clone(),
+                                    thread_id: Some(continuation_thread_id.to_owned()),
+                                    message_revision: turn.message_revision,
+                                    message_deleted: turn.message_deleted,
+                                },
+                            );
+                        }
+                    }
+                }
             }
-        };
-        let permission_profile =
-            self.materialized_turn_permission_profile(&outcome.materialization.turn)?;
-        crate::cli_runtime::context::compile_cli_runtime_delivery_plan(
-            self.artifact_runtime_home.as_path(),
-            crate::cli_runtime::context::CLIRuntimeContextBuildInput {
-                workspace_id: outcome.started_notification.workspace_id.as_str(),
-                thread_id: context_thread_id,
-                turn_id: outcome.started_notification.turn.id.as_str(),
-                runtime_id,
-                runtime_label: cli_runtime_context_label(runtime_kind),
+            let plan = stage_sync(Stage::CliContextBuild, || crate::cli_runtime::context::compile_cli_runtime_delivery_plan(
+                self.artifact_runtime_home.as_path(),
+                crate::cli_runtime::context::CLIRuntimeContextBuildInput {
+                    workspace_id: outcome.started_notification.workspace_id.as_str(),
+                    thread_id: outcome.started_notification.thread_id.as_str(),
+                    initiating_thread_id,
+                    turn_id: outcome.started_notification.turn.id.as_str(),
+                    runtime_id,
+                    runtime_label: cli_runtime_context_label(runtime_kind),
+                    runtime_kind,
+                    model: Some(outcome.materialization.thread.model.as_str()),
+                    cwd: native_cwd.as_deref(),
+                    permission_profile: permission_profile.clone(),
+                    history: history.as_deref(),
+                    selected_skill_names,
+                    selected_capabilities:
+                        crate::cli_runtime::context::cli_runtime_mcp_capabilities_input(mcp_projection),
+                },
+            ))?;
+            crate::cli_runtime::context::prepend_cli_turn_context_and_history_input(
+                input_mapping,
+                &plan,
+                history.as_deref(),
+                outcome.started_notification.workspace_id.as_str(),
+                native_cwd.as_deref(),
+                cli_runtime_context_label(runtime_kind),
+            )?;
+            // The adapter serializes the complete frame. On a provider switch,
+            // publish a canonical whole-round checkpoint and recapture its
+            // projection before trying again. Never reduce the current input.
+            let validation = stage_sync(Stage::CliContextValidate, || crate::cli_runtime::context::validate_cli_runtime_turn_input_frame(
+                input_mapping,
+                &plan,
+                max_input_tokens,
                 runtime_kind,
-                model: Some(outcome.materialization.thread.model.as_str()),
-                cwd: native_cwd.as_deref(),
-                permission_profile,
-                history: history.as_slice(),
-                selected_skill_names,
-                selected_capabilities:
-                    crate::cli_runtime::context::cli_runtime_mcp_capabilities_input(mcp_projection),
-            },
-        )
+            ));
+            if let Err(error) = validation {
+                if bootstrap_provider_context && remaining_compactions > 0 {
+                    let current_plan = stage_sync(Stage::CliContextBuild, || crate::cli_runtime::context::compile_cli_runtime_delivery_plan(
+                        self.artifact_runtime_home.as_path(),
+                        crate::cli_runtime::context::CLIRuntimeContextBuildInput {
+                            workspace_id: outcome.started_notification.workspace_id.as_str(),
+                            thread_id: outcome.started_notification.thread_id.as_str(),
+                            initiating_thread_id,
+                            turn_id: outcome.started_notification.turn.id.as_str(),
+                            runtime_id,
+                            runtime_label: cli_runtime_context_label(runtime_kind),
+                            runtime_kind,
+                            model: Some(outcome.materialization.thread.model.as_str()),
+                            cwd: native_cwd.as_deref(),
+                            permission_profile,
+                            history: None,
+                            selected_skill_names,
+                            selected_capabilities:
+                                crate::cli_runtime::context::cli_runtime_mcp_capabilities_input(
+                                    mcp_projection,
+                                ),
+                        },
+                    ))?;
+                    let mut current_only = original_input.clone();
+                    crate::cli_runtime::context::prepend_cli_turn_context_input(
+                        &mut current_only,
+                        &current_plan,
+                        cli_runtime_context_label(runtime_kind),
+                    );
+                    stage_sync(Stage::CliContextValidate, || crate::cli_runtime::context::validate_cli_runtime_turn_input_frame(
+                        &current_only,
+                        &current_plan,
+                        max_input_tokens,
+                        runtime_kind,
+                    ))
+                    .context("current CLI input, attachment, or launch instructions cannot fit in one request")?;
+                    let codex_history_budget = if runtime_kind == CLIAgentRuntimeKind::Codex {
+                        crate::cli_runtime::context::CodexTransferHistoryBudget::from_prepared_input(
+                            input_mapping,
+                            &current_only,
+                        )
+                    } else {
+                        None
+                    };
+                    let compaction_thread_id = outcome.started_notification.thread_id.as_str();
+                    self.compact_cli_transfer_history(
+                        outcome.started_notification.workspace_id.as_str(),
+                        compaction_thread_id,
+                        outcome.started_notification.turn.id.as_str(),
+                        runtime_id,
+                        runtime_kind,
+                        outcome.materialization.thread.model.as_str(),
+                        max_input_tokens,
+                        3 - remaining_compactions,
+                        history_deadline_ms,
+                        codex_history_budget,
+                        accepted_projection
+                            .take()
+                            .context("CLI transfer projection was lost")?,
+                    )
+                    .await?;
+                    // Fits can reuse an existing summary without publishing a new one.
+                    // Rebuild and validate the actual CLI frame; the bounded retry
+                    // budget still applies if its wire format needs more compression.
+                    *input_mapping = original_input;
+                    return Box::pin(self.compile_cli_runtime_delivery_plan_for_turn(
+                        runtime_id,
+                        runtime_kind,
+                        outcome,
+                        continuation_thread_id,
+                        bootstrap_provider_context,
+                        mcp_projection,
+                        initiating_thread_id,
+                        selected_skill_names,
+                        continuation_context_basis,
+                        input_mapping,
+                        runtime_cwd,
+                        max_input_tokens,
+                        remaining_compactions - 1,
+                        history_deadline_ms,
+                    ))
+                    .await;
+                }
+                return Err(error);
+            }
+            Ok(PreparedCliRuntimeDelivery {
+                frozen_hold: accepted_projection.as_mut().and_then(|prepared| prepared.frozen_hold.take()).or(continuity_hold),
+                plan,
+                sent_context_basis,
+            })
+        })
+        .await
+    }
+
+    pub(crate) async fn materialize_historical_artifacts(
+        &self,
+        workspace_id: &str,
+        mut history: Vec<ChatMessage>,
+    ) -> anyhow::Result<Vec<ChatMessage>> {
+        scope_current_stage(Stage::HistoryArtifacts, async {
+            for (message_index, message) in history.iter_mut().enumerate() {
+                for (part_index, part) in message.content_parts.iter_mut().enumerate() {
+                    let (attachment, expected_image) = match part {
+                        pioneer_provider::MessageContentPart::Image { image } => (image, true),
+                        pioneer_provider::MessageContentPart::File { file } => (file, false),
+                        pioneer_provider::MessageContentPart::Text { .. }
+                        | pioneer_provider::MessageContentPart::Audio { .. }
+                        | pioneer_provider::MessageContentPart::Video { .. } => continue,
+                    };
+                    let Some(artifact) = attachment.artifact.as_ref() else {
+                        continue;
+                    };
+                    if !matches!(
+                        &attachment.source,
+                        pioneer_provider::AttachmentDataSource::Reference { reference }
+                            if reference == &format!("pioneer-artifact:{}", artifact.artifact_id)
+                    ) {
+                        continue;
+                    }
+                    anyhow::ensure!(
+                        artifact.workspace_id.is_empty() || artifact.workspace_id == workspace_id,
+                        "historical attachment {message_index}:{part_index} belongs to another workspace"
+                    );
+                    let version_id = artifact.artifact_version_id.as_deref().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "historical attachment {message_index}:{part_index} has no accepted artifact version"
+                        )
+                    })?;
+                    let resolved = self
+                        .artifact_service
+                        .resolve_provider_attachment(
+                            workspace_id,
+                            artifact.artifact_id.as_str(),
+                            Some(version_id),
+                        )
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "failed to materialize accepted historical artifact `{}` version `{version_id}`",
+                                artifact.artifact_id
+                            )
+                        })?;
+                    anyhow::ensure!(
+                        resolved.version_id.as_deref() == Some(version_id),
+                        "historical artifact resolver changed the accepted version"
+                    );
+                    let resolved_is_image = match resolved.content_type {
+                        pioneer_provider::InputContentType::Image => true,
+                        pioneer_provider::InputContentType::File
+                        | pioneer_provider::InputContentType::Text => false,
+                        pioneer_provider::InputContentType::Audio
+                        | pioneer_provider::InputContentType::Video => anyhow::bail!(
+                            "historical artifact {message_index}:{part_index} has unsupported content type {:?}",
+                            resolved.content_type
+                        ),
+                    };
+                    anyhow::ensure!(
+                        resolved_is_image == expected_image,
+                        "historical attachment kind changed after accepted capture"
+                    );
+                    *attachment = resolved.attachment;
+                }
+            }
+            Ok(history)
+        })
+        .await
     }
 
     async fn persist_cli_runtime_prompt_manifest(
@@ -7490,14 +9759,21 @@ impl MessageProcessor {
         outcome: &crate::thread::TurnStartOutcome,
         user_message_capability_attachments: &[pioneer_protocol::UserMessageAttachment],
     ) -> bool {
-        if let Err(error) = message_future(self.emit_user_message_item_lifecycle(
-            outcome.started_notification.workspace_id.as_str(),
-            outcome.started_notification.thread_id.as_str(),
-            outcome.started_notification.turn.id.as_str(),
-            outcome.materialization.input.as_slice(),
-            user_message_capability_attachments,
-        ))
-        .await
+        // Detached Composer published this lifecycle before Task creation.
+        if !outcome
+            .materialization
+            .thread
+            .origin_kind
+            .composer_execution_mode()
+            .is_detached_admission(&outcome.started_notification.turn)
+            && let Err(error) = message_future(self.emit_user_message_item_lifecycle(
+                outcome.started_notification.workspace_id.as_str(),
+                outcome.started_notification.thread_id.as_str(),
+                outcome.started_notification.turn.id.as_str(),
+                outcome.materialization.input.as_slice(),
+                user_message_capability_attachments,
+            ))
+            .await
         {
             warn!(
                 thread_id = outcome.started_notification.thread_id,
@@ -7606,6 +9882,54 @@ impl MessageProcessor {
             return;
         }
 
+        if turn.status == TurnStatus::Completed && self.agent_manager.has_context_controller().await
+        {
+            // Completed user work remains completed. Stop applies to its owned
+            // context preparation, including an operation recovered after loss
+            // of the in-memory worker. Persist the fence before acknowledging.
+            let stopped = async {
+                self.crud_store
+                    .compaction_stop_execution(
+                        &workspace_id,
+                        &thread_id,
+                        &crate::compaction::native_owner(&workspace_id, &thread_id),
+                        &turn_id,
+                    )
+                    .await?;
+                self.stop_completed_history_check(&workspace_id, &thread_id, &turn_id)
+                    .await;
+                match self
+                    .agent_manager
+                    .cancel_turn(&thread_id, &turn_id, &reason)
+                    .await
+                {
+                    Ok(())
+                    | Err(
+                        pioneer_agent::AgentControlError::ThreadNotFound
+                        | pioneer_agent::AgentControlError::NoActiveTurn
+                        | pioneer_agent::AgentControlError::TurnMismatch,
+                    ) => Ok::<_, anyhow::Error>(()),
+                    Err(error) => Err(anyhow::anyhow!(
+                        "context cancellation was not acknowledged: {error:?}"
+                    )),
+                }
+            }
+            .await;
+            if stopped.is_err() {
+                self.send_error(
+                    connection_id,
+                    public_turn_error(
+                        Some(request_id),
+                        INVALID_REQUEST_CODE,
+                        pioneer_protocol::PublicErrorStage::Persistence,
+                        "failed to stop completed-turn context preparation".to_owned(),
+                    ),
+                )
+                .await;
+                return;
+            }
+        }
+
         if turn.status != TurnStatus::InProgress {
             if turn.status == TurnStatus::Interrupted
                 && !self
@@ -7677,6 +10001,26 @@ impl MessageProcessor {
             return;
         }
 
+        let cli_transition = match self.cli_runtime_turn_resume_transition(&turn_id).await {
+            Ok(transition) => transition.map(Arc::new),
+            Err(error) => {
+                self.user_turn_cancel_intents
+                    .lock()
+                    .await
+                    .remove(&cancel_intent_key);
+                self.send_error(
+                    connection_id,
+                    public_turn_error(
+                        Some(request_id),
+                        INVALID_REQUEST_CODE,
+                        pioneer_protocol::PublicErrorStage::Persistence,
+                        format!("failed to acquire CLI cancellation ownership: {error:#}"),
+                    ),
+                )
+                .await;
+                return;
+            }
+        };
         self.mcp_service
             .cancel_turn_mcp_invocations(turn_id.as_str());
 
@@ -7749,9 +10093,11 @@ impl MessageProcessor {
                 .await;
                 return;
             }
-            self.ensure_cli_runtime_turn_interrupted_cleanup(
+            self.cleanup_cli_runtime_terminal_turn_status_with_transition(
                 &cli_turn_binding,
-                Some(reason.as_str()),
+                TurnStatus::Interrupted,
+                &reason,
+                cli_transition.as_ref(),
             )
             .await;
             self.user_turn_cancel_intents
@@ -7912,6 +10258,23 @@ impl MessageProcessor {
                 binding.thread_id
             );
         }
+        let expected = self
+            .crud_store
+            .cli_runtime_turn_terminal_guard(&binding)
+            .await?;
+        let transition = self
+            .try_cli_runtime_turn_transition(&binding)
+            .await?
+            .context("CLI session cancellation is deferred while its transition is owned")?;
+        anyhow::ensure!(
+            expected.is_some()
+                && self
+                    .crud_store
+                    .cli_runtime_turn_terminal_guard(&binding)
+                    .await?
+                    == expected,
+            "CLI cancellation source changed"
+        );
         self.mcp_service.cancel_turn_mcp_invocations(turn_id);
         if !self
             .mark_turn_interrupted(thread_id.to_owned(), turn_id.to_owned(), reason.to_owned())
@@ -7919,8 +10282,13 @@ impl MessageProcessor {
         {
             anyhow::bail!("failed to interrupt CLI runtime turn `{turn_id}`");
         }
-        self.ensure_cli_runtime_turn_interrupted_cleanup(&binding, Some(reason))
-            .await;
+        self.cleanup_cli_runtime_terminal_turn_status_with_transition(
+            &binding,
+            TurnStatus::Interrupted,
+            reason,
+            Some(&transition),
+        )
+        .await;
         Ok(true)
     }
 
@@ -8134,6 +10502,21 @@ impl MessageProcessor {
                 return;
             }
             None => {
+                let transition = match self.cli_runtime_turn_resume_transition(&turn_id).await {
+                    Ok(transition) => transition,
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request_id),
+                                INVALID_REQUEST_CODE,
+                                format!("failed to acquire CLI resume ownership: {error:#}"),
+                            ),
+                        )
+                        .await;
+                        return;
+                    }
+                };
                 let resumed_job = match self
                     .recovery_coordinator
                     .resume_blocked_turn(
@@ -8171,6 +10554,7 @@ impl MessageProcessor {
                     }
                 };
 
+                drop(transition);
                 match self.recovery_coordinator.run_ready_jobs(now_unix, 16).await {
                     Ok(events) => {
                         for event in events {
@@ -8780,129 +11164,54 @@ impl MessageProcessor {
         runtime_kind: CLIAgentRuntimeKind,
         model_id: &str,
     ) -> Option<ProviderModelInfo> {
-        let instances = match self.load_cli_runtime_instances() {
-            Ok(instances) => instances,
+        let runtime_snapshot = match self
+            .cli_runtime_probe_snapshot(workspace_id, runtime_id)
+            .await
+        {
+            Ok(Some(snapshot)) => snapshot,
+            Ok(None) => {
+                debug!(
+                    workspace_id,
+                    runtime_id, model_id, "CLI runtime readiness is absent for reasoning lookup"
+                );
+                return None;
+            }
             Err(error) => {
                 debug!(
                     workspace_id,
                     runtime_id,
                     model_id,
                     error = %format!("{error:#}"),
-                    "failed to load CLI runtime config for reasoning capability lookup"
+                    "failed to read CLI runtime readiness for reasoning lookup"
                 );
                 return None;
             }
         };
-
-        let Some(instance) = instances
-            .into_iter()
-            .find(|instance| instance.id == runtime_id)
-        else {
-            debug!(
-                workspace_id,
-                runtime_id, model_id, "CLI runtime not found for reasoning capability lookup"
-            );
-            return None;
-        };
-
-        if !cli_runtime_kind_matches_config(runtime_kind, instance.kind) {
+        if runtime_snapshot.summary.kind != runtime_kind
+            || !matches!(runtime_snapshot.summary.status, RuntimeStatus::Ready)
+        {
             debug!(
                 workspace_id,
                 runtime_id,
                 requested_kind = cli_runtime_protocol_kind_label(runtime_kind),
-                configured_kind = cli_runtime_config_kind_label(instance.kind),
+                cached_kind = cli_runtime_protocol_kind_label(runtime_snapshot.summary.kind),
                 model_id,
-                "CLI runtime kind mismatch for reasoning capability lookup"
+                "CLI runtime readiness does not permit reasoning metadata lookup"
             );
             return None;
         }
 
-        let mut models = if instance.enabled {
-            match instance.kind {
-                pioneer_config::GatewayCliAgentRuntimeKindConfig::Codex => {
-                    let probe =
-                        CodexProbe::model_list(codex_account_probe_config_from_instance(&instance))
-                            .await;
-                    if probe.status == CodexModelListProbeStatus::Ready {
-                        probe
-                            .models
-                            .into_iter()
-                            .map(runtime_model_from_codex_snapshot_for_reasoning_lookup)
-                            .collect::<Vec<_>>()
-                    } else {
-                        debug!(
-                            workspace_id,
-                            runtime_id,
-                            model_id,
-                            status = ?probe.status,
-                            "Codex CLI model metadata is unavailable for reasoning lookup"
-                        );
-                        Vec::new()
-                    }
-                }
-                pioneer_config::GatewayCliAgentRuntimeKindConfig::Claude => {
-                    let probe = ClaudeProbe::model_list(
-                        claude_account_probe_config_from_instance(&instance),
-                        &instance.custom_models,
-                    )
-                    .await;
-                    if let Some(error_message) = probe.error_message.as_deref() {
-                        debug!(
-                            workspace_id,
-                            runtime_id,
-                            model_id,
-                            error = error_message,
-                            "Claude CLI model metadata returned diagnostics for reasoning lookup"
-                        );
-                    }
-                    probe
-                        .models
-                        .into_iter()
-                        .map(runtime_model_from_claude_snapshot_for_reasoning_lookup)
-                        .collect::<Vec<_>>()
-                }
-                pioneer_config::GatewayCliAgentRuntimeKindConfig::OpenCode => {
-                    let proxy_url = self
-                        .prepare_cli_runtime_proxy_url(workspace_id, runtime_id)
-                        .await
-                        .ok()
-                        .flatten();
-                    let probe = crate::cli_runtime::opencode_session::probe_opencode_instance(
-                        &instance,
-                        self.artifact_runtime_home.as_path(),
-                        &crate::cli_runtime::config::proxy_env(proxy_url.as_deref()),
-                    )
-                    .await;
-                    if probe.status
-                        != crate::cli_runtime::opencode_session::OpenCodeProbeStatus::Ready
-                    {
-                        debug!(
-                            workspace_id,
-                            runtime_id,
-                            model_id,
-                            status = ?probe.status,
-                            "OpenCode model metadata is unavailable for reasoning lookup"
-                        );
-                        Vec::new()
-                    } else {
-                        probe
-                            .models
-                            .into_iter()
-                            .map(runtime_model_from_opencode_snapshot_for_reasoning_lookup)
-                            .collect::<Vec<_>>()
-                    }
-                }
-            }
-        } else {
+        let Some(model_snapshot) = runtime_snapshot.models else {
             debug!(
                 workspace_id,
-                runtime_id, model_id, "CLI runtime is disabled for reasoning capability lookup"
+                runtime_id, model_id, "Gateway CLI model cache is unavailable for reasoning lookup"
             );
-            Vec::new()
+            return None;
         };
-        append_cli_runtime_custom_models_for_reasoning_lookup(&mut models, &instance.custom_models);
 
-        models
+        model_snapshot
+            .result
+            .models
             .into_iter()
             .find(|model| model.id == model_id)
             .map(|model| {
@@ -9144,101 +11453,6 @@ fn normalized_reasoning_effort_for_comparison(value: &str) -> String {
     reasoning_effort_comparison_key(value)
 }
 
-fn runtime_model_from_codex_snapshot_for_reasoning_lookup(
-    model: CodexModelSnapshot,
-) -> RuntimeModelInfo {
-    RuntimeModelInfo {
-        id: model.id,
-        name: model.name,
-        description: model.description,
-        family: model.family,
-        is_custom: false,
-        active: model.active,
-        effort_options: model.effort_options,
-        input_modalities: model.input_modalities,
-        output_modalities: model.output_modalities,
-        supports_reasoning: model.supports_reasoning,
-        supports_vision: model.supports_vision,
-        max_input_tokens: model.max_input_tokens,
-        max_output_tokens: model.max_output_tokens,
-    }
-}
-
-fn runtime_model_from_claude_snapshot_for_reasoning_lookup(
-    model: ClaudeModelSnapshot,
-) -> RuntimeModelInfo {
-    RuntimeModelInfo {
-        id: model.id,
-        name: model.name,
-        description: model.description,
-        family: model.family,
-        is_custom: false,
-        active: model.active,
-        effort_options: model.effort_options,
-        input_modalities: model.input_modalities,
-        output_modalities: model.output_modalities,
-        supports_reasoning: model.supports_reasoning,
-        supports_vision: model.supports_vision,
-        max_input_tokens: model.max_input_tokens,
-        max_output_tokens: model.max_output_tokens,
-    }
-}
-
-fn runtime_model_from_opencode_snapshot_for_reasoning_lookup(
-    model: crate::cli_runtime::opencode_session::OpenCodeModelSnapshot,
-) -> RuntimeModelInfo {
-    RuntimeModelInfo {
-        id: model.id,
-        name: model.name,
-        description: model.description,
-        family: model.family,
-        is_custom: model.is_custom,
-        active: model.active,
-        effort_options: model.effort_options,
-        input_modalities: model.input_modalities,
-        output_modalities: model.output_modalities,
-        supports_reasoning: model.supports_reasoning,
-        supports_vision: model.supports_vision,
-        max_input_tokens: model.max_input_tokens,
-        max_output_tokens: model.max_output_tokens,
-    }
-}
-
-fn append_cli_runtime_custom_models_for_reasoning_lookup(
-    models: &mut Vec<RuntimeModelInfo>,
-    custom_models: &[String],
-) {
-    let mut seen = models
-        .iter()
-        .map(|model| model.id.clone())
-        .collect::<HashSet<_>>();
-    for raw_model in custom_models {
-        let model_id = raw_model.trim();
-        if model_id.is_empty() || !seen.insert(model_id.to_owned()) {
-            continue;
-        }
-
-        models.push(RuntimeModelInfo {
-            id: model_id.to_owned(),
-            name: Some(model_id.to_owned()),
-            description: Some(
-                "Configured custom CLI runtime model; capability metadata was not reported by the runtime"
-                    .to_owned(),
-            ),
-            family: None,
-            is_custom: true,
-            active: None,
-            effort_options: Vec::new(),
-            input_modalities: Vec::new(),
-            output_modalities: Vec::new(),
-            supports_reasoning: None,
-            supports_vision: None,
-            max_input_tokens: None,
-            max_output_tokens: None,
-        });
-    }
-}
-
 fn provider_model_from_runtime_model_for_reasoning_lookup(
     provider_key: &str,
     model: RuntimeModelInfo,
@@ -9247,6 +11461,7 @@ fn provider_model_from_runtime_model_for_reasoning_lookup(
         .supports_reasoning
         .or_else(|| (!model.effort_options.is_empty()).then_some(true));
     let reasoning = supports_reasoning.map(|supported| ProviderModelReasoningCapabilities {
+        native: Default::default(),
         supported: Some(supported),
         effort_options: model.effort_options.clone(),
         default_effort: None,
@@ -9325,7 +11540,7 @@ fn normalize_cli_runtime_sandbox_label(value: &str) -> String {
         .collect()
 }
 
-fn cli_runtime_provider_key(runtime_id: &str) -> String {
+pub(super) fn cli_runtime_provider_key(runtime_id: &str) -> String {
     format!("cli_runtime:{}", runtime_id.trim())
 }
 
@@ -9436,9 +11651,112 @@ fn cli_runtime_binding_timestamp() -> sea_orm::entity::prelude::DateTimeWithTime
         .expect("current timestamp should be valid")
 }
 
+fn cli_runtime_unavailable_reason(status: &RuntimeStatus) -> &'static str {
+    match status {
+        RuntimeStatus::Disabled => "runtime is disabled",
+        RuntimeStatus::MissingBinary { .. } => "runtime binary is unavailable",
+        RuntimeStatus::SpawnFailed { .. } => "runtime failed to start",
+        RuntimeStatus::Initializing => "Gateway readiness check is still running",
+        RuntimeStatus::NeedsAuth => "runtime authentication is required",
+        RuntimeStatus::Ready => "runtime is ready",
+        RuntimeStatus::Degraded { .. } => "runtime readiness is degraded",
+        RuntimeStatus::UnsupportedVersion { .. } => "runtime version is unsupported",
+        RuntimeStatus::Error { .. } => "runtime readiness check failed",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn task_expected_causes_are_explicit_and_public_admission_does_not_imply_policy() {
+        use crate::public_error::test_support::capture_events;
+        use pioneer_tasks::{TaskStartCause, TaskStartReporting};
+        let (_, events) = capture_events(|| {
+            for (failure, cause, class) in [
+                (
+                    TurnStartFailure::protocol_invalid_input("private validation"),
+                    TaskStartCause::Validation,
+                    pioneer_protocol::TaskErrorClass::Validation,
+                ),
+                (
+                    TurnStartFailure::policy_denied("private policy")
+                        .with_task_cause(TaskStartCause::Policy),
+                    TaskStartCause::Policy,
+                    pioneer_protocol::TaskErrorClass::Policy,
+                ),
+                (
+                    TurnStartFailure::conflict("private conflict"),
+                    TaskStartCause::Refusal,
+                    pioneer_protocol::TaskErrorClass::Internal,
+                ),
+            ] {
+                let (public, failure) = failure.into_task_failure();
+                assert_eq!(failure.reporting(), TaskStartReporting::Reported);
+                assert_eq!(failure.descriptor().cause, cause);
+                assert_eq!(failure.descriptor().task_error(None).class, class);
+                assert_eq!(
+                    failure.descriptor().correlation_id.as_deref(),
+                    Some(public.correlation_id.as_str())
+                );
+            }
+            // Flush local breadcrumbs into an event to check their safe fields.
+            tracing::error!("task refusal breadcrumb checkpoint");
+        });
+        assert_eq!(events.len(), 1, "only the test checkpoint creates an event");
+        assert!(!serde_json::to_string(&events).unwrap().contains("private"));
+        for failure in [
+            TurnStartFailure::internal("private internal"),
+            TurnStartFailure::policy_denied("private unclassified policy"),
+            TurnStartFailure::invalid_input("private unclassified validation"),
+        ] {
+            let ((_, failure), events) = capture_events(|| failure.into_task_failure());
+            assert_eq!(events.len(), 1);
+            assert_eq!(failure.descriptor().cause, TaskStartCause::Unclassified);
+            assert_eq!(
+                failure.descriptor().task_error(None).class,
+                pioneer_protocol::TaskErrorClass::Internal
+            );
+            assert!(!serde_json::to_string(&events).unwrap().contains("private"));
+        }
+    }
+
+    #[test]
+    fn typed_admission_refusals_are_silent_but_unclassified_and_unavailable_failures_are_errors() {
+        use crate::public_error::test_support::*;
+        let request_id = RequestId::new("R".repeat(21)).unwrap();
+        let (_, events) = capture_events(|| {
+            for failure in [
+                TurnStartFailure::protocol_invalid_input("bearer-token /private/path"),
+                TurnStartFailure::conflict("bearer-token /private/path"),
+            ] {
+                let expected_code = failure.public_code;
+                let response = public_turn_start_error(request_id.clone(), failure);
+                assert_eq!(response.error.code, INVALID_REQUEST_CODE);
+                let public: pioneer_protocol::PublicError =
+                    serde_json::from_value(response.error.data.unwrap()["public_error"].clone())
+                        .unwrap();
+                assert_eq!(public.code, expected_code);
+                assert_eq!(public.stage, pioneer_protocol::PublicErrorStage::Admission);
+                assert!(!public.message.contains("bearer-token"));
+                assert!(!public.message.contains("/private/path"));
+            }
+        });
+        assert!(events.is_empty());
+        for failure in [
+            TurnStartFailure::invalid_input("unclassified validation cause"),
+            TurnStartFailure::policy_denied("unclassified policy cause"),
+            TurnStartFailure::internal("cancelled"),
+            TurnStartFailure::unavailable("unknown session"),
+            TurnStartFailure::new(pioneer_protocol::PublicErrorCode::Conflict, "unclassified"),
+            TurnStartFailure::from("unclassified failure".to_owned()),
+        ] {
+            let (public, events) = capture_events(|| failure.into_public_error());
+            assert_eq!(events.len(), 1);
+            assert_correlated(&events[0], &public);
+        }
+    }
 
     #[test]
     fn detached_task_creator_keeps_the_exact_request_actor() {
@@ -9560,6 +11878,7 @@ mod tests {
                     permission_profile: Some(permission_profile.clone()),
                     skill_ids,
                     mcp_server_ids,
+                    selected_capabilities: Vec::new(),
                 },
             }),
             reply_to_turn_id: None,
@@ -9689,11 +12008,156 @@ mod tests {
         }
     }
 
+    #[test]
+    fn documented_claude_off_survives_catalog_selector_and_admission() {
+        use pioneer_provider::catalog::ModelCatalog;
+        for (provider, key, id, template, optional) in [
+            (
+                "anthropic",
+                "anthropic",
+                "claude-opus-4-5-20251101",
+                "claude-opus-4-5",
+                true,
+            ),
+            (
+                "anthropic",
+                "anthropic",
+                "claude-opus-4-6",
+                "claude-opus-4-6",
+                true,
+            ),
+            (
+                "anthropic",
+                "anthropic",
+                "claude-sonnet-5",
+                "claude-opus-4-6",
+                true,
+            ),
+            (
+                "anthropic",
+                "anthropic",
+                "claude-opus-5",
+                "claude-opus-4-6",
+                true,
+            ),
+            (
+                "anthropic",
+                "anthropic",
+                "claude-fable-5-1",
+                "claude-opus-4-6",
+                false,
+            ),
+            (
+                "anthropic",
+                "anthropic",
+                "claude-sonnet-5-5",
+                "claude-opus-4-6",
+                false,
+            ),
+            (
+                "bedrock",
+                "amazon-bedrock",
+                "us.anthropic.claude-opus-4-6-v1",
+                "anthropic.claude-opus-4-6-v1",
+                true,
+            ),
+            (
+                "bedrock",
+                "amazon-bedrock",
+                "anthropic.claude-opus-4-5-20251101-v1:0",
+                "anthropic.claude-opus-4-6-v1",
+                true,
+            ),
+            (
+                "bedrock",
+                "amazon-bedrock",
+                "anthropic.claude-fable-5",
+                "anthropic.claude-opus-4-6-v1",
+                false,
+            ),
+        ] {
+            for kind in [
+                "saved",
+                "missing",
+                "partial",
+                "catalog-veto",
+                "native-veto",
+                "capability-veto",
+            ] {
+                let mut models: serde_json::Value = serde_json::from_str(include_str!(
+                    "../../../provider/tests/fixtures/catalog/models.json"
+                ))
+                .unwrap();
+                let mut provenance: serde_json::Value = serde_json::from_str(include_str!(
+                    "../../../provider/tests/fixtures/catalog/provenance.json"
+                ))
+                .unwrap();
+                if kind == "missing" {
+                    models[key].as_object_mut().unwrap().remove(id);
+                } else if kind != "saved" {
+                    let mut entry = models[key][template].clone();
+                    assert!(entry.get("api").is_some());
+                    entry["id"] = serde_json::json!(id);
+                    entry["thinkingLevelMap"] = if kind == "catalog-veto" {
+                        serde_json::json!({"off":null})
+                    } else {
+                        serde_json::json!({"max":"max"})
+                    };
+                    if kind == "capability-veto" {
+                        entry["reasoning"] = serde_json::json!(false);
+                    }
+                    models[key][id] = entry;
+                    provenance[key][id] = provenance[key][template].clone();
+                }
+                // Saved profiles can explicitly veto off too (Opus 5 has
+                // off:null). A documented optional mode only fills missing
+                // metadata; it cannot override that catalog denial.
+                let catalog_off_veto = models[key][id]["reasoning"] == false
+                    || models[key][id]
+                        .get("thinkingLevelMap")
+                        .and_then(|map| map.get("off"))
+                        .is_some_and(serde_json::Value::is_null);
+                let catalog =
+                    ModelCatalog::parse(&models.to_string(), &provenance.to_string()).unwrap();
+                let mut model = reasoning_test_model(None);
+                model.id = id.into();
+                model.provider = provider.into();
+                if kind == "native-veto" {
+                    model.capabilities.reasoning = Some(ProviderModelReasoningCapabilities {
+                        native: [("thinking.types.disabled".into(), Some(false))]
+                            .into_iter()
+                            .collect(),
+                        ..Default::default()
+                    });
+                }
+                catalog.enrich(provider, std::slice::from_mut(&mut model));
+                let rows = pioneer_client::providers::presentation::reasoning_effort_rows_for_model(
+                    &model, None,
+                );
+                let off_allowed = optional && !catalog_off_veto && kind != "native-veto";
+                assert_eq!(
+                    rows.iter().any(|r| r.effort == "none"),
+                    off_allowed,
+                    "{provider}/{id}/{kind}"
+                );
+                assert_eq!(
+                    validate_reasoning_effort_for_model(provider, id, "none", Some(&model)).is_ok(),
+                    off_allowed
+                );
+                for row in rows {
+                    validate_reasoning_effort_for_model(provider, id, &row.effort, Some(&model))
+                        .unwrap();
+                }
+            }
+        }
+    }
+
     fn reasoning_capabilities(
         supported: Option<bool>,
         effort_options: &[&str],
     ) -> ProviderModelReasoningCapabilities {
         ProviderModelReasoningCapabilities {
+            native: Default::default(),
             supported,
             effort_options: effort_options
                 .iter()

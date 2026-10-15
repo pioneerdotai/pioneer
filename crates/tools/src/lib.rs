@@ -1,4 +1,6 @@
+pub mod apply_patch;
 mod argument_normalizer;
+mod builtin_argument_validator;
 mod classifier;
 mod context;
 mod domain;
@@ -49,7 +51,9 @@ pub use error::ToolError;
 pub use events::{
     DurableToolEventEnvelope, ObservationContext, ToolCallCompletedEvent, ToolCallFailedEvent,
     ToolCallStartedEvent, ToolDeltaPayload, ToolEvent, ToolEventBus, ToolEventKind,
-    ToolEventPayload, ToolEventTrace, ToolOutputDeltaEvent,
+    ToolEventPayload, ToolEventTrace, ToolOutputDeltaEvent, native_patch_history_record,
+    register_native_patch_observer, unregister_native_patch_observer,
+    unregister_native_patch_observers_for_turn,
 };
 pub use file_policy::{
     FilePolicyChecker, FilePolicyDecision, FilePolicyDeny, FilePolicyDenyReason, FilePolicyGrant,
@@ -128,7 +132,7 @@ pub use spec::{
 };
 pub use tool_index::{
     PREFLIGHT_CORE_FILE_TOOL_NAMES, PREFLIGHT_CORE_TOOL_NAMES, PreflightCandidateToolDescriptor,
-    PreflightToolIndex, build_preflight_tool_index,
+    PreflightToolIndex, build_preflight_tool_index, filesystem_catalog_snapshot,
 };
 pub use visibility::{
     FinalToolVisibility, FinalToolVisibilityInput, ToolVisibilityDiagnostic,
@@ -149,10 +153,9 @@ pub use windows_restricted_token_backend::{
 #[cfg(feature = "computer-use")]
 use handlers::materialize_computer_use_domain_bundle;
 
-use handlers::FileObservationStore;
 use handlers::{
-    ApplyPatchHandler, DownloadUrlHandler, EditFileHandler, GrepHandler, ListDirHandler,
-    ReadFileHandler, UnifiedExecHandler, WebFetchHandler, WebSearchHandler, WriteFileHandler,
+    ApplyPatchHandler, DownloadUrlHandler, GrepHandler, ListDirHandler, ReadFileHandler,
+    UnifiedExecHandler, WebFetchHandler, WebSearchHandler,
 };
 use pioneer_protocol::TurnExecutionSecuritySnapshot;
 use std::collections::{BTreeMap, HashSet};
@@ -496,6 +499,15 @@ pub fn build_tools_with_environment_and_security_snapshot(
     };
 
     let mut configured_specs = builtin_tool_specs();
+    if let Some(search) = configured_specs
+        .iter_mut()
+        .find(|configured| configured.spec.name == "web_search")
+    {
+        search.spec.permission_metadata.network_targets = vec![
+            web_tools_config.ddg_html_search_url.clone(),
+            web_tools_config.ddg_instant_api_url.clone(),
+        ];
+    }
     let builtin_tool_names = configured_specs
         .iter()
         .map(|configured| configured.spec.name.clone())
@@ -555,21 +567,9 @@ pub fn build_tools_with_environment_and_security_snapshot(
     }
 
     let unified_exec_handler = Arc::new(UnifiedExecHandler::default());
-    let file_observation_store = Arc::new(FileObservationStore::default());
     builder.register_handler("exec_command", unified_exec_handler.clone());
     builder.register_handler("write_stdin", unified_exec_handler);
-    builder.register_handler(
-        "read_file",
-        Arc::new(ReadFileHandler::new(file_observation_store.clone())),
-    );
-    builder.register_handler(
-        "write_file",
-        Arc::new(WriteFileHandler::new(file_observation_store.clone())),
-    );
-    builder.register_handler(
-        "edit_file",
-        Arc::new(EditFileHandler::new(file_observation_store.clone())),
-    );
+    builder.register_handler("read_file", Arc::new(ReadFileHandler));
     builder.register_handler("list_dir", Arc::new(ListDirHandler));
     builder.register_handler("grep_files", Arc::new(GrepHandler));
     builder.register_handler("apply_patch", Arc::new(ApplyPatchHandler));
@@ -603,7 +603,13 @@ pub fn build_tools_with_environment_and_security_snapshot(
 
     let (configured_specs, registry) = builder.build();
 
-    let event_bus = ToolEventBus::default();
+    let event_bus = ToolEventBus::with_thread_id(
+        512,
+        permission_context
+            .thread_id
+            .clone()
+            .unwrap_or_else(|| "unbound-thread".to_owned()),
+    );
 
     let router = Arc::new(ToolRouter::new_with_blocked_tool_names(
         configured_specs,
@@ -698,11 +704,19 @@ fn validate_permission_context(
 #[cfg(test)]
 mod tests {
     use super::{
-        BuildToolsError, BuiltinTools, ComputerUseToolsConfig, ToolExtensionBundle, WebToolsConfig,
+        BuildToolsError, BuiltinTools, ComputerUseToolsConfig, DynamicToolOutputPolicyCaps,
+        McpDynamicToolAnnotations, McpDynamicToolDescriptor, McpToolCallOutput, McpToolCallRequest,
+        McpToolExecutor, SkillDynamicToolDescriptor, SkillDynamicToolKind, ToolExtensionBundle,
+        WebToolsConfig, materialize_mcp_runtime_tools, materialize_skill_runtime_tools,
     };
     use crate::context::{FunctionToolOutput, ToolInvocation};
     use crate::events::ToolEventTrace;
     use crate::output_policy::dynamic_unknown_output_policy;
+    use crate::permissions::{
+        PermissionActionKind, PermissionApprovalBroker, PermissionApprovalResolution,
+        PermissionDecisionReason, PermissionEvaluationContext, PermissionIntent,
+        PermissionRequestKey,
+    };
     use crate::registry::ToolHandler;
     use crate::router::RawToolCall;
     use crate::spec::{
@@ -711,7 +725,11 @@ mod tests {
     use async_trait::async_trait;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio::sync::Notify;
 
     #[derive(Default)]
     struct EchoHandler;
@@ -731,6 +749,63 @@ mod tests {
         calls: Arc<AtomicUsize>,
     }
 
+    struct RecordingApprovalBroker {
+        actions: Arc<Mutex<Vec<PermissionActionKind>>>,
+    }
+
+    struct RecordingMcpExecutor {
+        calls: Arc<Mutex<Vec<McpToolCallRequest>>>,
+    }
+
+    struct RecordingEffectHandler {
+        calls: Arc<Mutex<Vec<String>>>,
+    }
+
+    struct CancellationObservingHandler {
+        started: Arc<Notify>,
+        cancellation_observed: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl PermissionApprovalBroker for RecordingApprovalBroker {
+        async fn request_approval(
+            &self,
+            _context: &PermissionEvaluationContext,
+            _invocation: &ToolInvocation,
+            intent: &PermissionIntent,
+            _key: &PermissionRequestKey,
+            _reason: PermissionDecisionReason,
+        ) -> PermissionApprovalResolution {
+            self.actions
+                .lock()
+                .expect("approval actions")
+                .push(intent.action);
+            PermissionApprovalResolution::AllowOnce
+        }
+    }
+
+    #[async_trait]
+    impl McpToolExecutor for RecordingMcpExecutor {
+        async fn call_mcp_tool(
+            &self,
+            request: McpToolCallRequest,
+            _trace: ToolEventTrace,
+            _cancellation: tokio_util::sync::CancellationToken,
+        ) -> Result<McpToolCallOutput, crate::error::ToolError> {
+            self.calls.lock().expect("MCP calls").push(request);
+            Ok(McpToolCallOutput {
+                content: serde_json::json!([{
+                    "type": "text",
+                    "text": "nested-mcp-ok"
+                }]),
+                structured_content: Some(serde_json::json!({"status": "nested-mcp-ok"})),
+                is_error: false,
+                duration_ms: 1,
+                meta: None,
+            })
+        }
+    }
+
     #[async_trait]
     impl ToolHandler for CountingHandler {
         async fn handle(
@@ -740,6 +815,46 @@ mod tests {
         ) -> Result<Box<dyn crate::context::ToolOutput>, crate::error::ToolError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(Box::new(FunctionToolOutput::new("ok", true)))
+        }
+    }
+
+    #[async_trait]
+    impl ToolHandler for RecordingEffectHandler {
+        async fn handle(
+            &self,
+            invocation: ToolInvocation,
+            _trace: ToolEventTrace,
+        ) -> Result<Box<dyn crate::context::ToolOutput>, crate::error::ToolError> {
+            self.calls
+                .lock()
+                .expect("effect calls")
+                .push(invocation.tool_name);
+            Ok(Box::new(FunctionToolOutput::with_payload(
+                "effect-ok",
+                true,
+                serde_json::json!({"status": "effect-ok"}),
+            )))
+        }
+    }
+
+    #[async_trait]
+    impl ToolHandler for CancellationObservingHandler {
+        async fn handle(
+            &self,
+            invocation: ToolInvocation,
+            _trace: ToolEventTrace,
+        ) -> Result<Box<dyn crate::context::ToolOutput>, crate::error::ToolError> {
+            let cancellation = invocation.cancellation.clone();
+            let observed = self.cancellation_observed.clone();
+            tokio::spawn(async move {
+                cancellation.cancelled().await;
+                observed.store(true, Ordering::SeqCst);
+            });
+            self.started.notify_one();
+            std::future::pending::<
+                Result<Box<dyn crate::context::ToolOutput>, crate::error::ToolError>,
+            >()
+            .await
         }
     }
 
@@ -834,41 +949,952 @@ mod tests {
         )
     }
 
-    fn tools_runtime_temp_dir(prefix: &str) -> std::path::PathBuf {
-        let now_nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|duration| duration.as_nanos())
-            .unwrap_or(0);
-        let path = std::env::temp_dir().join(format!(
-            "pioneer_tools_{prefix}_{}_{}",
-            std::process::id(),
-            now_nanos
-        ));
-        std::fs::create_dir_all(path.as_path()).expect("tools runtime temp dir should exist");
-        path
+    fn dynamic_skill_descriptor(
+        canonical_tool_name: &str,
+        skill_asset_root: &Path,
+        kind: SkillDynamicToolKind,
+        config: serde_json::Value,
+    ) -> SkillDynamicToolDescriptor {
+        SkillDynamicToolDescriptor {
+            canonical_tool_name: canonical_tool_name.to_owned(),
+            skill_id: pioneer_protocol::SkillId::new("S".repeat(21))
+                .expect("valid dynamic skill id"),
+            skill_owner: Some("workspace_test".to_owned()),
+            skill_slug: "runtime-consent".to_owned(),
+            skill_asset_root: skill_asset_root.to_string_lossy().into_owned(),
+            skill_fingerprint: "f".repeat(64),
+            source_kind: pioneer_skills::SkillSourceKind::User,
+            trust_level: pioneer_skills::SkillTrustLevel::Internal,
+            description: "Dynamic consent test".to_owned(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "additionalProperties": true
+            }),
+            execution_class: ExecutionClass::Shared,
+            kind,
+            config,
+            requested_output_policy: None,
+        }
     }
 
-    async fn execute_builtin_json_call(
-        built: &BuiltinTools,
-        call_id: &str,
-        tool_name: &str,
-        arguments: serde_json::Value,
-    ) -> crate::context::AnyToolResult {
-        let call = built
-            .router
-            .build_model_tool_call(RawToolCall {
-                call_id: call_id.to_owned(),
-                tool_name: tool_name.to_owned(),
-                arguments: arguments.to_string(),
-            })
-            .await
-            .expect("model tool call should build");
+    fn supervised_test_context(turn_id: &str) -> PermissionEvaluationContext {
+        PermissionEvaluationContext::for_turn(
+            "workspace_test",
+            "thread_test",
+            turn_id,
+            pioneer_protocol::TurnPermissionProfileSnapshot::from_mode(
+                pioneer_protocol::TurnPermissionMode::Supervised,
+                pioneer_protocol::TurnPermissionProfileSource::Composer,
+            ),
+        )
+    }
 
-        built
+    fn supervised_native_snapshot(
+        workspace: &Path,
+        app_read_root: Option<&Path>,
+    ) -> pioneer_protocol::TurnExecutionSecuritySnapshot {
+        let mut entries = vec![
+            pioneer_protocol::TurnFilesystemSandboxEntry::workspace_root(
+                pioneer_protocol::TurnFilesystemAccess::Read,
+                workspace.to_string_lossy(),
+            ),
+        ];
+        if let Some(root) = app_read_root {
+            entries.push(pioneer_protocol::TurnFilesystemSandboxEntry {
+                path: pioneer_protocol::TurnFilesystemSandboxPath::ExplicitPath {
+                    path: root.to_string_lossy().into_owned(),
+                },
+                access: pioneer_protocol::TurnFilesystemAccess::Read,
+                provenance: pioneer_protocol::TurnSecurityRuleProvenance::Runtime,
+                resolved_path: Some(root.to_string_lossy().into_owned()),
+            });
+        }
+        pioneer_protocol::TurnExecutionSecuritySnapshot::read_only(
+            pioneer_protocol::TurnPermissionProfileSnapshot::from_mode(
+                pioneer_protocol::TurnPermissionMode::Supervised,
+                pioneer_protocol::TurnPermissionProfileSource::Composer,
+            ),
+            workspace.to_string_lossy(),
+            entries,
+            1,
+        )
+    }
+
+    async fn one_response_http_server(body: &'static str) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("dynamic-tool test listener");
+        let address = listener.local_addr().expect("dynamic-tool test address");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("dynamic-tool request");
+            let mut request = [0_u8; 2048];
+            let _ = stream.read(&mut request).await.expect("read request");
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("write response");
+        });
+        (
+            format!("http://localhost:{}/nested", address.port()),
+            server,
+        )
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn dynamic_shell_uses_one_semantic_prompt_and_real_native_sandbox() {
+        if !nono::Sandbox::is_supported() {
+            return;
+        }
+
+        let current = std::env::current_dir().expect("test cwd");
+        let fixture = tempfile::tempdir_in(current).expect("dynamic shell fixture");
+        let workspace = fixture.path().join("workspace");
+        let skill_root = fixture.path().join("skills/workspace_test/runtime-consent");
+        std::fs::create_dir_all(workspace.as_path()).expect("workspace");
+        std::fs::create_dir_all(skill_root.as_path()).expect("skill root");
+        let script = skill_root.join("run.sh");
+        std::fs::write(
+            script.as_path(),
+            "#!/bin/sh\nprintf 'dynamic-ok' > dynamic-output.txt\n",
+        )
+        .expect("dynamic skill script");
+
+        let tool_name = "skill.SSSSSSSSSSSSSSSSSSSSS.shell";
+        let materialization = materialize_skill_runtime_tools(
+            &[dynamic_skill_descriptor(
+                tool_name,
+                skill_root.as_path(),
+                SkillDynamicToolKind::Shell,
+                serde_json::json!({
+                    "command": ["/bin/sh", "${skill_asset_root}/run.sh"]
+                }),
+            )],
+            None,
+            DynamicToolOutputPolicyCaps::default(),
+        );
+        assert!(materialization.excluded_tools.is_empty());
+        let actions = Arc::new(Mutex::new(Vec::new()));
+        let mut snapshot =
+            supervised_native_snapshot(workspace.as_path(), Some(skill_root.as_path()));
+        snapshot.authority_cap.filesystem = pioneer_protocol::TurnFilesystemSandboxPolicy {
+            kind: pioneer_protocol::TurnFilesystemSandboxKind::Restricted,
+            entries: vec![
+                pioneer_protocol::TurnFilesystemSandboxEntry::workspace_root(
+                    pioneer_protocol::TurnFilesystemAccess::Write,
+                    workspace.to_string_lossy(),
+                ),
+            ],
+        };
+        let tools = super::build_tools_with_environment_and_security_snapshot(
+            workspace.clone(),
+            "turn_dynamic_shell_consent",
+            supervised_test_context("turn_dynamic_shell_consent"),
+            test_web_config(),
+            test_computer_use_config(),
+            materialization.bundles.clone(),
+            std::collections::BTreeMap::new(),
+            Some(snapshot),
+        )
+        .expect("dynamic shell tools should build")
+        .with_permission_approval_broker(Arc::new(RecordingApprovalBroker {
+            actions: actions.clone(),
+        }));
+        materialization
+            .bind_function_proxy_runtime(tools.router.clone(), tools.runtime.clone())
+            .await;
+        let call = tools
+            .router
+            .build_tool_call(RawToolCall {
+                call_id: "call_dynamic_shell_consent".to_owned(),
+                tool_name: tool_name.to_owned(),
+                arguments: "{}".to_owned(),
+            })
+            .expect("dynamic shell call");
+
+        let result = tools
             .runtime
             .execute_tool_call(call)
             .await
-            .expect("tool call should execute")
+            .expect("approved dynamic shell should execute");
+
+        assert!(result.success(), "{}", result.raw_output_text());
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("dynamic-output.txt"))
+                .expect("dynamic shell output"),
+            "dynamic-ok"
+        );
+        assert_eq!(
+            *actions.lock().expect("approval actions"),
+            vec![PermissionActionKind::ShellCommand],
+            "the non-effectful skill wrapper must not create a second prompt"
+        );
+    }
+
+    #[tokio::test]
+    async fn dynamic_function_proxy_prompts_once_for_target_file_read_and_applies_grant() {
+        let fixture = tempfile::tempdir().expect("dynamic proxy fixture");
+        let workspace = fixture.path().join("workspace");
+        let outside = fixture.path().join("outside");
+        let skill_root = fixture.path().join("skill");
+        std::fs::create_dir_all(workspace.as_path()).expect("workspace");
+        std::fs::create_dir_all(outside.as_path()).expect("outside");
+        std::fs::create_dir_all(skill_root.as_path()).expect("skill root");
+        let outside_file = outside.join("approved.txt");
+        std::fs::write(outside_file.as_path(), "proxy-approved\n").expect("outside file");
+
+        let tool_name = "skill.SSSSSSSSSSSSSSSSSSSSS.proxy";
+        let materialization = materialize_skill_runtime_tools(
+            &[dynamic_skill_descriptor(
+                tool_name,
+                skill_root.as_path(),
+                SkillDynamicToolKind::FunctionProxy,
+                serde_json::json!({"target_tool": "read_file"}),
+            )],
+            None,
+            DynamicToolOutputPolicyCaps::default(),
+        );
+        assert!(materialization.excluded_tools.is_empty());
+        let actions = Arc::new(Mutex::new(Vec::new()));
+        let tools = super::build_tools_with_environment_and_security_snapshot(
+            workspace.clone(),
+            "turn_dynamic_proxy_consent",
+            supervised_test_context("turn_dynamic_proxy_consent"),
+            test_web_config(),
+            test_computer_use_config(),
+            materialization.bundles.clone(),
+            std::collections::BTreeMap::new(),
+            Some(supervised_native_snapshot(workspace.as_path(), None)),
+        )
+        .expect("dynamic proxy tools should build")
+        .with_permission_approval_broker(Arc::new(RecordingApprovalBroker {
+            actions: actions.clone(),
+        }));
+        materialization
+            .bind_function_proxy_runtime(tools.router.clone(), tools.runtime.clone())
+            .await;
+        let call = tools
+            .router
+            .build_tool_call(RawToolCall {
+                call_id: "call_dynamic_proxy_consent".to_owned(),
+                tool_name: tool_name.to_owned(),
+                arguments: serde_json::json!({
+                    "arguments": {"path": outside_file}
+                })
+                .to_string(),
+            })
+            .expect("dynamic proxy call");
+
+        let result = tools
+            .runtime
+            .execute_tool_call(call)
+            .await
+            .expect("approved proxied read should execute");
+
+        assert!(result.raw_output_text().contains("proxy-approved"));
+        assert_eq!(
+            *actions.lock().expect("approval actions"),
+            vec![PermissionActionKind::FileRead],
+            "the proxy wrapper must defer to exactly one target-specific prompt"
+        );
+    }
+
+    #[tokio::test]
+    async fn dynamic_function_proxy_apply_patch_creates_an_approved_missing_root() {
+        let fixture = tempfile::tempdir().expect("dynamic patch proxy fixture");
+        let workspace = fixture.path().join("workspace");
+        let skill_root = fixture.path().join("skill");
+        let target = fixture
+            .path()
+            .join("downloads")
+            .join("weekend-trip-plan")
+            .join("README.md");
+        std::fs::create_dir_all(workspace.as_path()).expect("workspace");
+        std::fs::create_dir_all(skill_root.as_path()).expect("skill root");
+
+        let tool_name = "skill.SSSSSSSSSSSSSSSSSSSSS.patch_proxy";
+        let materialization = materialize_skill_runtime_tools(
+            &[dynamic_skill_descriptor(
+                tool_name,
+                skill_root.as_path(),
+                SkillDynamicToolKind::FunctionProxy,
+                serde_json::json!({"target_tool": "apply_patch"}),
+            )],
+            None,
+            DynamicToolOutputPolicyCaps::default(),
+        );
+        assert!(materialization.excluded_tools.is_empty());
+        let actions = Arc::new(Mutex::new(Vec::new()));
+        let turn_id = "turn_dynamic_patch_proxy_consent";
+        let tools = super::build_tools_with_environment_and_security_snapshot(
+            workspace.clone(),
+            turn_id,
+            supervised_test_context(turn_id),
+            test_web_config(),
+            test_computer_use_config(),
+            materialization.bundles.clone(),
+            std::collections::BTreeMap::new(),
+            Some(supervised_native_snapshot(workspace.as_path(), None)),
+        )
+        .expect("dynamic patch proxy tools should build")
+        .with_permission_approval_broker(Arc::new(RecordingApprovalBroker {
+            actions: actions.clone(),
+        }));
+        materialization
+            .bind_function_proxy_runtime(tools.router.clone(), tools.runtime.clone())
+            .await;
+
+        let nested_call_id = "call_dynamic_patch_proxy::apply_patch";
+        let identity = crate::apply_patch::history::InvocationIdentity::new(
+            "thread_test",
+            turn_id,
+            nested_call_id,
+        )
+        .expect("nested patch identity");
+        assert!(crate::events::register_native_patch_observer(
+            &identity,
+            Arc::new(crate::apply_patch::DurableCommitObserver::default()),
+        ));
+        let patch = format!(
+            "*** Begin Patch\n*** Add File: {}\n+approved through proxy\n*** End Patch",
+            target.display()
+        );
+        let call = tools
+            .router
+            .build_tool_call(RawToolCall {
+                call_id: "call_dynamic_patch_proxy".to_owned(),
+                tool_name: tool_name.to_owned(),
+                arguments: serde_json::json!({
+                    "arguments": {"patch": patch}
+                })
+                .to_string(),
+            })
+            .expect("dynamic patch proxy call");
+
+        let result = tools.runtime.execute_tool_call(call).await;
+        crate::events::unregister_native_patch_observer(&identity);
+        let result = result.expect("approved proxied patch should execute");
+
+        assert!(result.success(), "{}", result.raw_output_text());
+        assert_eq!(
+            std::fs::read_to_string(target).expect("proxied patch output"),
+            "approved through proxy"
+        );
+        assert_eq!(
+            *actions.lock().expect("approval actions"),
+            vec![PermissionActionKind::FileWrite],
+            "the proxy wrapper must defer to exactly one target-specific prompt"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_dynamic_function_proxies_prompt_only_for_the_final_target() {
+        let fixture = tempfile::tempdir().expect("two-level dynamic proxy fixture");
+        let workspace = fixture.path().join("workspace");
+        let outside = fixture.path().join("outside");
+        let skill_root = fixture.path().join("skill");
+        std::fs::create_dir_all(workspace.as_path()).expect("workspace");
+        std::fs::create_dir_all(outside.as_path()).expect("outside");
+        std::fs::create_dir_all(skill_root.as_path()).expect("skill root");
+        let outside_file = outside.join("approved.txt");
+        std::fs::write(outside_file.as_path(), "two-proxy-approved\n").expect("outside file");
+
+        let outer_proxy = "skill.SSSSSSSSSSSSSSSSSSSSS.outer_proxy";
+        let inner_proxy = "skill.SSSSSSSSSSSSSSSSSSSSS.inner_proxy";
+        let materialization = materialize_skill_runtime_tools(
+            &[
+                dynamic_skill_descriptor(
+                    outer_proxy,
+                    skill_root.as_path(),
+                    SkillDynamicToolKind::FunctionProxy,
+                    serde_json::json!({"target_tool": inner_proxy}),
+                ),
+                dynamic_skill_descriptor(
+                    inner_proxy,
+                    skill_root.as_path(),
+                    SkillDynamicToolKind::FunctionProxy,
+                    serde_json::json!({"target_tool": "read_file"}),
+                ),
+            ],
+            None,
+            DynamicToolOutputPolicyCaps::default(),
+        );
+        assert!(materialization.excluded_tools.is_empty());
+        let actions = Arc::new(Mutex::new(Vec::new()));
+        let tools = super::build_tools_with_environment_and_security_snapshot(
+            workspace.clone(),
+            "turn_two_dynamic_proxies",
+            supervised_test_context("turn_two_dynamic_proxies"),
+            test_web_config(),
+            test_computer_use_config(),
+            materialization.bundles.clone(),
+            std::collections::BTreeMap::new(),
+            Some(supervised_native_snapshot(workspace.as_path(), None)),
+        )
+        .expect("two-level dynamic proxy tools should build")
+        .with_permission_approval_broker(Arc::new(RecordingApprovalBroker {
+            actions: actions.clone(),
+        }));
+        materialization
+            .bind_function_proxy_runtime(tools.router.clone(), tools.runtime.clone())
+            .await;
+        let call = tools
+            .router
+            .build_tool_call(RawToolCall {
+                call_id: "call_two_dynamic_proxies".to_owned(),
+                tool_name: outer_proxy.to_owned(),
+                arguments: serde_json::json!({
+                    "arguments": {"path": outside_file}
+                })
+                .to_string(),
+            })
+            .expect("two-level dynamic proxy call");
+
+        let result = tools
+            .runtime
+            .execute_tool_call(call)
+            .await
+            .expect("approved final target should execute");
+        assert!(result.raw_output_text().contains("two-proxy-approved"));
+        assert_eq!(
+            *actions.lock().expect("approval actions"),
+            vec![PermissionActionKind::FileRead],
+            "non-effectful intermediate proxies must not create approvals"
+        );
+    }
+
+    #[tokio::test]
+    async fn dynamic_function_proxy_prompts_once_for_network_and_applies_exact_origin_grant() {
+        let fixture = tempfile::tempdir().expect("dynamic network proxy fixture");
+        let workspace = fixture.path().join("workspace");
+        let skill_root = fixture.path().join("skill");
+        std::fs::create_dir_all(workspace.as_path()).expect("workspace");
+        std::fs::create_dir_all(skill_root.as_path()).expect("skill root");
+        let (url, server) = one_response_http_server("nested-network-ok").await;
+
+        let tool_name = "skill.SSSSSSSSSSSSSSSSSSSSS.network_proxy";
+        let materialization = materialize_skill_runtime_tools(
+            &[dynamic_skill_descriptor(
+                tool_name,
+                skill_root.as_path(),
+                SkillDynamicToolKind::FunctionProxy,
+                serde_json::json!({"target_tool": "web_fetch"}),
+            )],
+            None,
+            DynamicToolOutputPolicyCaps::default(),
+        );
+        assert!(materialization.excluded_tools.is_empty());
+        let actions = Arc::new(Mutex::new(Vec::new()));
+        let tools = super::build_tools_with_environment_and_security_snapshot(
+            workspace.clone(),
+            "turn_dynamic_network_proxy_consent",
+            supervised_test_context("turn_dynamic_network_proxy_consent"),
+            test_web_config(),
+            test_computer_use_config(),
+            materialization.bundles.clone(),
+            std::collections::BTreeMap::new(),
+            Some(supervised_native_snapshot(workspace.as_path(), None)),
+        )
+        .expect("dynamic network proxy tools should build")
+        .with_permission_approval_broker(Arc::new(RecordingApprovalBroker {
+            actions: actions.clone(),
+        }));
+        materialization
+            .bind_function_proxy_runtime(tools.router.clone(), tools.runtime.clone())
+            .await;
+        let call = tools
+            .router
+            .build_tool_call(RawToolCall {
+                call_id: "call_dynamic_network_proxy_consent".to_owned(),
+                tool_name: tool_name.to_owned(),
+                arguments: serde_json::json!({
+                    "arguments": {"url": url, "max_bytes": 4096}
+                })
+                .to_string(),
+            })
+            .expect("dynamic network proxy call");
+
+        let result = tools
+            .runtime
+            .execute_tool_call(call)
+            .await
+            .expect("approved proxied network request should execute");
+
+        assert!(
+            result.raw_output_text().contains("nested-network-ok"),
+            "{}",
+            result.raw_output_text()
+        );
+        assert_eq!(
+            *actions.lock().expect("approval actions"),
+            vec![PermissionActionKind::Network],
+            "the proxy wrapper must defer to exactly one target-specific network prompt"
+        );
+        server.await.expect("dynamic network test server");
+    }
+
+    #[tokio::test]
+    async fn dynamic_function_proxy_prompts_once_for_mcp_and_preserves_target_binding() {
+        let fixture = tempfile::tempdir().expect("dynamic MCP proxy fixture");
+        let workspace = fixture.path().join("workspace");
+        let skill_root = fixture.path().join("skill");
+        std::fs::create_dir_all(workspace.as_path()).expect("workspace");
+        std::fs::create_dir_all(skill_root.as_path()).expect("skill root");
+
+        let mcp_tool_name = "mcp__mail__send";
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mcp_materialization = materialize_mcp_runtime_tools(
+            &[McpDynamicToolDescriptor {
+                callable_name: mcp_tool_name.to_owned(),
+                workspace_id: "workspace_test".to_owned(),
+                server_id: "mail-installation".to_owned(),
+                server_name: "mail".to_owned(),
+                raw_tool_name: "send".to_owned(),
+                catalog_version: "catalog-v1".to_owned(),
+                fingerprint: "m".repeat(64),
+                snapshot_version: 7,
+                description: "Send a test message".to_owned(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {"recipient": {"type": "string"}},
+                    "required": ["recipient"],
+                    "additionalProperties": false
+                }),
+                // Server-authored read-only claims must not suppress consent.
+                annotations: McpDynamicToolAnnotations {
+                    title: Some("Send".to_owned()),
+                    read_only_hint: Some(true),
+                    destructive_hint: Some(false),
+                    idempotent_hint: Some(true),
+                    open_world_hint: Some(false),
+                },
+                timeout_ms: Some(2_000),
+                max_arguments_bytes: 16 * 1024,
+                selection_reason: "test-selection".to_owned(),
+                capability_id: Some("mcp-tool:mail:send".to_owned()),
+            }],
+            Arc::new(RecordingMcpExecutor {
+                calls: calls.clone(),
+            }),
+        );
+        assert!(mcp_materialization.excluded_tools.is_empty());
+
+        let proxy_tool_name = "skill.SSSSSSSSSSSSSSSSSSSSS.mcp_proxy";
+        let skill_materialization = materialize_skill_runtime_tools(
+            &[dynamic_skill_descriptor(
+                proxy_tool_name,
+                skill_root.as_path(),
+                SkillDynamicToolKind::FunctionProxy,
+                serde_json::json!({"target_tool": mcp_tool_name}),
+            )],
+            None,
+            DynamicToolOutputPolicyCaps::default(),
+        );
+        assert!(skill_materialization.excluded_tools.is_empty());
+        let mut extensions = skill_materialization.bundles.clone();
+        extensions.extend(mcp_materialization.bundles.clone());
+        let actions = Arc::new(Mutex::new(Vec::new()));
+        let tools = super::build_tools_with_environment_and_security_snapshot(
+            workspace.clone(),
+            "turn_dynamic_mcp_proxy_consent",
+            supervised_test_context("turn_dynamic_mcp_proxy_consent"),
+            test_web_config(),
+            test_computer_use_config(),
+            extensions,
+            std::collections::BTreeMap::new(),
+            Some(supervised_native_snapshot(workspace.as_path(), None)),
+        )
+        .expect("dynamic MCP proxy tools should build")
+        .with_permission_approval_broker(Arc::new(RecordingApprovalBroker {
+            actions: actions.clone(),
+        }));
+        skill_materialization
+            .bind_function_proxy_runtime(tools.router.clone(), tools.runtime.clone())
+            .await;
+        let call = tools
+            .router
+            .build_tool_call(RawToolCall {
+                call_id: "call_dynamic_mcp_proxy_consent".to_owned(),
+                tool_name: proxy_tool_name.to_owned(),
+                arguments: serde_json::json!({
+                    "arguments": {"recipient": "approved@example.test"}
+                })
+                .to_string(),
+            })
+            .expect("dynamic MCP proxy call");
+
+        let result = tools
+            .runtime
+            .execute_tool_call(call)
+            .await
+            .expect("approved proxied MCP call should execute");
+
+        assert!(result.raw_output_text().contains("nested-mcp-ok"));
+        assert_eq!(
+            *actions.lock().expect("approval actions"),
+            vec![PermissionActionKind::McpWriteOrUnknown],
+            "the proxy wrapper must defer to exactly one MCP target prompt"
+        );
+        let calls = calls.lock().expect("MCP calls");
+        assert_eq!(calls.len(), 1, "MCP target must execute exactly once");
+        assert_eq!(calls[0].server_id, "mail-installation");
+        assert_eq!(calls[0].raw_tool_name, "send");
+        assert_eq!(
+            calls[0].arguments,
+            serde_json::json!({"recipient": "approved@example.test"})
+        );
+    }
+
+    #[tokio::test]
+    async fn dynamic_function_proxies_defer_once_to_task_and_agent_target_permissions() {
+        let fixture = tempfile::tempdir().expect("dynamic task/agent proxy fixture");
+        let workspace = fixture.path().join("workspace");
+        let skill_root = fixture.path().join("skill");
+        std::fs::create_dir_all(workspace.as_path()).expect("workspace");
+        std::fs::create_dir_all(skill_root.as_path()).expect("skill root");
+
+        let effect_calls = Arc::new(Mutex::new(Vec::new()));
+        let mut effect_bundle = ToolExtensionBundle::default();
+        for target in ["task_create", "threads_turn_start"] {
+            effect_bundle.specs.push(ConfiguredToolSpec::new(
+                ToolSpec::new(
+                    target,
+                    format!("Test target {target}"),
+                    serde_json::json!({"type": "object", "additionalProperties": true}),
+                    PayloadKind::Function,
+                ),
+                ExecutionClass::Shared,
+                dynamic_unknown_output_policy(),
+            ));
+            effect_bundle.handlers.push((
+                target.to_owned(),
+                Arc::new(RecordingEffectHandler {
+                    calls: effect_calls.clone(),
+                }) as Arc<dyn ToolHandler>,
+            ));
+        }
+
+        let task_proxy = "skill.SSSSSSSSSSSSSSSSSSSSS.task_proxy";
+        let agent_proxy = "skill.SSSSSSSSSSSSSSSSSSSSS.agent_proxy";
+        let skill_materialization = materialize_skill_runtime_tools(
+            &[
+                dynamic_skill_descriptor(
+                    task_proxy,
+                    skill_root.as_path(),
+                    SkillDynamicToolKind::FunctionProxy,
+                    serde_json::json!({"target_tool": "task_create"}),
+                ),
+                dynamic_skill_descriptor(
+                    agent_proxy,
+                    skill_root.as_path(),
+                    SkillDynamicToolKind::FunctionProxy,
+                    serde_json::json!({"target_tool": "threads_turn_start"}),
+                ),
+            ],
+            None,
+            DynamicToolOutputPolicyCaps::default(),
+        );
+        assert!(skill_materialization.excluded_tools.is_empty());
+        let mut extensions = skill_materialization.bundles.clone();
+        extensions.push(effect_bundle);
+        let actions = Arc::new(Mutex::new(Vec::new()));
+        let tools = super::build_tools_with_environment_and_security_snapshot(
+            workspace.clone(),
+            "turn_dynamic_task_agent_proxy_consent",
+            supervised_test_context("turn_dynamic_task_agent_proxy_consent"),
+            test_web_config(),
+            test_computer_use_config(),
+            extensions,
+            std::collections::BTreeMap::new(),
+            Some(supervised_native_snapshot(workspace.as_path(), None)),
+        )
+        .expect("dynamic task/agent proxy tools should build")
+        .with_permission_approval_broker(Arc::new(RecordingApprovalBroker {
+            actions: actions.clone(),
+        }));
+        skill_materialization
+            .bind_function_proxy_runtime(tools.router.clone(), tools.runtime.clone())
+            .await;
+
+        for (call_id, proxy, arguments) in [
+            (
+                "call_dynamic_task_proxy_consent",
+                task_proxy,
+                serde_json::json!({"title": "Nested task", "goal": "Run safely"}),
+            ),
+            (
+                "call_dynamic_agent_proxy_consent",
+                agent_proxy,
+                serde_json::json!({
+                    "targetOptionId": "native-agent",
+                    "input": {"prompt": "Run safely"}
+                }),
+            ),
+        ] {
+            let call = tools
+                .router
+                .build_tool_call(RawToolCall {
+                    call_id: call_id.to_owned(),
+                    tool_name: proxy.to_owned(),
+                    arguments: serde_json::json!({"arguments": arguments}).to_string(),
+                })
+                .expect("dynamic task/agent proxy call");
+            let result = tools
+                .runtime
+                .execute_tool_call(call)
+                .await
+                .expect("approved proxied task/agent target should execute");
+            assert!(result.raw_output_text().contains("effect-ok"));
+        }
+
+        assert_eq!(
+            *actions.lock().expect("approval actions"),
+            vec![
+                PermissionActionKind::TaskSubagent,
+                PermissionActionKind::AgentAction,
+            ],
+            "each proxy must defer to one semantic target prompt"
+        );
+        assert_eq!(
+            *effect_calls.lock().expect("effect calls"),
+            vec!["task_create".to_owned(), "threads_turn_start".to_owned()],
+            "each target side effect must execute exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn dynamic_http_tool_prompts_once_and_executes_with_exact_origin_grant() {
+        let fixture = tempfile::tempdir().expect("dynamic HTTP fixture");
+        let workspace = fixture.path().join("workspace");
+        let skill_root = fixture.path().join("skill");
+        std::fs::create_dir_all(workspace.as_path()).expect("workspace");
+        std::fs::create_dir_all(skill_root.as_path()).expect("skill root");
+        let (url, server) = one_response_http_server("dynamic-http-ok").await;
+
+        let tool_name = "skill.SSSSSSSSSSSSSSSSSSSSS.http";
+        let materialization = materialize_skill_runtime_tools(
+            &[dynamic_skill_descriptor(
+                tool_name,
+                skill_root.as_path(),
+                SkillDynamicToolKind::Http,
+                serde_json::json!({"method": "POST", "url": url}),
+            )],
+            None,
+            DynamicToolOutputPolicyCaps::default(),
+        );
+        assert!(materialization.excluded_tools.is_empty());
+        let actions = Arc::new(Mutex::new(Vec::new()));
+        let tools = super::build_tools_with_environment_and_security_snapshot(
+            workspace.clone(),
+            "turn_dynamic_http_consent",
+            supervised_test_context("turn_dynamic_http_consent"),
+            test_web_config(),
+            test_computer_use_config(),
+            materialization.bundles.clone(),
+            std::collections::BTreeMap::new(),
+            Some(supervised_native_snapshot(workspace.as_path(), None)),
+        )
+        .expect("dynamic HTTP tools should build")
+        .with_permission_approval_broker(Arc::new(RecordingApprovalBroker {
+            actions: actions.clone(),
+        }));
+        materialization
+            .bind_function_proxy_runtime(tools.router.clone(), tools.runtime.clone())
+            .await;
+        let call = tools
+            .router
+            .build_tool_call(RawToolCall {
+                call_id: "call_dynamic_http_consent".to_owned(),
+                tool_name: tool_name.to_owned(),
+                arguments: serde_json::json!({
+                    "body": {"value": "approved-body"}
+                })
+                .to_string(),
+            })
+            .expect("dynamic HTTP call");
+
+        let result = tools
+            .runtime
+            .execute_tool_call(call)
+            .await
+            .expect("approved dynamic HTTP request should execute");
+
+        assert!(result.raw_output_text().contains("dynamic-http-ok"));
+        assert_eq!(
+            *actions.lock().expect("approval actions"),
+            vec![PermissionActionKind::Network],
+            "dynamic HTTP must use exactly one network prompt"
+        );
+        server.await.expect("dynamic HTTP test server");
+    }
+
+    #[tokio::test]
+    async fn dynamic_function_proxy_propagates_outer_cancellation_to_nested_target_token() {
+        let fixture = tempfile::tempdir().expect("dynamic cancellation fixture");
+        let workspace = fixture.path().join("workspace");
+        let skill_root = fixture.path().join("skill");
+        std::fs::create_dir_all(workspace.as_path()).expect("workspace");
+        std::fs::create_dir_all(skill_root.as_path()).expect("skill root");
+
+        let started = Arc::new(Notify::new());
+        let cancellation_observed = Arc::new(AtomicBool::new(false));
+        let mut target_bundle = ToolExtensionBundle::default();
+        target_bundle.specs.push(ConfiguredToolSpec::new(
+            ToolSpec::new(
+                "blocking_effect",
+                "Wait for cancellation",
+                serde_json::json!({"type": "object", "additionalProperties": true}),
+                PayloadKind::Function,
+            ),
+            ExecutionClass::Shared,
+            dynamic_unknown_output_policy(),
+        ));
+        target_bundle.handlers.push((
+            "blocking_effect".to_owned(),
+            Arc::new(CancellationObservingHandler {
+                started: started.clone(),
+                cancellation_observed: cancellation_observed.clone(),
+            }) as Arc<dyn ToolHandler>,
+        ));
+
+        let proxy_tool = "skill.SSSSSSSSSSSSSSSSSSSSS.cancel_proxy";
+        let materialization = materialize_skill_runtime_tools(
+            &[dynamic_skill_descriptor(
+                proxy_tool,
+                skill_root.as_path(),
+                SkillDynamicToolKind::FunctionProxy,
+                serde_json::json!({"target_tool": "blocking_effect"}),
+            )],
+            None,
+            DynamicToolOutputPolicyCaps::default(),
+        );
+        let mut extensions = materialization.bundles.clone();
+        extensions.push(target_bundle);
+        let tools = super::build_tools_with_environment_and_security_snapshot(
+            workspace.clone(),
+            "turn_dynamic_proxy_cancellation",
+            supervised_test_context("turn_dynamic_proxy_cancellation"),
+            test_web_config(),
+            test_computer_use_config(),
+            extensions,
+            std::collections::BTreeMap::new(),
+            Some(supervised_native_snapshot(workspace.as_path(), None)),
+        )
+        .expect("dynamic cancellation tools should build")
+        .with_permission_approval_broker(Arc::new(RecordingApprovalBroker {
+            actions: Arc::new(Mutex::new(Vec::new())),
+        }));
+        materialization
+            .bind_function_proxy_runtime(tools.router.clone(), tools.runtime.clone())
+            .await;
+        let call = tools
+            .router
+            .build_tool_call(RawToolCall {
+                call_id: "call_dynamic_proxy_cancellation".to_owned(),
+                tool_name: proxy_tool.to_owned(),
+                arguments: serde_json::json!({"arguments": {}}).to_string(),
+            })
+            .expect("dynamic cancellation call");
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let runtime = tools.runtime.clone();
+        let run_cancellation = cancellation.clone();
+        let task = tokio::spawn(async move {
+            runtime
+                .execute_tool_call_with_cancellation(call, run_cancellation)
+                .await
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), started.notified())
+            .await
+            .expect("nested target should start");
+        cancellation.cancel();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .expect("cancelled proxy should finish")
+            .expect("proxy task should not panic");
+        assert!(matches!(result, Err(crate::error::ToolError::Cancelled(_))));
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !cancellation_observed.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("nested target must observe the exact outer cancellation token");
+    }
+
+    #[tokio::test]
+    async fn dynamic_function_proxy_cycle_is_rejected_at_bounded_depth() {
+        let fixture = tempfile::tempdir().expect("dynamic proxy cycle fixture");
+        let workspace = fixture.path().join("workspace");
+        let skill_root = fixture.path().join("skill");
+        std::fs::create_dir_all(workspace.as_path()).expect("workspace");
+        std::fs::create_dir_all(skill_root.as_path()).expect("skill root");
+
+        let proxy_names = (0..9)
+            .map(|index| format!("skill.SSSSSSSSSSSSSSSSSSSSS.cycle_{index}"))
+            .collect::<Vec<_>>();
+        let descriptors = proxy_names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| {
+                let target_tool = proxy_names[(index + 1) % proxy_names.len()].clone();
+                dynamic_skill_descriptor(
+                    name,
+                    skill_root.as_path(),
+                    SkillDynamicToolKind::FunctionProxy,
+                    serde_json::json!({"target_tool": target_tool}),
+                )
+            })
+            .collect::<Vec<_>>();
+        let materialization = materialize_skill_runtime_tools(
+            descriptors.as_slice(),
+            None,
+            DynamicToolOutputPolicyCaps::default(),
+        );
+        assert!(materialization.excluded_tools.is_empty());
+        let tools = build_tools(
+            workspace.clone(),
+            "turn_dynamic_proxy_cycle",
+            test_permission_context("turn_dynamic_proxy_cycle"),
+            test_web_config(),
+            test_computer_use_config(),
+            materialization.bundles.clone(),
+        )
+        .expect("dynamic cycle tools should build");
+        materialization
+            .bind_function_proxy_runtime(tools.router.clone(), tools.runtime.clone())
+            .await;
+        let call = tools
+            .router
+            .build_tool_call(RawToolCall {
+                call_id: "call_dynamic_proxy_cycle".to_owned(),
+                tool_name: proxy_names[0].clone(),
+                arguments: serde_json::json!({"arguments": {}}).to_string(),
+            })
+            .expect("dynamic cycle call");
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            tools.runtime.execute_tool_call(call),
+        )
+        .await
+        .expect("cycle must terminate at the configured bound");
+        match result {
+            Err(crate::error::ToolError::Rejected(message)) => assert!(
+                message.contains("maximum depth"),
+                "unexpected bounded rejection: {message}"
+            ),
+            Err(error) => panic!("cycle should preserve a typed rejection: {error}"),
+            Ok(output) => panic!(
+                "cycle should not execute successfully: {}",
+                output.raw_output_text()
+            ),
+        }
     }
 
     #[test]
@@ -945,6 +1971,32 @@ mod tests {
         assert_eq!(result.raw_output_text(), "ok");
     }
 
+    #[test]
+    fn web_search_permission_metadata_uses_normalized_configured_endpoints() {
+        let mut config = test_web_config();
+        config.ddg_html_search_url = "https://search.internal.example/html/".to_owned();
+        config.ddg_instant_api_url = "https://instant.internal.example/api/".to_owned();
+        let built = build_builtin_tools(
+            ".",
+            "turn_search_targets",
+            test_permission_context("turn_search_targets"),
+            config,
+            test_computer_use_config(),
+        );
+
+        let spec = built
+            .router
+            .find_spec("web_search")
+            .expect("web_search spec");
+        assert_eq!(
+            spec.spec.permission_metadata.network_targets,
+            vec![
+                "https://search.internal.example/html/".to_owned(),
+                "https://instant.internal.example/api/".to_owned(),
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn request_tools_is_in_default_model_visible_specs() {
         let built = build_builtin_tools(
@@ -966,322 +2018,38 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn write_file_has_builtin_spec_and_handler() {
+    #[test]
+    fn removed_file_mutators_are_absent_from_catalog_and_runtime() {
         let built = build_builtin_tools(
             ".",
-            "turn_write_file_registered",
-            test_permission_context("turn_write_file_registered"),
+            "turn_removed_file_mutators",
+            test_permission_context("turn_removed_file_mutators"),
             test_web_config(),
             test_computer_use_config(),
         );
 
-        assert!(built.router.find_spec("write_file").is_some());
-        assert!(
-            built.router.has_handler("write_file"),
-            "write_file must have a runtime handler"
-        );
-        assert!(
-            built
+        for tool_name in ["write_file", "edit_file"] {
+            assert!(
+                built.router.find_spec(tool_name).is_none(),
+                "removed tool {tool_name} must not have a visible schema"
+            );
+            assert!(
+                !built.router.has_handler(tool_name),
+                "removed tool {tool_name} must not have a runtime handler"
+            );
+            let error = built
                 .router
-                .preflight_tool_index()
-                .core_tools
-                .contains(&"write_file".to_owned()),
-            "write_file must be a core preflight-visible tool once its handler is registered"
-        );
-    }
-
-    #[tokio::test]
-    async fn edit_file_has_builtin_spec_and_handler() {
-        let built = build_builtin_tools(
-            ".",
-            "turn_edit_file_registered",
-            test_permission_context("turn_edit_file_registered"),
-            test_web_config(),
-            test_computer_use_config(),
-        );
-
-        assert!(built.router.find_spec("edit_file").is_some());
-        assert!(
-            built.router.has_handler("edit_file"),
-            "edit_file must have a runtime handler"
-        );
-        assert!(
-            built
-                .router
-                .preflight_tool_index()
-                .core_tools
-                .contains(&"edit_file".to_owned()),
-            "edit_file must be a core preflight-visible tool once its handler is registered"
-        );
-    }
-
-    #[tokio::test]
-    async fn write_file_runtime_read_then_write_flow_uses_shared_observation_store() {
-        let workdir = tools_runtime_temp_dir("write-file-runtime-flow");
-        let target = workdir.join("existing.txt");
-        std::fs::write(target.as_path(), "original\n").expect("seed existing file");
-        let built = build_builtin_tools(
-            workdir.as_path(),
-            "turn_write_file_runtime_flow",
-            test_permission_context("turn_write_file_runtime_flow"),
-            test_web_config(),
-            test_computer_use_config(),
-        );
-
-        let before_read = execute_builtin_json_call(
-            &built,
-            "write_before_read",
-            "write_file",
-            serde_json::json!({
-                "path": "existing.txt",
-                "content": "updated\n",
-                "overwrite": true
-            }),
-        )
-        .await;
-        assert!(!before_read.success());
-        assert_eq!(
-            before_read.raw_output_json()["status"].as_str(),
-            Some("read_required")
-        );
-        assert_eq!(
-            std::fs::read_to_string(target.as_path()).expect("target should remain readable"),
-            "original\n"
-        );
-
-        let read = execute_builtin_json_call(
-            &built,
-            "read_existing_complete",
-            "read_file",
-            serde_json::json!({"path": "existing.txt"}),
-        )
-        .await;
-        assert!(read.success());
-        let read_json = read.raw_output_json();
-        assert_eq!(
-            read_json["file_observation"]["complete"].as_bool(),
-            Some(true)
-        );
-
-        let overwrite = execute_builtin_json_call(
-            &built,
-            "write_after_read",
-            "write_file",
-            serde_json::json!({
-                "path": "existing.txt",
-                "content": "updated\n",
-                "overwrite": true
-            }),
-        )
-        .await;
-        assert!(overwrite.success());
-        assert_eq!(
-            overwrite.raw_output_json()["operation"].as_str(),
-            Some("overwritten")
-        );
-        assert_eq!(
-            std::fs::read_to_string(target.as_path()).expect("target should update"),
-            "updated\n"
-        );
-
-        let fresh_read = execute_builtin_json_call(
-            &built,
-            "read_existing_for_stale_check",
-            "read_file",
-            serde_json::json!({"path": "existing.txt"}),
-        )
-        .await;
-        assert!(fresh_read.success());
-        std::fs::write(target.as_path(), "external mutation\n").expect("mutate target externally");
-
-        let stale_write = execute_builtin_json_call(
-            &built,
-            "write_after_external_mutation",
-            "write_file",
-            serde_json::json!({
-                "path": "existing.txt",
-                "content": "should not land\n",
-                "overwrite": true
-            }),
-        )
-        .await;
-        assert!(!stale_write.success());
-        assert_eq!(
-            stale_write.raw_output_json()["status"].as_str(),
-            Some("precondition_failed")
-        );
-        assert_eq!(
-            std::fs::read_to_string(target.as_path()).expect("stale write must not modify target"),
-            "external mutation\n"
-        );
-    }
-
-    #[tokio::test]
-    async fn edit_file_runtime_read_then_edit_flow_uses_shared_observation_store() {
-        let workdir = tools_runtime_temp_dir("edit-file-runtime-flow");
-        let target = workdir.join("existing.txt");
-        std::fs::write(target.as_path(), "alpha\nbeta\ngamma\n").expect("seed existing file");
-        let built = build_builtin_tools(
-            workdir.as_path(),
-            "turn_edit_file_runtime_flow",
-            test_permission_context("turn_edit_file_runtime_flow"),
-            test_web_config(),
-            test_computer_use_config(),
-        );
-
-        let before_read = execute_builtin_json_call(
-            &built,
-            "edit_before_read",
-            "edit_file",
-            serde_json::json!({
-                "path": "existing.txt",
-                "old_string": "beta",
-                "new_string": "delta"
-            }),
-        )
-        .await;
-        assert!(!before_read.success());
-        assert_eq!(
-            before_read.raw_output_json()["status"].as_str(),
-            Some("read_required")
-        );
-
-        let read = execute_builtin_json_call(
-            &built,
-            "read_existing_for_edit",
-            "read_file",
-            serde_json::json!({"path": "existing.txt"}),
-        )
-        .await;
-        assert!(read.success());
-        assert_eq!(
-            read.raw_output_json()["file_observation"]["complete"].as_bool(),
-            Some(true)
-        );
-
-        let edit = execute_builtin_json_call(
-            &built,
-            "edit_after_read",
-            "edit_file",
-            serde_json::json!({
-                "path": "existing.txt",
-                "old_string": "alpha\nbeta\ngamma\n",
-                "new_string": "alpha\ndelta\ngamma\n"
-            }),
-        )
-        .await;
-        assert!(edit.success(), "edit failed: {}", edit.raw_output_json());
-        let edit_json = edit.raw_output_json();
-        assert_eq!(edit_json["operation"].as_str(), Some("edited"));
-        assert_eq!(edit_json["matches_replaced"].as_u64(), Some(1));
-        let expected_changed_file = std::fs::canonicalize(target.as_path())
-            .expect("target should canonicalize after edit")
-            .display()
-            .to_string();
-        assert_eq!(
-            edit_json["changed_files"][0].as_str(),
-            Some(expected_changed_file.as_str())
-        );
-        assert_eq!(
-            std::fs::read_to_string(target.as_path()).expect("target should update"),
-            "alpha\ndelta\ngamma\n"
-        );
-
-        let _ = std::fs::remove_dir_all(workdir);
-    }
-
-    #[tokio::test]
-    async fn edit_file_runtime_observation_chain_authorizes_second_edit_and_catches_stale() {
-        let workdir = tools_runtime_temp_dir("edit-file-observation-chain");
-        let target = workdir.join("existing.txt");
-        std::fs::write(target.as_path(), "one\ntwo\nthree\n").expect("seed existing file");
-        let built = build_builtin_tools(
-            workdir.as_path(),
-            "turn_edit_file_chain",
-            test_permission_context("turn_edit_file_chain"),
-            test_web_config(),
-            test_computer_use_config(),
-        );
-
-        let read = execute_builtin_json_call(
-            &built,
-            "read_existing_for_chain",
-            "read_file",
-            serde_json::json!({"path": "existing.txt"}),
-        )
-        .await;
-        assert!(read.success());
-
-        let first_edit = execute_builtin_json_call(
-            &built,
-            "edit_chain_first",
-            "edit_file",
-            serde_json::json!({
-                "path": "existing.txt",
-                "old_string": "two",
-                "new_string": "deux"
-            }),
-        )
-        .await;
-        assert!(
-            first_edit.success(),
-            "first edit failed: {}",
-            first_edit.raw_output_json()
-        );
-        assert_eq!(
-            first_edit.raw_output_json()["file_observation"]["id"].as_str(),
-            Some("edit_file:edit_chain_first")
-        );
-        assert_eq!(
-            std::fs::read_to_string(target.as_path()).expect("target should update"),
-            "one\ndeux\nthree\n"
-        );
-
-        let second_edit = execute_builtin_json_call(
-            &built,
-            "edit_chain_second",
-            "edit_file",
-            serde_json::json!({
-                "path": "existing.txt",
-                "old_string": "three",
-                "new_string": "trois"
-            }),
-        )
-        .await;
-        assert!(second_edit.success());
-        assert_eq!(
-            second_edit.raw_output_json()["file_observation"]["id"].as_str(),
-            Some("edit_file:edit_chain_second")
-        );
-        assert_eq!(
-            std::fs::read_to_string(target.as_path()).expect("target should update again"),
-            "one\ndeux\ntrois\n"
-        );
-
-        std::fs::write(target.as_path(), "external mutation\n").expect("mutate target externally");
-        let stale_edit = execute_builtin_json_call(
-            &built,
-            "edit_chain_after_external_mutation",
-            "edit_file",
-            serde_json::json!({
-                "path": "existing.txt",
-                "old_string": "external",
-                "new_string": "internal"
-            }),
-        )
-        .await;
-        assert!(!stale_edit.success());
-        assert_eq!(
-            stale_edit.raw_output_json()["status"].as_str(),
-            Some("precondition_failed")
-        );
-        assert_eq!(
-            std::fs::read_to_string(target.as_path()).expect("stale edit must not modify target"),
-            "external mutation\n"
-        );
-
-        let _ = std::fs::remove_dir_all(workdir);
+                .build_tool_call(RawToolCall {
+                    call_id: format!("call_{tool_name}"),
+                    tool_name: tool_name.to_owned(),
+                    arguments: "{}".to_owned(),
+                })
+                .expect_err("removed file mutators must be rejected as unknown tools");
+            assert!(
+                matches!(error, crate::ToolError::NotFound(_)),
+                "removed tool {tool_name} should fail before permission or handler dispatch"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1696,3 +2464,5 @@ mod tests {
         ));
     }
 }
+
+pub mod html;

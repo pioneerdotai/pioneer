@@ -9,6 +9,144 @@ use sea_orm::{
 
 const NOW: i64 = 1_900_100_000;
 
+#[tokio::test]
+async fn history_rewinds_legacy_baseline_but_excludes_completed_ranges_across_epochs() {
+    let (database, store) = migrated_store().await;
+    for suffix in ["missed", "consumed", "missed_later"] {
+        insert_source(&database, "ws_run_a", suffix, NOW - 10).await;
+    }
+    store
+        .activate_self_improvement_workspace("ws_run_a", NOW)
+        .await
+        .unwrap();
+    database.execute_unprepared("UPDATE self_improvement_workspace_state SET cursor_source_id = 1 WHERE workspace_id = 'ws_run_a'").await.unwrap();
+    let run = store
+        .create_or_get_self_improvement_run(new_run("ws_run_a", 1, 1, 2), NOW)
+        .await
+        .unwrap();
+    database
+        .execute_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            "UPDATE self_improvement_run SET status = 'completed' WHERE id = ?",
+            [run.id.into()],
+        ))
+        .await
+        .unwrap();
+    database.execute_unprepared("UPDATE self_improvement_workspace_state SET cursor_source_id = 3 WHERE workspace_id = 'ws_run_a'").await.unwrap();
+    store
+        .deactivate_self_improvement_workspace("ws_run_a", NOW + 1)
+        .await
+        .unwrap();
+    let active = store
+        .activate_self_improvement_workspace("ws_run_a", NOW + 2)
+        .await
+        .unwrap();
+    assert_eq!(
+        active.cursor_source_id, 3,
+        "re-enable preserves durable progress"
+    );
+    store
+        .reconcile_self_improvement_history_cursor("ws_run_a")
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .get_self_improvement_workspace_state("ws_run_a")
+            .await
+            .unwrap()
+            .unwrap()
+            .cursor_source_id,
+        0
+    );
+    let selected = store
+        .list_self_improvement_source_turns_after("ws_run_a", 0, NOW + 2, 10)
+        .await
+        .unwrap();
+    assert_eq!(
+        selected
+            .iter()
+            .map(|source| source.turn_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["turn_missed", "turn_missed_later"]
+    );
+    assert_eq!(
+        selected,
+        store
+            .list_frozen_self_improvement_source_range("ws_run_a", 0, 3, NOW + 2)
+            .await
+            .unwrap()
+    );
+    store
+        .reconcile_self_improvement_history_cursor("ws_run_a")
+        .await
+        .unwrap();
+    assert_eq!(
+        selected,
+        store
+            .list_self_improvement_source_turns_after("ws_run_a", 0, NOW + 2, 10)
+            .await
+            .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn history_reconciliation_never_rewinds_an_unresolved_frozen_run() {
+    let (database, store) = migrated_store().await;
+    insert_source(&database, "ws_run_a", "missed", NOW - 10).await;
+    insert_source(&database, "ws_run_a", "in_flight", NOW + 1).await;
+    store
+        .activate_self_improvement_workspace("ws_run_a", NOW)
+        .await
+        .unwrap();
+    database.execute_unprepared("UPDATE self_improvement_workspace_state SET cursor_source_id = 1 WHERE workspace_id = 'ws_run_a'").await.unwrap();
+    let run = store
+        .create_or_get_self_improvement_run(new_run("ws_run_a", 1, 1, 2), NOW + 2)
+        .await
+        .unwrap();
+    store
+        .reconcile_self_improvement_history_cursor("ws_run_a")
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .get_self_improvement_workspace_state("ws_run_a")
+            .await
+            .unwrap()
+            .unwrap()
+            .cursor_source_id,
+        1
+    );
+    assert_eq!(
+        store
+            .get_self_improvement_run("ws_run_a", &run.id)
+            .await
+            .unwrap()
+            .unwrap(),
+        run
+    );
+    store
+        .deactivate_self_improvement_workspace("ws_run_a", NOW + 3)
+        .await
+        .unwrap();
+    store
+        .activate_self_improvement_workspace("ws_run_a", NOW + 4)
+        .await
+        .unwrap();
+    store
+        .reconcile_self_improvement_history_cursor("ws_run_a")
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .get_self_improvement_workspace_state("ws_run_a")
+            .await
+            .unwrap()
+            .unwrap()
+            .cursor_source_id,
+        0
+    );
+}
+
 async fn migrated_store() -> (DatabaseConnection, CrudStore) {
     let database = Database::connect("sqlite::memory:")
         .await
@@ -125,14 +263,14 @@ async fn scalar_i64(database: &DatabaseConnection, sql: impl Into<String>) -> i6
 }
 
 #[tokio::test]
-async fn frozen_source_range_excludes_delayed_parallel_and_cross_workspace_rows() {
+async fn frozen_source_range_includes_history_but_excludes_parallel_and_cross_workspace_rows() {
     let (database, store) = migrated_store().await;
     insert_source(&database, "ws_run_a", "before_activation", NOW - 10).await;
     let active = store
         .activate_self_improvement_workspace("ws_run_a", NOW)
         .await
-        .expect("workspace must activate at the current source head");
-    assert_eq!(active.cursor_source_id, 1);
+        .expect("workspace must activate without skipping historical sources");
+    assert_eq!(active.cursor_source_id, 0);
 
     // This row is projected after activation but carries its exact old terminal time.
     insert_source(&database, "ws_run_a", "delayed_old_completion", NOW - 1).await;
@@ -147,7 +285,7 @@ async fn frozen_source_range_excludes_delayed_parallel_and_cross_workspace_rows(
             active
                 .effective_enabled_at_unix
                 .expect("active state must carry its activation timestamp"),
-            1,
+            3,
         )
         .await
         .expect("bounded source selection must load");
@@ -156,9 +294,13 @@ async fn frozen_source_range_excludes_delayed_parallel_and_cross_workspace_rows(
             .iter()
             .map(|source| source.turn_id.as_str())
             .collect::<Vec<_>>(),
-        vec!["turn_selected"]
+        vec![
+            "turn_before_activation",
+            "turn_delayed_old_completion",
+            "turn_selected"
+        ]
     );
-    let frozen_upper = selected[0].id;
+    let frozen_upper = selected.last().unwrap().id;
 
     insert_source(&database, "ws_run_a", "concurrent_after_freeze", NOW + 3).await;
     let first_read = store
@@ -219,14 +361,16 @@ fn new_run(
         source_upper_inclusive,
         learner_provider: "openai".to_owned(),
         learner_model: "gpt-5.4".to_owned(),
+        learner_reasoning_effort: None,
         reviewer_provider: "openai".to_owned(),
         reviewer_model: "gpt-5.4".to_owned(),
+        reviewer_reasoning_effort: None,
         pipeline_contract_version: "self-improvement-v1".to_owned(),
     }
 }
 
 #[tokio::test]
-async fn activation_baselines_head_and_daily_run_identity_freezes_the_range() {
+async fn activation_preserves_history_and_daily_run_identity_freezes_the_range() {
     let (database, store) = migrated_store().await;
     let initial = store
         .get_or_create_self_improvement_workspace_state("ws_run_a", NOW)
@@ -242,7 +386,7 @@ async fn activation_baselines_head_and_daily_run_identity_freezes_the_range() {
         .await
         .expect("workspace must activate");
     assert_eq!(active.activation_epoch, 1);
-    assert_eq!(active.cursor_source_id, 1);
+    assert_eq!(active.cursor_source_id, 0);
     assert_eq!(active.effective_enabled_at_unix, Some(NOW + 2));
 
     insert_source(&database, "ws_run_a", "after_activation_1", NOW + 3).await;
@@ -252,8 +396,8 @@ async fn activation_baselines_head_and_daily_run_identity_freezes_the_range() {
         .expect("already-active activation must be idempotent");
     assert_eq!(active_again.activation_epoch, 1);
     assert_eq!(
-        active_again.cursor_source_id, 1,
-        "repeat activation must not move the baseline"
+        active_again.cursor_source_id, 0,
+        "repeat activation must not skip unprocessed history"
     );
     assert_eq!(active_again.effective_enabled_at_unix, Some(NOW + 2));
 
@@ -269,7 +413,7 @@ async fn activation_baselines_head_and_daily_run_identity_freezes_the_range() {
         )
         .await
         .expect("daily run must be created");
-    assert_eq!(first.source_lower_exclusive, 1);
+    assert_eq!(first.source_lower_exclusive, 0);
     assert_eq!(first.source_upper_inclusive, 2);
     assert_eq!(first.status, "pending");
 
@@ -344,7 +488,7 @@ async fn activation_baselines_head_and_daily_run_identity_freezes_the_range() {
         inactive.activation_epoch, 1,
         "disable must not create a new activation epoch"
     );
-    assert_eq!(inactive.cursor_source_id, 1);
+    assert_eq!(inactive.cursor_source_id, 0);
     assert_eq!(inactive.effective_enabled_at_unix, None);
     let cancelled = store
         .get_self_improvement_run("ws_run_a", first.id.as_str())
@@ -366,8 +510,8 @@ async fn activation_baselines_head_and_daily_run_identity_freezes_the_range() {
         .expect("re-enable transition must commit");
     assert_eq!(reactivated.activation_epoch, 2);
     assert_eq!(
-        reactivated.cursor_source_id, 3,
-        "re-enable must baseline every source observed while disabled"
+        reactivated.cursor_source_id, 0,
+        "re-enable must preserve sources observed while disabled"
     );
     assert_eq!(reactivated.effective_enabled_at_unix, Some(NOW + 11));
 }
@@ -784,8 +928,10 @@ async fn failed_requeue_and_authority_reset_atomically_require_an_active_workspa
         effective_enabled: true,
         learner_provider: "openai".to_owned(),
         learner_model: "gpt-5.5".to_owned(),
+        learner_reasoning_effort: None,
         reviewer_provider: "openai".to_owned(),
         reviewer_model: "gpt-5.5".to_owned(),
+        reviewer_reasoning_effort: None,
         pipeline_contract_version: "self-improvement-v2".to_owned(),
     };
     assert_eq!(
@@ -1033,4 +1179,77 @@ async fn stale_state_rejects_run_creation_and_invalid_checkpoint_payloads() {
         .await
         .expect_err("invalid checkpoint JSON must reject");
     assert!(format!("{invalid_json:#}").contains("valid JSON"));
+}
+
+#[tokio::test]
+async fn reasoning_is_persisted_and_part_of_every_run_fence() {
+    let (database, store) = migrated_store().await;
+    let state = store
+        .activate_self_improvement_workspace("ws_run_a", NOW)
+        .await
+        .unwrap();
+    insert_source(&database, "ws_run_a", "reasoning", NOW + 1).await;
+    let mut input = new_run("ws_run_a", state.activation_epoch, 0, 1);
+    input.learner_reasoning_effort = Some("high".to_owned());
+    input.reviewer_reasoning_effort = Some("none".to_owned());
+    let run = store
+        .create_or_get_self_improvement_run(input, NOW + 2)
+        .await
+        .unwrap();
+    assert_eq!(run.learner_reasoning_effort.as_deref(), Some("high"));
+    assert_eq!(run.reviewer_reasoning_effort.as_deref(), Some("none"));
+    let claimed = store
+        .claim_available_self_improvement_run(
+            "ws_run_a",
+            &run.id,
+            state.activation_epoch,
+            "worker",
+            NOW + 3,
+            NOW + 100,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let fence = claimed.fence().unwrap();
+    let mut forged = fence.clone();
+    forged.learner_reasoning_effort = None;
+    assert_eq!(
+        store
+            .heartbeat_self_improvement_run(&forged, NOW + 4, NOW + 101)
+            .await
+            .unwrap(),
+        SelfImprovementRunMutationResult::LostAuthority
+    );
+    let replacement = SelfImprovementFinalizationAuthority {
+        effective_enabled: true,
+        learner_provider: run.learner_provider.clone(),
+        learner_model: run.learner_model.clone(),
+        learner_reasoning_effort: Some("low".to_owned()),
+        reviewer_provider: run.reviewer_provider.clone(),
+        reviewer_model: run.reviewer_model.clone(),
+        reviewer_reasoning_effort: None,
+        pipeline_contract_version: run.pipeline_contract_version.clone(),
+    };
+    assert_eq!(
+        store
+            .reset_unfinished_self_improvement_run_authority(&claimed, &replacement, NOW + 5)
+            .await
+            .unwrap(),
+        SelfImprovementRunMutationResult::Applied
+    );
+    assert_eq!(
+        store
+            .save_self_improvement_run_checkpoint(&fence, "{}", "{}", NOW + 6)
+            .await
+            .unwrap(),
+        SelfImprovementRunMutationResult::LostAuthority
+    );
+    let reset = store
+        .get_self_improvement_run("ws_run_a", &run.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(reset.learner_reasoning_effort.as_deref(), Some("low"));
+    assert_eq!(reset.reviewer_reasoning_effort, None);
+    assert_eq!(reset.source_upper_inclusive, run.source_upper_inclusive);
 }

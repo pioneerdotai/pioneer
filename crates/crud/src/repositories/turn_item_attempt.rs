@@ -2,14 +2,15 @@ use anyhow::{Context, Result};
 use pioneer_entity::{turn, turn_item, turn_item_attempt};
 use pioneer_protocol::{
     TurnItem, TurnItemAttemptStatus, TurnItemExecutionClass, TurnItemTimeoutReason, TurnItemType,
-    TurnStatus, generate_id,
+    TurnStatus,
 };
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::sea_query::Expr;
 use sea_orm::{
-    ColumnTrait, Condition, ConnectionTrait, EntityTrait, ExprTrait, FromQueryResult, JoinType,
-    Order, QueryFilter, QueryOrder, QuerySelect, Set,
+    ColumnTrait, Condition, ConnectionTrait, EntityTrait, ExprTrait, Order, QueryFilter,
+    QueryOrder, QuerySelect, Set,
 };
+use std::collections::{HashMap, HashSet};
 
 use crate::convention::{
     ATTEMPT_STATUS_TIMED_OUT, TURN_ITEM_STATUS_IN_PROGRESS, TURN_ITEM_STATUS_TIMED_OUT,
@@ -20,7 +21,7 @@ use crate::convention::{
 };
 use crate::turn_item_terminal::{TurnItemTerminalState, terminalize_turn_item_payload};
 
-const DB_ID_LEN: usize = 21;
+const MAX_TERMINAL_TURN_RUNNING_ATTEMPTS: u64 = 64;
 
 #[derive(Debug, Clone)]
 pub struct AttemptDeadlines {
@@ -62,18 +63,40 @@ pub struct TimedOutAttemptSnapshot {
     pub hard_deadline_at: Option<DateTimeWithTimeZone>,
 }
 
-#[derive(Debug, Clone, FromQueryResult)]
-pub struct UnclassifiedAttemptExecutionCandidate {
-    pub attempt_id: String,
-    pub turn_id: String,
-    pub item_id: String,
-    pub item_type: String,
-    pub item_payload: String,
-    pub started_at: DateTimeWithTimeZone,
+#[derive(Debug, Clone)]
+pub struct PreparedRunningAttemptTimeout {
+    attempt: RunningAttemptSnapshot,
+    timeout_reason: TurnItemTimeoutReason,
+    timeout_reason_db: String,
+    expected_item_payload: String,
+    terminal_item_payload: String,
+    updated_at: DateTimeWithTimeZone,
+}
+
+#[derive(Debug, Clone)]
+pub struct PreparedTimedOutAttemptReactivation {
+    attempt_id: String,
+    turn_id: String,
+    item_id: String,
+    expected_attempt_payload: String,
+    expected_attempt_updated_at: DateTimeWithTimeZone,
+    item_payload: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PreparedTerminalRunningAttempt {
+    attempt_id: String,
+    turn_id: String,
+    item_id: String,
+    expected_item_payload: String,
+    terminal_item_payload: String,
+    terminal_item_status: String,
+    updated_at: DateTimeWithTimeZone,
 }
 
 pub async fn create_running_attempt<C: ConnectionTrait>(
     db: &C,
+    id: String,
     turn_id: &str,
     item_id: &str,
     item_type: TurnItemType,
@@ -84,7 +107,6 @@ pub async fn create_running_attempt<C: ConnectionTrait>(
     started_event_sequence: Option<i64>,
 ) -> Result<turn_item_attempt::Model> {
     let next_attempt_number = next_attempt_number(db, turn_id, item_id).await?;
-    let id = generate_id(DB_ID_LEN);
 
     let status = turn_item_attempt_status_to_db(TurnItemAttemptStatus::Running).to_owned();
     let item_type_db = turn_item_type_to_db(item_type).to_owned();
@@ -390,15 +412,61 @@ pub async fn list_expired_running_attempts<C: ConnectionTrait>(
     rows.into_iter().map(running_snapshot_from_model).collect()
 }
 
-pub async fn transition_running_attempt_to_timed_out<C: ConnectionTrait>(
+pub async fn prepare_running_attempt_timeout<C: ConnectionTrait>(
     db: &C,
     attempt: &RunningAttemptSnapshot,
     timeout_reason: TurnItemTimeoutReason,
     updated_at: DateTimeWithTimeZone,
+) -> Result<Option<PreparedRunningAttemptTimeout>> {
+    let deadline = match timeout_reason {
+        TurnItemTimeoutReason::StartDeadlineExceeded => return Ok(None),
+        TurnItemTimeoutReason::HardDeadlineExceeded => attempt.hard_deadline_at.as_ref(),
+        TurnItemTimeoutReason::IdleDeadlineExceeded => attempt.idle_deadline_at.as_ref(),
+        TurnItemTimeoutReason::LeaseExpired => attempt.lease_expires_at.as_ref(),
+    };
+    if deadline.is_none_or(|deadline| deadline > &updated_at) {
+        return Ok(None);
+    }
+    let item_row = turn_item::Entity::find()
+        .filter(turn_item::Column::TurnId.eq(attempt.turn_id.clone()))
+        .filter(turn_item::Column::ItemId.eq(attempt.item_id.clone()))
+        .one(db)
+        .await
+        .context("failed to load turn_item row for timeout terminalization")?
+        .context("timed out attempt missing turn_item row")?;
+    let mut item: TurnItem =
+        serde_json::from_str(item_row.payload.as_str()).with_context(|| {
+            format!(
+                "failed to decode timed out turn_item payload for turn `{}` item `{}`",
+                attempt.turn_id, attempt.item_id
+            )
+        })?;
+    terminalize_turn_item_payload(
+        &mut item,
+        TurnItemTerminalState::TimedOut {
+            reason: timeout_reason,
+        },
+    );
+    let terminal_item_payload =
+        serde_json::to_string(&item).context("failed to encode terminalized item")?;
+    Ok(Some(PreparedRunningAttemptTimeout {
+        attempt: attempt.clone(),
+        timeout_reason,
+        timeout_reason_db: turn_item_timeout_reason_to_db(timeout_reason).to_owned(),
+        expected_item_payload: item_row.payload,
+        terminal_item_payload,
+        updated_at,
+    }))
+}
+
+pub async fn transition_prepared_running_attempt_to_timed_out<C: ConnectionTrait>(
+    db: &C,
+    prepared: PreparedRunningAttemptTimeout,
 ) -> Result<bool> {
+    let attempt = &prepared.attempt;
+    let updated_at = prepared.updated_at;
     let timed_out_status = turn_item_attempt_status_to_db(TurnItemAttemptStatus::TimedOut);
     let running_status = turn_item_attempt_status_to_db(TurnItemAttemptStatus::Running);
-    let timeout_reason_db = turn_item_timeout_reason_to_db(timeout_reason).to_owned();
 
     let last_heartbeat_matches = match attempt.last_heartbeat_at.as_ref() {
         Some(value) => turn_item_attempt::Column::LastHeartbeatAt.eq(value.clone()),
@@ -416,7 +484,7 @@ pub async fn transition_running_attempt_to_timed_out<C: ConnectionTrait>(
         Some(value) => turn_item_attempt::Column::HardDeadlineAt.eq(value.clone()),
         None => turn_item_attempt::Column::HardDeadlineAt.is_null(),
     };
-    let expired_deadline = match timeout_reason {
+    let expired_deadline = match prepared.timeout_reason {
         TurnItemTimeoutReason::StartDeadlineExceeded => return Ok(false),
         TurnItemTimeoutReason::HardDeadlineExceeded => {
             let Some(deadline) = attempt.hard_deadline_at.as_ref() else {
@@ -466,7 +534,7 @@ pub async fn transition_running_attempt_to_timed_out<C: ConnectionTrait>(
         )
         .col_expr(
             turn_item_attempt::Column::TimeoutReason,
-            Expr::value(Some(timeout_reason_db)),
+            Expr::value(Some(prepared.timeout_reason_db)),
         )
         .col_expr(
             turn_item_attempt::Column::UpdatedAt,
@@ -483,44 +551,57 @@ pub async fn transition_running_attempt_to_timed_out<C: ConnectionTrait>(
         return Ok(false);
     }
 
-    let item_row = turn_item::Entity::find()
-        .filter(turn_item::Column::TurnId.eq(attempt.turn_id.clone()))
-        .filter(turn_item::Column::ItemId.eq(attempt.item_id.clone()))
-        .one(db)
-        .await
-        .context("failed to load turn_item row for timeout terminalization")?
-        .context("timed out attempt missing turn_item row")?;
-
-    let mut item: TurnItem =
-        serde_json::from_str(item_row.payload.as_str()).with_context(|| {
-            format!(
-                "failed to decode timed out turn_item payload for turn `{}` item `{}`",
-                attempt.turn_id, attempt.item_id
-            )
-        })?;
-    terminalize_turn_item_payload(
-        &mut item,
-        TurnItemTerminalState::TimedOut {
-            reason: timeout_reason,
-        },
-    );
-    let payload_json =
-        serde_json::to_string(&item).context("failed to encode terminalized item")?;
     let turn_item_status = Some(TURN_ITEM_STATUS_TIMED_OUT);
 
+    let terminal_item_payload = prepared.terminal_item_payload.clone();
     turn_item::Entity::update_many()
         .col_expr(turn_item::Column::Status, Expr::value(turn_item_status))
         .col_expr(
             turn_item::Column::ActiveAttemptStatus,
             Expr::value(Some(timed_out_status)),
         )
-        .col_expr(turn_item::Column::Payload, Expr::value(payload_json))
-        .col_expr(turn_item::Column::UpdatedAt, Expr::value(updated_at))
+        .col_expr(
+            turn_item::Column::Payload,
+            Expr::value(terminal_item_payload.clone()),
+        )
+        .col_expr(
+            turn_item::Column::UpdatedAt,
+            Expr::value(updated_at.clone()),
+        )
         .filter(turn_item::Column::TurnId.eq(attempt.turn_id.clone()))
         .filter(turn_item::Column::ItemId.eq(attempt.item_id.clone()))
+        .filter(turn_item::Column::ActiveAttemptId.eq(attempt.id.clone()))
+        .filter(turn_item::Column::ActiveAttemptStatus.eq(running_status))
+        .filter(turn_item::Column::Payload.eq(prepared.expected_item_payload))
         .exec(db)
         .await
         .context("failed to mark turn_item timed_out")?;
+
+    // sqlite-zstd exposes turn_item through an INSTEAD OF-triggered view.
+    // SQLite reports zero affected rows for updates through that view even
+    // when the backing row changed, so changes()/rows_affected cannot prove
+    // whether the conditional update won. Verify the exact stored CAS result
+    // while the caller's transaction still owns the writer instead.
+    let item_updated = crate::repositories::turn::find_turn_item(
+        db,
+        attempt.turn_id.as_str(),
+        attempt.item_id.as_str(),
+    )
+    .await
+    .context("failed to verify timed_out turn_item update")?
+    .is_some_and(|item| {
+        item.status.as_deref() == Some(TURN_ITEM_STATUS_TIMED_OUT)
+            && item.active_attempt_id.as_deref() == Some(attempt.id.as_str())
+            && item.active_attempt_status.as_deref() == Some(timed_out_status)
+            && item.payload == terminal_item_payload
+            && item.updated_at == updated_at
+    });
+    if !item_updated {
+        anyhow::bail!(
+            "timed out attempt `{}` no longer owns its source turn item",
+            attempt.id
+        );
+    }
 
     Ok(true)
 }
@@ -565,21 +646,18 @@ pub async fn find_timed_out_attempt_by_id<C: ConnectionTrait>(
     }))
 }
 
-pub async fn reactivate_timed_out_attempt<C: ConnectionTrait>(
+pub async fn prepare_timed_out_attempt_reactivation<C: ConnectionTrait>(
     db: &C,
     attempt_id: &str,
-    heartbeat_at: DateTimeWithTimeZone,
-    deadlines: AttemptDeadlines,
-) -> Result<bool> {
+) -> Result<Option<PreparedTimedOutAttemptReactivation>> {
     let timed_out_status = turn_item_attempt_status_to_db(TurnItemAttemptStatus::TimedOut);
-    let running_status = turn_item_attempt_status_to_db(TurnItemAttemptStatus::Running);
     let Some(attempt) = turn_item_attempt::Entity::find_by_id(attempt_id.to_owned())
         .filter(turn_item_attempt::Column::Status.eq(timed_out_status))
         .one(db)
         .await
         .context("failed to load timed_out attempt for runtime rehydration")?
     else {
-        return Ok(false);
+        return Ok(None);
     };
     if turn::Entity::find_by_id(attempt.turn_id.clone())
         .filter(turn::Column::Status.eq(turn_status_to_db(TurnStatus::InProgress)))
@@ -588,7 +666,7 @@ pub async fn reactivate_timed_out_attempt<C: ConnectionTrait>(
         .context("failed to verify Turn status before attempt rehydration")?
         .is_none()
     {
-        return Ok(false);
+        return Ok(None);
     }
 
     let item: TurnItem = serde_json::from_str(attempt.payload.as_str()).with_context(|| {
@@ -605,8 +683,35 @@ pub async fn reactivate_timed_out_attempt<C: ConnectionTrait>(
             attempt.item_id
         );
     }
-    let payload_json =
+    let item_payload =
         serde_json::to_string(&item).context("failed to encode rehydrated turn item")?;
+    Ok(Some(PreparedTimedOutAttemptReactivation {
+        attempt_id: attempt.id,
+        turn_id: attempt.turn_id,
+        item_id: attempt.item_id,
+        expected_attempt_payload: attempt.payload,
+        expected_attempt_updated_at: attempt.updated_at,
+        item_payload,
+    }))
+}
+
+pub async fn reactivate_prepared_timed_out_attempt<C: ConnectionTrait>(
+    db: &C,
+    prepared: PreparedTimedOutAttemptReactivation,
+    heartbeat_at: DateTimeWithTimeZone,
+    deadlines: AttemptDeadlines,
+) -> Result<bool> {
+    let timed_out_status = turn_item_attempt_status_to_db(TurnItemAttemptStatus::TimedOut);
+    let running_status = turn_item_attempt_status_to_db(TurnItemAttemptStatus::Running);
+    if turn::Entity::find_by_id(prepared.turn_id.clone())
+        .filter(turn::Column::Status.eq(turn_status_to_db(TurnStatus::InProgress)))
+        .one(db)
+        .await
+        .context("failed to revalidate Turn status before attempt rehydration")?
+        .is_none()
+    {
+        return Ok(false);
+    }
 
     let attempt_affected = turn_item_attempt::Entity::update_many()
         .col_expr(
@@ -657,8 +762,10 @@ pub async fn reactivate_timed_out_attempt<C: ConnectionTrait>(
             turn_item_attempt::Column::UpdatedAt,
             Expr::value(heartbeat_at.clone()),
         )
-        .filter(turn_item_attempt::Column::Id.eq(attempt.id.clone()))
+        .filter(turn_item_attempt::Column::Id.eq(prepared.attempt_id.clone()))
         .filter(turn_item_attempt::Column::Status.eq(timed_out_status))
+        .filter(turn_item_attempt::Column::Payload.eq(prepared.expected_attempt_payload.clone()))
+        .filter(turn_item_attempt::Column::UpdatedAt.eq(prepared.expected_attempt_updated_at))
         .exec(db)
         .await
         .context("failed to reactivate timed_out attempt")?
@@ -667,7 +774,8 @@ pub async fn reactivate_timed_out_attempt<C: ConnectionTrait>(
         return Ok(false);
     }
 
-    let item_affected = turn_item::Entity::update_many()
+    let item_payload = prepared.item_payload.clone();
+    turn_item::Entity::update_many()
         .col_expr(
             turn_item::Column::Status,
             Expr::value(Some(TURN_ITEM_STATUS_IN_PROGRESS)),
@@ -676,29 +784,51 @@ pub async fn reactivate_timed_out_attempt<C: ConnectionTrait>(
             turn_item::Column::ActiveAttemptStatus,
             Expr::value(Some(running_status)),
         )
-        .col_expr(turn_item::Column::Payload, Expr::value(payload_json))
+        .col_expr(
+            turn_item::Column::Payload,
+            Expr::value(item_payload.clone()),
+        )
         .col_expr(
             turn_item::Column::LastHeartbeatAt,
             Expr::value(Some(heartbeat_at.clone())),
         )
         .col_expr(
             turn_item::Column::LeaseExpiresAt,
-            Expr::value(deadlines.lease_expires_at),
+            Expr::value(deadlines.lease_expires_at.clone()),
         )
-        .col_expr(turn_item::Column::UpdatedAt, Expr::value(heartbeat_at))
-        .filter(turn_item::Column::TurnId.eq(attempt.turn_id.clone()))
-        .filter(turn_item::Column::ItemId.eq(attempt.item_id.clone()))
-        .filter(turn_item::Column::ActiveAttemptId.eq(attempt.id.clone()))
+        .col_expr(
+            turn_item::Column::UpdatedAt,
+            Expr::value(heartbeat_at.clone()),
+        )
+        .filter(turn_item::Column::TurnId.eq(prepared.turn_id.clone()))
+        .filter(turn_item::Column::ItemId.eq(prepared.item_id.clone()))
+        .filter(turn_item::Column::ActiveAttemptId.eq(prepared.attempt_id.clone()))
         .filter(turn_item::Column::ActiveAttemptStatus.eq(timed_out_status))
         .filter(turn_item::Column::Status.eq(TURN_ITEM_STATUS_TIMED_OUT))
         .exec(db)
         .await
-        .context("failed to reactivate timed_out turn item")?
-        .rows_affected;
-    if item_affected != 1 {
+        .context("failed to reactivate timed_out turn item")?;
+
+    let item_updated = crate::repositories::turn::find_turn_item(
+        db,
+        prepared.turn_id.as_str(),
+        prepared.item_id.as_str(),
+    )
+    .await
+    .context("failed to verify reactivated turn_item update")?
+    .is_some_and(|item| {
+        item.status.as_deref() == Some(TURN_ITEM_STATUS_IN_PROGRESS)
+            && item.active_attempt_id.as_deref() == Some(prepared.attempt_id.as_str())
+            && item.active_attempt_status.as_deref() == Some(running_status)
+            && item.payload == item_payload
+            && item.last_heartbeat_at.as_ref() == Some(&heartbeat_at)
+            && item.lease_expires_at == deadlines.lease_expires_at
+            && item.updated_at == heartbeat_at
+    });
+    if !item_updated {
         anyhow::bail!(
             "timed_out attempt `{}` no longer owns its terminal turn item",
-            attempt.id
+            prepared.attempt_id
         );
     }
 
@@ -719,6 +849,205 @@ pub async fn list_running_attempts_for_turn<C: ConnectionTrait>(
         .context("failed to list running attempts for turn")?;
 
     rows.into_iter().map(running_snapshot_from_model).collect()
+}
+
+/// Prepares the payload changes needed to close every still-running item when
+/// its Turn becomes terminal. The potentially expensive JSON work happens on
+/// the reader side before the caller obtains the writer transaction.
+pub(crate) async fn prepare_terminal_running_attempts<C: ConnectionTrait>(
+    db: &C,
+    turn_id: &str,
+    updated_at: DateTimeWithTimeZone,
+) -> Result<Vec<PreparedTerminalRunningAttempt>> {
+    let running_status = turn_item_attempt_status_to_db(TurnItemAttemptStatus::Running);
+    let attempts = turn_item_attempt::Entity::find()
+        .filter(turn_item_attempt::Column::TurnId.eq(turn_id.to_owned()))
+        .filter(turn_item_attempt::Column::Status.eq(running_status))
+        .order_by_asc(turn_item_attempt::Column::AttemptNumber)
+        .limit(MAX_TERMINAL_TURN_RUNNING_ATTEMPTS.saturating_add(1))
+        .all(db)
+        .await
+        .context("failed to prepare running attempts for terminal Turn")?;
+    if attempts.len() > MAX_TERMINAL_TURN_RUNNING_ATTEMPTS as usize {
+        anyhow::bail!(
+            "terminal Turn `{turn_id}` has more than {MAX_TERMINAL_TURN_RUNNING_ATTEMPTS} running attempts"
+        );
+    }
+    if attempts.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let item_ids = attempts
+        .iter()
+        .map(|attempt| attempt.item_id.clone())
+        .collect::<Vec<_>>();
+    let items = turn_item::Entity::find()
+        .filter(turn_item::Column::TurnId.eq(turn_id.to_owned()))
+        .filter(turn_item::Column::ItemId.is_in(item_ids))
+        .all(db)
+        .await
+        .context("failed to load running turn items for terminal Turn")?
+        .into_iter()
+        .map(|item| (item.item_id.clone(), item))
+        .collect::<HashMap<_, _>>();
+
+    attempts
+        .into_iter()
+        .map(|attempt| {
+            let item = items.get(attempt.item_id.as_str()).with_context(|| {
+                format!(
+                    "running attempt `{}` is missing its turn_item row",
+                    attempt.id
+                )
+            })?;
+            if item.active_attempt_id.as_deref() != Some(attempt.id.as_str()) {
+                anyhow::bail!(
+                    "running attempt `{}` does not own turn item `{}`",
+                    attempt.id,
+                    attempt.item_id
+                );
+            }
+            let mut terminal_item = serde_json::from_str::<TurnItem>(item.payload.as_str())
+                .with_context(|| {
+                    format!(
+                        "failed to decode running turn_item payload for terminal Turn `{turn_id}` item `{}`",
+                        attempt.item_id
+                    )
+                })?;
+            let terminal_state = TurnItemTerminalState::Failed {
+                reason: Some("turn_terminal_before_item_completed".to_owned()),
+            };
+            terminalize_turn_item_payload(&mut terminal_item, terminal_state.clone());
+            let terminal_item_payload = serde_json::to_string(&terminal_item)
+                .context("failed to encode terminalized turn item")?;
+            Ok(PreparedTerminalRunningAttempt {
+                attempt_id: attempt.id,
+                turn_id: attempt.turn_id,
+                item_id: attempt.item_id,
+                expected_item_payload: item.payload.clone(),
+                terminal_item_payload,
+                terminal_item_status: terminal_state.to_turn_item_status().to_owned(),
+                updated_at,
+            })
+        })
+        .collect()
+}
+
+/// Applies a reader-prepared terminalization plan. All work here is bounded
+/// and consists only of SQLite reads/conditional updates. A newly-created
+/// running attempt that was absent from the reader snapshot rejects the whole
+/// transaction rather than leaving a terminal Turn with live work.
+pub(crate) async fn close_prepared_terminal_running_attempts<C: ConnectionTrait>(
+    db: &C,
+    turn_id: &str,
+    prepared: Vec<PreparedTerminalRunningAttempt>,
+) -> Result<()> {
+    let running_status = turn_item_attempt_status_to_db(TurnItemAttemptStatus::Running);
+    let current = turn_item_attempt::Entity::find()
+        .filter(turn_item_attempt::Column::TurnId.eq(turn_id.to_owned()))
+        .filter(turn_item_attempt::Column::Status.eq(running_status))
+        .order_by_asc(turn_item_attempt::Column::AttemptNumber)
+        .limit(MAX_TERMINAL_TURN_RUNNING_ATTEMPTS.saturating_add(1))
+        .all(db)
+        .await
+        .context("failed to revalidate running attempts for terminal Turn")?;
+    if current.len() > MAX_TERMINAL_TURN_RUNNING_ATTEMPTS as usize {
+        anyhow::bail!(
+            "terminal Turn `{turn_id}` has more than {MAX_TERMINAL_TURN_RUNNING_ATTEMPTS} running attempts"
+        );
+    }
+    let prepared_ids = prepared
+        .iter()
+        .map(|attempt| attempt.attempt_id.as_str())
+        .collect::<HashSet<_>>();
+    if current
+        .iter()
+        .any(|attempt| !prepared_ids.contains(attempt.id.as_str()))
+    {
+        anyhow::bail!("running attempts changed during terminal Turn preparation");
+    }
+
+    let interrupted_status =
+        turn_item_attempt_status_to_db(TurnItemAttemptStatus::Interrupted).to_owned();
+    for attempt in prepared {
+        let affected = turn_item_attempt::Entity::update_many()
+            .col_expr(
+                turn_item_attempt::Column::Status,
+                Expr::value(interrupted_status.clone()),
+            )
+            .col_expr(
+                turn_item_attempt::Column::FailureReason,
+                Expr::value(Some("turn_terminal_before_item_completed".to_owned())),
+            )
+            .col_expr(turn_item_attempt::Column::Payload, Expr::value("{}"))
+            .col_expr(
+                turn_item_attempt::Column::UpdatedAt,
+                Expr::value(attempt.updated_at),
+            )
+            .filter(turn_item_attempt::Column::Id.eq(attempt.attempt_id.clone()))
+            .filter(turn_item_attempt::Column::TurnId.eq(attempt.turn_id.clone()))
+            .filter(turn_item_attempt::Column::ItemId.eq(attempt.item_id.clone()))
+            .filter(turn_item_attempt::Column::Status.eq(running_status))
+            .exec(db)
+            .await
+            .context("failed to interrupt running attempt for terminal Turn")?
+            .rows_affected;
+        if affected == 0 {
+            // A completed attempt from the reader snapshot is already terminal
+            // and therefore needs no terminal-Turn projection.
+            continue;
+        }
+
+        let terminal_item_status = attempt.terminal_item_status.clone();
+        let terminal_item_payload = attempt.terminal_item_payload.clone();
+        turn_item::Entity::update_many()
+            .col_expr(
+                turn_item::Column::Status,
+                Expr::value(Some(terminal_item_status.clone())),
+            )
+            .col_expr(
+                turn_item::Column::Payload,
+                Expr::value(terminal_item_payload.clone()),
+            )
+            .col_expr(
+                turn_item::Column::ActiveAttemptStatus,
+                Expr::value(Some(interrupted_status.clone())),
+            )
+            .col_expr(
+                turn_item::Column::UpdatedAt,
+                Expr::value(attempt.updated_at.clone()),
+            )
+            .filter(turn_item::Column::TurnId.eq(attempt.turn_id.clone()))
+            .filter(turn_item::Column::ItemId.eq(attempt.item_id.clone()))
+            .filter(turn_item::Column::ActiveAttemptId.eq(attempt.attempt_id.clone()))
+            .filter(turn_item::Column::ActiveAttemptStatus.eq(running_status))
+            .filter(turn_item::Column::Payload.eq(attempt.expected_item_payload.clone()))
+            .exec(db)
+            .await
+            .context("failed to terminalize running turn item")?;
+
+        let item_updated = crate::repositories::turn::find_turn_item(
+            db,
+            attempt.turn_id.as_str(),
+            attempt.item_id.as_str(),
+        )
+        .await
+        .context("failed to verify terminalized running turn_item update")?
+        .is_some_and(|item| {
+            item.status.as_deref() == Some(terminal_item_status.as_str())
+                && item.active_attempt_id.as_deref() == Some(attempt.attempt_id.as_str())
+                && item.active_attempt_status.as_deref() == Some(interrupted_status.as_str())
+                && item.payload == terminal_item_payload
+                && item.updated_at == attempt.updated_at
+        });
+        if !item_updated {
+            anyhow::bail!(
+                "running attempt `{}` lost its turn_item projection during terminal Turn preparation",
+                attempt.attempt_id
+            );
+        }
+    }
+    Ok(())
 }
 
 pub async fn list_running_attempts_by_item_type<C: ConnectionTrait>(
@@ -795,100 +1124,6 @@ pub async fn list_timed_out_without_recovery<C: ConnectionTrait>(
             })
         })
         .collect()
-}
-
-pub async fn list_unclassified_execution_attempts<C: ConnectionTrait>(
-    db: &C,
-    limit: u64,
-) -> Result<Vec<UnclassifiedAttemptExecutionCandidate>> {
-    turn_item_attempt::Entity::find()
-        .select_only()
-        .column_as(turn_item_attempt::Column::Id, "attempt_id")
-        .column(turn_item_attempt::Column::TurnId)
-        .column(turn_item_attempt::Column::ItemId)
-        .column(turn_item_attempt::Column::ItemType)
-        .column_as(turn_item::Column::Payload, "item_payload")
-        .column(turn_item_attempt::Column::StartedAt)
-        .join(
-            JoinType::InnerJoin,
-            turn_item_attempt::Entity::belongs_to(turn_item::Entity)
-                .from((
-                    turn_item_attempt::Column::TurnId,
-                    turn_item_attempt::Column::ItemId,
-                ))
-                .to((turn_item::Column::TurnId, turn_item::Column::ItemId))
-                .into(),
-        )
-        .filter(turn_item_attempt::Column::ExecutionClass.is_null())
-        .order_by_asc(turn_item_attempt::Column::Id)
-        .limit(std::cmp::max(limit, 1))
-        .into_model::<UnclassifiedAttemptExecutionCandidate>()
-        .all(db)
-        .await
-        .context("failed to list attempts missing an execution class")
-}
-
-pub async fn classify_execution_attempt<C: ConnectionTrait>(
-    db: &C,
-    candidate: &UnclassifiedAttemptExecutionCandidate,
-    execution_class: TurnItemExecutionClass,
-    context_compaction_deadlines: Option<AttemptDeadlines>,
-) -> Result<bool> {
-    let mut update = turn_item_attempt::Entity::update_many().col_expr(
-        turn_item_attempt::Column::ExecutionClass,
-        Expr::value(Some(
-            turn_item_execution_class_to_db(execution_class).to_owned(),
-        )),
-    );
-    if let Some(deadlines) = &context_compaction_deadlines {
-        update = update
-            .col_expr(
-                turn_item_attempt::Column::LeaseExpiresAt,
-                Expr::value(deadlines.lease_expires_at),
-            )
-            .col_expr(
-                turn_item_attempt::Column::IdleDeadlineAt,
-                Expr::value(deadlines.idle_deadline_at),
-            )
-            .col_expr(
-                turn_item_attempt::Column::HardDeadlineAt,
-                Expr::value(deadlines.hard_deadline_at),
-            );
-    }
-    let changed = update
-        .filter(turn_item_attempt::Column::Id.eq(candidate.attempt_id.clone()))
-        .filter(turn_item_attempt::Column::ExecutionClass.is_null())
-        .exec(db)
-        .await
-        .with_context(|| {
-            format!(
-                "failed to classify execution for attempt `{}`",
-                candidate.attempt_id
-            )
-        })?
-        .rows_affected
-        > 0;
-
-    if changed && let Some(deadlines) = context_compaction_deadlines {
-        turn_item::Entity::update_many()
-            .col_expr(
-                turn_item::Column::LeaseExpiresAt,
-                Expr::value(deadlines.lease_expires_at),
-            )
-            .filter(turn_item::Column::TurnId.eq(candidate.turn_id.clone()))
-            .filter(turn_item::Column::ItemId.eq(candidate.item_id.clone()))
-            .filter(turn_item::Column::ActiveAttemptId.eq(candidate.attempt_id.clone()))
-            .exec(db)
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to synchronize context compaction item `{}` deadline",
-                    candidate.item_id
-                )
-            })?;
-    }
-
-    Ok(changed)
 }
 
 fn running_snapshot_from_model(row: turn_item_attempt::Model) -> Result<RunningAttemptSnapshot> {

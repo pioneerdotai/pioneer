@@ -1,11 +1,11 @@
 use super::PendingToolUiState;
 use crate::{AgentEventHub, AgentEventHubError};
 use pioneer_protocol::{
-    AgentDurableEvent, AgentProgressEvent, ItemCompletedNotification, ItemDeltaNotification,
-    ItemDeltaStream, ItemStartedNotification, LlmRetentionPolicy, StorageOutputPolicy,
-    TimelineOutputPolicy, ToolCallStatus, ToolDisplayPayload, ToolMetadata, ToolMetadataValue,
-    ToolObservation, ToolOutputPolicySnapshot, ToolOutputSummary, ToolRecoveryPolicySnapshot,
-    ToolRecoveryView, ToolStoragePayload, TurnItem, TurnItemExecutionClass, TurnItemType,
+    AgentDurableEvent, ItemCompletedNotification, ItemDeltaNotification, ItemDeltaStream,
+    ItemStartedNotification, LlmRetentionPolicy, StorageOutputPolicy, TimelineOutputPolicy,
+    ToolCallStatus, ToolDisplayPayload, ToolMetadata, ToolMetadataValue, ToolObservation,
+    ToolOutputPolicySnapshot, ToolOutputSummary, ToolRecoveryPolicySnapshot, ToolRecoveryView,
+    ToolStoragePayload, TurnItem, TurnItemExecutionClass, TurnItemType,
 };
 use pioneer_tools::{ToolDeltaPayload, ToolEvent, ToolEventPayload, ToolOutcome, ToolResultView};
 use serde_json::Value as JsonValue;
@@ -121,8 +121,8 @@ pub(super) async fn forward_tool_event_to_agent(
             let should_forward = {
                 let mut pending = pending_tool_ui.lock().await;
                 let Some(state) = pending.get_mut(event.call_id.as_str()) else {
-                    // Progress is deliberately lossy. It must never synthesize
-                    // durable lifecycle state when CallStarted has not yet
+                    // Output cannot synthesize
+                    // lifecycle state when CallStarted has not yet
                     // crossed the acknowledged lane or when CallCompleted has
                     // already removed that state.
                     return Ok(());
@@ -134,23 +134,36 @@ pub(super) async fn forward_tool_event_to_agent(
                 return Ok(());
             }
 
-            if let Some((delta, stream, payload)) =
+            if let Some((delta, stream, mut payload)) =
                 protocol_delta_from_tool_delta(delta_event.delta)
-                && !delta.is_empty()
+                && (!delta.is_empty() || payload.is_some())
             {
-                event_tx.publish_progress(AgentProgressEvent::ItemDelta {
-                    notification: ItemDeltaNotification {
-                        workspace_id: workspace_id.to_owned(),
-                        thread_id: thread_id.to_owned(),
-                        turn_id: turn_id.to_owned(),
-                        item_id: event.call_id,
-                        delta,
-                        stream: Some(stream),
-                        payload,
-                        markdown: None,
-                        markdown_version: None,
-                    },
-                });
+                let fields = payload.get_or_insert_with(|| serde_json::json!({}));
+                fields["observation"] =
+                    serde_json::to_value(&event.observation).unwrap_or_default();
+                event_tx
+                    .publish_durable_and_wait(AgentDurableEvent::ToolOutputRecorded {
+                        id: format!(
+                            "{}:{}:{}:{}:{}",
+                            turn_id,
+                            event.call_id,
+                            event.observation.trace_id,
+                            event.observation.attempt_id,
+                            event.observation.event_seq
+                        ),
+                        notification: ItemDeltaNotification {
+                            workspace_id: workspace_id.to_owned(),
+                            thread_id: thread_id.to_owned(),
+                            turn_id: turn_id.to_owned(),
+                            item_id: event.call_id,
+                            delta,
+                            stream: Some(stream),
+                            payload,
+                            markdown: None,
+                            markdown_version: None,
+                        },
+                    })
+                    .await?;
             }
         }
         ToolEventPayload::CallCompleted(completed) => {
@@ -206,6 +219,11 @@ pub(super) async fn forward_tool_event_to_agent(
             }
 
             let outcome = protocol_outcome_from_tool_outcome(&completed.outcome);
+            let storage = storage_with_native_patch_history(
+                event.tool_name.as_str(),
+                &completed.llm_view,
+                completed.storage,
+            );
 
             event_tx
                 .publish_durable_and_wait(AgentDurableEvent::ItemCompleted {
@@ -224,7 +242,7 @@ pub(super) async fn forward_tool_event_to_agent(
                             recovery_policy,
                             turn_item_execution_class,
                             display: completed.display,
-                            storage: completed.storage,
+                            storage,
                             recovery: completed.recovery,
                             observation: state_observation,
                         }),
@@ -315,6 +333,47 @@ pub(super) async fn forward_tool_event_to_agent(
     Ok(())
 }
 
+/// The native patch executor includes a typed, trusted history envelope in
+/// the structured tool result. Keep that envelope on the durable file-change
+/// item even when the normal tool output policy is metadata-only; the gateway
+/// consumes it to append the immutable record and then projects the aggregate.
+fn storage_with_native_patch_history(
+    tool_name: &str,
+    llm_view: &ToolResultView,
+    storage: ToolStoragePayload,
+) -> ToolStoragePayload {
+    if tool_name != "apply_patch" {
+        return storage;
+    }
+    let history_from_storage = match &storage {
+        ToolStoragePayload::Metadata { metadata } => {
+            metadata.to_json().get("patchHistory").cloned()
+        }
+        ToolStoragePayload::Summary(summary) => {
+            summary.metadata.to_json().get("patchHistory").cloned()
+        }
+        ToolStoragePayload::Shell { .. } | ToolStoragePayload::None => None,
+    };
+    let history = history_from_storage.or_else(|| match llm_view {
+        ToolResultView::Json { value, .. } => value.get("history").cloned(),
+        ToolResultView::Text { text, .. } => serde_json::from_str::<JsonValue>(text)
+            .ok()
+            .and_then(|value| value.get("history").cloned()),
+        ToolResultView::Empty => None,
+    });
+    let Some(history) = history else {
+        return storage;
+    };
+
+    let mut metadata = match storage {
+        ToolStoragePayload::Summary(summary) => summary.metadata,
+        ToolStoragePayload::Metadata { metadata } => metadata,
+        ToolStoragePayload::Shell { .. } | ToolStoragePayload::None => ToolMetadata::empty(),
+    };
+    metadata.insert("patchHistory", ToolMetadataValue::from_json(history));
+    ToolStoragePayload::Metadata { metadata }
+}
+
 fn protocol_observation(
     observation: pioneer_tools::ObservationContext,
 ) -> pioneer_protocol::ToolObservation {
@@ -389,7 +448,7 @@ fn protocol_delta_from_tool_delta(
 pub(super) fn tool_item_type_from_name(tool_name: &str) -> TurnItemType {
     match tool_name {
         "exec_command" | "write_stdin" => TurnItemType::CommandExecution,
-        "apply_patch" | "write_file" | "edit_file" => TurnItemType::FileChange,
+        "apply_patch" => TurnItemType::FileChange,
         "web_search" => TurnItemType::WebSearch,
         "web_fetch" => TurnItemType::WebFetch,
         "download_url" => TurnItemType::Download,
@@ -432,7 +491,9 @@ fn argument_command(arguments: &JsonValue) -> Vec<String> {
     Vec::new()
 }
 
-fn protocol_outcome_from_tool_outcome(outcome: &ToolOutcome) -> pioneer_protocol::ToolOutcome {
+pub(super) fn protocol_outcome_from_tool_outcome(
+    outcome: &ToolOutcome,
+) -> pioneer_protocol::ToolOutcome {
     pioneer_protocol::ToolOutcome {
         status: match outcome.status {
             pioneer_tools::ToolOutcomeStatus::Ok => pioneer_protocol::ToolOutcomeStatus::Ok,
@@ -991,7 +1052,7 @@ pub(super) fn build_tool_turn_item(input: ProjectedToolItemInput) -> TurnItem {
     let storage_metadata = storage_metadata_from_payload(storage_projection.as_ref());
     let storage_summary = storage_summary_from_payload(storage_projection.as_ref());
 
-    match tool_item_type_from_name(tool_name.as_str()) {
+    let mut item = match tool_item_type_from_name(tool_name.as_str()) {
         TurnItemType::CommandExecution => {
             let shell = shell_from_storage(storage_projection.as_ref())
                 .or_else(|| shell_from_display(display_projection.as_ref()))
@@ -1300,7 +1361,12 @@ pub(super) fn build_tool_turn_item(input: ProjectedToolItemInput) -> TurnItem {
                 observation,
             }
         }
-    }
+    };
+    // Canonical provider-round envelopes retain the exact call arguments for
+    // execution/history pairing. Timeline lifecycle snapshots need one compact
+    // representation, rather than repeating a complete HTML source each time.
+    pioneer_protocol::compact_html_timeline_item(&mut item);
+    item
 }
 
 pub(super) fn build_tool_error_message(
@@ -1331,6 +1397,85 @@ pub(super) fn build_tool_error_message(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn html_lifecycle_items_keep_source_out_of_timeline_snapshots() {
+        for tool_name in ["html_render", "html_preview"] {
+            for (arguments, expected_arguments) in [
+                (
+                    r#"{"html":"<p>точный source</p>","title":"Page"}"#,
+                    serde_json::json!({
+                        "htmlCharacters": "<p>точный source</p>".chars().count(),
+                        "title": "Page",
+                    }),
+                ),
+                (
+                    r#"{"html":"<p>частичный"#,
+                    serde_json::json!({
+                        "argumentsCharacters": r#"{"html":"<p>частичный"#.chars().count(),
+                    }),
+                ),
+                (
+                    r#""<p>частичный""#,
+                    serde_json::json!({
+                        "argumentsCharacters": "<p>частичный".chars().count(),
+                    }),
+                ),
+            ] {
+                let items = [
+                    build_started_tool_turn_item(
+                        "call".into(),
+                        tool_name.into(),
+                        arguments.into(),
+                        None,
+                        TurnItemExecutionClass::Standard,
+                        None,
+                        None,
+                    ),
+                    build_completed_tool_turn_item(
+                        "call".into(),
+                        tool_name.into(),
+                        arguments.into(),
+                        None,
+                        TurnItemExecutionClass::Standard,
+                        None,
+                        None,
+                    ),
+                    build_failed_tool_turn_item(
+                        "call".into(),
+                        tool_name.into(),
+                        arguments.into(),
+                        "invalid arguments".into(),
+                        ToolOutcome::fatal(pioneer_tools::ToolErrorClass::InvalidArguments, None),
+                        None,
+                        TurnItemExecutionClass::Standard,
+                        None,
+                        None,
+                    ),
+                ];
+                for item in items {
+                    let json = serde_json::to_value(item).unwrap();
+                    assert!(!json.to_string().contains("<p>"));
+                    assert_eq!(json["arguments"], expected_arguments);
+                }
+            }
+        }
+
+        let partial_arguments = r#"{"html":"<p>частичный"#;
+        let ordinary = build_started_tool_turn_item(
+            "ordinary-call".into(),
+            "ordinary_tool".into(),
+            partial_arguments.into(),
+            None,
+            TurnItemExecutionClass::Standard,
+            None,
+            None,
+        );
+        assert_eq!(
+            serde_json::to_value(ordinary).unwrap()["arguments"]["raw"],
+            partial_arguments,
+        );
+    }
     use pioneer_protocol::AgentDurableEvent;
     use pioneer_tools::{
         ObservationContext, ToolCallCompletedEvent, ToolEventPayload, ToolResultView,
@@ -1339,7 +1484,278 @@ mod tests {
     use tokio::time::{Duration, timeout};
 
     #[tokio::test]
-    async fn lossy_delta_cannot_synthesize_missing_durable_tool_start() {
+    async fn builtin_schema_diagnostics_reach_model_message_before_handler_execution() {
+        use pioneer_protocol::{
+            AgentModelToolName, AgentToolCapability, AgentToolOptionsProjection,
+        };
+        use pioneer_tools::{
+            ConfiguredToolSpec, ExecutionClass, PayloadKind, RawToolCall, ToolEventBus,
+            ToolRegistry, ToolRouter, ToolSpec, ToolVisibilitySnapshot,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingHandler(Arc<AtomicUsize>);
+        #[async_trait::async_trait]
+        impl pioneer_tools::ToolHandler for CountingHandler {
+            async fn handle(
+                &self,
+                _: pioneer_tools::ToolInvocation,
+                _: pioneer_tools::ToolEventTrace,
+            ) -> Result<Box<dyn pioneer_tools::ToolOutput>, pioneer_tools::ToolError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(Box::new(pioneer_tools::FunctionToolOutput::new(
+                    "executed", true,
+                )))
+            }
+        }
+        let options = AgentToolOptionsProjection {
+            identities: vec![],
+            profiles: vec![],
+            inherit_parent_identity_available: true,
+            default_pioneer_identity_available: false,
+            derived_ephemeral_identity_available: false,
+            inherit_parent_profile_available: true,
+            allowed_skill_ids: vec![],
+            allowed_mcp_server_ids: vec![],
+            max_permission_profile: pioneer_protocol::task_permission_cap_for_mode(
+                Default::default(),
+            ),
+            thread_creation_options: vec![],
+            target_options: vec![],
+            generation_fingerprint: "fixture".into(),
+        };
+        let entry = pioneer_protocol::project_agent_model_tool_catalog(
+            &[AgentToolCapability::ChildStart].into_iter().collect(),
+            Some(&options),
+        )
+        .into_iter()
+        .find(|entry| entry.name == AgentModelToolName::StartAgent)
+        .unwrap();
+        let name = entry.name.as_str();
+        let spec = ConfiguredToolSpec::with_output_projection(
+            ToolSpec::new(
+                name,
+                entry.description,
+                entry.parameters,
+                PayloadKind::Function,
+            ),
+            ExecutionClass::Shared,
+            pioneer_tools::dynamic_unknown_output_policy(),
+            pioneer_tools::ToolOutputProjectionKind::DynamicGeneric,
+        );
+        let nullable = ConfiguredToolSpec::new(
+            ToolSpec::new(
+                "nullable",
+                "fixture",
+                serde_json::json!({"type": "object", "$defs": {
+                "value": {"type": "object", "properties": {"a": {"type": "string"}, "b": {"type": "array"}}}
+            }, "properties": {"value": {"anyOf": [{"$ref": "#/$defs/value"}, {"type": "null"}]}}}),
+                PayloadKind::Function,
+            ),
+            ExecutionClass::Shared,
+            pioneer_tools::dynamic_unknown_output_policy(),
+        );
+        let ambiguous = ConfiguredToolSpec::new(
+            ToolSpec::new(
+                "ambiguous",
+                "fixture",
+                serde_json::json!({"type": "object", "properties": {
+                    "value": {"oneOf": [
+                        {"type": "object", "properties": {"a": {"type": "string"}, "b": {"type": "array"}}},
+                        {"type": "object", "properties": {"a": {"type": "string"}}}
+                    ]}
+                }}),
+                PayloadKind::Function,
+            ),
+            ExecutionClass::Shared,
+            pioneer_tools::dynamic_unknown_output_policy(),
+        );
+        let shell = pioneer_tools::builtin_tool_specs()
+            .into_iter()
+            .find(|spec| spec.spec.name == "exec_command")
+            .unwrap();
+        let stdin = pioneer_tools::builtin_tool_specs()
+            .into_iter()
+            .find(|spec| spec.spec.name == "write_stdin")
+            .unwrap();
+        let specs = vec![spec, nullable, ambiguous, shell, stdin];
+        let executions = Arc::new(AtomicUsize::new(0));
+        let mut handlers: HashMap<String, Arc<dyn pioneer_tools::ToolHandler>> = HashMap::new();
+        for spec in &specs {
+            handlers.insert(
+                spec.spec.name.clone(),
+                Arc::new(CountingHandler(executions.clone())),
+            );
+        }
+        let visibility =
+            ToolVisibilitySnapshot::new(specs.iter().map(|spec| spec.spec.clone()).collect());
+        assert!(!visibility.contains_name(name).await);
+        visibility
+            .set_visible_by_name(
+                &specs
+                    .iter()
+                    .map(|spec| spec.spec.name.clone())
+                    .collect::<Vec<_>>(),
+            )
+            .await;
+        assert!(visibility.contains_name(name).await);
+        let router = ToolRouter::new(
+            specs,
+            ToolRegistry::new(handlers),
+            visibility,
+            ToolEventBus::default(),
+            "turn",
+        );
+        let error = router
+            .build_model_tool_call(RawToolCall {
+                call_id: "call".into(),
+                tool_name: name.into(),
+                arguments: serde_json::json!({"targetOptionId": "target", "input": {}, "launch": {
+                    "identity": {"kind": "inherit_parent"}, "profile": {"kind": "inherit_parent"},
+                    "skillIds": "secret-skill", "mcpServerIds": "secret-server"
+                }})
+                .to_string(),
+            })
+            .await
+            .unwrap_err();
+        let pioneer_tools::ToolError::InvalidArguments(details) = &error else {
+            panic!("expected argument error")
+        };
+        let details: serde_json::Value = serde_json::from_str(details).unwrap();
+        let diagnostics = details["diagnostics"].as_array().unwrap();
+        assert_eq!(diagnostics.len(), 3);
+        for diagnostic in diagnostics {
+            assert_eq!(diagnostic["code"], "type");
+            assert_eq!(diagnostic["expected"], "array");
+            assert_eq!(
+                diagnostic["actualType"],
+                if diagnostic["path"] == "$/input" {
+                    "object"
+                } else {
+                    "string"
+                }
+            );
+        }
+        let outcome = pioneer_tools::classify_tool_error(name, &error);
+        assert_eq!(
+            outcome.error_class,
+            Some(pioneer_tools::ToolErrorClass::InvalidArguments)
+        );
+        let message =
+            build_tool_error_message("call".into(), name.into(), error.to_string(), outcome);
+        for path in ["$/input", "$/launch/skillIds", "$/launch/mcpServerIds"] {
+            assert!(message.content.contains(path));
+        }
+        assert!(!message.content.contains("agent_action_not_allowed"));
+        assert!(!message.content.contains("secret-"));
+        assert_eq!(executions.load(Ordering::SeqCst), 0);
+
+        // All these requests pass through the same model-call boundary and
+        // failure-message builder; no handler can receive an invalid ToolCall.
+        for (tool, arguments, expected) in [
+            (
+                name,
+                serde_json::json!({"targetOptionId": "target", "input": [
+                {"type": "text", "text": false, "textElements": 42}
+            ], "launch": {"identity": {"kind": "inherit_parent"}, "profile": {"kind": "inherit_parent"}}}),
+                vec![
+                    ("$/input/0/text", "string", "boolean"),
+                    ("$/input/0/textElements", "array", "number"),
+                ],
+            ),
+            (
+                "nullable",
+                serde_json::json!({"value": {"a": false, "b": 42}}),
+                vec![
+                    ("$/value/a", "string", "boolean"),
+                    ("$/value/b", "array", "number"),
+                ],
+            ),
+        ] {
+            let error = router
+                .build_model_tool_call(RawToolCall {
+                    call_id: "detail".into(),
+                    tool_name: tool.into(),
+                    arguments: arguments.to_string(),
+                })
+                .await
+                .unwrap_err();
+            let pioneer_tools::ToolError::InvalidArguments(details) = &error else {
+                panic!("expected arguments error")
+            };
+            let details: serde_json::Value = serde_json::from_str(details).unwrap();
+            let diagnostics = details["diagnostics"].as_array().unwrap();
+            assert_eq!(diagnostics.len(), expected.len());
+            let message = build_tool_error_message(
+                "detail".into(),
+                tool.into(),
+                error.to_string(),
+                pioneer_tools::classify_tool_error(tool, &error),
+            );
+            for (path, expected_type, actual_type) in expected {
+                let diagnostic = diagnostics.iter().find(|d| d["path"] == path).unwrap();
+                assert_eq!(diagnostic["code"], "type");
+                assert_eq!(diagnostic["expected"], expected_type);
+                assert_eq!(diagnostic["actualType"], actual_type);
+                assert!(message.content.contains(path));
+            }
+            assert!(!message.content.contains("agent_action_not_allowed"));
+            assert_eq!(executions.load(Ordering::SeqCst), 0);
+        }
+        let error = router
+            .build_model_tool_call(RawToolCall {
+                call_id: "ambiguous".into(),
+                tool_name: "ambiguous".into(),
+                arguments: serde_json::json!({"value": {"a": false, "b": 42}}).to_string(),
+            })
+            .await
+            .unwrap_err();
+        let pioneer_tools::ToolError::InvalidArguments(details) = error else {
+            panic!("expected arguments error")
+        };
+        let details: serde_json::Value = serde_json::from_str(&details).unwrap();
+        assert_eq!(details["diagnostics"].as_array().unwrap().len(), 1);
+        assert_eq!(details["diagnostics"][0]["path"], "$/value");
+        assert_eq!(details["diagnostics"][0]["code"], "oneOf");
+        assert_eq!(executions.load(Ordering::SeqCst), 0);
+        for (tool, arguments) in [
+            (
+                "exec_command",
+                r#"{"command":["true"],"yield_time_ms":12345.0}"#,
+            ),
+            ("write_stdin", r#"{"session_id":12345.0}"#),
+        ] {
+            let error = router
+                .build_model_tool_call(RawToolCall {
+                    call_id: "residual".into(),
+                    tool_name: tool.into(),
+                    arguments: arguments.into(),
+                })
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                pioneer_tools::ToolError::InvalidArguments(_)
+            ));
+            let message = build_tool_error_message(
+                "residual".into(),
+                tool.into(),
+                error.to_string(),
+                pioneer_tools::classify_tool_error(tool, &error),
+            );
+            assert!(
+                message
+                    .content
+                    .contains("builtin_argument_deserialization_error")
+            );
+            assert!(!message.content.contains("12345"));
+            assert!(!message.content.contains("floating point"));
+            assert_eq!(executions.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn output_delta_cannot_synthesize_missing_durable_tool_start() {
         let event_tx = AgentEventHub::with_capacity(8, 8);
         let mut durable_rx = event_tx
             .take_durable_receiver()
@@ -1379,7 +1795,7 @@ mod tests {
             "turn_1",
         )
         .await
-        .expect("lossy delta should be safely ignored");
+        .expect("orphan output delta should be safely ignored");
 
         assert!(
             timeout(Duration::from_millis(20), durable_rx.recv())
@@ -1390,17 +1806,9 @@ mod tests {
     }
 
     #[test]
-    fn tool_item_type_maps_write_file_to_file_change() {
-        assert_eq!(
-            tool_item_type_from_name("write_file"),
-            TurnItemType::FileChange
-        );
+    fn tool_item_type_maps_apply_patch_to_file_change() {
         assert_eq!(
             tool_item_type_from_name("apply_patch"),
-            TurnItemType::FileChange
-        );
-        assert_eq!(
-            tool_item_type_from_name("edit_file"),
             TurnItemType::FileChange
         );
         assert_eq!(
@@ -1420,16 +1828,8 @@ mod tests {
     #[test]
     fn file_change_title_uses_operation_when_available() {
         assert_eq!(
-            file_change_title("write_file", Some("created"), 1),
-            "write_file created 1 file(s)"
-        );
-        assert_eq!(
-            file_change_title("write_file", Some("overwritten"), 1),
-            "write_file overwrote 1 file(s)"
-        );
-        assert_eq!(
-            file_change_title("edit_file", Some("edited"), 1),
-            "edit_file edited 1 file(s)"
+            file_change_title("apply_patch", Some("update"), 1),
+            "apply_patch changed 1 file(s)"
         );
         assert_eq!(
             file_change_title("apply_patch", None, 2),

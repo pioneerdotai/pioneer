@@ -46,6 +46,7 @@ pub enum GatewayWsCommand {
         result_tx: Sender<std::result::Result<(), String>>,
     },
     Request {
+        expected_connection: Option<u64>,
         request_id: String,
         payload: String,
         response_tx: JsonRpcResponseSender,
@@ -63,9 +64,13 @@ pub enum GatewayWsCommand {
         response_tx: Sender<std::result::Result<ArtifactUploadChunkAckNotification, String>>,
     },
     VoiceBinaryChunk {
+        expected_connection: Option<u64>,
         payload: Vec<u8>,
     },
     Disconnect,
+    DisconnectConnection {
+        connection_id: u64,
+    },
     Shutdown,
 }
 
@@ -93,6 +98,7 @@ enum ConnectionRpcCommand {
 }
 
 struct ActiveConnectionTask {
+    connection_id: u64,
     handle: JoinHandle<()>,
     rpc_tx: UnboundedSender<ConnectionRpcCommand>,
 }
@@ -126,6 +132,7 @@ async fn run_worker(
                 abort_connection_task(&mut connection_task).await;
                 let (rpc_tx, rpc_rx) = unbounded_channel();
                 connection_task = Some(ActiveConnectionTask {
+                    connection_id,
                     handle: tokio::spawn(run_connection_task(
                         connection_id,
                         spec,
@@ -153,6 +160,7 @@ async fn run_worker(
                         abort_connection_task(&mut connection_task).await;
                         let (rpc_tx, rpc_rx) = unbounded_channel();
                         connection_task = Some(ActiveConnectionTask {
+                            connection_id,
                             handle: tokio::spawn(run_connection_task(
                                 connection_id,
                                 spec,
@@ -178,6 +186,7 @@ async fn run_worker(
                 }
             }
             GatewayWsCommand::Request {
+                expected_connection,
                 request_id,
                 payload,
                 response_tx,
@@ -188,6 +197,13 @@ async fn run_worker(
                     )));
                     continue;
                 };
+
+                if expected_connection.is_some_and(|id| id != connection_task.connection_id) {
+                    let _ = response_tx.send(Err(crate::rpc::JsonRpcResponseError::transport(
+                        "websocket request connection retired",
+                    )));
+                    continue;
+                }
 
                 let fallback_tx = response_tx.clone();
                 if connection_task
@@ -256,17 +272,31 @@ async fn run_worker(
                         .send(Err("websocket connection task is unavailable".to_owned()));
                 }
             }
-            GatewayWsCommand::VoiceBinaryChunk { payload } => {
+            GatewayWsCommand::VoiceBinaryChunk {
+                expected_connection,
+                payload,
+            } => {
                 let Some(connection_task) = connection_task.as_mut() else {
                     continue;
                 };
 
+                if expected_connection.is_some_and(|id| id != connection_task.connection_id) {
+                    continue;
+                }
                 let _ = connection_task
                     .rpc_tx
                     .send(ConnectionRpcCommand::VoiceBinaryChunk { payload });
             }
             GatewayWsCommand::Disconnect => {
                 abort_connection_task(&mut connection_task).await;
+            }
+            GatewayWsCommand::DisconnectConnection { connection_id } => {
+                if connection_task
+                    .as_ref()
+                    .is_some_and(|task| task.connection_id == connection_id)
+                {
+                    abort_connection_task(&mut connection_task).await;
+                }
             }
             GatewayWsCommand::Shutdown => {
                 break;
@@ -431,7 +461,10 @@ async fn monitor_connection(
                 match command {
                     Some(ConnectionRpcCommand::Request { request_id, payload, response_tx }) => {
                         pending_requests.insert(request_id.clone(), response_tx);
-                        if let Err(error) = writer.send(Message::Text(payload.into())).await {
+                        let startup_write = pioneer_observability::turn_startup::client_write(&payload, connection_id);
+                        let write_result = writer.send(Message::Text(payload.into())).await;
+                        drop(startup_write);
+                        if let Err(error) = write_result {
                             let message = websocket_write_failed_message(error);
                             if let Some(response_tx) = pending_requests.remove(request_id.as_str()) {
                                 let _ = response_tx.send(Err(
@@ -519,6 +552,7 @@ async fn monitor_connection(
             }
         }
     };
+    pioneer_observability::turn_startup::connection_lost(connection_id);
 
     fail_pending_requests(&mut pending_requests, disconnect_reason.as_str());
     fail_pending_upload_chunks(&mut pending_upload_chunks, disconnect_reason.as_str());

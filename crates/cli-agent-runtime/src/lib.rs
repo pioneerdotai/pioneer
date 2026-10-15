@@ -23,6 +23,7 @@ pub mod mcp;
 pub mod process;
 pub mod registry;
 pub mod reserved_args;
+pub mod service;
 pub mod session;
 
 pub const CLI_AGENT_RUNTIME_BOUNDARY: &str = "cli-agent-runtime";
@@ -41,6 +42,6 @@ mod tests {
 }
 mod native_event;
 pub use native_event::{
-    BoundedNativeEventCodec, NativeEventBudget, NativeIngressError, NativeIngressErrorKind,
-    SpooledNativeFrame,
+    BoundedNativeEventCodec, DEFAULT_MAX_RECOVERY_FRAME_BYTES, NativeEventBudget,
+    NativeIngressError, NativeIngressErrorKind, SpooledNativeFrame,
 };

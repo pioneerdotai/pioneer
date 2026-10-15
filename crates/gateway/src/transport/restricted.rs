@@ -29,6 +29,7 @@ const CLOSE_AUTH_TIMEOUT: u16 = 4408;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RestrictedExchangeOutcome {
     Succeeded,
+    RetryableFailure,
     Failed,
 }
 
@@ -59,6 +60,10 @@ pub(crate) async fn run(
                 ),
             )
             .await;
+            // The outer deadline includes waiting for the client to send its
+            // one allowed request. Unlike an explicit server backpressure
+            // response, a silent or stalled peer must count toward admission
+            // abuse accounting.
             Ok(RestrictedExchangeOutcome::Failed)
         }
     }
@@ -83,7 +88,7 @@ async fn run_one_exchange(
                 Ok(()) => {
                     let exchange_method = request.method.clone();
                     log_exchange_started(exchange_method.as_str());
-                    let response = match executor.execute(admission, request).await {
+                    match executor.execute(admission, request).await {
                         Ok(result) => {
                             log_exchange_completed(exchange_method.as_str());
                             let response = JsonRpcResponse::from_result(request_id, &result)
@@ -93,16 +98,30 @@ async fn run_one_exchange(
                                 })?;
                             send_bounded_json(ws, &response).await?;
                             close(ws, CLOSE_AUTH_RESTRICTED_DONE, "auth_exchange_complete").await?;
-                            return Ok(RestrictedExchangeOutcome::Succeeded);
+                            RestrictedExchangeOutcome::Succeeded
                         }
                         Err(error) => {
                             log_exchange_failed(exchange_method.as_str(), error.code());
-                            auth_error_response(Some(request_id), error.code())?
+                            let outcome = restricted_outcome_for_auth_error(error.code());
+                            let response = auth_error_response(Some(request_id), error.code())?;
+                            if outcome == RestrictedExchangeOutcome::RetryableFailure {
+                                // A client may hit its own timeout while the
+                                // server is reporting backpressure. Losing that
+                                // response must not turn a neutral DB condition
+                                // into an abuse failure; the durable request ID
+                                // makes the subsequent retry safe.
+                                let _ = send_bounded_json(ws, &response).await;
+                                let _ =
+                                    close(ws, CLOSE_AUTH_RESTRICTED_DONE, "auth_exchange_complete")
+                                        .await;
+                            } else {
+                                send_bounded_json(ws, &response).await?;
+                                close(ws, CLOSE_AUTH_RESTRICTED_DONE, "auth_exchange_complete")
+                                    .await?;
+                            }
+                            outcome
                         }
-                    };
-                    send_bounded_json(ws, &response).await?;
-                    close(ws, CLOSE_AUTH_RESTRICTED_DONE, "auth_exchange_complete").await?;
-                    RestrictedExchangeOutcome::Failed
+                    }
                 }
                 Err(code) => {
                     let response = auth_error_response(Some(request_id), code)?;
@@ -114,6 +133,17 @@ async fn run_one_exchange(
         }
     };
     Ok(exchange_outcome)
+}
+
+fn restricted_outcome_for_auth_error(code: AuthErrorCode) -> RestrictedExchangeOutcome {
+    if matches!(
+        code,
+        AuthErrorCode::AuthNotReady | AuthErrorCode::TemporarilyUnavailable
+    ) {
+        RestrictedExchangeOutcome::RetryableFailure
+    } else {
+        RestrictedExchangeOutcome::Failed
+    }
 }
 
 fn log_exchange_started(method: &str) {
@@ -357,6 +387,27 @@ mod tests {
         let failure = decode_request_frame(Message::Text(secret.into())).unwrap_err();
         let rendered = format!("{failure:?}");
         assert!(!rendered.contains(secret));
+    }
+
+    #[test]
+    fn retryable_server_failures_are_neutral_for_auth_abuse_accounting() {
+        for code in [
+            AuthErrorCode::AuthNotReady,
+            AuthErrorCode::TemporarilyUnavailable,
+        ] {
+            assert_eq!(
+                restricted_outcome_for_auth_error(code),
+                RestrictedExchangeOutcome::RetryableFailure
+            );
+        }
+        assert_eq!(
+            restricted_outcome_for_auth_error(AuthErrorCode::ExchangeTimeout),
+            RestrictedExchangeOutcome::Failed
+        );
+        assert_eq!(
+            restricted_outcome_for_auth_error(AuthErrorCode::InvalidCredential),
+            RestrictedExchangeOutcome::Failed
+        );
     }
 
     fn invitation_context() -> RestrictedAuthContext {

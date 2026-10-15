@@ -557,6 +557,24 @@ async fn computer_use_launch_command_allowlist_blocks_unlisted_command() {
     .expect_err("unlisted launch command must fail");
 
     assert!(error.to_string().contains("allowed_launch_commands"));
+
+    let injected = invoke_result(
+        &handler,
+        serde_json::json!({
+            "action": "start",
+            "goal": "launch command allowlist injection",
+            "target": {
+                "type": "app_name",
+                "name": "MissingApp",
+                "launch_if_missing": true,
+                "launch_command": "open -a ExampleApp ; printenv"
+            }
+        }),
+    )
+    .await
+    .expect_err("an allowed prefix with appended shell syntax must fail");
+
+    assert!(injected.to_string().contains("allowed_launch_commands"));
 }
 
 #[tokio::test]

@@ -180,21 +180,23 @@ async fn streamable_http_tool_call_cancellation_reaches_upstream() -> anyhow::Re
         .await
         .expect_err("cancelled MCP tools/call must not complete successfully");
     trigger.await?;
-    assert_eq!(error.kind, McpRuntimeErrorKind::Cancelled);
-    fixture.release_call.notify_one();
-    let follow_up = tokio::time::timeout(
+    tokio::time::timeout(
         Duration::from_secs(1),
-        session.call_tool(
+        fixture.cancellation_received.notified(),
+    )
+    .await
+    .expect("cancelled HTTP tools/call should notify the upstream server");
+    assert_eq!(error.kind, McpRuntimeErrorKind::Cancelled);
+    let follow_up = session
+        .call_tool(
             "domains",
             json!({}),
             McpInvocationBudget::default(),
             Duration::from_secs(1),
             CancellationToken::new(),
-        ),
-    )
-    .await
-    .expect("cancelled HTTP transport should reject follow-up work promptly");
-    assert!(follow_up.is_err());
+        )
+        .await?;
+    assert!(!follow_up.is_error);
     session.shutdown().await;
     server.abort();
     Ok(())
@@ -466,7 +468,7 @@ async fn cancellation_http_handler(
         .and_then(Value::as_str)
         .unwrap_or_default();
     match method {
-        "tools/call" => {
+        "tools/call" if body.pointer("/params/name").and_then(Value::as_str) == Some("send") => {
             fixture.call_started.notify_one();
             fixture.release_call.notified().await;
             Json(json!({

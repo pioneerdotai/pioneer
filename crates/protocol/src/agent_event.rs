@@ -29,6 +29,11 @@ pub enum ProtocolEventClass {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AgentDurableEvent {
+    /// A unique output chunk on the acknowledged lane, retained across interruption.
+    ToolOutputRecorded {
+        id: String,
+        notification: ItemDeltaNotification,
+    },
     PromptManifestCompiled {
         thread_id: String,
         turn_id: String,
@@ -137,6 +142,18 @@ pub enum AgentDurableEvent {
         turn_id: String,
         recovery: RecoveryAttemptContext,
     },
+    /// Frozen cancellation description, registered before provider/tool work.
+    /// Recovery may only confirm an existing description, never replace missing
+    /// history with current configuration. This does not activate outbox work.
+    NativeCancellationContextPrepared {
+        preparation: NativeTerminalEffectPreparation,
+        initial_turn: bool,
+    },
+    /// Bounded obligations prepared before a canonical terminal result; the
+    /// subsequent terminal projection atomically makes the current batch runnable.
+    NativeTerminalEffectsPrepared {
+        preparation: NativeTerminalEffectPreparation,
+    },
     TurnCompleted {
         thread_id: String,
         turn_id: String,
@@ -170,6 +187,87 @@ pub enum AgentDurableEvent {
     ThreadLineageCreated {
         lineage: ThreadLineage,
     },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeTerminalEffectKind {
+    PostTurnHook,
+    AttachedTaskCleanup,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeTerminalEffectGate {
+    TerminalCommit,
+    AcceptedTaskResult,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeTerminalEffectPreparationFailure {
+    InvalidHookRequest,
+    HookRuntimeUnavailable,
+    SubscriptionSnapshotUnavailable,
+    HandlerSnapshotUnavailable,
+    SnapshotSerializationFailed,
+    PayloadSerializationFailed,
+    PayloadTooLarge,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum NativeTerminalEffectPayload {
+    PostTurnHook {
+        request: JsonValue,
+        /// Versioned immutable subscriptions and handler descriptors captured
+        /// by the Turn. The outbox schema is new, so there is no valid legacy
+        /// row whose execution may fall back to mutable process configuration.
+        runtime_snapshot: JsonValue,
+    },
+    PostTurnHookPreparationFailed {
+        failure: NativeTerminalEffectPreparationFailure,
+    },
+    AttachedTaskCleanup {
+        reason: String,
+        /// Immutable semantic contract of the cleanup adapter captured by the
+        /// originating Turn. A worker may rebind the durable obligation to a
+        /// current provider after restart only when this value matches.
+        runtime_contract: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeTerminalEffectSpec {
+    pub effect_id: String,
+    pub effect_kind: NativeTerminalEffectKind,
+    pub gate: NativeTerminalEffectGate,
+    pub payload: NativeTerminalEffectPayload,
+    pub max_attempts: u16,
+}
+
+/// A controller receipt issued only for an accepted canonical cancellation
+/// whose bounded obligations were persisted in the same append transaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeDurableCancellationReceipt {
+    pub workspace_id: String,
+    pub thread_id: String,
+    pub turn_id: String,
+    pub execution_owner_id: String,
+    pub canonical_event_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeTerminalEffectPreparation {
+    pub batch_id: String,
+    pub workspace_id: String,
+    pub thread_id: String,
+    pub turn_id: String,
+    pub runtime_generation: u64,
+    #[serde(default)]
+    pub effects: Vec<NativeTerminalEffectSpec>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Hash)]
@@ -354,8 +452,17 @@ impl AgentDurableEvent {
             | Self::TurnInterrupted { turn_id, .. } => DurableEventCausalityKey::Turn {
                 turn_id: turn_id.clone(),
             },
+            Self::NativeCancellationContextPrepared { preparation, .. }
+            | Self::NativeTerminalEffectsPrepared { preparation } => {
+                DurableEventCausalityKey::Turn {
+                    turn_id: preparation.turn_id.clone(),
+                }
+            }
             Self::TurnPermissionAudit { event } => DurableEventCausalityKey::Turn {
                 turn_id: event.turn_id.clone(),
+            },
+            Self::ToolOutputRecorded { notification, .. } => DurableEventCausalityKey::Turn {
+                turn_id: notification.turn_id.clone(),
             },
             Self::ItemStarted { notification } => DurableEventCausalityKey::Turn {
                 turn_id: notification.turn_id.clone(),
@@ -419,6 +526,9 @@ impl AgentDurableEvent {
             | Self::TurnPermissionAudit { .. }
             | Self::TurnLlmContextAppended { .. }
             | Self::TurnProviderHistoryAppended { .. }
+            | Self::NativeCancellationContextPrepared { .. }
+            | Self::NativeTerminalEffectsPrepared { .. }
+            | Self::ToolOutputRecorded { .. }
             | Self::ItemStarted { .. }
             | Self::ItemToolRetryScheduled { .. }
             | Self::ItemToolRetryResolved { .. }
@@ -805,6 +915,7 @@ mod tests {
                 task_id: "task_1".to_owned(),
                 run_id: "run_1".to_owned(),
                 error: Some(crate::TaskError {
+                    recovery_diagnostic: None,
                     code: "failed".to_owned(),
                     message: "failed".to_owned(),
                     class: TaskErrorClass::Internal,

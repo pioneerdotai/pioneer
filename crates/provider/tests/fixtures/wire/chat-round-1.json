@@ -1,0 +1,28 @@
+{
+  "id": "fixture-1",
+  "object": "chat.completion",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": null,
+        "tool_calls": [
+          {
+            "id": "forecast_1",
+            "type": "function",
+            "function": {
+              "name": "forecast",
+              "arguments": "{\"location\":{\"city\":\"Moscow\"},\"days\":2,\"metric\":true}"
+            }
+          }
+        ]
+      },
+      "finish_reason": "tool_calls"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 21,
+    "completion_tokens": 7
+  }
+}

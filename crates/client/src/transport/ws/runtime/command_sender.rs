@@ -6,9 +6,12 @@ use crate::{
     skills::catalog::SkillSnapshotTransport,
 };
 use pioneer_protocol::{
-    ThreadReadParams, ThreadReadResponse, TurnMessageDeleteParams, TurnMessageDeleteResponse,
-    TurnMessageEditParams, TurnMessageEditResponse, TurnMessageRevisionsPageParams,
-    TurnMessageRevisionsPageResponse,
+    ThreadFilePatchHistoryPageParams, ThreadFilePatchHistoryPageResponse,
+    ThreadPatchStepsPageParams, ThreadPatchStepsPageResponse, ThreadReadParams, ThreadReadResponse,
+    TurnMessageDeleteParams, TurnMessageDeleteResponse, TurnMessageEditParams,
+    TurnMessageEditResponse, TurnMessageRevisionsPageParams, TurnMessageRevisionsPageResponse,
+    TurnPatchDiffGetParams, TurnPatchDiffGetResponse, TurnPatchRecordGetParams,
+    TurnPatchRecordGetResponse, TurnPatchStepsPageParams, TurnPatchStepsPageResponse,
 };
 
 impl crate::rpc::JsonRpcRequestTransport for GatewayWsCommandSender {
@@ -20,6 +23,7 @@ impl crate::rpc::JsonRpcRequestTransport for GatewayWsCommandSender {
     ) -> std::result::Result<(), String> {
         self.command_tx
             .send(GatewayWsCommand::Request {
+                expected_connection: None,
                 request_id,
                 payload,
                 response_tx,
@@ -87,8 +91,47 @@ impl SkillSnapshotTransport for GatewayWsCommandSender {
 }
 
 impl GatewayWsCommandSender {
+    pub(crate) fn gateway_state_event_is_current(&self, event: &GatewayWsEvent) -> bool {
+        let id = super::super::event_connection_id(event);
+        self.connection_generations.lock().is_ok_and(|generations| {
+            generations.active == Some(id) || generations.pending == Some(id)
+        })
+    }
+
+    fn begin_connection_attempt(&self) -> Result<GatewayConnectionAttempt<'_>> {
+        let id = self
+            .next_connection_id
+            .fetch_add(1, Ordering::Relaxed)
+            .checked_add(1)
+            .expect("Gateway connection generation exhausted");
+        self.connection_generations
+            .lock()
+            .map_err(|_| anyhow!("Gateway connection owner poisoned"))?
+            .pending = Some(id);
+        Ok(GatewayConnectionAttempt { sender: self, id })
+    }
+
+    pub(crate) fn accepts_gateway_event(&self, event: &GatewayWsEvent) -> bool {
+        let id = super::super::event_connection_id(event);
+        self.connection_generations
+            .lock()
+            .is_ok_and(|mut generations| {
+                if generations.active == Some(id) || generations.pending == Some(id) {
+                    return true;
+                }
+                if generations.retiring == Some(id)
+                    && matches!(event, GatewayWsEvent::Disconnected { .. })
+                {
+                    generations.retiring = None;
+                    return true;
+                }
+                false
+            })
+    }
+
     pub fn connect_and_wait(&self, spec: GatewayWsConnectSpec) -> Result<u64> {
-        let connection_id = self.next_connection_id.fetch_add(1, Ordering::Relaxed) + 1;
+        let attempt = self.begin_connection_attempt()?;
+        let connection_id = attempt.id;
         let session_access = http_access_from_spec(&spec, connection_id);
 
         let (result_tx, result_rx) = mpsc::channel();
@@ -107,12 +150,12 @@ impl GatewayWsCommandSender {
             .map_err(|_| anyhow!("websocket worker dropped initial connect result"))?;
 
         result.map_err(anyhow::Error::msg)?;
-        self.replace_http_session_access(session_access)?;
-        Ok(connection_id)
+        attempt.complete(session_access)
     }
 
     pub fn connect_with_retry(&self, spec: GatewayWsConnectSpec) -> Result<u64> {
-        let connection_id = self.next_connection_id.fetch_add(1, Ordering::Relaxed) + 1;
+        let attempt = self.begin_connection_attempt()?;
+        let connection_id = attempt.id;
         let session_access = http_access_from_spec(&spec, connection_id);
 
         self.command_tx
@@ -128,13 +171,12 @@ impl GatewayWsCommandSender {
         // this snapshot cannot authorize HTTP while the retrying WS is merely
         // connecting. Publishing it here keeps the sender as the single owner
         // of the ephemeral credential without copying it into shell state.
-        self.replace_http_session_access(session_access)?;
-
-        Ok(connection_id)
+        attempt.complete(session_access)
     }
 
     pub fn replace_access_and_wait(&self, spec: GatewayWsConnectSpec) -> Result<u64> {
-        let connection_id = self.next_connection_id.fetch_add(1, Ordering::Relaxed) + 1;
+        let attempt = self.begin_connection_attempt()?;
+        let connection_id = attempt.id;
         let session_access = http_access_from_spec(&spec, connection_id);
         let (result_tx, result_rx) = mpsc::channel();
         self.command_tx
@@ -148,11 +190,15 @@ impl GatewayWsCommandSender {
             .recv()
             .map_err(|_| anyhow!("websocket worker dropped access replacement result"))?
             .map_err(anyhow::Error::msg)?;
-        self.replace_http_session_access(session_access)?;
-        Ok(connection_id)
+        attempt.complete(session_access)
     }
 
     pub fn shutdown(&self) -> Result<()> {
+        *self
+            .connection_generations
+            .lock()
+            .map_err(|_| anyhow!("Gateway connection owner poisoned"))? =
+            GatewayConnectionGenerations::default();
         self.replace_http_session_access(None)?;
         self.command_tx
             .send(GatewayWsCommand::Shutdown)
@@ -160,9 +206,46 @@ impl GatewayWsCommandSender {
     }
 
     pub fn disconnect(&self) -> Result<()> {
+        {
+            let mut generations = self
+                .connection_generations
+                .lock()
+                .map_err(|_| anyhow!("Gateway connection owner poisoned"))?;
+            generations.retiring = generations.active.take();
+            generations.pending = None;
+        }
         self.replace_http_session_access(None)?;
         self.command_tx
             .send(GatewayWsCommand::Disconnect)
+            .map_err(|_| anyhow!("websocket worker is not available"))
+    }
+
+    /// Retire only the named connection, preserving a newer active or pending attempt.
+    pub(crate) fn disconnect_connection(&self, connection_id: u64) -> Result<()> {
+        let mut generations = self
+            .connection_generations
+            .lock()
+            .map_err(|_| anyhow!("Gateway connection owner poisoned"))?;
+        if generations.active == Some(connection_id) {
+            generations.retiring = generations.active.take();
+        }
+        if generations.pending == Some(connection_id) {
+            generations.pending = None;
+        }
+        {
+            let mut access = self
+                .session_access
+                .lock()
+                .map_err(|_| anyhow!("Gateway session access lock is poisoned"))?;
+            if access
+                .as_ref()
+                .is_some_and(|access| access.generation == connection_id)
+            {
+                *access = None;
+            }
+        }
+        self.command_tx
+            .send(GatewayWsCommand::DisconnectConnection { connection_id })
             .map_err(|_| anyhow!("websocket worker is not available"))
     }
 
@@ -176,7 +259,15 @@ impl GatewayWsCommandSender {
             .ok_or(GatewayHttpAuthorityError::TemporarilyUnavailable)
     }
 
-    fn replace_http_session_access(&self, access: Option<GatewayHttpAccess>) -> Result<()> {
+    #[cfg(test)]
+    pub(crate) fn set_http_session_access_for_test(&self, access: Option<GatewayHttpAccess>) {
+        self.replace_http_session_access(access).unwrap();
+    }
+
+    pub(super) fn replace_http_session_access(
+        &self,
+        access: Option<GatewayHttpAccess>,
+    ) -> Result<()> {
         *self
             .session_access
             .lock()
@@ -376,6 +467,20 @@ impl GatewayWsCommandSender {
         params: ThreadTimelinePageParams,
     ) -> Result<ThreadTimelinePageResponse> {
         client_ws_commands::thread_timeline_page(self, params)
+    }
+
+    pub fn thread_patch_steps_page(
+        &self,
+        params: ThreadPatchStepsPageParams,
+    ) -> Result<ThreadPatchStepsPageResponse> {
+        client_ws_commands::thread_patch_steps_page(self, params)
+    }
+
+    pub fn thread_file_patch_history_page(
+        &self,
+        params: ThreadFilePatchHistoryPageParams,
+    ) -> Result<ThreadFilePatchHistoryPageResponse> {
+        client_ws_commands::thread_file_patch_history_page(self, params)
     }
 
     pub fn workspace_default(&self) -> Result<WorkspaceDefaultResponse> {
@@ -636,6 +741,27 @@ impl GatewayWsCommandSender {
         client_ws_commands::turn_items_page(self, params)
     }
 
+    pub fn turn_patch_steps_page(
+        &self,
+        params: TurnPatchStepsPageParams,
+    ) -> Result<TurnPatchStepsPageResponse> {
+        client_ws_commands::turn_patch_steps_page(self, params)
+    }
+
+    pub fn turn_patch_record_get(
+        &self,
+        params: TurnPatchRecordGetParams,
+    ) -> Result<TurnPatchRecordGetResponse> {
+        client_ws_commands::turn_patch_record_get(self, params)
+    }
+
+    pub fn turn_patch_diff_get(
+        &self,
+        params: TurnPatchDiffGetParams,
+    ) -> Result<TurnPatchDiffGetResponse> {
+        client_ws_commands::turn_patch_diff_get(self, params)
+    }
+
     pub fn task_user_notification_list(
         &self,
         params: TaskUserNotificationListParams,
@@ -792,6 +918,13 @@ impl GatewayWsCommandSender {
         client_ws_commands::artifact_view_grant_create(self, params)
     }
 
+    pub fn thread_file_view_grant_create(
+        &self,
+        params: ThreadFileViewGrantCreateParams,
+    ) -> Result<ThreadFileViewGrantCreateResponse> {
+        client_ws_commands::thread_file_view_grant_create(self, params)
+    }
+
     pub fn artifact_delete(&self, params: ArtifactDeleteParams) -> Result<ArtifactDeleteResponse> {
         client_ws_commands::artifact_delete(self, params)
     }
@@ -857,6 +990,32 @@ impl GatewayWsCommandSender {
         response.map_err(anyhow::Error::msg)
     }
 
+    pub(crate) fn send_voice_audio_chunk_for_connection(
+        &self,
+        connection: u64,
+        session_id: String,
+        sequence: u64,
+        audio_format: VoiceAudioFormat,
+        captured_at_unix_ms: Option<u64>,
+        duration_ms: Option<u32>,
+        pcm_chunk: Vec<u8>,
+    ) -> Result<()> {
+        let payload = crate::transport::ws::frames::encode_voice_audio_chunk_frame(
+            session_id,
+            sequence,
+            audio_format,
+            captured_at_unix_ms,
+            duration_ms,
+            &pcm_chunk,
+        )?;
+        self.command_tx
+            .send(GatewayWsCommand::VoiceBinaryChunk {
+                expected_connection: Some(connection),
+                payload,
+            })
+            .map_err(|_| anyhow!("websocket worker is not available"))
+    }
+
     pub fn send_voice_audio_chunk(
         &self,
         session_id: String,
@@ -876,7 +1035,10 @@ impl GatewayWsCommandSender {
         )?;
 
         self.command_tx
-            .send(GatewayWsCommand::VoiceBinaryChunk { payload })
+            .send(GatewayWsCommand::VoiceBinaryChunk {
+                expected_connection: None,
+                payload,
+            })
             .map_err(|_| anyhow!("websocket worker is not available"))?;
 
         Ok(())
@@ -983,4 +1145,167 @@ fn http_access_from_spec(
         access_expires_at_unix: session.access_expires_at_unix,
         access_token,
     })
+}
+
+#[cfg(test)]
+mod connection_generation_tests {
+    use super::*;
+    fn event(id: u64) -> GatewayWsEvent {
+        GatewayWsEvent::Connecting {
+            connection_id: id,
+            endpoint_id: "synthetic".into(),
+            endpoint_name: "Synthetic".into(),
+            endpoint_kind: crate::gateway::types::GatewayEndpointKind::Remote,
+        }
+    }
+    #[test]
+    fn typed_ingress_reduces_owned_settings_once_and_routes_only_unported_features() {
+        use crate::core::{ClientCore, ClientScope};
+        use crate::gateway::event_router::GatewayEventRoute;
+        use pioneer_protocol::{GatewayNotification, GatewayVoiceInputStatusChangedNotification};
+        let core = ClientCore::new();
+        let sender = core.transport_runtime().ws_command_sender();
+        let id = sender
+            .begin_connection_attempt()
+            .unwrap()
+            .complete(None)
+            .unwrap();
+        let settings = GatewayWsEvent::Notification {
+            connection_id: id,
+            notification: GatewayNotification::GatewayVoiceInputStatusChanged(
+                GatewayVoiceInputStatusChangedNotification {
+                    settings: Default::default(),
+                },
+            ),
+        };
+        assert_eq!(core.route_gateway_event(&settings), None);
+        let published = core.snapshot(&ClientScope::Settings).unwrap().snapshot();
+        assert_eq!(core.route_gateway_event(&settings), None);
+        assert!(Arc::ptr_eq(
+            &published,
+            &core.snapshot(&ClientScope::Settings).unwrap().snapshot()
+        ));
+        let feature = GatewayWsEvent::Notification {
+            connection_id: id,
+            notification: GatewayNotification::Unknown(
+                pioneer_protocol::UnknownGatewayNotification {
+                    method: "synthetic/event".into(),
+                    workspace_id: None,
+                    thread_id: None,
+                    turn_id: None,
+                    item_id: None,
+                    params: serde_json::json!({}),
+                },
+            ),
+        };
+        assert_eq!(
+            core.route_gateway_event(&feature),
+            Some(GatewayEventRoute::Unknown)
+        );
+        sender.disconnect_connection(id).unwrap();
+        assert_eq!(core.route_gateway_event(&feature), None);
+        assert_eq!(core.route_gateway_event(&settings), None);
+        assert!(Arc::ptr_eq(
+            &published,
+            &core.snapshot(&ClientScope::Settings).unwrap().snapshot()
+        ));
+        core.shutdown();
+        assert_eq!(core.route_gateway_event(&settings), None);
+    }
+
+    #[test]
+    fn stale_retirement_preserves_new_active_and_pending_connections() {
+        let client = GatewayWsClient::new();
+        let sender = client.command_sender();
+        let old = sender
+            .begin_connection_attempt()
+            .unwrap()
+            .complete(None)
+            .unwrap();
+        let pending = sender.begin_connection_attempt().unwrap();
+        let candidate = pending.id;
+        sender.disconnect_connection(old).unwrap();
+        assert!(sender.accepts_gateway_event(&event(candidate)));
+        let current = pending.complete(None).unwrap();
+        sender.disconnect_connection(old).unwrap();
+        assert!(sender.accepts_gateway_event(&event(current)));
+        sender.disconnect_connection(current).unwrap();
+        assert!(!sender.accepts_gateway_event(&event(current)));
+    }
+
+    #[test]
+    fn replacement_cancellation_keeps_active_generation_and_superseded_completion_cannot_commit() {
+        let client = GatewayWsClient::new();
+        let sender = client.command_sender();
+        let first = sender.begin_connection_attempt().unwrap();
+        let active = first.complete(None).unwrap();
+        let replacement = sender.begin_connection_attempt().unwrap();
+        let abandoned = replacement.id;
+        assert!(sender.accepts_gateway_event(&event(active)));
+        assert!(sender.accepts_gateway_event(&event(abandoned)));
+        drop(replacement);
+        assert!(!sender.accepts_gateway_event(&event(abandoned)));
+        assert!(sender.accepts_gateway_event(&event(active)));
+        let stale = sender.begin_connection_attempt().unwrap();
+        let latest = sender.begin_connection_attempt().unwrap();
+        assert!(stale.complete(None).is_err());
+        let current = latest.complete(None).unwrap();
+        assert!(!sender.accepts_gateway_event(&event(active)));
+        assert!(sender.accepts_gateway_event(&event(current)));
+        sender.disconnect().unwrap();
+        assert!(!sender.accepts_gateway_event(&event(current)));
+        let retiring = GatewayWsEvent::Disconnected {
+            connection_id: current,
+            endpoint_id: "synthetic".into(),
+            endpoint_name: "Synthetic".into(),
+            endpoint_kind: crate::gateway::types::GatewayEndpointKind::Remote,
+            gateway_base_url: crate::gateway::endpoint::GatewayBaseUrl::parse_presentation(
+                "https://gateway.invalid",
+            )
+            .unwrap(),
+            reason: "synthetic disconnect".into(),
+        };
+        assert!(!sender.gateway_state_event_is_current(&retiring));
+        assert!(sender.accepts_gateway_event(&retiring));
+        assert!(!sender.accepts_gateway_event(&retiring));
+    }
+}
+
+// Connection-bound commands are rejected by the worker after a route replacement.
+pub(crate) struct ConnectionRequestTransport {
+    sender: GatewayWsCommandSender,
+    connection: u64,
+}
+impl crate::rpc::JsonRpcRequestTransport for ConnectionRequestTransport {
+    fn send_json_rpc_request(
+        &self,
+        request_id: String,
+        payload: String,
+        response_tx: crate::rpc::JsonRpcResponseSender,
+    ) -> std::result::Result<(), String> {
+        #[cfg(test)]
+        if let Some(transport) = self.sender.test_requests.lock().unwrap().clone() {
+            return transport.send_json_rpc_request(request_id, payload, response_tx);
+        }
+        self.sender
+            .command_tx
+            .send(GatewayWsCommand::Request {
+                expected_connection: Some(self.connection),
+                request_id,
+                payload,
+                response_tx,
+            })
+            .map_err(|_| crate::rpc::WEBSOCKET_WORKER_UNAVAILABLE_MESSAGE.to_owned())
+    }
+}
+impl GatewayWsCommandSender {
+    pub(crate) fn requests_for_connection(
+        &self,
+        connection: u64,
+    ) -> impl crate::rpc::JsonRpcRequestTransport + use<> {
+        ConnectionRequestTransport {
+            sender: self.clone(),
+            connection,
+        }
+    }
 }

@@ -181,6 +181,71 @@ fn parse_server(name: &str, value: &Value, context: &InstallParseContext) -> Mcp
         None
     };
 
+    let mut auth = McpAuthConfig::default();
+    if let Some(value) = object.get("oauth") {
+        match serde_json::from_value::<crate::domain::McpOAuthConfig>(value.clone()) {
+            Ok(mut oauth) => {
+                if let Some(secret) = value.get("client_secret").and_then(Value::as_str) {
+                    let (_, reference, material) = secret_ref_for(
+                        &context.scope_kind,
+                        &context.scope_key,
+                        name,
+                        "oauth",
+                        "client_secret",
+                        secret,
+                    );
+                    secrets.push(material);
+                    oauth.client_secret_ref = Some(reference.ref_id);
+                }
+                if oauth
+                    .token_endpoint_auth_method
+                    .as_deref()
+                    .is_some_and(|method| {
+                        !matches!(
+                            method,
+                            "none" | "client_secret_basic" | "client_secret_post"
+                        ) || (method != "none" && oauth.client_secret_ref.is_none())
+                            || (method == "none" && oauth.client_secret_ref.is_some())
+                    })
+                {
+                    diagnostics.push(McpValidationDiagnostic::error(
+                        "invalid_oauth_client_auth",
+                        "Unsupported or inconsistent OAuth client authentication method",
+                        Some(format!(
+                            "$.mcpServers.{name}.oauth.token_endpoint_auth_method"
+                        )),
+                    ));
+                }
+                if !has_url || (oauth.client_secret_ref.is_some() && oauth.client_id.is_none()) {
+                    diagnostics.push(McpValidationDiagnostic::error(
+                        "invalid_oauth",
+                        "OAuth requires HTTP and client_secret requires client_id",
+                        Some(format!("$.mcpServers.{name}.oauth")),
+                    ));
+                }
+                if let Some(McpTransportConfig::StreamableHttp { headers, .. }) = &transport {
+                    if headers
+                        .keys()
+                        .any(|key| key.eq_ignore_ascii_case("authorization"))
+                    {
+                        diagnostics.push(McpValidationDiagnostic::error(
+                            "oauth_header_conflict",
+                            "OAuth cannot be combined with an Authorization header",
+                            Some(format!("$.mcpServers.{name}.headers")),
+                        ));
+                    }
+                }
+                auth.oauth = Some(oauth);
+                auth.required = true;
+            }
+            Err(_) => diagnostics.push(McpValidationDiagnostic::error(
+                "invalid_oauth",
+                "Invalid OAuth configuration",
+                Some(format!("$.mcpServers.{name}.oauth")),
+            )),
+        }
+    }
+
     if diagnostics.iter().any(McpValidationDiagnostic::is_error) {
         return McpInstallPlanItem {
             name: name.to_owned(),
@@ -214,7 +279,7 @@ fn parse_server(name: &str, value: &Value, context: &InstallParseContext) -> Mcp
         source_kind: McpSourceKind::Config,
         source_ref,
         transport,
-        auth: McpAuthConfig::default(),
+        auth,
         secret_refs,
         enabled,
         allow_implicit_invocation,
@@ -565,6 +630,113 @@ mod tests {
             default_enabled: true,
             default_allow_implicit_invocation: false,
         }
+    }
+
+    #[test]
+    fn native_oauth_client_auth_method_is_preserved_and_validated() {
+        for method in ["client_secret_basic", "client_secret_post"] {
+            let config =
+                serde_json::json!({"mcpServers":{"native":{"url":"https://server.test/mcp",
+                "oauth":{"client_id":"registered","client_secret":"secret-canary",
+                    "token_endpoint_auth_method":method}}}})
+                .to_string();
+            let plan = parse_install_config(&config, context()).unwrap();
+            let auth = plan.items[0]
+                .installation
+                .as_ref()
+                .unwrap()
+                .auth
+                .oauth
+                .as_ref()
+                .unwrap();
+            assert_eq!(auth.token_endpoint_auth_method.as_deref(), Some(method));
+            assert!(
+                !serde_json::to_string(auth)
+                    .unwrap()
+                    .contains("secret-canary")
+            );
+        }
+        for (method, secret) in [
+            ("private_key_jwt", true),
+            ("client_secret_post", false),
+            ("none", true),
+        ] {
+            let mut oauth =
+                serde_json::json!({"client_id":"registered", "token_endpoint_auth_method":method});
+            if secret {
+                oauth["client_secret"] = serde_json::json!("secret-canary");
+            }
+            let config = serde_json::json!({"mcpServers":{"native":{"url":"https://server.test/mcp","oauth":oauth}}}).to_string();
+            let plan = parse_install_config(&config, context()).unwrap();
+            assert!(plan.items[0].installation.is_none());
+            assert!(
+                plan.items[0]
+                    .diagnostics
+                    .iter()
+                    .any(|d| d.code == "invalid_oauth_client_auth")
+            );
+        }
+    }
+    #[test]
+    fn native_oauth_client_secret_is_referenced_and_headers_are_unambiguous() {
+        let plan=parse_install_config(r#"{"mcpServers":{"native":{"url":"https://server.test/mcp","oauth":{"client_id":"registered","client_secret":"secret-canary","scopes":["read"],"issuer":"https://issuer.test"}}}}"#,context()).unwrap();
+        let item = &plan.items[0];
+        assert!(!format!("{plan:?}").contains("secret-canary"));
+        let installation = item.installation.as_ref().unwrap();
+        assert!(installation.auth.required);
+        assert_eq!(item.secrets.len(), 1);
+        assert!(
+            installation
+                .auth
+                .oauth
+                .as_ref()
+                .unwrap()
+                .client_secret_ref
+                .is_some()
+        );
+        assert!(
+            !serde_json::to_string(installation)
+                .unwrap()
+                .contains("secret-canary")
+        );
+        let conflict=parse_install_config(r#"{"mcpServers":{"native":{"url":"https://server.test/mcp","headers":{"Authorization":"Bearer canary"},"oauth":{}}}}"#,context()).unwrap();
+        assert!(conflict.items[0].installation.is_none());
+        assert!(
+            conflict.items[0]
+                .diagnostics
+                .iter()
+                .any(|d| d.code == "oauth_header_conflict")
+        );
+    }
+    #[test]
+    fn mcp_remote_commands_and_legacy_http_auth_keep_existing_configuration() {
+        let plan=parse_install_config(r#"{"mcpServers":{"remote":{"command":"npx","args":["mcp-remote","https://server.test/mcp","--header","Authorization: Bearer canary"]},"header":{"url":"https://server.test/mcp","headers":{"Authorization":"Bearer header-canary"}}}}"#,context()).unwrap();
+        for item in &plan.items {
+            let installation = item.installation.as_ref().unwrap();
+            assert!(installation.auth.oauth.is_none());
+        }
+        let remote = plan
+            .items
+            .iter()
+            .find(|i| i.name == "remote")
+            .unwrap()
+            .installation
+            .as_ref()
+            .unwrap();
+        let McpTransportConfig::Stdio { command, args, .. } = &remote.transport else {
+            panic!("stdio retained")
+        };
+        assert_eq!(command, "npx");
+        assert_eq!(args[0], "mcp-remote");
+        let header = plan
+            .items
+            .iter()
+            .find(|i| i.name == "header")
+            .unwrap()
+            .installation
+            .as_ref()
+            .unwrap();
+        assert!(header.transport.has_authorization_header());
     }
 
     #[test]

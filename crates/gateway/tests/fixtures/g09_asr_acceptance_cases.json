@@ -1,0 +1,310 @@
+{
+  "execution": "NOT EXECUTED: acceptance plan only; model/native inference requires separate authorization. Catalog fingerprints are fixtures, never product metadata.",
+  "sdk": "transcribe-rs 0.3.11 (343768c100d566b135fbb7a2441e61fa8aa177f2)",
+  "models": [
+    {
+      "model_id": "small",
+      "engine": "Whisper",
+      "artifact_url": "https://blob.handy.computer/ggml-small.bin",
+      "archive_sha256": "1be3a9b2063867b937e64e2ec7483364a79917e157fa98c5d94b5c1fffea987b",
+      "producer": "https://github.com/openai/whisper",
+      "pinned_sdk_control_expectation": "language=None => auto; translate=false",
+      "translation_advertised": true,
+      "gateway_audio": {
+        "sample_rate_hz": 16000,
+        "channels": 1,
+        "encoding": "pcm_s16le"
+      },
+      "gateway_partials": false
+    },
+    {
+      "model_id": "medium",
+      "engine": "Whisper",
+      "artifact_url": "https://blob.handy.computer/whisper-medium-q4_1.bin",
+      "archive_sha256": "79283fc1f9fe12ca3248543fbd54b73292164d8df5a16e095e2bceeaaabddf57",
+      "producer": "https://github.com/openai/whisper",
+      "pinned_sdk_control_expectation": "language=None => auto; translate=false",
+      "translation_advertised": true,
+      "gateway_audio": {
+        "sample_rate_hz": 16000,
+        "channels": 1,
+        "encoding": "pcm_s16le"
+      },
+      "gateway_partials": false
+    },
+    {
+      "model_id": "turbo",
+      "engine": "Whisper",
+      "artifact_url": "https://blob.handy.computer/ggml-large-v3-turbo.bin",
+      "archive_sha256": "1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69",
+      "producer": "https://huggingface.co/openai/whisper-large-v3-turbo",
+      "pinned_sdk_control_expectation": "language=None => auto; translate=false",
+      "translation_advertised": false,
+      "gateway_audio": {
+        "sample_rate_hz": 16000,
+        "channels": 1,
+        "encoding": "pcm_s16le"
+      },
+      "gateway_partials": false
+    },
+    {
+      "model_id": "large",
+      "engine": "Whisper",
+      "artifact_url": "https://blob.handy.computer/ggml-large-v3-q5_0.bin",
+      "archive_sha256": "d75795ecff3f83b5faa89d1900604ad8c780abd5739fae406de19f23ecd98ad1",
+      "producer": "https://github.com/openai/whisper",
+      "pinned_sdk_control_expectation": "language=None => auto; translate=false",
+      "translation_advertised": true,
+      "gateway_audio": {
+        "sample_rate_hz": 16000,
+        "channels": 1,
+        "encoding": "pcm_s16le"
+      },
+      "gateway_partials": false
+    },
+    {
+      "model_id": "breeze-asr",
+      "engine": "Whisper",
+      "artifact_url": "https://blob.handy.computer/breeze-asr-q5_k.bin",
+      "archive_sha256": "8efbf0ce8a3f50fe332b7617da787fb81354b358c288b008d3bdef8359df64c6",
+      "producer": "https://huggingface.co/MediaTek-Research/Breeze-ASR-25",
+      "pinned_sdk_control_expectation": "language=None => auto; translate=false",
+      "translation_advertised": false,
+      "gateway_audio": {
+        "sample_rate_hz": 16000,
+        "channels": 1,
+        "encoding": "pcm_s16le"
+      },
+      "gateway_partials": false
+    },
+    {
+      "model_id": "parakeet-tdt-0.6b-v2",
+      "engine": "Parakeet",
+      "artifact_url": "https://blob.handy.computer/parakeet-v2-int8.tar.gz",
+      "archive_sha256": "ac9b9429984dd565b25097337a887bb7f0f8ac393573661c651f0e7d31563991",
+      "producer": "https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2",
+      "pinned_sdk_control_expectation": "language=None; automatic for v3, English v2; segment timestamps",
+      "translation_advertised": false,
+      "gateway_audio": {
+        "sample_rate_hz": 16000,
+        "channels": 1,
+        "encoding": "pcm_s16le"
+      },
+      "gateway_partials": false
+    },
+    {
+      "model_id": "parakeet-tdt-0.6b-v3",
+      "engine": "Parakeet",
+      "artifact_url": "https://blob.handy.computer/parakeet-v3-int8.tar.gz",
+      "archive_sha256": "43d37191602727524a7d8c6da0eef11c4ba24320f5b4730f1a2497befc2efa77",
+      "producer": "https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3",
+      "pinned_sdk_control_expectation": "language=None; automatic for v3, English v2; segment timestamps",
+      "translation_advertised": false,
+      "gateway_audio": {
+        "sample_rate_hz": 16000,
+        "channels": 1,
+        "encoding": "pcm_s16le"
+      },
+      "gateway_partials": false
+    },
+    {
+      "model_id": "moonshine-base",
+      "engine": "Moonshine",
+      "artifact_url": "https://blob.handy.computer/moonshine-base.tar.gz",
+      "archive_sha256": "04bf6ab012cfceebd4ac7cf88c1b31d027bbdd3cd704649b692e2e935236b7e8",
+      "producer": "https://huggingface.co/moonshine-ai/moonshine-base",
+      "pinned_sdk_control_expectation": "language=None unused; English; BaseInt8",
+      "translation_advertised": false,
+      "gateway_audio": {
+        "sample_rate_hz": 16000,
+        "channels": 1,
+        "encoding": "pcm_s16le"
+      },
+      "gateway_partials": false
+    },
+    {
+      "model_id": "moonshine-tiny-streaming-en",
+      "engine": "MoonshineStreaming",
+      "artifact_url": "https://blob.handy.computer/moonshine-tiny-streaming-en.tar.gz",
+      "archive_sha256": "465addcfca9e86117415677dfdc98b21edc53537210333a3ecdb58509a80abaf",
+      "producer": "https://github.com/moonshine-ai/moonshine",
+      "pinned_sdk_control_expectation": "language=None unused; English; Int8; buffered transcribe_with; no published partials",
+      "translation_advertised": false,
+      "gateway_audio": {
+        "sample_rate_hz": 16000,
+        "channels": 1,
+        "encoding": "pcm_s16le"
+      },
+      "gateway_partials": false
+    },
+    {
+      "model_id": "moonshine-small-streaming-en",
+      "engine": "MoonshineStreaming",
+      "artifact_url": "https://blob.handy.computer/moonshine-small-streaming-en.tar.gz",
+      "archive_sha256": "dbb3e1c1832bd88a4ac712f7449a136cc2c9a18c5fe33a12ed1b7cb1cfe9cdd5",
+      "producer": "https://github.com/moonshine-ai/moonshine",
+      "pinned_sdk_control_expectation": "language=None unused; English; Int8; buffered transcribe_with; no published partials",
+      "translation_advertised": false,
+      "gateway_audio": {
+        "sample_rate_hz": 16000,
+        "channels": 1,
+        "encoding": "pcm_s16le"
+      },
+      "gateway_partials": false
+    },
+    {
+      "model_id": "moonshine-medium-streaming-en",
+      "engine": "MoonshineStreaming",
+      "artifact_url": "https://blob.handy.computer/moonshine-medium-streaming-en.tar.gz",
+      "archive_sha256": "07a66f3bff1c77e75a2f637e5a263928a08baae3c29c4c053fc968a9a9373d13",
+      "producer": "https://github.com/moonshine-ai/moonshine",
+      "pinned_sdk_control_expectation": "language=None unused; English; Int8; buffered transcribe_with; no published partials",
+      "translation_advertised": false,
+      "gateway_audio": {
+        "sample_rate_hz": 16000,
+        "channels": 1,
+        "encoding": "pcm_s16le"
+      },
+      "gateway_partials": false
+    },
+    {
+      "model_id": "sense-voice-int8",
+      "engine": "SenseVoice",
+      "artifact_url": "https://blob.handy.computer/sense-voice-int8.tar.gz",
+      "archive_sha256": "171d611fe5d353a50bbb741b6f3ef42559b1565685684e9aa888ef563ba3e8a4",
+      "producer": "https://huggingface.co/FunAudioLLM/SenseVoiceSmall",
+      "pinned_sdk_control_expectation": "language=None => auto; use_itn=Some(true)",
+      "translation_advertised": false,
+      "gateway_audio": {
+        "sample_rate_hz": 16000,
+        "channels": 1,
+        "encoding": "pcm_s16le"
+      },
+      "gateway_partials": false
+    },
+    {
+      "model_id": "gigaam-v3-e2e-ctc",
+      "engine": "GigaAm",
+      "artifact_url": "https://blob.handy.computer/giga-am-v3-int8.tar.gz",
+      "archive_sha256": "d872462268430db140b69b72e0fc4b787b194c1dbe51b58de39444d55b6da45b",
+      "producer": "https://github.com/salute-developers/GigaAM",
+      "pinned_sdk_control_expectation": "language=None unused; Russian; Int8 CTC",
+      "translation_advertised": false,
+      "gateway_audio": {
+        "sample_rate_hz": 16000,
+        "channels": 1,
+        "encoding": "pcm_s16le"
+      },
+      "gateway_partials": false
+    },
+    {
+      "model_id": "canary-180m-flash",
+      "engine": "Canary",
+      "artifact_url": "https://blob.handy.computer/canary-180m-flash.tar.gz",
+      "archive_sha256": "6d9cfca6118b296e196eaedc1c8fa9788305a7b0f1feafdb6dc91932ab6e53f7",
+      "producer": "https://huggingface.co/nvidia/canary-180m-flash",
+      "pinned_sdk_control_expectation": "language=None => en; target_language=None => source; use_pnc=true/use_itn=true; Int8",
+      "translation_advertised": true,
+      "gateway_audio": {
+        "sample_rate_hz": 16000,
+        "channels": 1,
+        "encoding": "pcm_s16le"
+      },
+      "gateway_partials": false
+    },
+    {
+      "model_id": "canary-1b-v2",
+      "engine": "Canary",
+      "artifact_url": "https://blob.handy.computer/canary-1b-v2.tar.gz",
+      "archive_sha256": "02305b2a25f9cf3e7deaffa7f94df00efa44f442cd55c101c2cb9c000f904666",
+      "producer": "https://huggingface.co/nvidia/canary-1b-v2",
+      "pinned_sdk_control_expectation": "language=None => en; target_language=None => source; use_pnc=true/use_itn=true; Int8",
+      "translation_advertised": true,
+      "gateway_audio": {
+        "sample_rate_hz": 16000,
+        "channels": 1,
+        "encoding": "pcm_s16le"
+      },
+      "gateway_partials": false
+    },
+    {
+      "model_id": "cohere-int8",
+      "engine": "Cohere",
+      "artifact_url": "https://blob.handy.computer/cohere-int8.tar.gz",
+      "archive_sha256": "ea2257d52434f3644574f187dcdcf666e302cd11b92866116ab8e14cd9c887f0",
+      "producer": "https://huggingface.co/CohereLabs/cohere-transcribe-03-2026",
+      "pinned_sdk_control_expectation": "language=None => en; translate=false (true unsupported by this ONNX SDK); max_new_tokens=None",
+      "translation_advertised": false,
+      "gateway_audio": {
+        "sample_rate_hz": 16000,
+        "channels": 1,
+        "encoding": "pcm_s16le"
+      },
+      "gateway_partials": false
+    }
+  ],
+  "synthetic_protocol_cases": [
+    {
+      "events": [
+        "record",
+        "finalize",
+        "transcript"
+      ],
+      "expected": "one final turn/result, no partial transcript"
+    },
+    {
+      "events": [
+        "record",
+        "finalize",
+        "vad_no_speech"
+      ],
+      "expected": "NoSpeech, zero turns"
+    },
+    {
+      "events": [
+        "record",
+        "finalize",
+        "whitespace_transcript"
+      ],
+      "expected": "NoSpeech, zero turns"
+    },
+    {
+      "events": [
+        "record",
+        "finalize",
+        "typed_runtime_error"
+      ],
+      "expected": "Failed with typed error, zero turns"
+    },
+    {
+      "events": [
+        "record",
+        "finalize",
+        "cancel",
+        "late_transcript"
+      ],
+      "expected": "Cancelled, late finalization claim=false, zero turns"
+    },
+    {
+      "events": [
+        "record",
+        "finalize",
+        "disconnect",
+        "late_error"
+      ],
+      "expected": "owner removed; late finalization claim=false; zero turns"
+    },
+    {
+      "events": [
+        "record",
+        "finalize",
+        "final_claim",
+        "cancel"
+      ],
+      "expected": "finalization owns terminal boundary; cancel cannot remove claimed session"
+    }
+  ],
+  "future_accuracy_inputs": {
+    "gap": "No producer-specific speech WAV/golden transcript corpus provided. Synthetic arrays certify protocol math only, never ASR accuracy. Supply corpus hashes, language and export identity per entry before any runtime acceptance."
+  }
+}

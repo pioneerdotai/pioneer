@@ -95,20 +95,20 @@ pub(crate) fn new_turn_runtime_snapshot(
     })
 }
 
-pub(crate) fn restored_recovery_turn_request_from_snapshot(
+pub(crate) async fn restored_recovery_turn_request_from_snapshot(
+    store: &CrudStore,
     snapshot: &TurnRuntimeSnapshotRecord,
     permission_profile: TurnPermissionProfileSnapshot,
     execution_security_snapshot: TurnExecutionSecuritySnapshot,
     agent_skill_overlay: Vec<AgentSkillRuntimeEntry>,
 ) -> Result<RestoredRecoveryTurnRequest> {
+    let (hook_runtime_context, history) =
+        restored_conversation_scope_from_snapshot(store, snapshot).await?;
     Ok(RestoredRecoveryTurnRequest {
         turn_id: snapshot.turn_id.clone(),
         execution_window_index: 1,
         mode: from_snapshot_json(&snapshot.mode_json, "thread mode")?,
-        hook_runtime_context: from_snapshot_json(
-            &snapshot.hook_runtime_context_json,
-            "hook runtime context",
-        )?,
+        hook_runtime_context,
         model: snapshot.model.clone(),
         provider_name: snapshot.provider_name.clone(),
         reasoning: snapshot
@@ -135,19 +135,71 @@ pub(crate) fn restored_recovery_turn_request_from_snapshot(
             &snapshot.runtime_environment_json,
             "runtime environment",
         )?,
-        history: from_snapshot_json(&snapshot.history_json, "conversation history")?,
+        history,
         permission_profile,
         execution_security_snapshot: Some(execution_security_snapshot),
     })
 }
 
-pub(crate) fn restored_conversation_scope_from_snapshot(
+pub(crate) async fn restored_conversation_scope_from_snapshot(
+    store: &CrudStore,
     snapshot: &TurnRuntimeSnapshotRecord,
 ) -> Result<(AgentTurnHookRuntimeContext, Vec<ChatMessage>)> {
-    Ok((
-        from_snapshot_json(&snapshot.hook_runtime_context_json, "hook runtime context")?,
-        from_snapshot_json(&snapshot.history_json, "conversation history")?,
-    ))
+    let (context, projection) =
+        restored_conversation_scope_projection_from_snapshot(store, snapshot).await?;
+    Ok((context, projection.messages))
+}
+
+pub(crate) async fn restored_conversation_scope_projection_from_snapshot(
+    store: &CrudStore,
+    snapshot: &TurnRuntimeSnapshotRecord,
+) -> Result<(
+    AgentTurnHookRuntimeContext,
+    crate::compaction::frozen::RestoredAcceptedHistory,
+)> {
+    let context: AgentTurnHookRuntimeContext =
+        from_snapshot_json(&snapshot.hook_runtime_context_json, "hook runtime context")?;
+    let _frozen_hold = crate::compaction::frozen::acquire_history_json(
+        store,
+        &snapshot.workspace_id,
+        &snapshot.history_json,
+    )
+    .await?;
+    let allowed = crate::compaction::frozen::execution_history_scopes(
+        store,
+        &snapshot.workspace_id,
+        &snapshot.thread_id,
+        &snapshot.turn_id,
+        context.conversation_thread_id.as_deref(),
+    )
+    .await?;
+    let history = crate::compaction::frozen::restore_accepted_history_for_execution(
+        store,
+        &snapshot.workspace_id,
+        context.conversation_thread_id.as_deref(),
+        &snapshot.thread_id,
+        &allowed,
+        &snapshot.history_json,
+    )
+    .await?;
+    Ok((context, history))
+}
+
+/// Read compatibility is explicit: already accepted array snapshots keep their
+/// exact old projection. Newly written manifests resolve canonical references.
+/// Callers supply scopes from accepted execution metadata, never model input.
+pub(crate) async fn restore_history_json(
+    store: &CrudStore,
+    workspace: &str,
+    allowed: &std::collections::BTreeSet<String>,
+    value: &str,
+) -> Result<Vec<ChatMessage>> {
+    if value.trim_start().starts_with('[') {
+        return from_snapshot_json(value, "legacy conversation history");
+    }
+    let descriptor: pioneer_compaction::frozen::FrozenHistoryRef =
+        from_snapshot_json(value, "frozen history reference")?;
+    crate::compaction::frozen::restore(store, workspace, allowed, &descriptor).await
 }
 
 fn agent_skill_versions_json(entries: &[AgentSkillRuntimeEntry]) -> Result<Option<String>> {
@@ -261,7 +313,7 @@ fn execution_capabilities_json(capabilities: &[TurnCapability]) -> Result<String
     to_snapshot_json(capabilities, "turn capabilities")
 }
 
-fn restored_execution_capabilities(value: &str) -> Result<Vec<TurnCapability>> {
+pub(crate) fn restored_execution_capabilities(value: &str) -> Result<Vec<TurnCapability>> {
     let capabilities: Vec<TurnCapability> = from_snapshot_json(value, "turn capabilities")?;
     validate_execution_capabilities(&capabilities)?;
     Ok(capabilities)

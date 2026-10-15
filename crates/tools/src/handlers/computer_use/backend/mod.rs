@@ -11,6 +11,7 @@ use super::model::{
 };
 use super::tree::AccessibilityTreeBudget;
 use crate::error::ToolError;
+use crate::process_policy::ProcessEnvironmentPlan;
 use std::time::Duration;
 
 pub(crate) use xa11y::Xa11yComputerUseBackend;
@@ -24,12 +25,28 @@ pub(crate) trait ComputerUseDesktopBackend: Send + Sync {
         &self,
         options: DesktopPreflightOptions,
     ) -> Result<DesktopPreflightReport, ToolError>;
-    fn list_apps(&self) -> Result<Vec<AppMeta>, ToolError>;
-    fn frontmost_app(&self) -> Result<Option<AppMeta>, ToolError>;
-    fn find_app(&self, target: &AppTarget, timeout: Duration) -> Result<AppHandle, ToolError>;
-    fn launch_app(&self, target: &AppTarget, launch_command: Option<&str>)
-    -> Result<(), ToolError>;
-    fn activate_app(&self, app: &AppHandle) -> Result<(), ToolError>;
+    fn list_apps(&self, environment: &ProcessEnvironmentPlan) -> Result<Vec<AppMeta>, ToolError>;
+    fn frontmost_app(
+        &self,
+        environment: &ProcessEnvironmentPlan,
+    ) -> Result<Option<AppMeta>, ToolError>;
+    fn find_app(
+        &self,
+        target: &AppTarget,
+        timeout: Duration,
+        environment: &ProcessEnvironmentPlan,
+    ) -> Result<AppHandle, ToolError>;
+    fn launch_app(
+        &self,
+        target: &AppTarget,
+        launch_command: Option<&str>,
+        environment: &ProcessEnvironmentPlan,
+    ) -> Result<(), ToolError>;
+    fn activate_app(
+        &self,
+        app: &AppHandle,
+        environment: &ProcessEnvironmentPlan,
+    ) -> Result<(), ToolError>;
     fn app_tree(
         &self,
         app: &AppHandle,
@@ -51,7 +68,11 @@ pub(crate) trait ComputerUseDesktopBackend: Send + Sync {
         action: &InputAction,
         targets: &ResolvedInputActionTargets,
     ) -> Result<ActionExecution, ToolError>;
-    fn perform_os_action(&self, action: &OsAction) -> Result<ActionExecution, ToolError>;
+    fn perform_os_action(
+        &self,
+        action: &OsAction,
+        environment: &ProcessEnvironmentPlan,
+    ) -> Result<ActionExecution, ToolError>;
     fn list_displays(&self) -> Result<Vec<super::model::DisplayMeta>, ToolError>;
     fn capture_display(
         &self,

@@ -5,9 +5,14 @@ use super::super::util::{
     apply_snapshot_loop_guards, compute_hash, ensure_session_running, now_unix_ms,
     resolve_snapshot_destination, stop_session_with_reason,
 };
+use crate::apply_patch::file_mutation::{
+    StagedFile, TargetExpectation, TargetResolver, TargetRole, ensure_parent_directories,
+};
 use crate::context::FunctionToolOutput;
 use crate::error::ToolError;
 use crate::events::ToolEventTrace;
+use std::io::Write;
+use std::path::Path;
 use std::path::PathBuf;
 
 impl ComputerUseHandler {
@@ -64,22 +69,26 @@ impl ComputerUseHandler {
             args.screenshot_path.as_deref(),
             snapshot_index,
         )?;
-        if let Some(parent) = destination.parent() {
-            tokio::fs::create_dir_all(parent).await.map_err(|error| {
-                ToolError::execution_failed(format!(
-                    "failed to create snapshot directory `{}`: {error}",
-                    parent.display()
-                ))
-            })?;
-        }
-        tokio::fs::write(destination.as_path(), frame.png_bytes.as_slice())
-            .await
-            .map_err(|error| {
-                ToolError::execution_failed(format!(
-                    "failed to write snapshot `{}`: {error}",
-                    destination.display()
-                ))
-            })?;
+        let snapshots_root = artifacts_dir.join("snapshots");
+        let relative_destination = destination
+            .strip_prefix(snapshots_root.as_path())
+            .map_err(|_| {
+                ToolError::execution_failed(
+                    "resolved computer_use snapshot escaped its session snapshots directory",
+                )
+            })?
+            .to_path_buf();
+        let snapshot_bytes = frame.png_bytes.clone();
+        let write_root = snapshots_root.clone();
+        tokio::task::spawn_blocking(move || {
+            write_snapshot_secure(
+                write_root.as_path(),
+                relative_destination.as_path(),
+                snapshot_bytes.as_slice(),
+            )
+        })
+        .await
+        .map_err(|error| ToolError::internal(format!("snapshot writer join error: {error}")))??;
 
         let snapshot = SnapshotMeta {
             index: snapshot_index,
@@ -364,6 +373,89 @@ impl ComputerUseHandler {
             text_max_chars: self.config.accessibility_tree_text_max_chars,
         }
     }
+}
+
+fn write_snapshot_secure(
+    snapshots_root: &Path,
+    relative_destination: &Path,
+    bytes: &[u8],
+) -> Result<(), ToolError> {
+    let resolver = TargetResolver::new(snapshots_root).map_err(|error| {
+        ToolError::execution_failed(format!(
+            "failed to anchor computer_use snapshot directory `{}`: {error}",
+            snapshots_root.display()
+        ))
+    })?;
+    let target = resolver
+        .resolve(
+            relative_destination.to_string_lossy().as_ref(),
+            TargetRole::Destination,
+            TargetExpectation::ExistingOrMissing,
+        )
+        .map_err(|error| {
+            ToolError::execution_failed(format!(
+                "refused unsafe computer_use snapshot destination `{}`: {error}",
+                relative_destination.display()
+            ))
+        })?;
+    ensure_parent_directories(&target).map_err(|failure| {
+        ToolError::execution_failed(format!(
+            "failed to securely create computer_use snapshot directories for `{}`: {}",
+            relative_destination.display(),
+            failure.source
+        ))
+    })?;
+    let staged = StagedFile::create(&target).map_err(|error| {
+        ToolError::execution_failed(format!(
+            "failed to securely stage computer_use snapshot `{}`: {error}",
+            relative_destination.display()
+        ))
+    })?;
+    let mut file = staged.file().try_clone().map_err(|error| {
+        ToolError::execution_failed(format!(
+            "failed to prepare staged computer_use snapshot `{}`: {error}",
+            relative_destination.display()
+        ))
+    })?;
+    file.write_all(bytes).map_err(|error| {
+        ToolError::execution_failed(format!(
+            "failed to write staged computer_use snapshot `{}`: {error}",
+            relative_destination.display()
+        ))
+    })?;
+    file.flush().map_err(|error| {
+        ToolError::execution_failed(format!(
+            "failed to flush staged computer_use snapshot `{}`: {error}",
+            relative_destination.display()
+        ))
+    })?;
+    file.sync_all().map_err(|error| {
+        ToolError::execution_failed(format!(
+            "failed to sync staged computer_use snapshot `{}`: {error}",
+            relative_destination.display()
+        ))
+    })?;
+    drop(file);
+
+    let published_parent = staged.publish_replace(false).map_err(|error| {
+        ToolError::execution_failed(format!(
+            "failed to publish computer_use snapshot `{}`: {}",
+            relative_destination.display(),
+            error.source
+        ))
+    })?;
+    if published_parent.cleanup_failed {
+        tracing::warn!(
+            destination = %target.absolute().display(),
+            "computer_use snapshot was published but its staging filename could not be removed"
+        );
+    }
+    published_parent.sync_all().map_err(|error| {
+        ToolError::execution_failed(format!(
+            "computer_use snapshot `{}` was published but its parent directory could not be synced: {error}",
+            relative_destination.display()
+        ))
+    })
 }
 
 fn snapshot_completion_evidence(

@@ -533,11 +533,8 @@ delete_failed = "API キーの削除に失敗しました"
 
 [providers.cli]
 title = "CLI Providers"
+description = "準備状況は Gateway によって確認・更新されます。"
 refreshing = "Refreshing"
-updated = "Updated"
-stale = "Stale"
-refresh_failed = "Refresh failed"
-not_refreshed = "Not refreshed"
 empty = "No CLI providers configured"
 diagnostics = "Diagnostics"
 native_events = "Native events"
@@ -546,8 +543,6 @@ copied_diagnostics = "Copied diagnostics for"
 login_code = "Code"
 login_open = "Open"
 login_started = "CLI login started"
-refresh_already_running = "CLI provider refresh is already running."
-refresh_wait = "CLI provider refresh is waiting for the refresh policy."
 
 [providers.cli.mcp]
 runtime_not_ready = "Runtime is not ready"
@@ -973,10 +968,13 @@ description = "インターフェースで使用する言語を選択します�
 label = "カラーテーマ"
 description = "表示モードを選択します。"
 
+[settings.option.file_opener]
+label = "ファイルを開く"
+description = "ファイルを開く既定のアプリを選択します。"
+
 [settings.option.keepawake]
 label = "アイドルスリープを防止"
 description = "ゲートウェイの実行中、アイドル状態によるシステムスリープを防ぎます。ノートPCのフタを閉じた状態での動作は保証されません。その場合はクラムシェルモードを使うか、常時稼働のマシンでゲートウェイを実行してください。"
-tooltip = "防げるのはアイドルスリープのみです。フタを閉じる場合はクラムシェルモードか常時稼働マシンが必要です。"
 
 [settings.option.telemetry]
 label = "テレメトリを送信"
@@ -1429,18 +1427,6 @@ empty_audit = "監査イベントはまだありません。"
 source = "ソース"
 trust = "信頼"
 
-[bottom_bar]
-gateway_disconnected = "ゲートウェイは切断されています"
-starting_thread = "スレッドを開始しています..."
-finishing_turn = "ターンを完了しています..."
-turn_running = "ターン `%{turn_id}` は実行中です"
-previous_turn_failed = "前のターンが失敗しました。新しいメッセージを送信できます。"
-turn_cancelled = "ターンはキャンセルされました。新しいメッセージを送信できます。"
-turn_completed = "ターンが完了しました。次のメッセージを送信できます。"
-ready = "準備完了"
-starting_turn = "ターンを開始しています..."
-agent_processing = "エージェントが処理しています..."
-
 [timeline.empty]
 start_thread = "このスレッドを開始するにはメッセージを送信してください"
 
@@ -1687,6 +1673,9 @@ avatar = "256 KB以下の画像を選択してください。"
 storage = "新しいセッションを安全に保存できませんでした。もう一度お試しください。"
 transport = "Gatewayに接続できませんでした。もう一度お試しください。"
 
+[thread.file_opener]
+use_workspace = "デフォルト"
+
 [thread.scope]
 title = "スレッドへのアクセス"
 create_title = "スレッドの公開範囲を選択"
@@ -1713,3 +1702,54 @@ empty = "タスク結果はありません"
 task = "タスク"
 mark_read = "既読にする"
 completed = "タスクが完了しました"
+
+[settings.self_improvement.status]
+title = "アクティビティ"
+refresh = "更新"
+loading = "更新中…"
+offline = "オフラインです。最後に受信した状態を表示しています。"
+refresh_failed = "更新できませんでした。情報が古い可能性があります。"
+unavailable = "状態を取得できません。データまたは Gateway を更新してください。"
+progress = "履歴の %{total} 部分中 %{processed} 部分を分析済み"
+last_run = "前回の実行：%{time}"
+next_run = "次回の予定：%{time}"
+next_retry = "再試行または再開：%{time}"
+observed = "状態の更新日時：%{time}"
+last_result = "前回の結果：%{result}"
+not_scheduled = "—"
+phase_disabled = "無効"
+phase_unavailable = "利用不可"
+phase_waiting = "待機中"
+phase_running = "実行中"
+phase_retrying = "再試行待ち"
+phase_failed = "失敗"
+phase_no_change = "変更なし"
+phase_completed = "完了"
+phase_cancelled = "キャンセル済み"
+reason_disabled = "このワークスペースの学習は無効です。"
+reason_model_unavailable = "利用可能な API モデルを選び、プロバイダーの認証情報を確認してください。"
+reason_worker_unavailable = "この Gateway の学習処理は利用できません。"
+reason_preparing = "ワークスペースの学習を準備しています。"
+reason_no_new_sources = "分析できる新しい完了済みタスクがありません。"
+reason_awaiting_schedule = "新しい履歴は次回の予定時刻まで待機しています。"
+reason_analyzing = "完了済みタスクの履歴を分析しています。"
+reason_finalizing = "分析が完了しました。スキル候補を作成し、検証しています。"
+reason_pending = "実行がキューに入っているか、再開を待っています。"
+reason_recovering = "前の処理が応答しなくなりました。復旧を待っています。"
+reason_timeout = "モデルが 10 分以内に回答を完了しませんでした。"
+reason_output_limit = "プロバイダーがトークン上限で回答を切り詰めました。モデルまたは推論レベルを変更して再試行してください。"
+reason_invalid_response = "モデルの回答が検証に失敗しました。"
+reason_provider_error = "モデルのプロバイダーがリクエストを完了できませんでした。"
+reason_response_filtered = "プロバイダーが回答をブロックしました。"
+reason_no_candidate = "十分な根拠を持つスキル変更は見つかりませんでした。"
+reason_reviewer_rejected = "レビューモデルが変更案を却下しました。"
+reason_validation_rejected = "変更案がスキル検証に失敗しました。"
+reason_created = "スキルを 1 件作成しました。"
+reason_updated = "スキルを 1 件更新しました。"
+reason_rolled_back = "スキルを以前のバージョンに戻しました。"
+reason_cancelled = "実行がキャンセルされました。"
+reason_unknown = "処理が正常に完了しませんでした。Gateway のログを確認してください。"
+
+[mcp.oauth]
+callback_received = "応答を受け付けました。Pioneerでログイン結果を確認してください。"
+callback_rejected = "ログインを受け付けられませんでした。Pioneerに戻って再試行してください。"

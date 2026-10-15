@@ -3,27 +3,35 @@ extern crate rust_i18n;
 
 i18n!("locales", fallback = "en");
 
-mod app;
+#[cfg(test)]
+#[path = "../tests/desktop_architecture.rs"]
+mod architecture_tests;
 mod assets;
 mod audio;
-mod code_highlight;
-mod components;
+mod client_runtime;
+mod desktop_chrome;
+mod desktop_navigation;
+mod desktop_shell;
+mod file_opener;
 mod gateway;
 mod menu;
+mod platform;
+mod profile_photo;
 mod settings;
+mod shell_state;
 mod state;
 #[cfg(test)]
 mod tests;
 mod theme;
-mod updater;
+mod thread_platform;
+
 mod window;
 
 use anyhow::Context as _;
 use assets::PioneerAssetsSource;
 use futures_util::{AsyncReadExt as _, FutureExt as _, future::BoxFuture};
-use gpui::http_client::{self, HttpClient};
-use gpui::*;
-use gpui_component::Root;
+use gpui_kit::http_client::{self, HttpClient};
+use gpui_kit::*;
 use reqwest::header::HeaderValue;
 use std::sync::Arc;
 use std::time::Duration;
@@ -31,8 +39,6 @@ use tracing::error;
 
 use pioneer_config::AppConfig;
 use pioneer_protocol::{InvitationPresentation, PioneerAppUrlScheme};
-
-use app::PioneerDesktop;
 
 #[derive(Clone)]
 struct DesktopHttpClient {
@@ -103,6 +109,11 @@ impl HttpClient for DesktopHttpClient {
 }
 
 fn main() {
+    // Pinned Kit's Windows child-WebView bootstrap, before UI/runtime threads.
+    #[cfg(target_os = "windows")]
+    unsafe {
+        std::env::set_var("GPUI_DISABLE_DIRECT_COMPOSITION", "true");
+    }
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     if let Some(version_probe) = version_probe_from_args(args.iter().cloned()) {
         print_version_probe(version_probe);
@@ -110,13 +121,39 @@ fn main() {
     }
     let initial_urls = invitation_urls_from_args(args);
 
-    let startup = pioneer_observability::DesktopStartupTrace::start();
     pioneer_observability::set_telemetry_enabled(false);
+    let startup = pioneer_observability::DesktopStartupTrace::start();
 
     let config_stage = startup.stage(pioneer_observability::DesktopStartupStage::ConfigLoad);
     let startup_config = AppConfig::load().ok();
     if startup_config.is_some() {
         config_stage.succeed();
+    }
+
+    if let Some(config) = startup_config.as_ref() {
+        match config.runtime_home_dir().and_then(|runtime_home| {
+            pioneer_desktop_update::claim_post_update_receipt(
+                runtime_home.as_path(),
+                pioneer_desktop_update::desktop_current_version(),
+            )
+            .map_err(Into::into)
+        }) {
+            Ok(Some(receipt)) => {
+                startup.set_post_update_context(pioneer_observability::DesktopPostUpdateContext {
+                    attempt_id: receipt.attempt_id,
+                    from_version: receipt.from_version,
+                    to_version: receipt.to_version,
+                    platform: receipt.platform,
+                    process_exit_wait: receipt.process_exit_wait,
+                    apply_duration: receipt.apply_duration,
+                    relaunch_duration: receipt.relaunch_duration,
+                    total_duration: receipt.total_duration,
+                    claimed_at: receipt.claimed_at,
+                });
+            }
+            Ok(None) => {}
+            Err(error) => eprintln!("failed to claim desktop update receipt: {error:#}"),
+        }
     }
 
     let consent_stage = startup.stage(pioneer_observability::DesktopStartupStage::ConsentLoad);
@@ -125,6 +162,7 @@ fn main() {
         .map(desktop_telemetry_enabled)
         .unwrap_or(true);
     pioneer_observability::set_telemetry_enabled(telemetry_enabled);
+    startup.bind_consent();
     consent_stage.succeed();
 
     if let Some(config) = startup_config.as_ref() {
@@ -138,11 +176,14 @@ fn main() {
                 export_interval: Duration::from_millis(config.gateway.telemetry.export_interval_ms),
                 export_timeout: Duration::from_millis(config.gateway.telemetry.export_timeout_ms),
                 deployment_environment: None,
+                service_version: None,
             },
         )
         .is_ok()
         {
             observability_stage.succeed();
+            startup.emit_post_update_handoff();
+            startup.schedule_post_update_stall_checkpoint(Duration::from_secs(30));
         }
     }
 
@@ -175,7 +216,11 @@ fn main() {
     let (url_sender, mut url_receiver) = tokio::sync::mpsc::unbounded_channel::<Vec<String>>();
     let ui_runtime_stage =
         startup.stage(pioneer_observability::DesktopStartupStage::UiRuntimeInitialize);
-    let app = gpui_platform::application()
+    #[cfg(target_os = "linux")]
+    let app = gpui_kit::platform::linux(gpui_kit::WindowingModes::X11);
+    #[cfg(not(target_os = "linux"))]
+    let app = gpui_kit::application();
+    let app = app
         .with_assets(PioneerAssetsSource)
         .with_http_client(Arc::new(http_client));
     ui_runtime_stage.succeed();
@@ -183,11 +228,15 @@ fn main() {
         let _ = url_sender.send(urls);
     });
 
+    let ui_event_loop_stage =
+        startup.stage(pioneer_observability::DesktopStartupStage::UiEventLoopEnter);
     let startup_for_app = startup.clone();
     app.run(move |cx| {
+        ui_event_loop_stage.succeed();
         let ui_components_stage = startup_for_app
             .stage(pioneer_observability::DesktopStartupStage::UiComponentsInitialize);
-        gpui_component::init(cx);
+        gpui_kit::init(cx);
+        client_runtime::DesktopRuntimeCoordinator::install(cx);
         theme::init(cx);
         menu::init_system_menus(cx);
 
@@ -199,21 +248,18 @@ fn main() {
             let window_stage =
                 startup.stage(pioneer_observability::DesktopStartupStage::WindowOpen);
             let window_options = WindowOptions {
-                titlebar: Some(gpui_component::TitleBar::title_bar_options()),
+                titlebar: Some(gpui_kit::component::TitleBar::title_bar_options()),
                 window_bounds: Some(initial_window_bounds),
                 ..Default::default()
             };
 
-            let mut desktop = None;
-            let window_handle = cx
-                .open_window(window_options, |window, cx| {
-                    let view = cx.new(|cx| PioneerDesktop::new(window, cx, startup.clone()));
-                    desktop = Some(view.clone());
-                    cx.new(|cx| Root::new(view, window, cx))
-                })
-                .context(t!("errors.window.open_failed").to_string())?;
+            let (window_handle, desktop) =
+                client_runtime::DesktopRuntimeCoordinator::open_window(window_options, cx)
+                    .context(t!("errors.window.open_failed").to_string())?;
             window_stage.succeed();
-            let desktop = desktop.context("desktop view was not created")?;
+            cx.update(|cx| {
+                client_runtime::DesktopRuntimeCoordinator::observe_startup(startup.clone(), cx)
+            });
 
             for url in initial_urls {
                 let desktop = desktop.clone();

@@ -39,11 +39,7 @@ impl MessageProcessor {
             .await
         {
             Ok(result) => {
-                let revision = self
-                    .publish_invitation_selector_change(&result.invitation.invitation_id)
-                    .await
-                    .policy_generation
-                    .get();
+                let revision = self.next_administration_revision();
                 self.send_scoped_invitation_changed_notification(
                     &result.invitation.invitation_id,
                     revision,
@@ -96,11 +92,7 @@ impl MessageProcessor {
         {
             Ok(committed) => {
                 for invitation_id in &committed.changed_invitation_ids {
-                    let revision = self
-                        .publish_invitation_selector_change(invitation_id)
-                        .await
-                        .policy_generation
-                        .get();
+                    let revision = self.next_administration_revision();
                     self.send_scoped_invitation_changed_notification(invitation_id, revision)
                         .await;
                 }
@@ -135,13 +127,7 @@ impl MessageProcessor {
         {
             Ok(committed) => {
                 if committed.notification_changed {
-                    let revision = self
-                        .publish_invitation_selector_change(
-                            &committed.response.invitation.invitation_id,
-                        )
-                        .await
-                        .policy_generation
-                        .get();
+                    let revision = self.next_administration_revision();
                     self.send_scoped_invitation_changed_notification(
                         &committed.response.invitation.invitation_id,
                         revision,
@@ -152,11 +138,7 @@ impl MessageProcessor {
                     .await
             }
             Err(InvitationServiceError::CommittedTerminalHidden(invitation_id)) => {
-                let revision = self
-                    .publish_invitation_selector_change(&invitation_id)
-                    .await
-                    .policy_generation
-                    .get();
+                let revision = self.next_administration_revision();
                 self.send_scoped_invitation_changed_notification(&invitation_id, revision)
                     .await;
                 self.send_error(

@@ -57,7 +57,7 @@
 //! # Example
 //!
 //! ```
-//! use gpui::{point, px, MouseButton};
+//! use gpui_kit::{point, px, MouseButton};
 //! use alacritty_terminal::term::TermMode;
 //! use alacritty_terminal::index::{Point, Line, Column};
 //! use terminal::mouse::{pixel_to_cell, mouse_button_report};
@@ -75,7 +75,7 @@
 
 use alacritty_terminal::index::{Column, Line, Point as AlacPoint};
 use alacritty_terminal::term::TermMode;
-use gpui::{MouseButton, Pixels, Point};
+use gpui_kit::{MouseButton, Pixels, Point};
 
 /// Type of text selection in the terminal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -161,7 +161,7 @@ impl Selection {
 /// # Examples
 ///
 /// ```
-/// use gpui::{Point, Pixels, point, px};
+/// use gpui_kit::{Point, Pixels, point, px};
 /// use terminal::mouse::pixel_to_cell;
 ///
 /// let position = point(px(100.0), px(50.0));
@@ -250,7 +250,7 @@ pub fn selection_type_from_clicks(click_count: usize) -> SelectionType {
 /// # Examples
 ///
 /// ```
-/// use gpui::MouseButton;
+/// use gpui_kit::MouseButton;
 /// use alacritty_terminal::term::TermMode;
 /// use alacritty_terminal::index::{Point, Line, Column};
 /// use terminal::mouse::mouse_button_report;
@@ -463,7 +463,7 @@ pub fn encode_modifiers(shift: bool, alt: bool, control: bool) -> u8 {
 /// # Examples
 ///
 /// ```
-/// use gpui::px;
+/// use gpui_kit::px;
 /// use terminal::mouse::pixels_to_scroll_lines;
 ///
 /// let cell_height = px(20.0);
@@ -479,7 +479,7 @@ pub fn pixels_to_scroll_lines(pixel_delta: Pixels, cell_height: Pixels) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::{point, px};
+    use gpui_kit::{point, px};
 
     #[test]
     fn test_pixel_to_cell() {

@@ -19,6 +19,7 @@ use pioneer_protocol::CLIAgentRuntimeKind;
 const CODEX_MCP_ADAPTER_KIND: &str = "codex_synthetic_mcp";
 const CLAUDE_MCP_ADAPTER_KIND: &str = "claude_strict_mcp";
 const OPENCODE_MCP_ADAPTER_KIND: &str = "opencode_dynamic_mcp";
+const FIRST_PARTY_FILE_SERVER_ID: &str = "pioneer-file-tools-v1";
 
 #[derive(Debug)]
 pub(crate) enum CliMcpSessionLaunchRestoreError {
@@ -109,6 +110,14 @@ pub(crate) async fn restore_cli_mcp_session_launch(
         turn_binding.turn_id.clone(),
     );
     for binding in &bindings {
+        // First-party Claude file tools are provider facade entries, not
+        // upstream MCP installations.  They are re-added by the Claude
+        // adapter from its canonical reserved catalog below; reconstructing
+        // them as ordinary runtime tools would make the recovery manifest
+        // ambiguous and would ask the MCP runtime to execute them upstream.
+        if binding.server_installation_id == FIRST_PARTY_FILE_SERVER_ID {
+            continue;
+        }
         let current = runtime_view
             .current_tool_identity(turn_binding.workspace_id.as_str(), binding)
             .await
@@ -153,7 +162,13 @@ pub(crate) async fn restore_cli_mcp_session_launch(
             raw_tool_name: current.raw_tool_name,
             description: current.description,
             input_schema: current.canonical_schema,
-            annotations: Some(annotations),
+            // HTML declares no canonical annotations; its durable binding stores
+            // effective {} hints. Preserve absence after frozen identity validation.
+            annotations: if binding.server_installation_id == pioneer_tools::html::HTML_SERVER_ID {
+                None
+            } else {
+                Some(annotations)
+            },
             timeout_ms: current.effective_timeout_ms,
             catalog_version: current.catalog_version,
             installation_fingerprint: current.installation_fingerprint,
@@ -163,8 +178,20 @@ pub(crate) async fn restore_cli_mcp_session_launch(
             capability_id: binding.capability_id.clone(),
         });
     }
+    // Current identities above already attest the exact first-party schemas.
+    // Reserve only those definitions; keep the external facade limit unchanged.
+    let mut canonical_limits = limits;
+    for tool in &projection.tools {
+        if tool.server_installation_id == pioneer_tools::html::HTML_SERVER_ID {
+            let (_, _, bytes) =
+                crate::turn_mcp::projection::canonical_schema_identity(&tool.input_schema)
+                    .map_err(|e| invalid(anyhow!(e)))?;
+            canonical_limits.max_tools += 1;
+            canonical_limits.max_total_schema_bytes += bytes.len();
+        }
+    }
     projection
-        .finalize_identity(limits)
+        .finalize_identity(canonical_limits)
         .context("failed to finalize frozen MCP projection for CLI recovery")
         .map_err(invalid)?;
     if projection.manifest_hash != projection_record.manifest_hash {
@@ -295,6 +322,9 @@ fn validate_canonical_callable_names(
     bindings: &[TurnMcpBindingRecord],
 ) -> Result<()> {
     for tool in tools {
+        if tool.server_installation_id == FIRST_PARTY_FILE_SERVER_ID {
+            continue;
+        }
         let binding = bindings
             .iter()
             .find(|binding| {
@@ -380,9 +410,12 @@ mod tests {
     impl TurnMcpRuntimeView for StaticRuntimeView {
         async fn current_tool_identity(
             &self,
-            _workspace_id: &str,
-            _binding: &TurnMcpBindingRecord,
+            workspace_id: &str,
+            binding: &TurnMcpBindingRecord,
         ) -> Result<CurrentMcpToolIdentity, TurnMcpInvocationError> {
+            if binding.server_installation_id == pioneer_tools::html::HTML_SERVER_ID {
+                return crate::mcp_service::first_party_html_identity(workspace_id, binding);
+            }
             Ok(self.current.clone())
         }
     }
@@ -489,6 +522,11 @@ mod tests {
         projection
             .finalize_identity(McpProjectionLimits::default())
             .expect("projection should finalize");
+        let limits = McpProjectionLimits {
+            max_tools: 1,
+            ..McpProjectionLimits::default()
+        };
+        let projection = projection.with_html_tools(limits).unwrap();
         let provider_contract_fingerprint = "a".repeat(64);
         let original_launch = build_codex_mcp_session_launch_projection(
             projection.clone(),
@@ -496,16 +534,21 @@ mod tests {
         )
         .expect("Codex MCP projection should build");
         let facade_fingerprint = original_launch
-            .facade_projection(CliMcpFacadeProjectionLimits::transport_bounded(128))
+            .facade_projection(CliMcpFacadeProjectionLimits::transport_bounded(1))
             .expect("facade should build")
             .fingerprint()
             .as_str()
             .to_owned();
-        let tool = projection.tools.first().expect("tool should exist");
+        let tool = projection
+            .tools
+            .iter()
+            .find(|tool| tool.server_installation_id == "mcp-installation")
+            .expect("external tool should exist");
         let transformed = original_launch
             .preflight
             .tools
-            .first()
+            .iter()
+            .find(|transformed| transformed.canonical_callable_name == tool.canonical_callable_name)
             .expect("transformed tool should exist");
         let (annotations_json, annotations_digest) =
             canonical_annotations_identity(&annotations).expect("annotations should canonicalize");
@@ -528,6 +571,39 @@ mod tests {
             selection_reason: "explicit_composer_capability".to_owned(),
             capability_id: tool.capability_id.clone(),
         };
+        let mut durable_bindings = vec![durable_binding.clone()];
+        for html in projection
+            .tools
+            .iter()
+            .filter(|tool| tool.server_installation_id == pioneer_tools::html::HTML_SERVER_ID)
+        {
+            let transformed = original_launch
+                .preflight
+                .tools
+                .iter()
+                .find(|transformed| {
+                    transformed.canonical_callable_name == html.canonical_callable_name
+                })
+                .unwrap();
+            let mut binding = durable_binding.clone();
+            binding.server_installation_id = html.server_installation_id.clone();
+            binding.server_name = html.server_name.clone();
+            binding.raw_tool_name = html.raw_tool_name.clone();
+            binding.callable_name = html.canonical_callable_name.clone();
+            binding.canonical_callable_name = html.canonical_callable_name.clone();
+            binding.provider_callable_name =
+                format!("mcp__pioneer__{}", html.canonical_callable_name);
+            binding.catalog_version = html.catalog_version.clone();
+            binding.fingerprint = html.installation_fingerprint.clone();
+            binding.canonical_schema_fingerprint = html.schema_fingerprint.clone();
+            binding.provider_schema_fingerprint =
+                transformed.transformed_schema_fingerprint.clone();
+            binding.effective_timeout_ms = 120000;
+            binding.runtime_generation = 1;
+            binding.selection_reason = "implicit_policy".into();
+            binding.capability_id = None;
+            durable_bindings.push(binding);
+        }
         store
             .replace_turn_mcp_projection(&TurnMcpProjectionReplacement {
                 projection: TurnMcpProjectionRecord {
@@ -536,10 +612,10 @@ mod tests {
                     projection_version: MCP_TURN_PROJECTION_VERSION as i32,
                     manifest_hash: projection.manifest_hash.clone(),
                     resolution_status: "resolved".to_owned(),
-                    tool_count: 1,
+                    tool_count: 3,
                     created_at_unix: chrono::Utc::now().timestamp(),
                 },
-                bindings: vec![durable_binding.clone()],
+                bindings: durable_bindings,
             })
             .await
             .expect("projection should persist");
@@ -602,11 +678,15 @@ mod tests {
             },
             &turn_binding,
             CLIAgentRuntimeKind::Codex,
-            McpProjectionLimits::default(),
+            limits,
         )
         .await
         .expect("exact frozen projection should restore");
-        assert!(matches!(restored, CliMcpSessionLaunch::Codex(_)));
+        let CliMcpSessionLaunch::Codex(restored) = restored else {
+            panic!("Codex recovery expected")
+        };
+        assert_eq!(restored.canonical_projection.html_tool_count(), 2);
+        assert_eq!(restored, original_launch);
 
         let error = restore_cli_mcp_session_launch(
             &store,
@@ -618,7 +698,7 @@ mod tests {
             },
             &turn_binding,
             CLIAgentRuntimeKind::Codex,
-            McpProjectionLimits::default(),
+            limits,
         )
         .await
         .expect_err("runtime drift must fail closed");

@@ -34,15 +34,14 @@ impl InvitationAcceptPostCommitHook for MessageProcessor {
         )
         .await;
         for workspace_id in &committed.workspace_ids {
-            let revision = self
-                .publish_committed_authorization_invalidation(
-                    AccessChangeKind::WorkspaceMembership,
-                    Some(committed.accepted_principal_id.clone()),
-                    workspace_id.to_string(),
-                    None,
-                )
-                .await
-                .authorization_revision;
+            self.publish_committed_authorization_invalidation(
+                AccessChangeKind::WorkspaceMembership,
+                Some(committed.accepted_principal_id.clone()),
+                workspace_id.to_string(),
+                None,
+            )
+            .await;
+            let revision = self.next_administration_revision();
             self.send_notification_to_authorized_workspace_connections(
                 workspace_id.as_str(),
                 events::WORKSPACE_MEMBERS_CHANGED,
@@ -53,11 +52,7 @@ impl InvitationAcceptPostCommitHook for MessageProcessor {
             )
             .await;
         }
-        let revision = self
-            .publish_invitation_selector_change(&committed.invitation_id)
-            .await
-            .policy_generation
-            .get();
+        let revision = self.next_administration_revision();
         self.send_scoped_invitation_changed_notification(&committed.invitation_id, revision)
             .await;
         self.send_notification_to_authorized_member_connections(
@@ -72,11 +67,7 @@ impl InvitationAcceptPostCommitHook for MessageProcessor {
     }
 
     async fn invitation_changed(&self, invitation_id: pioneer_protocol::InvitationId) {
-        let revision = self
-            .publish_invitation_selector_change(&invitation_id)
-            .await
-            .policy_generation
-            .get();
+        let revision = self.next_administration_revision();
         self.send_scoped_invitation_changed_notification(&invitation_id, revision)
             .await;
     }

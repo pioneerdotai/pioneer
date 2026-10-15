@@ -6,8 +6,8 @@ use pioneer_entity::{
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::sea_query::OnConflict;
 use sea_orm::{
-    ColumnTrait, Condition, ConnectionTrait, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder,
-    QuerySelect, Set, Statement,
+    ColumnTrait, Condition, ConnectionTrait, DatabaseBackend, EntityTrait, PaginatorTrait,
+    QueryFilter, QueryOrder, QuerySelect, Set, Statement,
 };
 use std::collections::HashMap;
 
@@ -750,6 +750,102 @@ pub async fn delete_turn_work_item_projection_for_item<C: ConnectionTrait>(
     Ok(result.rows_affected)
 }
 
+/// Refreshes every stale running work-item projection after its Turn has
+/// become terminal. The authoritative `turn_item` rows have already been
+/// terminalized in the caller's transaction, so this can be expressed as one
+/// indexed SQLite update instead of an application-side query/update loop.
+///
+/// Keeping this operation set-based is important: terminal Turn projection is
+/// atomic, but the number of historical work items in a Turn is not a valid
+/// correctness limit. A large valid Turn must not fail merely to bound an
+/// application loop while the writer is reserved.
+pub async fn refresh_terminal_running_turn_work_item_projections<C: ConnectionTrait>(
+    db: &C,
+    turn_id: &str,
+    source_event_id: &str,
+    source_sequence: i64,
+    updated_at: DateTimeWithTimeZone,
+) -> Result<u64> {
+    if db.get_database_backend() != DatabaseBackend::Sqlite {
+        anyhow::bail!("terminal work-item projection refresh requires the SQLite store");
+    }
+
+    // A work item and an assistant block are mutually exclusive placements.
+    // Preserve the existing projector's cleanup invariant without issuing one
+    // DELETE for every running row.
+    db.execute_raw(Statement::from_sql_and_values(
+        DatabaseBackend::Sqlite,
+        r#"
+            DELETE FROM thread_timeline_block
+            WHERE turn_id = ?
+              AND block_kind = 'assistant_message'
+              AND source_kind = 'turn_item'
+              AND source_key IN (
+                  SELECT projection.item_id
+                  FROM turn_work_item_projection AS projection
+                  WHERE projection.turn_id = ?
+                    AND projection.status = 'running'
+              )
+        "#,
+        vec![turn_id.to_owned().into(), turn_id.to_owned().into()],
+    ))
+    .await
+    .with_context(|| {
+        format!("failed to remove conflicting assistant blocks for terminal Turn `{turn_id}`")
+    })?;
+
+    let result = db
+        .execute_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            r#"
+                UPDATE turn_work_item_projection AS projection
+                SET source_event_id = ?,
+                    source_sequence = ?,
+                    status = CASE (
+                        SELECT item.status
+                        FROM turn_item AS item
+                        WHERE item.turn_id = projection.turn_id
+                          AND item.item_id = projection.item_id
+                    )
+                        WHEN 'in_progress' THEN 'running'
+                        WHEN 'running' THEN 'running'
+                        WHEN 'failed' THEN 'failed'
+                        WHEN 'timed_out' THEN 'failed'
+                        WHEN 'cancelled' THEN 'cancelled'
+                        WHEN 'canceled' THEN 'cancelled'
+                        ELSE 'completed'
+                    END,
+                    completed_at = (
+                        SELECT item.updated_at
+                        FROM turn_item AS item
+                        WHERE item.turn_id = projection.turn_id
+                          AND item.item_id = projection.item_id
+                    ),
+                    updated_at = ?
+                WHERE projection.turn_id = ?
+                  AND projection.status = 'running'
+                  AND EXISTS (
+                      SELECT 1
+                      FROM turn_item AS item
+                      WHERE item.turn_id = projection.turn_id
+                        AND item.item_id = projection.item_id
+                  )
+            "#,
+            vec![
+                source_event_id.to_owned().into(),
+                source_sequence.into(),
+                updated_at.into(),
+                turn_id.to_owned().into(),
+            ],
+        ))
+        .await
+        .with_context(|| {
+            format!("failed to refresh running work-item projections for terminal Turn `{turn_id}`")
+        })?;
+
+    Ok(result.rows_affected())
+}
+
 pub async fn list_turn_work_items_page<C: ConnectionTrait>(
     db: &C,
     turn_id: &str,
@@ -798,32 +894,6 @@ pub async fn list_turn_work_items_page<C: ConnectionTrait>(
     }
 
     Ok(rows)
-}
-
-pub async fn list_turn_work_items_by_status_page<C: ConnectionTrait>(
-    db: &C,
-    turn_id: &str,
-    status: &str,
-    after_order_key: Option<&str>,
-    limit: u64,
-) -> Result<Vec<turn_work_item_projection::Model>> {
-    let mut query = turn_work_item_projection::Entity::find()
-        .filter(turn_work_item_projection::Column::TurnId.eq(turn_id.to_owned()))
-        .filter(turn_work_item_projection::Column::Status.eq(status.to_owned()));
-
-    if let Some(after_order_key) = after_order_key {
-        query = query
-            .filter(turn_work_item_projection::Column::OrderKey.gt(after_order_key.to_owned()));
-    }
-
-    query
-        .order_by_asc(turn_work_item_projection::Column::OrderKey)
-        .limit(limit)
-        .all(db)
-        .await
-        .with_context(|| {
-            format!("failed to list `{status}` work item projection page for turn `{turn_id}`")
-        })
 }
 
 pub async fn count_turn_work_items<C: ConnectionTrait>(

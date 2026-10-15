@@ -32,14 +32,16 @@ pub(crate) struct VoiceChunkIngestReport {
     pub(crate) sequence: u64,
     pub(crate) buffered_chunks: usize,
     pub(crate) buffered_bytes: usize,
+    pub(crate) missing_chunks: u64,
+    pub(crate) already_buffered: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum VoiceChunkIngestErrorKind {
+    StoreUnavailable,
     UnknownSession,
     DuplicateSession,
     StaleChunk,
-    SequenceGap,
     AudioFormatMismatch,
     BufferLimitExceeded,
 }
@@ -53,17 +55,14 @@ pub(crate) struct VoiceChunkIngestError {
 impl VoiceChunkIngestError {
     pub(crate) fn into_voice_error(self) -> VoiceError {
         let (kind, public_code) = match self.kind {
-            VoiceChunkIngestErrorKind::UnknownSession
+            VoiceChunkIngestErrorKind::StoreUnavailable
+            | VoiceChunkIngestErrorKind::UnknownSession
             | VoiceChunkIngestErrorKind::DuplicateSession => (
                 VoiceErrorKind::InvalidSession,
                 pioneer_protocol::PublicErrorCode::InvalidInput,
             ),
             VoiceChunkIngestErrorKind::StaleChunk => (
                 VoiceErrorKind::StaleChunk,
-                pioneer_protocol::PublicErrorCode::InvalidInput,
-            ),
-            VoiceChunkIngestErrorKind::SequenceGap => (
-                VoiceErrorKind::SequenceGap,
                 pioneer_protocol::PublicErrorCode::InvalidInput,
             ),
             VoiceChunkIngestErrorKind::AudioFormatMismatch => (
@@ -75,11 +74,30 @@ impl VoiceChunkIngestError {
                 pioneer_protocol::PublicErrorCode::ResourceExhausted,
             ),
         };
-        let public_error = crate::public_error::map_agent_failure(
+        let public_error = crate::public_error::build_public_error(
             public_code,
             pioneer_protocol::PublicErrorStage::Admission,
-            self.message,
         );
+        match self.kind {
+            VoiceChunkIngestErrorKind::StoreUnavailable => {
+                crate::public_error::report_agent_failure(&public_error, self.message);
+            }
+            expected => {
+                let failure_class = match expected {
+                    VoiceChunkIngestErrorKind::UnknownSession => "unknown_session",
+                    VoiceChunkIngestErrorKind::DuplicateSession => "duplicate_session",
+                    VoiceChunkIngestErrorKind::StaleChunk => "stale_chunk",
+                    VoiceChunkIngestErrorKind::AudioFormatMismatch => "audio_format_mismatch",
+                    VoiceChunkIngestErrorKind::BufferLimitExceeded => "buffer_limit_exceeded",
+                    VoiceChunkIngestErrorKind::StoreUnavailable => unreachable!(),
+                };
+                crate::public_error::report_expected_failure(
+                    &public_error,
+                    "voice_chunk_ingest",
+                    failure_class,
+                );
+            }
+        }
         VoiceError {
             kind,
             message: public_error.message.clone(),
@@ -102,7 +120,7 @@ impl GatewayVoiceSessionBufferStore {
         let session_id = session_id.into();
         let mut sessions = self.sessions.lock().map_err(|_| {
             ingest_error(
-                VoiceChunkIngestErrorKind::UnknownSession,
+                VoiceChunkIngestErrorKind::StoreUnavailable,
                 "voice session buffer store is unavailable",
             )
         })?;
@@ -120,7 +138,7 @@ impl GatewayVoiceSessionBufferStore {
     pub(crate) fn remove_session(&self, session_id: &str) -> Result<(), VoiceChunkIngestError> {
         let mut sessions = self.sessions.lock().map_err(|_| {
             ingest_error(
-                VoiceChunkIngestErrorKind::UnknownSession,
+                VoiceChunkIngestErrorKind::StoreUnavailable,
                 "voice session buffer store is unavailable",
             )
         })?;
@@ -138,7 +156,7 @@ impl GatewayVoiceSessionBufferStore {
     ) -> Result<BufferedVoiceSessionAudio, VoiceChunkIngestError> {
         let mut sessions = self.sessions.lock().map_err(|_| {
             ingest_error(
-                VoiceChunkIngestErrorKind::UnknownSession,
+                VoiceChunkIngestErrorKind::StoreUnavailable,
                 "voice session buffer store is unavailable",
             )
         })?;
@@ -158,7 +176,7 @@ impl GatewayVoiceSessionBufferStore {
     ) -> Result<VoiceChunkIngestReport, VoiceChunkIngestError> {
         let mut sessions = self.sessions.lock().map_err(|_| {
             ingest_error(
-                VoiceChunkIngestErrorKind::UnknownSession,
+                VoiceChunkIngestErrorKind::StoreUnavailable,
                 "voice session buffer store is unavailable",
             )
         })?;
@@ -180,7 +198,7 @@ impl GatewayVoiceSessionBufferStore {
     ) -> Result<usize, VoiceChunkIngestError> {
         let sessions = self.sessions.lock().map_err(|_| {
             ingest_error(
-                VoiceChunkIngestErrorKind::UnknownSession,
+                VoiceChunkIngestErrorKind::StoreUnavailable,
                 "voice session buffer store is unavailable",
             )
         })?;
@@ -227,23 +245,17 @@ impl VoiceSessionBuffer {
             ));
         }
         if header.sequence < self.next_sequence {
-            return Err(ingest_error(
-                VoiceChunkIngestErrorKind::StaleChunk,
-                format!(
-                    "voice chunk sequence {} is stale; expected {}",
-                    header.sequence, self.next_sequence
-                ),
-            ));
+            return Ok(VoiceChunkIngestReport {
+                session_id: header.session_id,
+                sequence: header.sequence,
+                buffered_chunks: self.chunks.len(),
+                buffered_bytes: self.buffered_bytes,
+                missing_chunks: 0,
+                already_buffered: true,
+            });
         }
-        if header.sequence > self.next_sequence {
-            return Err(ingest_error(
-                VoiceChunkIngestErrorKind::SequenceGap,
-                format!(
-                    "voice chunk sequence gap: expected {}, got {}",
-                    self.next_sequence, header.sequence
-                ),
-            ));
-        }
+
+        let missing_chunks = header.sequence - self.next_sequence;
 
         let normalized = normalize_voice_pcm_chunk(header.audio_format(), audio_payload.as_slice())
             .map_err(|error| match error {
@@ -287,7 +299,7 @@ impl VoiceSessionBuffer {
         let duration_ms = header.duration_ms;
         let captured_at_unix_ms = header.captured_at_unix_ms;
         self.buffered_bytes = next_buffered_bytes;
-        self.next_sequence = self.next_sequence.saturating_add(1);
+        self.next_sequence = sequence.saturating_add(1);
         self.chunks.push_back(BufferedVoiceChunk {
             sequence,
             audio_payload,
@@ -301,6 +313,8 @@ impl VoiceSessionBuffer {
             sequence,
             buffered_chunks: self.chunks.len(),
             buffered_bytes: self.buffered_bytes,
+            missing_chunks,
+            already_buffered: false,
         })
     }
 
@@ -334,6 +348,42 @@ fn ingest_error(
 mod tests {
     use super::*;
     use pioneer_protocol::{VoiceAudioEncoding, VoiceAudioFormat};
+
+    #[test]
+    fn buffer_refusals_are_breadcrumbs_but_poisoned_store_is_an_error() {
+        use crate::public_error::test_support::*;
+        let store = GatewayVoiceSessionBufferStore::default();
+        let (error, events) = capture_events(|| {
+            store
+                .take_session_audio("missing_session")
+                .unwrap_err()
+                .into_voice_error()
+        });
+        assert!(events.is_empty());
+        assert_eq!(error.kind, VoiceErrorKind::InvalidSession);
+        assert_eq!(
+            error.public_error.unwrap().code,
+            pioneer_protocol::PublicErrorCode::InvalidInput
+        );
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = store.sessions.lock().unwrap();
+            panic!("poison test buffer store");
+        });
+        let (error, events) = capture_events(|| {
+            let failure = store.take_session_audio("missing_session").unwrap_err();
+            assert_eq!(failure.kind, VoiceChunkIngestErrorKind::StoreUnavailable);
+            failure.into_voice_error()
+        });
+        // Preserve the original public contract even though the internal cause
+        // now distinguishes infrastructure from a missing session.
+        assert_eq!(error.kind, VoiceErrorKind::InvalidSession);
+        assert_eq!(
+            error.public_error.as_ref().unwrap().code,
+            pioneer_protocol::PublicErrorCode::InvalidInput
+        );
+        assert_eq!(events.len(), 1);
+        assert_correlated(&events[0], error.public_error.as_ref().unwrap());
+    }
 
     #[test]
     fn active_session_buffers_ordered_chunks() {
@@ -390,7 +440,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_and_gap_sequences_are_rejected() {
+    fn stale_chunks_are_idempotent_and_sequence_gaps_resume_capture() {
         let store = GatewayVoiceSessionBufferStore::default();
         store
             .start_session("voice_session_1", target_format())
@@ -401,13 +451,22 @@ mod tests {
 
         let stale = store
             .append_chunk(header("voice_session_1", 0), vec![0; 640])
-            .expect_err("stale sequence should fail");
-        assert_eq!(stale.kind, VoiceChunkIngestErrorKind::StaleChunk);
+            .expect("a repeated chunk should be acknowledged idempotently");
+        assert!(stale.already_buffered);
+        assert_eq!(stale.buffered_chunks, 1);
 
         let gap = store
-            .append_chunk(header("voice_session_1", 2), vec![0; 640])
-            .expect_err("sequence gap should fail");
-        assert_eq!(gap.kind, VoiceChunkIngestErrorKind::SequenceGap);
+            .append_chunk(header("voice_session_1", 3), vec![0; 640])
+            .expect("a sequence gap should resume capture");
+        assert!(!gap.already_buffered);
+        assert_eq!(gap.missing_chunks, 2);
+        assert_eq!(gap.buffered_chunks, 2);
+
+        let resumed = store
+            .append_chunk(header("voice_session_1", 4), vec![0; 640])
+            .expect("capture should continue after a gap");
+        assert_eq!(resumed.missing_chunks, 0);
+        assert_eq!(resumed.buffered_chunks, 3);
     }
 
     #[test]

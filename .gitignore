@@ -1,6 +1,5 @@
 # Local
 .DS_Store
-.cargo/config.toml
 config/local.toml
 .worktrees
 

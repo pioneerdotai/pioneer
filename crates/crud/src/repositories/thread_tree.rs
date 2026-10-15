@@ -3,7 +3,7 @@ use pioneer_entity::{thread_folder, thread_placement};
 use sea_orm::entity::ActiveModelTrait;
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::sea_query::{Expr, OnConflict};
-use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, Set};
+use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, Set, Statement};
 
 pub async fn list_folders_by_workspace<C: ConnectionTrait>(
     db: &C,
@@ -48,6 +48,42 @@ pub async fn find_folder_by_id<C: ConnectionTrait>(
         .one(db)
         .await
         .context("failed to query thread folder by id")
+}
+
+/// Checks the prospective parent chain entirely inside SQLite. Using one
+/// recursive statement avoids loading and walking an unbounded workspace
+/// folder graph while a write transaction owns the physical writer.
+pub async fn folder_parent_would_create_cycle<C: ConnectionTrait>(
+    db: &C,
+    workspace_id: &str,
+    folder_id: &str,
+    parent_folder_id: &str,
+) -> Result<bool> {
+    let row = db
+        .query_one_raw(Statement::from_sql_and_values(
+            db.get_database_backend(),
+            "WITH RECURSIVE ancestors(id, parent_folder_id) AS (\
+               SELECT id, parent_folder_id FROM thread_folder \
+               WHERE id = ? AND workspace_id = ? \
+               UNION \
+               SELECT parent.id, parent.parent_folder_id \
+               FROM thread_folder parent \
+               JOIN ancestors child ON parent.id = child.parent_folder_id \
+               WHERE parent.workspace_id = ?\
+             ) \
+             SELECT EXISTS(SELECT 1 FROM ancestors WHERE id = ?) AS would_cycle"
+                .to_owned(),
+            [
+                parent_folder_id.into(),
+                workspace_id.into(),
+                workspace_id.into(),
+                folder_id.into(),
+            ],
+        ))
+        .await
+        .context("failed to validate thread folder ancestry")?
+        .context("thread folder ancestry query returned no result")?;
+    Ok(row.try_get::<i64>("", "would_cycle")? != 0)
 }
 
 pub async fn insert_folder<C: ConnectionTrait>(

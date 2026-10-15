@@ -1,0 +1,22 @@
+{
+  "output": {
+    "message": {
+      "role": "assistant",
+      "content": [
+        {
+          "reasoningContent": {
+            "redactedContent": "AQIDBA=="
+          }
+        },
+        {
+          "toolUse": {
+            "toolUseId": "clock_2",
+            "name": "clock",
+            "input": {}
+          }
+        }
+      ]
+    }
+  },
+  "stopReason": "tool_use"
+}

@@ -1,6 +1,7 @@
 use pioneer_protocol::ProviderFailureClass;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
+use std::fmt::{Display, Formatter};
 use std::time::Duration;
 
 pub use pioneer_protocol::ReasoningEffort;
@@ -12,6 +13,11 @@ pub use pioneer_protocol::ReasoningEffort;
 /// conservative provider-neutral classifier in the agent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderFailureClassification {
+    /// Retains the registry's network fallback after the unsafe source is dropped.
+    /// Internal transport fact, never serialized into public diagnostics.
+    pub is_network_error: bool,
+    pub error_reason: Option<pioneer_protocol::ProviderErrorReason>,
+    pub request_id: Option<pioneer_protocol::ProviderRequestId>,
     pub class: ProviderFailureClass,
     pub http_status: Option<u16>,
     pub provider_code: Option<String>,
@@ -21,6 +27,9 @@ pub struct ProviderFailureClassification {
 impl ProviderFailureClassification {
     pub fn new(class: ProviderFailureClass) -> Self {
         Self {
+            is_network_error: false,
+            error_reason: None,
+            request_id: None,
             class,
             http_status: None,
             provider_code: None,
@@ -28,6 +37,103 @@ impl ProviderFailureClassification {
         }
     }
 }
+
+/// Request-owned diagnostic facts, independent of payload chunks and progress.
+/// Each streaming request gets a fresh handle; providers must never reuse it.
+#[derive(Clone, Debug, Default)]
+pub struct ProviderStreamDiagnostics {
+    request_id: std::sync::Arc<std::sync::RwLock<Option<pioneer_protocol::ProviderRequestId>>>,
+}
+
+impl ProviderStreamDiagnostics {
+    pub fn request_id(&self) -> Option<pioneer_protocol::ProviderRequestId> {
+        self.request_id
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+
+    pub(crate) fn set_request_id(&self, id: pioneer_protocol::ProviderRequestId) {
+        *self
+            .request_id
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = Some(id);
+    }
+}
+
+/// A provider stream and its request-owned facts, consumed by agent deadlines.
+/// Facts do not produce chunks or reset the first/inter-chunk deadline.
+pub struct ProviderStream {
+    pub stream: futures_util::stream::BoxStream<'static, anyhow::Result<StreamChunk>>,
+    pub diagnostics: ProviderStreamDiagnostics,
+}
+
+impl ProviderStream {
+    pub fn new(
+        stream: futures_util::stream::BoxStream<'static, anyhow::Result<StreamChunk>>,
+    ) -> Self {
+        Self {
+            stream,
+            diagnostics: ProviderStreamDiagnostics::default(),
+        }
+    }
+}
+
+/// A provider-controlled response exceeded a hard runtime boundary.
+///
+/// This error deliberately contains only bounded metadata.  It is used for
+/// both transport bodies and the logical response envelope retained by the
+/// agent, so callers can classify it as non-retryable without inspecting a
+/// provider-supplied body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderResponseTooLarge {
+    pub component: &'static str,
+    pub limit: usize,
+    pub observed: usize,
+}
+
+impl ProviderResponseTooLarge {
+    pub const fn new(component: &'static str, limit: usize, observed: usize) -> Self {
+        Self {
+            component,
+            limit,
+            observed,
+        }
+    }
+}
+
+impl Display for ProviderResponseTooLarge {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "provider response exceeds {} limit (limit={} bytes, observed_at_least={} bytes)",
+            self.component, self.limit, self.observed
+        )
+    }
+}
+
+impl std::error::Error for ProviderResponseTooLarge {}
+
+/// An oversized HTTP error body. The status is retained even though the
+/// untrusted body is discarded, so retry/cooldown policy can still distinguish
+/// rate limits and provider failures from oversized successful responses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderHttpErrorBodyTooLarge {
+    pub status: u16,
+    pub limit: ProviderResponseTooLarge,
+}
+
+impl Display for ProviderHttpErrorBodyTooLarge {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "provider HTTP error {}: {}",
+            self.status, self.limit
+        )
+    }
+}
+
+impl std::error::Error for ProviderHttpErrorBodyTooLarge {}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -327,11 +433,19 @@ impl MessageContentPart {
     }
 }
 
-/// Provider-owned state that must be replayed unchanged with an assistant
-/// message. The common agent stores this value but never interprets it.
+/// Provider-owned state that must be replayed unchanged only to its proven
+/// provider/model target. The payload remains provider-owned; the history
+/// projection may extract explicitly typed human-readable fields when a
+/// completed round is moved to an incompatible target.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ProviderReplayState {
     pub provider: String,
+    /// Exact model whose continuation contract produced this state. Legacy
+    /// records omit it and are therefore portable history, not proof that an
+    /// active continuation can be replayed to an arbitrary model exposed by
+    /// the same provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     pub payload: JsonValue,
 }
 
@@ -339,8 +453,25 @@ impl ProviderReplayState {
     pub fn new(provider: impl Into<String>, payload: JsonValue) -> Self {
         Self {
             provider: provider.into(),
+            model: None,
             payload,
         }
+    }
+
+    pub fn for_model(
+        provider: impl Into<String>,
+        model: impl Into<String>,
+        payload: JsonValue,
+    ) -> Self {
+        Self {
+            provider: provider.into(),
+            model: Some(model.into()),
+            payload,
+        }
+    }
+
+    pub fn is_compatible_with(&self, provider: &str, model: &str) -> bool {
+        self.provider == provider && self.model.as_deref() == Some(model)
     }
 
     pub fn payload_for(&self, provider: &str) -> Option<&JsonValue> {
@@ -348,8 +479,75 @@ impl ProviderReplayState {
     }
 }
 
+/// Runtime-only provenance. Provider wire serializers never emit this field,
+/// and deserializing a provider response cannot manufacture trusted sources.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub struct MessageSourceRef {
+    pub scope: String,
+    pub id: String,
+    pub version: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MessageSourceAlias {
+    pub represented_thread_id: String,
+    pub represented_source: MessageSourceRef,
+    pub thread_id: String,
+    pub source: MessageSourceRef,
+}
+impl MessageSourceAlias {
+    /// Exact canonical response -> model-facing UI copy. Never a turn-wide alias.
+    pub fn is_response_copy(&self) -> bool {
+        self.thread_id == self.represented_thread_id
+            && self
+                .represented_source
+                .scope
+                .strip_prefix("context:")
+                .is_some_and(|turn| {
+                    !turn.is_empty() && self.source.scope.strip_prefix("event:") == Some(turn)
+                })
+            && !self.source.version.is_empty()
+            && !self.represented_source.version.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub struct MessageSourceIdentity {
+    pub thread_id: String,
+    pub source: MessageSourceRef,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MessageProvenance {
+    /// Exact Task command turn for a delivered outcome in the same source
+    /// thread. Set by trusted canonical projection, never inferred from text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logical_turn_id: Option<String>,
+    pub workspace_id: String,
+    /// Canonical storage scope. Adopting work never moves its source records.
+    pub thread_id: String,
+    /// Explicit execution-context ownership assigned only by the accepted
+    /// Gateway composition. None retains ownership in the canonical thread.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_thread: Option<String>,
+    pub unit_id: String,
+    pub sources: Vec<MessageSourceRef>,
+    /// Exact canonical inputs represented by this message without contributing
+    /// another provider-wire payload. Trusted Gateway metadata is the only
+    /// authority allowed to establish these aliases.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_aliases: Vec<MessageSourceAlias>,
+    /// Exact copies whose competing historical owners make suppression unsafe.
+    /// This is evidence only, never a represented source or access grant.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ambiguous_input_aliases: Vec<MessageSourceIdentity>,
+    pub complete: bool,
+    pub protected_input: bool,
+    pub inherited: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ChatMessage {
+    #[serde(skip)]
+    pub provenance: Option<MessageProvenance>,
     pub role: Role,
     pub content: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -369,6 +567,7 @@ pub struct ChatMessage {
 impl ChatMessage {
     pub fn system(content: impl Into<String>) -> Self {
         Self {
+            provenance: None,
             role: Role::System,
             content: content.into(),
             reasoning_content: None,
@@ -382,6 +581,7 @@ impl ChatMessage {
 
     pub fn user(content: impl Into<String>) -> Self {
         Self {
+            provenance: None,
             role: Role::User,
             content: content.into(),
             reasoning_content: None,
@@ -395,6 +595,7 @@ impl ChatMessage {
 
     pub fn assistant(content: impl Into<String>) -> Self {
         Self {
+            provenance: None,
             role: Role::Assistant,
             content: content.into(),
             reasoning_content: None,
@@ -408,6 +609,7 @@ impl ChatMessage {
 
     pub fn tool(content: impl Into<String>) -> Self {
         Self {
+            provenance: None,
             role: Role::Tool,
             content: content.into(),
             reasoning_content: None,
@@ -441,6 +643,7 @@ impl ChatMessage {
         provider_replay_state: Option<ProviderReplayState>,
     ) -> Self {
         Self {
+            provenance: None,
             role: Role::Assistant,
             content: content.map(Into::into).unwrap_or_default(),
             reasoning_content: reasoning_content.map(Into::into),
@@ -458,6 +661,7 @@ impl ChatMessage {
         content: impl Into<String>,
     ) -> Self {
         Self {
+            provenance: None,
             role: Role::Tool,
             content: content.into(),
             reasoning_content: None,
@@ -471,6 +675,7 @@ impl ChatMessage {
 
     pub fn user_parts(parts: Vec<MessageContentPart>) -> Self {
         Self {
+            provenance: None,
             role: Role::User,
             content: String::new(),
             reasoning_content: None,
@@ -644,9 +849,15 @@ pub struct ChatRequest {
     pub model: String,
     pub messages: Vec<ChatMessage>,
     pub temperature: Option<f32>,
+    /// Prepared generation reserve. Adapters must preserve this bound in their
+    /// native field. For inclusive APIs it covers thinking + visible output;
+    /// visible-only APIs need a separate prepared thinking reserve or an
+    /// explicit restriction. Qualitative effort never invents token budgets.
     pub max_tokens: Option<u32>,
     pub tools: Option<Vec<ToolDefinition>>,
     pub tool_choice: Option<ToolChoice>,
+    /// true permits multiple calls (it does not require them); false requires
+    /// at most one call per response and must be enforced or rejected locally.
     pub parallel_tool_calls: Option<bool>,
     pub reasoning: Option<ReasoningConfig>,
     pub compiled_prompt: Option<CompiledPromptPayload>,
@@ -670,11 +881,14 @@ impl EmbeddingRequest {
 #[derive(Debug, Clone, PartialEq)]
 pub struct EmbeddingResponse {
     pub embeddings: Vec<Vec<f32>>,
+    pub usage: Option<TokenUsage>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReasoningConfig {
+    /// Explicit off; differs from an omitted setting (server default).
     Disabled,
+    /// Includes explicit `None`, serialized as the protocol's off control.
     Effort(ReasoningEffort),
 }
 
@@ -817,10 +1031,111 @@ impl ProviderTermination {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq)]
+#[serde(default)]
 pub struct TokenUsage {
+    /// Effective input including cache reads/writes once. Missing is not zero.
     pub input_tokens: Option<u64>,
+    /// Output including reasoning once, according to the API category rules.
     pub output_tokens: Option<u64>,
+    pub uncached_input_tokens: Option<u64>,
+    pub cache_read_input_tokens: Option<u64>,
+    pub cache_write_input_tokens: Option<u64>,
+    pub reasoning_tokens: Option<u64>,
+    pub reported_total_tokens: Option<u64>,
+    pub semantics: Option<String>,
+    pub raw_usage: Option<serde_json::Value>,
+    pub generation_id: Option<String>,
+    pub reported_model: Option<String>,
+    pub service_tier: Option<String>,
+    pub request_id: Option<String>,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub api: Option<String>,
+    pub api_version: Option<String>,
+    pub route: Option<String>,
+    pub physical_attempt_id: Option<String>,
+    pub accounting: Option<serde_json::Value>,
+}
+
+impl TokenUsage {
+    /// Stream fields are cumulative snapshots. Duplicate events replace values;
+    /// partial native deltas preserve previously reported categories.
+    pub fn update(&mut self, snapshot: &Self) {
+        macro_rules! update {
+            ($($field:ident),*) => {$(if snapshot.$field.is_some() {
+                self.$field = snapshot.$field.clone();
+            })*};
+        }
+        update!(
+            input_tokens,
+            output_tokens,
+            uncached_input_tokens,
+            cache_read_input_tokens,
+            cache_write_input_tokens,
+            reasoning_tokens,
+            reported_total_tokens,
+            reported_model,
+            service_tier,
+            semantics,
+            generation_id,
+            request_id,
+            provider,
+            model,
+            api,
+            api_version,
+            route,
+            physical_attempt_id,
+            accounting
+        );
+        if let Some(raw) = &snapshot.raw_usage {
+            let target = self.raw_usage.get_or_insert_with(|| serde_json::json!({}));
+            if let (Some(target), Some(raw)) = (target.as_object_mut(), raw.as_object()) {
+                fn merge(
+                    target: &mut serde_json::Map<String, serde_json::Value>,
+                    raw: &serde_json::Map<String, serde_json::Value>,
+                ) {
+                    for (key, value) in raw {
+                        if let (Some(existing), Some(incoming)) = (
+                            target
+                                .get_mut(key)
+                                .and_then(serde_json::Value::as_object_mut),
+                            value.as_object(),
+                        ) {
+                            merge(existing, incoming);
+                        } else {
+                            target.insert(key.clone(), value.clone());
+                        }
+                    }
+                }
+                merge(target, raw);
+            }
+            self.raw_usage = self.raw_usage.as_ref().map(crate::usage::bounded_usage);
+        }
+        // Gemini thoughts are separate from candidates. A partial cumulative
+        // snapshot must not replace the earlier candidate count with thoughts.
+        if self.semantics.as_deref() == Some("inclusive_cache_separate_thoughts") {
+            if let Some(raw) = &self.raw_usage {
+                let candidates = raw
+                    .get("candidatesTokenCount")
+                    .and_then(serde_json::Value::as_u64);
+                let thoughts = raw
+                    .get("thoughtsTokenCount")
+                    .and_then(serde_json::Value::as_u64);
+                self.output_tokens = match (candidates, thoughts) {
+                    (Some(c), t) => c.checked_add(t.unwrap_or(0)),
+                    (None, Some(t)) => Some(t),
+                    _ => None,
+                };
+            }
+        }
+        if self.semantics.as_deref() == Some("exclusive_cache") {
+            self.input_tokens = self.uncached_input_tokens.and_then(|i| {
+                i.checked_add(self.cache_read_input_tokens.unwrap_or(0))?
+                    .checked_add(self.cache_write_input_tokens.unwrap_or(0))
+            });
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -841,6 +1156,7 @@ pub struct ChatResponse {
 
 #[derive(Debug, Clone)]
 pub struct StreamChunk {
+    pub usage: Option<TokenUsage>,
     pub delta: String,
     pub reasoning_delta: Option<String>,
     pub tool_calls: Vec<ProviderToolCall>,
@@ -852,8 +1168,21 @@ pub struct StreamChunk {
 }
 
 impl StreamChunk {
+    pub fn usage(usage: TokenUsage) -> Self {
+        Self {
+            usage: Some(usage),
+            ..Self::delta("")
+        }
+    }
+
+    pub fn with_usage(mut self, usage: Option<TokenUsage>) -> Self {
+        self.usage = usage;
+        self
+    }
+
     pub fn delta(text: impl Into<String>) -> Self {
         Self {
+            usage: None,
             delta: text.into(),
             reasoning_delta: None,
             tool_calls: Vec::new(),
@@ -865,6 +1194,7 @@ impl StreamChunk {
 
     pub fn reasoning(text: impl Into<String>) -> Self {
         Self {
+            usage: None,
             delta: String::new(),
             reasoning_delta: Some(text.into()),
             tool_calls: Vec::new(),
@@ -876,6 +1206,7 @@ impl StreamChunk {
 
     pub fn tool_calls(tool_calls: Vec<ProviderToolCall>) -> Self {
         Self {
+            usage: None,
             delta: String::new(),
             reasoning_delta: None,
             tool_calls,
@@ -887,6 +1218,7 @@ impl StreamChunk {
 
     pub fn provider_replay_state(state: ProviderReplayState) -> Self {
         Self {
+            usage: None,
             delta: String::new(),
             reasoning_delta: None,
             tool_calls: Vec::new(),
@@ -898,6 +1230,7 @@ impl StreamChunk {
 
     pub fn final_chunk_with(termination: ProviderTermination) -> Self {
         Self {
+            usage: None,
             delta: String::new(),
             reasoning_delta: None,
             tool_calls: Vec::new(),
@@ -905,6 +1238,221 @@ impl StreamChunk {
             is_final: true,
             termination: Some(termination),
         }
+    }
+}
+
+/// Hard limits for data originating at a provider boundary.  These values
+/// bound both the decoded transport body and the fields which the agent keeps
+/// across a streamed or replayed round.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProviderResponseLimits {
+    pub max_transport_bytes: usize,
+    pub max_text_bytes: usize,
+    pub max_reasoning_bytes: usize,
+    pub max_tool_calls: usize,
+    pub max_tool_arguments_bytes: usize,
+    pub max_replay_bytes: usize,
+    pub max_retained_bytes: usize,
+}
+
+impl Default for ProviderResponseLimits {
+    fn default() -> Self {
+        Self {
+            max_transport_bytes: 16 * 1024 * 1024,
+            max_text_bytes: 4 * 1024 * 1024,
+            max_reasoning_bytes: 4 * 1024 * 1024,
+            max_tool_calls: 64,
+            max_tool_arguments_bytes: 4 * 1024 * 1024,
+            max_replay_bytes: 2 * 1024 * 1024,
+            max_retained_bytes: 16 * 1024 * 1024,
+        }
+    }
+}
+
+impl ProviderResponseLimits {
+    pub fn validate_chat_response(
+        &self,
+        response: &ChatResponse,
+    ) -> Result<(), ProviderResponseTooLarge> {
+        self.validate_accumulated(
+            response.text.as_str(),
+            response.reasoning_content.as_deref().unwrap_or_default(),
+            response.tool_calls.as_slice(),
+            response.provider_replay_state.as_ref(),
+        )
+    }
+
+    pub fn validate_accumulated(
+        &self,
+        text: &str,
+        reasoning: &str,
+        tool_calls: &[ProviderToolCall],
+        replay_state: Option<&ProviderReplayState>,
+    ) -> Result<(), ProviderResponseTooLarge> {
+        self.validate_text(text, "response_text")?;
+        self.validate_reasoning(reasoning)?;
+        self.validate_tool_calls(tool_calls)?;
+        if let Some(state) = replay_state {
+            self.validate_replay_state(state)?;
+        }
+        self.validate_retained_bytes(
+            text.len()
+                .saturating_add(reasoning.len())
+                .saturating_add(tool_calls_bytes(tool_calls))
+                .saturating_add(replay_state.map_or(0, replay_state_bytes)),
+        )
+    }
+
+    pub fn validate_stream_chunk(
+        &self,
+        chunk: &StreamChunk,
+    ) -> Result<(), ProviderResponseTooLarge> {
+        self.validate_text(chunk.delta.as_str(), "stream_text_delta")?;
+        if let Some(reasoning) = chunk.reasoning_delta.as_deref() {
+            self.validate_reasoning(reasoning)?;
+        }
+        self.validate_tool_calls(chunk.tool_calls.as_slice())?;
+        if let Some(state) = chunk.provider_replay_state.as_ref() {
+            self.validate_replay_state(state)?;
+        }
+        self.validate_retained_bytes(
+            chunk
+                .delta
+                .len()
+                .saturating_add(chunk.reasoning_delta.as_deref().map_or(0, str::len))
+                .saturating_add(tool_calls_bytes(chunk.tool_calls.as_slice()))
+                .saturating_add(
+                    chunk
+                        .provider_replay_state
+                        .as_ref()
+                        .map_or(0, replay_state_bytes),
+                ),
+        )
+    }
+
+    pub fn validate_text(
+        &self,
+        text: &str,
+        component: &'static str,
+    ) -> Result<(), ProviderResponseTooLarge> {
+        self.validate_text_bytes(text.len(), component)
+    }
+
+    pub fn validate_text_bytes(
+        &self,
+        bytes: usize,
+        component: &'static str,
+    ) -> Result<(), ProviderResponseTooLarge> {
+        if bytes > self.max_text_bytes {
+            return Err(ProviderResponseTooLarge::new(
+                component,
+                self.max_text_bytes,
+                bytes,
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn validate_reasoning(&self, reasoning: &str) -> Result<(), ProviderResponseTooLarge> {
+        self.validate_reasoning_bytes(reasoning.len())
+    }
+
+    pub fn validate_reasoning_bytes(&self, bytes: usize) -> Result<(), ProviderResponseTooLarge> {
+        if bytes > self.max_reasoning_bytes {
+            return Err(ProviderResponseTooLarge::new(
+                "reasoning_content",
+                self.max_reasoning_bytes,
+                bytes,
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn validate_tool_calls(
+        &self,
+        calls: &[ProviderToolCall],
+    ) -> Result<(), ProviderResponseTooLarge> {
+        if calls.len() > self.max_tool_calls {
+            return Err(ProviderResponseTooLarge::new(
+                "tool_calls",
+                self.max_tool_calls,
+                calls.len(),
+            ));
+        }
+        let arguments_bytes = calls.iter().fold(0usize, |total, call| {
+            total.saturating_add(call.arguments.len())
+        });
+        if arguments_bytes > self.max_tool_arguments_bytes {
+            return Err(ProviderResponseTooLarge::new(
+                "tool_call_arguments",
+                self.max_tool_arguments_bytes,
+                arguments_bytes,
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn validate_replay_state(
+        &self,
+        state: &ProviderReplayState,
+    ) -> Result<(), ProviderResponseTooLarge> {
+        let bytes = replay_state_bytes(state);
+        if bytes > self.max_replay_bytes {
+            return Err(ProviderResponseTooLarge::new(
+                "provider_replay_state",
+                self.max_replay_bytes,
+                bytes,
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn validate_retained_bytes(&self, bytes: usize) -> Result<(), ProviderResponseTooLarge> {
+        if bytes > self.max_retained_bytes {
+            return Err(ProviderResponseTooLarge::new(
+                "retained_response_envelope",
+                self.max_retained_bytes,
+                bytes,
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn tool_calls_bytes(calls: &[ProviderToolCall]) -> usize {
+    calls.iter().fold(0usize, |total, call| {
+        total
+            .saturating_add(call.id.len())
+            .saturating_add(call.name.len())
+            .saturating_add(call.arguments.len())
+    })
+}
+
+fn replay_state_bytes(state: &ProviderReplayState) -> usize {
+    let mut counter = JsonByteCounter::default();
+    if serde_json::to_writer(&mut counter, &state.payload).is_err() {
+        return usize::MAX;
+    }
+    state
+        .provider
+        .len()
+        .saturating_add(state.model.as_deref().map_or(0, str::len))
+        .saturating_add(counter.bytes)
+}
+
+#[derive(Default)]
+struct JsonByteCounter {
+    bytes: usize,
+}
+
+impl std::io::Write for JsonByteCounter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.bytes = self.bytes.saturating_add(bytes.len());
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }
 
@@ -993,6 +1541,33 @@ mod tests {
     }
 
     #[test]
+    fn replay_compatibility_is_exact_and_legacy_payloads_remain_readable() {
+        let legacy: ProviderReplayState = serde_json::from_value(serde_json::json!({
+            "provider":"openrouter",
+            "payload":{"opaque":"unchanged"}
+        }))
+        .unwrap();
+        assert!(legacy.model.is_none());
+        assert!(!legacy.is_compatible_with("openrouter", "any-model"));
+        assert_eq!(
+            serde_json::to_value(&legacy).unwrap(),
+            serde_json::json!({
+                "provider":"openrouter",
+                "payload":{"opaque":"unchanged"}
+            })
+        );
+
+        let scoped = ProviderReplayState::for_model(
+            "openrouter",
+            "exact-model",
+            serde_json::json!({"opaque":"unchanged"}),
+        );
+        assert!(scoped.is_compatible_with("openrouter", "exact-model"));
+        assert!(!scoped.is_compatible_with("openrouter", "other-model"));
+        assert!(!scoped.is_compatible_with("other-provider", "exact-model"));
+    }
+
+    #[test]
     fn stream_chunk_constructors() {
         let chunk = StreamChunk::delta("hello");
         assert_eq!(chunk.delta, "hello");
@@ -1074,6 +1649,54 @@ mod tests {
     }
 
     #[test]
+    fn provider_response_limits_reject_oversized_logical_fields() {
+        let mut limits = ProviderResponseLimits::default();
+        limits.max_text_bytes = 3;
+        let error = limits
+            .validate_stream_chunk(&StreamChunk::delta("abcd"))
+            .expect_err("stream text must be bounded before retention");
+        assert_eq!(error.component, "stream_text_delta");
+        assert_eq!(error.limit, 3);
+
+        limits.max_text_bytes = usize::MAX;
+        limits.max_tool_calls = 1;
+        let calls = vec![
+            ProviderToolCall {
+                id: "one".to_owned(),
+                name: "read_file".to_owned(),
+                arguments: "{}".to_owned(),
+            },
+            ProviderToolCall {
+                id: "two".to_owned(),
+                name: "read_file".to_owned(),
+                arguments: "{}".to_owned(),
+            },
+        ];
+        let error = limits
+            .validate_accumulated("", "", calls.as_slice(), None)
+            .expect_err("tool-call count must be bounded");
+        assert_eq!(error.component, "tool_calls");
+    }
+
+    #[test]
+    fn provider_response_limits_bound_replay_and_retained_bytes() {
+        let mut limits = ProviderResponseLimits::default();
+        limits.max_replay_bytes = 4;
+        let replay = ProviderReplayState::new("provider", serde_json::json!({"value": "large"}));
+        let error = limits
+            .validate_accumulated("", "", &[], Some(&replay))
+            .expect_err("replay state must be bounded");
+        assert_eq!(error.component, "provider_replay_state");
+
+        limits.max_replay_bytes = usize::MAX;
+        limits.max_retained_bytes = 2;
+        let error = limits
+            .validate_accumulated("abc", "", &[], None)
+            .expect_err("retained response envelope must be bounded");
+        assert_eq!(error.component, "retained_response_envelope");
+    }
+
+    #[test]
     fn provider_termination_preserves_common_cross_provider_reasons() {
         assert_eq!(
             ProviderTermination::from_openai_reason("stop_sequence"),
@@ -1094,6 +1717,7 @@ mod tests {
         let usage = TokenUsage {
             input_tokens: Some(100),
             output_tokens: Some(50),
+            ..Default::default()
         };
         assert_eq!(usage.input_tokens, Some(100));
         assert_eq!(usage.output_tokens, Some(50));
@@ -1159,5 +1783,38 @@ mod tests {
             "Stable\n<!-- PIONEER_PROMPT_CACHE_BOUNDARY -->\nDynamic"
         );
         assert_eq!(rendered[1].role, Role::User);
+    }
+}
+
+#[cfg(test)]
+mod provenance_tests {
+    use super::*;
+    #[test]
+    fn runtime_provenance_survives_cloning_but_never_provider_serialization() {
+        let provenance = MessageProvenance {
+            logical_turn_id: Some("command-turn".into()),
+            workspace_id: "workspace".into(),
+            thread_id: "thread".into(),
+            context_thread: None,
+            unit_id: "round".into(),
+            sources: vec![MessageSourceRef {
+                scope: "input:turn".into(),
+                id: "source".into(),
+                version: "input-revision:1".into(),
+            }],
+            source_aliases: vec![],
+            ambiguous_input_aliases: vec![],
+            complete: true,
+            protected_input: true,
+            inherited: false,
+        };
+        let mut message = ChatMessage::user("text");
+        message.provenance = Some(provenance.clone());
+        assert_eq!(message.clone().provenance, Some(provenance.clone()));
+        let mut wire = serde_json::to_value(message).unwrap();
+        assert!(wire.get("provenance").is_none());
+        wire["provenance"] = serde_json::to_value(provenance).unwrap();
+        let received: ChatMessage = serde_json::from_value(wire).unwrap();
+        assert_eq!(received.provenance, None);
     }
 }

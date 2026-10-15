@@ -17,8 +17,9 @@ use pioneer_protocol::{
     PioneerAppUrlScheme, PrincipalId, PrincipalKind, PrincipalStatus, RoleKey, WorkspaceId,
     generate_id,
 };
+use pioneer_sqlite::SqliteDatabase;
 use sea_orm::{
-    DatabaseConnection, SqliteTransactionMode, TransactionOptions, TransactionTrait,
+    SqliteTransactionMode, TransactionOptions, TransactionTrait,
     entity::prelude::DateTimeWithTimeZone,
 };
 
@@ -103,7 +104,7 @@ impl Deref for InvitationRevokeCommitted {
 impl InvitationService {
     #[cfg(test)]
     pub(crate) async fn preview_restricted(
-        database: &DatabaseConnection,
+        database: &SqliteDatabase,
         credentials: &OpaqueCredentialFactory,
         gateway_id: &pioneer_protocol::GatewayId,
         raw_credential: &str,
@@ -121,7 +122,7 @@ impl InvitationService {
     }
 
     pub(crate) async fn preview_restricted_with_lifecycle(
-        database: &DatabaseConnection,
+        database: &SqliteDatabase,
         credentials: &OpaqueCredentialFactory,
         auth_service: Option<&GatewayAuthService>,
         gateway_id: &pioneer_protocol::GatewayId,
@@ -180,7 +181,7 @@ impl InvitationService {
     }
 
     pub(crate) async fn accept_restricted(
-        database: &DatabaseConnection,
+        database: &SqliteDatabase,
         credentials: &OpaqueCredentialFactory,
         auth_service: &GatewayAuthService,
         gateway_id: &pioneer_protocol::GatewayId,
@@ -842,7 +843,7 @@ enum InvitationAdmission {
 }
 
 async fn preflight_accept_admission(
-    database: &DatabaseConnection,
+    database: &SqliteDatabase,
     credentials: &OpaqueCredentialFactory,
     auth_service: &GatewayAuthService,
     gateway_id: &pioneer_protocol::GatewayId,
@@ -2420,6 +2421,7 @@ mod tests {
     async fn restricted_preview_is_pinned_safe_and_non_consuming_over_remote_ws() {
         let harness = IsolatedEpic4Harness::populated().await.unwrap();
         let store = CrudStore::new(harness.database.clone());
+        let database = store.database_connection();
         let secrets = Arc::new(GatewaySecrets::new(Arc::new(MemorySecretStore::new())));
         let service =
             InvitationService::new(store.clone(), secrets.clone(), "198.51.100.8:17878").unwrap();
@@ -2441,7 +2443,7 @@ mod tests {
 
         assert!(
             InvitationService::preview_restricted(
-                &harness.database,
+                &database,
                 &credentials,
                 &GatewayId::new("G00000000000000000099").unwrap(),
                 raw_credential.as_str(),
@@ -2452,7 +2454,7 @@ mod tests {
         );
 
         let preview = InvitationService::preview_restricted(
-            &harness.database,
+            &database,
             &credentials,
             &principal.gateway_id,
             raw_credential.as_str(),
@@ -2482,6 +2484,7 @@ mod tests {
     async fn preview_materializes_lost_member_authority_only_once() {
         let harness = IsolatedEpic4Harness::populated().await.unwrap();
         let store = CrudStore::new(harness.database.clone());
+        let database = store.database_connection();
         let secrets = Arc::new(GatewaySecrets::new(Arc::new(MemorySecretStore::new())));
         let service =
             InvitationService::new(store.clone(), secrets.clone(), "http://127.0.0.1:17878")
@@ -2511,7 +2514,7 @@ mod tests {
         for _ in 0..2 {
             assert!(
                 InvitationService::preview_restricted(
-                    &harness.database,
+                    &database,
                     &credentials,
                     &principal.gateway_id,
                     raw_credential.as_str(),
@@ -2551,6 +2554,7 @@ mod tests {
     async fn preview_materializes_expiration_without_exposing_the_invitation() {
         let harness = IsolatedEpic4Harness::populated().await.unwrap();
         let store = CrudStore::new(harness.database.clone());
+        let database = store.database_connection();
         let secrets = Arc::new(GatewaySecrets::new(Arc::new(MemorySecretStore::new())));
         let service =
             InvitationService::new(store.clone(), secrets.clone(), "http://127.0.0.1:17878")
@@ -2587,7 +2591,7 @@ mod tests {
         for _ in 0..2 {
             assert!(
                 InvitationService::preview_restricted(
-                    &harness.database,
+                    &database,
                     &credentials,
                     &principal.gateway_id,
                     raw_credential.as_str(),
@@ -2622,6 +2626,7 @@ mod tests {
     async fn accept_atomically_creates_exact_registered_role_grants_session_and_audit() {
         let harness = IsolatedEpic4Harness::populated().await.unwrap();
         let store = CrudStore::new(harness.database.clone());
+        let database = store.database_connection();
         let secrets = Arc::new(GatewaySecrets::new(Arc::new(MemorySecretStore::new())));
         let service =
             InvitationService::new(store.clone(), secrets.clone(), "http://127.0.0.1:17878")
@@ -2657,7 +2662,7 @@ mod tests {
         let response = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             InvitationService::accept_restricted(
-                &harness.database,
+                &database,
                 &credentials,
                 &auth_service,
                 &inviter.gateway_id,
@@ -2772,6 +2777,7 @@ mod tests {
     async fn nickname_collision_is_corrective_and_leaves_invitation_pending() {
         let harness = IsolatedEpic4Harness::populated().await.unwrap();
         let store = CrudStore::new(harness.database.clone());
+        let database = store.database_connection();
         let secrets = Arc::new(GatewaySecrets::new(Arc::new(MemorySecretStore::new())));
         let service =
             InvitationService::new(store.clone(), secrets.clone(), "127.0.0.1:17878").unwrap();
@@ -2792,7 +2798,7 @@ mod tests {
         let auth_service = invitation_auth_service(&harness, secrets.as_ref());
 
         let error = InvitationService::accept_restricted(
-            &harness.database,
+            &database,
             &credentials,
             &auth_service,
             &inviter.gateway_id,
@@ -2827,6 +2833,7 @@ mod tests {
     async fn corrective_profile_avatar_and_installation_errors_do_not_consume_invitation() {
         let harness = IsolatedEpic4Harness::populated().await.unwrap();
         let store = CrudStore::new(harness.database.clone());
+        let database = store.database_connection();
         let secrets = Arc::new(GatewaySecrets::new(Arc::new(MemorySecretStore::new())));
         let service =
             InvitationService::new(store.clone(), secrets.clone(), "127.0.0.1:17878").unwrap();
@@ -2863,7 +2870,7 @@ mod tests {
             ),
         ] {
             let error = InvitationService::accept_restricted(
-                &harness.database,
+                &database,
                 &credentials,
                 &auth_service,
                 &inviter.gateway_id,
@@ -2903,6 +2910,7 @@ mod tests {
     async fn first_session_failure_rolls_back_every_accept_row() {
         let harness = IsolatedEpic4Harness::populated().await.unwrap();
         let store = CrudStore::new(harness.database.clone());
+        let database = store.database_connection();
         let secrets = Arc::new(GatewaySecrets::new(Arc::new(MemorySecretStore::new())));
         let service =
             InvitationService::new(store.clone(), secrets.clone(), "127.0.0.1:17878").unwrap();
@@ -2925,7 +2933,7 @@ mod tests {
 
         assert!(
             InvitationService::accept_restricted(
-                &harness.database,
+                &database,
                 &credentials,
                 &auth_service,
                 &inviter.gateway_id,
@@ -2964,6 +2972,7 @@ mod tests {
     async fn accept_reauthorizes_all_grants_and_terminally_revokes_lost_authority() {
         let harness = IsolatedEpic4Harness::populated().await.unwrap();
         let store = CrudStore::new(harness.database.clone());
+        let database = store.database_connection();
         let secrets = Arc::new(GatewaySecrets::new(Arc::new(MemorySecretStore::new())));
         let service =
             InvitationService::new(store.clone(), secrets.clone(), "127.0.0.1:17878").unwrap();
@@ -2991,7 +3000,7 @@ mod tests {
 
         assert!(matches!(
             InvitationService::accept_restricted(
-                &harness.database,
+                &database,
                 &credentials,
                 &auth_service,
                 &inviter.gateway_id,
@@ -3035,6 +3044,7 @@ mod tests {
     async fn accept_reloads_inviter_status_and_cannot_commit_after_suspension() {
         let harness = IsolatedEpic4Harness::populated().await.unwrap();
         let store = CrudStore::new(harness.database.clone());
+        let database = store.database_connection();
         let secrets = Arc::new(GatewaySecrets::new(Arc::new(MemorySecretStore::new())));
         let service =
             InvitationService::new(store.clone(), secrets.clone(), "127.0.0.1:17878").unwrap();
@@ -3062,7 +3072,7 @@ mod tests {
 
         assert!(matches!(
             InvitationService::accept_restricted(
-                &harness.database,
+                &database,
                 &credentials,
                 &auth_service,
                 &inviter.gateway_id,
@@ -3096,6 +3106,7 @@ mod tests {
     async fn assert_one_concurrent_accept_winner(contenders: usize) {
         let harness = IsolatedEpic4Harness::populated().await.unwrap();
         let store = CrudStore::new(harness.database.clone());
+        let database = store.database_connection();
         let secrets = Arc::new(GatewaySecrets::new(Arc::new(MemorySecretStore::new())));
         let service =
             InvitationService::new(store.clone(), secrets.clone(), "127.0.0.1:17878").unwrap();
@@ -3119,7 +3130,7 @@ mod tests {
         let gateway_id = inviter.gateway_id.clone();
         let mut tasks = tokio::task::JoinSet::new();
         for _ in 0..contenders {
-            let database = harness.database.clone();
+            let database = database.clone();
             let credentials = credentials.clone();
             let auth_service = auth_service.clone();
             let raw_credential = raw_credential.clone();
@@ -3204,6 +3215,7 @@ mod tests {
         let harness = IsolatedEpic4Harness::populated().await.unwrap();
         seed_superuser_session(&harness.database).await;
         let store = CrudStore::new(harness.database.clone());
+        let database = store.database_connection();
         let secrets = Arc::new(GatewaySecrets::new(Arc::new(MemorySecretStore::new())));
         let service =
             InvitationService::new(store.clone(), secrets.clone(), "127.0.0.1:17878").unwrap();
@@ -3228,7 +3240,7 @@ mod tests {
         let revoke_proof = authorized_invitation(&store, &actor, &invitation_id).await;
 
         let accept = InvitationService::accept_restricted(
-            &harness.database,
+            &database,
             &credentials,
             &auth_service,
             &inviter.gateway_id,
@@ -3296,6 +3308,7 @@ mod tests {
         let harness = IsolatedEpic4Harness::populated().await.unwrap();
         seed_superuser_session(&harness.database).await;
         let store = CrudStore::new(harness.database.clone());
+        let database = store.database_connection();
         let secrets = Arc::new(GatewaySecrets::new(Arc::new(MemorySecretStore::new())));
         let invitation_service =
             InvitationService::new(store.clone(), secrets.clone(), "127.0.0.1:17878").unwrap();
@@ -3328,7 +3341,7 @@ mod tests {
         .await;
 
         let accept = InvitationService::accept_restricted(
-            &harness.database,
+            &database,
             &credentials,
             &auth_service,
             &inviter.gateway_id,
@@ -3430,6 +3443,7 @@ mod tests {
         let harness = IsolatedEpic4Harness::populated().await.unwrap();
         seed_superuser_session(&harness.database).await;
         let store = CrudStore::new(harness.database.clone());
+        let database = store.database_connection();
         let secrets = Arc::new(GatewaySecrets::new(Arc::new(MemorySecretStore::new())));
         let invitation_service =
             InvitationService::new(store.clone(), secrets.clone(), "127.0.0.1:17878").unwrap();
@@ -3462,7 +3476,7 @@ mod tests {
         .await;
 
         let accept = InvitationService::accept_restricted(
-            &harness.database,
+            &database,
             &credentials,
             &auth_service,
             &inviter.gateway_id,
@@ -3544,6 +3558,7 @@ mod tests {
     async fn accept_loses_to_committed_expiry_without_partial_identity() {
         let harness = IsolatedEpic4Harness::populated().await.unwrap();
         let store = CrudStore::new(harness.database.clone());
+        let database = store.database_connection();
         let secrets = Arc::new(GatewaySecrets::new(Arc::new(MemorySecretStore::new())));
         let service =
             InvitationService::new(store.clone(), secrets.clone(), "127.0.0.1:17878").unwrap();
@@ -3581,7 +3596,7 @@ mod tests {
 
         assert!(matches!(
             InvitationService::accept_restricted(
-                &harness.database,
+                &database,
                 &credentials,
                 &auth_service,
                 &inviter.gateway_id,
@@ -3620,6 +3635,7 @@ mod tests {
     #[tokio::test]
     async fn malformed_unknown_and_terminal_credentials_share_unavailable_preview() {
         let harness = IsolatedEpic4Harness::populated().await.unwrap();
+        let database = SqliteDatabase::from_single_connection(harness.database.clone());
         let key = AuthKeyMaterial::from_test_bytes(vec![9; 64]);
         let credentials = OpaqueCredentialFactory::new(key.as_bytes()).unwrap();
         let gateway_id = GatewayId::new("G00000000000000000001").unwrap();
@@ -3629,7 +3645,7 @@ mod tests {
         ] {
             assert!(
                 InvitationService::preview_restricted(
-                    &harness.database,
+                    &database,
                     &credentials,
                     &gateway_id,
                     credential.as_str(),

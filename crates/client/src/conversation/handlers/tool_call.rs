@@ -172,7 +172,7 @@ impl TurnItemHandler for ToolCallHandler {
 
 impl ToolCallHandler {
     fn is_supported_markdown_version(version: Option<u16>) -> bool {
-        version.is_none_or(|version| version == MARKDOWN_AST_VERSION)
+        version.is_none_or(|version| version == 1 || version == MARKDOWN_AST_VERSION)
     }
 }
 

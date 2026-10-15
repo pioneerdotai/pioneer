@@ -114,6 +114,28 @@ pub struct TurnExecutionRecord {
     pub updated_at: DateTimeWithTimeZone,
 }
 
+const TURN_EXECUTION_BATCH_LIMIT: usize = 200;
+
+pub async fn load_for_turns<C: ConnectionTrait>(
+    db: &C,
+    turn_ids: &[String],
+) -> Result<Vec<TurnExecutionRecord>> {
+    if turn_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    if turn_ids.len() > TURN_EXECUTION_BATCH_LIMIT {
+        bail!("Turn execution batch exceeds its bounded limit");
+    }
+    turn_execution::Entity::find()
+        .filter(turn_execution::Column::TurnId.is_in(turn_ids.iter().cloned()))
+        .all(db)
+        .await
+        .context("failed to batch-load Turn executions")?
+        .into_iter()
+        .map(record_from_model)
+        .collect()
+}
+
 pub async fn insert_immutable<C: ConnectionTrait>(
     db: &C,
     execution: NewTurnExecution,
@@ -169,9 +191,16 @@ pub async fn find<C: ConnectionTrait>(
 pub async fn heartbeat_owner<C: ConnectionTrait>(
     db: &C,
     owner_id: &str,
-    heartbeat_at: DateTimeWithTimeZone,
-    lease_until: DateTimeWithTimeZone,
+    lease_seconds: i64,
 ) -> Result<u64> {
+    // SQLite evaluates 'now' when it steps the UPDATE, after writer admission
+    // and on every retry. Match SQLx's UTC RFC3339 encoding at second precision
+    // so existing textual lease comparisons keep the same ordering.
+    let written_at = Expr::cust("strftime('%Y-%m-%dT%H:%M:%S+00:00', 'now')");
+    let lease_until = Expr::cust_with_values(
+        "strftime('%Y-%m-%dT%H:%M:%S+00:00', 'now', ? || ' seconds')",
+        [lease_seconds],
+    );
     let result = turn_execution::Entity::update_many()
         .filter(turn_execution::Column::OwnerId.eq(owner_id.to_owned()))
         .filter(turn_execution::Column::Status.is_in([
@@ -180,12 +209,9 @@ pub async fn heartbeat_owner<C: ConnectionTrait>(
             TurnExecutionStatus::Running.as_str(),
             TurnExecutionStatus::Recovering.as_str(),
         ]))
-        .col_expr(
-            turn_execution::Column::HeartbeatAt,
-            Expr::value(heartbeat_at),
-        )
-        .col_expr(turn_execution::Column::LeaseUntil, Expr::value(lease_until))
-        .col_expr(turn_execution::Column::UpdatedAt, Expr::value(heartbeat_at))
+        .col_expr(turn_execution::Column::HeartbeatAt, written_at.clone())
+        .col_expr(turn_execution::Column::LeaseUntil, lease_until)
+        .col_expr(turn_execution::Column::UpdatedAt, written_at)
         .exec(db)
         .await
         .context("failed to heartbeat owned Turn executions")?;
@@ -292,6 +318,33 @@ pub async fn list_expired_foreign_active<C: ConnectionTrait>(
         .into_iter()
         .map(record_from_model)
         .collect()
+}
+
+/// A rejected native pre-start admission remains owned, resumable recovery work.
+pub async fn mark_recovering_owned<C: ConnectionTrait>(
+    db: &C,
+    turn_id: &str,
+    owner_id: &str,
+    now: DateTimeWithTimeZone,
+) -> Result<bool> {
+    Ok(turn_execution::Entity::update_many()
+        .filter(turn_execution::Column::TurnId.eq(turn_id.to_owned()))
+        .filter(turn_execution::Column::OwnerId.eq(owner_id.to_owned()))
+        .filter(turn_execution::Column::Status.is_in([
+            TurnExecutionStatus::Queued.as_str(),
+            TurnExecutionStatus::Starting.as_str(),
+            TurnExecutionStatus::Running.as_str(),
+            TurnExecutionStatus::Recovering.as_str(),
+        ]))
+        .col_expr(
+            turn_execution::Column::Status,
+            Expr::value(TurnExecutionStatus::Recovering.as_str()),
+        )
+        .col_expr(turn_execution::Column::UpdatedAt, Expr::value(now))
+        .exec(db)
+        .await?
+        .rows_affected
+        == 1)
 }
 
 pub async fn list_owned_recovering<C: ConnectionTrait>(

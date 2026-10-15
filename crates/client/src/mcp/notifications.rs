@@ -56,6 +56,14 @@ pub fn reduce_mcp_server_status_changed_notification(
     let workspace_matches =
         should_refresh_workspace_bound_data(current_workspace, notification.workspace_id.as_str());
     let selected_server_matches = selected_server_id == Some(notification.server.id.as_str());
+    // OAuth URLs stay private to the initiating connection. Other authorized
+    // management views recover their current account state through scoped details.
+    let authorization_transition = matches!(
+        notification.server.status,
+        pioneer_protocol::McpServerStatus::AuthRequired
+            | pioneer_protocol::McpServerStatus::Ready
+            | pioneer_protocol::McpServerStatus::Degraded
+    );
 
     McpServerStatusChangedReduction {
         notification,
@@ -66,7 +74,7 @@ pub fn reduce_mcp_server_status_changed_notification(
             && has_selected_details,
         queue_mcp_details_refresh: workspace_matches
             && selected_server_matches
-            && !has_selected_details,
+            && (!has_selected_details || authorization_transition),
     }
 }
 
@@ -178,6 +186,8 @@ mod tests {
                 prompts: Vec::new(),
             },
             management: Some(McpManagementDetails {
+                oauth_cleanup_available: None,
+                oauth_state: None,
                 scope: McpScopeKind::Workspace,
                 source_kind: McpSourceKind::Config,
                 transport: McpTransportSummary::Stdio {
@@ -287,6 +297,39 @@ mod tests {
             details.management.expect("management").health.runtime.state,
             McpRuntimeState::Failed
         );
+    }
+
+    #[test]
+    fn authorization_transitions_refresh_account_state_only_for_selected_workspace() {
+        for status in [McpServerStatus::Ready, McpServerStatus::AuthRequired] {
+            let notification = McpServerStatusChangedNotification {
+                workspace_id: "ws_a".into(),
+                snapshot_version: 2,
+                server: McpServerStatusItem {
+                    id: "server_a".into(),
+                    name: "server_a".into(),
+                    scope_kind: McpScopeKind::Workspace,
+                    runtime: mcp_runtime(McpRuntimeState::AuthRequired, false),
+                    status,
+                },
+            };
+            let matching = reduce_mcp_server_status_changed_notification(
+                notification.clone(),
+                Some("ws_a"),
+                Some("server_a"),
+                true,
+            );
+            assert!(matching.queue_mcp_details_refresh);
+            for (workspace, selected) in [("ws_b", "server_a"), ("ws_a", "server_b")] {
+                let unrelated = reduce_mcp_server_status_changed_notification(
+                    notification.clone(),
+                    Some(workspace),
+                    Some(selected),
+                    true,
+                );
+                assert!(!unrelated.queue_mcp_details_refresh);
+            }
+        }
     }
 
     #[test]

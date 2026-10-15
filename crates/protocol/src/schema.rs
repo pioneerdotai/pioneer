@@ -1,3 +1,4 @@
+use crate::{ThreadToolResultCursor, ThreadToolResultReadParams, ThreadToolResultReadResponse};
 use schemars::{Schema, schema_for};
 use std::fs;
 use std::path::Path;
@@ -9,6 +10,13 @@ use crate::timeline::{
     TurnWorkItemsChangedNotification, TurnWorkItemsGetParams, TurnWorkItemsGetResponse,
     TurnWorkPageParams, TurnWorkPageResponse, TurnWorkPresentation, TurnWorkState,
     TurnWorkStateChangedNotification,
+};
+
+use crate::patch_history::{
+    ThreadFilePatchHistoryPageParams, ThreadFilePatchHistoryPageResponse,
+    ThreadPatchStepsPageParams, ThreadPatchStepsPageResponse, TurnPatchDiffGetParams,
+    TurnPatchDiffGetResponse, TurnPatchRecordGetParams, TurnPatchRecordGetResponse,
+    TurnPatchStepsPageParams, TurnPatchStepsPageResponse,
 };
 
 use crate::artifact::{
@@ -29,6 +37,7 @@ use crate::artifact::{
     ArtifactViewGrantCreateParams, ArtifactViewGrantCreateResponse, ArtifactViewGrantDisposition,
     ThreadArtifactsChangedNotification,
 };
+use crate::thread_file::{ThreadFileViewGrantCreateParams, ThreadFileViewGrantCreateResponse};
 
 use crate::{
     AccessChangeKind, AccessChangedNotification, AdministrativeActorRef, AgentActionId,
@@ -89,7 +98,7 @@ use crate::{
     ExecutionCheckpointWindowSummary, ExecutionWindowExhaustionReason, ExecutionWindowStatus,
     GatewayCliRuntimeInstanceSettings, GatewayCliRuntimeSettings, GatewayGeneralSettings,
     GatewayGeneralSettingsUpdate, GatewayMemoryModelSelection, GatewayMemoryModelSelectionSource,
-    GatewayMemorySettings, GatewayNativeAgentConfig, GatewayNotification,
+    GatewayMemorySettings, GatewayModelSelection, GatewayNativeAgentConfig, GatewayNotification,
     GatewayRemoteAccessErrorKind, GatewayRemoteAccessSettings, GatewayRemoteAccessSettingsUpdate,
     GatewayRemoteAccessState, GatewayRemoteAccessStatusChangedNotification,
     GatewayRemoteAccessStatusSnapshot, GatewayRemoteAccessTransport,
@@ -113,7 +122,8 @@ use crate::{
     MarkdownMarkKind, McpAuditEventSummary, McpChangedAction, McpChangedItem,
     McpChangedNotification, McpDiagnosticLevel, McpInstallParams, McpInstallResponse,
     McpInstallResult, McpInstallResultStatus, McpInstallStatus, McpLifecycleAuditSummary,
-    McpListItem, McpListParams, McpListResponse, McpManagementDetails, McpPolicySetParams,
+    McpListItem, McpListParams, McpListResponse, McpManagementDetails, McpOAuthAction,
+    McpOAuthNotification, McpOAuthParams, McpOAuthResponse, McpOAuthState, McpPolicySetParams,
     McpPolicySetResponse, McpPolicyState, McpPromptCatalogItem, McpResourceCatalogItem,
     McpResourceTemplateCatalogItem, McpRuntimeState, McpRuntimeStatus, McpScopeKind,
     McpServerCatalogChangedNotification, McpServerCatalogDetails, McpServerDetailsParams,
@@ -142,27 +152,28 @@ use crate::{
     MemoryScopeHint, MemoryScopeKind, MemorySearchHit, MemorySearchParams, MemorySearchResponse,
     MemorySemanticFields, MemorySemanticWriteDisposition, MemorySemanticWriteParams,
     MemorySemanticWriteResponse, MemorySensitivity, MemorySensitivityHint, MemorySourceContextKind,
-    MemoryStatus, MemorySubject, MemoryWriteEvidence, MemoryWriteRelation, NormalizedAgentAction,
-    PermissionBehavior, ProgressCoalescingKey, PromptManifest, PromptManifestDiagnostic,
-    PromptManifestDiagnosticCode, PromptManifestHookContributionKind, PromptManifestHookPhase,
-    PromptManifestHookSource, PromptManifestHookSourceEntry, PromptManifestHookTruncation,
-    PromptManifestProfile, ProviderConfigureParams, ProviderConfigureResponse,
-    ProviderDeleteApiKeyParams, ProviderDeleteApiKeyResponse, ProviderFailureClass,
-    ProviderFailureDetails, ProviderFailureStage, ProviderListModelsParams,
-    ProviderListModelsResponse, ProviderListParams, ProviderListResponse, ProviderSetApiKeyParams,
-    ProviderSetApiKeyResponse, ProviderTranscriptionModelMetadata, ProviderTransportKind,
-    PublicError, PublicErrorCode, PublicErrorStage, PublicTask, PublicTaskAgendaItem,
-    PublicTaskAgendaResponse, PublicTaskAgentConfiguration, PublicTaskArtifact,
-    PublicTaskConfiguration, PublicTaskDeliveriesResponse, PublicTaskDelivery,
-    PublicTaskDeliveryAttempt, PublicTaskDeliveryPolicy, PublicTaskDependency, PublicTaskEvent,
-    PublicTaskEventsResponse, PublicTaskFailure, PublicTaskGetResponse, PublicTaskListResponse,
-    PublicTaskResult, PublicTaskResultCandidate, PublicTaskResultContractConfiguration,
-    PublicTaskResultReadResponse, PublicTaskReviewContent, PublicTaskReviewContentFormat,
-    PublicTaskRun, PublicTaskTree, PublicTaskTreeResponse, PublicTaskTrigger,
-    PublicTaskTriggerConfiguration, PublicTaskTriggerSpec, PublicTaskWaitItem,
-    PublicTaskWaitNonWaitableItem, PublicTaskWaitResponse, PublicTaskWaitReviewItem,
-    ReasoningCeiling, RoleKey, RuntimeAccountSnapshot, RuntimeAppInfo, RuntimeCapabilities,
-    RuntimeDiagnostic, RuntimeDiagnosticLevel, RuntimeModelInfo, RuntimeStatus, RuntimeSummary,
+    MemoryStatus, MemorySubject, MemoryWriteEvidence, MemoryWriteRelation, ModelSelectionTransport,
+    NormalizedAgentAction, PermissionBehavior, ProgressCoalescingKey, PromptManifest,
+    PromptManifestDiagnostic, PromptManifestDiagnosticCode, PromptManifestHookContributionKind,
+    PromptManifestHookPhase, PromptManifestHookSource, PromptManifestHookSourceEntry,
+    PromptManifestHookTruncation, PromptManifestProfile, ProviderConfigureParams,
+    ProviderConfigureResponse, ProviderDefinition, ProviderDeleteApiKeyParams,
+    ProviderDeleteApiKeyResponse, ProviderFailureClass, ProviderFailureDetails,
+    ProviderFailureStage, ProviderListModelsParams, ProviderListModelsResponse, ProviderListParams,
+    ProviderListResponse, ProviderSetApiKeyParams, ProviderSetApiKeyResponse,
+    ProviderTranscriptionModelMetadata, ProviderTransportKind, PublicError, PublicErrorCode,
+    PublicErrorStage, PublicTask, PublicTaskAgendaItem, PublicTaskAgendaResponse,
+    PublicTaskAgentConfiguration, PublicTaskArtifact, PublicTaskConfiguration,
+    PublicTaskDeliveriesResponse, PublicTaskDelivery, PublicTaskDeliveryAttempt,
+    PublicTaskDeliveryPolicy, PublicTaskDependency, PublicTaskEvent, PublicTaskEventsResponse,
+    PublicTaskFailure, PublicTaskGetResponse, PublicTaskListResponse, PublicTaskResult,
+    PublicTaskResultCandidate, PublicTaskResultContractConfiguration, PublicTaskResultReadResponse,
+    PublicTaskReviewContent, PublicTaskReviewContentFormat, PublicTaskRun, PublicTaskTree,
+    PublicTaskTreeResponse, PublicTaskTrigger, PublicTaskTriggerConfiguration,
+    PublicTaskTriggerSpec, PublicTaskWaitItem, PublicTaskWaitNonWaitableItem,
+    PublicTaskWaitResponse, PublicTaskWaitReviewItem, ReasoningCeiling, RoleKey,
+    RuntimeAccountSnapshot, RuntimeAppInfo, RuntimeCapabilities, RuntimeDiagnostic,
+    RuntimeDiagnosticLevel, RuntimeModelInfo, RuntimeStatus, RuntimeSummary,
     SafeExecutionProfileMetadata, SafeRouteProvenance, SandboxBackendKind,
     SandboxBackendRequirement, SandboxMode, SandboxPolicy, ServiceId, SkillArchiveFormat,
     SkillAuditTimelineItem, SkillChangedItem, SkillDependencyDiagnostic, SkillHealthItem,
@@ -199,22 +210,22 @@ use crate::{
     TaskEventsParams, TaskEventsResponse, TaskExecutorKind, TaskExternalTriggerFilter,
     TaskFailedNotification, TaskGetParams, TaskGetResponse, TaskLifecyclePolicy, TaskListParams,
     TaskListResponse, TaskManualActor, TaskMetadata, TaskNotificationContext,
-    TaskOccurrenceContract, TaskOccurrenceStatus, TaskOperatorDeliveries, TaskOperatorDetails,
-    TaskOwnerKind, TaskParentTerminalAction, TaskPauseParams, TaskPauseResponse,
-    TaskPausedNotification, TaskProgressDetails, TaskProgressNotification, TaskQueuedNotification,
-    TaskRecoveredNotification, TaskRescheduleParams, TaskRescheduleResponse,
-    TaskRescheduledNotification, TaskResult, TaskResultCandidate, TaskResultReviewEvent,
-    TaskResultReviewResolutionStrategy, TaskResultReviewerRef, TaskResultReviewerSpec,
-    TaskResumeParams, TaskResumeResponse, TaskResumedNotification, TaskRetryBackoffKind,
-    TaskRetryPolicy, TaskReviewerIntent, TaskReviseParams, TaskReviseResponse, TaskRun,
-    TaskRunCompletedNotification, TaskRunCreatedNotification, TaskRunExecution,
-    TaskRunExecutionStatus, TaskRunFailedNotification, TaskRunStartedNotification, TaskRunStatus,
-    TaskRunThreadBinding, TaskRunTurn, TaskScheduledNotification, TaskSchema, TaskStatus,
-    TaskThreadLineage, TaskTimeoutPolicy, TaskTree,
-    TaskTreeChangedNotification as TaskTreeChangedTaskNotification, TaskTreeParams,
-    TaskTreeResponse, TaskTrigger, TaskTriggerInput, TaskTriggerKind, TaskTriggerSpec,
-    TaskTriggerStatus, TaskTurnItem, TaskUpdateParams, TaskUpdateResponse, TaskUpdatedNotification,
-    TaskUserNotification, TaskUserNotificationAcknowledgeParams,
+    TaskOccurrenceContract, TaskOccurrenceDeliveryPlan, TaskOccurrenceStatus,
+    TaskOperatorDeliveries, TaskOperatorDetails, TaskOwnerKind, TaskParentTerminalAction,
+    TaskPauseParams, TaskPauseResponse, TaskPausedNotification, TaskProgressDetails,
+    TaskProgressNotification, TaskQueuedNotification, TaskRecoveredNotification,
+    TaskRescheduleParams, TaskRescheduleResponse, TaskRescheduledNotification, TaskResult,
+    TaskResultCandidate, TaskResultReviewEvent, TaskResultReviewResolutionStrategy,
+    TaskResultReviewerRef, TaskResultReviewerSpec, TaskResumeParams, TaskResumeResponse,
+    TaskResumedNotification, TaskRetryBackoffKind, TaskRetryPolicy, TaskReviewerIntent,
+    TaskReviseParams, TaskReviseResponse, TaskRun, TaskRunCompletedNotification,
+    TaskRunCreatedNotification, TaskRunExecution, TaskRunExecutionStatus,
+    TaskRunFailedNotification, TaskRunStartedNotification, TaskRunStatus, TaskRunThreadBinding,
+    TaskRunTurn, TaskScheduledNotification, TaskSchema, TaskStatus, TaskThreadLineage,
+    TaskTimeoutPolicy, TaskTree, TaskTreeChangedNotification as TaskTreeChangedTaskNotification,
+    TaskTreeParams, TaskTreeResponse, TaskTrigger, TaskTriggerInput, TaskTriggerKind,
+    TaskTriggerSpec, TaskTriggerStatus, TaskTurnItem, TaskUpdateParams, TaskUpdateResponse,
+    TaskUpdatedNotification, TaskUserNotification, TaskUserNotificationAcknowledgeParams,
     TaskUserNotificationAcknowledgeResponse, TaskUserNotificationListParams,
     TaskUserNotificationListResponse, TaskValue, TaskWaitItem, TaskWaitParams, TaskWaitResponse,
     TaskWaitReviewAction, TaskWaitReviewItem, TaskWaitRevisionBlockedReason, TaskWriteLock,
@@ -667,6 +678,14 @@ pub fn protocol_schema_documents() -> Vec<SchemaDocument> {
         schema_doc!("artifact_get_params.json", ArtifactGetParams),
         schema_doc!("artifact_get_response.json", ArtifactGetResponse),
         schema_doc!(
+            "thread_file_view_grant_create_params.json",
+            ThreadFileViewGrantCreateParams
+        ),
+        schema_doc!(
+            "thread_file_view_grant_create_response.json",
+            ThreadFileViewGrantCreateResponse
+        ),
+        schema_doc!(
             "artifact_view_grant_disposition.json",
             ArtifactViewGrantDisposition
         ),
@@ -990,6 +1009,15 @@ pub fn protocol_schema_documents() -> Vec<SchemaDocument> {
             "thread_participants_changed_notification.json",
             ThreadParticipantsChangedNotification
         ),
+        schema_doc!("thread_tool_result_cursor.json", ThreadToolResultCursor),
+        schema_doc!(
+            "thread_tool_result_read_params.json",
+            ThreadToolResultReadParams
+        ),
+        schema_doc!(
+            "thread_tool_result_read_response.json",
+            ThreadToolResultReadResponse
+        ),
         schema_doc!("thread_get_params.json", ThreadGetParams),
         schema_doc!("thread_get_response.json", ThreadGetResponse),
         schema_doc!("thread_history_event.json", ThreadHistoryEvent),
@@ -1001,6 +1029,22 @@ pub fn protocol_schema_documents() -> Vec<SchemaDocument> {
         schema_doc!(
             "thread_timeline_page_response.json",
             ThreadTimelinePageResponse
+        ),
+        schema_doc!(
+            "thread_patch_steps_page_params.json",
+            ThreadPatchStepsPageParams
+        ),
+        schema_doc!(
+            "thread_patch_steps_page_response.json",
+            ThreadPatchStepsPageResponse
+        ),
+        schema_doc!(
+            "thread_file_patch_history_page_params.json",
+            ThreadFilePatchHistoryPageParams
+        ),
+        schema_doc!(
+            "thread_file_patch_history_page_response.json",
+            ThreadFilePatchHistoryPageResponse
         ),
         schema_doc!(
             "thread_timeline_blocks_changed_notification.json",
@@ -1125,6 +1169,12 @@ pub fn protocol_schema_documents() -> Vec<SchemaDocument> {
         schema_doc!("task_result.json", TaskResult),
         schema_doc!("task_error_class.json", TaskErrorClass),
         schema_doc!("task_error.json", TaskError),
+        schema_doc!("recovery_diagnostic.json", crate::RecoveryDiagnostic),
+        schema_doc!(
+            "recovery_provider_failure.json",
+            crate::RecoveryProviderFailure
+        ),
+        schema_doc!("recovery_stop_reason.json", crate::RecoveryStopReason),
         schema_doc!("task_trigger_kind.json", TaskTriggerKind),
         schema_doc!("task_manual_actor.json", TaskManualActor),
         schema_doc!(
@@ -1167,6 +1217,10 @@ pub fn protocol_schema_documents() -> Vec<SchemaDocument> {
             TaskDeliveryActorContract
         ),
         schema_doc!("task_occurrence_contract.json", TaskOccurrenceContract),
+        schema_doc!(
+            "task_occurrence_delivery_plan.json",
+            TaskOccurrenceDeliveryPlan
+        ),
         schema_doc!("task_occurrence_status.json", TaskOccurrenceStatus),
         schema_doc!("task_reviewer_intent.json", TaskReviewerIntent),
         schema_doc!("task_agent_spec.json", TaskAgentSpec),
@@ -1809,6 +1863,27 @@ pub fn protocol_schema_documents() -> Vec<SchemaDocument> {
         schema_doc!("turn_item_event.json", TurnItemEvent),
         schema_doc!("turn_item_event_payload.json", TurnItemEventPayload),
         schema_doc!("turn_items_response.json", TurnItemsResponse),
+        schema_doc!(
+            "turn_patch_steps_page_params.json",
+            TurnPatchStepsPageParams
+        ),
+        schema_doc!(
+            "turn_patch_steps_page_response.json",
+            TurnPatchStepsPageResponse
+        ),
+        schema_doc!(
+            "turn_patch_record_get_params.json",
+            TurnPatchRecordGetParams
+        ),
+        schema_doc!(
+            "turn_patch_record_get_response.json",
+            TurnPatchRecordGetResponse
+        ),
+        schema_doc!("turn_patch_diff_get_params.json", TurnPatchDiffGetParams),
+        schema_doc!(
+            "turn_patch_diff_get_response.json",
+            TurnPatchDiffGetResponse
+        ),
         schema_doc!("timeline_cursor.json", TimelineCursor),
         schema_doc!("timeline_page_anchor.json", TimelinePageAnchor),
         schema_doc!("timeline_page_info.json", TimelinePageInfo),
@@ -1990,11 +2065,14 @@ pub fn protocol_schema_documents() -> Vec<SchemaDocument> {
         schema_doc!("provider_transport_kind.json", ProviderTransportKind),
         schema_doc!("provider_failure_stage.json", ProviderFailureStage),
         schema_doc!("provider_failure_details.json", ProviderFailureDetails),
+        schema_doc!("provider_error_reason.json", crate::ProviderErrorReason),
+        schema_doc!("provider_request_id.json", crate::ProviderRequestId),
         schema_doc!("public_error.json", PublicError),
         schema_doc!("public_error_code.json", PublicErrorCode),
         schema_doc!("public_error_stage.json", PublicErrorStage),
         schema_doc!("provider_list_params.json", ProviderListParams),
         schema_doc!("provider_list_response.json", ProviderListResponse),
+        schema_doc!("provider_definition.json", ProviderDefinition),
         schema_doc!("provider_list_models_params.json", ProviderListModelsParams),
         schema_doc!(
             "provider_list_models_response.json",
@@ -2012,6 +2090,8 @@ pub fn protocol_schema_documents() -> Vec<SchemaDocument> {
             "gateway_memory_model_selection.json",
             GatewayMemoryModelSelection
         ),
+        schema_doc!("gateway_model_selection.json", GatewayModelSelection),
+        schema_doc!("model_selection_transport.json", ModelSelectionTransport),
         schema_doc!("gateway_memory_settings.json", GatewayMemorySettings),
         schema_doc!(
             "gateway_self_improvement_model_selection.json",
@@ -2261,6 +2341,11 @@ pub fn protocol_schema_documents() -> Vec<SchemaDocument> {
         schema_doc!("mcp_list_item.json", McpListItem),
         schema_doc!("mcp_scope_kind.json", McpScopeKind),
         schema_doc!("mcp_source_kind.json", McpSourceKind),
+        schema_doc!("mcp_oauth_params.json", McpOAuthParams),
+        schema_doc!("mcp_oauth_response.json", McpOAuthResponse),
+        schema_doc!("mcp_oauth_notification.json", McpOAuthNotification),
+        schema_doc!("mcp_oauth_action.json", McpOAuthAction),
+        schema_doc!("mcp_oauth_state.json", McpOAuthState),
         schema_doc!("mcp_install_params.json", McpInstallParams),
         schema_doc!("mcp_install_response.json", McpInstallResponse),
         schema_doc!("mcp_install_status.json", McpInstallStatus),

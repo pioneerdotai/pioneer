@@ -26,7 +26,7 @@ pub fn cleanup_successful_apply(plan_path: &Path, plan: &DesktopUpdatePlan) -> R
     Ok(())
 }
 
-fn update_root_from_plan_path(plan_path: &Path) -> Result<PathBuf> {
+pub(crate) fn update_root_from_plan_path(plan_path: &Path) -> Result<PathBuf> {
     let plan_dir = plan_path
         .parent()
         .ok_or_else(|| anyhow!("desktop update plan path has no parent"))?;
@@ -127,6 +127,8 @@ mod tests {
         DesktopUpdatePlan {
             schema_version: PLAN_SCHEMA_VERSION,
             product: PLAN_PRODUCT.to_owned(),
+            attempt_id: "A1b2C3d4E5f6G7h8I9j0K".to_owned(),
+            relaunch_requested_at_unix_ms: 1_789_100_000_000,
             target_version: "0.26.0".to_owned(),
             current_version: "0.25.0".to_owned(),
             tag: "v0.26.0".to_owned(),

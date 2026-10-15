@@ -107,7 +107,7 @@ fn structured_retry_after_ms(native: &RuntimeNativeEvent) -> Option<u64> {
         .or_else(|| native.raw_redacted.as_ref().and_then(find_retry_after_ms))
 }
 
-fn find_retry_after_ms(value: &JsonValue) -> Option<u64> {
+pub(crate) fn find_retry_after_ms(value: &JsonValue) -> Option<u64> {
     match value {
         JsonValue::Object(map) => {
             for key in ["retry_after_ms", "retryAfterMs"] {
@@ -171,6 +171,17 @@ impl OrderedIngressEvent for RuntimeEvent {
 
     fn ingress_class(&self) -> OrderedIngressClass<Self::Key> {
         let key = match self {
+            Self::ItemDelta(delta)
+                if matches!(
+                    delta.delta_kind,
+                    RuntimeItemDeltaKind::Stdout
+                        | RuntimeItemDeltaKind::Stderr
+                        | RuntimeItemDeltaKind::FileChange
+                        | RuntimeItemDeltaKind::ToolProgress
+                ) =>
+            {
+                return OrderedIngressClass::Durable;
+            }
             Self::ItemDelta(delta) => format!(
                 "item:{:?}:{}:{}:{}",
                 delta.delta_kind,
@@ -474,6 +485,17 @@ pub struct RuntimeDiffUpdated {
     pub native_turn_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diff_redacted: Option<JsonValue>,
+    /// The provider aggregate is kept as text only; Pioneer must not turn it
+    /// into native per-call records. These fields are protocol metadata, not
+    /// model-controlled authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diff_text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_exact: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native: Option<RuntimeNativeEvent>,
 }
@@ -801,7 +823,9 @@ fn map_codex_turn_completed(
     let Some(native_turn_id) = string_path(params, &["turn", "id"]) else {
         return raw_notification(notification, options, "turn/completed missing turn.id");
     };
-    let status = string_path(params, &["turn", "status"]).unwrap_or_else(|| "completed".to_owned());
+    let Some(status) = string_path(params, &["turn", "status"]) else {
+        return raw_notification(notification, options, "turn/completed missing turn.status");
+    };
     if status == "failed" {
         return RuntimeEvent::TurnFailed(RuntimeTurnFailed {
             native_thread_id: string_path(params, &["threadId"]),
@@ -819,6 +843,13 @@ fn map_codex_turn_completed(
             reason: status,
             native: native_notification(notification, options),
         });
+    }
+    if status != "completed" {
+        return raw_notification(
+            notification,
+            options,
+            "turn/completed has an unknown terminal status",
+        );
     }
     RuntimeEvent::TurnCompleted(RuntimeTurnCompleted {
         native_thread_id: string_path(params, &["threadId"]),
@@ -1019,6 +1050,21 @@ fn map_codex_diff_updated(
         native_thread_id: string_path(params, &["threadId"]),
         native_turn_id: string_path(params, &["turnId"]).unwrap_or_default(),
         diff_redacted: params.get("diff").or_else(|| Some(params)).map(redact_json),
+        diff_text: params
+            .get("diff")
+            .and_then(JsonValue::as_str)
+            .map(str::to_owned),
+        revision: params
+            .get("revision")
+            .or_else(|| params.get("version"))
+            .or_else(|| params.get("sequence"))
+            .and_then(JsonValue::as_u64),
+        event_id: params
+            .get("eventId")
+            .or_else(|| params.get("event_id"))
+            .and_then(JsonValue::as_str)
+            .map(str::to_owned),
+        provider_exact: params.get("exact").and_then(JsonValue::as_bool),
         native: native_notification(notification, options),
     })
 }
@@ -1231,6 +1277,37 @@ fn codex_item_projection_metadata(item: &JsonValue) -> Option<JsonValue> {
     );
     insert_string(
         &mut metadata,
+        "aggregatedOutput",
+        first_string_path(item, &[&["aggregatedOutput"], &["aggregated_output"]]),
+    );
+    insert_bool(
+        &mut metadata,
+        "timedOut",
+        first_bool_path(item, &[&["timedOut"], &["timed_out"]]),
+    );
+    insert_bool(
+        &mut metadata,
+        "truncated",
+        first_bool_path(item, &[&["truncated"]]),
+    );
+    for marker in [
+        "_pioneerOversizedPayloadOmitted",
+        "_pioneerFileChangePayloadOmitted",
+        "_pioneerPayloadOmitted",
+    ] {
+        if item.get(marker).and_then(JsonValue::as_bool) == Some(true) {
+            metadata.insert("truncated".into(), JsonValue::Bool(true));
+            metadata.insert(marker.into(), JsonValue::Bool(true));
+        }
+    }
+    // Codex command is a shell string, while other runtimes may supply argv.
+    if !metadata.contains_key("command") {
+        if let Some(command) = first_string_path(item, &[&["command"], &["cmd"]]) {
+            metadata.insert("command".into(), serde_json::json!([command]));
+        }
+    }
+    insert_string(
+        &mut metadata,
         "stdout",
         first_string_path(item, &[&["stdout"]]),
     );
@@ -1379,6 +1456,18 @@ fn codex_item_projection_metadata(item: &JsonValue) -> Option<JsonValue> {
 fn codex_delta_projection_metadata(params: &JsonValue) -> Option<JsonValue> {
     let mut metadata = JsonMap::new();
 
+    for field in [
+        "eventId",
+        "sequence",
+        "progress",
+        "total",
+        "progressToken",
+        "elapsedTimeMs",
+        "truncated",
+        "_pioneerOversizedPayloadOmitted",
+    ] {
+        insert_json(&mut metadata, field, params.get(field).cloned());
+    }
     insert_string(
         &mut metadata,
         "stream",
@@ -1457,6 +1546,24 @@ fn changed_files_from_value(value: &JsonValue) -> Vec<String> {
     );
     if !changed_files.is_empty() {
         return changed_files;
+    }
+    if let Some(changes) = value.get("changes") {
+        let mut changed_files = match changes {
+            JsonValue::Array(changes) => changes
+                .iter()
+                .filter_map(|change| string_path(change, &["path"]))
+                .collect::<Vec<_>>(),
+            // Older rollout projections represented file changes as a map
+            // keyed by path. Accept that shape without retaining any diff or
+            // file content stored in the values.
+            JsonValue::Object(changes) => changes.keys().cloned().collect::<Vec<_>>(),
+            _ => Vec::new(),
+        };
+        changed_files.sort();
+        changed_files.dedup();
+        if !changed_files.is_empty() {
+            return changed_files;
+        }
     }
     string_path(value, &["path"]).into_iter().collect()
 }
@@ -1635,6 +1742,38 @@ mod tests {
     use crate::driver::JsonlRpcId;
     use chrono::TimeZone;
     use serde_json::json;
+
+    #[test]
+    fn command_output_is_durable_in_both_ingress_queues() {
+        use pioneer_runtime_events::{OrderedIngressClass, OrderedIngressEvent};
+        for method in [
+            "item/commandExecution/outputDelta",
+            "item/fileChange/outputDelta",
+            "item/mcpToolCall/progress",
+        ] {
+            let notification = CodexJsonlRpcNotificationEvent {
+                method: method.into(),
+                params: Some(
+                    json!({"threadId":"thread", "turnId":"turn", "itemId":"item", "delta":"x".repeat(70000)}),
+                ),
+                raw: json!({}),
+            };
+            assert!(matches!(
+                notification.ingress_class(),
+                OrderedIngressClass::Durable
+            ));
+            let event =
+                map_codex_notification_event(&notification, RuntimeEventMappingOptions::default());
+            assert!(matches!(
+                event.ingress_class(),
+                OrderedIngressClass::Durable
+            ));
+            let RuntimeEvent::ItemDelta(delta) = event else {
+                panic!("missing output")
+            };
+            assert_eq!(delta.delta.len(), 70000);
+        }
+    }
 
     #[test]
     fn usage_limit_message_maps_provider_cooldown_until_local_retry_time() {
@@ -2264,5 +2403,40 @@ mod tests {
         assert_eq!(permission.request_kind, "permission_approval");
         assert_eq!(permission.native_item_id.as_deref(), Some("native_mcp_1"));
         assert_eq!(permission.native_request_id_json, Some(json!(11)));
+    }
+}
+
+#[cfg(test)]
+mod terminal_status_tests {
+    use super::*;
+    #[test]
+    fn codex_completed_notification_cannot_default_missing_or_unknown_status_to_success() {
+        for status in [
+            None,
+            Some("inProgress"),
+            Some("future"),
+            Some("completed"),
+            Some("interrupted"),
+            Some("failed"),
+        ] {
+            let mut turn = serde_json::json!({"id":"turn"});
+            if let Some(status) = status {
+                turn["status"] = serde_json::json!(status);
+            }
+            let event = map_codex_notification_event(
+                &CodexJsonlRpcNotificationEvent {
+                    method: "turn/completed".into(),
+                    params: Some(serde_json::json!({"threadId":"thread","turn":turn})),
+                    raw: serde_json::json!({}),
+                },
+                RuntimeEventMappingOptions::default(),
+            );
+            match status {
+                Some("completed") => assert!(matches!(event, RuntimeEvent::TurnCompleted(_))),
+                Some("interrupted") => assert!(matches!(event, RuntimeEvent::TurnInterrupted(_))),
+                Some("failed") => assert!(matches!(event, RuntimeEvent::TurnFailed(_))),
+                _ => assert!(matches!(event, RuntimeEvent::Raw(_))),
+            }
+        }
     }
 }

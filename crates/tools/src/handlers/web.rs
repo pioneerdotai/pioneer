@@ -1,9 +1,14 @@
 use super::http::{
-    BufferedHttpRequest, build_http_client, execute_buffered_http_request, validate_http_url,
+    BufferedHttpRequest, build_http_client, execute_buffered_http_request, map_http_request_error,
+    validate_http_url,
 };
 use crate::WebToolsConfig;
+use crate::apply_patch::file_mutation::{
+    CanonicalTarget, StagedFile, TargetExpectation, TargetResolver, TargetRole,
+};
 use crate::context::{FunctionToolOutput, ToolInvocation, ToolOutput, ToolPayload};
 use crate::error::ToolError;
+use crate::file_policy::FilePolicyCapability;
 use crate::network_policy::enforce_network_url;
 use crate::registry::ToolHandler;
 use crate::web::{
@@ -157,6 +162,7 @@ struct DownloadStreamResult {
     sha256: String,
     truncated: bool,
     elapsed_ms: u64,
+    durability_warning: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -371,16 +377,23 @@ impl ToolHandler for DownloadUrlHandler {
             include_headers: false,
         };
 
-        let mut destination = resolve_download_destination(
+        let requested_destination = resolve_download_destination(
             invocation.workdir.as_path(),
             args.destination.as_deref(),
             args.url.as_str(),
         )?;
-        if let Some(snapshot) = invocation.execution_security_snapshot.as_ref() {
-            match FilePolicyChecker::check_write(snapshot, destination.as_path()) {
-                FilePolicyDecision::Allowed(grant) => {
-                    destination = grant.resolved_path;
-                }
+        let snapshot = invocation
+            .execution_security_snapshot
+            .as_ref()
+            .ok_or_else(|| {
+                ToolError::Rejected(
+                "missing turn execution security snapshot; refusing download filesystem mutation"
+                    .to_owned(),
+            )
+            })?;
+        let (destination, capability) =
+            match FilePolicyChecker::check_write(snapshot, requested_destination.as_path()) {
+                FilePolicyDecision::Allowed(grant) => (grant.resolved_path, grant.capability),
                 FilePolicyDecision::Denied(deny) => {
                     return Err(ToolError::Rejected(format!(
                         "filesystem sandbox denied Write for download destination `{}`: {}",
@@ -388,17 +401,39 @@ impl ToolHandler for DownloadUrlHandler {
                         deny.message
                     )));
                 }
-            }
-        }
+            };
+        let target = TargetResolver::new(capability.anchor_path().to_path_buf())
+            .map_err(|error| {
+                ToolError::Rejected(format!(
+                    "download destination authorization root is invalid: {error}"
+                ))
+            })?
+            .with_absolute_paths(true)
+            .resolve(
+                destination.to_string_lossy().as_ref(),
+                TargetRole::Destination,
+                TargetExpectation::ExistingOrMissing,
+            )
+            .map_err(|error| {
+                ToolError::Rejected(format!(
+                    "download destination cannot be securely resolved: {error}"
+                ))
+            })?;
+        target.validate_expectation().map_err(|error| {
+            ToolError::Rejected(format!(
+                "download destination is not a regular file or missing path: {error}"
+            ))
+        })?;
 
         let stream_result = download_to_file(
             args.url.as_str(),
-            destination.as_path(),
+            &target,
             settings,
             args.overwrite.unwrap_or(false),
             args.create_dirs.unwrap_or(true),
             self.config.default_user_agent.as_str(),
             invocation.execution_security_snapshot.as_ref(),
+            &capability,
         )
         .await?;
 
@@ -414,6 +449,7 @@ impl ToolHandler for DownloadUrlHandler {
             content_type: stream_result.content_type,
             elapsed_ms: stream_result.elapsed_ms,
             truncated: stream_result.truncated,
+            durability_warning: stream_result.durability_warning,
         };
         let output = render_download_ui_text(&payload);
         let payload_json = serde_json::to_value(&payload)
@@ -510,7 +546,13 @@ async fn search_duckduckgo_html(
     let timeout_ms = config
         .default_timeout_ms
         .clamp(1, config.hard_max_timeout_ms.max(1));
-    let client = build_http_client(timeout_ms, true, Some(config.default_user_agent.as_str()))?;
+    let client = build_http_client(
+        timeout_ms,
+        true,
+        Some(config.default_user_agent.as_str()),
+        security_snapshot,
+        "web_search",
+    )?;
 
     let mut params: Vec<(&str, String)> = vec![("q", query.to_owned())];
     if let Some(region) = region {
@@ -549,9 +591,7 @@ async fn search_duckduckgo_html(
         .query(&params)
         .send()
         .await
-        .map_err(|error| {
-            ToolError::execution_failed(format!("duckduckgo request failed: {error}"))
-        })?;
+        .map_err(|error| map_http_request_error(error, "duckduckgo request failed"))?;
 
     let status = response.status().as_u16();
     let body = response.text().await.map_err(|error| {
@@ -642,7 +682,13 @@ async fn search_duckduckgo_instant_api(
     let timeout_ms = config
         .default_timeout_ms
         .clamp(1, config.hard_max_timeout_ms.max(1));
-    let client = build_http_client(timeout_ms, true, Some(config.default_user_agent.as_str()))?;
+    let client = build_http_client(
+        timeout_ms,
+        true,
+        Some(config.default_user_agent.as_str()),
+        security_snapshot,
+        "web_search",
+    )?;
     let payload = client
         .get(config.ddg_instant_api_url.as_str())
         .query(&[
@@ -653,9 +699,7 @@ async fn search_duckduckgo_instant_api(
         ])
         .send()
         .await
-        .map_err(|error| {
-            ToolError::execution_failed(format!("duckduckgo instant API request failed: {error}"))
-        })?
+        .map_err(|error| map_http_request_error(error, "duckduckgo instant API request failed"))?
         .json::<JsonValue>()
         .await
         .map_err(|error| {
@@ -819,17 +863,21 @@ async fn fetch_url(
 ) -> Result<HttpFetchResult, ToolError> {
     enforce_network_url(security_snapshot, url, "web_fetch")?;
 
-    let response = execute_buffered_http_request(BufferedHttpRequest {
-        method: "GET".to_owned(),
-        url: url.to_owned(),
-        timeout_ms: settings.timeout_ms,
-        follow_redirects: settings.follow_redirects,
-        user_agent: Some(user_agent.to_owned()),
-        headers: HashMap::new(),
-        query: None,
-        body: None,
-        max_bytes: settings.max_bytes.max(1),
-    })
+    let response = execute_buffered_http_request(
+        BufferedHttpRequest {
+            method: "GET".to_owned(),
+            url: url.to_owned(),
+            timeout_ms: settings.timeout_ms,
+            follow_redirects: settings.follow_redirects,
+            user_agent: Some(user_agent.to_owned()),
+            headers: HashMap::new(),
+            query: None,
+            body: None,
+            max_bytes: settings.max_bytes.max(1),
+        },
+        security_snapshot,
+        "web_fetch",
+    )
     .await?;
 
     let headers = response.headers;
@@ -856,66 +904,84 @@ async fn fetch_url(
 
 async fn download_to_file(
     url: &str,
-    destination: &Path,
+    target: &CanonicalTarget,
     settings: FetchSettings,
     overwrite: bool,
     create_dirs: bool,
     user_agent: &str,
     security_snapshot: Option<&TurnExecutionSecuritySnapshot>,
+    capability: &FilePolicyCapability,
 ) -> Result<DownloadStreamResult, ToolError> {
     validate_http_url(url)?;
     enforce_network_url(security_snapshot, url, "download_url")?;
-
-    if create_dirs && let Some(parent) = destination.parent() {
-        tokio::fs::create_dir_all(parent).await.map_err(|error| {
-            ToolError::execution_failed(format!(
-                "failed to create destination directory `{}`: {error}",
-                parent.display()
-            ))
-        })?;
-    }
-
-    let mut options = tokio::fs::OpenOptions::new();
-    options.write(true).create(true);
-    if overwrite {
-        options.truncate(true);
-    } else {
-        options.create_new(true);
-    }
-
-    let mut file = options.open(destination).await.map_err(|error| {
-        if error.kind() == std::io::ErrorKind::AlreadyExists {
-            ToolError::execution_failed(format!(
-                "destination already exists: {} (set overwrite=true)",
-                destination.display()
-            ))
-        } else {
-            ToolError::execution_failed(format!(
-                "failed to open destination `{}`: {error}",
-                destination.display()
-            ))
-        }
-    })?;
+    let destination = target.absolute();
 
     let client = build_http_client(
         settings.timeout_ms,
         settings.follow_redirects,
         Some(user_agent),
+        security_snapshot,
+        "download_url",
     )?;
     let started = Instant::now();
     let response = client
         .get(url)
         .send()
         .await
-        .map_err(|error| ToolError::execution_failed(format!("request failed: {error}")))?;
+        .map_err(|error| map_http_request_error(error, "request failed"))?;
 
     let status_code = response.status().as_u16();
     if status_code >= 400 {
-        let _ = tokio::fs::remove_file(destination).await;
         return Err(ToolError::execution_failed(format!(
             "download request failed with HTTP {status_code}"
         )));
     }
+
+    let replacement_permissions = if overwrite {
+        match crate::apply_patch::file_mutation::open_regular_file(destination) {
+            Ok(existing) => Some(
+                existing
+                    .metadata()
+                    .map_err(|error| {
+                        ToolError::execution_failed(format!(
+                            "failed to inspect existing destination `{}`: {error}",
+                            destination.display()
+                        ))
+                    })?
+                    .permissions(),
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(ToolError::execution_failed(format!(
+                    "failed to securely open existing destination `{}`: {error}",
+                    destination.display()
+                )));
+            }
+        }
+    } else {
+        None
+    };
+
+    let anchor = capability.anchor().map_err(|error| {
+        ToolError::execution_failed(format!(
+            "failed to retain authorized download directory for `{}`: {error}",
+            destination.display()
+        ))
+    })?;
+    let staged = StagedFile::create_at(&anchor, capability.relative_path(), target, create_dirs)
+        .map_err(|error| {
+            ToolError::execution_failed(format!(
+                "failed to securely stage download destination `{}`: {error}",
+                destination.display()
+            ))
+        })?;
+    let staged_file = staged.file().try_clone().map_err(|error| {
+        ToolError::execution_failed(format!(
+            "failed to prepare staged download file `{}`: {error}",
+            destination.display()
+        ))
+    })?;
+    let mut file = tokio::fs::File::from_std(staged_file);
 
     let final_url = response.url().to_string();
     let content_type = response
@@ -936,7 +1002,6 @@ async fn download_to_file(
         let chunk_len = u64::try_from(chunk.len()).unwrap_or(u64::MAX);
         let next_size = bytes_written.saturating_add(chunk_len);
         if next_size > u64::try_from(settings.max_bytes).unwrap_or(u64::MAX) {
-            let _ = tokio::fs::remove_file(destination).await;
             return Err(ToolError::execution_failed(format!(
                 "download exceeds max_bytes limit ({})",
                 settings.max_bytes
@@ -959,6 +1024,57 @@ async fn download_to_file(
             destination.display()
         ))
     })?;
+    if let Some(permissions) = replacement_permissions {
+        file.set_permissions(permissions).await.map_err(|error| {
+            ToolError::execution_failed(format!(
+                "failed to preserve destination permissions for `{}`: {error}",
+                destination.display()
+            ))
+        })?;
+    }
+    file.sync_all().await.map_err(|error| {
+        ToolError::execution_failed(format!(
+            "failed to sync staged download `{}`: {error}",
+            destination.display()
+        ))
+    })?;
+    drop(file);
+
+    let published_parent = if overwrite {
+        staged.publish_replace(false)
+    } else {
+        staged.publish_no_replace(false)
+    }
+    .map_err(|error| {
+        if error.source.kind() == std::io::ErrorKind::AlreadyExists {
+            ToolError::execution_failed(format!(
+                "destination already exists: {} (set overwrite=true)",
+                destination.display()
+            ))
+        } else {
+            ToolError::execution_failed(format!(
+                "failed to publish staged download `{}`: {}",
+                destination.display(),
+                error.source
+            ))
+        }
+    })?;
+    if published_parent.cleanup_failed {
+        tracing::warn!(
+            destination = %destination.display(),
+            "download was published but its staging filename could not be removed"
+        );
+    }
+    let durability_warning = published_parent.sync_all().err().map(|error| {
+        let warning = format!(
+            "download is committed at `{}` but parent-directory durability could not be confirmed: {error}",
+            destination.display()
+        );
+        // Returning a failure after rename would invite an unsafe retry of an
+        // already-committed mutation. Report the committed state explicitly.
+        tracing::warn!(destination = %destination.display(), error = %error, "{warning}");
+        warning
+    });
 
     Ok(DownloadStreamResult {
         request_url: url.to_owned(),
@@ -969,6 +1085,7 @@ async fn download_to_file(
         sha256: hex::encode(hasher.finalize()),
         truncated: false,
         elapsed_ms: started.elapsed().as_millis() as u64,
+        durability_warning,
     })
 }
 
@@ -1163,7 +1280,7 @@ fn is_probably_binary(content_type: Option<&str>, bytes: &[u8]) -> bool {
     non_printable.saturating_mul(100) / probe.len().max(1) > 20
 }
 
-fn resolve_download_destination(
+pub(crate) fn resolve_download_destination(
     workdir: &Path,
     destination: Option<&str>,
     source_url: &str,
@@ -1192,10 +1309,6 @@ fn resolve_download_destination(
             "invalid destination path `{}`",
             path.display()
         )));
-    }
-
-    if path.is_dir() {
-        return Ok(path.join(inferred_name.as_str()));
     }
 
     Ok(path)
@@ -1262,6 +1375,68 @@ fn looks_like_html(bytes: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    fn secure_download_target(root: &Path, destination: &Path) -> CanonicalTarget {
+        TargetResolver::new(root)
+            .expect("download root")
+            .with_absolute_paths(true)
+            .resolve(
+                destination.to_string_lossy().as_ref(),
+                TargetRole::Destination,
+                TargetExpectation::ExistingOrMissing,
+            )
+            .expect("download target")
+    }
+
+    fn secure_download_capability(destination: &Path) -> FilePolicyCapability {
+        let parent = destination
+            .parent()
+            .expect("download parent")
+            .canonicalize()
+            .unwrap();
+        let canonical_destination = parent.join(destination.file_name().expect("download name"));
+        FilePolicyCapability::capture_unchecked(
+            crate::FilePolicyOperation::Write,
+            canonical_destination.as_path(),
+        )
+        .expect("download write capability")
+    }
+
+    async fn one_response_server(response: &'static [u8]) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("download test listener");
+        let address = listener.local_addr().expect("download test address");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("download request");
+            let mut request = [0_u8; 2048];
+            let _ = stream.read(&mut request).await.expect("read request");
+            stream.write_all(response).await.expect("write response");
+        });
+        (format!("http://{address}/download"), server)
+    }
+
+    async fn truncated_response_server() -> (String, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("slow download test listener");
+        let address = listener.local_addr().expect("slow download test address");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("slow download request");
+            let mut request = [0_u8; 2048];
+            let _ = stream.read(&mut request).await.expect("read slow request");
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\npartial",
+                )
+                .await
+                .expect("write partial response");
+            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+        });
+        (format!("http://{address}/download"), server)
+    }
 
     #[test]
     fn normalize_duckduckgo_redirect_extracts_uddg() {
@@ -1329,6 +1504,331 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_overwrite_download_preserves_existing_destination() {
+        let root = tempfile::tempdir().expect("download root");
+        let destination = root.path().join("existing.bin");
+        std::fs::write(destination.as_path(), b"original").expect("existing destination");
+        let target = secure_download_target(root.path(), destination.as_path());
+        let capability = secure_download_capability(destination.as_path());
+        let (url, server) = one_response_server(
+            b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        let snapshot = TurnExecutionSecuritySnapshot::unrestricted_full_access(
+            root.path().to_string_lossy(),
+            1,
+        );
+
+        let error = download_to_file(
+            url.as_str(),
+            &target,
+            FetchSettings {
+                timeout_ms: 2_000,
+                max_bytes: 1024,
+                follow_redirects: false,
+                include_headers: false,
+            },
+            true,
+            true,
+            "pioneer-test",
+            Some(&snapshot),
+            &capability,
+        )
+        .await
+        .expect_err("HTTP failure must not publish the staged download");
+
+        assert!(error.to_string().contains("HTTP 500"));
+        assert_eq!(
+            std::fs::read(destination).expect("preserved destination"),
+            b"original"
+        );
+        server.await.expect("download server");
+    }
+
+    #[tokio::test]
+    async fn oversized_overwrite_download_preserves_existing_destination() {
+        let root = tempfile::tempdir().expect("download root");
+        let destination = root.path().join("existing.bin");
+        std::fs::write(destination.as_path(), b"original").expect("existing destination");
+        let target = secure_download_target(root.path(), destination.as_path());
+        let capability = secure_download_capability(destination.as_path());
+        let (url, server) = one_response_server(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\n12345678",
+        )
+        .await;
+        let snapshot = TurnExecutionSecuritySnapshot::unrestricted_full_access(
+            root.path().to_string_lossy(),
+            1,
+        );
+
+        let error = download_to_file(
+            url.as_str(),
+            &target,
+            FetchSettings {
+                timeout_ms: 2_000,
+                max_bytes: 4,
+                follow_redirects: false,
+                include_headers: false,
+            },
+            true,
+            true,
+            "pioneer-test",
+            Some(&snapshot),
+            &capability,
+        )
+        .await
+        .expect_err("oversized response must not publish the staged download");
+
+        assert!(error.to_string().contains("exceeds max_bytes"));
+        assert_eq!(
+            std::fs::read(destination).expect("preserved destination"),
+            b"original"
+        );
+        server.await.expect("download server");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn successful_overwrite_preserves_existing_mode_through_capability_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().expect("download root");
+        let destination = root.path().join("executable.bin");
+        std::fs::write(destination.as_path(), b"original").unwrap();
+        std::fs::set_permissions(
+            destination.as_path(),
+            std::fs::Permissions::from_mode(0o750),
+        )
+        .unwrap();
+        let target = secure_download_target(root.path(), destination.as_path());
+        let capability = secure_download_capability(destination.as_path());
+        let (url, server) = one_response_server(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nnew",
+        )
+        .await;
+        let snapshot = TurnExecutionSecuritySnapshot::unrestricted_full_access(
+            root.path().to_string_lossy(),
+            1,
+        );
+
+        download_to_file(
+            url.as_str(),
+            &target,
+            FetchSettings {
+                timeout_ms: 2_000,
+                max_bytes: 1024,
+                follow_redirects: false,
+                include_headers: false,
+            },
+            true,
+            true,
+            "pioneer-test",
+            Some(&snapshot),
+            &capability,
+        )
+        .await
+        .expect("overwrite should commit");
+
+        assert_eq!(std::fs::read(&destination).unwrap(), b"new");
+        assert_eq!(
+            std::fs::metadata(&destination)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o750
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn truncated_download_stream_preserves_destination_and_cleans_stage() {
+        let root = tempfile::tempdir().expect("download root");
+        let destination = root.path().join("existing.bin");
+        std::fs::write(destination.as_path(), b"original").expect("existing destination");
+        let target = secure_download_target(root.path(), destination.as_path());
+        let capability = secure_download_capability(destination.as_path());
+        let (url, server) = one_response_server(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\npartial",
+        )
+        .await;
+        let snapshot = TurnExecutionSecuritySnapshot::unrestricted_full_access(
+            root.path().to_string_lossy(),
+            1,
+        );
+
+        let error = download_to_file(
+            url.as_str(),
+            &target,
+            FetchSettings {
+                timeout_ms: 2_000,
+                max_bytes: 1024,
+                follow_redirects: false,
+                include_headers: false,
+            },
+            true,
+            true,
+            "pioneer-test",
+            Some(&snapshot),
+            &capability,
+        )
+        .await
+        .expect_err("a truncated response must fail before publish");
+
+        assert!(error.to_string().contains("response stream error"));
+        assert_eq!(
+            std::fs::read(destination).expect("preserved destination"),
+            b"original"
+        );
+        let has_stage = std::fs::read_dir(root.path())
+            .expect("download root entries")
+            .filter_map(Result::ok)
+            .any(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".pioneer-patch-")
+            });
+        assert!(!has_stage, "failed download must remove its private stage");
+        server.await.expect("download server");
+    }
+
+    #[tokio::test]
+    async fn cancelled_download_preserves_destination_and_cleans_stage() {
+        let root = tempfile::tempdir().expect("download root");
+        let destination = root.path().join("existing.bin");
+        std::fs::write(destination.as_path(), b"original").expect("existing destination");
+        let target = secure_download_target(root.path(), destination.as_path());
+        let capability = secure_download_capability(destination.as_path());
+        let (url, server) = truncated_response_server().await;
+        let snapshot = TurnExecutionSecuritySnapshot::unrestricted_full_access(
+            root.path().to_string_lossy(),
+            1,
+        );
+
+        let result = tokio::time::timeout(
+            tokio::time::Duration::from_millis(100),
+            download_to_file(
+                url.as_str(),
+                &target,
+                FetchSettings {
+                    timeout_ms: 2_000,
+                    max_bytes: 1024,
+                    follow_redirects: false,
+                    include_headers: false,
+                },
+                true,
+                true,
+                "pioneer-test",
+                Some(&snapshot),
+                &capability,
+            ),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "the in-flight download should be cancelled"
+        );
+        assert_eq!(
+            std::fs::read(destination).expect("preserved destination"),
+            b"original"
+        );
+        let has_stage = std::fs::read_dir(root.path())
+            .expect("download root entries")
+            .filter_map(Result::ok)
+            .any(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".pioneer-patch-")
+            });
+        assert!(
+            !has_stage,
+            "cancelled download must remove its private stage"
+        );
+        server.await.expect("download server");
+    }
+
+    #[tokio::test]
+    async fn download_url_creates_an_approved_missing_destination_tree() {
+        let base = tempfile::tempdir().expect("download base");
+        let workspace = base.path().join("workspace");
+        std::fs::create_dir(&workspace).expect("workspace");
+        let approved_root = base.path().join("downloads").join("nested");
+        let destination = approved_root.join("archive.bin");
+        let (url, server) = one_response_server(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\npayload",
+        )
+        .await;
+        let mut snapshot = TurnExecutionSecuritySnapshot::workspace_write(
+            pioneer_protocol::TurnPermissionProfileSnapshot::from_mode(
+                pioneer_protocol::TurnPermissionMode::Supervised,
+                pioneer_protocol::TurnPermissionProfileSource::Composer,
+            ),
+            workspace.to_string_lossy(),
+            vec![pioneer_protocol::TurnFilesystemSandboxEntry {
+                path: pioneer_protocol::TurnFilesystemSandboxPath::ExplicitPath {
+                    path: approved_root.display().to_string(),
+                },
+                access: pioneer_protocol::TurnFilesystemAccess::Write,
+                provenance: pioneer_protocol::TurnSecurityRuleProvenance::Runtime,
+                resolved_path: Some(approved_root.display().to_string()),
+            }],
+            1_700_000_000_000,
+        );
+        let mut network = pioneer_protocol::TurnNetworkPolicySnapshot::disabled();
+        network.mode = pioneer_protocol::TurnNetworkMode::Restricted;
+        network.allow_localhost = true;
+        network.allowed_domains = vec![format!("={url}")];
+        snapshot.network = network.clone();
+        snapshot.sandbox.network = network;
+
+        let mut config = test_web_config();
+        config.default_timeout_ms = 2_000;
+        config.hard_max_timeout_ms = 5_000;
+        let handler = DownloadUrlHandler::new(config);
+        let invocation = ToolInvocation {
+            call_id: "call_missing_download_root".to_owned(),
+            tool_name: "download_url".to_owned(),
+            source: crate::context::ToolCallSource::Model,
+            payload: ToolPayload::Function {
+                arguments: serde_json::json!({
+                    "url": url,
+                    "destination": destination.display().to_string(),
+                    "create_dirs": true,
+                }),
+            },
+            workdir: workspace,
+            environment: Default::default(),
+            attempt_id: 1,
+            idempotency_key: None,
+            recovery: crate::spec::ToolRecoveryMetadata::default(),
+            permission_metadata: crate::spec::ToolPermissionMetadata::default(),
+            execution_security_snapshot: Some(snapshot),
+            apply_patch_preflight: None,
+            cancellation: tokio_util::sync::CancellationToken::new(),
+        };
+
+        handler
+            .handle(
+                invocation,
+                crate::events::ToolEventBus::default().start_trace(
+                    "turn",
+                    "call_missing_download_root",
+                    "download_url",
+                ),
+            )
+            .await
+            .expect("an approved download should create its missing destination tree");
+
+        assert_eq!(
+            std::fs::read(destination).expect("downloaded file"),
+            b"payload"
+        );
+        server.await.expect("download server");
+    }
+
+    #[tokio::test]
     async fn download_url_policy_denies_destination_outside_workspace_before_request() {
         let base =
             std::env::temp_dir().join(format!("pioneer-download-policy-{}", std::process::id()));
@@ -1369,6 +1869,7 @@ mod tests {
             recovery: crate::spec::ToolRecoveryMetadata::default(),
             permission_metadata: crate::spec::ToolPermissionMetadata::default(),
             execution_security_snapshot: Some(snapshot),
+            apply_patch_preflight: None,
             cancellation: tokio_util::sync::CancellationToken::new(),
         };
 

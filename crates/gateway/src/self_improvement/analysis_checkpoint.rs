@@ -10,7 +10,7 @@ use super::learner::{
     ValidatedChunkDigest, validate_digest_against_processed_chunks, validate_persistable_digest,
 };
 
-const CHECKPOINT_SCHEMA_VERSION: u32 = 2;
+const CHECKPOINT_SCHEMA_VERSION: u32 = 3;
 const CURSOR_MAX_BYTES: usize = 64 * 1024;
 const DIGEST_MAX_BYTES: usize = 1024 * 1024;
 const CHUNK_TERMINAL_VALIDATED: u8 = 0;
@@ -18,6 +18,27 @@ const CHUNK_TERMINAL_OUTPUT_TOO_LARGE: u8 = 1;
 const CHUNK_TERMINAL_MALFORMED_JSON: u8 = 2;
 const CHUNK_TERMINAL_CONTRACT_REJECTED: u8 = 3;
 const CHUNKS_PER_TERMINAL_CODE_BYTE: u32 = 4;
+
+/// Reads only bounded cursor metadata; status requests never reconstruct the history plan.
+pub(crate) fn checkpoint_progress(
+    run: &SelfImprovementRunRecord,
+) -> Option<pioneer_protocol::SelfImprovementProgress> {
+    let text = run.analysis_cursor_json.as_deref()?;
+    if text.len() > CURSOR_MAX_BYTES {
+        return None;
+    }
+    let cursor: AnalysisCursor = serde_json::from_str(text).ok()?;
+    (cursor.schema_version == CHECKPOINT_SCHEMA_VERSION
+        && cursor.source_lower_exclusive == run.source_lower_exclusive
+        && cursor.source_upper_inclusive == run.source_upper_inclusive
+        && cursor.chunk_count > 0
+        && cursor.validated_chunk_count <= cursor.next_chunk_index
+        && cursor.next_chunk_index <= cursor.chunk_count)
+        .then_some(pioneer_protocol::SelfImprovementProgress {
+            processed_chunks: cursor.validated_chunk_count,
+            total_chunks: cursor.chunk_count,
+        })
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -109,7 +130,6 @@ impl ResumableHistoryAnalysis {
         self.digest.validated.as_ref()
     }
 
-    #[cfg(test)]
     pub(crate) fn chunk_rejection_reason_code(
         &self,
         chunk_index: u32,
@@ -144,6 +164,7 @@ impl ResumableHistoryAnalysis {
         self.validate_counts()
     }
 
+    #[cfg(test)]
     pub(crate) fn record_contract_rejected(
         &mut self,
         chunk: &SelfImprovementHistoryChunk,
@@ -360,6 +381,7 @@ fn validate_chunk_terminal_codes(codes: &[u8], chunk_count: u32) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn rejection_terminal_code(reason_code: &str) -> Result<u8> {
     match reason_code {
         "model_output_too_large" => Ok(CHUNK_TERMINAL_OUTPUT_TOO_LARGE),
@@ -415,7 +437,7 @@ mod tests {
 
     fn chunk(index: u32, count: u32, text: &str) -> SelfImprovementHistoryChunk {
         let mut chunk = SelfImprovementHistoryChunk {
-            schema_version: 2,
+            schema_version: 3,
             workspace_id: "workspace".to_owned(),
             source_lower_exclusive: 0,
             source_upper_inclusive: 1,
@@ -426,6 +448,7 @@ mod tests {
                 turns: vec![SelfImprovementHistoryTurn {
                     turn_id: format!("turn-{index}"),
                     blocks: vec![SelfImprovementHistoryBlock {
+                        event_created_at_unix: 2,
                         block_key: format!("event-{index}:fragment"),
                         event_id: format!("event-{index}"),
                         event_thread_id: "thread".to_owned(),
@@ -464,8 +487,10 @@ mod tests {
             next_attempt_at_unix: None,
             learner_provider: "provider".to_owned(),
             learner_model: "model".to_owned(),
+            learner_reasoning_effort: None,
             reviewer_provider: "provider".to_owned(),
             reviewer_model: "model".to_owned(),
+            reviewer_reasoning_effort: None,
             pipeline_contract_version: "contract".to_owned(),
             analysis_cursor_json: None,
             analysis_digest_json: None,
@@ -498,6 +523,7 @@ mod tests {
                         observation_key: "stable-key".to_owned(),
                         summary: "Bounded procedural summary".to_owned(),
                         evidence: vec![ValidatedObservationEvidence {
+                            event_created_at_unix: 2,
                             chunk_fingerprint: chunks[0].fingerprint.clone(),
                             turn_id: "turn-0".to_owned(),
                             event_id: "event-0".to_owned(),

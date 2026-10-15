@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
   "crates/agent",
+  "crates/compaction",
   "crates/artifacts",
   "crates/client",
   "crates/client-ffi",
@@ -14,12 +15,23 @@ members = [
   "crates/hooks",
   "crates/observability",
   "crates/desktop",
+  "crates/desktop-foundation",
+  "crates/desktop-thread",
+  "crates/desktop-administration",
+  "crates/desktop-providers",
+  "crates/desktop-mcp",
+  "crates/desktop-skills",
+  "crates/desktop-agents-doc",
+  "crates/desktop-onboarding",
+  "crates/desktop-settings",
+  "crates/desktop-task-notifications",
   "crates/desktop-updater",
   "crates/cli",
   "crates/crud",
   "crates/entity",
   "crates/migration",
   "crates/mcp",
+  "crates/mcp-oauth",
   "crates/memory",
   "crates/protocol",
   "crates/provider",
@@ -33,13 +45,14 @@ members = [
 ]
 
 [workspace.package]
-version = "0.41.1"
+version = "0.59.0"
 edition = "2024"
 license = "MIT"
 authors = ["Pioneer Contributors"]
 
 [workspace.dependencies]
 # Local
+pioneer-compaction = { path = "crates/compaction" }
 pioneer-agent = { path = "crates/agent" }
 pioneer-artifacts = { path = "crates/artifacts" }
 pioneer-client = { path = "crates/client" }
@@ -52,11 +65,24 @@ pioneer-hooks = { path = "crates/hooks" }
 pioneer-observability = { path = "crates/observability" }
 pioneer-config = { path = "crates/config" }
 pioneer-desktop = { path = "crates/desktop" }
+pioneer-desktop-foundation = { path = "crates/desktop-foundation" }
+pioneer-desktop-thread = { path = "crates/desktop-thread" }
+pioneer-desktop-administration = { path = "crates/desktop-administration" }
+pioneer-desktop-providers = { path = "crates/desktop-providers" }
+pioneer-desktop-mcp = { path = "crates/desktop-mcp" }
+pioneer-desktop-skills = { path = "crates/desktop-skills" }
+pioneer-desktop-agents-doc = { path = "crates/desktop-agents-doc" }
+pioneer-desktop-onboarding = { path = "crates/desktop-onboarding" }
+pioneer-desktop-settings = { path = "crates/desktop-settings" }
+pioneer-desktop-workspaces = { path = "crates/desktop-workspaces" }
+pioneer-desktop-update = { path = "crates/desktop-update" }
+pioneer-desktop-task-notifications = { path = "crates/desktop-task-notifications" }
 pioneer-app-updater = { path = "crates/desktop-updater" }
 pioneer-cli = { path = "crates/cli" }
 pioneer-crud = { path = "crates/crud" }
 pioneer-entity = { path = "crates/entity" }
 pioneer-migration = { path = "crates/migration" }
+pioneer-mcp-oauth = { path = "crates/mcp-oauth" }
 pioneer-mcp = { path = "crates/mcp" }
 pioneer-memory = { path = "crates/memory" }
 pioneer-protocol = { path = "crates/protocol" }
@@ -69,6 +95,11 @@ pioneer-tools = { path = "crates/tools" }
 pioneer-sqlite = { path = "crates/sqlite" }
 pioneer-promt = { path = "crates/promt" }
 
+# Native skills directory notifications (FSEvents on macOS).
+notify = { version = "=8.2.0", default-features = true }
+same-file = "=1.0.6"
+async-stream = "0.3"
+
 # Error handling
 anyhow = "1"
 
@@ -79,12 +110,12 @@ serde_yaml = "0.9"
 semver = "1"
 toml = "1.1"
 schemars = { version = "1.2", features = ["derive"] }
-jsonwebtoken = { version = "10", features = ["rust_crypto"] }
-uuid = "1.24"
+jsonwebtoken = { version = "11", features = ["rust_crypto"] }
+uuid = "1.27"
 
 # Async
-axum = { version = "=0.8.9", features = ["ws"] }
-tokio = { version = "1.52", features = ["full"] }
+axum = { version = "0.8.9", features = ["ws"] }
+tokio = { version = "1.53", features = ["full"] }
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 tokio-util = { version = "0.7", features = ["full"] }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
@@ -94,25 +125,25 @@ log = "0.4"
 env_logger = "0.11"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3" }
-sentry = { version = "0.48", default-features = false, features = ["anyhow", "backtrace", "contexts", "panic", "transport", "tracing"] }
+sentry = { version = "0.49", default-features = false, features = ["anyhow", "backtrace", "contexts", "panic", "transport", "tracing"] }
 dotenvy = "0.15"
 opentelemetry = { version = "0.32", default-features = false, features = ["internal-logs", "metrics", "trace"] }
 opentelemetry_sdk = { version = "0.32", default-features = false, features = ["internal-logs", "metrics", "trace"] }
-opentelemetry-otlp = { version = "0.32", default-features = false, features = ["internal-logs", "metrics", "trace", "http-proto", "reqwest-blocking-client"] }
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["internal-logs", "metrics", "trace", "http-proto", "reqwest-blocking-client", "experimental-http-retry"] }
 
 # UI
-gpui = { git = "https://github.com/zed-industries/zed" }
-gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["font-kit"] }
-gpui-component = { git = "https://github.com/longbridge/gpui-component", package = "gpui-component" }
-gpui-component-assets = { git = "https://github.com/longbridge/gpui-component", package = "gpui-component-assets" }
+gpui-kit = { git = "https://github.com/longbridge/gpui-kit", default-features = false, features = ["gpui-fast"] }
+gpui-webview = { git = "https://github.com/longbridge/gpui-kit" }
+wry = { version = "0.53.3", package = "lb-wry" }
 terminal = { path = "crates/terminal" }
 markdown = "1"
 
 # Tokenization
 tiktoken-rs = "0.12"
-syntect = { version = "=5.3.0", default-features = false, features = ["parsing", "default-syntaxes", "default-themes", "regex-onig", "dump-load"] }
+syntect = { version = "5.3", default-features = false, features = ["parsing", "default-syntaxes", "default-themes", "regex-onig", "dump-load"] }
 two-face = { version = "=0.5.1", default-features = false, features = ["syntect-onig"] }
-unicode-width = "=0.2.2"
+unicode-width = "0.2"
+webbrowser = { version = "1.2.4", features = ["hardened"] }
 
 # Utils
 nanoid = "0.5"
@@ -121,7 +152,7 @@ futures-timer = "3"
 async-trait = "0.1"
 tokio-stream = "0.1"
 config = "0.15"
-dirs = "6"
+dirs = "7"
 rand = "0.10"
 webclaw-core = { git = "https://github.com/0xMassi/webclaw", package = "webclaw-core", default-features = false }
 nono = { git = "https://github.com/nolabs-ai/nono", tag = "v0.66.0", default-features = false }
@@ -129,7 +160,7 @@ scraper = "0.27"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 chrono-tz = "0.10"
 xcap = "0.9"
-xa11y = "0.11"
+xa11y = "0.15"
 tempfile = "3"
 fs4 = "1.1"
 lazy_static = "1.5"
@@ -140,10 +171,11 @@ pretty_assertions = "1"
 shell-words = "1.1"
 keepawake = "0.6"
 cpal = "0.18"
+tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
 transcribe-rs = { version = "0.3.11", features = ["onnx", "whisper-cpp"] }
 
 # Agent memory capsule store
-memvid-core = { git = "https://github.com/pioneerdotai/memory", tag = "v3.1.2", default-features = false, features = ["lex", "temporal_track", "simd", "vec"] }
+memvid-core = { git = "https://github.com/pioneerdotai/memory", tag = "v3.1.8", default-features = false, features = ["lex", "temporal_track", "simd", "vec"] }
 
 # Embed
 rust-embed = "8"
@@ -153,9 +185,10 @@ rust-i18n = "4"
 sys-locale = "0.3"
 
 # HTTP
-reqwest = { version = "0.13", features = ["json", "query", "stream", "multipart", "blocking", "socks"] }
+reqwest = { version = "0.13", features = ["json", "query", "stream", "multipart", "blocking", "socks", "gzip"] }
+bytes = "1"
 http = "1"
-rathole = { git = "https://github.com/pioneerdotai/relay.git", default-features = false, features = ["client"] }
+rathole = { git = "https://github.com/pioneerdotai/relay.git", version = "0.6.1", default-features = false, features = ["client"] }
 
 # Crypto
 hmac = "0.13"
@@ -163,8 +196,8 @@ sha2 = "0.11"
 zeroize = "1"
 subtle = "2.6"
 hex = "0.4"
-icu_collator = "2.2.1"
-base64 = "0.22"
+icu_collator = "2.3"
+base64 = "0.23"
 url = "2"
 libc = "0.2"
 mime_guess = "2"
@@ -175,11 +208,17 @@ tar = "0.4"
 windows-sys = "0.61"
 
 # Database
-sea-orm = "2.0.0-rc.43"
-sea-orm-migration = "2.0.0-rc.43"
+sea-orm = "2.0"
+sea-orm-migration = "2.0"
 rusqlite = { version = "0.39", default-features = false, features = ["functions", "blob", "bundled", "array"] }
-zstd = { version = "0.13", features = ["experimental"] }
+zstd = { version = "0.14", features = ["experimental"] }
 
 # MCP
-rmcp = { version = "2.2", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest"] }
-process-wrap = { version = "9.1.0", features = ["tokio1"] }
+rmcp = { version = "3.5", default-features = false, features = ["auth", "client", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest"] }
+process-wrap = { version = "10", features = ["tokio1"] }
+
+# Patched Fast composition from the Pioneer fork.
+[patch.crates-io]
+gpui-fast = { git = "https://github.com/pioneerdotai/gpui-fast", branch = "cargo/composition-input" }
+gpui-fast-linux = { git = "https://github.com/pioneerdotai/gpui-fast", branch = "cargo/composition-input" }
+gpui-fast-macos = { git = "https://github.com/pioneerdotai/gpui-fast", branch = "cargo/composition-input" }

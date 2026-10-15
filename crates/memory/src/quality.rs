@@ -1224,6 +1224,7 @@ mod tests {
             source_context_kind: None,
             disposition: Some(MemorySemanticWriteDisposition::AcceptActive),
             client_provided_key: None,
+            target_memory_id: None,
             confidence: Some(0.95),
             importance: Some(0.7),
             metadata: BTreeMap::new(),
@@ -1345,6 +1346,7 @@ mod tests {
 
     fn memory_record_with_metadata(metadata: BTreeMap<String, Value>) -> MemoryRecord {
         MemoryRecord {
+            recall_eligibility: None,
             id: "memory-1".to_owned(),
             scope: MemoryScope {
                 kind: MemoryScopeKind::User,

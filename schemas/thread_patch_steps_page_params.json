@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ThreadPatchStepsPageParams",
+  "type": "object",
+  "properties": {
+    "cursor": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/PatchThreadHistoryCursor"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "limit": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "minimum": 0
+    },
+    "threadId": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "threadId"
+  ],
+  "$defs": {
+    "PatchThreadHistoryCursor": {
+      "type": "object",
+      "properties": {
+        "committedAtUnixMs": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
+        "ordinal": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "sourceThreadId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "turnId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "turnId",
+        "ordinal"
+      ]
+    }
+  }
+}

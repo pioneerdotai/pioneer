@@ -91,6 +91,7 @@ impl TurnToolProvider for GatewayArtifactToolProvider {
             .artifact_tool_state_for_turn(context.turn_id.as_str())
             .await;
         let agent_tool_context = context.clone();
+        let context_for_results = context.clone();
         let artifact_context = ArtifactToolContext {
             workspace_id: context.workspace_id,
             thread_id: context.thread_id,
@@ -133,10 +134,13 @@ impl TurnToolProvider for GatewayArtifactToolProvider {
             .into_iter()
             .collect::<Vec<_>>();
         bundles.extend(agent_actions.bundles);
+        bundles.push(processor.html_tools(context_for_results.clone()));
+        bundles.push(processor.thread_result_tools(context_for_results));
 
         Ok(TurnToolMaterialization {
             bundles,
             diagnostics: agent_actions.diagnostics,
+            initiating_thread_id: agent_actions.initiating_thread_id,
         })
     }
 
@@ -359,20 +363,26 @@ impl MessageProcessor {
         self.artifact_output_dirs
             .lock()
             .await
-            .insert(turn_id.to_owned(), output_dir.path.display().to_string());
+            .insert(turn_id.to_owned(), output_dir);
         Ok(environment)
     }
 
     pub(crate) async fn bind_artifact_tool_bridge(self: &Arc<Self>) {
+        *self
+            .mcp_service
+            .inner
+            .html_processor
+            .write()
+            .expect("HTML processor lock") = Arc::downgrade(self);
         self.agent_manager
-            .set_turn_tool_provider(Some(Arc::new(GatewayArtifactToolProvider::new(
-                Arc::downgrade(self),
-            ))))
-            .await;
-        self.agent_manager
-            .set_turn_finalization_provider(Some(Arc::new(
-                GatewayArtifactFinalizationProvider::new(Arc::downgrade(self)),
-            )))
+            .set_turn_execution_providers(
+                Some(Arc::new(GatewayArtifactToolProvider::new(Arc::downgrade(
+                    self,
+                )))),
+                Some(Arc::new(GatewayArtifactFinalizationProvider::new(
+                    Arc::downgrade(self),
+                ))),
+            )
             .await;
     }
 
@@ -467,7 +477,12 @@ impl MessageProcessor {
             .get(turn_id)
             .map(|state| state.prepared_outputs())
             .unwrap_or_default();
-        let output_dir = self.artifact_output_dirs.lock().await.get(turn_id).cloned();
+        let output_dir = self
+            .artifact_output_dirs
+            .lock()
+            .await
+            .get(turn_id)
+            .map(|output| output.path.display().to_string());
 
         artifact_finalization_diagnostics::diagnose_artifact_finalization(
             prepared_outputs.as_slice(),

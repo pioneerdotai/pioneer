@@ -1,3 +1,4 @@
+use crate::file_tools::NativeFileToolCapability;
 use crate::types::{
     ChatRequest, ChatResponse, EmbeddingRequest, EmbeddingResponse, ProviderCapabilities,
     ProviderFailureClassification, StreamChunk,
@@ -8,10 +9,36 @@ use futures_util::stream::BoxStream;
 
 use pioneer_protocol::ProviderModelInfo;
 
+/// Result of a safe, non-inference provider warm-up.
+///
+/// `NotSupported` is intentionally distinct from success: adapters that do
+/// not expose a harmless health/authentication endpoint must not be reported
+/// as verified merely because the default implementation did no work.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProviderWarmupOutcome {
+    Completed,
+    NotSupported,
+}
+
 #[async_trait]
 pub trait Provider: Send + Sync {
     /// Human-readable provider name (e.g. "openrouter", "anthropic").
     fn name(&self) -> &str;
+
+    /// Actual adapter API, independent of the API preferred by the model catalog.
+    fn usage_api(&self) -> &'static str {
+        "chat_completions"
+    }
+
+    fn usage_api_version(&self) -> Option<String> {
+        None
+    }
+
+    /// Public route identity: an opaque endpoint fingerprint and API template.
+    /// Never credentials, query, private host or configured path fragments.
+    fn usage_route(&self) -> Option<String> {
+        None
+    }
 
     /// Non-secret identity of the credential/account/endpoint authority that
     /// created this instance. Registry-managed providers always expose one;
@@ -25,14 +52,40 @@ pub trait Provider: Send + Sync {
         ProviderCapabilities::default()
     }
 
+    /// Adapter capability is a protocol ceiling; known catalog model support
+    /// can narrow it. Absence remains unknown, not evidence for every model.
+    fn model_tool_calling(&self, model: &str) -> bool {
+        self.capabilities().tool_calling
+            && crate::tools::policy::model_tool_support(self.name(), model) != Some(false)
+    }
+
+    /// Selects the native file-tool wire contract for this provider/model.
+    /// The decision is provider-owned and fail-closed for unknown families;
+    /// callers must use the same result for both catalog and prompt output.
+    fn native_file_tool_capability(&self, model: &str) -> NativeFileToolCapability {
+        crate::file_tools::select_native_file_tool_capability(self.name(), model)
+    }
+
     /// Classify a provider-owned error when the adapter has structured
     /// knowledge that the provider-neutral fallback cannot have.
     ///
     /// Returning `None` is always safe: unknown request rejections are not
     /// retried, while transport/HTTP transient failures are classified by the
-    /// agent's provider-neutral fallback.
-    fn classify_failure(&self, _error: &anyhow::Error) -> Option<ProviderFailureClassification> {
-        None
+    /// shared provider-neutral fallback before endpoint errors are redacted.
+    fn classify_failure(&self, error: &anyhow::Error) -> Option<ProviderFailureClassification> {
+        crate::failure::classify_stream_error(error)
+    }
+
+    /// Materialize and locally budget the media that this request will send.
+    /// The registry wrapper supplies and revalidates the same authority as chat.
+    /// This path performs no model request or provider upload.
+    async fn prepare_input_budget(
+        &self,
+        request: ChatRequest,
+    ) -> Result<crate::attachments::PreparedInputBudget> {
+        let request = crate::history::project_request_for_provider(self.name(), request)?;
+        crate::attachments::input_estimate::prepare(self.name(), &self.capabilities(), request)
+            .await
     }
 
     /// Send a chat request and receive the complete response.
@@ -48,6 +101,17 @@ pub trait Provider: Send + Sync {
         &self,
         request: ChatRequest,
     ) -> Result<BoxStream<'static, Result<StreamChunk>>>;
+
+    /// Send a stream with request-owned facts for agent-side deadline failures.
+    /// Default adapters retain their existing stream behavior with no known ID.
+    async fn stream_chat_with_diagnostics(
+        &self,
+        request: ChatRequest,
+    ) -> Result<crate::ProviderStream> {
+        self.stream_chat(request)
+            .await
+            .map(crate::ProviderStream::new)
+    }
 
     /// List all models available from this provider.
     /// Default implementation returns an error for providers that don't support listing.
@@ -79,10 +143,13 @@ pub trait Provider: Send + Sync {
         anyhow::bail!("provider '{}' does not support embeddings", self.name())
     }
 
-    /// Pre-warm the HTTP connection pool (TLS handshake, DNS, HTTP/2 setup).
-    /// Default implementation is a no-op.
-    async fn warmup(&self) -> Result<()> {
-        Ok(())
+    /// Run a safe readiness probe without making a paid inference request.
+    ///
+    /// Adapters without a harmless health/authentication endpoint return
+    /// `NotSupported`; callers must preserve that distinction instead of
+    /// treating a no-op as proof of readiness.
+    async fn warmup(&self) -> Result<ProviderWarmupOutcome> {
+        Ok(ProviderWarmupOutcome::NotSupported)
     }
 }
 
@@ -120,6 +187,7 @@ mod tests {
                 usage: Some(TokenUsage {
                     input_tokens: Some(10),
                     output_tokens: Some(5),
+                    ..Default::default()
                 }),
                 reasoning_content: None,
                 tool_calls: Vec::new(),
@@ -224,5 +292,69 @@ mod tests {
             error.to_string(),
             "provider 'mock' does not support listing transcription models"
         );
+    }
+
+    #[tokio::test]
+    async fn provider_default_warmup_is_explicitly_unverified() {
+        assert_eq!(
+            MockProvider.warmup().await.expect("default warm-up"),
+            ProviderWarmupOutcome::NotSupported
+        );
+    }
+
+    #[tokio::test]
+    async fn default_budget_preflight_uses_target_model_history_projection() {
+        use crate::{MessageProvenance, MessageSourceRef, ProviderReplayState};
+
+        let replay = ProviderReplayState::for_model(
+            "foreign",
+            "source-model",
+            serde_json::json!({
+                "schema_version":1,
+                "assistant_message":{
+                    "content":null,
+                    "reasoning_content":"meaningful reasoning",
+                    "tool_calls":[]
+                }
+            }),
+        );
+        let mut message = ChatMessage::assistant("answer");
+        message.provider_replay_state = Some(replay.clone());
+        message.provenance = Some(MessageProvenance {
+            logical_turn_id: Some("turn".into()),
+            workspace_id: "workspace".into(),
+            thread_id: "thread".into(),
+            context_thread: None,
+            unit_id: "answer".into(),
+            sources: vec![MessageSourceRef {
+                scope: "event:turn".into(),
+                id: "source".into(),
+                version: "revision:1".into(),
+            }],
+            complete: true,
+            protected_input: false,
+            inherited: false,
+            source_aliases: vec![],
+            ambiguous_input_aliases: vec![],
+        });
+        let request = ChatRequest {
+            model: "target-model".into(),
+            messages: vec![message.clone()],
+            temperature: None,
+            max_tokens: None,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            reasoning: None,
+            compiled_prompt: None,
+        };
+
+        let prepared = MockProvider.prepare_input_budget(request).await.unwrap();
+        assert_eq!(
+            prepared.request.messages[0].reasoning_content.as_deref(),
+            Some("meaningful reasoning")
+        );
+        assert!(prepared.request.messages[0].provider_replay_state.is_none());
+        assert_eq!(message.provider_replay_state.as_ref(), Some(&replay));
     }
 }

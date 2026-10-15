@@ -17,7 +17,7 @@ pub const TURN_RESUME_IN_PROGRESS_POLL_DELAY: Duration = Duration::from_millis(8
 pub const TURN_RESUME_MISMATCH_RETRY_DELAY: Duration = Duration::from_secs(5);
 pub const TURN_RESUME_ITEMS_PAGE_LIMIT: u32 = 200;
 
-#[derive(Default)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct ThreadResumeCoordinator {
     pub in_progress: bool,
     pub retry_attempt: u32,

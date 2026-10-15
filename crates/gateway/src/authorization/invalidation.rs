@@ -36,6 +36,7 @@ pub(crate) struct AccessChangeSignal {
 /// to isolated tests that do not own a database.
 pub(crate) struct AuthorizationInvalidationHub {
     generation: AtomicU64,
+    initialization: tokio::sync::Mutex<()>,
     store: Option<Arc<CrudStore>>,
 }
 
@@ -43,6 +44,7 @@ impl Default for AuthorizationInvalidationHub {
     fn default() -> Self {
         Self {
             generation: AtomicU64::new(0),
+            initialization: tokio::sync::Mutex::new(()),
             store: None,
         }
     }
@@ -52,12 +54,48 @@ impl AuthorizationInvalidationHub {
     pub(crate) fn durable(store: Arc<CrudStore>) -> Self {
         Self {
             generation: AtomicU64::new(0),
-            store: Some(store),
+            initialization: tokio::sync::Mutex::new(()),
+            // Policy generations and committed ACL invalidations fence every
+            // later authorization decision. They are control-plane writes,
+            // independent of whether the mutation which triggered them came
+            // from an interactive request or a recovery worker.
+            store: Some(Arc::new(store.with_critical_writes())),
         }
     }
 
     pub(crate) async fn current_generation(&self) -> Result<PolicyGeneration> {
-        if let Some(store) = &self.store {
+        if let Some(generation) = self.cached_generation() {
+            return Ok(generation);
+        }
+        self.current_generation_with_store(self.store.as_deref())
+            .await
+    }
+
+    pub(crate) async fn current_generation_for_maintenance(&self) -> Result<PolicyGeneration> {
+        if let Some(generation) = self.cached_generation() {
+            return Ok(generation);
+        }
+        match self.store.as_deref() {
+            Some(store) => {
+                let store = store.with_maintenance_reads_and_critical_writes();
+                self.current_generation_with_store(Some(&store)).await
+            }
+            None => self.current_generation_with_store(None).await,
+        }
+    }
+
+    async fn current_generation_with_store(
+        &self,
+        store: Option<&CrudStore>,
+    ) -> Result<PolicyGeneration> {
+        if let Some(generation) = self.cached_generation() {
+            return Ok(generation);
+        }
+        let _initialization = self.initialization.lock().await;
+        if let Some(generation) = self.cached_generation() {
+            return Ok(generation);
+        }
+        if let Some(store) = store {
             let fingerprint = RoleDefinitionRegistry::new().policy_fingerprint();
             let initialized = pioneer_crud::ensure_code_policy_generation(
                 &store.database_connection(),
@@ -71,20 +109,22 @@ impl AuthorizationInvalidationHub {
             self.observe(durable);
             return Ok(durable);
         }
-        let current = self.generation.load(Ordering::Acquire);
-        if let Some(current) = PolicyGeneration::new(current) {
-            return Ok(current);
-        }
-        self.generation
-            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
-            .ok();
+        self.observe(PolicyGeneration::INITIAL);
         Ok(PolicyGeneration::INITIAL)
+    }
+
+    fn cached_generation(&self) -> Option<PolicyGeneration> {
+        PolicyGeneration::new(self.generation.load(Ordering::Acquire))
     }
 
     pub(crate) async fn current_revision(&self) -> Result<u64> {
         Ok(self.current_generation().await?.get())
     }
 
+    /// Publish only a committed difference in role assignments or ACL grants.
+    /// Callers must use the mutation's in-transaction change receipt (or a newly
+    /// created principal/grant). Catalog/profile/invitation data notifications
+    /// have independent revisions and never pass through this policy fence.
     pub(crate) async fn publish_change(
         &self,
         change: AuthorizationChangeKind,

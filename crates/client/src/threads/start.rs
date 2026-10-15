@@ -9,7 +9,7 @@ pub const WORKSPACE_START_SCOPE_BOOTSTRAP: &str = "__bootstrap__";
 pub const THREAD_START_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(500);
 pub const THREAD_START_RETRY_MAX_DELAY: Duration = Duration::from_millis(5_000);
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct ThreadStartCoordinator {
     pub pending_thread_id: Option<String>,
     pub in_progress: bool,

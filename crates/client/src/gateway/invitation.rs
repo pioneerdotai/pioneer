@@ -96,7 +96,9 @@ impl std::fmt::Debug for InvitationQrPresentation {
 ///
 /// The phase is safe to project into UI state. The secret presentation itself
 /// remains owned by [`InvitationJoinFlow`] and is never part of a snapshot.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum InvitationJoinPhase {
     Parsing,
     Previewing,

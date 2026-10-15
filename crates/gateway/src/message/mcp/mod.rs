@@ -21,42 +21,117 @@ const MCP_ERROR_INTERNAL: &str = "mcp.internal_error";
 mod details;
 mod install;
 mod list;
+mod oauth;
 mod policy;
 mod restart;
 mod uninstall;
 
 impl MessageProcessor {
-    pub(crate) async fn start_mcp_workspace_supervisor(self: &std::sync::Arc<Self>) {
-        let this = self.clone();
-        let _handle = tokio::spawn(async move {
-            let workspaces = match this.workspace_manager.list_workspaces().await {
-                Ok(workspaces) => workspaces
-                    .into_iter()
-                    .filter(|workspace| workspace.is_active)
-                    .collect::<Vec<_>>(),
+    pub(crate) async fn initialize_mcp_workspaces_with_retry(
+        self: &std::sync::Arc<Self>,
+        cancellation: &tokio_util::sync::CancellationToken,
+        on_degraded: impl Fn(bool),
+    ) -> Result<()> {
+        let maintenance = self.for_background_reconciliation();
+        let mut initialized = std::collections::HashSet::new();
+        let mut retry_delay = std::time::Duration::from_millis(250);
+        loop {
+            if cancellation.is_cancelled() {
+                anyhow::bail!("MCP workspace initialization cancelled");
+            }
+            let trace = pioneer_observability::GatewayOperationTrace::start(
+                pioneer_observability::GatewayOperation::McpWorkspaceInitialize,
+            );
+            let workspaces_stage =
+                trace.stage(pioneer_observability::GatewayOperationStage::McpWorkspacesLoad);
+            let workspaces = match maintenance.workspace_manager.list_workspaces().await {
+                Ok(workspaces) => {
+                    workspaces_stage.succeed();
+                    workspaces
+                        .into_iter()
+                        .filter(|workspace| workspace.is_active)
+                        .collect::<Vec<_>>()
+                }
                 Err(error) => {
+                    drop(workspaces_stage);
+                    on_degraded(true);
                     warn!(
                         error = %error,
                         "failed to list workspaces for MCP startup supervisor"
                     );
-                    return;
+                    trace.finish_failure();
+                    tokio::select! {
+                        _ = cancellation.cancelled() => anyhow::bail!("MCP workspace initialization cancelled"),
+                        _ = tokio::time::sleep(retry_delay) => {}
+                    }
+                    retry_delay = retry_delay
+                        .saturating_mul(2)
+                        .min(std::time::Duration::from_secs(30));
+                    continue;
                 }
             };
 
-            for workspace in workspaces {
-                if let Err(error) = this
+            let current_workspace_ids = workspaces
+                .iter()
+                .map(|workspace| workspace.id.clone())
+                .collect::<std::collections::HashSet<_>>();
+            initialized.retain(|workspace_id| current_workspace_ids.contains(workspace_id));
+            let pending_workspaces = workspaces
+                .into_iter()
+                .filter(|workspace| !initialized.contains(&workspace.id))
+                .collect::<Vec<_>>();
+            let mut first_error = None;
+            for workspace in pending_workspaces {
+                if cancellation.is_cancelled() {
+                    trace.finish_cancelled();
+                    anyhow::bail!("MCP workspace initialization cancelled");
+                }
+                let reload_stage =
+                    trace.stage(pioneer_observability::GatewayOperationStage::McpWorkspaceReload);
+                if let Err(error) = maintenance
                     .mcp_service
-                    .reload_workspace(workspace.id.as_str())
+                    .reload_workspace_for_maintenance(workspace.id.as_str())
                     .await
                 {
+                    drop(reload_stage);
                     warn!(
                         workspace_id = workspace.id.as_str(),
                         error = %format!("{error:#}"),
                         "failed to start MCP workspace runtime"
                     );
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                } else {
+                    reload_stage.succeed();
+                    initialized.insert(workspace.id);
                 }
             }
-        });
+            if let Some(error) = first_error {
+                on_degraded(true);
+                trace.finish_failure();
+                warn!(
+                    error = %format!("{error:#}"),
+                    retry_delay_ms = retry_delay.as_millis() as u64,
+                    "MCP workspace initialization incomplete; retrying"
+                );
+                tokio::select! {
+                    _ = cancellation.cancelled() => anyhow::bail!("MCP workspace initialization cancelled"),
+                    _ = tokio::time::sleep(retry_delay) => {}
+                }
+                retry_delay = retry_delay
+                    .saturating_mul(2)
+                    .min(std::time::Duration::from_secs(30));
+            } else {
+                if cancellation.is_cancelled() {
+                    trace.finish_cancelled();
+                    anyhow::bail!("MCP workspace initialization cancelled");
+                }
+                on_degraded(false);
+                trace.finish_success();
+                return Ok(());
+            }
+        }
     }
 }
 
@@ -73,11 +148,24 @@ fn mcp_error(
         MCP_ERROR_NOT_FOUND => pioneer_protocol::PublicErrorCode::NotFound,
         _ => pioneer_protocol::PublicErrorCode::Internal,
     };
-    let public_error = crate::public_error::map_agent_failure(
+    let public_error = crate::public_error::build_public_error(
         public_code,
         pioneer_protocol::PublicErrorStage::Discovery,
-        format!("{code}: {message}; details={details}"),
     );
+    match code {
+        MCP_ERROR_INVALID_REQUEST => crate::public_error::report_expected_failure(
+            &public_error,
+            "mcp_request",
+            "invalid_request",
+        ),
+        MCP_ERROR_NOT_FOUND => {
+            crate::public_error::report_expected_failure(&public_error, "mcp_request", "not_found")
+        }
+        _ => crate::public_error::report_agent_failure(
+            &public_error,
+            format!("{code}: {message}; details={details}"),
+        ),
+    }
     JsonRpcErrorResponse {
         jsonrpc: pioneer_protocol::JSONRPC_VERSION.to_owned(),
         id: request_id,
@@ -277,8 +365,8 @@ impl MessageProcessor {
             return;
         }
 
-        self.publish_resource_selector_change(workspace_id).await;
-
+        // Runtime configuration changes availability, not authorization grants.
+        // Keep this on the MCP notification stream instead of a policy fence.
         let snapshot_version = self.next_mcp_snapshot_version();
         let notification = McpChangedNotification {
             workspace_id: workspace_id.to_owned(),
@@ -343,5 +431,62 @@ impl MessageProcessor {
             .await;
 
         Ok(workspace_id)
+    }
+}
+
+#[cfg(test)]
+mod public_error_tests {
+    use super::*;
+    use crate::public_error::test_support::*;
+
+    #[test]
+    fn mcp_refusals_are_expected_and_unknown_causes_remain_correlated_errors() {
+        for (cause, public_code, expected) in [
+            (
+                MCP_ERROR_INVALID_REQUEST,
+                pioneer_protocol::PublicErrorCode::InvalidInput,
+                true,
+            ),
+            (
+                MCP_ERROR_NOT_FOUND,
+                pioneer_protocol::PublicErrorCode::NotFound,
+                true,
+            ),
+            (
+                MCP_ERROR_INTERNAL,
+                pioneer_protocol::PublicErrorCode::Internal,
+                false,
+            ),
+            (
+                "mcp.unclassified",
+                pioneer_protocol::PublicErrorCode::Internal,
+                false,
+            ),
+        ] {
+            let (response, events) = capture_events(|| {
+                mcp_error(
+                    None,
+                    INVALID_PARAMS_CODE,
+                    cause,
+                    "bearer-token /private/path",
+                    json!({"private": "bearer-token /private/path"}),
+                )
+            });
+            let encoded = serde_json::to_string(&response).unwrap();
+            assert!(!encoded.contains("bearer-token"));
+            assert!(!encoded.contains("/private/path"));
+            assert_eq!(response.error.code, INVALID_PARAMS_CODE);
+            let public: pioneer_protocol::PublicError =
+                serde_json::from_value(response.error.data.unwrap()["public_error"].clone())
+                    .unwrap();
+            assert_eq!(public.code, public_code);
+            assert_eq!(public.stage, pioneer_protocol::PublicErrorStage::Discovery);
+            if expected {
+                assert!(events.is_empty());
+            } else {
+                assert_eq!(events.len(), 1);
+                assert_correlated(&events[0], &public);
+            }
+        }
     }
 }

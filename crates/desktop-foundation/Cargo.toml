@@ -1,0 +1,21 @@
+[package]
+name = "pioneer-desktop-foundation"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+gpui-kit = { workspace = true, features = ["component"] }
+pioneer-client.workspace = true
+
+[dev-dependencies]
+pioneer-client = { workspace = true, features = ["test-support"] }
+
+[package.metadata.pioneer-desktop-foundation]
+forbidden-dependencies = [
+  "pioneer-client-ffi",
+  "pioneer-desktop",
+  "react-native",
+  "nitro",
+]

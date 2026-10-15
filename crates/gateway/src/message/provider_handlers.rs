@@ -63,6 +63,25 @@ impl MessageProcessor {
                 return;
             }
         };
+        let provider_base_urls = match self
+            .gateway_secrets
+            .list_workspace_provider_base_urls(workspace_id.as_str())
+        {
+            Ok(provider_base_urls) => provider_base_urls,
+            Err(error) => {
+                let message = if member {
+                    "provider catalog is unavailable".to_owned()
+                } else {
+                    format!("failed to list provider base urls: {error:#}")
+                };
+                self.send_error(
+                    connection_id,
+                    JsonRpcErrorResponse::new(Some(request_id), INVALID_REQUEST_CODE, message),
+                )
+                .await;
+                return;
+            }
+        };
 
         let mut provider_configs = std::collections::BTreeMap::new();
         for name in provider_names {
@@ -71,19 +90,36 @@ impl MessageProcessor {
             // must remain true for a Member, otherwise the shared clients
             // correctly filter the provider out as unusable. Secret-bearing
             // proxy configuration remains redacted below.
-            provider_configs.insert(name, (true, None));
+            provider_configs.insert(name, (true, None, None));
         }
         for (name, proxy_url) in provider_proxies {
             provider_configs
                 .entry(name)
-                .and_modify(|(_, existing_proxy)| *existing_proxy = Some(proxy_url.clone()))
-                .or_insert((false, Some(proxy_url)));
+                .and_modify(|entry: &mut (bool, Option<String>, Option<String>)| {
+                    entry.1 = Some(proxy_url.clone())
+                })
+                .or_insert((false, Some(proxy_url), None));
+        }
+        for (name, base_url) in provider_base_urls {
+            provider_configs
+                .entry(name)
+                .and_modify(|entry: &mut (bool, Option<String>, Option<String>)| {
+                    entry.2 = Some(base_url.clone())
+                })
+                .or_insert((false, None, Some(base_url)));
         }
 
         // Local is built in, so there is no workspace secret or proxy from which to discover it.
         provider_configs
             .entry("local".to_owned())
-            .or_insert((false, None));
+            .or_insert((false, None, None));
+        if pioneer_provider::provider_definition("bedrock").is_some_and(|definition| {
+            pioneer_provider::provider_is_available(false, false, false, definition)
+        }) {
+            provider_configs
+                .entry("bedrock".to_owned())
+                .or_insert((false, None, None));
+        }
 
         let providers = provider_configs
             .into_iter()
@@ -94,9 +130,16 @@ impl MessageProcessor {
                     name.as_str(),
                 )
             })
-            .map(|(name, (api_key_configured, proxy_url))| {
-                let operationally_configured =
-                    api_key_configured || proxy_url.is_some() || name == "local";
+            .map(|(name, (api_key_configured, proxy_url, base_url))| {
+                let operationally_configured = pioneer_provider::provider_definition(&name)
+                    .is_some_and(|definition| {
+                        pioneer_provider::provider_is_available(
+                            api_key_configured,
+                            proxy_url.is_some(),
+                            base_url.is_some(),
+                            definition,
+                        )
+                    });
                 let capabilities = self
                     .provider_registry
                     .get_or_create_for_workspace(workspace_id.as_str(), name.as_str())
@@ -126,12 +169,32 @@ impl MessageProcessor {
                     } else {
                         api_key_configured
                     },
+                    available: Some(operationally_configured),
                     proxy_url: if member { None } else { proxy_url },
+                    base_url: if member { None } else { base_url },
                 }
             })
             .collect::<Vec<_>>();
 
-        let result = ProviderListResponse { providers };
+        let definitions = pioneer_provider::provider_definitions()
+            .filter(|definition| {
+                crate::authorization::AuthorizationService::new().provider_allowed(
+                    request_context.principal().kind,
+                    request_context.principal().role_key.as_ref(),
+                    definition.name,
+                )
+            })
+            .map(|definition| ProviderDefinition {
+                name: definition.name.to_owned(),
+                default_base_url: definition.default_base_url.map(str::to_owned),
+                supports_base_url_override: definition.supports_base_url_override,
+                retirement_reason: definition.retirement_reason().map(str::to_owned),
+            })
+            .collect();
+        let result = ProviderListResponse {
+            providers,
+            definitions,
+        };
 
         let response = match JsonRpcResponse::from_result(request_id, &result) {
             Ok(response) => response,
@@ -288,8 +351,9 @@ impl MessageProcessor {
                     "provider model catalog is unavailable".to_owned()
                 } else {
                     format!(
-                        "failed to list models for provider `{}`: {error:#}",
-                        params.provider
+                        "failed to list models for provider `{}`: {}",
+                        params.provider,
+                        self.safe_provider_error(&error)
                     )
                 };
                 self.send_error(
@@ -430,8 +494,9 @@ impl MessageProcessor {
                     "provider model catalog is unavailable".to_owned()
                 } else {
                     format!(
-                        "failed to list embedding models for provider `{}`: {error:#}",
-                        params.provider
+                        "failed to list embedding models for provider `{}`: {}",
+                        params.provider,
+                        self.safe_provider_error(&error)
                     )
                 };
                 self.send_error(
@@ -572,8 +637,9 @@ impl MessageProcessor {
                     "provider model catalog is unavailable".to_owned()
                 } else {
                     format!(
-                        "failed to list transcription models for provider `{}`: {error:#}",
-                        params.provider
+                        "failed to list transcription models for provider `{}`: {}",
+                        params.provider,
+                        self.safe_provider_error(&error)
                     )
                 };
                 self.send_error(
@@ -656,6 +722,22 @@ impl MessageProcessor {
             return;
         }
 
+        if params.clear_base_url && params.base_url.is_some() {
+            self.send_error(
+                connection_id,
+                JsonRpcErrorResponse::new(
+                    Some(request_id),
+                    INVALID_PARAMS_CODE,
+                    format!(
+                        "invalid params for `{}`: `base_url` and `clear_base_url` cannot both be set",
+                        methods::PROVIDER_CONFIGURE
+                    ),
+                ),
+            )
+            .await;
+            return;
+        }
+
         let api_key = match params.api_key {
             Some(api_key) => {
                 let trimmed = api_key.trim().to_owned();
@@ -699,6 +781,28 @@ impl MessageProcessor {
             },
             None => None,
         };
+        let base_url = match params.base_url {
+            Some(base_url) => {
+                let trimmed = base_url.trim().to_owned();
+                if trimmed.is_empty() {
+                    self.send_error(
+                        connection_id,
+                        JsonRpcErrorResponse::new(
+                            Some(request_id),
+                            INVALID_PARAMS_CODE,
+                            format!(
+                                "invalid params for `{}`: `base_url` must not be empty when provided",
+                                methods::PROVIDER_CONFIGURE
+                            ),
+                        ),
+                    )
+                    .await;
+                    return;
+                }
+                Some(trimmed)
+            }
+            None => None,
+        };
 
         let raw_provider = params.provider;
         let mut normalized_provider = match self
@@ -722,6 +826,35 @@ impl MessageProcessor {
                 return;
             }
         };
+        let raw_provider = normalized_provider.clone();
+        let reconcile_partial = || {
+            self.provider_registry
+                .invalidate_workspace_provider(workspace_id.as_str(), raw_provider.as_str());
+            self.request_api_provider_warmup(workspace_id.clone());
+        };
+        let base_url = match base_url {
+            Some(value) => {
+                match pioneer_provider::validate_provider_base_url(&raw_provider, &value) {
+                    Ok(value) => Some(value),
+                    Err(error) => {
+                        self.send_error(
+                            connection_id,
+                            JsonRpcErrorResponse::new(
+                                Some(request_id),
+                                INVALID_PARAMS_CODE,
+                                format!(
+                                    "invalid params for `{}`: {error:#}",
+                                    methods::PROVIDER_CONFIGURE
+                                ),
+                            ),
+                        )
+                        .await;
+                        return;
+                    }
+                }
+            }
+            None => None,
+        };
         let mut api_key_updated = false;
         if let Some(api_key) = api_key {
             match self.gateway_secrets.set_workspace_provider_api_key(
@@ -734,6 +867,7 @@ impl MessageProcessor {
                     api_key_updated = true;
                 }
                 Err(error) => {
+                    reconcile_partial();
                     self.send_error(
                         connection_id,
                         JsonRpcErrorResponse::new(
@@ -767,12 +901,20 @@ impl MessageProcessor {
                     response_proxy_url = Some(proxy_url);
                 }
                 Err(error) => {
+                    reconcile_partial();
                     self.send_error(
                         connection_id,
                         JsonRpcErrorResponse::new(
                             Some(request_id),
                             INVALID_REQUEST_CODE,
-                            format!("failed to save provider proxy: {error:#}"),
+                            format!(
+                                "failed to save provider proxy: {error:#}{}",
+                                if api_key_updated {
+                                    "; API key was saved"
+                                } else {
+                                    ""
+                                }
+                            ),
                         ),
                     )
                     .await;
@@ -790,12 +932,20 @@ impl MessageProcessor {
                     response_proxy_url = None;
                 }
                 Err(error) => {
+                    reconcile_partial();
                     self.send_error(
                         connection_id,
                         JsonRpcErrorResponse::new(
                             Some(request_id),
                             INVALID_REQUEST_CODE,
-                            format!("failed to delete provider proxy: {error:#}"),
+                            format!(
+                                "failed to delete provider proxy: {error:#}{}",
+                                if api_key_updated {
+                                    "; API key was saved"
+                                } else {
+                                    ""
+                                }
+                            ),
                         ),
                     )
                     .await;
@@ -804,14 +954,83 @@ impl MessageProcessor {
             }
         }
 
-        if api_key_updated || proxy_updated || proxy_deleted {
-            self.provider_registry.invalidate(raw_provider.as_str());
-            if raw_provider != normalized_provider {
-                self.provider_registry
-                    .invalidate(normalized_provider.as_str());
+        let mut base_url_updated = false;
+        let mut base_url_deleted = false;
+        let mut response_base_url = self
+            .gateway_secrets
+            .get_workspace_provider_base_url(workspace_id.as_str(), raw_provider.as_str())
+            .ok()
+            .flatten();
+        if let Some(base_url) = base_url {
+            match self.gateway_secrets.set_workspace_provider_base_url(
+                workspace_id.as_str(),
+                raw_provider.as_str(),
+                base_url.as_str(),
+            ) {
+                Ok(provider) => {
+                    normalized_provider = provider;
+                    base_url_updated = true;
+                    response_base_url = Some(base_url);
+                }
+                Err(error) => {
+                    reconcile_partial();
+                    self.send_error(
+                        connection_id,
+                        JsonRpcErrorResponse::new(
+                            Some(request_id),
+                            INVALID_REQUEST_CODE,
+                            format!(
+                                "failed to save provider base url: {error:#}{}",
+                                if api_key_updated || proxy_updated || proxy_deleted {
+                                    "; earlier fields were saved"
+                                } else {
+                                    ""
+                                }
+                            ),
+                        ),
+                    )
+                    .await;
+                    return;
+                }
             }
-            self.publish_resource_selector_change(workspace_id.as_str())
-                .await;
+        } else if params.clear_base_url {
+            match self
+                .gateway_secrets
+                .delete_workspace_provider_base_url(workspace_id.as_str(), raw_provider.as_str())
+            {
+                Ok((provider, deleted)) => {
+                    normalized_provider = provider;
+                    base_url_deleted = deleted;
+                    response_base_url = None;
+                }
+                Err(error) => {
+                    reconcile_partial();
+                    self.send_error(
+                        connection_id,
+                        JsonRpcErrorResponse::new(
+                            Some(request_id),
+                            INVALID_REQUEST_CODE,
+                            format!(
+                                "failed to delete provider base url: {error:#}{}",
+                                if api_key_updated || proxy_updated || proxy_deleted {
+                                    "; earlier fields were saved"
+                                } else {
+                                    ""
+                                }
+                            ),
+                        ),
+                    )
+                    .await;
+                    return;
+                }
+            }
+        }
+
+        if api_key_updated || proxy_updated || proxy_deleted || base_url_updated || base_url_deleted
+        {
+            self.provider_registry
+                .invalidate_workspace_provider(workspace_id.as_str(), normalized_provider.as_str());
+            self.request_api_provider_warmup(workspace_id.clone());
         }
 
         let response = ProviderConfigureResponse {
@@ -820,6 +1039,9 @@ impl MessageProcessor {
             proxy_updated,
             proxy_deleted,
             proxy_url: response_proxy_url,
+            base_url_updated,
+            base_url_deleted,
+            base_url: response_base_url,
         };
         let response = match JsonRpcResponse::from_result(request_id, &response) {
             Ok(response) => response,
@@ -939,12 +1161,9 @@ impl MessageProcessor {
             }
         };
 
-        self.provider_registry.invalidate(&raw_provider);
-        if raw_provider != normalized_provider {
-            self.provider_registry.invalidate(&normalized_provider);
-        }
-        self.publish_resource_selector_change(workspace_id.as_str())
-            .await;
+        self.provider_registry
+            .invalidate_workspace_provider(workspace_id.as_str(), &normalized_provider);
+        self.request_api_provider_warmup(workspace_id.clone());
 
         let response = ProviderSetApiKeyResponse {
             provider: normalized_provider,
@@ -1037,6 +1256,9 @@ impl MessageProcessor {
         {
             Ok(result) => result,
             Err(error) => {
+                self.provider_registry
+                    .invalidate_workspace_provider(workspace_id.as_str(), raw_provider.as_str());
+                self.request_api_provider_warmup(workspace_id.clone());
                 self.send_error(
                     connection_id,
                     JsonRpcErrorResponse::new(
@@ -1051,12 +1273,9 @@ impl MessageProcessor {
         };
 
         if deleted {
-            self.provider_registry.invalidate(&raw_provider);
-            if raw_provider != normalized_provider {
-                self.provider_registry.invalidate(&normalized_provider);
-            }
-            self.publish_resource_selector_change(workspace_id.as_str())
-                .await;
+            self.provider_registry
+                .invalidate_workspace_provider(workspace_id.as_str(), &normalized_provider);
+            self.request_api_provider_warmup(workspace_id.clone());
         }
 
         let response = ProviderDeleteApiKeyResponse {
@@ -1088,385 +1307,28 @@ impl MessageProcessor {
         }
     }
 
-    /// Load conversation history for a thread with progressive summarization.
-    ///
-    /// Strategy (ChatGPT-style):
-    /// 1. Load all completed turns + existing summary
-    /// 2. Count total tokens
-    /// 3. If < 80% of budget — return everything as-is (maximum context fidelity)
-    /// 4. If >= 80% — compress ALL turns into a ~10% summary via LLM, notify UI,
-    ///    then return the compressed summary (conversation continues growing from there)
-    #[cfg(test)]
-    pub(super) async fn load_conversation_history(
-        &self,
-        thread_id: &str,
-        turn_id: &str,
-    ) -> Vec<ChatMessage> {
-        let workspace_id = match self.crud_store.get_thread_by_id(thread_id).await {
-            Ok(Some(thread)) => Some(thread.workspace_id),
-            Ok(None) => None,
-            Err(error) => {
-                warn!(
-                    thread_id,
-                    error = %format!("{error:#}"),
-                    "failed to load thread workspace for conversation artifact refs"
-                );
-                None
-            }
-        };
-        self.load_conversation_history_inner(
-            workspace_id.as_deref(),
-            thread_id,
-            thread_id,
-            turn_id,
-            None,
-            None,
-            None,
-            false,
-        )
-        .await
-    }
-
+    /// Restore canonical history without generating summaries or truncating sources.
+    /// The native request controller owns admission and full-request budgeting.
     pub(super) async fn load_conversation_history_for_workspace(
         &self,
         workspace_id: &str,
         thread_id: &str,
         turn_id: &str,
-    ) -> Vec<ChatMessage> {
-        self.load_conversation_history_inner(
-            Some(workspace_id),
-            thread_id,
-            thread_id,
-            turn_id,
-            None,
-            None,
-            None,
-            false,
-        )
-        .await
+    ) -> anyhow::Result<Vec<ChatMessage>> {
+        let store = self.crud_store.as_ref();
+        let prepared = self
+            .capture_current_context_basis_prepared(
+                store,
+                workspace_id,
+                thread_id,
+                turn_id,
+                Some(turn_id),
+            )
+            .await?;
+        Ok(prepared.messages)
     }
 
-    pub(super) async fn load_conversation_history_for_workspace_in_execution_excluding_turn(
-        &self,
-        workspace_id: &str,
-        conversation_thread_id: &str,
-        execution_thread_id: &str,
-        execution_turn_id: &str,
-        excluded_conversation_turn_id: Option<&str>,
-        fallback_model: Option<&str>,
-        fallback_model_provider: Option<&str>,
-    ) -> Vec<ChatMessage> {
-        self.load_conversation_history_inner(
-            Some(workspace_id),
-            conversation_thread_id,
-            execution_thread_id,
-            execution_turn_id,
-            fallback_model,
-            fallback_model_provider,
-            excluded_conversation_turn_id,
-            true,
-        )
-        .await
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn load_conversation_history_inner(
-        &self,
-        workspace_id: Option<&str>,
-        conversation_thread_id: &str,
-        execution_thread_id: &str,
-        execution_turn_id: &str,
-        fallback_model: Option<&str>,
-        fallback_model_provider: Option<&str>,
-        excluded_conversation_turn_id: Option<&str>,
-        causally_closed: bool,
-    ) -> Vec<ChatMessage> {
-        use crate::tokenizer::count_tokens;
-
-        const MAX_TURNS: usize = 200;
-        const MESSAGE_OVERHEAD: usize = 4;
-        const COMPRESSION_THRESHOLD_BPS: u16 = 8_000;
-        const COMPRESSION_TARGET_BPS: u16 = 1_000;
-        const BPS_DENOMINATOR: usize = 10_000;
-
-        let budget = self.context_budget.history_budget();
-
-        let (existing_summary, existing_summary_turn_count) = match self
-            .crud_store
-            .get_thread_summary(conversation_thread_id)
-            .await
-        {
-            Ok(Some((text, turn_count))) => (Some(text), Some(turn_count)),
-            Ok(None) => (None, None),
-            Err(error) => {
-                warn!(
-                    thread_id = conversation_thread_id,
-                    error = %format!("{error:#}"),
-                    "failed to load existing thread summary"
-                );
-                (None, None)
-            }
-        };
-
-        let entries_result = if let Some(workspace_id) = workspace_id {
-            if causally_closed {
-                self.crud_store
-                    .get_thread_causally_closed_conversation_history_with_artifacts(
-                        workspace_id,
-                        conversation_thread_id,
-                        MAX_TURNS,
-                    )
-                    .await
-            } else {
-                self.crud_store
-                    .get_thread_conversation_history_with_artifacts(
-                        workspace_id,
-                        conversation_thread_id,
-                        MAX_TURNS,
-                    )
-                    .await
-            }
-        } else if causally_closed {
-            self.crud_store
-                .get_thread_causally_closed_conversation_history(conversation_thread_id, MAX_TURNS)
-                .await
-        } else {
-            self.crud_store
-                .get_thread_conversation_history(conversation_thread_id, MAX_TURNS)
-                .await
-        };
-
-        let mut entries = match entries_result {
-            Ok(entries) => entries,
-            Err(error) => {
-                warn!(
-                    thread_id = conversation_thread_id,
-                    error = %format!("{error:#}"),
-                    "failed to load conversation history, proceeding without it"
-                );
-                return Vec::new();
-            }
-        };
-        if let Some(excluded_turn_id) = excluded_conversation_turn_id {
-            entries.retain(|entry| entry.turn_id != excluded_turn_id);
-        }
-
-        let mut total_tokens: usize = 0;
-
-        if let Some(ref summary_text) = existing_summary {
-            total_tokens +=
-                count_tokens(&format!("Summary of earlier conversation:\n{summary_text}"))
-                    + MESSAGE_OVERHEAD;
-        }
-
-        let entry_tokens: Vec<usize> = entries
-            .iter()
-            .map(|entry| {
-                let user_t = rendered_user_history_text(entry)
-                    .as_deref()
-                    .map(|text| count_tokens(text) + MESSAGE_OVERHEAD)
-                    .unwrap_or(0);
-                let assistant_t = rendered_assistant_history_text(entry)
-                    .as_deref()
-                    .map(|text| count_tokens(text) + MESSAGE_OVERHEAD)
-                    .unwrap_or(0);
-                user_t + assistant_t
-            })
-            .collect();
-
-        let turns_tokens: usize = entry_tokens.iter().sum();
-        total_tokens += turns_tokens;
-
-        let threshold =
-            budget.saturating_mul(usize::from(COMPRESSION_THRESHOLD_BPS)) / BPS_DENOMINATOR;
-        let target_tokens =
-            budget.saturating_mul(usize::from(COMPRESSION_TARGET_BPS)) / BPS_DENOMINATOR;
-
-        debug!(
-            thread_id = conversation_thread_id,
-            total_tokens,
-            budget,
-            threshold,
-            turn_count = entries.len(),
-            "context token count"
-        );
-
-        if total_tokens < threshold {
-            return self.build_messages_from_entries(existing_summary.as_deref(), &entries);
-        }
-
-        info!(
-            thread_id = conversation_thread_id,
-            total_tokens, threshold, "context threshold reached, compressing conversation"
-        );
-
-        let hook_runtime = self.hook_runtime.read().await.clone();
-        if let Some(runtime) = hook_runtime.as_ref() {
-            let thread = match self
-                .crud_store
-                .get_thread_by_id(conversation_thread_id)
-                .await
-            {
-                Ok(Some(thread)) => Some(thread),
-                Ok(None) => {
-                    warn!(
-                        thread_id = conversation_thread_id,
-                        "thread not found while preparing pre-compaction hook input"
-                    );
-                    None
-                }
-                Err(error) => {
-                    warn!(
-                        thread_id = conversation_thread_id,
-                        error = %format!("{error:#}"),
-                        "failed to load thread while preparing pre-compaction hook input"
-                    );
-                    None
-                }
-            };
-
-            if let Some(thread) = thread {
-                let compaction_id = format!("cmp_{}", pioneer_protocol::generate_id(21));
-                let dispatch = match hooks::build_pre_compaction_hook_dispatch(
-                    hooks::PreCompactionHookInputParts {
-                        workspace_id: thread.workspace_id.as_str(),
-                        execution_thread_id,
-                        conversation_thread_id,
-                        turn_id: execution_turn_id,
-                        compaction_id,
-                        loaded_completed_turn_count: entries.len(),
-                        source_entry_count: entries.len(),
-                        max_loaded_turns: MAX_TURNS,
-                        existing_summary_turn_count,
-                        max_context_tokens: self.context_budget.max_context_tokens,
-                        response_reserve_tokens: self.context_budget.response_reserve_tokens,
-                        history_budget_tokens: budget,
-                        estimated_current_tokens: total_tokens,
-                        compression_threshold_tokens: threshold,
-                        target_summary_tokens: target_tokens,
-                        compression_threshold_bps: COMPRESSION_THRESHOLD_BPS,
-                        compression_target_bps: COMPRESSION_TARGET_BPS,
-                        existing_summary: existing_summary.as_deref(),
-                    },
-                ) {
-                    Ok(dispatch) => Some(dispatch),
-                    Err(error) => {
-                        warn!(
-                            thread_id = execution_thread_id,
-                            turn_id = execution_turn_id,
-                            conversation_thread_id,
-                            error = %error,
-                            "failed to build typed pre-compaction hook context"
-                        );
-                        None
-                    }
-                };
-
-                if let Some(dispatch) = dispatch {
-                    match hooks::run_pre_compaction_hook_phase(Some(runtime), dispatch).await {
-                        Ok(outcome) => {
-                            if !outcome.diagnostics.is_empty() || !outcome.runs.is_empty() {
-                                debug!(
-                                    thread_id = execution_thread_id,
-                                    turn_id = execution_turn_id,
-                                    conversation_thread_id,
-                                    diagnostic_count = outcome.diagnostics.len(),
-                                    run_count = outcome.runs.len(),
-                                    "pre-compaction hook phase completed"
-                                );
-                            }
-                        }
-                        Err(error) => {
-                            warn!(
-                                thread_id = execution_thread_id,
-                                turn_id = execution_turn_id,
-                                conversation_thread_id,
-                                error = %error.runtime_error,
-                                message = error.safe_message.as_str(),
-                                "pre-compaction hook phase blocked context compression"
-                            );
-                            return self.build_messages_truncated(
-                                existing_summary.as_deref(),
-                                &entries,
-                                &entry_tokens,
-                                budget,
-                            );
-                        }
-                    }
-                }
-            }
-        }
-
-        let compressing_notification = ContextCompressingNotification {
-            thread_id: execution_thread_id.to_owned(),
-            turn_id: execution_turn_id.to_owned(),
-            message: "Compressing conversation history...".to_owned(),
-        };
-        self.send_notification_to_thread_subscribers(
-            execution_thread_id,
-            events::CONTEXT_COMPRESSING,
-            &compressing_notification,
-        )
-        .await;
-
-        match summary::compress_context(
-            &self.crud_store,
-            &self.provider_registry,
-            conversation_thread_id,
-            &entries,
-            existing_summary.as_deref(),
-            target_tokens,
-            &self.summary_config,
-            fallback_model,
-            fallback_model_provider,
-        )
-        .await
-        {
-            Ok(compressed_summary) => {
-                let compressed_tokens = count_tokens(&compressed_summary);
-
-                let compressed_notification = ContextCompressedNotification {
-                    thread_id: execution_thread_id.to_owned(),
-                    turn_id: execution_turn_id.to_owned(),
-                    compressed_tokens,
-                };
-                self.send_notification_to_thread_subscribers(
-                    execution_thread_id,
-                    events::CONTEXT_COMPRESSED,
-                    &compressed_notification,
-                )
-                .await;
-
-                debug!(
-                    thread_id = conversation_thread_id,
-                    compressed_tokens,
-                    original_tokens = total_tokens,
-                    "context compressed successfully"
-                );
-
-                // Return just the summary — conversation grows from here
-                vec![ChatMessage::system(format!(
-                    "Summary of earlier conversation:\n{compressed_summary}"
-                ))]
-            }
-            Err(error) => {
-                warn!(
-                    thread_id = conversation_thread_id,
-                    error = %format!("{error:#}"),
-                    "context compression failed, falling back to truncation"
-                );
-
-                // Fallback: return as many recent turns as fit in the budget
-                self.build_messages_truncated(
-                    existing_summary.as_deref(),
-                    &entries,
-                    &entry_tokens,
-                    budget,
-                )
-            }
-        }
-    }
-
+    #[cfg(test)]
     /// Build ChatMessage list from summary + all entries (no truncation).
     pub(super) fn build_messages_from_entries(
         &self,
@@ -1486,58 +1348,6 @@ impl MessageProcessor {
                 messages.push(ChatMessage::user(user_text));
             }
             if let Some(assistant_text) = rendered_assistant_history_text(entry) {
-                messages.push(ChatMessage::assistant(assistant_text));
-            }
-        }
-
-        messages
-    }
-
-    /// Fallback: fit as many recent turns as possible within the token budget.
-    pub(super) fn build_messages_truncated(
-        &self,
-        existing_summary: Option<&str>,
-        entries: &[ConversationEntry],
-        entry_tokens: &[usize],
-        budget: usize,
-    ) -> Vec<ChatMessage> {
-        const MESSAGE_OVERHEAD: usize = 4;
-
-        let mut used_tokens: usize = 0;
-
-        let summary_msg = if let Some(summary_text) = existing_summary {
-            let text = format!("Summary of earlier conversation:\n{summary_text}");
-            let tokens = count_tokens(&text) + MESSAGE_OVERHEAD;
-            if tokens < budget {
-                used_tokens += tokens;
-                Some(ChatMessage::system(text))
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        let mut selected_indices: Vec<usize> = Vec::new();
-        for i in (0..entries.len()).rev() {
-            if used_tokens + entry_tokens[i] <= budget {
-                used_tokens += entry_tokens[i];
-                selected_indices.push(i);
-            } else {
-                break;
-            }
-        }
-        selected_indices.reverse();
-
-        let mut messages = Vec::with_capacity(1 + selected_indices.len() * 2);
-        if let Some(summary) = summary_msg {
-            messages.push(summary);
-        }
-        for i in selected_indices {
-            if let Some(user_text) = rendered_user_history_text(&entries[i]) {
-                messages.push(ChatMessage::user(user_text));
-            }
-            if let Some(assistant_text) = rendered_assistant_history_text(&entries[i]) {
                 messages.push(ChatMessage::assistant(assistant_text));
             }
         }
@@ -1578,20 +1388,39 @@ impl MessageProcessor {
         Some(workspace_id)
     }
 
-    fn member_provider_is_configured(&self, workspace_id: &str, provider: &str) -> bool {
+    fn safe_provider_error(&self, error: &anyhow::Error) -> String {
+        // A provider constructed with an endpoint override redacts its errors
+        // before returning them. Reading the current keystore here would be
+        // racy with a reset while the failed request is still in flight.
+        format!("{error:#}")
+    }
+
+    pub(super) fn member_provider_is_configured(&self, workspace_id: &str, provider: &str) -> bool {
         let Ok(provider) = self.gateway_secrets.normalize_provider_name(provider) else {
             return false;
         };
-        if provider == "local" {
-            return true;
-        }
-        self.gateway_secrets
-            .list_configured_workspace_provider_names(workspace_id)
-            .is_ok_and(|providers| providers.into_iter().any(|name| name == provider))
-            || self
-                .gateway_secrets
-                .list_workspace_provider_proxies(workspace_id)
-                .is_ok_and(|proxies| proxies.into_iter().any(|(name, _)| name == provider))
+        let Some(definition) = pioneer_provider::provider_definition(&provider) else {
+            return false;
+        };
+        let api_key = self
+            .gateway_secrets
+            .get_workspace_provider_api_key(workspace_id, &provider)
+            .ok()
+            .flatten()
+            .is_some();
+        let proxy = self
+            .gateway_secrets
+            .get_workspace_provider_proxy(workspace_id, &provider)
+            .ok()
+            .flatten()
+            .is_some();
+        let base_url = self
+            .gateway_secrets
+            .get_workspace_provider_base_url(workspace_id, &provider)
+            .ok()
+            .flatten()
+            .is_some();
+        pioneer_provider::provider_is_available(api_key, proxy, base_url, definition)
     }
 }
 

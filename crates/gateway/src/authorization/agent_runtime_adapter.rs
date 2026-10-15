@@ -29,6 +29,8 @@ use std::collections::BTreeSet;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AgentToolAdapterError {
     InvalidInput(String),
+    /// JSON decoding failed before any launch or authorization checks.
+    InvalidArguments,
     Action(AgentActionServiceError),
     OptionsUnavailable,
 }
@@ -870,8 +872,7 @@ impl BoundAgentActionAdapter {
 fn decode<T: serde::de::DeserializeOwned>(
     arguments: serde_json::Value,
 ) -> Result<T, AgentToolAdapterError> {
-    serde_json::from_value(arguments)
-        .map_err(|error| AgentToolAdapterError::InvalidInput(error.to_string()))
+    serde_json::from_value(arguments).map_err(|_| AgentToolAdapterError::InvalidArguments)
 }
 
 fn validate_tool_launch(
@@ -1033,7 +1034,13 @@ pub(crate) fn action_id_for_call(call_id: &str) -> AgentActionId {
 pub(crate) fn idempotency_key_for_call(call_id: &str, tool: AgentModelToolName) -> String {
     let mut digest = Sha256::new();
     digest.update(b"pioneer:agent-runtime:model-tool:v1\0");
-    digest.update(tool.as_str().as_bytes());
+    // Keep keys for actions committed before the model-facing rename stable.
+    let stable_name = match tool {
+        AgentModelToolName::StartAgent => "agent_start",
+        AgentModelToolName::AgentStartOptions => "agent_start_options",
+        _ => tool.as_str(),
+    };
+    digest.update(stable_name.as_bytes());
     digest.update([0]);
     digest.update(call_id.as_bytes());
     hex::encode(digest.finalize())
@@ -1474,6 +1481,10 @@ mod tests {
         let key = idempotency_key_for_call("provider-call-1", AgentModelToolName::StartAgent);
         assert_eq!(key.len(), 64);
         assert!(!key.contains("provider-call-1"));
+        let mut original = Sha256::new();
+        original.update(b"pioneer:agent-runtime:model-tool:v1\0");
+        original.update(b"agent_start\0provider-call-1");
+        assert_eq!(key, hex::encode(original.finalize()));
     }
 
     #[test]
@@ -1597,6 +1608,80 @@ mod tests {
     }
 
     #[test]
+    fn model_launch_restrictions_keep_their_public_meaning_before_any_intent_can_execute() {
+        let mut adapter = test_adapter();
+        let mut options = test_options(&mut adapter);
+        // Permit FullAccess in the profile to exercise the independent ceiling,
+        // rather than stopping at the profile's allowed-mode list.
+        options.profiles[0]
+            .allowed_permission_profiles
+            .push(TurnPermissionMode::FullAccess);
+        let mut permission = exact_tool_launch();
+        permission.permission_profile = Some(TurnPermissionProfileSelection {
+            mode: TurnPermissionMode::FullAccess,
+        });
+        let mut skill = exact_tool_launch();
+        skill.skill_ids = vec![SkillId::new("K99999999999999999999").unwrap()];
+        let mut mcp = exact_tool_launch();
+        mcp.mcp_server_ids = vec!["private-ungranted-mcp".into()];
+        let mut identity = exact_tool_launch();
+        identity.identity = AgentToolIdentityChoice::Exact {
+            id: AgentIdentityId::new("A99999999999999999999").unwrap(),
+        };
+        let mut profile = exact_tool_launch();
+        profile.profile = AgentToolProfileChoice::Exact(
+            pioneer_protocol::AgentExecutionProfileId::new("P99999999999999999999").unwrap(),
+        );
+        let current_target = adapter.current_target_option_id();
+        for (launch, target_option_id) in [
+            (permission, current_target.clone()),
+            (skill, current_target.clone()),
+            (mcp, current_target.clone()),
+            (identity, current_target.clone()),
+            (profile, current_target),
+            (exact_tool_launch(), "private-unavailable-target".into()),
+        ] {
+            let input = serde_json::to_value(AgentStartToolInput {
+                target_option_id,
+                input: AgentAuthoredInput::default(),
+                launch,
+            })
+            .unwrap();
+            let error = adapter
+                .intent_from_model_call(
+                    "restriction",
+                    AgentModelToolName::StartAgent,
+                    input,
+                    Some(&options),
+                )
+                .expect_err("no executable intent may be produced");
+            assert!(matches!(error, AgentToolAdapterError::InvalidInput(_)));
+            let public = crate::message::agent_action_tools::sanitize_agent_tool_error(
+                crate::message::agent_action_tools::adapter_tool_error(error),
+            );
+            assert_eq!(
+                public.to_string(),
+                "invalid arguments: agent_action_not_allowed"
+            );
+            assert!(!public.to_string().contains("private-"));
+        }
+        let invalid = adapter
+            .intent_from_model_call(
+                "malformed",
+                AgentModelToolName::StartAgent,
+                serde_json::json!({"targetOptionId": "target", "input": {}, "launch": {}}),
+                Some(&options),
+            )
+            .expect_err("malformed request must not produce an intent");
+        assert!(matches!(invalid, AgentToolAdapterError::InvalidArguments));
+        let public = crate::message::agent_action_tools::adapter_tool_error(invalid);
+        assert_eq!(
+            public.to_string(),
+            "invalid arguments: agent_invalid_arguments"
+        );
+    }
+
+    #[test]
     fn persisted_work_graph_root_is_exact_and_never_synthesized() {
         let mut adapter = test_adapter();
         let persisted = "E99999999999999999999";
@@ -1650,6 +1735,156 @@ mod tests {
             !task_agent_capabilities(&envelope).contains(&AgentToolCapability::ChildStart),
             "child start must not be projected when half of its source intersection is missing"
         );
+    }
+
+    #[test]
+    fn task_management_intents_require_the_exact_current_action_not_just_control_capability() {
+        for control in [
+            pioneer_protocol::AgentTaskControl::Update,
+            pioneer_protocol::AgentTaskControl::Pause,
+            pioneer_protocol::AgentTaskControl::Reschedule,
+            pioneer_protocol::AgentTaskControl::Resume,
+        ] {
+            let mut adapter = test_adapter();
+            let intent = adapter
+                .intent_from_model_call(
+                    "management-call",
+                    AgentModelToolName::ControlTask,
+                    serde_json::to_value(AgentControlTaskToolInput {
+                        task_id: "K12345678901234567890".to_owned(),
+                        control,
+                    })
+                    .unwrap(),
+                    None,
+                )
+                .unwrap()
+                .unwrap();
+            assert!(adapter.prepare(&intent).is_ok());
+            adapter
+                .envelope
+                .allowed_actions
+                .remove(&ResourceAction::TaskScheduleManage);
+            adapter.root.envelope = adapter.envelope.clone();
+            assert!(
+                task_agent_capabilities(&adapter.envelope)
+                    .contains(&AgentToolCapability::TaskControl),
+                "cancel/detach still project generic control capability"
+            );
+            assert!(
+                adapter.prepare(&intent).is_err(),
+                "generic control must not grant schedule management"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn task_management_rolls_back_events_and_state_when_the_action_fence_fails() {
+        use sea_orm::ConnectionTrait;
+        let harness = crate::tests::authorization::IsolatedEpic4Harness::new()
+            .await
+            .unwrap();
+        harness.database.execute_unprepared(
+            "INSERT INTO task(id,workspace_id,owner_kind,owner_id,created_by_thread_id,executor_kind,status,title,goal) VALUES('K12345678901234567890','W00000000000000000001','user','P0000000000000000000A','T00000000000000000001','workflow','waiting','Original','Original');"
+        ).await.unwrap();
+        let store = std::sync::Arc::new(pioneer_crud::CrudStore::new(harness.database.clone()));
+        let runtime = pioneer_tasks::TaskRuntime::new(store.clone());
+        let task_id = "K12345678901234567890";
+        let before = store.get_task(task_id).await.unwrap().unwrap();
+        let events_before = store.get_task_events(task_id, None).await.unwrap();
+        for control in [
+            pioneer_protocol::AgentTaskControl::Update,
+            pioneer_protocol::AgentTaskControl::Pause,
+            pioneer_protocol::AgentTaskControl::Reschedule,
+        ] {
+            let mut adapter = test_adapter();
+            let intent = adapter
+                .intent_from_model_call(
+                    "fenced-management",
+                    AgentModelToolName::ControlTask,
+                    serde_json::to_value(AgentControlTaskToolInput {
+                        task_id: task_id.to_owned(),
+                        control: control.clone(),
+                    })
+                    .unwrap(),
+                    None,
+                )
+                .unwrap()
+                .unwrap();
+            let prepared = adapter.prepare(&intent).unwrap();
+            let fingerprint = adapter.policy_fingerprint().to_owned();
+            let mut plan = adapter
+                .prepare_commit(
+                    &prepared,
+                    None,
+                    &fingerprint,
+                    adapter.current_policy_generation(),
+                )
+                .unwrap();
+            // A valid prepared intent with an obsolete policy fence must fail
+            // inside the same writer transaction that projects Task events.
+            plan.input.expected_policy_generation = i64::MAX;
+            for _ in 0..2 {
+                let context = pioneer_tasks::TaskMutationContext {
+                    agent_action_commit: Some(plan.input.clone()),
+                    ..Default::default()
+                };
+                let result = match control {
+                    pioneer_protocol::AgentTaskControl::Update => runtime
+                        .service()
+                        .update_task(
+                            context,
+                            pioneer_protocol::TaskUpdateParams {
+                                task_id: task_id.to_owned(),
+                                title: Some("Changed".to_owned()),
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        .map(|_| ()),
+                    pioneer_protocol::AgentTaskControl::Pause => runtime
+                        .service()
+                        .pause_task(
+                            context,
+                            pioneer_protocol::TaskPauseParams {
+                                task_id: task_id.to_owned(),
+                                reason: None,
+                            },
+                        )
+                        .await
+                        .map(|_| ()),
+                    pioneer_protocol::AgentTaskControl::Reschedule => runtime
+                        .service()
+                        .reschedule_task(
+                            context,
+                            pioneer_protocol::TaskRescheduleParams {
+                                task_id: task_id.to_owned(),
+                                trigger: pioneer_protocol::TaskTriggerInput {
+                                    spec: pioneer_protocol::TaskTriggerSpec::Cron {
+                                        cron_expr: "0 5 * * *".to_owned(),
+                                        timezone: "UTC".to_owned(),
+                                        catch_up_policy: None,
+                                    },
+                                },
+                            },
+                        )
+                        .await
+                        .map(|_| ()),
+                    _ => unreachable!(),
+                };
+                let error = result.expect_err("stale action fence must reject management");
+                assert!(
+                    format!("{error:#}").contains("policy changed before commit"),
+                    "{error:#}"
+                );
+                let after = store.get_task(task_id).await.unwrap().unwrap();
+                assert_eq!(after.task, before.task);
+                assert_eq!(after.triggers, before.triggers);
+                assert_eq!(
+                    store.get_task_events(task_id, None).await.unwrap(),
+                    events_before
+                );
+            }
+        }
     }
 
     fn exact_tool_launch() -> AgentToolLaunchSelection {

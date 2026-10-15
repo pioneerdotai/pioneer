@@ -5,6 +5,52 @@ use std::mem::size_of;
 
 pub const THREAD_EPISODIC_WORKSPACE_CAPSULE_THREAD_ID: &str = "__workspace__";
 pub const THREAD_EPISODIC_WORKSPACE_SEGMENT_CAPACITY_BYTES: i64 = 50 * 1024 * 1024;
+pub const THREAD_EPISODIC_SOURCE_VERSION_SUPERSEDED_ERROR: &str =
+    "thread episodic source version superseded during reconciliation";
+pub const THREAD_EPISODIC_USER_DELETED_ERROR: &str = "thread episodic source deleted by user";
+pub const THREAD_EPISODIC_USER_EXCLUDED_ERROR: &str = "thread episodic source excluded by user";
+pub const THREAD_EPISODIC_LEGACY_SOURCE_HASH_MISMATCH_ERROR: &str =
+    "thread episodic source text hash changed before indexing";
+
+// A request was resolved for a projection the workspace cannot accept. Keep
+// that transition obligation on its existing job even at the old attempt limit.
+pub const THREAD_EPISODIC_PROJECTION_CHANGED_ERROR: &str =
+    "thread episodic request requires projection replacement";
+
+#[derive(Debug, Default)]
+pub struct ThreadEpisodicIndexClaimBatch {
+    pub claimed: Vec<ThreadEpisodicIndexJobRecord>,
+    // Input snapshots, not dispatch receipts. Only writer-side observation may
+    // settle a possibly committed attempt; the static class excludes panic data.
+    pub failures: Vec<(ThreadEpisodicIndexJobRecord, &'static str)>,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl ThreadEpisodicIndexClaimBatch {
+    pub fn assert_no_failures_for_test(self) -> Vec<ThreadEpisodicIndexJobRecord> {
+        assert!(
+            self.failures.is_empty(),
+            "unexpected episodic claim failure"
+        );
+        self.claimed
+    }
+}
+
+/// Progress for the existing workspace projection-reset checkpoint. The files
+/// are removed before rebudgeting jobs; the source cursor commits with each
+/// replacement batch, so a restart never grants that source another budget.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ThreadEpisodicProjectionResetProgress {
+    pub files_cleaned: bool,
+    pub after_source: Option<[String; 4]>,
+}
+
+pub fn thread_episodic_projection_reset_key(workspace_id: &str) -> Result<String> {
+    Ok(format!(
+        "thread_episodic_projection_reset:{}",
+        thread_episodic_key_hash("workspace", workspace_id)?
+    ))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThreadEpisodicCapsuleWriteState {
@@ -58,6 +104,9 @@ pub enum ThreadEpisodicItemStatus {
     PendingIndex,
     Active,
     Excluded,
+    /// Automatically retired because the canonical source moved to another version.
+    /// Unlike `Deleted`, this state may be restored by source reconciliation.
+    Superseded,
     Deleted,
     Failed,
 }
@@ -248,6 +297,30 @@ pub struct NewThreadEpisodicItemRecord {
     pub frame_uri: Option<String>,
     pub indexed_at: Option<DateTimeWithTimeZone>,
     pub deleted_at: Option<DateTimeWithTimeZone>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThreadEpisodicCanonicalItem {
+    pub committed: bool,
+    pub item: pioneer_protocol::TurnItem,
+    pub source_payload: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThreadEpisodicSourceReconcileOutcome {
+    Current,
+    MoreWork,
+    PreservedDeletion,
+    PreservedExclusion,
+    SourceChanged,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThreadEpisodicIndexAttemptOutcome {
+    Applied,
+    StaleAttempt,
+    SourceChanged,
+    Excluded,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -946,6 +1019,7 @@ pub(crate) fn item_status_to_db(status: ThreadEpisodicItemStatus) -> &'static st
         ThreadEpisodicItemStatus::PendingIndex => "pending_index",
         ThreadEpisodicItemStatus::Active => "active",
         ThreadEpisodicItemStatus::Excluded => "excluded",
+        ThreadEpisodicItemStatus::Superseded => "superseded",
         ThreadEpisodicItemStatus::Deleted => "deleted",
         ThreadEpisodicItemStatus::Failed => "failed",
     }
@@ -956,6 +1030,7 @@ pub(crate) fn item_status_from_db(value: &str) -> Result<ThreadEpisodicItemStatu
         "pending_index" => Ok(ThreadEpisodicItemStatus::PendingIndex),
         "active" => Ok(ThreadEpisodicItemStatus::Active),
         "excluded" => Ok(ThreadEpisodicItemStatus::Excluded),
+        "superseded" => Ok(ThreadEpisodicItemStatus::Superseded),
         "deleted" => Ok(ThreadEpisodicItemStatus::Deleted),
         "failed" => Ok(ThreadEpisodicItemStatus::Failed),
         other => bail!("unknown thread episodic item status `{other}`"),

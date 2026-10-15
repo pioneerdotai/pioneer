@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::future::Future;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::{Context, Poll};
@@ -52,31 +53,122 @@ pub(crate) struct ViewGrantScope {
     pub(crate) gateway_id: GatewayId,
     pub(crate) principal_id: PrincipalId,
     pub(crate) auth_session_id: AuthSessionId,
+    pub(crate) disposition: ViewGrantDisposition,
+    pub(crate) subject: ViewGrantSubject,
+}
+
+impl ViewGrantScope {
+    fn validate(&self) -> Result<(), ViewGrantError> {
+        self.subject.validate()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ViewGrantSubject {
+    Artifact(ArtifactViewGrantScope),
+    ThreadFile(ThreadFileViewGrantScope),
+}
+
+impl ViewGrantSubject {
+    fn validate(&self) -> Result<(), ViewGrantError> {
+        match self {
+            Self::Artifact(scope) => scope.validate(),
+            Self::ThreadFile(scope) => scope.validate(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ArtifactViewGrantScope {
     pub(crate) workspace_id: String,
     pub(crate) artifact_id: String,
     pub(crate) version_id: String,
     pub(crate) artifact_sha256: [u8; 32],
     pub(crate) projection_kind: Option<ArtifactProjectionKind>,
-    pub(crate) disposition: ViewGrantDisposition,
 }
 
-impl ViewGrantScope {
+impl ArtifactViewGrantScope {
     fn validate(&self) -> Result<(), ViewGrantError> {
-        for value in [
+        validate_scope_ids([
             self.workspace_id.as_str(),
             self.artifact_id.as_str(),
             self.version_id.as_str(),
-        ] {
-            if value.is_empty()
-                || value.len() > MAX_SCOPE_ID_BYTES
-                || value.trim() != value
-                || value.chars().any(char::is_control)
-            {
-                return Err(ViewGrantError::InvalidScope);
-            }
+        ])
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct ThreadFileViewGrantScope {
+    pub(crate) workspace_id: String,
+    pub(crate) thread_id: String,
+    pub(crate) turn_id: String,
+    pub(crate) item_id: String,
+    pub(crate) canonical_root: PathBuf,
+    pub(crate) canonical_path: PathBuf,
+    pub(crate) file_name: String,
+    pub(crate) content_type: String,
+    pub(crate) size_bytes: u64,
+    pub(crate) line: Option<u32>,
+    pub(crate) column: Option<u32>,
+}
+
+impl fmt::Debug for ThreadFileViewGrantScope {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ThreadFileViewGrantScope")
+            .field("workspace_id", &self.workspace_id)
+            .field("thread_id", &self.thread_id)
+            .field("turn_id", &self.turn_id)
+            .field("item_id", &self.item_id)
+            .field("canonical_root", &"[REDACTED]")
+            .field("canonical_path", &"[REDACTED]")
+            .field("file_name", &self.file_name)
+            .field("content_type", &self.content_type)
+            .field("size_bytes", &self.size_bytes)
+            .field("line", &self.line)
+            .field("column", &self.column)
+            .finish()
+    }
+}
+
+impl ThreadFileViewGrantScope {
+    fn validate(&self) -> Result<(), ViewGrantError> {
+        validate_scope_ids([
+            self.workspace_id.as_str(),
+            self.thread_id.as_str(),
+            self.turn_id.as_str(),
+            self.item_id.as_str(),
+        ])?;
+        if !self.canonical_root.is_absolute()
+            || !self.canonical_path.is_absolute()
+            || !self.canonical_path.starts_with(&self.canonical_root)
+            || self.file_name.is_empty()
+            || self.file_name.len() > 255
+            || self.file_name.chars().any(char::is_control)
+            || self.content_type.is_empty()
+            || self.content_type.len() > 255
+            || self.content_type.chars().any(char::is_control)
+            || self.size_bytes > pioneer_protocol::THREAD_FILE_VIEW_MAX_BYTES
+            || self.line == Some(0)
+            || self.column == Some(0)
+        {
+            return Err(ViewGrantError::InvalidScope);
         }
         Ok(())
     }
+}
+
+fn validate_scope_ids<'a>(values: impl IntoIterator<Item = &'a str>) -> Result<(), ViewGrantError> {
+    for value in values {
+        if value.is_empty()
+            || value.len() > MAX_SCOPE_ID_BYTES
+            || value.trim() != value
+            || value.chars().any(char::is_control)
+        {
+            return Err(ViewGrantError::InvalidScope);
+        }
+    }
+    Ok(())
 }
 
 pub(crate) struct OpaqueViewGrantSecret {
@@ -530,12 +622,14 @@ mod tests {
             gateway_id: GatewayId::new("G00000000000000000001").unwrap(),
             principal_id: PrincipalId::new("P00000000000000000001").unwrap(),
             auth_session_id: AuthSessionId::new(format!("S{session_suffix:0>20}")).unwrap(),
-            workspace_id: "workspace-1".to_owned(),
-            artifact_id: "artifact-1".to_owned(),
-            version_id: "version-1".to_owned(),
-            artifact_sha256: [0xAB; 32],
-            projection_kind: None,
             disposition: ViewGrantDisposition::Inline,
+            subject: ViewGrantSubject::Artifact(ArtifactViewGrantScope {
+                workspace_id: "workspace-1".to_owned(),
+                artifact_id: "artifact-1".to_owned(),
+                version_id: "version-1".to_owned(),
+                artifact_sha256: [0xAB; 32],
+                projection_kind: None,
+            }),
         }
     }
 
@@ -710,7 +804,10 @@ mod tests {
         );
 
         let mut invalid = scope("2");
-        invalid.version_id = "x".repeat(MAX_SCOPE_ID_BYTES + 1);
+        let ViewGrantSubject::Artifact(artifact) = &mut invalid.subject else {
+            unreachable!();
+        };
+        artifact.version_id = "x".repeat(MAX_SCOPE_ID_BYTES + 1);
         assert!(matches!(
             service.mint(invalid),
             Err(ViewGrantError::InvalidScope)

@@ -3,6 +3,13 @@
   "title": "CLIRuntimeRefreshResponse",
   "type": "object",
   "properties": {
+    "revision": {
+      "description": "Revision of the complete cached workspace snapshot. A later\nGateway-owned reconciliation may publish a newer revision through\n`cli_runtime/status_changed`.",
+      "type": "integer",
+      "format": "uint64",
+      "default": 0,
+      "minimum": 0
+    },
     "runtimes": {
       "type": "array",
       "items": {

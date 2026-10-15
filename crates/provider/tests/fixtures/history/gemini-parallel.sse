@@ -1,0 +1,9 @@
+data: {"candidates": [{"content": {"role": "model", "parts": [{"text": "before", "thoughtSignature": "text-sig"}, {"functionCall": {"name": "first", "args": {}}, "thoughtSignature": "call-sig"}]}}]}
+
+data: {"candidates": [{"content": {"role": "model", "parts": [{"functionCall": {"name": "second", "args": {}}}, {"text": "", "thoughtSignature": "empty-text-sig"}]}}]}
+
+data: {"candidates": [{"finishReason": "STOP"}]}
+
+data: {"usageMetadata": {"promptTokenCount": 4, "candidatesTokenCount": 9}}
+
+: fixture-end

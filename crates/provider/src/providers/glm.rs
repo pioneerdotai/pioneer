@@ -4,12 +4,12 @@ use crate::{
         ensure_no_unrendered_attachments, prepare_messages_for_provider_async,
     },
     tools::call::{StreamToolCallAccumulator, StreamToolCallDelta, StreamToolFunctionDelta},
-    tools::parse::{parse_embedded_tool_payload, parse_tool_calls},
-    tools::stream::{IncrementalLineDecoder, sse_data},
+    tools::parse::parse_tool_calls,
+    tools::stream::IncrementalSseDecoder,
     types::{
         ChatRequest, ChatResponse, InputContentType, ProviderCapabilities,
         ProviderInputCapabilities, ProviderTermination, ProviderTimeoutPolicy, Role, StreamChunk,
-        TokenUsage, ToolChoice, ToolDefinition,
+        ToolChoice, ToolDefinition,
     },
 };
 use anyhow::{Result, anyhow};
@@ -23,9 +23,13 @@ use serde::{Deserialize, Serialize};
 
 use pioneer_protocol::{ProviderModelCapabilities, ProviderModelInfo, ProviderModelLimits};
 
-const DEFAULT_BASE_URL: &str = "https://open.bigmodel.cn/api/paas/v4";
+pub(crate) const DEFAULT_BASE_URL: &str = "https://open.bigmodel.cn/api/paas/v4";
+pub(crate) const GLOBAL_BASE_URL: &str = "https://api.z.ai/api/paas/v4";
+pub(crate) const CN_CODING_BASE_URL: &str = "https://open.bigmodel.cn/api/coding/paas/v4";
+pub(crate) const GLOBAL_CODING_BASE_URL: &str = "https://api.z.ai/api/coding/paas/v4";
 
 pub struct GlmProvider {
+    profile: &'static str,
     api_key: String,
     base_url: String,
     timeout_policy: ProviderTimeoutPolicy,
@@ -49,6 +53,8 @@ struct ApiChatRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     parallel_tool_calls: Option<bool>,
     stream: bool,
+    #[serde(flatten)]
+    generation: crate::generation::Fields,
 }
 
 #[derive(Debug, Serialize)]
@@ -157,6 +163,12 @@ struct ApiToolCallFunction {
 
 #[derive(Debug, Deserialize)]
 struct ApiChatResponse {
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    request_id: Option<String>,
     choices: Vec<ApiChoice>,
     #[serde(default)]
     usage: Option<ApiUsage>,
@@ -189,18 +201,20 @@ impl ApiResponseMessage {
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct ApiUsage {
-    #[serde(default)]
-    prompt_tokens: Option<u64>,
-    #[serde(default)]
-    completion_tokens: Option<u64>,
-}
+type ApiUsage = crate::usage::ChatUsage;
 
 // ── SSE streaming response types ────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
 struct StreamResponse {
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    request_id: Option<String>,
+    #[serde(default)]
+    usage: Option<ApiUsage>,
     #[serde(default)]
     choices: Vec<StreamChoice>,
     #[serde(default)]
@@ -227,6 +241,30 @@ struct StreamDelta {
     tool_calls: Option<Vec<StreamToolCallDelta>>,
     #[serde(default)]
     function_call: Option<StreamToolFunctionDelta>,
+}
+
+impl StreamDelta {
+    fn has_payload(&self) -> bool {
+        self.content
+            .as_deref()
+            .is_some_and(|value| !value.is_empty())
+            || self
+                .reasoning_content
+                .as_deref()
+                .is_some_and(|value| !value.is_empty())
+            || self
+                .reasoning
+                .as_deref()
+                .is_some_and(|value| !value.is_empty())
+            || self
+                .tool_calls
+                .as_ref()
+                .is_some_and(|calls| calls.iter().any(StreamToolCallDelta::has_payload))
+            || self
+                .function_call
+                .as_ref()
+                .is_some_and(StreamToolFunctionDelta::has_payload)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -284,6 +322,69 @@ struct ApiModelEntry {
 // ── Implementation ──────────────────────────────────────────────────────────
 
 impl GlmProvider {
+    #[cfg(test)]
+    fn build_chat_request(
+        request: &ChatRequest,
+        messages: Vec<ApiMessage>,
+        stream: bool,
+    ) -> Result<ApiChatRequest> {
+        Self::build_chat_request_with_catalog(
+            request,
+            messages,
+            stream,
+            crate::catalog::model_catalog().ok().as_deref(),
+        )
+    }
+
+    #[cfg(test)]
+    fn build_chat_request_with_catalog(
+        request: &ChatRequest,
+        messages: Vec<ApiMessage>,
+        stream: bool,
+        catalog: Option<&crate::catalog::ModelCatalog>,
+    ) -> Result<ApiChatRequest> {
+        Self::build_profile_chat_request_with_catalog("glm", request, messages, stream, catalog)
+    }
+
+    fn build_profile_chat_request(
+        &self,
+        request: &ChatRequest,
+        messages: Vec<ApiMessage>,
+        stream: bool,
+    ) -> Result<ApiChatRequest> {
+        Self::build_profile_chat_request_with_catalog(
+            self.profile,
+            request,
+            messages,
+            stream,
+            crate::catalog::model_catalog().ok().as_deref(),
+        )
+    }
+
+    fn build_profile_chat_request_with_catalog(
+        profile: &str,
+        request: &ChatRequest,
+        messages: Vec<ApiMessage>,
+        stream: bool,
+        catalog: Option<&crate::catalog::ModelCatalog>,
+    ) -> Result<ApiChatRequest> {
+        let generation = crate::generation::chat_fields_from_catalog(catalog, profile, request)?;
+        Ok(ApiChatRequest {
+            generation,
+            model: request.model.clone(),
+            messages,
+            temperature: None,
+            max_tokens: None,
+            tools: request
+                .tools
+                .as_ref()
+                .map(|tools| Self::convert_tools(tools)),
+            tool_choice: request.tool_choice.clone().map(Self::convert_tool_choice),
+            parallel_tool_calls: request.parallel_tool_calls,
+            stream,
+        })
+    }
+
     pub fn new(api_key: impl Into<String>) -> Self {
         Self::with_timeout_policy(api_key, ProviderTimeoutPolicy::default())
     }
@@ -305,11 +406,17 @@ impl GlmProvider {
         timeout_policy: ProviderTimeoutPolicy,
     ) -> Self {
         Self {
+            profile: "glm",
             api_key: api_key.into(),
-            base_url: base_url.into(),
+            base_url: base_url.into().trim_end_matches('/').to_owned(),
             timeout_policy,
             client: crate::http::build_client(timeout_policy),
         }
+    }
+
+    pub(crate) fn with_profile(mut self, profile: &'static str) -> Self {
+        self.profile = profile;
+        self
     }
 
     fn audio_format_from_mime(mime: &str) -> String {
@@ -504,18 +611,230 @@ impl GlmProvider {
 
     async fn api_error(response: reqwest::Response) -> anyhow::Error {
         let status = response.status();
-        let body = response
-            .text()
-            .await
-            .unwrap_or_else(|_| "<failed to read error body>".into());
+        let body = match crate::http::read_response_text_bounded(
+            response,
+            16 * 1024,
+            "provider_error_body",
+        )
+        .await
+        {
+            Ok(body) => body,
+            Err(error) => return error,
+        };
         anyhow!("GLM API error ({status}): {body}")
+    }
+}
+
+// The same decoder is used by HTTP transport and in-memory regression fixtures.
+impl GlmProvider {
+    pub(super) fn decode_stream(
+        byte_stream: BoxStream<'static, Result<bytes::Bytes>>,
+    ) -> BoxStream<'static, Result<StreamChunk>> {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<StreamChunk>>(64);
+
+        tokio::spawn(async move {
+            let mut decoder = IncrementalSseDecoder::default();
+            let mut tool_call_accumulator = StreamToolCallAccumulator::default();
+            let mut terminal_reason = None;
+
+            tokio::pin!(byte_stream);
+
+            while let Some(result) = tokio::select! {
+                biased;
+                _ = tx.closed() => return,
+                result = byte_stream.next() => result,
+            } {
+                let bytes = match result {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        if tx.send(Err(anyhow!(e))).await.is_err() {
+                            return;
+                        }
+                        return;
+                    }
+                };
+
+                let lines = match decoder.push(bytes.as_ref()) {
+                    Ok(lines) => lines,
+                    Err(error) => {
+                        if tx.send(Err(error)).await.is_err() {
+                            return;
+                        }
+                        return;
+                    }
+                };
+                for frame in lines {
+                    let data = frame.data.as_str();
+
+                    if data.trim() == "[DONE]" {
+                        let terminal = terminal_reason
+                            .take()
+                            .map(StreamChunk::final_chunk_with)
+                            .ok_or_else(|| {
+                                crate::failure::ProviderStreamIncomplete::DoneWithoutFinishReason
+                                    .into()
+                            });
+                        let _ = tx.send(terminal).await;
+                        return;
+                    }
+
+                    match serde_json::from_str::<StreamResponse>(data) {
+                        Ok(resp) => {
+                            if terminal_reason.is_some()
+                                && resp.choices.iter().any(|choice| choice.delta.has_payload())
+                            {
+                                let _ = tx
+                                    .send(Err(anyhow!("provider sent payload after finish_reason")))
+                                    .await;
+                                return;
+                            }
+                            if resp.usage.is_some()
+                                || resp.id.is_some()
+                                || resp.request_id.is_some()
+                            {
+                                let usage = resp
+                                    .usage
+                                    .map(|u| u.normalized())
+                                    .unwrap_or_default()
+                                    .with_native_id(resp.id.as_deref())
+                                    .with_request_id(resp.request_id.as_deref())
+                                    .with_reported_model(resp.model.as_deref());
+                                if tx.send(Ok(StreamChunk::usage(usage))).await.is_err() {
+                                    return;
+                                }
+                            }
+                            if let Some(error) = resp.error {
+                                let status = error
+                                    .code
+                                    .as_ref()
+                                    .and_then(serde_json::Value::as_u64)
+                                    .and_then(|code| u16::try_from(code).ok());
+                                let outcome = crate::failure::native_chat_stream_error(
+                                    &error.description(),
+                                    status,
+                                );
+                                let _ = tx.send(Err(outcome)).await;
+                                return;
+                            }
+                            for choice in resp.choices {
+                                if terminal_reason.is_some() {
+                                    if choice.finish_reason.as_deref().is_some_and(|reason| {
+                                        Some(ProviderTermination::from_openai_reason(reason))
+                                            != terminal_reason
+                                    }) {
+                                        let _ = tx
+                                            .send(Err(anyhow!(
+                                                "provider changed finish_reason after completion"
+                                            )))
+                                            .await;
+                                        return;
+                                    }
+                                    if choice.delta.has_payload() {
+                                        let _ = tx
+                                            .send(Err(anyhow!(
+                                                "provider sent payload after finish_reason"
+                                            )))
+                                            .await;
+                                        return;
+                                    }
+                                    continue;
+                                }
+                                if let Some(reasoning) =
+                                    choice.delta.reasoning_content.or(choice.delta.reasoning)
+                                {
+                                    if !reasoning.is_empty() {
+                                        if tx
+                                            .send(Ok(StreamChunk::reasoning(reasoning)))
+                                            .await
+                                            .is_err()
+                                        {
+                                            return;
+                                        }
+                                    }
+                                }
+                                if let Some(content) = choice.delta.content {
+                                    if !content.is_empty() {
+                                        if tx.send(Ok(StreamChunk::delta(content))).await.is_err() {
+                                            return;
+                                        }
+                                    }
+                                }
+                                if let Some(tool_calls) = choice.delta.tool_calls {
+                                    tool_call_accumulator.ingest(tool_calls);
+                                }
+                                if let Some(function_call) = choice.delta.function_call {
+                                    tool_call_accumulator.ingest(vec![StreamToolCallDelta {
+                                        index: Some(0),
+                                        id: None,
+                                        function: Some(function_call),
+                                        name: None,
+                                        arguments: None,
+                                    }]);
+                                }
+                                if let Some(reason) = choice.finish_reason {
+                                    let termination =
+                                        ProviderTermination::from_openai_reason(&reason);
+                                    let tool_calls = match tool_call_accumulator.take_tool_calls() {
+                                        Ok(calls) => calls,
+                                        Err(error) => {
+                                            if tx.send(Err(error)).await.is_err() {
+                                                return;
+                                            }
+                                            return;
+                                        }
+                                    };
+                                    if !tool_calls.is_empty() {
+                                        if tx
+                                            .send(Ok(StreamChunk::tool_calls(tool_calls)))
+                                            .await
+                                            .is_err()
+                                        {
+                                            return;
+                                        }
+                                    }
+                                    terminal_reason = Some(termination);
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            if tx
+                                .send(Err(anyhow!("malformed GLM SSE frame")))
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                            return;
+                        }
+                    }
+                }
+            }
+
+            let terminal = match decoder.finish() {
+                Err(error) => Err(error),
+                Ok(_) => {
+                    Err(crate::failure::ProviderStreamIncomplete::EofWithoutTerminalMarker.into())
+                }
+            };
+            let _ = tx.send(terminal).await;
+        });
+
+        let chunk_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+        Box::pin(chunk_stream)
     }
 }
 
 #[async_trait]
 impl crate::traits::Provider for GlmProvider {
+    fn usage_api(&self) -> &'static str {
+        "chat_completions"
+    }
+    fn usage_route(&self) -> Option<String> {
+        crate::usage::route(&self.base_url, "/chat/completions")
+    }
+
     fn name(&self) -> &str {
-        "glm"
+        self.profile
     }
 
     fn capabilities(&self) -> ProviderCapabilities {
@@ -530,26 +849,18 @@ impl crate::traits::Provider for GlmProvider {
     }
 
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
-        let prepared = prepare_messages_for_provider_async(
+        let request = crate::tools::policy::prepare_request(self.name(), request)?;
+        let mut prepared = prepare_messages_for_provider_async(
             self.name(),
+            request.model.as_str(),
             &self.capabilities(),
             request.rendered_messages_with_compiled_prompt().as_slice(),
         )
         .await?;
+        crate::tools::policy::prepare_history(self.name(), &mut prepared.messages)?;
         ensure_no_unrendered_attachments(self.name(), &prepared)?;
-        let api_request = ApiChatRequest {
-            model: request.model,
-            messages: Self::convert_messages(&prepared)?,
-            temperature: request.temperature,
-            max_tokens: request.max_tokens,
-            tools: request
-                .tools
-                .as_ref()
-                .map(|tools| Self::convert_tools(tools)),
-            tool_choice: request.tool_choice.map(Self::convert_tool_choice),
-            parallel_tool_calls: request.parallel_tool_calls,
-            stream: false,
-        };
+        let api_request =
+            self.build_profile_chat_request(&request, Self::convert_messages(&prepared)?, false)?;
 
         let request_builder = self
             .client
@@ -564,11 +875,21 @@ impl crate::traits::Provider for GlmProvider {
             return Err(Self::api_error(response).await);
         }
 
-        let api_response: ApiChatResponse = response.json().await?;
-        let usage = api_response.usage.map(|u| TokenUsage {
-            input_tokens: u.prompt_tokens,
-            output_tokens: u.completion_tokens,
-        });
+        let api_response: ApiChatResponse = crate::http::read_response_json_bounded(
+            response,
+            Default::default(),
+            "provider_response",
+        )
+        .await?;
+        let usage = Some(
+            api_response
+                .usage
+                .map(|u| u.normalized())
+                .unwrap_or_default()
+                .with_native_id(api_response.id.as_deref())
+                .with_request_id(api_response.request_id.as_deref())
+                .with_reported_model(api_response.model.as_deref()),
+        );
 
         let choice = api_response
             .choices
@@ -581,23 +902,10 @@ impl crate::traits::Provider for GlmProvider {
             .map(ProviderTermination::from_openai_reason)
             .unwrap_or_else(|| ProviderTermination::Unknown("missing_finish_reason".to_owned()));
         let message = choice.message;
-        let raw_content = message.content.clone();
-        let mut text = message.effective_content();
-        let mut tool_calls =
+        let text = message.effective_content();
+        let tool_calls =
             parse_tool_calls(message.tool_calls.as_ref(), message.function_call.as_ref())?;
-        let mut reasoning_content = message.reasoning_content.or(message.reasoning);
-
-        if tool_calls.is_empty() {
-            if let Some(content) = raw_content.as_deref() {
-                if let Some(parsed) = parse_embedded_tool_payload(content)? {
-                    text = parsed.text;
-                    if reasoning_content.is_none() {
-                        reasoning_content = parsed.reasoning_content;
-                    }
-                    tool_calls = parsed.tool_calls;
-                }
-            }
-        }
+        let reasoning_content = message.reasoning_content.or(message.reasoning);
 
         if text.is_empty()
             && tool_calls.is_empty()
@@ -620,26 +928,18 @@ impl crate::traits::Provider for GlmProvider {
         &self,
         request: ChatRequest,
     ) -> Result<BoxStream<'static, Result<StreamChunk>>> {
-        let prepared = prepare_messages_for_provider_async(
+        let request = crate::tools::policy::prepare_request(self.name(), request)?;
+        let mut prepared = prepare_messages_for_provider_async(
             self.name(),
+            request.model.as_str(),
             &self.capabilities(),
             request.rendered_messages_with_compiled_prompt().as_slice(),
         )
         .await?;
+        crate::tools::policy::prepare_history(self.name(), &mut prepared.messages)?;
         ensure_no_unrendered_attachments(self.name(), &prepared)?;
-        let api_request = ApiChatRequest {
-            model: request.model,
-            messages: Self::convert_messages(&prepared)?,
-            temperature: request.temperature,
-            max_tokens: request.max_tokens,
-            tools: request
-                .tools
-                .as_ref()
-                .map(|tools| Self::convert_tools(tools)),
-            tool_choice: request.tool_choice.map(Self::convert_tool_choice),
-            parallel_tool_calls: request.parallel_tool_calls,
-            stream: true,
-        };
+        let api_request =
+            self.build_profile_chat_request(&request, Self::convert_messages(&prepared)?, true)?;
 
         let request_builder = self
             .client
@@ -653,121 +953,13 @@ impl crate::traits::Provider for GlmProvider {
             return Err(Self::api_error(response).await);
         }
 
-        let byte_stream = response.bytes_stream();
+        let byte_stream = crate::http::bounded_response_stream(
+            response,
+            crate::types::ProviderResponseLimits::default().max_transport_bytes,
+            "provider_stream",
+        );
 
-        let (tx, rx) = tokio::sync::mpsc::channel::<Result<StreamChunk>>(64);
-
-        tokio::spawn(async move {
-            let mut decoder = IncrementalLineDecoder::default();
-            let mut tool_call_accumulator = StreamToolCallAccumulator::default();
-
-            tokio::pin!(byte_stream);
-
-            while let Some(result) = byte_stream.next().await {
-                let bytes = match result {
-                    Ok(bytes) => bytes,
-                    Err(e) => {
-                        let _ = tx.send(Err(anyhow!(e))).await;
-                        return;
-                    }
-                };
-
-                let lines = match decoder.push(bytes.as_ref()) {
-                    Ok(lines) => lines,
-                    Err(error) => {
-                        let _ = tx.send(Err(error)).await;
-                        return;
-                    }
-                };
-                for line in lines {
-                    let line = line.trim();
-                    if line.is_empty() {
-                        continue;
-                    }
-
-                    let Some(data) = sse_data(line) else {
-                        continue;
-                    };
-
-                    if data.trim() == "[DONE]" {
-                        let _ = tx
-                            .send(Err(anyhow!("GLM stream ended without a finish_reason")))
-                            .await;
-                        return;
-                    }
-
-                    match serde_json::from_str::<StreamResponse>(data) {
-                        Ok(resp) => {
-                            if let Some(error) = resp.error {
-                                let _ = tx
-                                    .send(Err(anyhow!("GLM stream error: {}", error.description())))
-                                    .await;
-                                return;
-                            }
-                            for choice in resp.choices {
-                                if let Some(reasoning) =
-                                    choice.delta.reasoning_content.or(choice.delta.reasoning)
-                                {
-                                    if !reasoning.is_empty() {
-                                        let _ =
-                                            tx.send(Ok(StreamChunk::reasoning(reasoning))).await;
-                                    }
-                                }
-                                if let Some(content) = choice.delta.content {
-                                    if !content.is_empty() {
-                                        let _ = tx.send(Ok(StreamChunk::delta(content))).await;
-                                    }
-                                }
-                                if let Some(tool_calls) = choice.delta.tool_calls {
-                                    tool_call_accumulator.ingest(tool_calls);
-                                }
-                                if let Some(function_call) = choice.delta.function_call {
-                                    tool_call_accumulator.ingest(vec![StreamToolCallDelta {
-                                        index: Some(0),
-                                        id: None,
-                                        function: Some(function_call),
-                                        name: None,
-                                        arguments: None,
-                                    }]);
-                                }
-                                if let Some(reason) = choice.finish_reason {
-                                    let termination =
-                                        ProviderTermination::from_openai_reason(&reason);
-                                    let tool_calls = match tool_call_accumulator.take_tool_calls() {
-                                        Ok(calls) => calls,
-                                        Err(error) => {
-                                            let _ = tx.send(Err(error)).await;
-                                            return;
-                                        }
-                                    };
-                                    if !tool_calls.is_empty() {
-                                        let _ =
-                                            tx.send(Ok(StreamChunk::tool_calls(tool_calls))).await;
-                                    }
-                                    let _ = tx
-                                        .send(Ok(StreamChunk::final_chunk_with(termination)))
-                                        .await;
-                                    return;
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            let _ = tx.send(Err(anyhow!("malformed GLM SSE frame: {e}"))).await;
-                            return;
-                        }
-                    }
-                }
-            }
-
-            let error = decoder
-                .finish()
-                .err()
-                .unwrap_or_else(|| anyhow!("GLM stream ended before a provider terminal marker"));
-            let _ = tx.send(Err(error)).await;
-        });
-
-        let chunk_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
-        Ok(Box::pin(chunk_stream))
+        Ok(Self::decode_stream(byte_stream))
     }
 
     async fn list_models(&self) -> Result<Vec<ProviderModelInfo>> {
@@ -783,7 +975,12 @@ impl crate::traits::Provider for GlmProvider {
             return Err(Self::api_error(response).await);
         }
 
-        let api_response: ModelsListResponse = response.json().await?;
+        let api_response: ModelsListResponse = crate::http::read_response_json_bounded(
+            response,
+            Default::default(),
+            "provider_response",
+        )
+        .await?;
 
         Ok(api_response
             .data
@@ -793,8 +990,8 @@ impl crate::traits::Provider for GlmProvider {
                 name: None,
                 description: None,
                 created: m.created,
-                provider: "glm".to_owned(),
-                owned_by: m.owned_by.or(Some("zhipu".to_owned())),
+                provider: self.name().to_owned(),
+                owned_by: m.owned_by,
                 limits: ProviderModelLimits::default(),
                 capabilities: ProviderModelCapabilities::default(),
                 transcription: None,
@@ -805,14 +1002,224 @@ impl crate::traits::Provider for GlmProvider {
             })
             .collect())
     }
+
+    async fn warmup(&self) -> Result<crate::ProviderWarmupOutcome> {
+        self.list_models().await?;
+        Ok(crate::ProviderWarmupOutcome::Completed)
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::types::{ReasoningConfig, ReasoningEffort};
+    #[test]
+    fn saved_and_fresh_glm_53_discovery_controls_reach_normal_and_stream_bodies() {
+        for fresh in [false, true] {
+            let catalog = crate::generation::test_catalog(fresh);
+            // The saved Pi snapshot contains the global coding profile. Fresh
+            // generation also includes the distinct standard and CN profiles.
+            let profiles: &[&str] = if fresh {
+                &["glm", "zai", "glm-coding", "zai-coding"]
+            } else {
+                &["zai-coding"]
+            };
+            for profile in profiles {
+                let discovered = crate::generation::test_discovery(&catalog, profile, "glm-5.3");
+                for effort in [
+                    ReasoningEffort::Low,
+                    ReasoningEffort::High,
+                    ReasoningEffort::Max,
+                ] {
+                    assert!(
+                        discovered
+                            .capabilities
+                            .reasoning
+                            .as_ref()
+                            .unwrap()
+                            .effort_options
+                            .contains(&effort.as_str().into())
+                    );
+                    let mut request = crate::generation::test_request("glm-5.3");
+                    request.reasoning = Some(ReasoningConfig::Effort(effort));
+                    for stream in [false, true] {
+                        let body = serde_json::to_value(
+                            GlmProvider::build_profile_chat_request_with_catalog(
+                                profile,
+                                &request,
+                                vec![],
+                                stream,
+                                Some(&catalog),
+                            )
+                            .unwrap(),
+                        )
+                        .unwrap();
+                        assert_eq!(body["reasoning_effort"], effort.as_str());
+                        assert_eq!(body["thinking"]["type"], "enabled");
+                        assert_eq!(body["max_tokens"], 1024);
+                    }
+                }
+                for off in [
+                    ReasoningConfig::Disabled,
+                    ReasoningConfig::Effort(ReasoningEffort::None),
+                ] {
+                    let mut request = crate::generation::test_request("glm-5.3");
+                    request.reasoning = Some(off);
+                    for stream in [false, true] {
+                        assert!(
+                            GlmProvider::build_profile_chat_request_with_catalog(
+                                profile,
+                                &request,
+                                vec![],
+                                stream,
+                                Some(&catalog)
+                            )
+                            .is_err()
+                        );
+                    }
+                }
+                let mut request = crate::generation::test_request("glm-5.2");
+                request.reasoning = Some(ReasoningConfig::Effort(ReasoningEffort::Low));
+                for stream in [false, true] {
+                    assert!(
+                        GlmProvider::build_profile_chat_request_with_catalog(
+                            profile,
+                            &request,
+                            vec![],
+                            stream,
+                            Some(&catalog)
+                        )
+                        .is_err()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn distinct_glm_profiles_use_their_own_updated_source_limits() {
+        use crate::catalog::generator::{SOURCE_URLS, SourceSnapshot, generate};
+        let mut source: SourceSnapshot =
+            serde_json::from_str(include_str!("../../tests/fixtures/catalog/sources.json"))
+                .unwrap();
+        let profiles = [
+            ("glm", "zhipuai", 512),
+            ("zai", "zai", 2048),
+            ("glm-coding", "zhipuai-coding-plan", 4096),
+            ("zai-coding", "zai-coding-plan", 8192),
+        ];
+        for (_, upstream, limit) in profiles {
+            source.sources.get_mut(SOURCE_URLS[0]).unwrap().body[upstream]["models"]["glm-5.3"]["limit"]
+                ["output"] = serde_json::json!(limit);
+        }
+        let generated = generate(&source, true).unwrap();
+        let catalog = crate::catalog::ModelCatalog::parse(
+            &serde_json::to_string(&generated.models).unwrap(),
+            &serde_json::to_string(&generated.provenance).unwrap(),
+        )
+        .unwrap();
+        for (profile, _, limit) in profiles {
+            let mut request = crate::generation::test_request("glm-5.3");
+            request.reasoning = Some(ReasoningConfig::Effort(ReasoningEffort::Low));
+            request.max_tokens = Some(limit);
+            for stream in [false, true] {
+                let body = serde_json::to_value(
+                    GlmProvider::build_profile_chat_request_with_catalog(
+                        profile,
+                        &request,
+                        vec![],
+                        stream,
+                        Some(&catalog),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+                assert_eq!(body["max_tokens"], limit);
+                assert_eq!(body["reasoning_effort"], "low");
+                assert_eq!(body["thinking"]["type"], "enabled");
+                let mut oversized = request.clone();
+                oversized.max_tokens = Some(limit + 1);
+                let error = GlmProvider::build_profile_chat_request_with_catalog(
+                    profile,
+                    &oversized,
+                    vec![],
+                    stream,
+                    Some(&catalog),
+                )
+                .unwrap_err();
+                assert!(error.to_string().contains("current catalog limit"));
+            }
+        }
+    }
+
+    #[test]
+    fn glm_normal_and_streaming_bodies_preserve_default_explicit_off_and_effort() {
+        let mut request = crate::generation::test_request("glm-5.2");
+        for stream in [false, true] {
+            request.reasoning = None;
+            let body = serde_json::to_value(
+                GlmProvider::build_chat_request(&request, vec![], stream).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(body["max_tokens"], 1024);
+            assert!(body.get("thinking").is_none());
+            request.reasoning = Some(crate::types::ReasoningConfig::Disabled);
+            let body = serde_json::to_value(
+                GlmProvider::build_chat_request(&request, vec![], stream).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(body["thinking"]["type"], "disabled");
+            request.reasoning = Some(crate::types::ReasoningConfig::Effort(
+                crate::types::ReasoningEffort::Max,
+            ));
+            let body = serde_json::to_value(
+                GlmProvider::build_chat_request(&request, vec![], stream).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(body["thinking"]["type"], "enabled");
+            assert_eq!(body["reasoning_effort"], "max");
+        }
+        request.model = "glm-5.3".into();
+        request.reasoning = Some(crate::types::ReasoningConfig::Disabled);
+        assert!(GlmProvider::build_chat_request(&request, vec![], false).is_err());
+        request.model = "glm-5.9-unknown-family".into();
+        assert!(GlmProvider::build_chat_request(&request, vec![], false).is_err());
+        request.model = "glm-4.7".into();
+        request.reasoning = Some(crate::types::ReasoningConfig::Effort(
+            crate::types::ReasoningEffort::High,
+        ));
+        assert!(GlmProvider::build_chat_request(&request, vec![], false).is_err());
+    }
     use super::*;
     use crate::attachments::prepare_messages_for_provider;
     use crate::traits::Provider;
     use crate::types::ChatMessage;
+
+    #[test]
+    fn region_product_defaults_and_override_keep_profile_identity() {
+        for (name, base) in [
+            ("glm", DEFAULT_BASE_URL),
+            ("zai", GLOBAL_BASE_URL),
+            ("glm-coding", CN_CODING_BASE_URL),
+            ("zai-coding", GLOBAL_CODING_BASE_URL),
+        ] {
+            let provider =
+                GlmProvider::with_base_url("dummy-key", format!("{base}/")).with_profile(name);
+            assert_eq!(provider.name(), name);
+            assert_eq!(
+                provider.chat_completions_url(),
+                format!("{base}/chat/completions")
+            );
+            assert_eq!(provider.models_url(), format!("{base}/models"));
+            let custom =
+                GlmProvider::with_base_url("dummy-key", "https://example.test/team/coding/")
+                    .with_profile(name);
+            assert_eq!(custom.name(), name);
+            assert_eq!(
+                custom.chat_completions_url(),
+                "https://example.test/team/coding/chat/completions"
+            );
+        }
+    }
 
     #[test]
     fn creates_with_api_key() {
@@ -825,6 +1232,19 @@ mod tests {
     fn creates_with_custom_base_url() {
         let provider = GlmProvider::with_base_url("key", "http://localhost:8080");
         assert_eq!(provider.base_url, "http://localhost:8080");
+    }
+
+    #[test]
+    fn custom_gateway_prefix_routes_chat_and_models_without_double_slashes() {
+        let provider = GlmProvider::with_base_url("key", "http://localhost:8080/team/v4/");
+        assert_eq!(
+            provider.chat_completions_url(),
+            "http://localhost:8080/team/v4/chat/completions"
+        );
+        assert_eq!(
+            provider.models_url(),
+            "http://localhost:8080/team/v4/models"
+        );
     }
 
     #[test]
@@ -878,4 +1298,14 @@ mod tests {
         assert!(caps.streaming);
         assert!(!caps.vision);
     }
+}
+
+#[cfg(test)]
+mod wire_contract_tests {
+    use super::*;
+    type WireProvider = GlmProvider;
+    fn wire_provider() -> WireProvider {
+        WireProvider::new("fixture")
+    }
+    include!("wire_tests/chat.rs");
 }

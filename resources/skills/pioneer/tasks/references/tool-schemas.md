@@ -28,6 +28,16 @@ Only call tools visible in the current turn. If a needed task tool is hidden and
 
 If the tool remains unavailable, do not fake the operation.
 
+`threads_start_options` is available through the `task` domain when permitted. Call it with `{}` only when you need to select an identity, execution profile, or destination explicitly:
+
+- Use `identities[].id` in `task_create.launch.identity` as `{"kind":"exact","id":"IDENTITY_ID"}`.
+- Use a compatible `profiles[].id` in `launch.profile` as `{"kind":"exact","id":"PROFILE_ID"}`.
+- If setting `launch.reasoning` or `launch.permissionProfile`, stay within the selected profile's `allowedReasoning` and `allowedPermissionProfiles` and the response's `maxPermissionProfile`.
+- If setting `launch.skillIds` or `launch.mcpServerIds`, choose from `allowedSkillIds` or `allowedMcpServerIds`.
+- Use `targetOptions[].id` as `task_create.targetOptionId` for a permitted destination.
+
+`inheritParentIdentityAvailable` and `inheritParentProfileAvailable` indicate whether inheritance can be selected. `defaultPioneerIdentityAvailable` and `derivedEphemeralIdentityAvailable` indicate whether `launch.identity.kind` can be `default_pioneer` or `server_derived_ephemeral`. For a task that inherits the current parent's identity and profile, omit both `launch` and `targetOptionId`; no options lookup is required. The server rechecks authorization when `task_create` runs.
+
 ## task_create For Scheduled Or Background Tasks
 
 Use `task_create` with `trigger` for scheduled, interval, or cron work.
@@ -147,6 +157,8 @@ Use for exact current task state.
 
 Use before `task_update` when the update depends on preserving existing schedule, instructions, delivery, or revision.
 
+Each returned run has an `execution` observation: `status`, `heartbeatAt`, `lastActivityAt`, and `observedAt` (Unix seconds). `status:null` means no execution row was observed. A heartbeat is a periodic liveness mark, not meaningful work progress. `lastActivityAt` is confirmed task activity for the current execution attempt when recorded; `null` means unknown. Task and run `updatedAt` fields do not measure child activity.
+
 ## task_update
 
 Patch only fields that should change. Omitted fields keep their current value.
@@ -234,5 +246,7 @@ Rules:
 ## task_wait Caveat
 
 Do not call `task_wait` after creating scheduled future work unless the returned run is active and waitable.
+
+For active attached work, `timedOut:true` means only the requested wait window expired. It does not stop or diagnose a run; waiting again with `taskIds` or `runIds` is allowed. A run's own timeout is reported in its status and error.
 
 Scheduled, interval, and cron tasks often return `waitable:false` or `runId:null` at creation. Confirm the schedule instead of waiting.

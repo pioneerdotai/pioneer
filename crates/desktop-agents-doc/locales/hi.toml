@@ -1,0 +1,24 @@
+[editor.agents_doc]
+title = "AGENTS.md"
+loading = "AGENTS.md लोड हो रहा है..."
+load_error = "AGENTS.md लोड नहीं हुआ"
+retry = "फिर कोशिश करें"
+retry_save = "सहेजना फिर कोशिश करें"
+save_conflict = "AGENTS.md कहीं और बदल गया है। विवाद हल करने के बाद फिर लोड करें या फिर कोशिश करें।"
+save_conflict_missing_remote = "AGENTS.md कहीं और बदल गया है, लेकिन दूरस्थ दस्तावेज़ लोड नहीं हुआ।"
+
+[editor.agents_doc.conflict]
+title = "AGENTS.md विवाद"
+description = "यह संपादन सहेजे जाने से पहले दूरस्थ दस्तावेज़ बदल गया।"
+reload_remote = "दूरस्थ फिर लोड करें"
+overwrite_remote = "दूरस्थ को बदलें"
+local = "स्थानीय"
+remote = "दूरस्थ"
+
+[editor.agents_doc.save_state]
+clean = "कोई असहेजे बदलाव नहीं"
+dirty = "असहेजे बदलाव"
+saving = "सेव हो रहा है..."
+saved = "सेव हो गया"
+error = "सेव विफल: %{message}"
+conflict = "सहेजने से पहले विवाद हल करें"

@@ -99,7 +99,7 @@ impl NetworkPolicyChecker {
         };
 
         let policy = &snapshot.network;
-        if domain_list_matches(policy.denied_domains.as_slice(), host.as_str()) {
+        if network_rule_list_matches(policy.denied_domains.as_slice(), &parsed, host.as_str()) {
             return deny(
                 operation,
                 url,
@@ -124,7 +124,14 @@ impl NetworkPolicyChecker {
                 "network access is disabled for this turn".to_owned(),
             ),
             TurnNetworkMode::Restricted => {
-                if policy.allow_localhost && is_localhost(host.as_str()) {
+                // `allow_localhost` is the address-space capability needed to
+                // connect to loopback. When explicit URL rules are present,
+                // they still constrain scheme/host/port; the boolean must not
+                // turn one approved localhost origin into every local service.
+                if policy.allow_localhost
+                    && is_localhost(host.as_str())
+                    && policy.allowed_domains.is_empty()
+                {
                     return NetworkPolicyDecision::Allowed(NetworkPolicyGrant {
                         operation,
                         url: url.to_owned(),
@@ -133,7 +140,11 @@ impl NetworkPolicyChecker {
                     });
                 }
 
-                if domain_list_matches(policy.allowed_domains.as_slice(), host.as_str()) {
+                if network_rule_list_matches(
+                    policy.allowed_domains.as_slice(),
+                    &parsed,
+                    host.as_str(),
+                ) {
                     return NetworkPolicyDecision::Allowed(NetworkPolicyGrant {
                         operation,
                         url: url.to_owned(),
@@ -196,9 +207,22 @@ fn deny(
     })
 }
 
-fn domain_list_matches(domains: &[String], host: &str) -> bool {
-    domains.iter().any(|domain| {
-        let domain = normalize_domain_rule(domain);
+fn network_rule_list_matches(rules: &[String], url: &Url, host: &str) -> bool {
+    rules.iter().any(|rule| {
+        if let Some(exact) = rule.trim().strip_prefix('=') {
+            if let Ok(exact_url) = Url::parse(exact)
+                && matches!(exact_url.scheme(), "http" | "https")
+                && exact_url.host_str().is_some()
+            {
+                return exact_url.scheme().eq_ignore_ascii_case(url.scheme())
+                    && exact_url
+                        .host_str()
+                        .is_some_and(|exact_host| normalize_host(exact_host) == host)
+                    && exact_url.port_or_known_default() == url.port_or_known_default();
+            }
+            return normalize_host(exact) == host;
+        }
+        let domain = normalize_domain_rule(rule);
         !domain.is_empty() && domain_matches(host, domain.as_str())
     })
 }
@@ -220,7 +244,7 @@ fn normalize_domain_rule(domain: &str) -> String {
         .to_ascii_lowercase()
 }
 
-fn is_localhost(host: &str) -> bool {
+pub(crate) fn is_localhost(host: &str) -> bool {
     host == "localhost"
         || host.ends_with(".localhost")
         || host
@@ -307,6 +331,111 @@ mod tests {
         assert!(
             NetworkPolicyChecker::check_url(&snapshot, "https://api.example.com", "web_fetch")
                 .is_allowed()
+        );
+    }
+
+    #[test]
+    fn network_policy_exact_host_rule_does_not_authorize_subdomains() {
+        let mut policy = TurnNetworkPolicySnapshot::disabled();
+        policy.mode = TurnNetworkMode::Restricted;
+        policy.allowed_domains = vec!["=example.com".to_owned()];
+        let snapshot = snapshot_with_network(policy);
+
+        assert!(
+            NetworkPolicyChecker::check_url(&snapshot, "https://example.com", "web_fetch")
+                .is_allowed()
+        );
+        assert_eq!(
+            NetworkPolicyChecker::check_url(&snapshot, "https://redirect.example.com", "web_fetch")
+                .deny()
+                .map(|deny| deny.reason),
+            Some(NetworkPolicyDenyReason::HostNotAllowed)
+        );
+    }
+
+    #[test]
+    fn network_policy_exact_origin_rule_binds_scheme_and_effective_port() {
+        let mut policy = TurnNetworkPolicySnapshot::disabled();
+        policy.mode = TurnNetworkMode::Restricted;
+        policy.allowed_domains = vec!["=https://example.com:8443".to_owned()];
+        let snapshot = snapshot_with_network(policy);
+
+        assert!(
+            NetworkPolicyChecker::check_url(
+                &snapshot,
+                "https://example.com:8443/allowed",
+                "web_fetch"
+            )
+            .is_allowed()
+        );
+        for denied_url in [
+            "https://example.com:9443/blocked",
+            "http://example.com:8443/blocked",
+            "https://api.example.com:8443/blocked",
+        ] {
+            assert_eq!(
+                NetworkPolicyChecker::check_url(&snapshot, denied_url, "web_fetch")
+                    .deny()
+                    .map(|deny| deny.reason),
+                Some(NetworkPolicyDenyReason::HostNotAllowed),
+                "exact origin unexpectedly authorized {denied_url}"
+            );
+        }
+    }
+
+    #[test]
+    fn localhost_address_capability_does_not_widen_an_exact_origin_rule() {
+        let mut policy = TurnNetworkPolicySnapshot::disabled();
+        policy.mode = TurnNetworkMode::Restricted;
+        policy.allowed_domains = vec!["=http://localhost:4321".to_owned()];
+        policy.allow_localhost = true;
+        let snapshot = snapshot_with_network(policy);
+
+        assert!(
+            NetworkPolicyChecker::check_url(
+                &snapshot,
+                "http://localhost:4321/allowed",
+                "web_fetch"
+            )
+            .is_allowed()
+        );
+        for denied_url in [
+            "http://localhost:4322/blocked",
+            "https://localhost:4321/blocked",
+            "http://child.localhost:4321/blocked",
+        ] {
+            assert_eq!(
+                NetworkPolicyChecker::check_url(&snapshot, denied_url, "web_fetch")
+                    .deny()
+                    .map(|deny| deny.reason),
+                Some(NetworkPolicyDenyReason::HostNotAllowed),
+                "localhost address capability widened exact rule to {denied_url}"
+            );
+        }
+    }
+
+    #[test]
+    fn network_policy_exact_origin_normalizes_default_port() {
+        let mut policy = TurnNetworkPolicySnapshot::disabled();
+        policy.mode = TurnNetworkMode::Restricted;
+        policy.allowed_domains = vec!["=https://example.com".to_owned()];
+        let snapshot = snapshot_with_network(policy);
+
+        assert!(
+            NetworkPolicyChecker::check_url(
+                &snapshot,
+                "https://example.com:443/allowed",
+                "web_fetch"
+            )
+            .is_allowed()
+        );
+        assert!(
+            !NetworkPolicyChecker::check_url(
+                &snapshot,
+                "https://example.com:444/blocked",
+                "web_fetch"
+            )
+            .is_allowed()
         );
     }
 

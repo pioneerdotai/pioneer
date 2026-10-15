@@ -25,6 +25,78 @@ pub enum GatewayTransportSecurity {
     Tls,
 }
 
+/// Process-level Gateway readiness exposed by the unauthenticated `/ready`
+/// endpoint. This status deliberately describes whether clients may begin a
+/// session; provider-specific readiness remains a separate, workspace-scoped
+/// contract.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum GatewayReadinessStatus {
+    #[default]
+    Starting,
+    AcceptingSessions,
+    Operational,
+    Degraded,
+}
+
+impl GatewayReadinessStatus {
+    pub const fn accepts_sessions(self) -> bool {
+        matches!(
+            self,
+            Self::AcceptingSessions | Self::Operational | Self::Degraded
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct GatewayReadinessSnapshot {
+    pub status: GatewayReadinessStatus,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum GatewayReadinessComponent {
+    Database,
+    NativeAgentManager,
+    DurableListeners,
+    RecoveryCoordinator,
+    Terminalization,
+    ProviderRegistry,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum GatewayReadinessComponentState {
+    Starting,
+    Healthy,
+    Degraded,
+    Unhealthy,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayReadinessComponentSnapshot {
+    pub component: GatewayReadinessComponent,
+    pub state: GatewayReadinessComponentState,
+    pub generation: u64,
+    pub active: u64,
+    pub pending: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oldest_pending_age_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason_code: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayNativeLifecycleReadinessReport {
+    pub status: GatewayReadinessStatus,
+    pub accepting_new_turns: bool,
+    pub generation: u64,
+    pub checked_at_unix: i64,
+    pub components: Vec<GatewayReadinessComponentSnapshot>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GatewayBaseUrlError {
     Empty,
@@ -86,6 +158,13 @@ impl GatewayBaseUrl {
         url.set_scheme(scheme)
             .expect("ws/wss is compatible with an HTTP URL");
         url
+    }
+
+    pub fn readiness_url(&self) -> Url {
+        Url::parse(self.as_str())
+            .expect("GatewayBaseUrl invariant")
+            .join("ready")
+            .expect("readiness is a valid relative Gateway URL")
     }
 
     pub fn storage_url(&self, storage_path: &str) -> Result<Url, GatewayBaseUrlError> {

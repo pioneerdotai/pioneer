@@ -2,14 +2,16 @@
 
 use std::{error::Error, fmt, time::Duration};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct GatewayTimings {
     pub connect_timeout: Duration,
     pub startup_timeout: Duration,
     pub poll_interval: Duration,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct GatewayWsTimings {
     pub connect_timeout: Duration,
     pub ping_interval: Duration,

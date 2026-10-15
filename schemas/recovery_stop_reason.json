@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "RecoveryStopReason",
+  "type": "string",
+  "enum": [
+    "attempts_exhausted",
+    "wall_clock_exhausted",
+    "no_progress",
+    "policy_rejected",
+    "terminal_failure"
+  ]
+}

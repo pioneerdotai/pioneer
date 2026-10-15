@@ -1,0 +1,34 @@
+{
+  "candidates": [
+    {
+      "content": {
+        "role": "model",
+        "parts": [
+          {
+            "thought": true,
+            "text": "Look up the forecast."
+          },
+          {
+            "functionCall": {
+              "id": "forecast_1",
+              "name": "forecast",
+              "args": {
+                "location": {
+                  "city": "Moscow"
+                },
+                "days": 2,
+                "metric": true
+              }
+            },
+            "thoughtSignature": "AQIDBA=="
+          }
+        ]
+      },
+      "finishReason": "STOP"
+    }
+  ],
+  "usageMetadata": {
+    "promptTokenCount": 21,
+    "candidatesTokenCount": 7
+  }
+}

@@ -67,11 +67,14 @@ Inspect:
 
 - task status;
 - latest run status;
+- execution status, heartbeat, activity, and observation time from `task_get`;
 - error snapshot;
 - result candidates;
 - child thread evidence when available.
 
 Use `task_result(candidateId)` before looking for child-thread or database workarounds. Direct database access is not part of the review protocol and must not be required to accept or revise a candidate.
+
+An unchanged `running` run, absent result, repeated `task_get` output, or repeated `task_wait` timeouts does not by itself establish a stall. Heartbeats show liveness, while recorded activity shows only that the runtime observed work; neither promises a result. Missing activity data is unknown. Wait again for active attached work after a wait timeout. Use a confirmed error, changed user request, unsafe or irrelevant work, or another concrete reason when deciding to cancel or repeat work.
 
 Then choose:
 

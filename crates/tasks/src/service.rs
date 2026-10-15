@@ -24,7 +24,7 @@ use crate::trigger::TaskTriggerCalculator;
 use anyhow::{Context, anyhow, bail};
 use pioneer_crud::{
     AppendedTaskEvent, ArtifactBindingTargetRecord, CrudStore, NewTaskRunConversationSnapshot,
-    TaskRootAccessFilter,
+    TaskDeliveryTransition, TaskDeliveryTransitionOutcome, TaskRootAccessFilter,
 };
 use pioneer_protocol::{
     ArtifactBindingDirection, ArtifactBindingKind, ArtifactRole, TASK_COMPOSER_WORK_VERSION, Task,
@@ -68,7 +68,7 @@ const WAIT_LIVENESS_SCAN_INTERVAL: Duration = Duration::from_secs(5);
 const LIVE_RECONCILIATION_INTERVAL: Duration = Duration::from_secs(5);
 const REVIEW_AUTO_ACCEPT_SCAN_INTERVAL: Duration = Duration::from_secs(30);
 const REVIEW_AUTO_ACCEPT_SCAN_LIMIT: u64 = 1024;
-const DELIVERY_RECOVERY_BATCH_LIMIT: u64 = 1_000;
+const DELIVERY_RECOVERY_BATCH_LIMIT: u64 = pioneer_crud::DELIVERY_RECOVERY_BUDGET;
 const MAX_REVISION_FEEDBACK_CHARS: usize = 16_000;
 const MAX_WAIT_GOVERNOR_SCOPES: usize = 1_024;
 
@@ -107,6 +107,9 @@ struct TaskReviseValidationContext {
 
 pub struct TaskRuntime {
     service: Arc<TaskService>,
+    critical_service: Arc<TaskService>,
+    maintenance_service: Arc<TaskService>,
+    background_control_service: Arc<TaskService>,
     scheduler: Arc<TaskScheduler>,
     event_bus: Arc<TaskEventBus>,
     executors: Arc<TaskExecutorRegistry>,
@@ -136,6 +139,21 @@ impl Drop for TaskRuntime {
         if let Ok(mut guard) = self.review_timeout_task.try_lock() {
             if let Some(handle) = guard.take() {
                 handle.abort();
+            }
+        }
+    }
+}
+
+impl TaskRuntime {
+    pub async fn shutdown(&self) {
+        for worker in [
+            &self.scheduler_task,
+            &self.live_reconciliation_task,
+            &self.review_timeout_task,
+        ] {
+            if let Some(handle) = worker.lock().await.take() {
+                handle.abort();
+                let _ = handle.await;
             }
         }
     }
@@ -183,26 +201,53 @@ impl TaskRuntime {
     pub fn new_with_config(store: Arc<CrudStore>, config: TaskRuntimeConfig) -> Self {
         let event_bus = Arc::new(TaskEventBus::new());
         let executors = Arc::new(TaskExecutorRegistry::new());
+        let critical_store = Arc::new(store.with_critical_writes());
+        let maintenance_store = Arc::new(store.with_maintenance_access());
+        let background_control_store = Arc::new(store.with_maintenance_reads_and_critical_writes());
         let service = Arc::new(TaskService::new_with_config(
             store.clone(),
             event_bus.clone(),
             executors.clone(),
             config.clone(),
         ));
+        let critical_service = Arc::new(TaskService::new_with_config(
+            critical_store,
+            event_bus.clone(),
+            executors.clone(),
+            config.clone(),
+        ));
+        let maintenance_service = Arc::new(TaskService::new_with_config(
+            maintenance_store.clone(),
+            event_bus.clone(),
+            executors.clone(),
+            config.clone(),
+        ));
+        let background_control_service = Arc::new(TaskService::new_with_config(
+            background_control_store,
+            event_bus.clone(),
+            executors.clone(),
+            config,
+        ));
         let scheduler = Arc::new(TaskScheduler::new(
-            store.clone(),
+            maintenance_store.clone(),
             event_bus.clone(),
             executors.clone(),
         ));
         service.set_scheduler(Arc::downgrade(&scheduler));
+        critical_service.set_scheduler(Arc::downgrade(&scheduler));
+        maintenance_service.set_scheduler(Arc::downgrade(&scheduler));
+        background_control_service.set_scheduler(Arc::downgrade(&scheduler));
         let reconciler = Arc::new(TaskStartupReconciler::new(
-            store,
+            maintenance_store,
             event_bus.clone(),
             executors.clone(),
             scheduler.handle(),
         ));
         Self {
             service,
+            critical_service,
+            maintenance_service,
+            background_control_service,
             scheduler,
             event_bus,
             executors,
@@ -217,6 +262,21 @@ impl TaskRuntime {
         self.service.clone()
     }
 
+    pub fn critical_service(&self) -> Arc<TaskService> {
+        self.critical_service.clone()
+    }
+
+    pub fn maintenance_service(&self) -> Arc<TaskService> {
+        self.maintenance_service.clone()
+    }
+
+    /// Returns the durable background control-plane service. Its discovery
+    /// reads are admitted as maintenance work while its authority-preserving
+    /// mutations retain critical writer priority.
+    pub fn background_control_service(&self) -> Arc<TaskService> {
+        self.background_control_service.clone()
+    }
+
     pub fn event_bus(&self) -> Arc<TaskEventBus> {
         self.event_bus.clone()
     }
@@ -228,11 +288,21 @@ impl TaskRuntime {
     pub async fn start(&self) -> TaskRuntimeResult<()> {
         let now = now_timestamp_secs();
         self.reconciler.reconcile(now).await?;
-        self.service.recover_retry_and_lock_state(now).await?;
-        self.service
-            .recover_stuck_deliveries(now, DELIVERY_RECOVERY_BATCH_LIMIT)
+        self.maintenance_service
+            .recover_retry_and_lock_state(now)
             .await?;
-        self.service
+        if self
+            .maintenance_service
+            .recover_stuck_deliveries(now, DELIVERY_RECOVERY_BATCH_LIMIT)
+            .await
+            .is_err()
+        {
+            warn!(
+                failure_class = "task_delivery_recovery_startup_discovery_failed",
+                "delivery recovery unavailable at startup; continuing independent startup work"
+            );
+        }
+        self.maintenance_service
             .auto_accept_expired_review_candidates(now, REVIEW_AUTO_ACCEPT_SCAN_LIMIT)
             .await?;
         self.scheduler.process_due_once(now).await?;
@@ -263,9 +333,12 @@ impl TaskRuntime {
         }
         let mut review_timeout_guard = self.review_timeout_task.lock().await;
         if review_timeout_guard.is_none()
-            && self.service.review_auto_accept_timeout_seconds().is_some()
+            && self
+                .maintenance_service
+                .review_auto_accept_timeout_seconds()
+                .is_some()
         {
-            let service = self.service.clone();
+            let service = self.maintenance_service.clone();
             *review_timeout_guard = Some(tokio::spawn(async move {
                 let mut interval = interval(REVIEW_AUTO_ACCEPT_SCAN_INTERVAL);
                 interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -293,6 +366,38 @@ impl TaskRuntime {
     }
 }
 
+/// Outcome of one bounded quantum, including repairs committed before failures.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct TaskDeliveryRecoveryResult {
+    /// Unique candidates; duplicate locators still consume discovery inputs.
+    pub selected: usize,
+    pub recovered: usize,
+    pub failed: usize,
+    /// Candidates whose failure deferral durability could not be established.
+    pub undurable: usize,
+    pub cooling_down: bool,
+}
+
+#[derive(Default)]
+struct DeliveryRecoveryState {
+    cursor: Option<pioneer_crud::DeliveryRecoveryCursor>,
+    retry_turn: bool,
+    failed_quanta: u32,
+    retry_at: Option<Instant>,
+}
+
+impl DeliveryRecoveryState {
+    fn delay_next_quantum(&mut self) {
+        self.failed_quanta = self.failed_quanta.saturating_add(1).min(16);
+        let delay = (5_u64 << (self.failed_quanta - 1)).min(300);
+        self.retry_at = Some(Instant::now() + Duration::from_secs(delay));
+        warn!(
+            failure_class = "task_delivery_recovery_cooldown",
+            "subsequent delivery recovery quanta delayed; durable deferral unavailable"
+        );
+    }
+}
+
 pub struct TaskService {
     store: Arc<CrudStore>,
     projector: TaskProjector,
@@ -300,6 +405,7 @@ pub struct TaskService {
     executors: Arc<TaskExecutorRegistry>,
     scheduler: RwLock<Option<Weak<TaskScheduler>>>,
     config: TaskRuntimeConfig,
+    delivery_recovery: Mutex<DeliveryRecoveryState>,
 }
 
 impl TaskService {
@@ -325,6 +431,7 @@ impl TaskService {
             executors,
             scheduler: RwLock::new(None),
             config,
+            delivery_recovery: Mutex::new(DeliveryRecoveryState::default()),
         }
     }
 
@@ -1558,10 +1665,10 @@ impl TaskService {
                     ),
                 };
                 if reviewer_execution_id.as_str() != intended_execution_id {
-                    bail!(
+                    return Err(anyhow::Error::new(crate::TaskOperationError::AccessDenied).context(format!(
                         "parent reviewer execution does not match task `{}` immutable reviewer intent",
                         response.task.id
-                    );
+                    )));
                 }
                 let turn_id = actor
                     .reviewer_turn_id
@@ -2107,9 +2214,12 @@ impl TaskService {
                 agent_action: context.agent_action_commit,
             })
             .await?;
+        // The atomic Task/snapshot commit is now the durable root. Release
+        // capture handoff before notification and immediate executor work.
+        drop(context.conversation_frozen_hold);
         self.publish_and_wake(appended).await;
-        if trigger_kind == TaskTriggerKind::Immediate {
-            self.process_due_once(now).await?;
+        if let Some(run) = immediate_run {
+            self.process_queued_run_once(run).await?;
         }
 
         let response = self
@@ -2378,7 +2488,6 @@ impl TaskService {
         let plan = plan_cancellation(&tree, params.scope);
         let mut events = Vec::new();
         let mut cancelled_runs = Vec::new();
-        let mut cancelled_deliveries = Vec::new();
         let mut cancelled_executions = Vec::new();
 
         for task in &plan.cancelled_tasks {
@@ -2391,7 +2500,6 @@ impl TaskService {
                 now,
                 &mut events,
                 &mut cancelled_runs,
-                &mut cancelled_deliveries,
                 &mut cancelled_executions,
             )
             .await?;
@@ -2421,8 +2529,16 @@ impl TaskService {
         }
 
         let appended = self
-            .append_events_with_optional_agent_action(events, now, agent_action)
+            .projector
+            .append_cancellation_events(events, now, agent_action)
             .await?;
+        let cancelled_deliveries = appended
+            .iter()
+            .filter_map(|event| match &event.payload {
+                TaskEventPayload::DeliveryCancelled { delivery, .. } => Some(delivery.clone()),
+                _ => None,
+            })
+            .collect();
         for run in &cancelled_runs {
             let mut occurrence = self
                 .store
@@ -2448,6 +2564,7 @@ impl TaskService {
                 cancelled_executions.push((
                     execution.id,
                     Some(TaskError {
+                        recovery_diagnostic: None,
                         code: "task_run_cancelled".to_owned(),
                         message: reason.clone(),
                         class: TaskErrorClass::Cancelled,
@@ -2507,11 +2624,11 @@ impl TaskService {
         };
 
         if execution_turn.task_id == target_task_id {
-            bail!(
+            return Err(anyhow::Error::new(crate::TaskOperationError::AccessDenied).context(format!(
                 "cannot_cancel_current_execution_task: task `{}` cannot cancel itself while executing run `{}`",
                 execution_turn.task_id,
                 execution_turn.run_id
-            );
+            )));
         }
 
         let mut visited = BTreeSet::new();
@@ -2537,12 +2654,12 @@ impl TaskService {
                 return Ok(());
             };
             if parent_task_id == target_task_id {
-                bail!(
+                return Err(anyhow::Error::new(crate::TaskOperationError::AccessDenied).context(format!(
                     "cannot_cancel_current_execution_ancestor: task `{}` cannot cancel ancestor task `{}` while executing run `{}`",
                     execution_turn.task_id,
                     target_task_id,
                     execution_turn.run_id
-                );
+                )));
             }
             current_task_id = parent_task_id;
         }
@@ -2610,7 +2727,7 @@ impl TaskService {
 
     pub async fn update_task(
         &self,
-        _context: TaskMutationContext,
+        context: TaskMutationContext,
         params: TaskUpdateParams,
     ) -> TaskRuntimeResult<TaskUpdateResponse> {
         validate_update_params(&params)?;
@@ -2618,16 +2735,21 @@ impl TaskService {
             bail!("task `{}` not found", params.task_id);
         };
         if is_terminal_task(response.task.status) {
-            bail!("terminal task `{}` cannot be updated", params.task_id);
+            return Err(
+                anyhow::Error::new(crate::TaskOperationError::StateConflict).context(format!(
+                    "terminal task `{}` cannot be updated",
+                    params.task_id
+                )),
+            );
         }
         if let Some(expected_revision) = params.expected_revision
             && response.task.revision != expected_revision
         {
-            bail!(
-                "task `{}` revision mismatch: expected {}, got {}",
-                params.task_id,
-                expected_revision,
-                response.task.revision
+            return Err(
+                anyhow::Error::new(crate::TaskOperationError::StateConflict).context(format!(
+                    "task `{}` revision mismatch: expected {}, got {}",
+                    params.task_id, expected_revision, response.task.revision
+                )),
             );
         }
 
@@ -2933,6 +3055,12 @@ impl TaskService {
         )?;
 
         if changed_fields.is_empty() {
+            self.append_events_with_optional_agent_action(
+                Vec::new(),
+                now,
+                context.agent_action_commit,
+            )
+            .await?;
             return Ok(TaskUpdateResponse {
                 task,
                 trigger: None,
@@ -2944,18 +3072,19 @@ impl TaskService {
         task.updated_at = now;
         task.revision = task.revision.saturating_add(1);
         let appended = self
-            .append_event(
-                TaskEventPayload::TaskUpdated {
+            .append_events_with_optional_agent_action(
+                vec![TaskEventPayload::TaskUpdated {
                     task: task.clone(),
                     trigger: updated_trigger.clone(),
                     agent_spec: updated_agent_spec.clone(),
                     changed_fields: changed_fields.clone(),
                     updated_at: now,
-                },
+                }],
                 now,
+                context.agent_action_commit,
             )
             .await?;
-        self.publish_and_wake(vec![appended]).await;
+        self.publish_and_wake(appended).await;
         if updated_trigger.is_some() {
             self.process_due_once(now).await?;
         }
@@ -2974,14 +3103,19 @@ impl TaskService {
 
     pub async fn reschedule_task(
         &self,
-        _context: TaskMutationContext,
+        context: TaskMutationContext,
         params: TaskRescheduleParams,
     ) -> TaskRuntimeResult<TaskRescheduleResponse> {
         let Some(response) = self.store.get_task(params.task_id.as_str()).await? else {
             bail!("task `{}` not found", params.task_id);
         };
         if is_terminal_task(response.task.status) {
-            bail!("terminal task `{}` cannot be rescheduled", params.task_id);
+            return Err(
+                anyhow::Error::new(crate::TaskOperationError::StateConflict).context(format!(
+                    "terminal task `{}` cannot be rescheduled",
+                    params.task_id
+                )),
+            );
         }
         TaskTriggerCalculator::validate(&params.trigger.spec)?;
         let now = now_timestamp_secs();
@@ -3009,17 +3143,18 @@ impl TaskService {
             updated_at: now,
         };
         let appended = self
-            .append_event(
-                TaskEventPayload::TaskRescheduled {
+            .append_events_with_optional_agent_action(
+                vec![TaskEventPayload::TaskRescheduled {
                     task_id: params.task_id.clone(),
                     trigger: trigger.clone(),
                     rescheduled_at: now,
                     reason: pioneer_protocol::TaskRescheduleReason::UserRequested,
-                },
+                }],
                 now,
+                context.agent_action_commit,
             )
             .await?;
-        self.publish_and_wake(vec![appended]).await;
+        self.publish_and_wake(appended).await;
         self.process_due_once(now).await?;
         let task = self
             .store
@@ -3032,13 +3167,19 @@ impl TaskService {
 
     pub async fn pause_task(
         &self,
-        _context: TaskMutationContext,
+        context: TaskMutationContext,
         params: TaskPauseParams,
     ) -> TaskRuntimeResult<TaskPauseResponse> {
         let Some(response) = self.store.get_task(params.task_id.as_str()).await? else {
             bail!("task `{}` not found", params.task_id);
         };
         if is_terminal_task(response.task.status) {
+            self.append_events_with_optional_agent_action(
+                Vec::new(),
+                now_timestamp_secs(),
+                context.agent_action_commit,
+            )
+            .await?;
             return Ok(TaskPauseResponse {
                 task: response.task,
                 triggers: response.triggers,
@@ -3059,17 +3200,18 @@ impl TaskService {
                 trigger
             })
             .collect::<Vec<_>>();
-        let appended = task_service_future(self.append_event(
-            TaskEventPayload::TaskPaused {
+        let appended = task_service_future(self.append_events_with_optional_agent_action(
+            vec![TaskEventPayload::TaskPaused {
                 task: task.clone(),
                 triggers: triggers.clone(),
                 reason: params.reason,
                 paused_at: now,
-            },
+            }],
             now,
+            context.agent_action_commit,
         ))
         .await?;
-        self.publish_and_wake(vec![appended]).await;
+        self.publish_and_wake(appended).await;
         Ok(TaskPauseResponse { task, triggers })
     }
 
@@ -3084,7 +3226,12 @@ impl TaskService {
         };
         let was_blocked = response.task.status == TaskStatus::Blocked;
         if is_terminal_task(response.task.status) && !was_blocked {
-            bail!("terminal task `{}` cannot be resumed", params.task_id);
+            return Err(
+                anyhow::Error::new(crate::TaskOperationError::StateConflict).context(format!(
+                    "terminal task `{}` cannot be resumed",
+                    params.task_id
+                )),
+            );
         }
         let readmission = match (
             was_blocked,
@@ -3287,23 +3434,23 @@ impl TaskService {
         &self,
         delivery_id: &str,
         started_at: i64,
-    ) -> TaskRuntimeResult<Option<(TaskDelivery, TaskDeliveryAttempt)>> {
-        let Some(mut delivery) = self.store.get_task_delivery(delivery_id).await? else {
-            return Ok(None);
-        };
-        if delivery.status != TaskDeliveryStatus::Pending {
-            return Ok(None);
-        }
-        if let Some(next_attempt_at) = delivery.next_attempt_at
-            && next_attempt_at > started_at
-        {
-            return Ok(None);
-        }
+    ) -> TaskRuntimeResult<TaskDeliveryTransitionOutcome<(TaskDelivery, TaskDeliveryAttempt)>> {
+        let mut delivery = self
+            .store
+            .get_task_delivery(delivery_id)
+            .await?
+            .context("delivery start has no durable delivery")?;
         self.validate_delivery_boundary(&delivery).await?;
         let attempt_number = delivery.attempt_count.saturating_add(1);
         delivery.status = TaskDeliveryStatus::Delivering;
         delivery.attempt_count = attempt_number;
         delivery.next_attempt_at = None;
+        // Prepare a start candidate even for a terminal snapshot; only writer
+        // preflight can grant it. Terminal receipt fields remain durable and
+        // this candidate is discarded without an event when it loses.
+        delivery.delivered_turn_id = None;
+        delivery.delivered_notification_id = None;
+        delivery.delivered_at = None;
         delivery.updated_at = started_at;
         let attempt = TaskDeliveryAttempt {
             id: generate_id(ID_LEN),
@@ -3316,17 +3463,26 @@ impl TaskService {
             error: None,
             response_fingerprint: None,
         };
-        let appended = self
-            .append_event(
+        let outcome = self
+            .projector
+            .transition_delivery(
                 TaskEventPayload::DeliveryStarted {
                     delivery: delivery.clone(),
                     attempt: attempt.clone(),
                 },
+                TaskDeliveryTransition::Start,
                 started_at,
             )
             .await?;
-        self.event_bus.publish(appended).await;
-        Ok(Some((delivery, attempt)))
+        match outcome {
+            TaskDeliveryTransitionOutcome::Applied(appended) => {
+                self.event_bus.publish(appended).await;
+                Ok(TaskDeliveryTransitionOutcome::Applied((delivery, attempt)))
+            }
+            TaskDeliveryTransitionOutcome::Superseded => {
+                Ok(TaskDeliveryTransitionOutcome::Superseded)
+            }
+        }
     }
 
     pub async fn complete_delivery(
@@ -3338,7 +3494,8 @@ impl TaskService {
         http_status: Option<u16>,
         response_fingerprint: Option<String>,
         delivered_at: i64,
-    ) -> TaskRuntimeResult<TaskDelivery> {
+    ) -> TaskRuntimeResult<TaskDeliveryTransitionOutcome<TaskDelivery>> {
+        validate_worker_delivery_attempt(&delivery, &attempt)?;
         self.validate_delivery_boundary(&delivery).await?;
         delivery.status = TaskDeliveryStatus::Delivered;
         delivery.delivered_turn_id = delivered_turn_id;
@@ -3351,17 +3508,26 @@ impl TaskService {
         attempt.completed_at = Some(delivered_at);
         attempt.http_status = http_status;
         attempt.response_fingerprint = response_fingerprint;
-        let appended = self
-            .append_event(
+        let outcome = self
+            .projector
+            .transition_delivery(
                 TaskEventPayload::DeliveryDelivered {
                     delivery: delivery.clone(),
                     attempt,
                 },
+                TaskDeliveryTransition::Finish,
                 delivered_at,
             )
             .await?;
-        self.event_bus.publish(appended).await;
-        Ok(delivery)
+        match outcome {
+            TaskDeliveryTransitionOutcome::Applied(appended) => {
+                self.event_bus.publish(appended).await;
+                Ok(TaskDeliveryTransitionOutcome::Applied(delivery))
+            }
+            TaskDeliveryTransitionOutcome::Superseded => {
+                Ok(TaskDeliveryTransitionOutcome::Superseded)
+            }
+        }
     }
 
     pub async fn fail_delivery(
@@ -3372,7 +3538,8 @@ impl TaskService {
         http_status: Option<u16>,
         response_fingerprint: Option<String>,
         failed_at: i64,
-    ) -> TaskRuntimeResult<TaskDelivery> {
+    ) -> TaskRuntimeResult<TaskDeliveryTransitionOutcome<TaskDelivery>> {
+        validate_worker_delivery_attempt(&delivery, &attempt)?;
         self.validate_delivery_boundary(&delivery).await?;
         let retryable = delivery.attempt_count < delivery.max_attempts;
         delivery.status = if retryable {
@@ -3389,17 +3556,26 @@ impl TaskService {
         attempt.http_status = http_status;
         attempt.error = Some(failure_class);
         attempt.response_fingerprint = response_fingerprint;
-        let appended = self
-            .append_event(
+        let outcome = self
+            .projector
+            .transition_delivery(
                 TaskEventPayload::DeliveryFailed {
                     delivery: delivery.clone(),
                     attempt,
                 },
+                TaskDeliveryTransition::Finish,
                 failed_at,
             )
             .await?;
-        self.event_bus.publish(appended).await;
-        Ok(delivery)
+        match outcome {
+            TaskDeliveryTransitionOutcome::Applied(appended) => {
+                self.event_bus.publish(appended).await;
+                Ok(TaskDeliveryTransitionOutcome::Applied(delivery))
+            }
+            TaskDeliveryTransitionOutcome::Superseded => {
+                Ok(TaskDeliveryTransitionOutcome::Superseded)
+            }
+        }
     }
 
     async fn validate_delivery_boundary(&self, delivery: &TaskDelivery) -> TaskRuntimeResult<()> {
@@ -3417,77 +3593,247 @@ impl TaskService {
             .delivery
             .validate()
             .map_err(|error| anyhow!("task delivery authority is invalid: {error:?}"))?;
-        if !contract.delivery.enabled {
-            bail!("task delivery is disabled by its durable actor contract");
-        }
-        let destination_matches = match delivery.mode {
-            TaskDeliveryMode::Thread => {
+        let occurrence = self
+            .store
+            .get_task_occurrence_contract_by_run(delivery.run_id.as_str())
+            .await?
+            .context("task delivery has no durable occurrence contract")?;
+        let task = self
+            .store
+            .get_task(delivery.task_id.as_str())
+            .await?
+            .context("task delivery has no Task")?;
+        let frozen_policy = occurrence.delivery_plan.as_ref().map(|plan| &plan.policy);
+        let destination_matches = match (delivery.mode, frozen_policy) {
+            (TaskDeliveryMode::Thread, Some(policy)) => {
+                delivery.target_thread_id == policy.thread_id
+            }
+            (TaskDeliveryMode::UserNotification, Some(_)) => {
+                delivery.target_user_id
+                    == contract.delivery.destination_user_id.clone().or_else(|| {
+                        (task.task.owner_kind == pioneer_protocol::TaskOwnerKind::User)
+                            .then(|| task.task.owner_id.clone())
+                            .flatten()
+                    })
+            }
+            (TaskDeliveryMode::Webhook, Some(policy)) => {
+                delivery.webhook_url_fingerprint
+                    == policy
+                        .webhook_url
+                        .as_deref()
+                        .map(crate::actor_contract::delivery_target_fingerprint)
+            }
+            (TaskDeliveryMode::None, Some(_)) => false,
+            // Legacy occurrences predate frozen routing and retain the original
+            // immutable actor-contract check.
+            (TaskDeliveryMode::Thread, None) => {
                 delivery.target_thread_id == contract.delivery.destination_thread_id
             }
-            TaskDeliveryMode::UserNotification => {
+            (TaskDeliveryMode::UserNotification, None) => {
                 delivery.target_user_id == contract.delivery.destination_user_id
             }
-            TaskDeliveryMode::Webhook => {
+            (TaskDeliveryMode::Webhook, None) => {
                 delivery.webhook_url_fingerprint
                     == contract.delivery.destination_webhook_url_fingerprint
             }
-            TaskDeliveryMode::None => false,
+            (TaskDeliveryMode::None, None) => false,
         };
         if !destination_matches {
-            bail!("task delivery destination no longer matches its durable route");
+            bail!("task delivery destination differs from its frozen occurrence route");
+        }
+        if contract.delivery.route_id.is_some()
+            && match delivery.mode {
+                TaskDeliveryMode::Thread => {
+                    delivery.target_thread_id != contract.delivery.destination_thread_id
+                }
+                TaskDeliveryMode::UserNotification => {
+                    delivery.target_user_id != contract.delivery.destination_user_id
+                }
+                TaskDeliveryMode::Webhook | TaskDeliveryMode::None => true,
+            }
+        {
+            bail!("task delivery attempts to reuse a route for another destination");
         }
         Ok(())
     }
 
-    pub async fn recover_stuck_deliveries(&self, now: i64, limit: u64) -> TaskRuntimeResult<usize> {
-        let cutoff = now.saturating_sub(300);
-        let deliveries = self.store.list_stuck_task_deliveries(cutoff, limit).await?;
-        let mut recovered = 0usize;
-        for mut delivery in deliveries {
-            let attempts = self
-                .store
-                .list_task_deliveries(TaskDeliveriesParams {
-                    workspace_id: delivery.workspace_id.clone(),
-                    task_id: Some(delivery.task_id.clone()),
-                    run_id: Some(delivery.run_id.clone()),
-                    statuses: Vec::new(),
-                    limit: Some(100),
-                })
-                .await?
-                .attempts;
-            let mut attempt = attempts
-                .into_iter()
-                .find(|attempt| {
-                    attempt.delivery_id == delivery.id
-                        && attempt.attempt_number == delivery.attempt_count
-                        && attempt.status == TaskDeliveryAttemptStatus::Started
-                })
-                .ok_or_else(|| {
-                    anyhow!(
-                        "stuck Task delivery `{}` has no exact active attempt",
-                        delivery.id
-                    )
-                })?;
-            let retryable = delivery.attempt_count < delivery.max_attempts;
-            delivery.status = if retryable {
-                TaskDeliveryStatus::Pending
-            } else {
-                TaskDeliveryStatus::Failed
-            };
-            delivery.next_attempt_at = retryable.then_some(now);
-            let recovery_error = "task_delivery_recovered".to_owned();
-            delivery.last_error = Some(recovery_error.clone());
-            delivery.updated_at = now;
-            attempt.status = TaskDeliveryAttemptStatus::Failed;
-            attempt.completed_at = Some(now);
-            attempt.error = Some(recovery_error);
-            let appended = self
-                .append_event(TaskEventPayload::DeliveryFailed { delivery, attempt }, now)
-                .await?;
-            self.event_bus.publish(appended).await;
-            recovered = recovered.saturating_add(1);
+    pub async fn recover_stuck_deliveries(
+        &self,
+        now: i64,
+        limit: u64,
+    ) -> TaskRuntimeResult<TaskDeliveryRecoveryResult> {
+        if limit == 0 {
+            bail!("delivery recovery requires a nonzero input budget");
         }
-        Ok(recovered)
+        let limit = limit.min(pioneer_crud::DELIVERY_RECOVERY_BUDGET);
+        // Serializes only this service's quanta; no DB resource is held here.
+        // The cursor is fairness for current work, never a domain ACK.
+        let mut state = self.delivery_recovery.lock().await;
+        if state.retry_at.is_some_and(|at| Instant::now() < at) {
+            return Ok(TaskDeliveryRecoveryResult {
+                cooling_down: true,
+                ..Default::default()
+            });
+        }
+        let maintenance = Arc::new(self.store.with_maintenance_access());
+        let cutoff = now.saturating_sub(300);
+        // For limit=1 alternate sources; otherwise reserve half for each.
+        let retry_quota = if limit == 1 {
+            u64::from(state.retry_turn)
+        } else {
+            limit / 2
+        };
+        state.retry_turn = !state.retry_turn;
+        let discovery = async {
+            let retries = maintenance
+                .due_task_delivery_recovery_retries(now, retry_quota)
+                .await?;
+            let source_limit = limit - retries.len() as u64;
+            let rows = if source_limit > 0 {
+                maintenance
+                    .task_delivery_recovery_page(cutoff, state.cursor.as_ref(), source_limit)
+                    .await?
+            } else {
+                Vec::new()
+            };
+            Ok::<_, anyhow::Error>((retries, rows, source_limit))
+        }
+        .await;
+        let (retries, rows, source_limit) = match discovery {
+            Ok(page) => page,
+            Err(error) => {
+                state.delay_next_quantum();
+                warn!(
+                    failure_class = "task_delivery_recovery_discovery_failed",
+                    "delivery recovery discovery storage access failed; no quantum issued"
+                );
+                return Err(error);
+            }
+        };
+        // Advance before any fallible row work. Wrap only in the next quantum.
+        if source_limit > 0 {
+            state.cursor = if rows.len() < source_limit as usize {
+                None
+            } else {
+                rows.last().cloned()
+            };
+        }
+        let mut selected = BTreeSet::new();
+        let mut result = TaskDeliveryRecoveryResult::default();
+        let candidates = retries
+            .into_iter()
+            .map(|r| (r.delivery_id.clone(), Some(r)))
+            .chain(rows.into_iter().map(|r| (r.id, None)));
+        for (id, due_retry) in candidates {
+            if !selected.insert(id.clone()) {
+                continue;
+            }
+            result.selected += 1;
+            let snapshot_store = maintenance.clone();
+            let snapshot_id = id;
+            let snapshot = match crate::task_boundary::task_fresh_task(
+                async move {
+                    snapshot_store
+                        .task_delivery_recovery_snapshot(&snapshot_id)
+                        .await
+                },
+                "task delivery recovery snapshot panicked",
+            )
+            .await
+            {
+                Ok(Some(snapshot)) => snapshot,
+                Ok(None) => continue,
+                Err(_) => {
+                    // Without a snapshot there is no authority to repair, infer
+                    // an absent attempt, or write a fenced retry.
+                    result.failed += 1;
+                    result.undurable += 1;
+                    warn!(
+                        failure_class = "task_delivery_recovery_snapshot_failed",
+                        "candidate snapshot unavailable; durable deferral unavailable"
+                    );
+                    continue;
+                }
+            };
+            if !snapshot.eligible(now)
+                || due_retry
+                    .as_ref()
+                    .is_some_and(|r| snapshot.retry.as_ref() != Some(r))
+            {
+                continue;
+            }
+            // Reuse the owned, abort-on-drop task boundary to isolate both
+            // preparation and apply panics without detaching cancelled work.
+            let source = snapshot.clone();
+            let store = self.store.clone();
+            let repair = crate::task_boundary::task_fresh_task(
+                async move {
+                    let event = source.failure_event(now)?;
+                    store
+                        .recover_task_delivery(event, &source, cutoff, now)
+                        .await
+                },
+                "task delivery recovery row panicked",
+            )
+            .await;
+            match repair {
+                Ok(TaskDeliveryTransitionOutcome::Applied(appended)) => {
+                    // Atomic event + both projections have committed; capacity
+                    // is released before publishing any notification.
+                    self.event_bus.publish(appended).await;
+                    result.recovered += 1;
+                }
+                Ok(TaskDeliveryTransitionOutcome::Superseded) => {}
+                Err(_) => {
+                    result.failed += 1;
+                    warn!(
+                        failure_class = "task_delivery_recovery_row_failed",
+                        "delivery recovery candidate failed; retaining current delivering work"
+                    );
+                    // Clock after writer admission, even when admission waited.
+                    // Keep an explicit caller time floor for deterministic quanta.
+                    let retry_store = maintenance.clone();
+                    if crate::task_boundary::task_fresh_task(
+                        async move {
+                            let clock = || now_timestamp_secs().max(now);
+                            retry_store
+                                .defer_task_delivery_recovery(&snapshot, &clock)
+                                .await
+                        },
+                        "task delivery recovery bookkeeping panicked",
+                    )
+                    .await
+                    .is_err()
+                    {
+                        result.undurable += 1;
+                        warn!(
+                            failure_class = "task_delivery_recovery_deferral_failed",
+                            "candidate failure bookkeeping failed; durable deferral unavailable"
+                        );
+                    }
+                }
+            }
+        }
+        if result.undurable == 0 {
+            state.failed_quanta = 0;
+            state.retry_at = None;
+        } else {
+            // Once per quantum, after all selected work. A local error does not
+            // establish a storage-wide outage or revoke another row's budget.
+            state.delay_next_quantum();
+        }
+        result.cooling_down = result.undurable > 0;
+        if result.failed > 0 {
+            warn!(
+                failure_class = "task_delivery_recovery_partial_failure",
+                selected = result.selected,
+                recovered = result.recovered,
+                failed = result.failed,
+                undurable = result.undurable,
+                "delivery recovery quantum completed with candidate failures"
+            );
+        }
+        Ok(result)
     }
 
     pub async fn get_task(&self, params: TaskGetParams) -> TaskRuntimeResult<TaskGetResponse> {
@@ -3940,6 +4286,15 @@ impl TaskService {
         }
     }
 
+    async fn process_queued_run_once(&self, run: TaskRun) -> TaskRuntimeResult<bool> {
+        let scheduler = self.scheduler.read().await.as_ref().and_then(Weak::upgrade);
+        if let Some(scheduler) = scheduler {
+            scheduler.process_queued_run_once(&self.store, run).await
+        } else {
+            Ok(false)
+        }
+    }
+
     async fn wake_scheduler(&self) {
         if let Some(scheduler) = self.scheduler.read().await.as_ref().and_then(Weak::upgrade) {
             scheduler.wake();
@@ -4270,7 +4625,6 @@ impl TaskService {
         now: i64,
         events: &mut Vec<TaskEventPayload>,
         cancelled_runs: &mut Vec<TaskRun>,
-        cancelled_deliveries: &mut Vec<TaskDelivery>,
         cancelled_executions: &mut Vec<(String, Option<TaskError>)>,
     ) -> TaskRuntimeResult<()> {
         if is_terminal_task(response.task.status) && response.task.status != TaskStatus::Blocked {
@@ -4361,38 +4715,9 @@ impl TaskService {
             .await?
             .deliveries
         {
-            let attempt = if delivery.status == TaskDeliveryStatus::Delivering {
-                let attempts = self
-                    .store
-                    .list_task_deliveries(TaskDeliveriesParams {
-                        workspace_id: delivery.workspace_id.clone(),
-                        task_id: Some(delivery.task_id.clone()),
-                        run_id: Some(delivery.run_id.clone()),
-                        statuses: Vec::new(),
-                        limit: Some(100),
-                    })
-                    .await?
-                    .attempts;
-                let mut attempt = attempts
-                    .into_iter()
-                    .find(|attempt| {
-                        attempt.delivery_id == delivery.id
-                            && attempt.attempt_number == delivery.attempt_count
-                            && attempt.status == TaskDeliveryAttemptStatus::Started
-                    })
-                    .ok_or_else(|| {
-                        anyhow!(
-                            "cancelling Task delivery `{}` has no exact active attempt",
-                            delivery.id
-                        )
-                    })?;
-                attempt.status = TaskDeliveryAttemptStatus::Failed;
-                attempt.completed_at = Some(now);
-                attempt.error = Some(reason.to_owned());
-                Some(attempt)
-            } else {
-                None
-            };
+            // The cancellation batch prepares/revalidates the exact active
+            // attempt through CrudStore, preserving its atomic Task write set.
+            let attempt = None;
             delivery.status = TaskDeliveryStatus::Cancelled;
             delivery.next_attempt_at = None;
             delivery.last_error = Some(reason.to_owned());
@@ -4402,7 +4727,6 @@ impl TaskService {
                 attempt,
                 reason: Some(reason.to_owned()),
             });
-            cancelled_deliveries.push(delivery);
         }
         if let Some(current_response) = self.store.get_task(response.task.id.as_str()).await?
             && is_terminal_task(current_response.task.status)
@@ -4461,6 +4785,7 @@ impl TaskService {
             cancelled_executions.push((
                 execution.id,
                 Some(TaskError {
+                    recovery_diagnostic: None,
                     code: "task_run_cancelled".to_owned(),
                     message: reason.to_owned(),
                     class: TaskErrorClass::Cancelled,
@@ -4574,6 +4899,23 @@ impl TaskService {
         self.publish_and_wake(vec![appended]).await;
         Ok(())
     }
+}
+
+fn validate_worker_delivery_attempt(
+    delivery: &TaskDelivery,
+    attempt: &TaskDeliveryAttempt,
+) -> TaskRuntimeResult<()> {
+    if delivery.status != TaskDeliveryStatus::Delivering
+        || attempt.status != TaskDeliveryAttemptStatus::Started
+        || attempt.delivery_id != delivery.id
+        || attempt.attempt_number != delivery.attempt_count
+        || attempt.attempt_number == 0
+        || attempt.completed_at.is_some()
+        || attempt.error.is_some()
+    {
+        bail!("worker does not carry its exact started delivery attempt");
+    }
+    Ok(())
 }
 
 fn normalize_delivery_failure_class(value: &str) -> String {
@@ -5885,6 +6227,7 @@ pub(crate) fn task_error(
     failed_run_id: Option<String>,
 ) -> TaskError {
     TaskError {
+        recovery_diagnostic: None,
         code: code.into(),
         message: message.into(),
         class,
@@ -5895,7 +6238,11 @@ pub(crate) fn task_error(
 
 #[cfg(test)]
 mod resource_policy_tests {
-    use super::ensure_paginated_response_budget;
+    use super::{TaskRuntime, ensure_paginated_response_budget};
+    use pioneer_crud::CrudStore;
+    use pioneer_sqlite::{SqliteDatabase, SqliteReadClass, SqliteWriteClass};
+    use sea_orm::Database;
+    use std::sync::Arc;
 
     #[test]
     fn page_size_target_never_hides_a_single_logical_record() {
@@ -5903,5 +6250,45 @@ mod resource_policy_tests {
         ensure_paginated_response_budget(&response, 1, 64, "test page")
             .expect("a single logical record must remain readable intact");
         assert!(ensure_paginated_response_budget(&response, 2, 64, "test page").is_err());
+    }
+
+    #[tokio::test]
+    async fn runtime_services_preserve_independent_read_and_write_classes() {
+        let connection = Database::connect("sqlite::memory:")
+            .await
+            .expect("open test database");
+        let store = Arc::new(CrudStore::new(SqliteDatabase::from_single_connection(
+            connection,
+        )));
+        let runtime = TaskRuntime::new(store);
+
+        let cases = [
+            (
+                runtime.service(),
+                SqliteReadClass::Interactive,
+                SqliteWriteClass::Interactive,
+            ),
+            (
+                runtime.critical_service(),
+                SqliteReadClass::Interactive,
+                SqliteWriteClass::Critical,
+            ),
+            (
+                runtime.maintenance_service(),
+                SqliteReadClass::Maintenance,
+                SqliteWriteClass::Maintenance,
+            ),
+            (
+                runtime.background_control_service(),
+                SqliteReadClass::Maintenance,
+                SqliteWriteClass::Critical,
+            ),
+        ];
+
+        for (service, expected_read, expected_write) in cases {
+            let database = service.store().database_connection();
+            assert_eq!(database.read_class(), expected_read);
+            assert_eq!(database.write_class(), expected_write);
+        }
     }
 }

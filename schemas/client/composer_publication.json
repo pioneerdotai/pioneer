@@ -1,0 +1,3049 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ComposerPublication",
+  "type": "object",
+  "properties": {
+    "authorization_fingerprint": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "draft": {
+      "$ref": "#/$defs/ComposerDomainDraft"
+    },
+    "draft_id": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "execution_capabilities_removed": {
+      "type": "boolean"
+    },
+    "message_edit": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ComposerMessageEditTarget"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "model_display": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ComposerModelDisplayPublication"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "operation": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ComposerOperationPublication"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "permission_options": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/ComposerPermissionModeOption"
+      }
+    },
+    "reconciliation": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ExecutionDraftReconciliation"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "revision": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "runtime_selection": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ComposerRuntimePublication"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "selected_permission_mode_allowed": {
+      "type": "boolean"
+    },
+    "selected_provider_ready": {
+      "type": "boolean"
+    },
+    "thread_id": {
+      "type": "string"
+    },
+    "voice_readiness": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ComposerVoiceReadinessPublication"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "required": [
+    "selected_provider_ready",
+    "permission_options",
+    "selected_permission_mode_allowed",
+    "thread_id",
+    "draft_id",
+    "revision",
+    "draft",
+    "execution_capabilities_removed"
+  ],
+  "$defs": {
+    "AgentExecutionBackend": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "provider": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "apiProvider"
+            }
+          },
+          "required": [
+            "type",
+            "provider"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "runtime_id": {
+              "type": "string"
+            },
+            "runtime_kind": {
+              "$ref": "#/$defs/CLIAgentRuntimeKind"
+            },
+            "type": {
+              "type": "string",
+              "const": "cliAgentRuntime"
+            }
+          },
+          "required": [
+            "type",
+            "runtime_id",
+            "runtime_kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "runtime_id": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "acpAgentRuntime"
+            }
+          },
+          "required": [
+            "type",
+            "runtime_id"
+          ]
+        }
+      ]
+    },
+    "AgentExecutionId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "AgentIdentityId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "AgentIdentitySourceKind": {
+      "type": "string",
+      "enum": [
+        "native_agent",
+        "cli_runtime_instance",
+        "ephemeral"
+      ]
+    },
+    "AgentPresentationSnapshot": {
+      "type": "object",
+      "properties": {
+        "agent_execution_id": {
+          "$ref": "#/$defs/AgentExecutionId"
+        },
+        "agent_identity_id": {
+          "$ref": "#/$defs/AgentIdentityId"
+        },
+        "avatar_revision": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "display_name": {
+          "type": "string"
+        },
+        "identity_source_kind": {
+          "$ref": "#/$defs/AgentIdentitySourceKind"
+        },
+        "identity_source_revision": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "nickname": {
+          "type": "string"
+        },
+        "role_label": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "agent_identity_id",
+        "agent_execution_id",
+        "identity_source_kind",
+        "identity_source_revision",
+        "display_name",
+        "nickname"
+      ]
+    },
+    "AgentResultReturnPolicy": {
+      "type": "string",
+      "enum": [
+        "none",
+        "summary_only",
+        "full_result"
+      ]
+    },
+    "AgentRouteAction": {
+      "type": "string",
+      "enum": [
+        "send_message",
+        "start_agent",
+        "create_task",
+        "schedule_task",
+        "review_task_result",
+        "deliver_result"
+      ]
+    },
+    "AgentRouteDisclosurePolicy": {
+      "type": "object",
+      "properties": {
+        "artifacts": {
+          "description": "Exact, already-authorized artifact handles. Raw files and paths are\nnever represented by this flag.",
+          "type": "boolean",
+          "default": false
+        },
+        "context": {
+          "description": "Bounded conversation excerpts or summaries selected by server policy.",
+          "type": "boolean",
+          "default": false
+        },
+        "resultReturn": {
+          "description": "Result return is a separate disclosure class: allowing ordinary text\nmust never imply that a full Task result can cross a capsule boundary.",
+          "$ref": "#/$defs/AgentResultReturnPolicy",
+          "default": "none"
+        },
+        "text": {
+          "description": "Explicit text authored for the routed operation.",
+          "type": "boolean",
+          "default": false
+        },
+        "userInput": {
+          "description": "Explicit user-provided Task inputs. This is deliberately independent\nfrom Agent-authored text and inherited conversation context.",
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "ArtifactKind": {
+      "type": "string",
+      "enum": [
+        "file",
+        "text",
+        "image",
+        "audio",
+        "video",
+        "pdf",
+        "spreadsheet",
+        "archive",
+        "json",
+        "generated_image",
+        "screenshot",
+        "workspace_file",
+        "directory_manifest",
+        "unknown"
+      ]
+    },
+    "ArtifactPreviewRef": {
+      "type": "object",
+      "properties": {
+        "artifact_id": {
+          "type": "string"
+        },
+        "blob_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "mime_type": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "projection_kind": {
+          "$ref": "#/$defs/ArtifactProjectionKind"
+        },
+        "sha256": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "size_bytes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "status": {
+          "$ref": "#/$defs/ArtifactProjectionStatus"
+        },
+        "version_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "projection_kind",
+        "status",
+        "artifact_id",
+        "version_id"
+      ]
+    },
+    "ArtifactProjectionKind": {
+      "type": "string",
+      "enum": [
+        "plain_text",
+        "thumbnail",
+        "json_summary",
+        "pdf_text"
+      ]
+    },
+    "ArtifactProjectionStatus": {
+      "type": "string",
+      "enum": [
+        "pending",
+        "ready",
+        "failed",
+        "stale"
+      ]
+    },
+    "ArtifactRef": {
+      "type": "object",
+      "properties": {
+        "artifact_id": {
+          "type": "string"
+        },
+        "display_name": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/ArtifactKind"
+        },
+        "mime_type": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "preview": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ArtifactPreviewRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "sha256": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "size_bytes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "status": {
+          "$ref": "#/$defs/ArtifactStatus"
+        },
+        "version_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "artifact_id",
+        "display_name",
+        "kind",
+        "status"
+      ]
+    },
+    "ArtifactStatus": {
+      "type": "string",
+      "enum": [
+        "ready",
+        "pending",
+        "quarantined",
+        "deleted",
+        "missing_external_source",
+        "failed"
+      ]
+    },
+    "ByteRange": {
+      "type": "object",
+      "properties": {
+        "end": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        },
+        "start": {
+          "type": "integer",
+          "format": "uint",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "start",
+        "end"
+      ]
+    },
+    "CLIAgentRuntimeKind": {
+      "type": "string",
+      "enum": [
+        "codex",
+        "claude"
+      ]
+    },
+    "ComposerAttachment": {
+      "type": "object",
+      "properties": {
+        "file_name": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/ComposerAttachmentKind"
+        },
+        "path": {
+          "type": "string"
+        },
+        "upload_state": {
+          "$ref": "#/$defs/ComposerAttachmentUploadState"
+        }
+      },
+      "required": [
+        "path",
+        "file_name",
+        "kind",
+        "upload_state"
+      ]
+    },
+    "ComposerAttachmentKind": {
+      "type": "string",
+      "enum": [
+        "Image",
+        "File",
+        "Audio",
+        "Video"
+      ]
+    },
+    "ComposerAttachmentUploadState": {
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "Local",
+            "Uploading"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "Uploaded": {
+              "type": "object",
+              "properties": {
+                "artifact": {
+                  "$ref": "#/$defs/ArtifactRef"
+                }
+              },
+              "required": [
+                "artifact"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "Uploaded"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "Failed": {
+              "type": "object",
+              "properties": {
+                "error": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "error"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "Failed"
+          ]
+        }
+      ]
+    },
+    "ComposerCapability": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/ComposerCapabilityKind"
+        },
+        "label": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "label",
+        "kind"
+      ]
+    },
+    "ComposerCapabilityKind": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "Skill": {
+              "type": "object",
+              "properties": {
+                "owner": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "skill_id": {
+                  "$ref": "#/$defs/SkillId"
+                },
+                "slug": {
+                  "type": "string"
+                },
+                "source_kind": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "skill_id",
+                "slug",
+                "source_kind"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "Skill"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "McpServer": {
+              "type": "object",
+              "properties": {
+                "name": {
+                  "type": "string"
+                },
+                "scope_kind": {
+                  "$ref": "#/$defs/McpScopeKind"
+                }
+              },
+              "required": [
+                "name",
+                "scope_kind"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "McpServer"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "McpTool": {
+              "type": "object",
+              "properties": {
+                "raw_tool_name": {
+                  "type": "string"
+                },
+                "scope_kind": {
+                  "$ref": "#/$defs/McpScopeKind"
+                },
+                "server_name": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "server_name",
+                "raw_tool_name",
+                "scope_kind"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "McpTool"
+          ]
+        }
+      ]
+    },
+    "ComposerCapabilityTarget": {
+      "description": "Capability eligibility context.\n\nThe target kind exists only because native skills retain their current\nsource policy while CLI skills must be exportable. Capability support is\nrepresented exclusively by [`ComposerCapabilityPolicy`].",
+      "type": "object",
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/ComposerCapabilityTargetKind"
+        },
+        "supports_mcp_tools": {
+          "type": "boolean"
+        },
+        "supports_skills": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "supports_skills",
+        "supports_mcp_tools"
+      ]
+    },
+    "ComposerCapabilityTargetKind": {
+      "type": "string",
+      "enum": [
+        "native",
+        "cli"
+      ]
+    },
+    "ComposerCatalogRequest": {
+      "type": "object",
+      "properties": {
+        "generation": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "state": {
+          "$ref": "#/$defs/ComposerCatalogRequestState"
+        }
+      },
+      "required": [
+        "generation",
+        "state"
+      ]
+    },
+    "ComposerCatalogRequestState": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "idle"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "loading"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "ready"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "failed"
+            },
+            "message": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "message"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "cancelled"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        }
+      ]
+    },
+    "ComposerDomainDraft": {
+      "description": "Complete, shell-neutral draft payload used by desktop and mobile.\n\nHot editor state (cursor, IME composition, focus, keyboard, sheets) is not\npart of this value. Client owns the text; shells publish user edits and\napply controlled publications without moving cursor or IME state into Client.",
+      "type": "object",
+      "properties": {
+        "domain": {
+          "$ref": "#/$defs/ComposerDomainState"
+        },
+        "text": {
+          "type": "string",
+          "default": ""
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "domain"
+      ]
+    },
+    "ComposerDomainState": {
+      "type": "object",
+      "properties": {
+        "attachments": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/ComposerAttachment"
+          }
+        },
+        "capabilities": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/ComposerCapability"
+          }
+        },
+        "capability_target": {
+          "$ref": "#/$defs/ComposerCapabilityTarget"
+        },
+        "mode_manually_selected": {
+          "type": "boolean",
+          "default": false
+        },
+        "model_manually_selected": {
+          "type": "boolean",
+          "default": false
+        },
+        "reply_target": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ComposerReplyTarget"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "selected_mentions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ComposerMentionSelection"
+          }
+        },
+        "selected_mode": {
+          "$ref": "#/$defs/ThreadMode",
+          "default": "Message"
+        },
+        "selected_model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "selected_permission_mode": {
+          "$ref": "#/$defs/TurnPermissionMode",
+          "default": "full_access"
+        },
+        "selected_provider": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "selected_reasoning_effort": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "skill_selections": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/ComposerSkillSelection"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "capability_target"
+      ]
+    },
+    "ComposerMentionSelection": {
+      "type": "object",
+      "properties": {
+        "display_name": {
+          "type": "string"
+        },
+        "nickname": {
+          "type": "string"
+        },
+        "principal_id": {
+          "$ref": "#/$defs/PrincipalId"
+        },
+        "text_token": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "principal_id",
+        "display_name",
+        "nickname",
+        "text_token"
+      ]
+    },
+    "ComposerMessageEditTarget": {
+      "type": "object",
+      "properties": {
+        "artifacts": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ArtifactRef"
+          }
+        },
+        "conflicted": {
+          "type": "boolean"
+        },
+        "failed": {
+          "type": "boolean"
+        },
+        "presentation": {
+          "$ref": "#/$defs/UserMessagePresentation"
+        },
+        "preview": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "presentation",
+        "preview",
+        "artifacts",
+        "failed",
+        "conflicted"
+      ]
+    },
+    "ComposerModelDisplayPublication": {
+      "type": "object",
+      "properties": {
+        "identity": {
+          "$ref": "#/$defs/ComposerOperationIdentity"
+        },
+        "key": {
+          "$ref": "#/$defs/ProviderModelDisplayKey"
+        },
+        "label": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reasoning_effort": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reasoning_effort_label": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "request": {
+          "$ref": "#/$defs/ComposerModelDisplayRequestState"
+        }
+      },
+      "required": [
+        "identity",
+        "key",
+        "request"
+      ]
+    },
+    "ComposerModelDisplayRequestState": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "loading"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "ready"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "failed"
+            },
+            "message": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "message"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "cancelled"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        }
+      ]
+    },
+    "ComposerOperationIdentity": {
+      "type": "object",
+      "properties": {
+        "draft_id": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "generation": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "thread_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "thread_id",
+        "draft_id",
+        "generation"
+      ]
+    },
+    "ComposerOperationKind": {
+      "type": "string",
+      "enum": [
+        "send",
+        "edit_message",
+        "steer",
+        "voice",
+        "pick_files",
+        "pick_media"
+      ]
+    },
+    "ComposerOperationPlan": {
+      "type": "object",
+      "properties": {
+        "authorization_fingerprint": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "draft": {
+          "$ref": "#/$defs/ComposerDomainDraft"
+        },
+        "identity": {
+          "$ref": "#/$defs/ComposerOperationIdentity"
+        },
+        "kind": {
+          "$ref": "#/$defs/ComposerOperationKind"
+        },
+        "message_edit": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ComposerMessageEditTarget"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "steer_target": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ComposerSteerTarget"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "voice_start": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/VoiceSessionStartContext"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "identity",
+        "kind",
+        "draft"
+      ]
+    },
+    "ComposerOperationPublication": {
+      "type": "object",
+      "properties": {
+        "identity": {
+          "$ref": "#/$defs/ComposerOperationIdentity"
+        },
+        "kind": {
+          "$ref": "#/$defs/ComposerOperationKind"
+        },
+        "plan": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ComposerOperationPlan"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "status": {
+          "$ref": "#/$defs/ComposerOperationStatus"
+        },
+        "voice_capture_preflight": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ComposerVoiceCapturePreflightState"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "voice_committing": {
+          "type": "boolean"
+        },
+        "voice_context": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/VoiceTurnContext"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "voice_finalize": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/VoiceFinalizeResponseReduction"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "voice_result": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/VoiceSessionResultReduction"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "voice_session_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "voice_turn_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "voice_committing",
+        "identity",
+        "kind",
+        "status"
+      ]
+    },
+    "ComposerOperationStatus": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "starting_capture"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "pending"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "preparing"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "uploading"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "prepared"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "sending"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "failed"
+            },
+            "message": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "message"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "cancelled"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "completed"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        }
+      ]
+    },
+    "ComposerPermissionModeOption": {
+      "type": "object",
+      "properties": {
+        "description": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        },
+        "mode": {
+          "$ref": "#/$defs/TurnPermissionMode"
+        }
+      },
+      "required": [
+        "mode",
+        "label",
+        "description"
+      ]
+    },
+    "ComposerReplyTarget": {
+      "type": "object",
+      "properties": {
+        "author_display_name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "preview": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "turn_id": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "turn_id"
+      ]
+    },
+    "ComposerRuntimePublication": {
+      "type": "object",
+      "properties": {
+        "active_runtime_supports_steer": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "identity": {
+          "$ref": "#/$defs/ComposerOperationIdentity"
+        },
+        "request": {
+          "$ref": "#/$defs/ComposerCatalogRequest"
+        },
+        "selected_provider": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "selected_provider_ready": {
+          "type": "boolean"
+        },
+        "workspace_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "identity",
+        "workspace_id",
+        "request",
+        "selected_provider_ready"
+      ]
+    },
+    "ComposerSkillSelection": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "skill"
+            },
+            "pack_id": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SkillPackId"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "skill_id": {
+              "$ref": "#/$defs/SkillId"
+            }
+          },
+          "required": [
+            "kind",
+            "skill_id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "skill_pack"
+            },
+            "pack_id": {
+              "$ref": "#/$defs/SkillPackId"
+            }
+          },
+          "required": [
+            "kind",
+            "pack_id"
+          ]
+        }
+      ]
+    },
+    "ComposerSteerTarget": {
+      "type": "object",
+      "properties": {
+        "runtime_id": {
+          "type": "string"
+        },
+        "turn_id": {
+          "type": "string"
+        },
+        "workspace_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "workspace_id",
+        "runtime_id",
+        "turn_id"
+      ]
+    },
+    "ComposerVoiceCapturePreflightState": {
+      "type": "string",
+      "enum": [
+        "checking",
+        "ready"
+      ]
+    },
+    "ComposerVoiceReadinessDemand": {
+      "type": "string",
+      "enum": [
+        "suspended",
+        "until_ready",
+        "while_visible"
+      ]
+    },
+    "ComposerVoiceReadinessPublication": {
+      "type": "object",
+      "properties": {
+        "demand": {
+          "$ref": "#/$defs/ComposerVoiceReadinessDemand"
+        },
+        "error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "identity": {
+          "$ref": "#/$defs/ComposerOperationIdentity"
+        },
+        "loading": {
+          "type": "boolean"
+        },
+        "response": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/VoiceStatusResponse"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "identity",
+        "demand",
+        "loading"
+      ]
+    },
+    "CrossThreadSourceVisibility": {
+      "type": "string",
+      "enum": [
+        "accessible",
+        "inaccessible"
+      ]
+    },
+    "ExecutionDraftReconciliation": {
+      "type": "object",
+      "properties": {
+        "changed": {
+          "type": "boolean"
+        },
+        "draft": {
+          "$ref": "#/$defs/ExecutionDraftSelection"
+        },
+        "reasons": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ExecutionDraftReconciliationReason"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "draft",
+        "changed"
+      ]
+    },
+    "ExecutionDraftReconciliationKind": {
+      "type": "string",
+      "enum": [
+        "policy_generation",
+        "provider",
+        "model",
+        "permission_mode",
+        "skill",
+        "mcp_server",
+        "attachment"
+      ]
+    },
+    "ExecutionDraftReconciliationReason": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/ExecutionDraftReconciliationKind"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "resource_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "reason"
+      ]
+    },
+    "ExecutionDraftSelection": {
+      "type": "object",
+      "properties": {
+        "has_attachments": {
+          "type": "boolean",
+          "default": false
+        },
+        "mcp_server_ids": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "permission_mode": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TurnPermissionMode"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "policy_fingerprint": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "provider": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "skill_ids": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "McpScopeKind": {
+      "type": "string",
+      "enum": [
+        "workspace",
+        "user"
+      ]
+    },
+    "PersistedActorRef": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/PrincipalId"
+            },
+            "kind": {
+              "type": "string",
+              "const": "principal"
+            }
+          },
+          "required": [
+            "kind",
+            "id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/AgentExecutionId"
+            },
+            "kind": {
+              "type": "string",
+              "const": "agent_execution"
+            }
+          },
+          "required": [
+            "kind",
+            "id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "system"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        }
+      ]
+    },
+    "PrincipalId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "ProviderModelDisplayKey": {
+      "type": "object",
+      "properties": {
+        "model": {
+          "type": "string"
+        },
+        "provider": {
+          "type": "string"
+        },
+        "workspace_id": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "workspace_id",
+        "provider",
+        "model"
+      ]
+    },
+    "PublicError": {
+      "description": "Stable, bounded failure presentation shared by RPC, voice and task\nexecution surfaces. Raw source chains are never part of this type.",
+      "type": "object",
+      "properties": {
+        "code": {
+          "$ref": "#/$defs/PublicErrorCode"
+        },
+        "correlation_id": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "retry_after_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "retryable": {
+          "type": "boolean"
+        },
+        "stage": {
+          "$ref": "#/$defs/PublicErrorStage"
+        },
+        "version": {
+          "type": "integer",
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0
+        }
+      },
+      "required": [
+        "version",
+        "code",
+        "stage",
+        "message",
+        "retryable",
+        "correlation_id"
+      ]
+    },
+    "PublicErrorCode": {
+      "type": "string",
+      "enum": [
+        "invalid_input",
+        "policy_denied",
+        "not_found",
+        "conflict",
+        "resource_exhausted",
+        "unavailable",
+        "timeout",
+        "internal"
+      ]
+    },
+    "PublicErrorStage": {
+      "type": "string",
+      "enum": [
+        "discovery",
+        "admission",
+        "preparation",
+        "execution",
+        "persistence",
+        "delivery",
+        "observation"
+      ]
+    },
+    "SafeRouteProvenance": {
+      "type": "object",
+      "properties": {
+        "action": {
+          "$ref": "#/$defs/AgentRouteAction"
+        },
+        "disclosure": {
+          "$ref": "#/$defs/AgentRouteDisclosurePolicy"
+        },
+        "sourceThreadLabel": {
+          "description": "Present only when the viewer has source read authority.  Source title,\nparticipants, prompts, and raw identifiers are never sent otherwise.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "visibility": {
+          "$ref": "#/$defs/CrossThreadSourceVisibility"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "action",
+        "visibility",
+        "disclosure"
+      ]
+    },
+    "SandboxMode": {
+      "type": "string",
+      "enum": [
+        "FullAccess"
+      ]
+    },
+    "SandboxPolicy": {
+      "type": "object",
+      "properties": {
+        "mode": {
+          "$ref": "#/$defs/SandboxMode"
+        }
+      },
+      "required": [
+        "mode"
+      ]
+    },
+    "SkillId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "SkillPackId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "TextElement": {
+      "type": "object",
+      "properties": {
+        "byte_range": {
+          "$ref": "#/$defs/ByteRange"
+        },
+        "placeholder": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "byte_range"
+      ]
+    },
+    "ThreadMode": {
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "Message",
+            "Agent"
+          ]
+        },
+        {
+          "description": "Compatibility default for pre-Epic-6 persisted and wire values. New\nuser-thread creation selects `Message` explicitly.",
+          "type": "string",
+          "const": "Chat"
+        }
+      ]
+    },
+    "TimelineReplyState": {
+      "type": "string",
+      "enum": [
+        "available",
+        "deleted",
+        "unavailable"
+      ]
+    },
+    "TimelineReplySummary": {
+      "type": "object",
+      "properties": {
+        "author": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TurnAuthorSnapshot"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "deleted": {
+          "type": "boolean",
+          "default": false
+        },
+        "text": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "turnId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "turnId"
+      ]
+    },
+    "TurnAuthorSnapshot": {
+      "type": "object",
+      "properties": {
+        "actor": {
+          "$ref": "#/$defs/PersistedActorRef"
+        },
+        "agent": {
+          "description": "Full immutable identity presentation for an agent-authored Turn.  This\nis carried with the Turn instead of being reconstructed from mutable\nidentity/runtime state. Non-agent actors leave it absent.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AgentPresentationSnapshot"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "avatar_revision": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "display_name": {
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1
+        },
+        "nickname": {
+          "type": "string",
+          "maxLength": 32,
+          "minLength": 2,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{1,31}$"
+        }
+      },
+      "required": [
+        "actor",
+        "display_name",
+        "nickname"
+      ]
+    },
+    "TurnCLIRuntimeOptions": {
+      "type": "object",
+      "properties": {
+        "effort": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "personality": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sandbox": true,
+        "steer_if_active": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "summary": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "TurnCapability": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/TurnCapabilityKind"
+        },
+        "label": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "kind"
+      ]
+    },
+    "TurnCapabilityKind": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "packId": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SkillPackId"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "skillId": {
+              "$ref": "#/$defs/SkillId"
+            },
+            "type": {
+              "type": "string",
+              "const": "skill"
+            }
+          },
+          "required": [
+            "type",
+            "skillId"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "packId": {
+              "$ref": "#/$defs/SkillPackId"
+            },
+            "type": {
+              "type": "string",
+              "const": "skillPack"
+            }
+          },
+          "required": [
+            "type",
+            "packId"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "scopeKind": {
+              "$ref": "#/$defs/McpScopeKind"
+            },
+            "type": {
+              "type": "string",
+              "const": "mcpServer"
+            }
+          },
+          "required": [
+            "type",
+            "name",
+            "scopeKind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "rawToolName": {
+              "type": "string"
+            },
+            "scopeKind": {
+              "$ref": "#/$defs/McpScopeKind"
+            },
+            "serverName": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "mcpTool"
+            }
+          },
+          "required": [
+            "type",
+            "serverName",
+            "rawToolName",
+            "scopeKind"
+          ]
+        }
+      ]
+    },
+    "TurnMcpServerCapabilitySummary": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "scopeKind": {
+          "$ref": "#/$defs/McpScopeKind"
+        }
+      },
+      "required": [
+        "id",
+        "label",
+        "name",
+        "scopeKind"
+      ]
+    },
+    "TurnMcpToolCapabilitySummary": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        },
+        "rawToolName": {
+          "type": "string"
+        },
+        "scopeKind": {
+          "$ref": "#/$defs/McpScopeKind"
+        },
+        "serverName": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "label",
+        "serverName",
+        "rawToolName",
+        "scopeKind"
+      ]
+    },
+    "TurnMention": {
+      "type": "object",
+      "properties": {
+        "nickname": {
+          "type": "string",
+          "maxLength": 32,
+          "minLength": 2,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{1,31}$"
+        },
+        "principal_id": {
+          "$ref": "#/$defs/PrincipalId"
+        }
+      },
+      "required": [
+        "principal_id",
+        "nickname"
+      ]
+    },
+    "TurnPermissionMode": {
+      "type": "string",
+      "enum": [
+        "full_access",
+        "auto_accept_edits",
+        "supervised"
+      ]
+    },
+    "TurnPermissionProfileSelection": {
+      "type": "object",
+      "properties": {
+        "mode": {
+          "$ref": "#/$defs/TurnPermissionMode"
+        }
+      },
+      "required": [
+        "mode"
+      ]
+    },
+    "TurnReasoningSelection": {
+      "type": "object",
+      "properties": {
+        "effort": {
+          "description": "String-valued because CLI runtimes may advertise efforts newer than\nPioneer API-provider adapters understand.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "effort"
+      ]
+    },
+    "TurnSkillCapabilitySummary": {
+      "type": "object",
+      "properties": {
+        "label": {
+          "type": "string"
+        },
+        "owner": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pack": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TurnSkillPackPresentationSummary"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "skillId": {
+          "$ref": "#/$defs/SkillId"
+        },
+        "slug": {
+          "type": "string"
+        },
+        "sourceKind": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "skillId",
+        "label",
+        "slug",
+        "sourceKind"
+      ]
+    },
+    "TurnSkillPackCapabilitySummary": {
+      "type": "object",
+      "properties": {
+        "label": {
+          "type": "string"
+        },
+        "packId": {
+          "$ref": "#/$defs/SkillPackId"
+        }
+      },
+      "required": [
+        "packId",
+        "label"
+      ]
+    },
+    "TurnSkillPackPresentationSummary": {
+      "type": "object",
+      "properties": {
+        "label": {
+          "type": "string"
+        },
+        "packId": {
+          "$ref": "#/$defs/SkillPackId"
+        }
+      },
+      "required": [
+        "packId",
+        "label"
+      ]
+    },
+    "UserInput": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "text": {
+              "type": "string"
+            },
+            "textElements": {
+              "type": "array",
+              "default": [],
+              "items": {
+                "$ref": "#/$defs/TextElement"
+              }
+            },
+            "type": {
+              "type": "string",
+              "const": "text"
+            }
+          },
+          "required": [
+            "type",
+            "text"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "image"
+            },
+            "url": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "url"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "localImage"
+            }
+          },
+          "required": [
+            "type",
+            "path"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "file"
+            },
+            "url": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "url"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "localFile"
+            }
+          },
+          "required": [
+            "type",
+            "path"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "audio"
+            },
+            "url": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "url"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "localAudio"
+            }
+          },
+          "required": [
+            "type",
+            "path"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "video"
+            },
+            "url": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "url"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "localVideo"
+            }
+          },
+          "required": [
+            "type",
+            "path"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "artifactId": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "artifact"
+            },
+            "versionId": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "type",
+            "artifactId"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "path": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "mention"
+            }
+          },
+          "required": [
+            "type",
+            "name",
+            "path"
+          ]
+        }
+      ]
+    },
+    "UserMessageAttachment": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "image"
+            },
+            "url": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "url"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "localImage"
+            }
+          },
+          "required": [
+            "type",
+            "path"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "file"
+            },
+            "url": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "url"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "localFile"
+            }
+          },
+          "required": [
+            "type",
+            "path"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "audio"
+            },
+            "url": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "url"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "localAudio"
+            }
+          },
+          "required": [
+            "type",
+            "path"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "type": "string",
+              "const": "video"
+            },
+            "url": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "url"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "localVideo"
+            }
+          },
+          "required": [
+            "type",
+            "path"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "artifact": {
+              "$ref": "#/$defs/ArtifactRef"
+            },
+            "type": {
+              "type": "string",
+              "const": "artifact"
+            }
+          },
+          "required": [
+            "type",
+            "artifact"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "capability": {
+              "$ref": "#/$defs/TurnSkillCapabilitySummary"
+            },
+            "type": {
+              "type": "string",
+              "const": "skill"
+            }
+          },
+          "required": [
+            "type",
+            "capability"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "capability": {
+              "$ref": "#/$defs/TurnSkillPackCapabilitySummary"
+            },
+            "type": {
+              "type": "string",
+              "const": "skillPack"
+            }
+          },
+          "required": [
+            "type",
+            "capability"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "capability": {
+              "$ref": "#/$defs/TurnMcpServerCapabilitySummary"
+            },
+            "type": {
+              "type": "string",
+              "const": "mcpServer"
+            }
+          },
+          "required": [
+            "type",
+            "capability"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "capability": {
+              "$ref": "#/$defs/TurnMcpToolCapabilitySummary"
+            },
+            "type": {
+              "type": "string",
+              "const": "mcpTool"
+            }
+          },
+          "required": [
+            "type",
+            "capability"
+          ]
+        }
+      ]
+    },
+    "UserMessagePresentation": {
+      "description": "Authoritative collaboration metadata attached to a rendered user-message\nrow. It mirrors disclosed server fields; shells must not reconstruct it by\nparsing text or by joining a mutable member directory.",
+      "type": "object",
+      "properties": {
+        "attachments": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/UserMessageAttachment"
+          }
+        },
+        "author": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TurnAuthorSnapshot"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "block_id": {
+          "type": "string"
+        },
+        "deleted": {
+          "type": "boolean"
+        },
+        "edited": {
+          "type": "boolean"
+        },
+        "item_id": {
+          "type": "string"
+        },
+        "mentions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TurnMention"
+          }
+        },
+        "mode": {
+          "$ref": "#/$defs/ThreadMode"
+        },
+        "reply": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TimelineReplySummary"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "reply_state": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TimelineReplyState"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "revision": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "route": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SafeRouteProvenance"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "thread_id": {
+          "type": "string"
+        },
+        "turn_id": {
+          "type": "string"
+        },
+        "workspace_id": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "workspace_id",
+        "thread_id",
+        "block_id",
+        "turn_id",
+        "item_id",
+        "mode",
+        "revision",
+        "edited",
+        "deleted"
+      ]
+    },
+    "VoiceError": {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/VoiceErrorKind"
+        },
+        "message": {
+          "type": "string"
+        },
+        "public_error": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PublicError"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "kind",
+        "message"
+      ]
+    },
+    "VoiceErrorKind": {
+      "type": "string",
+      "enum": [
+        "model_unavailable",
+        "microphone_permission_blocked",
+        "device_unavailable",
+        "invalid_session",
+        "stale_chunk",
+        "sequence_gap",
+        "cancelled",
+        "no_speech",
+        "transcription_failed",
+        "gateway_busy",
+        "model_downloading",
+        "unknown"
+      ]
+    },
+    "VoiceFinalizeResponseReduction": {
+      "type": "object",
+      "properties": {
+        "action": {
+          "$ref": "#/$defs/VoiceFinalizeUiAction"
+        },
+        "session_id": {
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/$defs/VoiceStatus"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "session_id",
+        "status",
+        "action"
+      ]
+    },
+    "VoiceFinalizeUiAction": {
+      "type": "string",
+      "enum": [
+        "keep_finalizing",
+        "clear_finalizing",
+        "show_no_speech_error",
+        "show_finalize_error"
+      ]
+    },
+    "VoiceSessionOutcome": {
+      "type": "string",
+      "enum": [
+        "turn_started",
+        "cancelled",
+        "no_speech",
+        "failed"
+      ]
+    },
+    "VoiceSessionResultReduction": {
+      "type": "object",
+      "properties": {
+        "action": {
+          "$ref": "#/$defs/VoiceFinalizeUiAction"
+        },
+        "error": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/VoiceError"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "outcome": {
+          "$ref": "#/$defs/VoiceSessionOutcome"
+        },
+        "session_id": {
+          "type": "string"
+        },
+        "turn_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "session_id",
+        "outcome",
+        "action"
+      ]
+    },
+    "VoiceSessionStartContext": {
+      "description": "Minimal context required to route and own a streaming voice session.\n\nFull turn materialization context is provided on commit/finalize so clients can\nstart microphone streaming before slower attachment/capability preparation.",
+      "type": "object",
+      "properties": {
+        "thread_id": {
+          "type": "string"
+        },
+        "turn_id": {
+          "type": "string"
+        },
+        "workspace_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "workspace_id",
+        "thread_id",
+        "turn_id"
+      ]
+    },
+    "VoiceStatus": {
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "disabled",
+            "unavailable",
+            "model_loading",
+            "ready",
+            "busy",
+            "recording",
+            "transcribing",
+            "error"
+          ]
+        },
+        {
+          "description": "Model download is happening in the gateway background. First pass UI\nshould not infer or require detailed progress from this status.",
+          "type": "string",
+          "const": "model_downloading"
+        }
+      ]
+    },
+    "VoiceStatusResponse": {
+      "type": "object",
+      "properties": {
+        "active_session_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "error": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/VoiceError"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "status": {
+          "$ref": "#/$defs/VoiceStatus"
+        }
+      },
+      "required": [
+        "status"
+      ]
+    },
+    "VoiceTurnContext": {
+      "description": "Frozen non-audio composer context for voice turn materialization.\n\n`prepared_input` is for existing prepared `UserInput` references such as\nartifacts/local attachment references. It must not contain the future voice\ntranscript; the gateway prepends the transcript as `UserInput::Text` after\nsuccessful transcription.",
+      "type": "object",
+      "properties": {
+        "capabilities": {
+          "description": "Selected skills, MCP tools/servers and related turn capabilities.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TurnCapability"
+          }
+        },
+        "cli_runtime_options": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TurnCLIRuntimeOptions"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "execution_backend": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AgentExecutionBackend"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "mode": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ThreadMode"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "model_provider": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "permission_profile": {
+          "description": "Agent permission profile for the eventual turn.\n\nThis is not the platform microphone permission. Microphone permission\nstays client/platform-local and is reported through voice status/errors.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TurnPermissionProfileSelection"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "prepared_input": {
+          "description": "Existing prepared composer inputs such as artifact/file references.\n\nThis vector must not contain audio bytes or the future transcript. On\ncancel, dropping this context must not create a turn; already completed\nupload/cache side effects are handled by the existing attachment flow.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/UserInput"
+          }
+        },
+        "reasoning": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TurnReasoningSelection"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "sandbox_policy": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SandboxPolicy"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "thread_id": {
+          "description": "Thread that receives the gateway-created turn after transcription.",
+          "type": "string"
+        },
+        "turn_id": {
+          "description": "Client-planned turn id reserved before any audio chunk is accepted.",
+          "type": "string"
+        },
+        "workspace_id": {
+          "description": "Workspace active when the voice session starts.\n\n`TurnStartParams` is still thread-scoped; the gateway keeps the\nworkspace here to validate/session-route the frozen voice context.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "workspace_id",
+        "thread_id",
+        "turn_id"
+      ]
+    }
+  }
+}

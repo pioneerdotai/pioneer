@@ -2,10 +2,19 @@ use crate::domain::{McpConfigValue, McpScopeKind, McpSecretRef};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 pub struct McpSecretMaterialization {
     pub ref_id: String,
     pub value: String,
+}
+impl std::fmt::Debug for McpSecretMaterialization {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("McpSecretMaterialization")
+            .field("ref_id", &self.ref_id)
+            .field("value", &"[redacted]")
+            .finish()
+    }
 }
 
 pub fn secret_ref_for(

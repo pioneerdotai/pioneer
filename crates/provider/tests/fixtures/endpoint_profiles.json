@@ -1,0 +1,330 @@
+[
+  {
+    "provider": "groq",
+    "base": "https://api.groq.com/openai/v1",
+    "chat": "https://api.groq.com/openai/v1/chat/completions",
+    "models": "https://api.groq.com/openai/v1/models",
+    "source": "https://console.groq.com/docs/api-reference",
+    "evidence": "documented Chat prefix; constructed discovery path is not proof of GET models support; acceptance unexecuted"
+  },
+  {
+    "provider": "mistral",
+    "base": "https://api.mistral.ai/v1",
+    "chat": "https://api.mistral.ai/v1/chat/completions",
+    "models": "https://api.mistral.ai/v1/models",
+    "source": "https://docs.mistral.ai/api/endpoint/chat",
+    "evidence": "documented Chat prefix; constructed discovery path is not proof of GET models support; acceptance unexecuted"
+  },
+  {
+    "provider": "xai",
+    "base": "https://api.x.ai/v1",
+    "chat": "https://api.x.ai/v1/chat/completions",
+    "models": "https://api.x.ai/v1/models",
+    "source": "https://docs.x.ai/developers/model-capabilities/text/generate-text",
+    "evidence": "documented Chat prefix; constructed discovery path is not proof of GET models support; acceptance unexecuted"
+  },
+  {
+    "provider": "together",
+    "base": "https://api.together.ai/v1",
+    "chat": "https://api.together.ai/v1/chat/completions",
+    "models": "https://api.together.ai/v1/models",
+    "source": "https://docs.together.ai/reference/chat-completions",
+    "evidence": "documented Chat prefix; constructed discovery path is not proof of GET models support; acceptance unexecuted"
+  },
+  {
+    "provider": "fireworks",
+    "base": "https://api.fireworks.ai/inference/v1",
+    "chat": "https://api.fireworks.ai/inference/v1/chat/completions",
+    "models": "https://api.fireworks.ai/inference/v1/models",
+    "source": "https://docs.fireworks.ai/api-reference/post-chatcompletions",
+    "evidence": "documented Chat prefix; constructed discovery path is not proof of GET models support; acceptance unexecuted"
+  },
+  {
+    "provider": "novita",
+    "base": "https://api.novita.ai/openai/v1",
+    "chat": "https://api.novita.ai/openai/v1/chat/completions",
+    "models": "https://api.novita.ai/openai/v1/models",
+    "source": "https://docs.novita.ai/api-reference/model-apis-llm-create-chat-completion",
+    "evidence": "documented Chat prefix; constructed discovery path is not proof of GET models support; acceptance unexecuted"
+  },
+  {
+    "provider": "perplexity",
+    "base": "https://api.perplexity.ai",
+    "chat": "https://api.perplexity.ai/chat/completions",
+    "models": "https://api.perplexity.ai/models",
+    "source": "https://docs.perplexity.ai/docs/agent-api/migrate-from-sonar/overview",
+    "evidence": "documented Chat prefix; constructed discovery path is not proof of GET models support; acceptance unexecuted"
+  },
+  {
+    "provider": "cohere",
+    "base": "https://api.cohere.ai/compatibility/v1",
+    "chat": "https://api.cohere.ai/compatibility/v1/chat/completions",
+    "models": "https://api.cohere.ai/compatibility/v1/models",
+    "source": "https://docs.cohere.com/docs/compatibility-api",
+    "evidence": "documented Chat prefix; constructed discovery path is not proof of GET models support; acceptance unexecuted"
+  },
+  {
+    "provider": "venice",
+    "base": "https://api.venice.ai/api/v1",
+    "chat": "https://api.venice.ai/api/v1/chat/completions",
+    "models": "https://api.venice.ai/api/v1/models",
+    "source": "https://docs.venice.ai/api-reference/endpoint/chat/completions",
+    "evidence": "documented Chat prefix; constructed discovery path is not proof of GET models support; acceptance unexecuted"
+  },
+  {
+    "provider": "cerebras",
+    "base": "https://api.cerebras.ai/v1",
+    "chat": "https://api.cerebras.ai/v1/chat/completions",
+    "models": "https://api.cerebras.ai/v1/models",
+    "source": "https://inference-docs.cerebras.ai/api-reference/chat-completions",
+    "evidence": "documented Chat prefix; constructed discovery path is not proof of GET models support; acceptance unexecuted"
+  },
+  {
+    "provider": "sambanova",
+    "base": "https://api.sambanova.ai/v1",
+    "chat": "https://api.sambanova.ai/v1/chat/completions",
+    "models": "https://api.sambanova.ai/v1/models",
+    "source": "https://docs.sambanova.ai/docs/en/models/sambacloud-models",
+    "evidence": "documented Chat prefix; constructed discovery path is not proof of GET models support; acceptance unexecuted"
+  },
+  {
+    "provider": "hyperbolic",
+    "base": "https://api.hyperbolic.xyz/v1",
+    "chat": "https://api.hyperbolic.xyz/v1/chat/completions",
+    "models": "https://api.hyperbolic.xyz/v1/models",
+    "source": "https://www.hyperbolic.ai/docs/faq/inference-models",
+    "evidence": "retired public product; route retained as configuration metadata"
+  },
+  {
+    "provider": "deepinfra",
+    "base": "https://api.deepinfra.com/v1/openai",
+    "chat": "https://api.deepinfra.com/v1/openai/chat/completions",
+    "models": "https://api.deepinfra.com/v1/openai/models",
+    "source": "https://docs.deepinfra.com/chat/overview",
+    "evidence": "documented Chat prefix; constructed discovery path is not proof of GET models support; acceptance unexecuted"
+  },
+  {
+    "provider": "huggingface",
+    "base": "https://router.huggingface.co/v1",
+    "chat": "https://router.huggingface.co/v1/chat/completions",
+    "models": "https://router.huggingface.co/v1/models",
+    "source": "https://huggingface.co/docs/inference-providers/en/tasks/chat-completion",
+    "evidence": "documented Chat prefix; constructed discovery path is not proof of GET models support; acceptance unexecuted"
+  },
+  {
+    "provider": "ai21",
+    "base": "https://api.ai21.com/studio/v1",
+    "chat": "https://api.ai21.com/studio/v1/chat/completions",
+    "models": "https://api.ai21.com/studio/v1/models",
+    "source": "https://docs.ai21.com/docs/jamba-foundation-models",
+    "evidence": "current profile construction only; latest full host/discovery contract unconfirmed"
+  },
+  {
+    "provider": "reka",
+    "base": "https://api.reka.ai/v1",
+    "chat": "https://api.reka.ai/v1/chat/completions",
+    "models": "https://api.reka.ai/v1/models",
+    "source": "https://docs.reka.ai/quickstart",
+    "evidence": "documented Chat prefix; constructed discovery path is not proof of GET models support; acceptance unexecuted"
+  },
+  {
+    "provider": "baseten",
+    "base": "https://inference.baseten.co/v1",
+    "chat": "https://inference.baseten.co/v1/chat/completions",
+    "models": "https://inference.baseten.co/v1/models",
+    "source": "https://docs.baseten.co/inference/model-apis/overview",
+    "evidence": "documented Chat prefix; constructed discovery path is not proof of GET models support; acceptance unexecuted"
+  },
+  {
+    "provider": "nscale",
+    "base": "https://inference.api.nscale.com/v1",
+    "chat": "https://inference.api.nscale.com/v1/chat/completions",
+    "models": "https://inference.api.nscale.com/v1/models",
+    "source": "https://docs.nscale.com/login?redirect=%2Fdocs%2Fserverless-inference",
+    "evidence": "current profile construction only; latest full host/discovery contract unconfirmed"
+  },
+  {
+    "provider": "anyscale",
+    "base": "https://api.endpoints.anyscale.com/v1",
+    "chat": "https://api.endpoints.anyscale.com/v1/chat/completions",
+    "models": "https://api.endpoints.anyscale.com/v1/models",
+    "source": "https://www.anyscale.com/blog/inference-graphs-at-linkedin-using-ray-serve",
+    "evidence": "current profile construction only; latest full host/discovery contract unconfirmed"
+  },
+  {
+    "provider": "nebius",
+    "base": "https://api.studio.nebius.ai/v1",
+    "chat": "https://api.studio.nebius.ai/v1/chat/completions",
+    "models": "https://api.studio.nebius.ai/v1/models",
+    "source": "https://docs.tokenfactory.nebius.com/quickstart.md",
+    "evidence": "current profile construction only; latest full host/discovery contract unconfirmed"
+  },
+  {
+    "provider": "friendli",
+    "base": "https://api.friendli.ai/serverless/v1",
+    "chat": "https://api.friendli.ai/serverless/v1/chat/completions",
+    "models": "https://api.friendli.ai/serverless/v1/models",
+    "source": "https://friendli.ai/docs/openapi/model-apis/chat-completions",
+    "evidence": "documented Chat prefix; constructed discovery path is not proof of GET models support; acceptance unexecuted"
+  },
+  {
+    "provider": "lepton",
+    "base": "https://llama3-1-405b.lepton.run/api/v1",
+    "chat": "https://llama3-1-405b.lepton.run/api/v1/chat/completions",
+    "models": "https://llama3-1-405b.lepton.run/api/v1/models",
+    "source": "https://docs.nvidia.com/dgx-cloud/lepton/features/endpoints/create-llm/",
+    "evidence": "current profile construction only; latest full host/discovery contract unconfirmed"
+  },
+  {
+    "provider": "siliconflow",
+    "base": "https://api.siliconflow.cn/v1",
+    "chat": "https://api.siliconflow.cn/v1/chat/completions",
+    "models": "https://api.siliconflow.cn/v1/models",
+    "source": "https://docs.siliconflow.cn/docs/api/chat-completions-post",
+    "evidence": "documented Chat prefix; constructed discovery path is not proof of GET models support; acceptance unexecuted"
+  },
+  {
+    "provider": "aihubmix",
+    "base": "https://aihubmix.com/v1",
+    "chat": "https://aihubmix.com/v1/chat/completions",
+    "models": "https://aihubmix.com/v1/models",
+    "source": "https://docs.aihubmix.com/cn",
+    "evidence": "current profile construction only; latest full host/discovery contract unconfirmed"
+  },
+  {
+    "provider": "astrai",
+    "base": "https://as-trai.com/v1",
+    "chat": "https://as-trai.com/v1/chat/completions",
+    "models": "https://as-trai.com/v1/models",
+    "source": "https://as-trai.com/",
+    "evidence": "current profile construction only; latest full host/discovery contract unconfirmed"
+  },
+  {
+    "provider": "stepfun",
+    "base": "https://api.stepfun.com/v1",
+    "chat": "https://api.stepfun.com/v1/chat/completions",
+    "models": "https://api.stepfun.com/v1/models",
+    "source": "https://platform.stepfun.com/",
+    "evidence": "documented Chat prefix; constructed discovery path is not proof of GET models support; acceptance unexecuted"
+  },
+  {
+    "provider": "baichuan",
+    "base": "https://api.baichuan-ai.com/v1",
+    "chat": "https://api.baichuan-ai.com/v1/chat/completions",
+    "models": "https://api.baichuan-ai.com/v1/models",
+    "source": "https://platform.baichuan-ai.com/docs-v2/api",
+    "evidence": "current profile construction only; latest full host/discovery contract unconfirmed"
+  },
+  {
+    "provider": "yi",
+    "base": "https://api.lingyiwanwu.com/v1",
+    "chat": "https://api.lingyiwanwu.com/v1/chat/completions",
+    "models": "https://api.lingyiwanwu.com/v1/models",
+    "source": "https://platform.lingyiwanwu.com/",
+    "evidence": "retired public product; route retained as configuration metadata"
+  },
+  {
+    "provider": "hunyuan",
+    "base": "https://api.hunyuan.cloud.tencent.com/v1",
+    "chat": "https://api.hunyuan.cloud.tencent.com/v1/chat/completions",
+    "models": "https://api.hunyuan.cloud.tencent.com/v1/models",
+    "source": "https://cloud.tencent.com/document/product/1729/111007",
+    "evidence": "documented Chat prefix; constructed discovery path is not proof of GET models support; acceptance unexecuted"
+  },
+  {
+    "provider": "ovhcloud",
+    "base": "https://api.ai.cloud.ovh.net/v1",
+    "chat": "https://api.ai.cloud.ovh.net/v1/chat/completions",
+    "models": "https://api.ai.cloud.ovh.net/v1/models",
+    "source": "https://www.ovhcloud.com/en/public-cloud/ai-endpoints/catalog/llama-3-1-8b-instruct/",
+    "evidence": "current profile construction only; latest full host/discovery contract unconfirmed"
+  },
+  {
+    "provider": "nvidia",
+    "base": "https://integrate.api.nvidia.com/v1",
+    "chat": "https://integrate.api.nvidia.com/v1/chat/completions",
+    "models": "https://integrate.api.nvidia.com/v1/models",
+    "source": "https://docs.api.nvidia.com/nim/reference/llm-apis",
+    "evidence": "documented Chat prefix; constructed discovery path is not proof of GET models support; acceptance unexecuted"
+  },
+  {
+    "provider": "synthetic",
+    "base": "https://api.synthetic.new/openai/v1",
+    "chat": "https://api.synthetic.new/openai/v1/chat/completions",
+    "models": "https://api.synthetic.new/openai/v1/models",
+    "source": "https://dev.synthetic.new/docs/openai/chat-completions",
+    "evidence": "documented Chat prefix; constructed discovery path is not proof of GET models support; acceptance unexecuted"
+  },
+  {
+    "provider": "doubao",
+    "base": "https://ark.cn-beijing.volces.com/api/v3",
+    "chat": "https://ark.cn-beijing.volces.com/api/v3/chat/completions",
+    "models": "https://ark.cn-beijing.volces.com/api/v3/models",
+    "source": "https://docs.volcengine.com/docs/ark/model-list?lang=zh",
+    "evidence": "current profile construction only; latest full host/discovery contract unconfirmed"
+  },
+  {
+    "provider": "qianfan",
+    "base": "https://qianfan.baidubce.com/v2",
+    "chat": "https://qianfan.baidubce.com/v2/chat/completions",
+    "models": "https://qianfan.baidubce.com/v2/models",
+    "source": "https://cloud.baidu.com/doc/BCM/s/Fmhyk2faa-en",
+    "evidence": "documented Chat prefix; constructed discovery path is not proof of GET models support; acceptance unexecuted"
+  },
+  {
+    "provider": "lmstudio",
+    "base": "http://localhost:1234/v1",
+    "chat": "http://localhost:1234/v1/chat/completions",
+    "models": "http://localhost:1234/v1/models",
+    "source": "https://lmstudio.ai/docs/developer/openai-compat",
+    "evidence": "documented Chat prefix; constructed discovery path is not proof of GET models support; acceptance unexecuted"
+  },
+  {
+    "provider": "llamacpp",
+    "base": "http://localhost:8080/v1",
+    "chat": "http://localhost:8080/v1/chat/completions",
+    "models": "http://localhost:8080/v1/models",
+    "source": "https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md",
+    "evidence": "documented Chat prefix; constructed discovery path is not proof of GET models support; acceptance unexecuted"
+  },
+  {
+    "provider": "sglang",
+    "base": "http://localhost:30000/v1",
+    "chat": "http://localhost:30000/v1/chat/completions",
+    "models": "http://localhost:30000/v1/models",
+    "source": "https://docs.sglang.io/docs/basic_usage/openai_api",
+    "evidence": "documented Chat prefix; constructed discovery path is not proof of GET models support; acceptance unexecuted"
+  },
+  {
+    "provider": "vllm",
+    "base": "http://localhost:8000/v1",
+    "chat": "http://localhost:8000/v1/chat/completions",
+    "models": "http://localhost:8000/v1/models",
+    "source": "https://docs.vllm.ai/en/latest/features/tool_calling/",
+    "evidence": "documented Chat prefix; constructed discovery path is not proof of GET models support; acceptance unexecuted"
+  },
+  {
+    "provider": "osaurus",
+    "base": "http://localhost:1337/v1",
+    "chat": "http://localhost:1337/v1/chat/completions",
+    "models": "http://localhost:1337/v1/models",
+    "source": "https://raw.githubusercontent.com/osaurus-ai/osaurus/main/docs/OpenAI_API_GUIDE.md",
+    "evidence": "documented Chat prefix; constructed discovery path is not proof of GET models support; acceptance unexecuted"
+  },
+  {
+    "provider": "litellm",
+    "base": "http://localhost:4000/v1",
+    "chat": "http://localhost:4000/v1/chat/completions",
+    "models": "http://localhost:4000/v1/models",
+    "source": "https://docs.litellm.ai/docs/proxy/quick_start",
+    "evidence": "documented Chat prefix; constructed discovery path is not proof of GET models support; acceptance unexecuted"
+  },
+  {
+    "provider": "custom",
+    "base": "http://localhost:8000/v1",
+    "chat": "http://localhost:8000/v1/chat/completions",
+    "models": "http://localhost:8000/v1/models",
+    "source": null,
+    "evidence": "user-defined contract; URL construction only, no server acceptance"
+  }
+]

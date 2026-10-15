@@ -31,7 +31,7 @@ enabled = true
 otlp_metrics_endpoint = "https://telemetry.getpioneer.dev/v1/metrics"
 otlp_traces_endpoint = "https://telemetry.getpioneer.dev/v1/traces"
 export_interval_ms = 30000
-export_timeout_ms = 3000
+export_timeout_ms = 15000
 
 [gateway.hooks.recovery]
 enabled = true
@@ -91,8 +91,7 @@ default_max_revision_rounds = 5
 auto_accept_after_seconds = 300
 
 [gateway.thread]
-default_model = "google/gemini-3-flash-preview"
-default_model_provider = "openrouter"
+# Workspace default model is optional; explicit launch/thread selection is retained.
 max_context_tokens = 128000
 response_reserve_tokens = 16000
 # summary_model = "gpt-5.4" — if omitted, uses thread's model
@@ -135,7 +134,8 @@ semantic_action_timeout_ms = 30000
 app_activation_timeout_ms = 5000
 input_simulation_enabled = true
 launch_if_missing_default = false
-# Empty allows any explicit launch_command. Non-empty restricts launch_command by exact command or prefix.
+# Empty allows any explicit launch_command. Non-empty allows only exact commands.
+# List each intended variant explicitly; prefix matching would let shell syntax append another command.
 allowed_launch_commands = []
 preflight_screenshot_probe_enabled = true
 max_consecutive_same_snapshot_hash = 6
@@ -252,7 +252,7 @@ upload_registry_enabled = true
 upload_registry_ttl_secs = 604800
 enforce_path_allowlist = false
 allowed_path_roots = []
-allow_url_sources = true
+allow_url_sources = false
 allow_http = false
 allow_private_network = false
 max_url_redirects = 3
@@ -273,7 +273,8 @@ circuit_breaker_open_ms = 30000
 
 [gateway.database]
 file_name = "gateway.db"
-max_connections = 1
+# Parallel read-only connections (runtime minimum: 4). Gateway writes use a separate single connection.
+max_connections = 4
 connect_timeout_ms = 5000
 acquire_timeout_ms = 30000
 idle_timeout_ms = 30000
@@ -289,6 +290,9 @@ active_recall_enabled = true
 tools_enabled = true
 proactive_writes_enabled = true
 background_extraction_enabled = true
+# "thread" reuses a native API model. CLI turns have no API thread-model fallback;
+# for extraction on CLI turns select a custom API model in memory settings, e.g.
+# proactive_writes_model = { source = "custom", model_provider = "openrouter", model = "your-api-model" }
 proactive_writes_model = "thread"
 debug_trace_enabled = false
 strict_diagnostics_enabled = false
@@ -325,6 +329,9 @@ access_token_ttl_seconds = 900
 refresh_token_ttl_seconds = 7776000
 device_activation_code_ttl_seconds = 600
 auth_exchange_timeout_seconds = 15
+
+[desktop.mcp_oauth]
+callback_port = 37643
 
 [desktop.gateway]
 connect_timeout_ms = 300

@@ -70,7 +70,7 @@
 //! # Example
 //!
 //! ```
-//! use gpui::Keystroke;
+//! use gpui_kit::Keystroke;
 //! use alacritty_terminal::term::TermMode;
 //! use terminal::input::keystroke_to_bytes;
 //!
@@ -84,7 +84,7 @@
 //! ```
 
 use alacritty_terminal::term::TermMode;
-use gpui::Keystroke;
+use gpui_kit::Keystroke;
 
 /// Convert a GPUI keystroke to terminal escape sequence bytes.
 ///
@@ -105,7 +105,7 @@ use gpui::Keystroke;
 /// # Examples
 ///
 /// ```
-/// use gpui::Keystroke;
+/// use gpui_kit::Keystroke;
 /// use alacritty_terminal::term::TermMode;
 /// use terminal::input::keystroke_to_bytes;
 ///

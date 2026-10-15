@@ -1,0 +1,126 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SkillUploadPublication",
+  "type": "object",
+  "properties": {
+    "generation": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "operation_id": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "pack": {
+      "type": "boolean"
+    },
+    "revision": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "sent_bytes": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "state": {
+      "$ref": "#/$defs/SkillUploadState"
+    },
+    "target": {
+      "$ref": "#/$defs/SkillUploadTarget"
+    },
+    "total_bytes": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    }
+  },
+  "required": [
+    "operation_id",
+    "generation",
+    "revision",
+    "state",
+    "sent_bytes",
+    "total_bytes",
+    "target",
+    "pack"
+  ],
+  "$defs": {
+    "SkillId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "SkillPackId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "SkillUploadState": {
+      "type": "string",
+      "enum": [
+        "preparing",
+        "starting",
+        "uploading",
+        "finishing",
+        "applying",
+        "succeeded",
+        "failed",
+        "cancelled"
+      ]
+    },
+    "SkillUploadTarget": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "install"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "update"
+            },
+            "skill_id": {
+              "$ref": "#/$defs/SkillId"
+            }
+          },
+          "required": [
+            "kind",
+            "skill_id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "update_pack"
+            },
+            "pack_id": {
+              "$ref": "#/$defs/SkillPackId"
+            }
+          },
+          "required": [
+            "kind",
+            "pack_id"
+          ]
+        }
+      ]
+    }
+  }
+}

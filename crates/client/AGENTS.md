@@ -81,7 +81,7 @@ directly.
 
 This crate must stay UI-free and shell-free. Do not add dependencies on:
 
-- `gpui`, `gpui-component`, `terminal`;
+- `gpui`, `gpui-kit`, `gpui-component`, `terminal`;
 - `pioneer-desktop`;
 - React Native/Nitro/mobile bridge crates;
 - platform UI/localization crates such as `rust-i18n`;

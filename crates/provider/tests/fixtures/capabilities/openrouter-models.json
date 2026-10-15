@@ -1,0 +1,9 @@
+{"data":[
+{"id":"vision","architecture":{"input_modalities":["text"],"output_modalities":["image"],"modality":"text+image->text"}},
+{"id":"new/vision","architecture":{"input_modalities":["text","image"],"output_modalities":["text"]}},
+{"id":"missing"},
+{"id":"empty","architecture":{"input_modalities":[],"output_modalities":["image"]}},
+{"id":"legacy","architecture":{"modality":"text+image->text"}},
+{"id":"invalid-legacy","architecture":{"modality":"unknown"}},
+{"id":"text","architecture":{"input_modalities":["text","image"],"output_modalities":["text"]}}
+]}

@@ -24,7 +24,13 @@ pub struct Model {
     #[sea_orm(has_many)]
     pub agent_skills: HasMany<super::agent_skill::Entity>,
     #[sea_orm(has_many)]
+    pub compaction_frozen_histories: HasMany<super::compaction_frozen_history::Entity>,
+    #[sea_orm(has_many)]
+    pub compaction_task_outputs: HasMany<super::compaction_task_output::Entity>,
+    #[sea_orm(has_many)]
     pub native_agent_configs: HasMany<super::native_agent_config::Entity>,
+    #[sea_orm(has_many)]
+    pub provider_usage_observations: HasMany<super::provider_usage_observation::Entity>,
     #[sea_orm(has_many)]
     pub self_improvement_runs: HasMany<super::self_improvement_run::Entity>,
     #[sea_orm(has_many)]

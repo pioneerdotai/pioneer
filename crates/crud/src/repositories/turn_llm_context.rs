@@ -3,9 +3,13 @@ use pioneer_entity::{turn, turn_llm_context};
 use pioneer_protocol::{TurnStatus, generate_id};
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
 use sea_orm::sea_query::{Alias, Expr, ExprTrait, Query};
-use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, Set};
+use sea_orm::{
+    ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect, QueryTrait,
+    Set,
+};
 
 use crate::convention::turn_status_to_db;
+use crate::repositories::compaction::MODEL_HISTORY_CONTEXT_SOURCES;
 
 const DB_ID_LEN: usize = 21;
 
@@ -182,6 +186,7 @@ pub async fn delete_turn_llm_context_for_turn<C: ConnectionTrait>(
     turn_id: &str,
 ) -> Result<u64> {
     let deleted = turn_llm_context::Entity::delete_many()
+        .filter(turn_llm_context::Column::Source.is_not_in(MODEL_HISTORY_CONTEXT_SOURCES))
         .filter(turn_llm_context::Column::TurnId.eq(turn_id.to_owned()))
         .exec(db)
         .await
@@ -191,6 +196,7 @@ pub async fn delete_turn_llm_context_for_turn<C: ConnectionTrait>(
 
 pub async fn delete_expired_turn_llm_context<C: ConnectionTrait>(db: &C) -> Result<u64> {
     let deleted = turn_llm_context::Entity::delete_many()
+        .filter(turn_llm_context::Column::Source.is_not_in(MODEL_HISTORY_CONTEXT_SOURCES))
         .filter(turn_llm_context::Column::ExpiresAt.is_not_null())
         .filter(turn_llm_context::Column::ExpiresAt.lte(chrono::Utc::now().fixed_offset()))
         .exec(db)
@@ -208,20 +214,14 @@ pub async fn delete_turn_llm_context_for_terminal_turns<C: ConnectionTrait>(db: 
     ];
 
     let terminal_turn_ids = turn::Entity::find()
+        .select_only()
+        .column(turn::Column::Id)
         .filter(turn::Column::Status.is_in(terminal_statuses))
-        .all(db)
-        .await
-        .context("failed to list terminal turns for turn_llm_context cleanup")?
-        .into_iter()
-        .map(|turn| turn.id)
-        .collect::<Vec<_>>();
-
-    if terminal_turn_ids.is_empty() {
-        return Ok(0);
-    }
+        .into_query();
 
     let deleted = turn_llm_context::Entity::delete_many()
-        .filter(turn_llm_context::Column::TurnId.is_in(terminal_turn_ids))
+        .filter(turn_llm_context::Column::Source.is_not_in(MODEL_HISTORY_CONTEXT_SOURCES))
+        .filter(turn_llm_context::Column::TurnId.in_subquery(terminal_turn_ids))
         .exec(db)
         .await
         .context("failed to delete terminal turn_llm_context rows")?;

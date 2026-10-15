@@ -307,13 +307,13 @@ mod tests {
     #[test]
     fn tool_schema_dump_detector_matches_common_schema_shapes() {
         assert!(looks_like_tool_schema_dump(
-            r#"{"name":"write_file","description":"Write a file","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"],"additionalProperties":false}}"#
+            r#"{"name":"apply_patch","description":"Apply a patch","parameters":{"type":"object","properties":{"patch":{"type":"string"}},"required":["patch"],"additionalProperties":false}}"#
         ));
         assert!(looks_like_tool_schema_dump(
             r#"[{"name":"read_file","description":"Read a file","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}]"#
         ));
         assert!(looks_like_tool_schema_dump(
-            r#"{"tools":[{"type":"function","function":{"name":"edit_file","description":"Edit a file","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}}]}"#
+            r#"{"tools":[{"type":"function","function":{"name":"apply_patch","description":"Apply a patch","parameters":{"type":"object","properties":{"patch":{"type":"string"}},"required":["patch"]}}}]}"#
         ));
         assert!(looks_like_tool_schema_dump(
             r#"```json
@@ -334,7 +334,7 @@ mod tests {
             r#"{"name":"report","description":"weather report","parameters":{"city":"Moscow"}}"#
         ));
         assert!(!looks_like_tool_schema_dump(
-            "Here is the JSON:\n{\"name\":\"write_file\",\"description\":\"Write\",\"parameters\":{\"type\":\"object\",\"properties\":{}}}"
+            "Here is the JSON:\n{\"name\":\"apply_patch\",\"description\":\"Apply\",\"parameters\":{\"type\":\"object\",\"properties\":{}}}"
         ));
     }
 }

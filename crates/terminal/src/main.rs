@@ -4,7 +4,7 @@
 //! using portable-pty for proper PTY support.
 
 use anyhow::Result;
-use gpui::{
+use gpui_kit::{
     AppContext, Context, Edges, Entity, InteractiveElement, IntoElement, KeyDownEvent,
     ParentElement, Render, Styled, Window, div, px,
 };
@@ -58,7 +58,7 @@ impl Render for TerminalApp {
 }
 
 fn main() -> Result<()> {
-    let app = gpui_platform::application();
+    let app = gpui_kit::application();
 
     app.run(move |cx| {
         // Get shell from environment
@@ -152,8 +152,8 @@ fn main() -> Result<()> {
             };
 
             cx.open_window(
-                gpui::WindowOptions {
-                    titlebar: Some(gpui::TitlebarOptions {
+                gpui_kit::WindowOptions {
+                    titlebar: Some(gpui_kit::TitlebarOptions {
                         title: Some("terminal".into()),
                         ..Default::default()
                     }),

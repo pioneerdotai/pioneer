@@ -1,3 +1,8 @@
+pub mod runtime_ids {
+    /// Durable runtime discriminator used for native tool permission requests.
+    pub const NATIVE_PERMISSION: &str = "__native_permission__";
+}
+
 pub mod methods {
     pub const AUTH_ME: &str = "auth/me";
     pub const AUTHORIZATION_CAPABILITIES: &str = "authorization/capabilities";
@@ -40,8 +45,12 @@ pub mod methods {
     pub const THREAD_AGENTS_DOC_SAVE: &str = "thread/agents_doc/save";
     pub const THREAD_AGENTS_DOC_ARCHIVE: &str = "thread/agents_doc/archive";
     pub const THREAD_AGENTS_DOC_RESOLVE_FOR_THREAD: &str = "thread/agents_doc/resolve_for_thread";
+    pub const THREADS_TOOLS_RESULT_READ: &str = "threads/tools/result/read";
     pub const THREAD_GET: &str = "thread/get";
     pub const THREAD_TIMELINE_PAGE: &str = "thread/timeline/page";
+    pub const THREAD_PATCH_STEPS_PAGE: &str = "thread/patch_steps/page";
+    pub const THREAD_FILE_PATCH_HISTORY_PAGE: &str = "thread/file_patch_history/page";
+    pub const THREAD_FILE_VIEW_GRANT_CREATE: &str = "thread/file/view_grant/create";
     pub const THREAD_READ: &str = "thread/read";
     pub const THREAD_UNSUBSCRIBE: &str = "thread/unsubscribe";
     pub const TURN_START: &str = "turn/start";
@@ -52,6 +61,9 @@ pub mod methods {
     pub const TURN_RESUME: &str = "turn/resume";
     pub const TURN_GET: &str = "turn/get";
     pub const TURN_ITEMS_PAGE: &str = "turn/items/page";
+    pub const TURN_PATCH_STEPS_PAGE: &str = "turn/patch_steps/page";
+    pub const TURN_PATCH_RECORD_GET: &str = "turn/patch_record/get";
+    pub const TURN_PATCH_DIFF_GET: &str = "turn/patch_diff/get";
     pub const TURN_WORK_PAGE: &str = "turn/work/page";
     pub const TURN_WORK_ITEMS_GET: &str = "turn/work/items/get";
     pub const TURN_PERMISSION_REQUEST_RESPOND: &str = "turn/permission/request/respond";
@@ -97,6 +109,7 @@ pub mod methods {
     pub const SKILLS_POLICY_LIST: &str = "skills/policy/list";
     pub const SKILLS_POLICY_SET: &str = "skills/policy/set";
     pub const MCP_LIST: &str = "mcp/list";
+    pub const MCP_OAUTH: &str = "mcp/oauth";
     pub const MCP_INSTALL: &str = "mcp/install";
     pub const MCP_POLICY_SET: &str = "mcp/policy/set";
     pub const MCP_SERVER_RESTART: &str = "mcp/server/restart";
@@ -192,7 +205,11 @@ pub mod methods {
         THREAD_AGENTS_DOC_ARCHIVE,
         THREAD_AGENTS_DOC_RESOLVE_FOR_THREAD,
         THREAD_GET,
+        THREADS_TOOLS_RESULT_READ,
         THREAD_TIMELINE_PAGE,
+        THREAD_FILE_VIEW_GRANT_CREATE,
+        THREAD_PATCH_STEPS_PAGE,
+        THREAD_FILE_PATCH_HISTORY_PAGE,
         THREAD_READ,
         THREAD_UNSUBSCRIBE,
         TURN_START,
@@ -203,6 +220,9 @@ pub mod methods {
         TURN_RESUME,
         TURN_GET,
         TURN_ITEMS_PAGE,
+        TURN_PATCH_STEPS_PAGE,
+        TURN_PATCH_RECORD_GET,
+        TURN_PATCH_DIFF_GET,
         TURN_WORK_PAGE,
         TURN_WORK_ITEMS_GET,
         TURN_PERMISSION_REQUEST_RESPOND,
@@ -249,6 +269,7 @@ pub mod methods {
         SKILLS_POLICY_SET,
         MCP_LIST,
         MCP_INSTALL,
+        MCP_OAUTH,
         MCP_POLICY_SET,
         MCP_SERVER_RESTART,
         MCP_UNINSTALL,
@@ -368,6 +389,7 @@ pub mod events {
     pub const CONTEXT_COMPRESSED: &str = "context/compressed";
     pub const SKILLS_CHANGED: &str = "skills/changed";
     pub const SKILLS_UPLOAD_CHUNK_ACK: &str = "skills/upload/chunk_ack";
+    pub const MCP_OAUTH_CHANGED: &str = "mcp/oauth/changed";
     pub const MCP_CHANGED: &str = "mcp/changed";
     pub const MCP_SERVER_STATUS_CHANGED: &str = "mcp/server/status_changed";
     pub const MCP_SERVER_CATALOG_CHANGED: &str = "mcp/server/catalog_changed";

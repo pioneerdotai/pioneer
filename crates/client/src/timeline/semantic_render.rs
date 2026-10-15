@@ -7,7 +7,6 @@ use crate::{
     conversation::{ConversationViewState, ItemView, TimelineEntry, TimelineEntryStatus},
     timeline::{
         labels::RunningTurnDisplay,
-        render_fingerprint::timeline_row_content_fingerprint,
         rows::{
             TimelineRow, TimelineRowKind, TurnWorkGroupRow, UserMessagePresentation,
             timeline_reply_state,
@@ -30,7 +29,6 @@ pub struct SemanticTimelineRenderModel {
     pub projection: ConversationViewState,
     pub rows: Vec<TimelineRow>,
     pub semantic_row_ids: HashMap<String, SemanticTimelineRowId>,
-    pub row_render_fingerprints: HashMap<String, u64>,
 }
 
 pub fn render_semantic_timeline_rows(
@@ -92,21 +90,10 @@ pub fn render_semantic_timeline_rows(
         }
     }
 
-    let row_render_fingerprints = rows
-        .iter()
-        .map(|row| {
-            (
-                row.key.clone(),
-                timeline_row_content_fingerprint(&projection, row),
-            )
-        })
-        .collect();
-
     SemanticTimelineRenderModel {
         projection,
         rows,
         semantic_row_ids,
-        row_render_fingerprints,
     }
 }
 
@@ -177,6 +164,7 @@ fn push_user_block(
         projection,
         rows,
         ItemRowInput {
+            html_publications: Vec::new(),
             entry_id: block.block_id.clone(),
             item_id: item_id.to_owned(),
             turn_id: turn_id.to_owned(),
@@ -237,6 +225,7 @@ fn push_assistant_block(
     author: Option<pioneer_protocol::TurnAuthorSnapshot>,
 ) {
     let TimelineBlockKind::AssistantMessage {
+        html_publications,
         item_id,
         text,
         status,
@@ -259,6 +248,7 @@ fn push_assistant_block(
         projection,
         rows,
         ItemRowInput {
+            html_publications: html_publications.clone(),
             entry_id: block.block_id.clone(),
             item_id: item_id.clone(),
             turn_id: turn_id.to_owned(),
@@ -320,6 +310,7 @@ fn push_work_item(
         projection,
         rows,
         ItemRowInput {
+            html_publications: Vec::new(),
             entry_id: item.work_item_id.clone(),
             item_id: item.item_id.clone(),
             turn_id: item.turn_id.clone(),
@@ -358,6 +349,7 @@ fn push_detached_task_run(
         projection,
         rows,
         ItemRowInput {
+            html_publications: Vec::new(),
             entry_id: block.block_id.clone(),
             item_id: task.id.clone(),
             turn_id: turn_id.to_owned(),
@@ -447,6 +439,7 @@ fn push_turn_state(
         projection,
         rows,
         ItemRowInput {
+            html_publications: Vec::new(),
             entry_id: block.block_id.clone(),
             item_id,
             turn_id: turn_id.to_owned(),
@@ -504,6 +497,7 @@ fn running_turn_display_for_projection(
 }
 
 struct ItemRowInput {
+    html_publications: Vec<pioneer_protocol::HtmlPublication>,
     entry_id: String,
     item_id: String,
     turn_id: String,
@@ -530,6 +524,7 @@ fn push_item_row(
     let item_index = projection.items.len();
     let timeline_index = projection.timeline.len();
     projection.items.push(ItemView {
+        html_publications: input.html_publications,
         id: input.item_id.clone(),
         turn_id: input.turn_id.clone(),
         item_type: input.item_type,
@@ -701,6 +696,61 @@ mod tests {
     };
 
     #[test]
+    fn publications_remain_ordered_and_unique_before_final_reply_on_replay() {
+        let publication = |id: &str| pioneer_protocol::HtmlPublication {
+            workspace_id: "workspace_a".into(),
+            thread_id: "thread_a".into(),
+            turn_id: "turn_a".into(),
+            call_id: id.into(),
+            title: id.into(),
+            artifact: pioneer_protocol::ArtifactRef {
+                artifact_id: id.into(),
+                version_id: Some(format!("version-{id}")),
+                display_name: id.into(),
+                kind: pioneer_protocol::ArtifactKind::File,
+                mime_type: Some("text/html".into()),
+                size_bytes: Some(20),
+                sha256: Some("a".repeat(64)),
+                status: pioneer_protocol::ArtifactStatus::Ready,
+                preview: None,
+            },
+        };
+        let mut answer = assistant_block(None);
+        if let TimelineBlockKind::AssistantMessage {
+            html_publications, ..
+        } = &mut answer.kind
+        {
+            *html_publications = vec![publication("first"), publication("second")];
+        }
+        let semantic = semantic_row(SemanticTimelineRowKind::AssistantMessage { block: answer });
+        let model =
+            render_semantic_timeline_rows(&[semantic.clone()], ConversationViewState::default());
+        let replay = render_semantic_timeline_rows(&[semantic], ConversationViewState::default());
+        assert_eq!(model.rows.len(), 1);
+        assert_eq!(model.projection.items.len(), 1);
+        let item = &model.projection.items[0];
+        assert!(matches!(
+            item.item,
+            TurnItem::AgentMessage {
+                phase: AgentMessagePhase::FinalAnswer,
+                ..
+            }
+        ));
+        assert_eq!(
+            item.html_publications,
+            vec![publication("first"), publication("second")]
+        );
+        assert!(model.projection.same_content(&replay.projection));
+        assert_eq!(model.projection.revision, replay.projection.revision);
+        assert!(
+            model
+                .rows
+                .iter()
+                .all(|row| !row.key.starts_with("html-publication::"))
+        );
+    }
+
+    #[test]
     fn assistant_block_preserves_final_markdown_in_shared_projection() {
         let markdown = MarkdownDocument::from_plain_text("final markdown");
         let model = render_semantic_timeline_rows(
@@ -711,12 +761,6 @@ mod tests {
         );
 
         assert_eq!(model.rows.len(), 1);
-        assert_eq!(model.row_render_fingerprints.len(), 1);
-        assert!(
-            model
-                .row_render_fingerprints
-                .contains_key(model.rows[0].key.as_str())
-        );
         assert_eq!(model.projection.items.len(), 1);
         assert_eq!(
             model.projection.items[0].final_text.as_deref(),
@@ -1122,6 +1166,7 @@ mod tests {
             started_at_unix_ms: Some(3),
             updated_at_unix_ms: Some(3),
             kind: TimelineBlockKind::AssistantMessage {
+                html_publications: Vec::new(),
                 item_id: "assistant_final".to_owned(),
                 text: "final **markdown**".to_owned(),
                 status: TurnWorkItemStatus::Completed,
@@ -1193,6 +1238,7 @@ mod tests {
 
     fn work_payload(presentation: TurnWorkPresentation, work_count: u64) -> TurnWorkBlock {
         TurnWorkBlock {
+            html_publications: Vec::new(),
             turn_id: "turn_a".to_owned(),
             presentation,
             state: TurnWorkState::Completed,

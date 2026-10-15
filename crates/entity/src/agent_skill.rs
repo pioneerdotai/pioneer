@@ -16,6 +16,7 @@ pub struct Model {
     pub active_version_id: Option<String>,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
+    pub evidence_latest_at_unix: Option<i64>,
     #[sea_orm(
         belongs_to,
         from = "active_version_id",

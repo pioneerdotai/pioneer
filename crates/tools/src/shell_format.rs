@@ -10,6 +10,21 @@ pub struct ExecTruncation {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExecStreamOutputStats {
+    pub bytes_seen: usize,
+    pub bytes_retained: usize,
+    pub bytes_dropped: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExecOutputStats {
+    pub stdout: ExecStreamOutputStats,
+    pub stderr: ExecStreamOutputStats,
+    pub truncation_method: String,
+    pub full_output_available: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ExecModelPayload {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i32>,
@@ -19,6 +34,8 @@ pub struct ExecModelPayload {
     pub stderr: String,
     pub aggregated_output: String,
     pub truncated: ExecTruncation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_stats: Option<ExecOutputStats>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<u64>,
     pub command: Vec<String>,
@@ -39,6 +56,13 @@ pub struct ExecPayloadInput {
 }
 
 pub fn build_exec_model_payload(input: ExecPayloadInput) -> ExecModelPayload {
+    build_exec_model_payload_with_stats(input, None)
+}
+
+pub fn build_exec_model_payload_with_stats(
+    input: ExecPayloadInput,
+    output_stats: Option<ExecOutputStats>,
+) -> ExecModelPayload {
     let aggregated_raw = aggregate_output(input.stdout.as_str(), input.stderr.as_str());
 
     let (stdout, stdout_truncated) =
@@ -62,6 +86,7 @@ pub fn build_exec_model_payload(input: ExecPayloadInput) -> ExecModelPayload {
                 || input.force_truncated_stdout
                 || input.force_truncated_stderr,
         },
+        output_stats,
         session_id: input.session_id,
         command: input.command,
     }

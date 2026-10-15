@@ -4,7 +4,10 @@ use crate::{KeystoreError, Result};
 
 pub const PROVIDER_API_KEY_SERVICE: &str = "pioneer.gateway.provider_api_key";
 pub const PROVIDER_PROXY_SERVICE: &str = "pioneer.gateway.provider_proxy";
+pub const PROVIDER_BASE_URL_SERVICE: &str = "pioneer.gateway.provider_base_url";
 pub const CLI_RUNTIME_PROXY_SERVICE: &str = "pioneer.gateway.cli_runtime_proxy";
+pub const MODEL_CATALOG_PROXY_SERVICE: &str = "pioneer.gateway.model_catalog_proxy";
+pub const MCP_OAUTH_SERVICE: &str = "pioneer.gateway.mcp_oauth";
 pub const MCP_SECRET_SERVICE: &str = "pioneer.gateway.mcp_secret";
 pub const USER_JWT_TOKEN_SERVICE: &str = "pioneer.gateway.user_jwt_token";
 pub const GATEWAY_ACCESS_JWT_SIGNING_KEY_SERVICE: &str = "pioneer.gateway.access_jwt_signing_key";
@@ -46,6 +49,15 @@ impl SecretId {
         )
     }
 
+    pub fn workspace_provider_base_url(workspace_id: &str, provider: &str) -> Result<Self> {
+        let workspace_id = validate_user("workspace id", workspace_id)?;
+        let provider = validate_user("provider", provider)?.to_ascii_lowercase();
+        Self::from_service_user(
+            PROVIDER_BASE_URL_SERVICE,
+            format!("workspace:{workspace_id}:provider:{provider}"),
+        )
+    }
+
     pub fn workspace_cli_runtime_proxy(workspace_id: &str, runtime_id: &str) -> Result<Self> {
         let workspace_id = validate_user("workspace id", workspace_id)?;
         let runtime_id = validate_user("CLI runtime id", runtime_id)?;
@@ -53,6 +65,13 @@ impl SecretId {
             CLI_RUNTIME_PROXY_SERVICE,
             format!("workspace:{workspace_id}:runtime:{runtime_id}"),
         )
+    }
+
+    pub fn model_catalog_proxy() -> Self {
+        Self {
+            service: MODEL_CATALOG_PROXY_SERVICE.to_owned(),
+            user: GATEWAY_AUTH_KEY_USER.to_owned(),
+        }
     }
 
     pub fn user_jwt_token(token_id: &str) -> Result<Self> {
@@ -72,6 +91,13 @@ impl SecretId {
             service: GATEWAY_AUTH_CREDENTIAL_HMAC_KEY_SERVICE.to_owned(),
             user: GATEWAY_AUTH_KEY_USER.to_owned(),
         }
+    }
+
+    pub fn mcp_oauth(connection_id: &str) -> Result<Self> {
+        Self::from_service_user(
+            MCP_OAUTH_SERVICE,
+            validate_user("OAuth connection", connection_id)?,
+        )
     }
 
     pub fn mcp_secret(ref_id: &str) -> Result<Self> {
@@ -112,8 +138,11 @@ impl SecretId {
 pub enum SecretKind {
     ProviderApiKey,
     ProviderProxy,
+    ProviderBaseUrl,
     CliRuntimeProxy,
+    ModelCatalogProxy,
     McpSecret,
+    McpOAuth,
     UserJwtToken,
     GatewayAccessJwtSigningKey,
     GatewayAuthCredentialHmacKey,
@@ -126,7 +155,10 @@ impl SecretKind {
         match self {
             SecretKind::ProviderApiKey => PROVIDER_API_KEY_SERVICE,
             SecretKind::ProviderProxy => PROVIDER_PROXY_SERVICE,
+            SecretKind::ProviderBaseUrl => PROVIDER_BASE_URL_SERVICE,
             SecretKind::CliRuntimeProxy => CLI_RUNTIME_PROXY_SERVICE,
+            SecretKind::ModelCatalogProxy => MODEL_CATALOG_PROXY_SERVICE,
+            SecretKind::McpOAuth => MCP_OAUTH_SERVICE,
             SecretKind::McpSecret => MCP_SECRET_SERVICE,
             SecretKind::UserJwtToken => USER_JWT_TOKEN_SERVICE,
             SecretKind::GatewayAccessJwtSigningKey => GATEWAY_ACCESS_JWT_SIGNING_KEY_SERVICE,
@@ -140,7 +172,10 @@ impl SecretKind {
         match service {
             PROVIDER_API_KEY_SERVICE => Some(SecretKind::ProviderApiKey),
             PROVIDER_PROXY_SERVICE => Some(SecretKind::ProviderProxy),
+            PROVIDER_BASE_URL_SERVICE => Some(SecretKind::ProviderBaseUrl),
             CLI_RUNTIME_PROXY_SERVICE => Some(SecretKind::CliRuntimeProxy),
+            MODEL_CATALOG_PROXY_SERVICE => Some(SecretKind::ModelCatalogProxy),
+            MCP_OAUTH_SERVICE => Some(SecretKind::McpOAuth),
             MCP_SECRET_SERVICE => Some(SecretKind::McpSecret),
             USER_JWT_TOKEN_SERVICE => Some(SecretKind::UserJwtToken),
             GATEWAY_ACCESS_JWT_SIGNING_KEY_SERVICE => Some(SecretKind::GatewayAccessJwtSigningKey),
@@ -272,12 +307,36 @@ mod tests {
     }
 
     #[test]
+    fn workspace_provider_base_url_id_is_scoped_by_workspace() {
+        let id =
+            SecretId::workspace_provider_base_url("  ws_1  ", "  OpenAI  ").expect("base url id");
+
+        assert_eq!(id.service(), PROVIDER_BASE_URL_SERVICE);
+        assert_eq!(id.user(), "workspace:ws_1:provider:openai");
+        assert_eq!(
+            SecretKind::from_service(id.service()),
+            Some(SecretKind::ProviderBaseUrl)
+        );
+    }
+
+    #[test]
     fn workspace_cli_runtime_proxy_id_is_scoped_by_workspace() {
         let id = SecretId::workspace_cli_runtime_proxy("  ws_1  ", "  codex_work  ")
             .expect("runtime proxy id");
 
         assert_eq!(id.service(), CLI_RUNTIME_PROXY_SERVICE);
         assert_eq!(id.user(), "workspace:ws_1:runtime:codex_work");
+    }
+
+    #[test]
+    fn model_catalog_proxy_id_is_gateway_global() {
+        let id = SecretId::model_catalog_proxy();
+        assert_eq!(id.service(), MODEL_CATALOG_PROXY_SERVICE);
+        assert_eq!(id.user(), GATEWAY_AUTH_KEY_USER);
+        assert_eq!(
+            SecretKind::from_service(id.service()),
+            Some(SecretKind::ModelCatalogProxy)
+        );
     }
 
     #[test]

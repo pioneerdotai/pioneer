@@ -1,0 +1,44 @@
+{
+  "candidates": [
+    {
+      "content": {
+        "role": "model",
+        "parts": [
+          {
+            "text": "thought",
+            "thought": true,
+            "thoughtSignature": "thought-sig"
+          },
+          {
+            "text": "answer",
+            "thoughtSignature": "text-sig"
+          },
+          {
+            "functionCall": {
+              "name": "first",
+              "args": {},
+              "id": "a"
+            },
+            "thoughtSignature": "call-sig"
+          },
+          {
+            "inlineData": {
+              "mimeType": "image/png",
+              "data": "opaque-image",
+              "displayName": "result"
+            },
+            "thoughtSignature": "media-sig"
+          },
+          {
+            "functionCall": {
+              "name": "second",
+              "args": {},
+              "id": "b"
+            }
+          }
+        ]
+      },
+      "finishReason": "STOP"
+    }
+  ]
+}

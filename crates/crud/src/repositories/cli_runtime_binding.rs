@@ -1,13 +1,13 @@
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use pioneer_entity::{
     cli_runtime_native_event, cli_runtime_pending_request, thread_cli_runtime_binding,
     turn_cli_runtime_attempt, turn_cli_runtime_binding, turn_cli_runtime_execution_segment,
 };
 use sea_orm::entity::prelude::DateTimeWithTimeZone;
-use sea_orm::sea_query::OnConflict;
+use sea_orm::sea_query::{Expr, OnConflict};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, EntityTrait, ExprTrait,
-    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set,
+    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set, Statement,
 };
 use serde::{Serialize, de::DeserializeOwned};
 
@@ -123,6 +123,7 @@ pub struct CliRuntimeProviderSessionBinding {
 pub struct PrepareClaudeProviderSessionBinding {
     pub thread_binding: NewCliRuntimeThreadBinding,
     pub proposed_provider_session_id: String,
+    pub force_new: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -166,6 +167,24 @@ pub struct NewCliRuntimeThreadBinding {
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
 }
+
+/// Only the persistent active set participates in global background discovery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CliRuntimeActiveTurnBindingStatus {
+    Starting,
+    Running,
+}
+
+impl CliRuntimeActiveTurnBindingStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Starting => "starting",
+            Self::Running => "running",
+        }
+    }
+}
+
+pub const CLI_RUNTIME_ACTIVE_TURN_BINDING_PAGE_MAX: u64 = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CliRuntimeTurnBindingRecord {
@@ -540,6 +559,7 @@ pub struct CliRuntimeNativeEventListFilter {
     pub turn_id: Option<String>,
     pub native_thread_id: Option<String>,
     pub native_turn_id: Option<String>,
+    pub native_method: Option<String>,
     pub limit: Option<u64>,
 }
 
@@ -554,9 +574,11 @@ pub fn deserialize_cli_runtime_json<T: DeserializeOwned>(value: &str) -> Result<
 pub async fn upsert_thread_binding<C: ConnectionTrait>(
     db: &C,
     binding: NewCliRuntimeThreadBinding,
+    root: &crate::frozen_lifetime::PreparedFrozenRoot,
 ) -> Result<CliRuntimeThreadBindingRecord> {
+    root.verify(db, &binding.workspace_id).await?;
     let thread_id = binding.thread_id.clone();
-    thread_cli_runtime_binding::Entity::insert(active_thread_binding_from_new(binding))
+    thread_cli_runtime_binding::Entity::insert(active_thread_binding_from_new(binding, root))
         .on_conflict(
             OnConflict::column(thread_cli_runtime_binding::Column::ThreadId)
                 .update_columns([
@@ -569,6 +591,7 @@ pub async fn upsert_thread_binding<C: ConnectionTrait>(
                     thread_cli_runtime_binding::Column::NativeCwd,
                     thread_cli_runtime_binding::Column::NativeModel,
                     thread_cli_runtime_binding::Column::ResumeCursorJson,
+                    thread_cli_runtime_binding::Column::FrozenManifestId,
                     thread_cli_runtime_binding::Column::Status,
                     thread_cli_runtime_binding::Column::UpdatedAt,
                 ])
@@ -583,6 +606,29 @@ pub async fn upsert_thread_binding<C: ConnectionTrait>(
         .context("upserted CLI runtime thread binding is missing")
 }
 
+pub async fn insert_fork_intent_if_absent<C: ConnectionTrait>(
+    db: &C,
+    pending: NewCliRuntimeThreadBinding,
+    root: &crate::frozen_lifetime::PreparedFrozenRoot,
+) -> Result<bool> {
+    root.verify(db, &pending.workspace_id).await?;
+    anyhow::ensure!(
+        pending.status == "fork_pending",
+        "CLI fork intent must be pending"
+    );
+    let result =
+        thread_cli_runtime_binding::Entity::insert(active_thread_binding_from_new(pending, root))
+            .on_conflict(
+                OnConflict::column(thread_cli_runtime_binding::Column::ThreadId)
+                    .do_nothing()
+                    .to_owned(),
+            )
+            .exec_without_returning(db)
+            .await
+            .context("failed to insert CLI fork intent")?;
+    Ok(result == 1)
+}
+
 pub async fn find_thread_binding<C: ConnectionTrait>(
     db: &C,
     thread_id: &str,
@@ -595,12 +641,150 @@ pub async fn find_thread_binding<C: ConnectionTrait>(
         .transpose()
 }
 
+/// Remove only an unsent fork intent after a typed provider rejection proves
+/// that no branch was created. A concurrent state change is never erased.
+pub async fn discard_rejected_fork_intent<C: ConnectionTrait>(
+    db: &C,
+    thread_id: &str,
+    runtime_id: &str,
+    source_native_thread_id: &str,
+    expected_cursor_json: &str,
+) -> Result<bool> {
+    let result = thread_cli_runtime_binding::Entity::delete_many()
+        .filter(thread_cli_runtime_binding::Column::ThreadId.eq(thread_id.to_owned()))
+        .filter(thread_cli_runtime_binding::Column::RuntimeId.eq(runtime_id.to_owned()))
+        .filter(
+            thread_cli_runtime_binding::Column::NativeThreadId
+                .eq(source_native_thread_id.to_owned()),
+        )
+        .filter(thread_cli_runtime_binding::Column::Status.eq("fork_pending"))
+        .filter(
+            thread_cli_runtime_binding::Column::ResumeCursorJson
+                .eq(expected_cursor_json.to_owned()),
+        )
+        .exec(db)
+        .await
+        .context("failed to discard rejected CLI fork intent")?;
+    Ok(result.rows_affected == 1)
+}
+
+/// Commit a provider fork only while the exact durable intent is still
+/// pending. The caller performs provider I/O before entering the writer.
+pub async fn confirm_marked_fork_intent<C: ConnectionTrait>(
+    db: &C,
+    pending: &CliRuntimeThreadBindingRecord,
+    fork_native_thread_id: &str,
+    native_cwd: Option<String>,
+    native_model: Option<String>,
+    resume_cursor_json: String,
+    updated_at: DateTimeWithTimeZone,
+    root: &crate::frozen_lifetime::PreparedFrozenRoot,
+) -> Result<CliRuntimeThreadBindingRecord> {
+    root.verify(db, &pending.workspace_id).await?;
+    let result = thread_cli_runtime_binding::Entity::update_many()
+        .col_expr(
+            thread_cli_runtime_binding::Column::FrozenManifestId,
+            Expr::value(root.locator()),
+        )
+        .col_expr(
+            thread_cli_runtime_binding::Column::NativeThreadId,
+            Expr::value(fork_native_thread_id.to_owned()),
+        )
+        .col_expr(
+            thread_cli_runtime_binding::Column::NativeCwd,
+            Expr::value(native_cwd),
+        )
+        .col_expr(
+            thread_cli_runtime_binding::Column::NativeModel,
+            Expr::value(native_model),
+        )
+        .col_expr(
+            thread_cli_runtime_binding::Column::ResumeCursorJson,
+            Expr::value(resume_cursor_json),
+        )
+        .col_expr(
+            thread_cli_runtime_binding::Column::Status,
+            Expr::value("active"),
+        )
+        .col_expr(
+            thread_cli_runtime_binding::Column::UpdatedAt,
+            Expr::value(updated_at),
+        )
+        .filter(thread_cli_runtime_binding::Column::ThreadId.eq(pending.thread_id.clone()))
+        .filter(thread_cli_runtime_binding::Column::WorkspaceId.eq(pending.workspace_id.clone()))
+        .filter(thread_cli_runtime_binding::Column::RuntimeId.eq(pending.runtime_id.clone()))
+        .filter(
+            thread_cli_runtime_binding::Column::NativeThreadId.eq(pending.native_thread_id.clone()),
+        )
+        .filter(
+            thread_cli_runtime_binding::Column::ResumeCursorJson
+                .eq(pending.resume_cursor_json.clone()),
+        )
+        .filter(thread_cli_runtime_binding::Column::Status.eq("fork_pending"))
+        .exec(db)
+        .await
+        .context("failed to commit marked CLI fork")?;
+    if result.rows_affected != 1 {
+        bail!("CLI fork intent changed before provider result commit");
+    }
+    find_thread_binding(db, pending.thread_id.as_str())
+        .await?
+        .context("confirmed CLI fork binding is missing")
+}
+
+pub async fn update_thread_resume_cursor<C: ConnectionTrait>(
+    db: &C,
+    thread_id: &str,
+    expected_native_thread_id: &str,
+    expected_cursor_json: &str,
+    resume_cursor_json: String,
+    updated_at: DateTimeWithTimeZone,
+    root: &crate::frozen_lifetime::PreparedFrozenRoot,
+) -> Result<CliRuntimeThreadBindingRecord> {
+    let current = find_thread_binding(db, thread_id)
+        .await?
+        .context("CLI binding missing")?;
+    root.verify(db, &current.workspace_id).await?;
+    let result = thread_cli_runtime_binding::Entity::update_many()
+        .col_expr(
+            thread_cli_runtime_binding::Column::FrozenManifestId,
+            Expr::value(root.locator()),
+        )
+        .col_expr(
+            thread_cli_runtime_binding::Column::ResumeCursorJson,
+            Expr::value(resume_cursor_json),
+        )
+        .col_expr(
+            thread_cli_runtime_binding::Column::UpdatedAt,
+            Expr::value(updated_at),
+        )
+        .filter(thread_cli_runtime_binding::Column::ThreadId.eq(thread_id.to_owned()))
+        .filter(
+            thread_cli_runtime_binding::Column::NativeThreadId
+                .eq(expected_native_thread_id.to_owned()),
+        )
+        .filter(
+            thread_cli_runtime_binding::Column::ResumeCursorJson
+                .eq(expected_cursor_json.to_owned()),
+        )
+        .exec(db)
+        .await
+        .context("failed to update CLI runtime context receipt")?;
+    if result.rows_affected != 1 {
+        bail!("CLI runtime thread changed before context receipt commit");
+    }
+    find_thread_binding(db, thread_id)
+        .await?
+        .context("CLI runtime thread binding disappeared after context receipt commit")
+}
+
 /// Atomically load or create the durable Claude provider UUID before a
 /// provider process can be spawned. The caller supplies a freshly generated
 /// candidate, but an existing binding always wins.
 pub async fn prepare_claude_provider_session_binding<C: ConnectionTrait>(
     db: &C,
     request: PrepareClaudeProviderSessionBinding,
+    root: &crate::frozen_lifetime::PreparedFrozenRoot,
 ) -> Result<PreparedClaudeProviderSessionBinding> {
     validate_provider_session_id(request.proposed_provider_session_id.as_str())?;
     let thread_id = request.thread_binding.thread_id.clone();
@@ -611,7 +795,49 @@ pub async fn prepare_claude_provider_session_binding<C: ConnectionTrait>(
         .await
         .context("failed to query Claude provider session binding")?
     {
-        validate_claude_binding_identity(&model, &request.thread_binding)?;
+        let crossing_runtime = request.force_new
+            && model.workspace_id == request.thread_binding.workspace_id
+            && model.status == "active"
+            && (model.runtime_id != request.thread_binding.runtime_id
+                || model.runtime_kind != "claude");
+        if !crossing_runtime {
+            validate_claude_binding_identity(&model, &request.thread_binding)?;
+        }
+        if request.force_new {
+            root.verify(db, &request.thread_binding.workspace_id)
+                .await?;
+            // The transition fence differs for a provider switch, but both
+            // paths prepare the same durable Claude session fields once.
+            let mut active: thread_cli_runtime_binding::ActiveModel = model.into();
+            if crossing_runtime {
+                active.runtime_id = Set(request.thread_binding.runtime_id);
+                active.runtime_kind = Set("claude".to_owned());
+            }
+            let proposed_provider_session_id = request.proposed_provider_session_id;
+            active.native_thread_id = Set(proposed_provider_session_id.clone());
+            active.native_session_id = Set(Some(proposed_provider_session_id.clone()));
+            active.native_root_thread_id = Set(request.thread_binding.native_root_thread_id);
+            active.native_cwd = Set(request.thread_binding.native_cwd);
+            active.native_model = Set(request.thread_binding.native_model);
+            active.resume_cursor_json = Set(request.thread_binding.resume_cursor_json);
+            active.frozen_manifest_id = Set(root.locator());
+            active.provider_session_id = Set(Some(proposed_provider_session_id));
+            active.provider_session_lifecycle_state = Set(Some(
+                CliRuntimeProviderSessionLifecycle::Prepared
+                    .as_str()
+                    .to_owned(),
+            ));
+            active.provider_session_last_verified_process_generation = Set(None);
+            active.updated_at = Set(request.thread_binding.updated_at);
+            let binding = active
+                .update(db)
+                .await
+                .context("failed to replace Claude provider session binding")?;
+            return Ok(PreparedClaudeProviderSessionBinding {
+                binding: thread_binding_record_from_model(binding)?,
+                mode: PreparedClaudeProviderSessionMode::New,
+            });
+        }
         let existing = provider_session_binding_from_model(&model)?;
         if let Some(existing) = existing {
             if existing.lifecycle == CliRuntimeProviderSessionLifecycle::Invalid {
@@ -635,8 +861,10 @@ pub async fn prepare_claude_provider_session_binding<C: ConnectionTrait>(
         ));
     }
 
+    root.verify(db, &request.thread_binding.workspace_id)
+        .await?;
     let proposed_provider_session_id = request.proposed_provider_session_id;
-    let mut active = active_thread_binding_from_new(request.thread_binding);
+    let mut active = active_thread_binding_from_new(request.thread_binding, root);
     active.native_thread_id = Set(proposed_provider_session_id.clone());
     active.native_session_id = Set(Some(proposed_provider_session_id.clone()));
     active.provider_session_id = Set(Some(proposed_provider_session_id));
@@ -872,9 +1100,11 @@ pub async fn list_thread_bindings_for_runtime<C: ConnectionTrait>(
 pub async fn upsert_turn_binding<C: ConnectionTrait>(
     db: &C,
     binding: NewCliRuntimeTurnBinding,
+    root: &crate::frozen_lifetime::PreparedFrozenRoot,
 ) -> Result<CliRuntimeTurnBindingRecord> {
+    root.verify(db, &binding.workspace_id).await?;
     let turn_id = binding.turn_id.clone();
-    turn_cli_runtime_binding::Entity::insert(active_turn_binding_from_new(binding))
+    turn_cli_runtime_binding::Entity::insert(active_turn_binding_from_new(binding, root))
         .on_conflict(
             OnConflict::column(turn_cli_runtime_binding::Column::TurnId)
                 .update_columns([
@@ -892,6 +1122,7 @@ pub async fn upsert_turn_binding<C: ConnectionTrait>(
                     turn_cli_runtime_binding::Column::SandboxJson,
                     turn_cli_runtime_binding::Column::ApprovalPolicy,
                     turn_cli_runtime_binding::Column::InputMappingJson,
+                    turn_cli_runtime_binding::Column::FrozenManifestId,
                     turn_cli_runtime_binding::Column::UpdatedAt,
                 ])
                 .to_owned(),
@@ -905,6 +1136,46 @@ pub async fn upsert_turn_binding<C: ConnectionTrait>(
         .context("upserted CLI runtime turn binding is missing")
 }
 
+/// Control-only projection used by recovery/activation/terminal transactions.
+/// Root identity and sent mapping were loaded in that same writer and remain
+/// untouched, including a legacy unknown locator awaiting reconciliation.
+pub(crate) async fn update_turn_control<C: ConnectionTrait>(
+    db: &C,
+    binding: NewCliRuntimeTurnBinding,
+) -> Result<CliRuntimeTurnBindingRecord> {
+    let id = binding.turn_id;
+    let result = turn_cli_runtime_binding::Entity::update_many()
+        .col_expr(
+            turn_cli_runtime_binding::Column::NativeTurnId,
+            Expr::value(binding.native_turn_id),
+        )
+        .col_expr(
+            turn_cli_runtime_binding::Column::RequestId,
+            Expr::value(binding.request_id),
+        )
+        .col_expr(
+            turn_cli_runtime_binding::Column::Status,
+            Expr::value(binding.status),
+        )
+        .col_expr(
+            turn_cli_runtime_binding::Column::UpdatedAt,
+            Expr::value(binding.updated_at),
+        )
+        .filter(turn_cli_runtime_binding::Column::TurnId.eq(&id))
+        .filter(turn_cli_runtime_binding::Column::WorkspaceId.eq(binding.workspace_id))
+        .filter(turn_cli_runtime_binding::Column::ThreadId.eq(binding.thread_id))
+        .filter(
+            turn_cli_runtime_binding::Column::ContinuationThreadId
+                .eq(binding.continuation_thread_id),
+        )
+        .exec(db)
+        .await?;
+    anyhow::ensure!(result.rows_affected == 1, "CLI control identity changed");
+    find_turn_binding(db, &id)
+        .await?
+        .context("CLI control binding missing")
+}
+
 pub async fn find_turn_binding<C: ConnectionTrait>(
     db: &C,
     turn_id: &str,
@@ -915,6 +1186,30 @@ pub async fn find_turn_binding<C: ConnectionTrait>(
         .context("failed to query CLI runtime turn binding")?
         .map(turn_binding_record_from_model)
         .transpose()
+}
+
+/// A receipt cannot rule out a newer dispatch (including an unknown RPC
+/// outcome). Use the continuation-owner index and return only one identifier;
+/// never load or parse the thread's older input mappings. Timestamp ties are
+/// deliberately inconclusive.
+pub async fn has_dispatch_at_or_after<C: ConnectionTrait>(
+    db: &C,
+    source: &CliRuntimeTurnBindingRecord,
+) -> Result<bool> {
+    use turn_cli_runtime_binding::Column;
+    Ok(turn_cli_runtime_binding::Entity::find()
+        .select_only()
+        .column(Column::TurnId)
+        .filter(Column::WorkspaceId.eq(source.workspace_id.clone()))
+        .filter(Column::RuntimeId.eq(source.runtime_id.clone()))
+        .filter(Column::ContinuationThreadId.eq(source.continuation_thread_id.clone()))
+        .filter(Column::CreatedAt.gte(source.created_at))
+        .filter(Column::TurnId.ne(source.turn_id.clone()))
+        .into_tuple::<String>()
+        .one(db)
+        .await
+        .context("failed to check newer CLI dispatch evidence")?
+        .is_some())
 }
 
 pub async fn set_turn_mcp_metadata<C: ConnectionTrait>(
@@ -1052,6 +1347,42 @@ pub async fn list_turn_bindings_for_thread<C: ConnectionTrait>(
         .all(db)
         .await
         .context("failed to list CLI runtime turn bindings")?
+        .into_iter()
+        .map(turn_binding_record_from_model)
+        .collect()
+}
+
+// One equality range per status; the row-value seek matches the global
+// (status, created_at, turn_id) index, including timestamp ties.
+pub(crate) fn active_turn_binding_page_query(
+    status: CliRuntimeActiveTurnBindingStatus,
+    after: Option<&(DateTimeWithTimeZone, String)>,
+) -> sea_orm::Select<turn_cli_runtime_binding::Entity> {
+    use turn_cli_runtime_binding::Column;
+    let mut query =
+        turn_cli_runtime_binding::Entity::find().filter(Column::Status.eq(status.as_str()));
+    if let Some((created_at, turn_id)) = after {
+        query = query.filter(
+            Expr::tuple([Expr::col(Column::CreatedAt), Expr::col(Column::TurnId)]).gt(Expr::tuple(
+                [Expr::value(*created_at), Expr::value(turn_id.clone())],
+            )),
+        );
+    }
+    query
+        .order_by_asc(Column::CreatedAt)
+        .order_by_asc(Column::TurnId)
+        .limit(CLI_RUNTIME_ACTIVE_TURN_BINDING_PAGE_MAX)
+}
+
+pub async fn list_active_turn_binding_page<C: ConnectionTrait>(
+    db: &C,
+    status: CliRuntimeActiveTurnBindingStatus,
+    after: Option<&(DateTimeWithTimeZone, String)>,
+) -> Result<Vec<CliRuntimeTurnBindingRecord>> {
+    active_turn_binding_page_query(status, after)
+        .all(db)
+        .await
+        .context("failed to list active CLI runtime turn binding page")?
         .into_iter()
         .map(turn_binding_record_from_model)
         .collect()
@@ -1609,6 +1940,63 @@ pub async fn list_pending_requests<C: ConnectionTrait>(
         .collect()
 }
 
+/// Loads open requests for the complete descendant-thread subtree in one
+/// bounded query. The recursive relation is traversed by SQLite rather than by
+/// issuing one pending-request query per descendant.
+pub async fn list_open_pending_requests_for_descendant_threads<C: ConnectionTrait>(
+    db: &C,
+    workspace_id: &str,
+    thread_id: &str,
+) -> Result<Vec<CliRuntimePendingRequestRecord>> {
+    let limit = i64::try_from(CLI_RUNTIME_PENDING_REQUEST_PAGE_MAX)
+        .context("pending request page limit exceeds SQLite integer range")?;
+    let statement = Statement::from_sql_and_values(
+        db.get_database_backend(),
+        r#"
+WITH RECURSIVE descendant_threads(thread_id) AS (
+    SELECT child_thread_id
+    FROM thread_lineage
+    WHERE parent_thread_id = ?
+    UNION
+    SELECT lineage.child_thread_id
+    FROM thread_lineage AS lineage
+    INNER JOIN descendant_threads AS descendant
+        ON lineage.parent_thread_id = descendant.thread_id
+)
+SELECT pending.*
+FROM cli_runtime_pending_request AS pending
+INNER JOIN descendant_threads AS descendant
+    ON descendant.thread_id = pending.thread_id
+WHERE pending.workspace_id = ?
+  AND pending.status IN (?, ?, ?, ?)
+ORDER BY pending.created_at ASC, pending.request_id ASC
+LIMIT ?
+"#,
+        [
+            thread_id.into(),
+            workspace_id.into(),
+            CliRuntimePendingRequestStatus::Pending.as_str().into(),
+            CliRuntimePendingRequestStatus::ResponseAccepted
+                .as_str()
+                .into(),
+            CliRuntimePendingRequestStatus::Delivering.as_str().into(),
+            CliRuntimePendingRequestStatus::DeliveryFailed
+                .as_str()
+                .into(),
+            limit.into(),
+        ],
+    );
+
+    cli_runtime_pending_request::Entity::find()
+        .from_raw_sql(statement)
+        .all(db)
+        .await
+        .context("failed to list open CLI runtime pending requests for descendant threads")?
+        .into_iter()
+        .map(pending_request_record_from_model)
+        .collect()
+}
+
 pub async fn resolve_pending_request<C: ConnectionTrait>(
     db: &C,
     resolution: ResolveCliRuntimePendingRequest,
@@ -1852,6 +2240,40 @@ pub async fn append_native_event<C: ConnectionTrait>(
         .context("inserted CLI runtime native event is missing")
 }
 
+/// The Claude completion boundary uses a deterministic event ID. A replay
+/// must recover the same row, while an accidental ID collision must fail.
+pub async fn append_native_event_if_absent<C: ConnectionTrait>(
+    db: &C,
+    event: NewCliRuntimeNativeEvent,
+) -> Result<CliRuntimeNativeEventRecord> {
+    let id = event.id.clone();
+    cli_runtime_native_event::Entity::insert(active_native_event_from_new(event.clone()))
+        .on_conflict(
+            OnConflict::column(cli_runtime_native_event::Column::Id)
+                .do_nothing()
+                .to_owned(),
+        )
+        .exec_without_returning(db)
+        .await
+        .context("failed to persist idempotent CLI runtime native event")?;
+    let existing = find_native_event(db, id.as_str())
+        .await?
+        .context("idempotent CLI runtime native event disappeared")?;
+    anyhow::ensure!(
+        existing.runtime_id == event.runtime_id
+            && existing.runtime_kind == event.runtime_kind
+            && existing.workspace_id == event.workspace_id
+            && existing.thread_id == event.thread_id
+            && existing.turn_id == event.turn_id
+            && existing.native_thread_id == event.native_thread_id
+            && existing.native_turn_id == event.native_turn_id
+            && existing.native_method == event.native_method
+            && existing.payload_redacted_json == event.payload_redacted_json,
+        "idempotent CLI runtime native event conflicts with existing identity"
+    );
+    Ok(existing)
+}
+
 pub async fn find_native_event<C: ConnectionTrait>(
     db: &C,
     id: &str,
@@ -1911,6 +2333,9 @@ fn filter_native_events(
     if let Some(native_turn_id) = filter.native_turn_id {
         query = query.filter(cli_runtime_native_event::Column::NativeTurnId.eq(native_turn_id));
     }
+    if let Some(native_method) = filter.native_method {
+        query = query.filter(cli_runtime_native_event::Column::NativeMethod.eq(native_method));
+    }
     if let Some(limit) = filter.limit {
         query = query.limit(limit);
     }
@@ -1956,6 +2381,7 @@ async fn update_pending_request_metadata<C: ConnectionTrait>(
 
 fn active_thread_binding_from_new(
     binding: NewCliRuntimeThreadBinding,
+    root: &crate::frozen_lifetime::PreparedFrozenRoot,
 ) -> thread_cli_runtime_binding::ActiveModel {
     thread_cli_runtime_binding::ActiveModel {
         thread_id: Set(binding.thread_id),
@@ -1968,6 +2394,7 @@ fn active_thread_binding_from_new(
         native_cwd: Set(binding.native_cwd),
         native_model: Set(binding.native_model),
         resume_cursor_json: Set(binding.resume_cursor_json),
+        frozen_manifest_id: Set(root.locator()),
         status: Set(binding.status),
         created_at: Set(binding.created_at),
         updated_at: Set(binding.updated_at),
@@ -1977,6 +2404,7 @@ fn active_thread_binding_from_new(
 
 fn active_turn_binding_from_new(
     binding: NewCliRuntimeTurnBinding,
+    root: &crate::frozen_lifetime::PreparedFrozenRoot,
 ) -> turn_cli_runtime_binding::ActiveModel {
     turn_cli_runtime_binding::ActiveModel {
         turn_id: Set(binding.turn_id),
@@ -1994,6 +2422,7 @@ fn active_turn_binding_from_new(
         sandbox_json: Set(binding.sandbox_json),
         approval_policy: Set(binding.approval_policy),
         input_mapping_json: Set(binding.input_mapping_json),
+        frozen_manifest_id: Set(root.locator()),
         created_at: Set(binding.created_at),
         updated_at: Set(binding.updated_at),
         ..Default::default()
@@ -2470,6 +2899,227 @@ fn native_event_record_from_model(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use migration::{Migrator, MigratorTrait};
+    use pioneer_sqlite::{
+        SqliteDatabase, SqliteReadClass, SqliteReadEvent, SqliteReadObserver, SqliteWriteClass,
+        SqliteWriteEvent, SqliteWriteExecutor, SqliteWriteObserver,
+        sqlite_read_only_connection_url,
+    };
+    use sea_orm::{ConnectOptions, Database, TransactionTrait};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default)]
+    struct CliBindingRoutes {
+        reads: Mutex<Vec<SqliteReadClass>>,
+        writes: Mutex<Vec<SqliteWriteEvent>>,
+    }
+
+    impl SqliteReadObserver for CliBindingRoutes {
+        fn observe(&self, event: SqliteReadEvent) {
+            if let SqliteReadEvent::OperationFinished { class, .. } = event {
+                self.reads.lock().unwrap().push(class);
+            }
+        }
+    }
+
+    impl SqliteWriteObserver for CliBindingRoutes {
+        fn observe(&self, event: SqliteWriteEvent) {
+            self.writes.lock().unwrap().push(event);
+        }
+    }
+
+    struct TestDatabasePath(std::path::PathBuf);
+
+    impl Drop for TestDatabasePath {
+        fn drop(&mut self) {
+            for suffix in ["", "-wal", "-shm"] {
+                let _ = std::fs::remove_file(format!("{}{suffix}", self.0.display()));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn native_boundary_uses_scoped_routes_and_cancelled_queue_keeps_no_capacity() {
+        let path = TestDatabasePath(std::env::temp_dir().join(format!(
+            "pioneer-cli-binding-route-{}.sqlite",
+            uuid::Uuid::new_v4()
+        )));
+        let mut writer_options =
+            ConnectOptions::new(format!("sqlite://{}?mode=rwc", path.0.display()));
+        writer_options.max_connections(1);
+        let writer = Database::connect(writer_options).await.unwrap();
+        Migrator::up(&writer, None).await.unwrap();
+        writer
+            .execute_unprepared("PRAGMA journal_mode=WAL")
+            .await
+            .unwrap();
+        let mut reader_options = ConnectOptions::new(sqlite_read_only_connection_url(&path.0));
+        reader_options.max_connections(2);
+        reader_options.map_sqlx_sqlite_opts(|options| {
+            options
+                .read_only(true)
+                .create_if_missing(false)
+                .pragma("query_only", "ON")
+        });
+        let reader = Database::connect(reader_options).await.unwrap();
+        let routes = Arc::new(CliBindingRoutes::default());
+        let db = SqliteDatabase::from_executor_with_read_observer(
+            reader,
+            SqliteWriteExecutor::with_observer(writer, routes.clone()),
+            routes.clone(),
+        );
+        let store = crate::CrudStore::new(db.clone());
+        let maintenance = store.with_maintenance_access();
+        let event = NewCliRuntimeNativeEvent {
+            id: "boundary-route".to_owned(),
+            runtime_id: "claude".to_owned(),
+            runtime_kind: "claude".to_owned(),
+            workspace_id: None,
+            thread_id: None,
+            turn_id: None,
+            native_thread_id: None,
+            native_turn_id: None,
+            native_method: "claude/assistant_record_boundary".to_owned(),
+            payload_redacted_json:
+                serde_json::json!({"messageUuid":"01900000-0000-7000-8000-000000000001"})
+                    .to_string(),
+            sequence: 1,
+            created_at: chrono::Utc::now().fixed_offset(),
+        };
+        maintenance
+            .append_cli_runtime_native_event_if_absent(event.clone())
+            .await
+            .unwrap();
+        assert!(routes.writes.lock().unwrap().iter().any(|event| matches!(
+            event,
+            SqliteWriteEvent::Acquired {
+                class: SqliteWriteClass::Maintenance,
+                ..
+            }
+        )));
+        maintenance
+            .latest_cli_runtime_native_event(CliRuntimeNativeEventListFilter {
+                native_method: Some(event.native_method.clone()),
+                limit: Some(1),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(
+            routes
+                .reads
+                .lock()
+                .unwrap()
+                .contains(&SqliteReadClass::Maintenance)
+        );
+
+        let blocker = db.begin().await.unwrap();
+        let before = routes.writes.lock().unwrap().len();
+        let queued_store = maintenance.clone();
+        let queued = tokio::spawn(async move {
+            queued_store
+                .append_cli_runtime_native_event_if_absent(NewCliRuntimeNativeEvent {
+                    id: "cancelled-boundary".to_owned(),
+                    ..event
+                })
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if routes.writes.lock().unwrap()[before..].iter().any(|event| {
+                    matches!(
+                        event,
+                        SqliteWriteEvent::Enqueued {
+                            class: SqliteWriteClass::Maintenance,
+                            ..
+                        }
+                    )
+                }) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        queued.abort();
+        assert!(queued.await.unwrap_err().is_cancelled());
+        assert!(
+            routes
+                .writes
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| matches!(event,
+                    SqliteWriteEvent::Cancelled { class: SqliteWriteClass::Maintenance, queue, .. }
+                        if queue.maintenance == 0
+                ))
+        );
+        blocker.rollback().await.unwrap();
+        maintenance
+            .append_cli_runtime_native_event_if_absent(NewCliRuntimeNativeEvent {
+                id: "after-cancel-boundary".to_owned(),
+                runtime_id: "claude".to_owned(),
+                runtime_kind: "claude".to_owned(),
+                workspace_id: None,
+                thread_id: None,
+                turn_id: None,
+                native_thread_id: None,
+                native_turn_id: None,
+                native_method: "claude/after_cancel_boundary".to_owned(),
+                payload_redacted_json: "{}".to_owned(),
+                sequence: 2,
+                created_at: chrono::Utc::now().fixed_offset(),
+            })
+            .await
+            .unwrap();
+        assert!(
+            maintenance
+                .latest_cli_runtime_native_event(CliRuntimeNativeEventListFilter {
+                    native_method: Some("claude/after_cancel_boundary".to_owned()),
+                    limit: Some(1),
+                    ..Default::default()
+                })
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            maintenance
+                .latest_cli_runtime_native_event(CliRuntimeNativeEventListFilter {
+                    native_method: Some("claude/assistant_record_boundary".to_owned()),
+                    limit: Some(10),
+                    ..Default::default()
+                })
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            maintenance
+                .list_cli_runtime_native_events(CliRuntimeNativeEventListFilter {
+                    runtime_id: Some("claude".to_owned()),
+                    limit: Some(10),
+                    ..Default::default()
+                })
+                .await
+                .unwrap()
+                .iter()
+                .all(|record| record.id != "cancelled-boundary")
+        );
+        assert!(
+            store
+                .latest_cli_runtime_native_event(CliRuntimeNativeEventListFilter {
+                    native_method: Some("claude/assistant_record_boundary".to_owned()),
+                    limit: Some(2),
+                    ..Default::default()
+                })
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
 
     #[test]
     fn pending_request_repository_limit_is_always_server_bounded() {

@@ -1,0 +1,1375 @@
+use crate::assets::PioneerIconName;
+use crate::file_opener::LocalFileTarget;
+use crate::file_opener::local_file_target;
+use crate::timeline::row_view::RowPresentation;
+use gpui_kit::component::IconName;
+use gpui_kit::component::IconNamed;
+use gpui_kit::component::Sizable;
+use gpui_kit::component::StyledExt;
+use gpui_kit::component::clipboard::Clipboard;
+use gpui_kit::component::h_flex;
+use gpui_kit::component::scroll::ScrollableElement;
+use gpui_kit::component::table::{Table, TableBody, TableCell, TableHead, TableHeader, TableRow};
+use gpui_kit::component::theme::ActiveTheme;
+use gpui_kit::component::v_flex;
+use gpui_kit::prelude::*;
+use gpui_kit::*;
+use pioneer_client::conversation::TimelineEntryStatus;
+use pioneer_client::timeline::markdown::{MarkdownNode, MarkdownPresentation};
+use pioneer_client::timeline::types::MarkdownBlock;
+use pioneer_client::timeline::types::MarkdownInline;
+use pioneer_client::timeline::types::MarkdownList;
+use pioneer_client::timeline::types::MarkdownMark;
+use pioneer_client::timeline::types::MarkdownMarkKind;
+use pioneer_client::timeline::types::{MarkdownTable, MarkdownTableAlignment};
+use std::cell::Cell;
+use std::ops::Range;
+use std::rc::Rc;
+use std::sync::Arc;
+use std::time::Instant;
+
+use super::layout::TIMELINE_ROW_MEASUREMENT_GUARD;
+
+const TIMELINE_MESSAGE_FONT_SIZE_REM: f32 = 0.875;
+const TIMELINE_MESSAGE_LINE_HEIGHT_RATIO: f32 = 1.65;
+const MARKDOWN_LINK_ICON_PLACEHOLDER: &str = "\u{2007}\u{2007}";
+const MARKDOWN_LINK_ICON_FONT_SCALE: f32 = 0.85;
+
+pub(super) fn timeline_message_text_bottom_inset(window: &Window) -> Pixels {
+    let font_size = px(window.rem_size().as_f32() * TIMELINE_MESSAGE_FONT_SIZE_REM);
+    let line_height = px((font_size.as_f32() * TIMELINE_MESSAGE_LINE_HEIGHT_RATIO).round());
+    let text_style = window.text_style();
+    let font_id = window.text_system().resolve_font(&text_style.font());
+    let ascent = window.text_system().ascent(font_id, font_size).as_f32();
+    // GPUI stores the OpenType descender with its native negative sign.
+    let descent = window
+        .text_system()
+        .descent(font_id, font_size)
+        .as_f32()
+        .abs();
+    let text_height = px(ascent + descent);
+    let lower_leading = px(((line_height - text_height).as_f32() / 2.).max(0.));
+
+    lower_leading + TIMELINE_ROW_MEASUREMENT_GUARD
+}
+
+#[derive(Clone, Copy, Debug)]
+enum MarkdownTextVariant {
+    Paragraph,
+    TableCell(MarkdownTableAlignment),
+    Heading(u8),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum CodeHighlightPolicy {
+    Disabled,
+    FinalMessage,
+}
+
+impl CodeHighlightPolicy {
+    pub(super) fn for_timeline_status(status: TimelineEntryStatus) -> Self {
+        if status == TimelineEntryStatus::Completed {
+            Self::FinalMessage
+        } else {
+            Self::Disabled
+        }
+    }
+}
+
+struct MarkdownLinkText {
+    id: ElementId,
+    text: MarkdownLinkTextContent,
+    text_layout: TextLayout,
+    icons: Vec<MarkdownLinkIcon>,
+    icon_color: Hsla,
+    accessible_text: SharedString,
+}
+
+#[derive(Default)]
+struct TableLinkState {
+    mouse_down: Rc<Cell<Option<usize>>>,
+    hovered_index: Rc<Cell<Option<usize>>>,
+}
+
+enum MarkdownLinkTextContent {
+    Interactive(InteractiveText),
+    Table {
+        text: StyledText,
+        ranges: Vec<Range<usize>>,
+        on_click: Option<Box<dyn Fn(usize, &mut Window, &mut App)>>,
+    },
+}
+
+// Table-only mapping of the existing shaped lines. Each row uses the same wrap
+// boundary and alignment width as GPUI's text painter; no text is measured here.
+struct TableTextRow {
+    range: Range<usize>,
+    line_start: usize,
+    start_x: Pixels,
+    origin: Point<Pixels>,
+    layout: Arc<WrappedLineLayout>,
+}
+
+impl TableTextRow {
+    fn from_layout(text: &TextLayout, alignment: TextAlign) -> Vec<Self> {
+        let bounds = text.bounds();
+        let mut rows = Vec::new();
+        let mut origin = bounds.origin;
+        let mut line_start = 0;
+        for line in text.line_layouts() {
+            let mut start = 0;
+            let mut start_x = px(0.);
+            for (end, end_x) in line
+                .wrap_boundaries
+                .iter()
+                .map(|boundary| {
+                    let glyph =
+                        &line.unwrapped_layout.runs[boundary.run_ix].glyphs[boundary.glyph_ix];
+                    (glyph.index, glyph.position.x)
+                })
+                .chain([(line.len(), line.unwrapped_layout.width)])
+            {
+                let width = end_x - start_x;
+                let x = match alignment {
+                    TextAlign::Left => bounds.origin.x,
+                    TextAlign::Center => (bounds.origin.x * 2. + bounds.size.width - width) / 2.,
+                    TextAlign::Right => bounds.origin.x + bounds.size.width - width,
+                };
+                rows.push(Self {
+                    range: line_start + start..line_start + end,
+                    line_start,
+                    start_x,
+                    origin: point(x, origin.y),
+                    layout: line.clone(),
+                });
+                start = end;
+                start_x = end_x;
+                origin.y += text.line_height();
+            }
+            line_start += line.len() + 1;
+        }
+        rows
+    }
+
+    fn position(&self, index: usize) -> Point<Pixels> {
+        point(
+            self.origin.x
+                + self
+                    .layout
+                    .unwrapped_layout
+                    .x_for_index(index - self.line_start)
+                - self.start_x,
+            self.origin.y,
+        )
+    }
+
+    fn index_at(rows: &[Self], position: Point<Pixels>, line_height: Pixels) -> Option<usize> {
+        let row = rows
+            .iter()
+            .find(|row| position.y >= row.origin.y && position.y < row.origin.y + line_height)?;
+        let x = position.x - row.origin.x + row.start_x;
+        if x < row.start_x {
+            return None;
+        }
+        let index = row.line_start + row.layout.unwrapped_layout.index_for_x(x)?;
+        row.range.contains(&index).then_some(index)
+    }
+}
+
+struct MarkdownLinkIcon {
+    offset: usize,
+    path: SharedString,
+}
+
+impl IntoElement for MarkdownLinkText {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl Element for MarkdownLinkText {
+    type RequestLayoutState = ();
+    type PrepaintState = Hitbox;
+
+    fn id(&self) -> Option<ElementId> {
+        Some(self.id.clone())
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn a11y_role(&self) -> Option<Role> {
+        Some(Role::Label)
+    }
+
+    fn write_a11y_info(&self, node: &mut accesskit::Node) {
+        node.set_value(self.accessible_text.to_string());
+    }
+
+    fn request_layout(
+        &mut self,
+        global_id: Option<&GlobalElementId>,
+        inspector_id: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        match &mut self.text {
+            MarkdownLinkTextContent::Interactive(text) => {
+                text.request_layout(global_id, inspector_id, window, cx)
+            }
+            MarkdownLinkTextContent::Table { text, .. } => {
+                text.request_layout(None, inspector_id, window, cx)
+            }
+        }
+    }
+
+    fn prepaint(
+        &mut self,
+        global_id: Option<&GlobalElementId>,
+        inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        request_layout: &mut Self::RequestLayoutState,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Self::PrepaintState {
+        match &mut self.text {
+            MarkdownLinkTextContent::Interactive(text) => {
+                text.prepaint(global_id, inspector_id, bounds, request_layout, window, cx)
+            }
+            MarkdownLinkTextContent::Table { text, .. } => {
+                text.prepaint(None, inspector_id, bounds, request_layout, window, cx);
+                window.insert_hitbox(bounds, HitboxBehavior::Normal)
+            }
+        }
+    }
+
+    fn paint(
+        &mut self,
+        global_id: Option<&GlobalElementId>,
+        inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        request_layout: &mut Self::RequestLayoutState,
+        hitbox: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let table_rows = match &mut self.text {
+            MarkdownLinkTextContent::Interactive(text) => {
+                text.paint(
+                    global_id,
+                    inspector_id,
+                    bounds,
+                    request_layout,
+                    hitbox,
+                    window,
+                    cx,
+                );
+                None
+            }
+            MarkdownLinkTextContent::Table {
+                text,
+                ranges,
+                on_click,
+            } => {
+                text.paint(
+                    None,
+                    inspector_id,
+                    bounds,
+                    request_layout,
+                    &mut (),
+                    window,
+                    cx,
+                );
+                let rows = Rc::new(TableTextRow::from_layout(
+                    &self.text_layout,
+                    window.text_style().text_align,
+                ));
+                let line_height = self.text_layout.line_height();
+                if hitbox.is_hovered(window)
+                    && let Some(index) =
+                        TableTextRow::index_at(&rows, window.mouse_position(), line_height)
+                    && ranges.iter().any(|range| range.contains(&index))
+                {
+                    window.set_cursor_style(CursorStyle::PointingHand, hitbox);
+                }
+                window.with_element_state::<TableLinkState, _>(
+                    global_id.unwrap(),
+                    |state, window| {
+                        let state = state.unwrap_or_default();
+                        let mouse_down = &state.mouse_down;
+                        let hovered_index = state.hovered_index.clone();
+                        let hover_rows = rows.clone();
+                        let hover_hitbox = hitbox.clone();
+                        window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, _| {
+                            if phase == DispatchPhase::Bubble {
+                                let index = hover_hitbox
+                                    .is_hovered(window)
+                                    .then(|| {
+                                        TableTextRow::index_at(
+                                            &hover_rows,
+                                            event.position,
+                                            line_height,
+                                        )
+                                    })
+                                    .flatten();
+                                if hovered_index.replace(index) != index {
+                                    window.refresh();
+                                }
+                            }
+                        });
+                        let rows = rows.clone();
+                        let hitbox = hitbox.clone();
+                        if let Some(down_index) = mouse_down.get() {
+                            let ranges = std::mem::take(ranges);
+                            let on_click = on_click.take();
+                            let mouse_down = mouse_down.clone();
+                            window.on_mouse_event(
+                                move |event: &MouseUpEvent, phase, window, cx| {
+                                    if phase == DispatchPhase::Bubble {
+                                        if hitbox.is_hovered(window)
+                                            && let Some(up_index) = TableTextRow::index_at(
+                                                &rows,
+                                                event.position,
+                                                line_height,
+                                            )
+                                            && let Some(on_click) = &on_click
+                                        {
+                                            for (index, range) in ranges.iter().enumerate() {
+                                                if range.contains(&down_index)
+                                                    && range.contains(&up_index)
+                                                {
+                                                    on_click(index, window, cx);
+                                                }
+                                            }
+                                        }
+                                        mouse_down.take();
+                                        window.refresh();
+                                    }
+                                },
+                            );
+                        } else {
+                            let mouse_down = mouse_down.clone();
+                            window.on_mouse_event(
+                                move |event: &MouseDownEvent, phase, window, _| {
+                                    if phase == DispatchPhase::Bubble
+                                        && hitbox.is_hovered(window)
+                                        && let Some(index) = TableTextRow::index_at(
+                                            &rows,
+                                            event.position,
+                                            line_height,
+                                        )
+                                    {
+                                        mouse_down.set(Some(index));
+                                        window.refresh();
+                                    }
+                                },
+                            );
+                        }
+                        ((), state)
+                    },
+                );
+                Some(rows)
+            }
+        };
+
+        let line_height = self.text_layout.line_height();
+        let font_size = window.text_style().font_size.to_pixels(window.rem_size());
+        for icon in &self.icons {
+            let end_index = icon
+                .offset
+                .saturating_add(MARKDOWN_LINK_ICON_PLACEHOLDER.len());
+            let positions = if let Some(rows) = &table_rows {
+                rows.iter()
+                    .find(|row| row.range.contains(&icon.offset) && end_index <= row.range.end)
+                    .map(|row| (row.position(icon.offset), row.position(end_index)))
+            } else {
+                self.text_layout
+                    .position_for_index(icon.offset)
+                    .zip(self.text_layout.position_for_index(end_index))
+                    .filter(|(start, end)| start.y == end.y)
+            };
+            let Some((start, end)) = positions else {
+                continue;
+            };
+
+            let reserved_width = end.x - start.x;
+            let icon_size =
+                px((font_size.as_f32() * MARKDOWN_LINK_ICON_FONT_SCALE)
+                    .min(reserved_width.as_f32()));
+            if icon_size <= px(0.) {
+                continue;
+            }
+            let icon_bounds = Bounds::new(
+                point(
+                    start.x + (reserved_width - icon_size) / 2.,
+                    start.y + (line_height - icon_size) / 1.9,
+                ),
+                size(icon_size, icon_size),
+            );
+            let _ = window.paint_svg(
+                icon_bounds,
+                icon.path.clone(),
+                None,
+                TransformationMatrix::default(),
+                self.icon_color,
+                cx,
+            );
+        }
+    }
+}
+
+#[derive(gpui_kit::IntoElement)]
+struct MarkdownDocumentSurface {
+    content: AnyElement,
+}
+impl RenderOnce for MarkdownDocumentSurface {
+    fn render(self, _: &mut Window, _: &mut App) -> impl IntoElement {
+        self.content
+    }
+}
+
+impl RowPresentation {
+    pub(super) fn render_markdown_auto(
+        &self,
+        interaction_scope: &str,
+        text: &str,
+        document: Option<&MarkdownPresentation>,
+        code_highlight_policy: CodeHighlightPolicy,
+        cx: &mut App,
+    ) -> AnyElement {
+        if let Some(document) = document {
+            self.render_markdown_document(interaction_scope, document, code_highlight_policy, cx)
+        } else {
+            self.render_markdown_plain(text, cx)
+        }
+    }
+
+    pub(super) fn render_markdown_plain(&self, text: &str, _cx: &mut App) -> AnyElement {
+        pioneer_client::timeline::diagnostics::record_qualification_diagnostic!(record_render(
+            pioneer_client::timeline::diagnostics::RenderRegion::Markdown
+        ));
+        pioneer_client::timeline::diagnostics::record_qualification_diagnostic!(record_timeline(
+            pioneer_client::timeline::diagnostics::TimelineStage::MarkdownElementBuild,
+            pioneer_client::timeline::diagnostics::DiagnosticAction::Executed,
+            1,
+        ));
+        let started = Instant::now();
+        let element = div()
+            .w_full()
+            .overflow_hidden()
+            .whitespace_normal()
+            .text_sm()
+            .line_height(relative(1.65))
+            .child(text.to_owned())
+            .into_any_element();
+        pioneer_client::timeline::diagnostics::record_desktop_timeline_stage(
+            pioneer_client::timeline::diagnostics::DesktopTimelineStageMetric {
+                stage: pioneer_client::timeline::diagnostics::DesktopTimelineStage::MarkdownElementBuild,
+                cache: pioneer_client::timeline::diagnostics::DesktopTimelineCacheStatus::NotApplicable,
+                content: pioneer_client::timeline::diagnostics::DesktopTimelineContentKind::PlainText,
+                outcome: pioneer_client::timeline::diagnostics::DesktopTimelineOutcome::Ok,
+                elapsed: started.elapsed(),
+                input_bytes: Some(text.len()),
+                block_count: Some(0),
+                row_count: None,
+            },
+        );
+        element
+    }
+
+    pub(super) fn render_markdown_document(
+        &self,
+        _interaction_scope: &str,
+        document: &MarkdownPresentation,
+        code_highlight_policy: CodeHighlightPolicy,
+        cx: &mut App,
+    ) -> AnyElement {
+        pioneer_client::timeline::diagnostics::record_qualification_diagnostic!(record_render(
+            pioneer_client::timeline::diagnostics::RenderRegion::Markdown
+        ));
+        pioneer_client::timeline::diagnostics::record_qualification_diagnostic!(record_timeline(
+            pioneer_client::timeline::diagnostics::TimelineStage::MarkdownElementBuild,
+            pioneer_client::timeline::diagnostics::DiagnosticAction::Executed,
+            1,
+        ));
+        let started = Instant::now();
+        if document.nodes.is_empty() {
+            let element = div()
+                .w_full()
+                .text_sm()
+                .line_height(relative(1.6))
+                .into_any_element();
+            pioneer_client::timeline::diagnostics::record_desktop_timeline_stage(
+                pioneer_client::timeline::diagnostics::DesktopTimelineStageMetric {
+                    stage: pioneer_client::timeline::diagnostics::DesktopTimelineStage::MarkdownElementBuild,
+                    cache: pioneer_client::timeline::diagnostics::DesktopTimelineCacheStatus::NotApplicable,
+                    content: pioneer_client::timeline::diagnostics::DesktopTimelineContentKind::Markdown,
+                    outcome: pioneer_client::timeline::diagnostics::DesktopTimelineOutcome::Ok,
+                    elapsed: started.elapsed(),
+                    input_bytes: None,
+                    block_count: Some(0),
+                    row_count: None,
+                },
+            );
+            return MarkdownDocumentSurface { content: element }.into_any_element();
+        }
+
+        let mut content = v_flex().w_full().overflow_hidden().gap_0();
+        let mut previous_block: Option<&MarkdownBlock> = None;
+        let interaction_root = document.document_id.as_str();
+        for (index, node) in document.nodes.iter().enumerate() {
+            let block = &node.block;
+            let top_spacing = Self::markdown_block_spacing(previous_block, block, index);
+            if top_spacing > px(0.) {
+                content = content.child(div().w_full().h(top_spacing));
+            }
+            content = content.child(self.render_markdown_block(
+                node,
+                code_highlight_policy,
+                interaction_root,
+                cx,
+            ));
+            previous_block = Some(block);
+        }
+        let element = content.into_any_element();
+        pioneer_client::timeline::diagnostics::record_desktop_timeline_stage(
+            pioneer_client::timeline::diagnostics::DesktopTimelineStageMetric {
+                stage: pioneer_client::timeline::diagnostics::DesktopTimelineStage::MarkdownElementBuild,
+                cache: pioneer_client::timeline::diagnostics::DesktopTimelineCacheStatus::NotApplicable,
+                content: pioneer_client::timeline::diagnostics::DesktopTimelineContentKind::Markdown,
+                outcome: pioneer_client::timeline::diagnostics::DesktopTimelineOutcome::Ok,
+                elapsed: started.elapsed(),
+                input_bytes: None,
+                block_count: Some(document.nodes.len()),
+                row_count: None,
+            },
+        );
+        MarkdownDocumentSurface { content: element }.into_any_element()
+    }
+
+    fn markdown_block_spacing(
+        previous: Option<&MarkdownBlock>,
+        current: &MarkdownBlock,
+        index: usize,
+    ) -> Pixels {
+        if index == 0 {
+            return px(0.);
+        }
+
+        if matches!(previous, Some(MarkdownBlock::Rule)) || matches!(current, MarkdownBlock::Rule) {
+            return px(20.);
+        }
+
+        if matches!(current, MarkdownBlock::Heading { .. }) {
+            return px(20.);
+        }
+
+        px(8.)
+    }
+
+    fn render_markdown_block(
+        &self,
+        node: &MarkdownNode,
+        code_highlight_policy: CodeHighlightPolicy,
+        document_id: &str,
+        cx: &mut App,
+    ) -> AnyElement {
+        let interaction_id = markdown_node_interaction_id(document_id, node.id);
+        match &node.block {
+            MarkdownBlock::Paragraph(inline) => self.render_markdown_inline(
+                inline,
+                MarkdownTextVariant::Paragraph,
+                interaction_id,
+                cx,
+            ),
+            MarkdownBlock::Heading { level, content } => self.render_markdown_inline(
+                content,
+                MarkdownTextVariant::Heading(*level),
+                interaction_id,
+                cx,
+            ),
+            MarkdownBlock::List(list) => self.render_markdown_list(
+                list,
+                &node.children,
+                code_highlight_policy,
+                document_id,
+                cx,
+            ),
+            MarkdownBlock::Quote { .. } => {
+                self.render_markdown_quote(&node.children, code_highlight_policy, document_id, cx)
+            }
+            MarkdownBlock::Code { language, text } => self.render_markdown_code_block(
+                language.as_deref(),
+                text.as_str(),
+                code_highlight_policy,
+                interaction_id,
+                cx,
+            ),
+            MarkdownBlock::Table(table) => self.render_markdown_table(table, interaction_id, cx),
+            MarkdownBlock::Rule => div()
+                .w_full()
+                .h(px(1.))
+                .bg(cx.theme().border)
+                .opacity(0.8)
+                .into_any_element(),
+        }
+    }
+
+    fn render_markdown_table(
+        &self,
+        table: &MarkdownTable,
+        interaction_id: u64,
+        cx: &mut App,
+    ) -> AnyElement {
+        let empty = MarkdownInline::default();
+        let cell_content =
+            |row_ix: usize, column_ix: usize, inline: &MarkdownInline, cx: &mut App| {
+                let id = markdown_node_interaction_id(
+                    &format!("table:{interaction_id}:{row_ix}"),
+                    column_ix as u64,
+                );
+                self.render_markdown_inline(
+                    inline,
+                    MarkdownTextVariant::TableCell(
+                        table
+                            .alignments
+                            .get(column_ix)
+                            .copied()
+                            .unwrap_or(MarkdownTableAlignment::None),
+                    ),
+                    id,
+                    cx,
+                )
+            };
+        let mut header = TableRow::new();
+        for (column_ix, inline) in table.headers.iter().enumerate() {
+            header = header.child(
+                TableHead::new()
+                    .w_48()
+                    .min_w_48()
+                    .flex_grow_1()
+                    .flex_shrink_0()
+                    .font_semibold()
+                    .child(cell_content(0, column_ix, inline, cx)),
+            );
+        }
+        let mut body = TableBody::new();
+        for (row_ix, row) in table.rows.iter().enumerate() {
+            let mut rendered_row = TableRow::new();
+            // GFM uses the header's column count, filling missing cells and ignoring extras.
+            for column_ix in 0..table.headers.len() {
+                rendered_row = rendered_row.child(
+                    TableCell::new()
+                        .w_48()
+                        .min_w_48()
+                        .flex_grow_1()
+                        .flex_shrink_0()
+                        .child(cell_content(
+                            row_ix + 1,
+                            column_ix,
+                            row.get(column_ix).unwrap_or(&empty),
+                            cx,
+                        )),
+                );
+            }
+            body = body.child(rendered_row);
+        }
+        // The same rem-based minimum and cell geometry apply to every row.
+        div()
+            .w_full()
+            .h_auto()
+            .min_w_0()
+            .child(
+                Table::new()
+                    .small()
+                    .min_w(rems(12. * table.headers.len() as f32))
+                    .child(TableHeader::new().child(header))
+                    .child(body),
+            )
+            .overflow_x_scrollbar()
+            .id(("timeline-markdown-table", interaction_id))
+            .into_any_element()
+    }
+
+    fn render_markdown_inline(
+        &self,
+        inline: &MarkdownInline,
+        variant: MarkdownTextVariant,
+        interaction_id: u64,
+        cx: &mut App,
+    ) -> AnyElement {
+        let base = div().w_full().overflow_hidden().whitespace_normal();
+        let base = match variant {
+            MarkdownTextVariant::TableCell(alignment) => base
+                .flex()
+                .flex_col()
+                .text_left()
+                .when(alignment == MarkdownTableAlignment::Center, |this| {
+                    this.text_center()
+                })
+                .when(alignment == MarkdownTableAlignment::Right, |this| {
+                    this.text_right()
+                }),
+            _ => base,
+        };
+        let links = normalized_markdown_links(inline.text.as_str(), &inline.marks);
+        let base = if links.is_empty() {
+            base.child(self.styled_markdown_inline_text(inline.text.as_str(), &inline.marks, cx))
+        } else {
+            let presentation =
+                markdown_inline_with_link_icons(inline.text.as_str(), &inline.marks, links);
+            let styled_text = self.styled_markdown_inline_text(
+                presentation.text.as_str(),
+                &presentation.marks,
+                cx,
+            );
+            let text_layout = styled_text.layout().clone();
+            let ranges = presentation
+                .links
+                .iter()
+                .map(|link| link.range.clone())
+                .collect();
+            let targets: Vec<_> = presentation
+                .links
+                .iter()
+                .map(|link| MarkdownClickTarget::from_url(link.url.clone()))
+                .collect();
+            let icons = presentation
+                .icon_offsets
+                .iter()
+                .copied()
+                .zip(targets.iter())
+                .map(|(offset, target)| MarkdownLinkIcon {
+                    offset,
+                    path: target.icon_path(),
+                })
+                .collect();
+            let selected_file_opener = self.active_thread_file_opener(cx);
+            let owner = self.actions.owner.clone();
+            let element_id: ElementId = ("timeline-markdown-inline", interaction_id).into();
+            let on_click = move |range_index: usize, _: &mut Window, cx: &mut App| {
+                let Some(target) = targets.get(range_index) else {
+                    return;
+                };
+                let result = owner.update(cx, |view, _| match target {
+                    MarkdownClickTarget::Web(url) => view.open_external_link(url.as_ref()),
+                    MarkdownClickTarget::LocalFile(target) => {
+                        view.open_local_file(&selected_file_opener, target)
+                    }
+                });
+                let Ok(result) = result else {
+                    return;
+                };
+                if let Err(error) = result {
+                    tracing::warn!(
+                        error = %format!("{error:#}"),
+                        "failed to open timeline markdown link"
+                    );
+                }
+            };
+            let text = if matches!(variant, MarkdownTextVariant::TableCell(_)) {
+                MarkdownLinkTextContent::Table {
+                    text: styled_text,
+                    ranges,
+                    on_click: Some(Box::new(on_click)),
+                }
+            } else {
+                MarkdownLinkTextContent::Interactive(
+                    InteractiveText::new(element_id.clone(), styled_text)
+                        .on_click(ranges, on_click),
+                )
+            };
+            base.child(MarkdownLinkText {
+                id: element_id,
+                text,
+                text_layout,
+                icons,
+                icon_color: cx.theme().link,
+                accessible_text: SharedString::new(Arc::<str>::from(inline.text.as_str())),
+            })
+        };
+        let styled = match variant {
+            MarkdownTextVariant::Paragraph | MarkdownTextVariant::TableCell(_) => {
+                base.text_sm().line_height(relative(1.65))
+            }
+            MarkdownTextVariant::Heading(level) => match level {
+                1 => base.text_2xl().font_bold().line_height(relative(1.2)),
+                2 => base.text_xl().font_bold().line_height(relative(1.25)),
+                3 => base.text_lg().font_semibold().line_height(relative(1.3)),
+                4 => base.text_base().font_semibold().line_height(relative(1.35)),
+                _ => base.text_sm().font_semibold().line_height(relative(1.45)),
+            },
+        };
+
+        styled.into_any_element()
+    }
+
+    fn styled_markdown_inline_text(
+        &self,
+        text: &str,
+        marks: &[MarkdownMark],
+        cx: &mut App,
+    ) -> StyledText {
+        let shared_text = if text.is_empty() {
+            SharedString::new_static(" ")
+        } else {
+            SharedString::new(Arc::<str>::from(text))
+        };
+        let highlights =
+            normalized_markdown_highlights(text, marks, |mark| self.markdown_highlight(mark, cx));
+
+        if highlights.is_empty() {
+            StyledText::new(shared_text)
+        } else {
+            StyledText::new(shared_text).with_highlights(highlights)
+        }
+    }
+
+    fn markdown_highlight(&self, mark: &MarkdownMark, cx: &mut App) -> HighlightStyle {
+        match &mark.kind {
+            MarkdownMarkKind::Bold => HighlightStyle {
+                font_weight: Some(FontWeight::SEMIBOLD),
+                ..Default::default()
+            },
+            MarkdownMarkKind::Italic => HighlightStyle {
+                font_style: Some(FontStyle::Italic),
+                ..Default::default()
+            },
+            MarkdownMarkKind::Strike => HighlightStyle {
+                strikethrough: Some(StrikethroughStyle {
+                    thickness: px(1.),
+                    color: Some(cx.theme().muted_foreground),
+                }),
+                ..Default::default()
+            },
+            MarkdownMarkKind::Code => HighlightStyle {
+                background_color: Some(cx.theme().muted.opacity(0.85)),
+                ..Default::default()
+            },
+            MarkdownMarkKind::Link { url: _ } => HighlightStyle {
+                color: Some(cx.theme().link),
+                font_weight: Some(FontWeight::MEDIUM),
+                ..Default::default()
+            },
+        }
+    }
+
+    fn render_markdown_list(
+        &self,
+        list: &MarkdownList,
+        nodes: &[MarkdownNode],
+        code_highlight_policy: CodeHighlightPolicy,
+        document_id: &str,
+        cx: &mut App,
+    ) -> AnyElement {
+        let mut rows = v_flex().w_full().overflow_hidden().gap_1();
+        let mut nodes = nodes.iter();
+        for (index, item) in list.items.iter().enumerate() {
+            let prefix = if let Some(checked) = item.checked {
+                if checked {
+                    "[x]".to_owned()
+                } else {
+                    "[ ]".to_owned()
+                }
+            } else if list.ordered {
+                format!("{}.", list.start.saturating_add(index))
+            } else {
+                "•".to_owned()
+            };
+
+            let mut content = v_flex().w_full().gap_2();
+            for _ in &item.blocks {
+                let node = nodes.next().expect("Client list block identity");
+                content = content.child(self.render_markdown_block(
+                    node,
+                    code_highlight_policy,
+                    document_id,
+                    cx,
+                ));
+            }
+
+            rows = rows.child(
+                h_flex()
+                    .w_full()
+                    .items_start()
+                    .gap_2()
+                    .overflow_hidden()
+                    .child(
+                        div()
+                            .ml_4()
+                            .flex_none()
+                            .text_sm()
+                            .opacity(0.75)
+                            .line_height(relative(1.65))
+                            .child(prefix),
+                    )
+                    .child(div().w_full().flex_1().overflow_hidden().child(content)),
+            );
+        }
+        rows.into_any_element()
+    }
+
+    fn render_markdown_quote(
+        &self,
+        blocks: &[MarkdownNode],
+        code_highlight_policy: CodeHighlightPolicy,
+        document_id: &str,
+        cx: &mut App,
+    ) -> AnyElement {
+        let mut content = v_flex().w_full().gap_2();
+        for block in blocks {
+            content = content.child(self.render_markdown_block(
+                block,
+                code_highlight_policy,
+                document_id,
+                cx,
+            ));
+        }
+
+        div()
+            .w_full()
+            .overflow_hidden()
+            .bg(cx.theme().muted.opacity(0.5))
+            .rounded_2xl()
+            .p_3()
+            .child(content)
+            .into_any_element()
+    }
+
+    fn render_markdown_code_block(
+        &self,
+        language: Option<&str>,
+        text: &str,
+        code_highlight_policy: CodeHighlightPolicy,
+        interaction_id: u64,
+        cx: &mut App,
+    ) -> AnyElement {
+        pioneer_client::timeline::diagnostics::record_qualification_diagnostic!(record_timeline(
+            pioneer_client::timeline::diagnostics::TimelineStage::MarkdownCodeBlockProjection,
+            pioneer_client::timeline::diagnostics::DiagnosticAction::Executed,
+            1,
+        ));
+        let language_label = sanitized_language_label(language);
+        let clipboard_id = SharedString::from(format!("copy-code-block:{interaction_id}"));
+        let header = h_flex()
+            .w_full()
+            .h(px(20.))
+            .items_center()
+            .justify_between()
+            .child(
+                div()
+                    .text_xs()
+                    .opacity(0.6)
+                    .line_height(relative(1.1))
+                    .when_some(language_label, |this, language| this.child(language)),
+            )
+            .child(
+                div()
+                    .opacity(0.6)
+                    .child(Clipboard::new(clipboard_id).value(text.to_owned())),
+            );
+        let mut body = v_flex().w_full().gap_2().child(header);
+        let styled_code = match code_highlight_policy {
+            CodeHighlightPolicy::Disabled => {
+                StyledText::new(SharedString::new(Arc::<str>::from(text))).into_any_element()
+            }
+            CodeHighlightPolicy::FinalMessage => {
+                self.render_code_highlighted_text(interaction_id, text)
+            }
+        };
+        body = body.child(
+            div()
+                .w_full()
+                .min_h(px(20.))
+                .overflow_hidden()
+                // In GPUI `WhiteSpace::Normal` controls soft wrapping; it does not rewrite the
+                // `StyledText` source. This keeps newlines/tabs copyable while avoiding nested
+                // horizontal-scroll arbitration inside the virtualized timeline.
+                .whitespace_normal()
+                .text_sm()
+                .line_height(relative(1.45))
+                .font_family("monospace")
+                .child(styled_code),
+        );
+
+        div()
+            .w_full()
+            .overflow_hidden()
+            .bg(cx.theme().muted.opacity(0.75))
+            .rounded_2xl()
+            .p_3()
+            .child(body)
+            .into_any_element()
+    }
+}
+
+fn sanitized_language_label(language: Option<&str>) -> Option<String> {
+    let token = language?
+        .trim_matches(|character: char| character.is_ascii_whitespace())
+        .split_ascii_whitespace()
+        .next()?;
+    if token.is_empty() {
+        return None;
+    }
+    let mut end = token.len().min(64);
+    while !token.is_char_boundary(end) {
+        end -= 1;
+    }
+    let label: String = token[..end]
+        .chars()
+        .filter(|character| !character.is_control())
+        .collect();
+    (!label.is_empty()).then_some(label)
+}
+
+fn normalize_mark_range(text: &str, mark: &MarkdownMark) -> (usize, usize) {
+    use pioneer_client::timeline::markdown::markdown_byte_boundary;
+    (
+        markdown_byte_boundary(text, mark.start, false),
+        markdown_byte_boundary(text, mark.end, true),
+    )
+}
+
+pub(super) fn markdown_node_interaction_id(document: &str, node: u64) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    document.hash(&mut hasher);
+    node.hash(&mut hasher);
+    hasher.finish()
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct MarkdownLink {
+    range: Range<usize>,
+    url: Arc<str>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MarkdownClickTarget {
+    Web(Arc<str>),
+    LocalFile(LocalFileTarget),
+}
+
+impl MarkdownClickTarget {
+    fn from_url(url: Arc<str>) -> Self {
+        if let Some(target) = local_file_target(url.as_ref()) {
+            Self::LocalFile(target)
+        } else {
+            Self::Web(url)
+        }
+    }
+
+    fn icon_path(&self) -> SharedString {
+        match self {
+            Self::Web(_) => PioneerIconName::Globe.path(),
+            Self::LocalFile(_) => IconName::File.path(),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct MarkdownInlineWithLinkIcons {
+    text: String,
+    marks: Vec<MarkdownMark>,
+    links: Vec<MarkdownLink>,
+    icon_offsets: Vec<usize>,
+}
+
+fn normalized_markdown_links(text: &str, marks: &[MarkdownMark]) -> Vec<MarkdownLink> {
+    let mut links: Vec<_> = marks
+        .iter()
+        .filter_map(|mark| {
+            let MarkdownMarkKind::Link { url } = &mark.kind else {
+                return None;
+            };
+            let (start, end) = normalize_mark_range(text, mark);
+            (start < end).then(|| MarkdownLink {
+                range: start..end,
+                url: Arc::from(url.as_str()),
+            })
+        })
+        .collect();
+    links.sort_by_key(|link| (link.range.start, link.range.end));
+
+    let mut previous_end = 0;
+    links.retain(|link| {
+        if link.range.start < previous_end {
+            return false;
+        }
+        previous_end = link.range.end;
+        true
+    });
+    links
+}
+
+fn markdown_inline_with_link_icons(
+    text: &str,
+    marks: &[MarkdownMark],
+    links: Vec<MarkdownLink>,
+) -> MarkdownInlineWithLinkIcons {
+    let link_starts: Vec<_> = links.iter().map(|link| link.range.start).collect();
+    let mut rendered_text = String::with_capacity(
+        text.len()
+            + links
+                .len()
+                .saturating_mul(MARKDOWN_LINK_ICON_PLACEHOLDER.len()),
+    );
+    let mut cursor = 0;
+    let mut icon_offsets = Vec::with_capacity(links.len());
+    for link in &links {
+        rendered_text.push_str(&text[cursor..link.range.start]);
+        icon_offsets.push(rendered_text.len());
+        rendered_text.push_str(MARKDOWN_LINK_ICON_PLACEHOLDER);
+        cursor = link.range.start;
+    }
+    rendered_text.push_str(&text[cursor..]);
+
+    let rendered_marks = marks
+        .iter()
+        .filter_map(|mark| {
+            let (start, end) = normalize_mark_range(text, mark);
+            (start < end).then(|| MarkdownMark {
+                start: markdown_index_after_link_icons(start, &link_starts),
+                end: markdown_range_end_after_link_icons(end, &link_starts),
+                kind: mark.kind.clone(),
+            })
+        })
+        .collect();
+    let rendered_links = links
+        .into_iter()
+        .map(|link| {
+            let text_start = markdown_index_after_link_icons(link.range.start, &link_starts);
+            MarkdownLink {
+                range: text_start.saturating_sub(MARKDOWN_LINK_ICON_PLACEHOLDER.len())
+                    ..markdown_range_end_after_link_icons(link.range.end, &link_starts),
+                url: link.url,
+            }
+        })
+        .collect();
+
+    MarkdownInlineWithLinkIcons {
+        text: rendered_text,
+        marks: rendered_marks,
+        links: rendered_links,
+        icon_offsets,
+    }
+}
+
+fn markdown_index_after_link_icons(index: usize, link_starts: &[usize]) -> usize {
+    index
+        + link_starts
+            .partition_point(|link_start| *link_start <= index)
+            .saturating_mul(MARKDOWN_LINK_ICON_PLACEHOLDER.len())
+}
+
+fn markdown_range_end_after_link_icons(index: usize, link_starts: &[usize]) -> usize {
+    index
+        + link_starts
+            .partition_point(|link_start| *link_start < index)
+            .saturating_mul(MARKDOWN_LINK_ICON_PLACEHOLDER.len())
+}
+
+fn normalized_markdown_highlights(
+    text: &str,
+    marks: &[MarkdownMark],
+    mut highlight_for_mark: impl FnMut(&MarkdownMark) -> HighlightStyle,
+) -> Vec<(Range<usize>, HighlightStyle)> {
+    // GPUI StyledText expects sorted, non-overlapping highlight ranges.
+    // Markdown marks can overlap when styles are nested, such as bold italic text.
+    let highlights = marks.iter().filter_map(|mark| {
+        let (start, end) = normalize_mark_range(text, mark);
+        (start < end).then(|| (start..end, highlight_for_mark(mark)))
+    });
+
+    combine_highlights(
+        std::iter::empty::<(Range<usize>, HighlightStyle)>(),
+        highlights,
+    )
+    .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CodeHighlightPolicy;
+    use super::MARKDOWN_LINK_ICON_PLACEHOLDER;
+    use super::MarkdownClickTarget;
+    use super::MarkdownLink;
+    use super::markdown_inline_with_link_icons;
+    use super::normalized_markdown_links;
+    use super::sanitized_language_label;
+    use pioneer_client::conversation::TimelineEntryStatus;
+    use pioneer_client::timeline::types::MarkdownMark;
+    use pioneer_client::timeline::types::MarkdownMarkKind;
+    use std::sync::Arc;
+
+    #[test]
+    fn code_highlighting_is_limited_to_completed_timeline_items() {
+        assert_eq!(
+            CodeHighlightPolicy::for_timeline_status(TimelineEntryStatus::Completed),
+            CodeHighlightPolicy::FinalMessage
+        );
+        for status in [
+            TimelineEntryStatus::Running,
+            TimelineEntryStatus::Failed,
+            TimelineEntryStatus::Cancelled,
+            TimelineEntryStatus::Blocked,
+        ] {
+            assert_eq!(
+                CodeHighlightPolicy::for_timeline_status(status),
+                CodeHighlightPolicy::Disabled
+            );
+        }
+    }
+
+    #[test]
+    fn code_highlight_language_label_is_single_token_control_free_and_byte_bounded() {
+        assert_eq!(
+            sanitized_language_label(Some("  rust metadata\nignored")),
+            Some("rust".to_owned())
+        );
+        assert_eq!(sanitized_language_label(Some("\n\t")), None);
+        assert!(
+            sanitized_language_label(Some(&"x".repeat(80)))
+                .unwrap()
+                .len()
+                <= 64
+        );
+        assert!(
+            sanitized_language_label(Some(&"界".repeat(30)))
+                .unwrap()
+                .len()
+                <= 64
+        );
+    }
+
+    #[test]
+    fn markdown_links_keep_urls_and_normalize_clickable_ranges() {
+        let text = "go to café now";
+        let marks = vec![
+            MarkdownMark {
+                start: 6,
+                end: 10,
+                kind: MarkdownMarkKind::Link {
+                    url: "https://example.com/cafe".to_owned(),
+                },
+            },
+            MarkdownMark {
+                start: 0,
+                end: 2,
+                kind: MarkdownMarkKind::Bold,
+            },
+            MarkdownMark {
+                start: text.len(),
+                end: text.len() + 10,
+                kind: MarkdownMarkKind::Link {
+                    url: "https://example.com/empty".to_owned(),
+                },
+            },
+        ];
+
+        assert_eq!(
+            normalized_markdown_links(text, &marks),
+            vec![MarkdownLink {
+                range: 6..11,
+                url: Arc::from("https://example.com/cafe"),
+            }]
+        );
+    }
+
+    #[test]
+    fn markdown_links_do_not_create_overlapping_click_targets() {
+        let marks = vec![
+            MarkdownMark {
+                start: 0,
+                end: 5,
+                kind: MarkdownMarkKind::Link {
+                    url: "https://example.com/first".to_owned(),
+                },
+            },
+            MarkdownMark {
+                start: 3,
+                end: 8,
+                kind: MarkdownMarkKind::Link {
+                    url: "https://example.com/second".to_owned(),
+                },
+            },
+        ];
+
+        let links = normalized_markdown_links("overlaps", &marks);
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].url.as_ref(), "https://example.com/first");
+    }
+
+    #[test]
+    fn markdown_link_icons_precede_links_and_shift_marks_and_click_targets() {
+        let text = "one and two";
+        let marks = vec![
+            MarkdownMark {
+                start: 0,
+                end: 3,
+                kind: MarkdownMarkKind::Link {
+                    url: "https://example.com/one".to_owned(),
+                },
+            },
+            MarkdownMark {
+                start: 8,
+                end: 11,
+                kind: MarkdownMarkKind::Link {
+                    url: "https://example.com/two".to_owned(),
+                },
+            },
+        ];
+        let links = normalized_markdown_links(text, &marks);
+
+        let presentation = markdown_inline_with_link_icons(text, &marks, links);
+
+        assert_eq!(
+            presentation.text,
+            format!("{MARKDOWN_LINK_ICON_PLACEHOLDER}one and {MARKDOWN_LINK_ICON_PLACEHOLDER}two")
+        );
+        assert_eq!(presentation.icon_offsets, vec![0, 14]);
+        assert_eq!(presentation.marks[0].start..presentation.marks[0].end, 6..9);
+        assert_eq!(
+            presentation.marks[1].start..presentation.marks[1].end,
+            20..23
+        );
+        assert_eq!(presentation.links[0].range, 0..9);
+        assert_eq!(presentation.links[1].range, 14..23);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn markdown_click_targets_distinguish_local_files_from_web_urls() {
+        assert!(matches!(
+            MarkdownClickTarget::from_url(Arc::from("/tmp/example.rs:4:2")),
+            MarkdownClickTarget::LocalFile(_)
+        ));
+        assert_eq!(
+            MarkdownClickTarget::from_url(Arc::from("https://example.com")),
+            MarkdownClickTarget::Web(Arc::from("https://example.com"))
+        );
+    }
+}
+
+impl crate::screen::TimelineView {
+    pub(super) fn prepare_markdown_highlights(
+        &self,
+        document: &MarkdownPresentation,
+        cx: &mut Context<Self>,
+    ) {
+        for node in document.code_blocks() {
+            if let MarkdownBlock::Code { language, text } = &node.block {
+                self.prepare_code_highlight(
+                    markdown_node_interaction_id(&document.document_id, node.id),
+                    node.revision,
+                    text,
+                    language.as_deref(),
+                    cx,
+                );
+            }
+        }
+    }
+}

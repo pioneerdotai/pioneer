@@ -42,6 +42,8 @@ pub struct Model {
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
     pub completed_at: Option<DateTimeWithTimeZone>,
+    #[sea_orm(has_many)]
+    pub compaction_task_outputs: HasMany<super::compaction_task_output::Entity>,
     #[sea_orm(has_one)]
     pub task_event_fanout_cursor: HasOne<super::task_event_fanout_cursor::Entity>,
     #[sea_orm(has_one)]

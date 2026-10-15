@@ -647,9 +647,15 @@ struct TodoInfo {
 
 struct IncrementalMaintenanceArgs {
     end_limit: Instant,
-    target_db_load: f32,
     time_limit: f64,
 }
+/// Legacy SQL maintenance entry point retained for sqlite-zstd compatibility.
+///
+/// Pioneer Gateway does not call this function: its maintenance reads bounded
+/// rows, compresses outside SQLite, and commits with a short CAS transaction.
+/// Keep this path free of deliberate sleeps and post-update whole-table scans
+/// so an external compatibility caller cannot make an already long statement
+/// even worse while holding a SQLite connection.
 pub fn zstd_incremental_maintenance<'a>(ctx: &Context) -> Result<ToSqlOutput<'a>, anyhow::Error> {
     let args = {
         let arg_time_limit_seconds = 0;
@@ -658,7 +664,7 @@ pub fn zstd_incremental_maintenance<'a>(ctx: &Context) -> Result<ToSqlOutput<'a>
             .get(arg_time_limit_seconds)
             .context("could not get time limit argument")?;
         let time_limit = time_limit.unwrap_or(100000000.0);
-        let target_db_load: f32 = ctx
+        let _target_db_load: f32 = ctx
             .get(arg_target_db_load)
             .context("could not get target db load argument")?;
         if !(0.0..=1e100).contains(&time_limit) {
@@ -667,7 +673,6 @@ pub fn zstd_incremental_maintenance<'a>(ctx: &Context) -> Result<ToSqlOutput<'a>
         let end_limit = Instant::now() + Duration::from_secs_f64(time_limit);
         IncrementalMaintenanceArgs {
             end_limit,
-            target_db_load,
             time_limit,
         }
     };
@@ -820,7 +825,6 @@ fn maintenance_for_todo(
         chunk_size
     );
     loop {
-        let update_start = Instant::now();
         let q = &format!(
             "update {tbl} set {datacol} = zstd_compress_col({datacol}, :lvl, :dict, :compact), {dictcol} = :dict where rowid in (select rowid from {tbl} where {dictcol} is null and :dictchoice = ({chooser}) limit :chunksize)",
             tbl = esc_names.compressed_tablename,
@@ -847,44 +851,18 @@ fn maintenance_for_todo(
         if Instant::now() > args.end_limit {
             break;
         }
-        let elapsed = update_start.elapsed();
-        if elapsed.div_f32(args.target_db_load) > elapsed {
-            let sleep_duration = elapsed.div_f32(args.target_db_load) - elapsed;
-            if sleep_duration > Duration::from_millis(1) {
-                log::debug!(
-                    "Sleeping {}s to keep write load at {}",
-                    sleep_duration.as_secs_f32(),
-                    args.target_db_load
-                );
-                std::thread::sleep(sleep_duration);
-            }
-        }
 
         if updated == 0 {
             break;
         }
     }
 
-    let (total_size_after, total_count_after): (i64, i64) = db.query_row(
-        &format!(
-            "select sum(length({datacol})), count(*) from {tbl} where {dictcol} = ?",
-            tbl = esc_names.compressed_tablename,
-            datacol = esc_names.data_colname,
-            dictcol = esc_names.dict_colname
-        ),
-        params![dict_id],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    )?;
     if dict_is_new {
         log::info!(
-            "Compressed {} rows with dict_choice={} (dict_id={}). Total size of entries before: {}, afterwards: {}, (average: before={}, after={})",
+            "Compressed {} rows with new dict_choice={} (dict_id={}); bounded Gateway maintenance reports batch-local sizes separately",
             total_updated,
             dict_choice,
             dict_id,
-            pretty_bytes(todo.total_bytes),
-            pretty_bytes(total_size_after),
-            pretty_bytes(avg_sample_bytes),
-            pretty_bytes(total_size_after / total_count_after),
         );
     }
     Ok(total_updated)
@@ -975,7 +953,8 @@ mod tests {
     use super::add_functions::tests::create_example_db;
     use super::*;
     use pretty_assertions::assert_eq;
-    use rand::prelude::IndexedRandom;
+    use rand::prelude::{IndexedRandom, SeedableRng};
+    use rand::{Rng, RngExt};
     use rusqlite::params;
     use rusqlite::types::ValueRef;
     use rusqlite::{Connection, Row};
@@ -1106,13 +1085,16 @@ mod tests {
         Ok(())
     }
 
-    fn get_rand_id(db: &Connection) -> anyhow::Result<i64> {
+    fn get_seeded_id(db: &Connection, rng: &mut impl Rng) -> anyhow::Result<i64> {
+        let count: i64 =
+            db.query_row("select count(*) from events", params![], |row| row.get(0))?;
+        let offset = rng.random_range(0..count);
         db.query_row(
-            "select id from events order by random() limit 1",
-            params![],
+            "select id from events order by id limit 1 offset ?",
+            params![offset],
             |r| r.get(0),
         )
-        .context("Could not get random id")
+        .context("Could not get seeded id")
     }
 
     fn insert(db: &Connection, _id: i64, _id2: i64) -> anyhow::Result<()> {
@@ -1221,63 +1203,64 @@ mod tests {
     #[test]
     fn test_many() -> anyhow::Result<()> {
         type Executor = dyn Fn(&Connection, i64, i64) -> anyhow::Result<()>;
-        let posses: Vec<&Executor> = vec![
-            &insert,
-            &update_comp_col,
-            &update_other_col,
-            &update_other_two_col,
-            &update_comp_col_and_other_two_col,
-            &update_two_rows,
-            &update_two_rows_by_compressed,
-            &delete_one,
-            &delete_where_other,
+        let operations: Vec<(&str, &Executor)> = vec![
+            ("insert", &insert),
+            ("update_comp_col", &update_comp_col),
+            ("update_other_col", &update_other_col),
+            ("update_other_two_col", &update_other_two_col),
+            (
+                "update_comp_col_and_other_two_col",
+                &update_comp_col_and_other_two_col,
+            ),
+            ("update_two_rows", &update_two_rows),
+            (
+                "update_two_rows_by_compressed",
+                &update_two_rows_by_compressed,
+            ),
+            ("delete_one", &delete_one),
+            ("delete_where_other", &delete_where_other),
         ];
 
-        let mut posses2 = vec![];
-        for _ in 0..100 {
-            posses2.push(*posses.choose(&mut rand::rng()).unwrap());
-        }
-        for compress_first in [false, true] {
-            for operations in &[&posses2] {
-                if compress_first {
-                    let (db1, db2) =
-                        get_two_dbs(Some(123)).context("Could not create databases")?;
-                    if compress_first {
-                        let done: i64 = db2.query_row(
-                            "select zstd_incremental_maintenance(9999999, 1)",
-                            params![],
-                            |r| r.get(0),
-                        )?;
+        for seed in [0, 1, 0x5eed, u64::MAX] {
+            let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+            let (db1, db2) = get_two_dbs(Some(123)).context("Could not create databases")?;
+            let done: i64 = db2.query_row(
+                "select zstd_incremental_maintenance(9999999, 1)",
+                params![],
+                |r| r.get(0),
+            )?;
 
-                        assert_eq!(done, 0);
+            assert_eq!(done, 0);
 
-                        let uncompressed_count: i64 = db2
-                            .query_row(
-                                "select count(*) from _events_zstd where _data_dict is null",
-                                params![],
-                                |r| r.get(0),
-                            )
-                            .context("Could not query uncompressed count")?;
-                        assert_eq!(uncompressed_count, 0);
-                    }
+            let uncompressed_count: i64 = db2
+                .query_row(
+                    "select count(*) from _events_zstd where _data_dict is null",
+                    params![],
+                    |r| r.get(0),
+                )
+                .context("Could not query uncompressed count")?;
+            assert_eq!(uncompressed_count, 0);
 
-                    for operation in *operations {
-                        let id = get_rand_id(&db1)?;
-                        // Apply the same logical operation to both databases.
-                        // Choosing ids independently made the comparison itself
-                        // nondeterministic (especially for delete/update paths)
-                        // and could report compression corruption even when the
-                        // two implementations produced identical results.
-                        let id2 = get_rand_id(&db1)?;
-                        operation(&db1, id, id2)
-                            .context("Could not run operation on uncompressed db")?;
-                        operation(&db2, id, id2)
-                            .context("Could not run operation on compressed db")?;
-                    }
-
-                    check_table_rows_same(&db1, &db2)?;
-                }
+            for step in 0..100 {
+                let &(operation_name, operation) = operations
+                    .choose(&mut rng)
+                    .expect("operation corpus is non-empty");
+                let id = get_seeded_id(&db1, &mut rng)?;
+                let id2 = get_seeded_id(&db1, &mut rng)?;
+                operation(&db1, id, id2).with_context(|| {
+                    format!(
+                        "Could not run operation on uncompressed db: seed={seed}, step={step}, operation={operation_name}"
+                    )
+                })?;
+                operation(&db2, id, id2).with_context(|| {
+                    format!(
+                        "Could not run operation on compressed db: seed={seed}, step={step}, operation={operation_name}"
+                    )
+                })?;
             }
+
+            check_table_rows_same(&db1, &db2)
+                .with_context(|| format!("database mismatch after seed={seed}"))?;
         }
 
         Ok(())
@@ -1309,8 +1292,9 @@ mod tests {
             .context("Could not query uncompressed count")?;
         assert_eq!(uncompressed_count, 0);
 
-        let id = get_rand_id(&db1)?;
-        let id2 = get_rand_id(&db2)?;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(456);
+        let id = get_seeded_id(&db1, &mut rng)?;
+        let id2 = get_seeded_id(&db1, &mut rng)?;
         insert_both_columns(&db1, id, id2).context("Could not run operation on uncompressed db")?;
         insert_both_columns(&db2, id, id2).context("Could not run operation on compressed db")?;
 

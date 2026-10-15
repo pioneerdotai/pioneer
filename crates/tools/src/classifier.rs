@@ -87,18 +87,15 @@ impl ErrorClassifier for DefaultErrorClassifier {
             );
         }
 
-        if invocation.tool_name == "write_file"
-            && !success
-            && let Some(outcome) = classify_write_file_result(raw_output_json)
-        {
-            return outcome;
+        if invocation.tool_name == "apply_patch" {
+            return classify_apply_patch_result(raw_output_json, success);
         }
 
-        if invocation.tool_name == "edit_file"
-            && !success
-            && let Some(outcome) = classify_edit_file_result(raw_output_json)
-        {
-            return outcome;
+        // A bounded directory page is a successful discovery result. The
+        // truncated/has_more fields tell the model to narrow or continue;
+        // they must not turn a valid list_dir call into a failed tool attempt.
+        if invocation.tool_name == "list_dir" && success {
+            return ToolOutcome::ok();
         }
 
         if is_mcp_invocation(invocation) {
@@ -125,6 +122,10 @@ impl ErrorClassifier for DefaultErrorClassifier {
     }
 
     fn classify_error(&self, invocation: &ToolInvocation, error: &ToolError) -> ToolOutcome {
+        if is_native_file_tool(invocation.tool_name.as_str()) {
+            return classify_native_file_tool_error(invocation.tool_name.as_str(), error);
+        }
+
         if error_is_permission_denied(error) {
             return permission_denied_outcome();
         }
@@ -139,12 +140,6 @@ impl ErrorClassifier for DefaultErrorClassifier {
 
         if is_web_tool(invocation.tool_name.as_str()) {
             return classify_web_error(error);
-        }
-
-        if invocation.tool_name == "write_file"
-            && let Some(outcome) = classify_write_file_error(error)
-        {
-            return outcome;
         }
 
         if is_mcp_invocation(invocation) {
@@ -191,98 +186,172 @@ impl ErrorClassifier for DefaultErrorClassifier {
     }
 }
 
-fn classify_write_file_result(raw_output_json: &JsonValue) -> Option<ToolOutcome> {
-    let status = raw_output_json
-        .get("status")
-        .and_then(JsonValue::as_str)
-        .unwrap_or_default();
-    let error_class = raw_output_json
-        .get("errorClass")
-        .and_then(JsonValue::as_str)
-        .unwrap_or_default();
-
-    match (status, error_class) {
-        ("read_required", _) => Some(ToolOutcome::recoverable(
-            ToolErrorClass::InvalidArguments,
-            "write_file needs current file state before overwrite. Call read_file for the complete file, then retry write_file with updated content.",
-            false,
-            None,
-        )),
-        ("precondition_failed", _) | (_, "precondition_failed") => Some(ToolOutcome::recoverable(
-            ToolErrorClass::ExecutionFailed,
-            "The target changed before write_file could overwrite it. Call read_file again for the complete current file, then retry write_file with updated content.",
-            false,
-            None,
-        )),
-        _ => None,
-    }
+fn is_native_file_tool(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "read_file" | "list_dir" | "grep_files" | "apply_patch"
+    )
 }
 
-fn classify_edit_file_result(raw_output_json: &JsonValue) -> Option<ToolOutcome> {
-    let status = raw_output_json
-        .get("status")
-        .and_then(JsonValue::as_str)
-        .unwrap_or_default();
-    let error_class = raw_output_json
-        .get("errorClass")
-        .and_then(JsonValue::as_str)
-        .unwrap_or_default();
-
-    match (status, error_class) {
-        ("read_required", _) => Some(ToolOutcome::recoverable(
-            ToolErrorClass::InvalidArguments,
-            "edit_file needs current file state before editing. Call read_file for the complete file, then retry edit_file with exact old_string text copied without line-number prefixes.",
-            false,
-            None,
-        )),
-        ("precondition_failed", _) | (_, "precondition_failed") => Some(ToolOutcome::recoverable(
-            ToolErrorClass::ExecutionFailed,
-            "The target changed before edit_file could modify it. Call read_file again for the complete current file, then retry edit_file with updated exact old_string text.",
-            false,
-            None,
-        )),
-        ("not_found", _) => Some(ToolOutcome::recoverable(
-            ToolErrorClass::InvalidArguments,
-            "edit_file could not find old_string. Call read_file again, copy the exact current file text without line-number prefixes, and retry with a corrected old_string.",
-            false,
-            None,
-        )),
-        ("ambiguous_match", _) => Some(ToolOutcome::recoverable(
-            ToolErrorClass::InvalidArguments,
-            "edit_file old_string matched multiple locations. Retry with more surrounding context for a unique match, or set replace_all=true only if every exact occurrence should change.",
-            false,
-            None,
-        )),
-        ("not_utf8", _) => Some(ToolOutcome::fatal(
-            ToolErrorClass::InvalidArguments,
-            Some("edit_file only supports UTF-8 text files. Use an appropriate binary-safe workflow instead of retrying edit_file with the same target.".to_owned()),
-        )),
-        ("no_change", _) => Some(ToolOutcome::fatal(
-            ToolErrorClass::InvalidArguments,
-            Some("edit_file computed no content change. Do not retry the same edit_file arguments; inspect the current file and choose a different edit only if needed.".to_owned()),
-        )),
-        _ => None,
-    }
-}
-
-fn classify_write_file_error(error: &ToolError) -> Option<ToolOutcome> {
-    let ToolError::InvalidArguments(message) = error else {
-        return None;
-    };
-
-    if message.contains("missing field `path`")
-        || message.contains("missing field `content`")
-        || message.contains("unknown field")
+fn classify_native_file_tool_error(tool_name: &str, error: &ToolError) -> ToolOutcome {
+    if let ToolError::ExecutionFailed(message) = error
+        && message_indicates_permission_denied(message)
     {
-        return Some(ToolOutcome::recoverable(
-            ToolErrorClass::InvalidArguments,
-            "Call write_file with canonical JSON fields `path` and `content`. Use write_stdin only for an existing exec_command session, not for file creation.",
-            false,
-            None,
-        ));
+        return ToolOutcome::fatal(
+            ToolErrorClass::PermissionDenied,
+            Some(format!(
+                "{tool_name} was denied by the filesystem: {message} Do not retry the same denied path; use an authorized path or report the blocker."
+            )),
+        );
     }
 
-    None
+    match error {
+        ToolError::InvalidArguments(message) => ToolOutcome::recoverable(
+            ToolErrorClass::InvalidArguments,
+            format!(
+                "{tool_name} rejected the input: {message} Follow that diagnostic and submit corrected arguments; do not repeat the same call unchanged."
+            ),
+            false,
+            None,
+        ),
+        ToolError::NotFound(message) => ToolOutcome::recoverable(
+            ToolErrorClass::NotFound,
+            format!(
+                "{tool_name} could not find the requested path: {message} Use list_dir on the nearest existing parent and retry with an exact returned path."
+            ),
+            false,
+            None,
+        ),
+        ToolError::Rejected(message) => ToolOutcome::fatal(
+            ToolErrorClass::PermissionDenied,
+            Some(format!(
+                "{tool_name} was rejected: {message} Use only the current working directory and authorized roots reported by the tool; do not repeat the denied call unchanged."
+            )),
+        ),
+        ToolError::ExecutionFailed(message) => ToolOutcome::recoverable(
+            ToolErrorClass::ExecutionFailed,
+            format!(
+                "{tool_name} failed: {message} Fix the reported filesystem condition or path, then submit a corrected call."
+            ),
+            false,
+            None,
+        ),
+        ToolError::Cancelled(message) => ToolOutcome::recoverable(
+            ToolErrorClass::Cancelled,
+            format!(
+                "{tool_name} was cancelled: {message} Retry only if the operation is still needed."
+            ),
+            false,
+            None,
+        ),
+        ToolError::NotVisible(message) => ToolOutcome::recoverable(
+            ToolErrorClass::ToolNotVisible,
+            format!("{tool_name} is not visible: {message} Use a currently visible tool."),
+            false,
+            None,
+        ),
+        ToolError::Internal(message) => ToolOutcome::fatal(
+            ToolErrorClass::Internal,
+            Some(format!(
+                "{tool_name} failed internally: {message} Do not retry the same call; report the blocker."
+            )),
+        ),
+    }
+}
+
+fn classify_apply_patch_result(raw_output_json: &JsonValue, success: bool) -> ToolOutcome {
+    if success {
+        return ToolOutcome::ok();
+    }
+
+    let status = raw_output_json
+        .get("status")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("failed");
+    let error = raw_output_json.get("error");
+    let code = error
+        .and_then(|error| error.get("code"))
+        .and_then(JsonValue::as_str)
+        .unwrap_or("unknown");
+    let next_action = error
+        .and_then(|error| error.get("next_action"))
+        .and_then(JsonValue::as_str)
+        .filter(|action| !action.trim().is_empty())
+        .unwrap_or(
+            "Inspect the reported failure, read the affected path if necessary, and submit a corrected new patch. Do not repeat the same patch unchanged.",
+        )
+        .to_owned();
+
+    if let Some(validation) = raw_output_json.get("validation") {
+        let syntax_complete = validation
+            .get("syntax_complete")
+            .and_then(JsonValue::as_bool)
+            .unwrap_or(false);
+        let reason = (!syntax_complete).then(|| {
+            let from_line = validation
+                .get("unchecked_from_line")
+                .and_then(JsonValue::as_u64)
+                .map(|line| format!("scan stopped at patch line {line}"));
+            let skipped = validation
+                .get("unverified_ranges")
+                .and_then(JsonValue::as_array)
+                .and_then(|ranges| ranges.first())
+                .and_then(|range| range.get("start"))
+                .and_then(JsonValue::as_u64)
+                .map(|line| {
+                    format!("operation body starting at patch line {line} was not checked")
+                });
+            let detail = from_line
+                .or(skipped)
+                .unwrap_or_else(|| "some patch lines were not checked".to_owned());
+            format!(
+                "apply_patch syntax validation incomplete: {detail}; later stages were not checked"
+            )
+        });
+        return ToolOutcome::recoverable(
+            ToolErrorClass::InvalidArguments,
+            next_action,
+            !syntax_complete,
+            reason,
+        );
+    }
+
+    if matches!(status, "partial" | "commit_state_uncertain") {
+        return ToolOutcome {
+            status: ToolOutcomeStatus::PartialSuccess,
+            error_class: Some(ToolErrorClass::ExecutionFailed),
+            should_retry: false,
+            retry_hint: Some(next_action),
+            incomplete: true,
+            incomplete_reason: Some(format!("apply_patch finished with status `{status}`")),
+        };
+    }
+
+    if code == "permission_denied" {
+        return ToolOutcome::fatal(ToolErrorClass::PermissionDenied, Some(next_action));
+    }
+
+    let class = if matches!(
+        code,
+        "patch_syntax_error"
+            | "patch_empty"
+            | "invalid_payload"
+            | "invalid_request"
+            | "invalid_path"
+            | "path_outside_allowed_root"
+            | "unauthorized_path"
+            | "context_not_found"
+            | "ambiguous_context"
+            | "source_missing"
+            | "destination_exists"
+            | "destination_missing"
+            | "stale_file"
+    ) {
+        ToolErrorClass::InvalidArguments
+    } else {
+        ToolErrorClass::ExecutionFailed
+    };
+    ToolOutcome::recoverable(class, next_action, false, None)
 }
 
 pub fn classify_tool_error(tool_name: &str, error: &ToolError) -> ToolOutcome {
@@ -301,6 +370,7 @@ pub fn classify_tool_error(tool_name: &str, error: &ToolError) -> ToolOutcome {
         recovery: crate::spec::ToolRecoveryMetadata::default(),
         permission_metadata: crate::spec::ToolPermissionMetadata::default(),
         execution_security_snapshot: None,
+        apply_patch_preflight: None,
         cancellation: tokio_util::sync::CancellationToken::new(),
     };
     classifier.classify_error(&invocation, error)
@@ -1086,6 +1156,7 @@ mod tests {
             recovery: crate::spec::ToolRecoveryMetadata::default(),
             permission_metadata: crate::spec::ToolPermissionMetadata::default(),
             execution_security_snapshot: None,
+            apply_patch_preflight: None,
             cancellation: tokio_util::sync::CancellationToken::new(),
         }
     }
@@ -1105,44 +1176,7 @@ mod tests {
             recovery: crate::spec::ToolRecoveryMetadata::default(),
             permission_metadata: crate::spec::ToolPermissionMetadata::default(),
             execution_security_snapshot: None,
-            cancellation: tokio_util::sync::CancellationToken::new(),
-        }
-    }
-
-    fn write_file_invocation() -> ToolInvocation {
-        ToolInvocation {
-            call_id: "call".to_owned(),
-            tool_name: "write_file".to_owned(),
-            source: crate::context::ToolCallSource::Model,
-            payload: crate::context::ToolPayload::Function {
-                arguments: serde_json::json!({}),
-            },
-            workdir: std::path::PathBuf::from("."),
-            environment: Default::default(),
-            attempt_id: 1,
-            idempotency_key: None,
-            recovery: crate::spec::ToolRecoveryMetadata::default(),
-            permission_metadata: crate::spec::ToolPermissionMetadata::default(),
-            execution_security_snapshot: None,
-            cancellation: tokio_util::sync::CancellationToken::new(),
-        }
-    }
-
-    fn edit_file_invocation() -> ToolInvocation {
-        ToolInvocation {
-            call_id: "call".to_owned(),
-            tool_name: "edit_file".to_owned(),
-            source: crate::context::ToolCallSource::Model,
-            payload: crate::context::ToolPayload::Function {
-                arguments: serde_json::json!({}),
-            },
-            workdir: std::path::PathBuf::from("."),
-            environment: Default::default(),
-            attempt_id: 1,
-            idempotency_key: None,
-            recovery: crate::spec::ToolRecoveryMetadata::default(),
-            permission_metadata: crate::spec::ToolPermissionMetadata::default(),
-            execution_security_snapshot: None,
+            apply_patch_preflight: None,
             cancellation: tokio_util::sync::CancellationToken::new(),
         }
     }
@@ -1164,6 +1198,7 @@ mod tests {
             recovery: crate::spec::ToolRecoveryMetadata::default(),
             permission_metadata: crate::spec::ToolPermissionMetadata::default(),
             execution_security_snapshot: None,
+            apply_patch_preflight: None,
             cancellation: tokio_util::sync::CancellationToken::new(),
         };
         let outcome = classifier.classify_result(
@@ -1177,184 +1212,6 @@ mod tests {
 
         assert_eq!(outcome.error_class, Some(ToolErrorClass::NeedsNarrowing));
         assert!(outcome.should_retry);
-    }
-
-    #[test]
-    fn write_file_read_required_result_points_to_complete_read_then_retry() {
-        let classifier = DefaultErrorClassifier;
-        let invocation = write_file_invocation();
-        let outcome = classifier.classify_result(
-            &invocation,
-            &serde_json::json!({
-                "ok": false,
-                "status": "read_required",
-                "errorClass": "invalid_arguments"
-            }),
-            false,
-        );
-
-        assert_eq!(outcome.status, ToolOutcomeStatus::RecoverableError);
-        assert_eq!(outcome.error_class, Some(ToolErrorClass::InvalidArguments));
-        assert!(outcome.should_retry);
-        let hint = outcome.retry_hint.expect("retry hint should exist");
-        assert!(hint.contains("read_file for the complete file"));
-        assert!(hint.contains("retry write_file"));
-    }
-
-    #[test]
-    fn write_file_precondition_failed_result_points_to_fresh_read() {
-        let classifier = DefaultErrorClassifier;
-        let invocation = write_file_invocation();
-        let outcome = classifier.classify_result(
-            &invocation,
-            &serde_json::json!({
-                "ok": false,
-                "status": "precondition_failed",
-                "errorClass": "precondition_failed"
-            }),
-            false,
-        );
-
-        assert_eq!(outcome.status, ToolOutcomeStatus::RecoverableError);
-        assert_eq!(outcome.error_class, Some(ToolErrorClass::ExecutionFailed));
-        assert!(outcome.should_retry);
-        let hint = outcome.retry_hint.expect("retry hint should exist");
-        assert!(hint.contains("Call read_file again"));
-        assert!(hint.contains("retry write_file"));
-    }
-
-    #[test]
-    fn write_file_malformed_arguments_get_write_specific_hint() {
-        let classifier = DefaultErrorClassifier;
-        let invocation = write_file_invocation();
-        let outcome = classifier.classify_error(
-            &invocation,
-            &ToolError::invalid_arguments("invalid arguments: missing field `content`"),
-        );
-
-        assert_eq!(outcome.status, ToolOutcomeStatus::RecoverableError);
-        assert_eq!(outcome.error_class, Some(ToolErrorClass::InvalidArguments));
-        let hint = outcome.retry_hint.expect("retry hint should exist");
-        assert!(hint.contains("`path` and `content`"));
-        assert!(hint.contains("write_stdin only"));
-    }
-
-    #[test]
-    fn edit_file_read_required_result_points_to_complete_read_then_retry() {
-        let classifier = DefaultErrorClassifier;
-        let invocation = edit_file_invocation();
-        let outcome = classifier.classify_result(
-            &invocation,
-            &serde_json::json!({
-                "ok": false,
-                "status": "read_required",
-                "errorClass": "invalid_arguments"
-            }),
-            false,
-        );
-
-        assert_eq!(outcome.status, ToolOutcomeStatus::RecoverableError);
-        assert_eq!(outcome.error_class, Some(ToolErrorClass::InvalidArguments));
-        assert!(outcome.should_retry);
-        let hint = outcome.retry_hint.expect("retry hint should exist");
-        assert!(hint.contains("read_file for the complete file"));
-        assert!(hint.contains("retry edit_file"));
-        assert!(hint.contains("without line-number prefixes"));
-    }
-
-    #[test]
-    fn edit_file_precondition_failed_result_points_to_fresh_read() {
-        let classifier = DefaultErrorClassifier;
-        let invocation = edit_file_invocation();
-        let outcome = classifier.classify_result(
-            &invocation,
-            &serde_json::json!({
-                "ok": false,
-                "status": "precondition_failed",
-                "errorClass": "precondition_failed"
-            }),
-            false,
-        );
-
-        assert_eq!(outcome.status, ToolOutcomeStatus::RecoverableError);
-        assert_eq!(outcome.error_class, Some(ToolErrorClass::ExecutionFailed));
-        assert!(outcome.should_retry);
-        let hint = outcome.retry_hint.expect("retry hint should exist");
-        assert!(hint.contains("Call read_file again"));
-        assert!(hint.contains("retry edit_file"));
-    }
-
-    #[test]
-    fn edit_file_not_found_result_points_to_exact_current_text() {
-        let classifier = DefaultErrorClassifier;
-        let invocation = edit_file_invocation();
-        let outcome = classifier.classify_result(
-            &invocation,
-            &serde_json::json!({
-                "ok": false,
-                "status": "not_found",
-                "errorClass": "invalid_arguments"
-            }),
-            false,
-        );
-
-        assert_eq!(outcome.status, ToolOutcomeStatus::RecoverableError);
-        assert_eq!(outcome.error_class, Some(ToolErrorClass::InvalidArguments));
-        assert!(outcome.should_retry);
-        let hint = outcome.retry_hint.expect("retry hint should exist");
-        assert!(hint.contains("could not find old_string"));
-        assert!(hint.contains("copy the exact current file text"));
-        assert!(hint.contains("without line-number prefixes"));
-    }
-
-    #[test]
-    fn edit_file_ambiguous_match_result_points_to_unique_context_or_replace_all() {
-        let classifier = DefaultErrorClassifier;
-        let invocation = edit_file_invocation();
-        let outcome = classifier.classify_result(
-            &invocation,
-            &serde_json::json!({
-                "ok": false,
-                "status": "ambiguous_match",
-                "errorClass": "invalid_arguments",
-                "matches": 2
-            }),
-            false,
-        );
-
-        assert_eq!(outcome.status, ToolOutcomeStatus::RecoverableError);
-        assert_eq!(outcome.error_class, Some(ToolErrorClass::InvalidArguments));
-        assert!(outcome.should_retry);
-        let hint = outcome.retry_hint.expect("retry hint should exist");
-        assert!(hint.contains("more surrounding context"));
-        assert!(hint.contains("replace_all=true"));
-    }
-
-    #[test]
-    fn edit_file_terminal_statuses_do_not_retry_same_arguments() {
-        let classifier = DefaultErrorClassifier;
-        let invocation = edit_file_invocation();
-
-        for (status, expected_hint) in [
-            ("not_utf8", "only supports UTF-8"),
-            ("no_change", "Do not retry the same edit_file arguments"),
-        ] {
-            let outcome = classifier.classify_result(
-                &invocation,
-                &serde_json::json!({
-                    "ok": false,
-                    "status": status,
-                    "errorClass": "invalid_arguments"
-                }),
-                false,
-            );
-
-            assert_eq!(outcome.status, ToolOutcomeStatus::FatalError);
-            assert_eq!(outcome.error_class, Some(ToolErrorClass::InvalidArguments));
-            assert!(!outcome.should_retry);
-            let hint = outcome.retry_hint.expect("retry hint should exist");
-            assert!(hint.contains(expected_hint));
-        }
     }
 
     #[test]
@@ -1387,6 +1244,7 @@ mod tests {
             recovery: crate::spec::ToolRecoveryMetadata::default(),
             permission_metadata: crate::spec::ToolPermissionMetadata::default(),
             execution_security_snapshot: None,
+            apply_patch_preflight: None,
             cancellation: tokio_util::sync::CancellationToken::new(),
         };
         let outcome = classifier.classify_result(&invocation, &serde_json::json!(payload), true);
@@ -1448,6 +1306,129 @@ mod tests {
         assert_eq!(outcome.status, ToolOutcomeStatus::FatalError);
         assert_eq!(outcome.error_class, Some(ToolErrorClass::PermissionDenied));
         assert!(!outcome.should_retry);
+    }
+
+    #[test]
+    fn bounded_list_dir_page_is_success_even_when_more_entries_exist() {
+        let outcome = DefaultErrorClassifier.classify_result(
+            &invocation_for("list_dir"),
+            &serde_json::json!({
+                "root": "/workspace",
+                "truncated": true,
+                "has_more": true,
+                "entries": []
+            }),
+            true,
+        );
+
+        assert_eq!(outcome.status, ToolOutcomeStatus::Ok);
+        assert!(!outcome.should_retry);
+        assert!(!outcome.incomplete);
+    }
+
+    #[test]
+    fn apply_patch_retry_uses_the_concrete_next_action() {
+        let outcome = DefaultErrorClassifier.classify_result(
+            &invocation_for("apply_patch"),
+            &serde_json::json!({
+                "status": "rejected",
+                "success": false,
+                "error": {
+                    "code": "context_not_found",
+                    "next_action": "Read `/workspace/file.txt` and build a new hunk from its current contents.",
+                    "retry_same_patch": false
+                }
+            }),
+            false,
+        );
+
+        assert_eq!(outcome.status, ToolOutcomeStatus::RecoverableError);
+        assert_eq!(outcome.error_class, Some(ToolErrorClass::InvalidArguments));
+        assert_eq!(
+            outcome.retry_hint.as_deref(),
+            Some("Read `/workspace/file.txt` and build a new hunk from its current contents.")
+        );
+        assert!(outcome.should_retry);
+    }
+
+    #[test]
+    fn apply_patch_validation_completeness_is_distinct_from_display_truncation() {
+        let complete = DefaultErrorClassifier.classify_result(
+            &invocation_for("apply_patch"),
+            &serde_json::json!({
+                "status": "rejected", "error": {"code": "patch_syntax_error", "next_action": "Fix lines 3-4."},
+                "validation": {"stage": "syntax", "syntax_complete": true, "display_truncated": true}
+            }), false,
+        );
+        assert_eq!(complete.status, ToolOutcomeStatus::RecoverableError);
+        assert!(!complete.incomplete);
+        assert_eq!(complete.retry_hint.as_deref(), Some("Fix lines 3-4."));
+
+        let stopped = DefaultErrorClassifier.classify_result(
+            &invocation_for("apply_patch"),
+            &serde_json::json!({
+                "status": "rejected", "error": {"code": "patch_syntax_error", "next_action": "Fix the boundary."},
+                "validation": {"stage": "syntax", "syntax_complete": false, "unchecked_from_line": 4}
+            }), false,
+        );
+        assert!(stopped.incomplete);
+        assert!(stopped.incomplete_reason.unwrap().contains("line 4"));
+
+        let skipped = DefaultErrorClassifier.classify_result(
+            &invocation_for("apply_patch"),
+            &serde_json::json!({
+                "status": "rejected", "error": {"code": "invalid_path", "next_action": "Fix the path."},
+                "validation": {"stage": "syntax", "syntax_complete": false,
+                    "unverified_ranges": [{"start": 3, "end": 3}]}
+            }), false,
+        );
+        assert!(skipped.incomplete);
+        assert!(skipped.incomplete_reason.unwrap().contains("line 3"));
+    }
+
+    #[test]
+    fn partial_apply_patch_never_schedules_an_automatic_retry() {
+        let outcome = DefaultErrorClassifier.classify_result(
+            &invocation_for("apply_patch"),
+            &serde_json::json!({
+                "status": "partial",
+                "success": false,
+                "changed_files": ["/workspace/committed.txt"],
+                "error": {
+                    "code": "partial_commit",
+                    "next_action": "Inspect changed_files before making only the remaining changes.",
+                    "retry_same_patch": false
+                }
+            }),
+            false,
+        );
+
+        assert_eq!(outcome.status, ToolOutcomeStatus::PartialSuccess);
+        assert!(!outcome.should_retry);
+        assert!(outcome.incomplete);
+        assert_eq!(
+            outcome.retry_hint.as_deref(),
+            Some("Inspect changed_files before making only the remaining changes.")
+        );
+    }
+
+    #[test]
+    fn native_file_tool_errors_preserve_the_actionable_diagnostic() {
+        let outcome = DefaultErrorClassifier.classify_error(
+            &invocation_for("read_file"),
+            &ToolError::InvalidArguments(
+                "input `Downloads/file.txt` resolved to `/Downloads/file.txt`; cwd is `/Users/alexander`"
+                    .to_owned(),
+            ),
+        );
+
+        assert_eq!(outcome.error_class, Some(ToolErrorClass::InvalidArguments));
+        assert!(outcome.should_retry);
+        let hint = outcome.retry_hint.unwrap();
+        assert!(hint.contains("Downloads/file.txt"));
+        assert!(hint.contains("/Downloads/file.txt"));
+        assert!(hint.contains("/Users/alexander"));
+        assert!(hint.contains("do not repeat"));
     }
 
     #[test]

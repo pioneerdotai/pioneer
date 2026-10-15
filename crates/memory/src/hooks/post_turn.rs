@@ -14,6 +14,7 @@ pub(super) fn memory_post_turn_extractor_context_from_turn(
     context: &MemoryTurnContext,
     model: Option<String>,
     model_provider: Option<String>,
+    durable_terminal_effect: Option<MemoryDurableTerminalEffectClaim>,
 ) -> MemoryPostTurnExtractorContext {
     MemoryPostTurnExtractorContext {
         workspace_id: context.workspace_id.clone(),
@@ -22,6 +23,47 @@ pub(super) fn memory_post_turn_extractor_context_from_turn(
         mode: context.mode,
         model,
         model_provider,
+        durable_terminal_effect,
+    }
+}
+
+pub(super) fn memory_durable_terminal_effect_claim(
+    context: &pioneer_hooks::HookContext,
+) -> HookResult<Option<MemoryDurableTerminalEffectClaim>> {
+    let effect_key = HookMetadataKey::new("native_terminal_effect_id")
+        .expect("static terminal-effect metadata key is valid");
+    let claim_key = HookMetadataKey::new("native_terminal_effect_claim_token")
+        .expect("static terminal-effect metadata key is valid");
+    let effect_id = match context.metadata.get(&effect_key) {
+        Some(HookValue::Text(value)) if !value.trim().is_empty() => Some(value.trim()),
+        Some(_) => {
+            return Err(memory_hook_error(
+                "memory.post_turn_extractor.invalid_terminal_effect",
+                "memory post-turn extractor received an invalid terminal-effect identity",
+            ));
+        }
+        None => None,
+    };
+    let claim_token = match context.metadata.get(&claim_key) {
+        Some(HookValue::Text(value)) if !value.trim().is_empty() => Some(value.trim()),
+        Some(_) => {
+            return Err(memory_hook_error(
+                "memory.post_turn_extractor.invalid_terminal_effect_claim",
+                "memory post-turn extractor received an invalid terminal-effect claim",
+            ));
+        }
+        None => None,
+    };
+    match (effect_id, claim_token) {
+        (None, None) => Ok(None),
+        (Some(effect_id), Some(claim_token)) => Ok(Some(MemoryDurableTerminalEffectClaim {
+            effect_id: effect_id.to_owned(),
+            claim_token: claim_token.to_owned(),
+        })),
+        _ => Err(memory_hook_error(
+            "memory.post_turn_extractor.incomplete_terminal_effect_claim",
+            "memory post-turn extractor requires a complete terminal-effect claim",
+        )),
     }
 }
 
@@ -153,6 +195,7 @@ pub(super) struct MemoryPostTurnParsedFacts {
 
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct MemoryPostTurnExtractedFact {
+    pub(super) target_memory_id: Option<String>,
     pub(super) semantic: MemorySemanticFields,
     pub(super) ontology_proposal: Option<MemoryExtractorOntologyProposal>,
     pub(super) content: String,
@@ -170,6 +213,8 @@ pub(super) struct MemoryPostTurnExtractorJson {
 
 #[derive(Debug, Deserialize)]
 pub(super) struct MemoryPostTurnExtractedFactJson {
+    #[serde(default)]
+    target_memory_id: Option<String>,
     semantic: MemorySemanticFields,
     #[serde(default)]
     ontology: Option<Value>,
@@ -187,12 +232,72 @@ pub(super) struct MemoryPostTurnExtractedFactJson {
     evidence: MemoryWriteEvidence,
 }
 
+/// Safe parse diagnostics: never retain serde's message, which may quote response values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryPostTurnResponseFormatError {
+    pub category: MemoryPostTurnResponseFormatCategory,
+    pub line: usize,
+    pub column: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryPostTurnResponseFormatCategory {
+    Syntax,
+    Structure,
+    Eof,
+    Io,
+}
+
+impl MemoryPostTurnResponseFormatCategory {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Syntax => "syntax",
+            Self::Structure => "structure",
+            Self::Eof => "eof",
+            Self::Io => "io",
+        }
+    }
+}
+
+impl fmt::Display for MemoryPostTurnResponseFormatError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "category={} line={} column={}",
+            self.category.as_str(),
+            self.line,
+            self.column
+        )
+    }
+}
+
+fn decode_memory_post_turn_response(
+    raw: &str,
+) -> Result<MemoryPostTurnExtractorJson, MemoryPostTurnResponseFormatError> {
+    serde_json::from_str(raw.trim()).map_err(|error| MemoryPostTurnResponseFormatError {
+        category: match error.classify() {
+            serde_json::error::Category::Syntax => MemoryPostTurnResponseFormatCategory::Syntax,
+            serde_json::error::Category::Data => MemoryPostTurnResponseFormatCategory::Structure,
+            serde_json::error::Category::Eof => MemoryPostTurnResponseFormatCategory::Eof,
+            serde_json::error::Category::Io => MemoryPostTurnResponseFormatCategory::Io,
+        },
+        line: error.line(),
+        column: error.column(),
+    })
+}
+
+/// Uses exactly the handler's typed schema; candidate policy remains a later step.
+pub fn validate_memory_post_turn_response_format(
+    raw: &str,
+) -> Result<(), MemoryPostTurnResponseFormatError> {
+    decode_memory_post_turn_response(raw).map(|_| ())
+}
+
 pub(super) fn parse_memory_post_turn_extractor_json(
     raw: &str,
     config: &MemoryPostTurnExtractorConfig,
-) -> Result<MemoryPostTurnParsedFacts, String> {
-    let parsed = serde_json::from_str::<MemoryPostTurnExtractorJson>(raw.trim())
-        .map_err(|error| error.to_string())?;
+) -> Result<MemoryPostTurnParsedFacts, MemoryPostTurnResponseFormatError> {
+    let parsed = decode_memory_post_turn_response(raw)?;
     let raw_fact_count = parsed.facts.len();
     let mut validation_rejected_count = 0;
     let mut diagnostics = Vec::new();
@@ -283,6 +388,7 @@ pub(super) fn validate_memory_post_turn_fact(
         return Err("transient_or_session_only");
     }
     let semantic = normalized_post_turn_fact_semantic(fact.semantic);
+    crate::write::validate_memory_semantic_identity(&semantic)?;
     let Some(content) = bounded_nonempty_text(fact.content.as_str(), config.max_fact_content_chars)
     else {
         return Err("empty_content");
@@ -306,6 +412,7 @@ pub(super) fn validate_memory_post_turn_fact(
     let confidence = Some(computed_post_turn_fact_confidence(&semantic));
     let importance = Some(computed_post_turn_fact_importance(&semantic));
     Ok(MemoryPostTurnExtractedFact {
+        target_memory_id: fact.target_memory_id,
         semantic,
         ontology_proposal,
         content,
@@ -613,6 +720,7 @@ pub(super) fn memory_semantic_write_params_from_extracted_fact(
         source_context_kind: Some(source_context_kind),
         disposition: Some(MemorySemanticWriteDisposition::RouteToCandidatePolicy),
         client_provided_key: None,
+        target_memory_id: fact.target_memory_id,
         confidence: fact.confidence,
         importance: fact.importance,
         metadata,

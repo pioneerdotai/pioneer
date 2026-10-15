@@ -1,8 +1,14 @@
+mod admission;
+pub(crate) mod attribution;
 mod connection;
 pub(crate) mod maintenance;
 pub(crate) mod startup;
 mod zstd_column;
 
+#[cfg(test)]
+pub(crate) use zstd_column::compress_history_payloads_for_test;
+
+pub(crate) use admission::{read_observer, write_observer};
 #[cfg(test)]
 pub(crate) use connection::initialize;
 pub(crate) use connection::{

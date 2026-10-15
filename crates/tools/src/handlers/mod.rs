@@ -2,6 +2,7 @@
 mod computer_use;
 
 pub(crate) mod apply_patch;
+mod fff_grep;
 mod files;
 mod http;
 mod mcp;
@@ -14,8 +15,7 @@ mod web;
 pub use computer_use::{ComputerUseHandler, materialize_computer_use_domain_bundle};
 
 pub use apply_patch::ApplyPatchHandler;
-pub(crate) use files::FileObservationStore;
-pub use files::{EditFileHandler, GrepHandler, ListDirHandler, ReadFileHandler, WriteFileHandler};
+pub use files::{GrepHandler, ListDirHandler, ReadFileHandler};
 pub use mcp::{
     ExcludedMcpRuntimeTool, McpDynamicToolAnnotations, McpDynamicToolBinding,
     McpDynamicToolDescriptor, McpRuntimeToolMaterialization, McpToolCallOutput, McpToolCallRequest,
@@ -28,4 +28,5 @@ pub use skill::{
     SkillReadToolConfig, SkillReadToolEntry, SkillRuntimeToolMaterialization,
     SkillRuntimeToolPolicyDiagnostic, materialize_skill_runtime_tools,
 };
+pub(crate) use web::resolve_download_destination;
 pub use web::{DownloadUrlHandler, WebFetchHandler, WebSearchHandler};

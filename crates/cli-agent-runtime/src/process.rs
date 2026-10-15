@@ -191,6 +191,7 @@ impl CLIAgentProcessSpawnConfig {
         self
     }
 
+    /// Zero drains stderr without retaining payloads (isolated service calls).
     pub fn with_stderr_ring_lines(mut self, stderr_ring_lines: usize) -> Self {
         self.stderr_ring_lines = stderr_ring_lines;
         self
@@ -341,10 +342,20 @@ impl CLIAgentProcess {
     }
 
     async fn wait_for_stderr(&mut self) -> Result<()> {
-        if let Some(reader) = self.stderr_reader.take() {
+        if let Some(reader) = self.stderr_reader.as_mut() {
             reader.await.context("failed to drain CLI process stderr")?;
+            self.stderr_reader.take();
         }
         Ok(())
+    }
+
+    /// Abort only this owned service process and its stderr reader when its
+    /// owner is dropped before the normal terminate-and-join path completes.
+    pub fn abort_service(&mut self) {
+        let _ = self.child.start_kill();
+        if let Some(reader) = &self.stderr_reader {
+            reader.abort();
+        }
     }
 }
 
@@ -455,6 +466,9 @@ pub fn spawn_cli_agent_process(config: &CLIAgentProcessSpawnConfig) -> Result<CL
 pub fn spawn_prepared_cli_agent_process(
     prepared: &PreparedCLIAgentCommand,
 ) -> Result<CLIAgentProcess> {
+    let _startup_stage = pioneer_observability::turn_startup::current_stage(
+        pioneer_observability::turn_startup::Stage::CliSpawn,
+    );
     let mut command = Command::new(prepared.executable.as_str());
     scrub_inherited_cli_environment(&mut command);
     command.args(prepared.args.iter().map(String::as_str));
@@ -490,10 +504,15 @@ pub fn spawn_prepared_cli_agent_process(
         prepared.stderr_redactions.clone(),
         prepared.process_generation,
     );
-    let stderr_reader = child
-        .stderr()
-        .take()
-        .map(|stderr_pipe| stderr.spawn_reader_tracked(stderr_pipe));
+    let stderr_reader = child.stderr().take().map(|mut stderr_pipe| {
+        if prepared.stderr_ring_lines == 0 {
+            tokio::spawn(async move {
+                let _ = tokio::io::copy(&mut stderr_pipe, &mut tokio::io::sink()).await;
+            })
+        } else {
+            stderr.spawn_reader_tracked(stderr_pipe)
+        }
+    });
 
     Ok(CLIAgentProcess {
         child,

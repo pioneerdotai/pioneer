@@ -10,3 +10,13 @@ pub mod session;
 pub mod start;
 pub mod title;
 pub mod tree;
+
+pub mod registry;
+
+pub mod capabilities;
+
+pub mod members;
+
+pub mod message_deletion;
+
+pub mod message_revisions;

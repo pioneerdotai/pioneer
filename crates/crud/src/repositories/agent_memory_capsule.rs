@@ -102,6 +102,16 @@ pub async fn find_capsule_by_ref<C: ConnectionTrait>(
         .with_context(|| format!("failed to find memory capsule by ref `{capsule_ref}`"))
 }
 
+pub async fn find_capsule_by_id<C: ConnectionTrait>(
+    db: &C,
+    capsule_id: &str,
+) -> Result<Option<agent_memory_capsule::Model>> {
+    agent_memory_capsule::Entity::find_by_id(capsule_id.to_owned())
+        .one(db)
+        .await
+        .with_context(|| format!("failed to find memory capsule `{capsule_id}`"))
+}
+
 pub async fn mark_capsule_repair_status<C: ConnectionTrait>(
     db: &C,
     capsule_id: &str,

@@ -56,22 +56,29 @@ async fn frozen_source_is_revalidated_before_canonical_history_rendering() {
     let sources = store
         .list_self_improvement_source_turns_after("ws_history_a", 0, 0, 10)
         .await
-        .expect("workspace-visible source must be selected");
+        .expect("private source must be selected");
     let frozen = frozen_range("ws_history_a", 0, sources);
+    assert!(
+        !store
+            .list_canonical_turn_events_for_self_improvement(&frozen)
+            .await
+            .expect("private source history must hydrate")
+            .is_empty()
+    );
     database
         .execute_unprepared(
-            "UPDATE thread SET access_class = 'private' \
+            "UPDATE thread SET workspace_id = 'ws_history_b' \
              WHERE id = 'thread_revalidated_source'",
         )
         .await
-        .expect("source visibility must change");
+        .expect("source workspace must change");
     assert!(
         store
             .list_self_improvement_source_turns_after("ws_history_a", 0, 0, 10)
             .await
             .expect("source selection revalidation must succeed")
             .is_empty(),
-        "private source must be removed before pagination/history hydration"
+        "cross-workspace source must be removed before pagination/history hydration"
     );
     assert_eq!(
         store
@@ -85,9 +92,9 @@ async fn frozen_source_is_revalidated_before_canonical_history_rendering() {
     let error = store
         .list_canonical_turn_events_for_self_improvement(&frozen)
         .await
-        .expect_err("cached source must be rejected after visibility loss");
+        .expect_err("cached source must be rejected after workspace change");
     assert!(
-        error.to_string().contains("no longer workspace-visible"),
+        error.to_string().contains("belongs to workspace"),
         "unexpected source revalidation error: {error:#}"
     );
 }
@@ -207,7 +214,7 @@ async fn start(store: &CrudStore, thread: &Thread, turn: &Turn, text: &str) {
             .database_connection()
             .execute_unprepared(
                 format!(
-                    "UPDATE thread SET access_class = 'workspace' WHERE id = '{}'",
+                    "UPDATE thread SET access_class = 'private' WHERE id = '{}'",
                     thread.id
                 )
                 .as_str(),
@@ -349,13 +356,16 @@ async fn seed_failed_collaborative_context(
                 '{child_thread_id}', '{parent_thread_id}', '{parent_thread_id}', 1,
                 'task_run', '{parent_thread_id}', '{parent_turn_id}'
             );
-            INSERT INTO task_run_conversation_snapshot (
+            WITH frozen_root_fixture(
                 run_id, task_id, workspace_id, conversation_thread_id, source_turn_id,
                 history_json
-            ) VALUES (
+            ) AS (VALUES (
                 '{run_id}', '{task_id}', '{workspace_id}', '{parent_thread_id}',
                 '{parent_turn_id}', '[]'
-            );
+            )) INSERT INTO task_run_conversation_snapshot(
+                run_id, task_id, workspace_id, conversation_thread_id, source_turn_id,
+                history_json
+            ,frozen_manifest_id) SELECT run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,history_json,CASE WHEN json_valid(history_json) THEN CASE WHEN json_type(history_json)='object' THEN json_extract(history_json,'$.manifest_id') ELSE NULL END ELSE NULL END FROM frozen_root_fixture;
             INSERT INTO task_run_turn (
                 id, task_id, run_id, thread_id, turn_id, kind, round, sequence, status,
                 completed_at
@@ -1028,13 +1038,16 @@ async fn collaborative_canonical_history_contains_only_the_verified_causal_bundl
                 'thread_hist_child', '{parent_thread_id}', '{parent_thread_id}', 1,
                 'task_run', '{parent_thread_id}', 'run_hist_collab'
             );
-            INSERT INTO task_run_conversation_snapshot (
+            WITH frozen_root_fixture(
                 run_id, task_id, workspace_id, conversation_thread_id, source_turn_id,
                 history_json
-            ) VALUES (
+            ) AS (VALUES (
                 'run_hist_collab', 'task_hist_collab', 'ws_history_a',
                 '{parent_thread_id}', '{parent_turn_id}', '[]'
-            );
+            )) INSERT INTO task_run_conversation_snapshot(
+                run_id, task_id, workspace_id, conversation_thread_id, source_turn_id,
+                history_json
+            ,frozen_manifest_id) SELECT run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,history_json,CASE WHEN json_valid(history_json) THEN CASE WHEN json_type(history_json)='object' THEN json_extract(history_json,'$.manifest_id') ELSE NULL END ELSE NULL END FROM frozen_root_fixture;
             INSERT INTO task_run_turn (
                 id, task_id, run_id, thread_id, turn_id, kind, round, sequence, status,
                 completed_at

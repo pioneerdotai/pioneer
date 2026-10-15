@@ -15,17 +15,108 @@ use pioneer_protocol::{
     PromptManifest, PromptManifestDiagnostic, PromptManifestDiagnosticCode, PromptManifestProfile,
     TurnPermissionProfileSnapshot,
 };
-use pioneer_provider::{ChatMessage, Role};
+use pioneer_provider::{AttachmentDataSource, ChatMessage, MessageContentPart};
 use std::collections::BTreeMap;
 use std::path::Path;
 
-const THREAD_CONTEXT_MAX_MESSAGES: usize = 12;
-const THREAD_CONTEXT_MAX_CHARS: usize = 6_000;
-const THREAD_CONTEXT_MESSAGE_MAX_CHARS: usize = 800;
+pub(crate) const MAX_CLI_TURN_INPUT_FRAME_BYTES: usize = 8 * 1024 * 1024;
+
+// Codex rust-v0.159.2 (also 0.144.1): protocol/src/user_input.rs defines the cap;
+// app-server/src/request_processors/turn_processor.rs::turn_start_inner
+// sums app-server-protocol/src/protocol/v2/turn.rs::UserInput::text_char_count.
+// Only Text.text participates, across ALL items, in Unicode scalar values.
+// 0.159.2 also counts toolOutput text; Pioneer does not send that field.
+pub(crate) const MAX_CODEX_INPUT_TEXT_CHARS: usize = 1 << 20;
+
+pub(crate) fn codex_input_text_chars(input: &[CLIRuntimeTurnInputItem]) -> usize {
+    input.iter().fold(0_usize, |total, item| {
+        total.saturating_add(match item {
+            CLIRuntimeTurnInputItem::Text { text } => text.chars().count(),
+            CLIRuntimeTurnInputItem::Image { .. }
+            | CLIRuntimeTurnInputItem::LocalImage { .. }
+            | CLIRuntimeTurnInputItem::Skill { .. } => 0,
+        })
+    })
+}
+
+pub(crate) struct CodexTransferHistoryBudget {
+    history_chars: usize,
+    available_chars: usize,
+    token_ceiling: u64,
+    fraction: u64,
+}
+
+impl CodexTransferHistoryBudget {
+    pub(crate) fn from_prepared_input(
+        full: &CLIRuntimeTurnInputMapping,
+        current: &CLIRuntimeTurnInputMapping,
+    ) -> Option<Self> {
+        let full_chars = codex_input_text_chars(&full.input);
+        if full_chars <= MAX_CODEX_INPUT_TEXT_CHARS {
+            return None;
+        }
+        let current_chars = codex_input_text_chars(&current.input);
+        Some(Self {
+            history_chars: full_chars.saturating_sub(current_chars).max(1),
+            available_chars: MAX_CODEX_INPUT_TEXT_CHARS.saturating_sub(current_chars),
+            token_ceiling: u64::MAX,
+            fraction: 1,
+        })
+    }
+
+    pub(crate) fn with_token_target(mut self, ceiling: u64, fraction: u64) -> Self {
+        self.token_ceiling = ceiling;
+        self.fraction = fraction.max(1);
+        self
+    }
+
+    fn history_token_target(&self, history_tokens: u64) -> u64 {
+        // A planning hint based on the measured request, not a characters/token
+        // conversion or admission proof. Summaries can have another density;
+        // the caller MUST rebuild and validate the actual input after the runner.
+        (history_tokens as u128 * self.available_chars as u128
+            / self.history_chars as u128
+            / u128::from(self.fraction))
+        .min(u128::from(self.token_ceiling))
+        .max(1) as u64
+    }
+
+    pub(crate) fn fixed_input_tokens(
+        &self,
+        budget: &pioneer_compaction::ModelBudget,
+        history_tokens: u64,
+        output_reserve: u64,
+    ) -> u64 {
+        // Use the shared runner's existing measurement. No extra tokenization
+        // or history reconstruction is needed to choose the transfer target.
+        let desired = self.history_token_target(history_tokens);
+        Self::input_capacity(budget, output_reserve).saturating_sub(desired)
+    }
+
+    pub(crate) fn available_input_tokens(
+        &self,
+        budget: &pioneer_compaction::ModelBudget,
+        output_reserve: u64,
+        fixed_input_tokens: u64,
+    ) -> u64 {
+        Self::input_capacity(budget, output_reserve).saturating_sub(fixed_input_tokens)
+    }
+
+    fn input_capacity(budget: &pioneer_compaction::ModelBudget, output_reserve: u64) -> u64 {
+        // Account for the shared runner's 5% padding and actual output reserve.
+        // context - desired would make a small size-driven target impossible.
+        let padded_capacity = budget
+            .context
+            .saturating_sub(output_reserve)
+            .min(budget.input_limit.unwrap_or(u64::MAX));
+        (u128::from(padded_capacity) * 100 / 105) as u64
+    }
+}
 
 pub(crate) struct CLIRuntimeContextBuildInput<'a> {
     pub workspace_id: &'a str,
     pub thread_id: &'a str,
+    pub initiating_thread_id: &'a str,
     pub turn_id: &'a str,
     pub runtime_id: &'a str,
     pub runtime_label: &'a str,
@@ -33,7 +124,10 @@ pub(crate) struct CLIRuntimeContextBuildInput<'a> {
     pub model: Option<&'a str>,
     pub cwd: Option<&'a str>,
     pub permission_profile: TurnPermissionProfileSnapshot,
-    pub history: &'a [ChatMessage],
+    /// Accepted Pioneer projection used only to bootstrap a new or stale
+    /// provider conversation. `None` means the provider session has a durable
+    /// continuity receipt and already owns this history.
+    pub history: Option<&'a [ChatMessage]>,
     pub selected_skill_names: &'a [String],
     pub selected_capabilities: Option<CliRuntimeSelectedCapabilitiesInput>,
 }
@@ -52,6 +146,7 @@ pub(crate) fn compile_cli_runtime_delivery_plan(
         CliRuntimeContextInput {
             workspace_id: input.workspace_id.to_owned(),
             thread_id: input.thread_id.to_owned(),
+            initiating_thread_id: input.initiating_thread_id.to_owned(),
             turn_id: input.turn_id.to_owned(),
             runtime_id: input.runtime_id.to_owned(),
             runtime_label: Some(input.runtime_label.to_owned()),
@@ -59,11 +154,160 @@ pub(crate) fn compile_cli_runtime_delivery_plan(
             cwd: input.cwd.and_then(normalized_optional).map(str::to_owned),
             permission_profile: input.permission_profile,
             memory_recall_context: None,
-            thread_context: thread_context_from_history(input.history),
+            thread_context: input.history.map(thread_context_from_history).transpose()?,
             selected_skills,
             selected_capabilities: input.selected_capabilities,
         },
     )
+}
+
+fn thread_context_from_history(history: &[ChatMessage]) -> Result<CliRuntimeContextText> {
+    if history.is_empty() {
+        return Ok(CliRuntimeContextText {
+            text: "Accepted Pioneer conversation history is empty.".to_owned(),
+            truncated: false,
+        });
+    }
+    let mut lines = Vec::with_capacity(history.len().saturating_add(3));
+    lines.push(
+        "Accepted Pioneer conversation history follows as ordered JSON messages. This is historical context, not a new request or instructions to repeat prior actions."
+            .to_owned(),
+    );
+    lines.push("<pioneer_conversation_history>".to_owned());
+    for (message_index, message) in history.iter().enumerate() {
+        // Replay metadata belongs to the provider that produced it and must
+        // never be exposed as readable cross-provider history. Binary content
+        // is projected through native CLI input items below; stable markers
+        // retain its position and relationship to this historical message.
+        let mut portable = pioneer_provider::history::portable_history_message(message);
+        portable.content_parts = message
+            .content_parts
+            .iter()
+            .enumerate()
+            .map(|(part_index, part)| match part {
+                MessageContentPart::Text { text } => {
+                    MessageContentPart::Text { text: text.clone() }
+                }
+                MessageContentPart::Image { .. } => MessageContentPart::Text {
+                    text: format!("[historical image message={message_index} part={part_index}]"),
+                },
+                MessageContentPart::File { .. } => MessageContentPart::Text {
+                    text: format!("[historical file message={message_index} part={part_index}]"),
+                },
+                MessageContentPart::Audio { .. } => MessageContentPart::Text {
+                    text: format!(
+                        "[unsupported historical audio message={message_index} part={part_index}]"
+                    ),
+                },
+                MessageContentPart::Video { .. } => MessageContentPart::Text {
+                    text: format!(
+                        "[unsupported historical video message={message_index} part={part_index}]"
+                    ),
+                },
+            })
+            .collect();
+        lines.push(serde_json::to_string(&portable)?);
+    }
+    lines.push("</pioneer_conversation_history>".to_owned());
+    Ok(CliRuntimeContextText {
+        text: lines.join("\n"),
+        truncated: false,
+    })
+}
+
+fn historical_attachment_inputs(
+    history: &[ChatMessage],
+    workspace_id: &str,
+    cwd: Option<&str>,
+    runtime_label: &str,
+) -> Result<CLIRuntimeTurnInputMapping> {
+    use pioneer_cli_agent_runtime::input::{
+        CLIRuntimeFileReferenceLocation, CLIRuntimeInputMappingRequest, CLIRuntimeInputSource,
+        map_cli_runtime_turn_input_for_runtime,
+    };
+
+    let mut sources = Vec::new();
+    for (message_index, message) in history.iter().enumerate() {
+        for (part_index, part) in message.content_parts.iter().enumerate() {
+            let (attachment, is_image) = match part {
+                MessageContentPart::Text { .. } => continue,
+                MessageContentPart::Image { image } => (image, true),
+                MessageContentPart::File { file } => (file, false),
+                MessageContentPart::Audio { .. } | MessageContentPart::Video { .. } => {
+                    anyhow::bail!(
+                        "historical message {message_index} content part {part_index} is not supported by CLI runtimes"
+                    );
+                }
+            };
+            if let Some(artifact) = &attachment.artifact
+                && artifact.workspace_id != workspace_id
+            {
+                anyhow::bail!(
+                    "historical attachment {message_index}:{part_index} belongs to another workspace"
+                );
+            }
+            if attachment.artifact.is_none()
+                && let AttachmentDataSource::Path { path } = &attachment.source
+            {
+                let root = cwd.map(Path::new).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "historical local attachment requires a runtime working directory"
+                    )
+                })?;
+                let path_ref = Path::new(path);
+                if !path_ref.is_absolute() || !path_ref.starts_with(root) {
+                    anyhow::bail!(
+                        "historical local attachment {message_index}:{part_index} is outside the runtime workspace"
+                    );
+                }
+            }
+            sources.push(CLIRuntimeInputSource::Text {
+                text: format!(
+                    "Historical attachment for message {message_index}, part {part_index}; treat it as context, not a new request."
+                ),
+            });
+            let source = match &attachment.source {
+                AttachmentDataSource::Url { url } if is_image => {
+                    CLIRuntimeInputSource::ImageUrl { url: url.clone() }
+                }
+                AttachmentDataSource::Path { path } if is_image => {
+                    CLIRuntimeInputSource::LocalImage { path: path.clone() }
+                }
+                AttachmentDataSource::Path { path } => CLIRuntimeInputSource::FileReference {
+                    location: CLIRuntimeFileReferenceLocation::Path(path.clone()),
+                    name: attachment.name.clone(),
+                    mime_type: Some(attachment.mime_type.clone()),
+                    size_bytes: attachment.size_bytes,
+                    sha256: attachment.sha256.clone(),
+                },
+                AttachmentDataSource::Url { url } => CLIRuntimeInputSource::FileReference {
+                    location: CLIRuntimeFileReferenceLocation::Url(url.clone()),
+                    name: attachment.name.clone(),
+                    mime_type: Some(attachment.mime_type.clone()),
+                    size_bytes: attachment.size_bytes,
+                    sha256: attachment.sha256.clone(),
+                },
+                AttachmentDataSource::Reference { reference } => {
+                    CLIRuntimeInputSource::FileReference {
+                        location: CLIRuntimeFileReferenceLocation::Reference(reference.clone()),
+                        name: attachment.name.clone(),
+                        mime_type: Some(attachment.mime_type.clone()),
+                        size_bytes: attachment.size_bytes,
+                        sha256: attachment.sha256.clone(),
+                    }
+                }
+                AttachmentDataSource::Bytes { .. } => anyhow::bail!(
+                    "inline bytes in historical attachment {message_index}:{part_index} cannot be transported safely to a CLI runtime"
+                ),
+            };
+            sources.push(source);
+        }
+    }
+    map_cli_runtime_turn_input_for_runtime(
+        CLIRuntimeInputMappingRequest { inputs: sources },
+        runtime_label,
+    )
+    .map_err(Into::into)
 }
 
 pub(crate) fn cli_runtime_mcp_capabilities_input(
@@ -115,6 +359,95 @@ pub(crate) fn prepend_cli_turn_context_input(
         runtime_label,
         "cli_runtime_input.turn_context_mapped",
     )
+}
+
+pub(crate) fn prepend_cli_turn_context_and_history_input(
+    mapping: &mut CLIRuntimeTurnInputMapping,
+    plan: &CompiledInstructionDeliveryPlan,
+    history: Option<&[ChatMessage]>,
+    workspace_id: &str,
+    cwd: Option<&str>,
+    runtime_label: &str,
+) -> Result<bool> {
+    let mut history_mapping = match history {
+        Some(history) => historical_attachment_inputs(history, workspace_id, cwd, runtime_label)?,
+        None => CLIRuntimeTurnInputMapping {
+            input: Vec::new(),
+            diagnostics: Vec::new(),
+        },
+    };
+    let current_input = std::mem::take(&mut mapping.input);
+    let inserted = prepend_cli_turn_context_input(mapping, plan, runtime_label);
+    mapping.input.append(&mut history_mapping.input);
+    mapping.input.extend(current_input);
+    mapping.diagnostics.append(&mut history_mapping.diagnostics);
+    Ok(inserted)
+}
+
+pub(crate) fn validate_cli_runtime_turn_input_frame(
+    mapping: &CLIRuntimeTurnInputMapping,
+    plan: &CompiledInstructionDeliveryPlan,
+    max_input_tokens: Option<u64>,
+    runtime_kind: pioneer_protocol::CLIAgentRuntimeKind,
+) -> Result<()> {
+    if runtime_kind == pioneer_protocol::CLIAgentRuntimeKind::Codex {
+        let actual_chars = codex_input_text_chars(&mapping.input);
+        anyhow::ensure!(
+            actual_chars <= MAX_CODEX_INPUT_TEXT_CHARS,
+            "Codex input contains {actual_chars} Unicode scalar values across Text items, exceeding the maximum length of {MAX_CODEX_INPUT_TEXT_CHARS} characters"
+        );
+    }
+    // Include the turn envelope fields that accompany input at the adapter
+    // boundary. Claude additionally performs an exact post-materialization
+    // check after LocalImage paths have become base64 blocks.
+    let mut frame_bytes = serde_json::to_vec(&serde_json::json!({
+        "input": &mapping.input,
+        "elevatedInstructions": &plan.provider_instructions.text,
+        "instructionFingerprint": &plan.provider_instructions.fingerprint,
+    }))?
+    .len();
+    let mut model_image_tokens = 0_u64;
+    if runtime_kind == pioneer_protocol::CLIAgentRuntimeKind::Claude {
+        // Claude's stream-json adapter reads LocalImage paths into base64.
+        // Account for the materialized bytes before deciding whether a
+        // historical checkpoint can bring the request under the frame cap.
+        for item in &mapping.input {
+            if let CLIRuntimeTurnInputItem::LocalImage { path } = item {
+                let image_bytes = std::fs::metadata(path)?.len();
+                let encoded = image_bytes.div_ceil(3).saturating_mul(4);
+                frame_bytes =
+                    frame_bytes.saturating_add(usize::try_from(encoded).unwrap_or(usize::MAX));
+                if max_input_tokens.is_some() {
+                    let (width, height) = image::image_dimensions(path)?;
+                    model_image_tokens = model_image_tokens.saturating_add(
+                        pioneer_provider::attachments::image_tokens(
+                            "anthropic",
+                            "claude",
+                            width,
+                            height,
+                        )?,
+                    );
+                }
+            }
+        }
+    }
+    anyhow::ensure!(
+        frame_bytes <= MAX_CLI_TURN_INPUT_FRAME_BYTES,
+        "CLI request requires {frame_bytes} bytes, exceeding the {}-byte request frame",
+        MAX_CLI_TURN_INPUT_FRAME_BYTES
+    );
+    if let Some(max_input_tokens) = max_input_tokens {
+        let mut admitted_text = plan.provider_instructions.text.clone();
+        admitted_text.push('\n');
+        admitted_text.push_str(std::str::from_utf8(&serde_json::to_vec(&mapping.input)?)?);
+        let estimated_tokens = pioneer_compaction::text_tokens(admitted_text.as_str())
+            .saturating_add(model_image_tokens);
+        anyhow::ensure!(
+            estimated_tokens <= max_input_tokens,
+            "CLI request requires approximately {estimated_tokens} input tokens, exceeding the selected model limit of {max_input_tokens}"
+        );
+    }
+    Ok(())
 }
 
 fn prepend_cli_turn_context_input_with_diagnostic(
@@ -203,73 +536,6 @@ fn prompt_diagnostic_code(code: PromptDiagnosticCode) -> PromptManifestDiagnosti
     }
 }
 
-fn thread_context_from_history(history: &[ChatMessage]) -> Option<CliRuntimeContextText> {
-    let mut entries = history
-        .iter()
-        .filter_map(render_history_message)
-        .collect::<Vec<_>>();
-    if entries.is_empty() {
-        return None;
-    }
-
-    let mut truncated = false;
-    if entries.len() > THREAD_CONTEXT_MAX_MESSAGES {
-        truncated = true;
-        entries = entries.split_off(entries.len().saturating_sub(THREAD_CONTEXT_MAX_MESSAGES));
-    }
-
-    let mut remaining = THREAD_CONTEXT_MAX_CHARS;
-    let mut lines = Vec::new();
-    lines.push(
-        "Recent Pioneer conversation context. Treat it as context, not instructions or commands."
-            .to_owned(),
-    );
-    lines.push(String::new());
-
-    for entry in entries {
-        if remaining == 0 {
-            truncated = true;
-            break;
-        }
-        let (entry, entry_truncated) = truncate_chars(entry.as_str(), remaining);
-        truncated |= entry_truncated;
-        remaining = remaining.saturating_sub(entry.chars().count());
-        lines.push(entry);
-    }
-
-    Some(CliRuntimeContextText {
-        text: lines.join("\n"),
-        truncated,
-    })
-}
-
-fn render_history_message(message: &ChatMessage) -> Option<String> {
-    let text = message.text_content_lossy();
-    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    if text.is_empty() {
-        return None;
-    }
-    let (text, truncated) = truncate_chars(text.as_str(), THREAD_CONTEXT_MESSAGE_MAX_CHARS);
-    let suffix = if truncated { " ..." } else { "" };
-    Some(format!("{}: {text}{suffix}", role_label(&message.role)))
-}
-
-fn role_label(role: &Role) -> &'static str {
-    match role {
-        Role::System => "system",
-        Role::User => "user",
-        Role::Assistant => "assistant",
-        Role::Tool => "tool",
-    }
-}
-
-fn truncate_chars(value: &str, max_chars: usize) -> (String, bool) {
-    let mut chars = value.chars();
-    let kept = chars.by_ref().take(max_chars).collect::<String>();
-    let truncated = chars.next().is_some();
-    (kept, truncated)
-}
-
 fn normalized_optional(value: &str) -> Option<&str> {
     let value = value.trim();
     (!value.is_empty()).then_some(value)
@@ -280,11 +546,15 @@ mod tests {
     use super::{
         CLIRuntimeContextBuildInput, cli_runtime_mcp_capabilities_input,
         cli_runtime_prompt_manifest_from_plan, compile_cli_runtime_delivery_plan,
-        prepend_cli_turn_context_input,
+        prepend_cli_turn_context_and_history_input, prepend_cli_turn_context_input,
+        validate_cli_runtime_turn_input_frame,
     };
     use pioneer_cli_agent_runtime::input::{CLIRuntimeTurnInputItem, CLIRuntimeTurnInputMapping};
     use pioneer_protocol::{CLIAgentRuntimeKind, PromptManifestProfile};
-    use pioneer_provider::ChatMessage;
+    use pioneer_provider::{
+        AttachmentDataSource, ChatMessage, MessageAttachment, MessageContentPart,
+        ProviderReplayState, ProviderToolCall,
+    };
 
     fn mcp_projection() -> crate::turn_mcp::ResolvedMcpTurnProjection {
         let mut projection =
@@ -339,11 +609,27 @@ mod tests {
     fn cli_runtime_prompt_manifest_uses_runtime_profile_without_api_sections() {
         let root = temp_workspace("manifest");
         std::fs::write(root.join("SOUL.md"), "api prompt file").expect("write SOUL");
+        let long_accepted_answer = format!("{}ACCEPTED_HISTORY_TAIL", "x".repeat(40_000));
+        let accepted_history = [
+            ChatMessage::user("accepted parent question"),
+            ChatMessage::assistant(long_accepted_answer),
+            ChatMessage::assistant_tool_calls(
+                None::<String>,
+                vec![ProviderToolCall {
+                    id: "historical-call".to_owned(),
+                    name: "read_file".to_owned(),
+                    arguments: r#"{"path":"notes.txt"}"#.to_owned(),
+                }],
+            ),
+            ChatMessage::tool_result("historical-call", "read_file", "HISTORICAL_TOOL_ROUND_TAIL"),
+        ];
+        let selected_skills = ["review".to_owned()];
         let plan = compile_cli_runtime_delivery_plan(
             root.as_path(),
             CLIRuntimeContextBuildInput {
                 workspace_id: "workspace_1",
                 thread_id: "thread_1",
+                initiating_thread_id: "thread_1",
                 turn_id: "turn_1",
                 runtime_id: "codex-default",
                 runtime_label: "Codex CLI",
@@ -351,8 +637,8 @@ mod tests {
                 model: Some("gpt-5-codex"),
                 cwd: Some("/workspace"),
                 permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
-                history: &[ChatMessage::user("continue from prior context")],
-                selected_skill_names: &[],
+                history: Some(&accepted_history),
+                selected_skill_names: &selected_skills,
                 selected_capabilities: None,
             },
         )
@@ -366,8 +652,572 @@ mod tests {
                 .contains(&"pioneer_cli_runtime_context".to_owned())
         );
         assert!(manifest.section_ids.contains(&"thread_context".to_owned()));
+        let user = plan
+            .turn_context
+            .text
+            .find("\"role\":\"user\"")
+            .expect("accepted user role should be preserved");
+        let assistant = plan
+            .turn_context
+            .text
+            .find("\"role\":\"assistant\"")
+            .expect("accepted assistant role should be preserved");
+        assert!(user < assistant);
+        assert!(plan.turn_context.text.contains("ACCEPTED_HISTORY_TAIL"));
+        let tool_call = plan.turn_context.text.find("historical-call").unwrap();
+        let tool_result = plan
+            .turn_context
+            .text
+            .find("HISTORICAL_TOOL_ROUND_TAIL")
+            .unwrap();
+        assert!(
+            tool_call < tool_result,
+            "the complete tool round must survive atomically"
+        );
+        assert!(
+            !manifest
+                .section_ids
+                .contains(&"current_permissions".to_owned()),
+            "the default full-access profile has no extra permission guidance"
+        );
+        assert!(plan.provider_instructions.text.contains("Selected Skills"));
+        assert!(plan.provider_instructions.text.contains("review"));
+        assert!(
+            !plan
+                .bundle
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.section_id.as_deref() == Some("thread_context")),
+            "accepted history must not be silently truncated by a second prompt budget"
+        );
         assert!(!plan.bundle.full_system_text.contains("Tool Usage"));
         assert!(!plan.bundle.full_system_text.contains("api prompt file"));
+    }
+
+    #[test]
+    fn codex_and_claude_bootstrap_keep_portable_replay_reasoning_for_native_return() {
+        let root = temp_workspace("portable-reasoning");
+        let mut historical = ChatMessage::assistant("retained answer");
+        historical.reasoning_content = Some("additional common reasoning".into());
+        historical.provider_replay_state = Some(ProviderReplayState::for_model(
+            "openrouter",
+            "source-model",
+            serde_json::json!({"reasoning_details":[
+                {"type":"reasoning.encrypted","data":"opaque-secret"},
+                {"type":"reasoning.summary","summary":"replay-only reasoning"}
+            ]}),
+        ));
+        historical.provenance = Some(pioneer_provider::MessageProvenance {
+            logical_turn_id: Some("turn_1".into()),
+            workspace_id: "workspace_1".into(),
+            thread_id: "thread_1".into(),
+            context_thread: None,
+            unit_id: "answer".into(),
+            sources: vec![pioneer_provider::MessageSourceRef {
+                scope: "context:turn_1".into(),
+                id: "source".into(),
+                version: "revision:1".into(),
+            }],
+            source_aliases: vec![],
+            ambiguous_input_aliases: vec![],
+            complete: true,
+            protected_input: false,
+            inherited: false,
+        });
+        let canonical = historical.clone();
+        let history = [ChatMessage::user("original question"), historical];
+        for (kind, label) in [
+            (CLIAgentRuntimeKind::Codex, "Codex CLI"),
+            (CLIAgentRuntimeKind::Claude, "Claude CLI"),
+        ] {
+            let plan = compile_cli_runtime_delivery_plan(
+                root.as_path(),
+                CLIRuntimeContextBuildInput {
+                    workspace_id: "workspace_1",
+                    thread_id: "thread_1",
+                    initiating_thread_id: "thread_1",
+                    turn_id: "turn_2",
+                    runtime_id: "runtime",
+                    runtime_label: label,
+                    runtime_kind: kind,
+                    model: None,
+                    cwd: Some(root.to_str().unwrap()),
+                    permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(
+                    ),
+                    history: Some(&history),
+                    selected_skill_names: &[],
+                    selected_capabilities: None,
+                },
+            )
+            .unwrap();
+            let text = &plan.turn_context.text;
+            assert!(text.contains("original question"));
+            assert!(text.contains("additional common reasoning"));
+            assert!(text.contains("replay-only reasoning"));
+            assert!(!text.contains("opaque-secret"));
+            assert!(text.find("original question") < text.find("retained answer"));
+            let mut mapping = CLIRuntimeTurnInputMapping {
+                input: vec![CLIRuntimeTurnInputItem::Text {
+                    text: "current request".into(),
+                }],
+                diagnostics: vec![],
+            };
+            prepend_cli_turn_context_and_history_input(
+                &mut mapping,
+                &plan,
+                Some(&history),
+                "workspace_1",
+                Some(root.to_str().unwrap()),
+                label,
+            )
+            .unwrap();
+            let outgoing = serde_json::to_string(&mapping.input).unwrap();
+            assert!(outgoing.contains("replay-only reasoning"));
+            assert!(!outgoing.contains("opaque-secret"));
+        }
+        let native = pioneer_provider::history::portable_history_message(&canonical);
+        assert_eq!(
+            native.reasoning_content.as_deref(),
+            Some("additional common reasoning\n\nreplay-only reasoning")
+        );
+        let native_request = pioneer_provider::history::project_request_for_provider(
+            "deepseek",
+            pioneer_provider::ChatRequest {
+                model: "deepseek-chat".into(),
+                messages: vec![
+                    history[0].clone(),
+                    history[1].clone(),
+                    ChatMessage::assistant("CLI result"),
+                ],
+                temperature: None,
+                max_tokens: None,
+                tools: None,
+                tool_choice: None,
+                parallel_tool_calls: None,
+                reasoning: None,
+                compiled_prompt: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            native_request.messages[1].reasoning_content,
+            native.reasoning_content
+        );
+        assert_eq!(native_request.messages[2].content, "CLI result");
+        assert!(native_request.messages[1].provider_replay_state.is_none());
+        assert_eq!(history[1], canonical);
+
+        let mut replay_only = canonical.clone();
+        replay_only.reasoning_content = None;
+        let text = super::thread_context_from_history(&[replay_only.clone()])
+            .unwrap()
+            .text;
+        assert!(text.contains("replay-only reasoning"));
+        assert!(!text.contains("opaque-secret"));
+        assert_eq!(
+            replay_only.provider_replay_state,
+            canonical.provider_replay_state
+        );
+    }
+
+    #[test]
+    fn historical_multimodal_content_uses_native_cli_items_without_replay_state() {
+        let root = temp_workspace("multimodal");
+        let materialized = tempfile::tempdir().expect("materialized artifact root");
+        let image_path = materialized.path().join("history.png");
+        let history = [ChatMessage {
+            provider_replay_state: Some(ProviderReplayState::new(
+                "native-provider",
+                serde_json::json!({"opaqueSecret":"must-not-cross"}),
+            )),
+            content_parts: vec![
+                MessageContentPart::Text {
+                    text: "look at the historical image".to_owned(),
+                },
+                MessageContentPart::Image {
+                    image: MessageAttachment {
+                        mime_type: "image/png".to_owned(),
+                        name: Some("history.png".to_owned()),
+                        size_bytes: Some(42),
+                        sha256: None,
+                        source: AttachmentDataSource::Path {
+                            path: image_path.display().to_string(),
+                        },
+                        artifact: Some(pioneer_provider::AttachmentArtifactContext {
+                            workspace_id: "workspace_1".to_owned(),
+                            artifact_id: "artifact_history_image".to_owned(),
+                            artifact_version_id: Some("version_history_image".to_owned()),
+                        }),
+                    },
+                },
+                MessageContentPart::File {
+                    file: MessageAttachment::from_url(
+                        "https://example.test/history.txt",
+                        "text/plain",
+                    ),
+                },
+            ],
+            ..ChatMessage::user("")
+        }];
+        let plan = compile_cli_runtime_delivery_plan(
+            root.as_path(),
+            CLIRuntimeContextBuildInput {
+                workspace_id: "workspace_1",
+                thread_id: "thread_1",
+                initiating_thread_id: "thread_1",
+                turn_id: "turn_1",
+                runtime_id: "codex-default",
+                runtime_label: "Codex CLI",
+                runtime_kind: CLIAgentRuntimeKind::Codex,
+                model: Some("gpt-5-codex"),
+                cwd: Some(root.to_str().unwrap()),
+                permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
+                history: Some(&history),
+                selected_skill_names: &[],
+                selected_capabilities: None,
+            },
+        )
+        .unwrap();
+        let mut mapping = CLIRuntimeTurnInputMapping {
+            input: vec![CLIRuntimeTurnInputItem::Text {
+                text: "current question".to_owned(),
+            }],
+            diagnostics: Vec::new(),
+        };
+        prepend_cli_turn_context_and_history_input(
+            &mut mapping,
+            &plan,
+            Some(&history),
+            "workspace_1",
+            Some(root.to_str().unwrap()),
+            "Codex CLI",
+        )
+        .unwrap();
+        let serialized = serde_json::to_string(&mapping.input).unwrap();
+        assert!(serialized.contains("historical image message=0 part=1"));
+        assert!(serialized.contains("history.png"));
+        assert!(serialized.contains("https://example.test/history.txt"));
+        assert!(serialized.contains("current question"));
+        assert!(!serialized.contains("opaqueSecret"));
+        assert!(matches!(
+            &mapping.input[2],
+            CLIRuntimeTurnInputItem::LocalImage { path }
+                if path == image_path.to_string_lossy().as_ref()
+        ));
+    }
+
+    #[test]
+    fn oversized_atomic_bootstrap_is_rejected_before_adapter_send() {
+        let mapping = CLIRuntimeTurnInputMapping {
+            input: vec![CLIRuntimeTurnInputItem::Text {
+                text: "x".repeat(32_000),
+            }],
+            diagnostics: Vec::new(),
+        };
+        let root = temp_workspace("oversized");
+        let plan = compile_cli_runtime_delivery_plan(
+            root.as_path(),
+            CLIRuntimeContextBuildInput {
+                workspace_id: "workspace_1",
+                thread_id: "thread_1",
+                initiating_thread_id: "thread_1",
+                turn_id: "turn_1",
+                runtime_id: "codex-default",
+                runtime_label: "Codex CLI",
+                runtime_kind: CLIAgentRuntimeKind::Codex,
+                model: Some("tiny-model"),
+                cwd: Some(root.to_str().unwrap()),
+                permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
+                history: None,
+                selected_skill_names: &[],
+                selected_capabilities: None,
+            },
+        )
+        .unwrap();
+        let error = validate_cli_runtime_turn_input_frame(
+            &mapping,
+            &plan,
+            Some(128),
+            CLIAgentRuntimeKind::Codex,
+        )
+        .unwrap_err();
+        let error = format!("{error:#}");
+        assert!(error.contains("selected model limit of 128"));
+    }
+
+    #[test]
+    fn codex_input_limit_counts_unicode_text_across_items_at_the_exact_boundary() {
+        let root = temp_workspace("codex-input-chars");
+        let mut plan = compile_cli_runtime_delivery_plan(
+            root.as_path(),
+            CLIRuntimeContextBuildInput {
+                workspace_id: "workspace_1",
+                thread_id: "thread_1",
+                initiating_thread_id: "thread_1",
+                turn_id: "turn_1",
+                runtime_id: "codex",
+                runtime_label: "Codex CLI",
+                runtime_kind: CLIAgentRuntimeKind::Codex,
+                model: Some("test-model"),
+                cwd: Some(root.to_str().unwrap()),
+                permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
+                history: None,
+                selected_skill_names: &[],
+                selected_capabilities: None,
+            },
+        )
+        .unwrap();
+        // Provider instructions are a separate field, outside Codex's input cap.
+        plan.provider_instructions.text = "i".repeat(super::MAX_CODEX_INPUT_TEXT_CHARS + 1);
+        for chars in [
+            super::MAX_CODEX_INPUT_TEXT_CHARS - 1,
+            super::MAX_CODEX_INPUT_TEXT_CHARS,
+            super::MAX_CODEX_INPUT_TEXT_CHARS + 1,
+        ] {
+            let first = "😀".repeat(chars / 2);
+            // Two scalar values, one grapheme: a letter and combining accent.
+            let second_chars = chars - chars / 2;
+            let second = format!(
+                "{}{}",
+                "e\u{301}".repeat(second_chars / 2),
+                if second_chars % 2 == 1 { "Ж" } else { "" },
+            );
+            let mapping = CLIRuntimeTurnInputMapping {
+                input: vec![
+                    CLIRuntimeTurnInputItem::Text { text: first },
+                    CLIRuntimeTurnInputItem::Text { text: second },
+                    CLIRuntimeTurnInputItem::Image {
+                        url: "url".repeat(64),
+                    },
+                    CLIRuntimeTurnInputItem::LocalImage {
+                        path: "missing.png".into(),
+                    },
+                    CLIRuntimeTurnInputItem::Skill {
+                        name: "skill".into(),
+                        path: "path".repeat(64),
+                    },
+                ],
+                diagnostics: Vec::new(),
+            };
+            assert_eq!(super::codex_input_text_chars(&mapping.input), chars);
+            assert!(
+                serde_json::to_vec(&mapping.input).unwrap().len()
+                    < super::MAX_CLI_TURN_INPUT_FRAME_BYTES
+            );
+            let result = validate_cli_runtime_turn_input_frame(
+                &mapping,
+                &plan,
+                None,
+                CLIAgentRuntimeKind::Codex,
+            );
+            if chars <= super::MAX_CODEX_INPUT_TEXT_CHARS {
+                result.unwrap();
+            } else {
+                let error = result.unwrap_err().to_string();
+                assert!(error.contains("1048577 Unicode scalar values"));
+                assert!(error.contains("maximum length of 1048576 characters"));
+            }
+            // Claude still admits the same textual request under the frame cap.
+            let mut claude = mapping.clone();
+            claude
+                .input
+                .retain(|item| !matches!(item, CLIRuntimeTurnInputItem::LocalImage { .. }));
+            validate_cli_runtime_turn_input_frame(
+                &claude,
+                &plan,
+                None,
+                CLIAgentRuntimeKind::Claude,
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn codex_history_budget_uses_prepared_text_and_current_input_headroom() {
+        let mapping = |text: String| CLIRuntimeTurnInputMapping {
+            input: vec![CLIRuntimeTurnInputItem::Text { text }],
+            diagnostics: Vec::new(),
+        };
+        let current = mapping("current".into());
+        assert!(
+            super::CodexTransferHistoryBudget::from_prepared_input(&current, &current,).is_none()
+        );
+        let full = mapping(format!(
+            "{}current",
+            "x".repeat(super::MAX_CODEX_INPUT_TEXT_CHARS)
+        ));
+        let small =
+            super::CodexTransferHistoryBudget::from_prepared_input(&full, &current).unwrap();
+        let near_limit = mapping("y".repeat(super::MAX_CODEX_INPUT_TEXT_CHARS - 1_024));
+        let tight_full = mapping(format!(
+            "{}{}",
+            "x".repeat(super::MAX_CODEX_INPUT_TEXT_CHARS),
+            "y".repeat(super::MAX_CODEX_INPUT_TEXT_CHARS - 1_024)
+        ));
+        let tight =
+            super::CodexTransferHistoryBudget::from_prepared_input(&tight_full, &near_limit)
+                .unwrap();
+        assert!(tight.history_token_target(10_000) < small.history_token_target(10_000));
+        let retry = super::CodexTransferHistoryBudget::from_prepared_input(&full, &current)
+            .unwrap()
+            .with_token_target(u64::MAX, 4);
+        assert!(retry.history_token_target(10_000) < small.history_token_target(10_000));
+        let desired = tight.history_token_target(10_000);
+        for input_limit in [None, Some(900_000)] {
+            let model = pioneer_compaction::ModelBudget::new(Some(1_000_000), input_limit, None);
+            let reserve = model.output_reserve(None).unwrap();
+            let fixed = tight.fixed_input_tokens(&model, 10_000, reserve);
+            assert!(model.fits(fixed + desired, reserve, false));
+            assert!(!model.fits(fixed + 10_000, reserve, false));
+            assert_eq!(
+                tight.available_input_tokens(&model, reserve, fixed),
+                desired
+            );
+        }
+        assert_eq!(small.available_chars, super::MAX_CODEX_INPUT_TEXT_CHARS - 7);
+    }
+
+    #[test]
+    fn claude_frame_preflight_counts_materialized_local_image_bytes() {
+        let root = temp_workspace("claude-image-frame");
+        let image = root.join("historical.png");
+        std::fs::write(&image, vec![0_u8; 6 * 1024 * 1024]).unwrap();
+        let plan = compile_cli_runtime_delivery_plan(
+            root.as_path(),
+            CLIRuntimeContextBuildInput {
+                workspace_id: "workspace_1",
+                thread_id: "thread_1",
+                initiating_thread_id: "thread_1",
+                turn_id: "turn_1",
+                runtime_id: "claude",
+                runtime_label: "Claude CLI",
+                runtime_kind: CLIAgentRuntimeKind::Claude,
+                model: Some("test-model"),
+                cwd: Some(root.to_str().unwrap()),
+                permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
+                history: None,
+                selected_skill_names: &[],
+                selected_capabilities: None,
+            },
+        )
+        .unwrap();
+        let mapping = CLIRuntimeTurnInputMapping {
+            input: vec![CLIRuntimeTurnInputItem::LocalImage {
+                path: image.to_string_lossy().into_owned(),
+            }],
+            diagnostics: Vec::new(),
+        };
+        assert!(
+            validate_cli_runtime_turn_input_frame(
+                &mapping,
+                &plan,
+                None,
+                CLIAgentRuntimeKind::Claude,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("request frame")
+        );
+        assert!(
+            validate_cli_runtime_turn_input_frame(
+                &mapping,
+                &plan,
+                None,
+                CLIAgentRuntimeKind::Codex,
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn claude_image_uses_visual_tokens_under_a_model_limit() {
+        let root = temp_workspace("claude-image-model-tokens");
+        let image = root.join("image.png");
+        let pixels = image::RgbImage::from_fn(1024, 1024, |x, y| {
+            let mut value = (u64::from(y) << 10) | u64::from(x);
+            value = value.wrapping_add(0x9e3779b97f4a7c15);
+            value = (value ^ (value >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+            value = (value ^ (value >> 27)).wrapping_mul(0x94d049bb133111eb);
+            value ^= value >> 31;
+            image::Rgb([value as u8, (value >> 8) as u8, (value >> 16) as u8])
+        });
+        pixels.save(&image).unwrap();
+        let plan = compile_cli_runtime_delivery_plan(
+            root.as_path(),
+            CLIRuntimeContextBuildInput {
+                workspace_id: "workspace_1",
+                thread_id: "thread_1",
+                initiating_thread_id: "thread_1",
+                turn_id: "turn_1",
+                runtime_id: "claude",
+                runtime_label: "Claude CLI",
+                runtime_kind: CLIAgentRuntimeKind::Claude,
+                model: Some("claude-sonnet-4"),
+                cwd: Some(root.to_str().unwrap()),
+                permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
+                history: None,
+                selected_skill_names: &[],
+                selected_capabilities: None,
+            },
+        )
+        .unwrap();
+        let mapping = CLIRuntimeTurnInputMapping {
+            input: vec![CLIRuntimeTurnInputItem::LocalImage {
+                path: image.to_string_lossy().into_owned(),
+            }],
+            diagnostics: Vec::new(),
+        };
+        assert!(std::fs::metadata(&image).unwrap().len() > 1_000_000);
+        validate_cli_runtime_turn_input_frame(
+            &mapping,
+            &plan,
+            Some(20_000),
+            CLIAgentRuntimeKind::Claude,
+        )
+        .expect("visual token estimate should admit an ordinary image below the byte cap");
+    }
+
+    #[test]
+    fn unsupported_historical_media_is_rejected_instead_of_becoming_text() {
+        let root = temp_workspace("historical-audio");
+        let history = [ChatMessage::user_parts(vec![MessageContentPart::audio(
+            MessageAttachment::from_url("https://example.test/history.wav", "audio/wav"),
+        )])];
+        let plan = compile_cli_runtime_delivery_plan(
+            root.as_path(),
+            CLIRuntimeContextBuildInput {
+                workspace_id: "workspace_1",
+                thread_id: "thread_1",
+                initiating_thread_id: "thread_1",
+                turn_id: "turn_1",
+                runtime_id: "codex-default",
+                runtime_label: "Codex CLI",
+                runtime_kind: CLIAgentRuntimeKind::Codex,
+                model: Some("gpt-5-codex"),
+                cwd: Some(root.to_str().unwrap()),
+                permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
+                history: Some(&history),
+                selected_skill_names: &[],
+                selected_capabilities: None,
+            },
+        )
+        .unwrap();
+        let mut mapping = CLIRuntimeTurnInputMapping {
+            input: vec![CLIRuntimeTurnInputItem::Text {
+                text: "current question".to_owned(),
+            }],
+            diagnostics: Vec::new(),
+        };
+        let error = prepend_cli_turn_context_and_history_input(
+            &mut mapping,
+            &plan,
+            Some(&history),
+            "workspace_1",
+            Some(root.to_str().unwrap()),
+            "Codex CLI",
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("not supported by CLI runtimes"));
     }
 
     #[test]
@@ -378,6 +1228,7 @@ mod tests {
             CLIRuntimeContextBuildInput {
                 workspace_id: "workspace_1",
                 thread_id: "thread_1",
+                initiating_thread_id: "thread_1",
                 turn_id: "turn_1",
                 runtime_id: "claude-default",
                 runtime_label: "Claude CLI",
@@ -385,7 +1236,7 @@ mod tests {
                 model: None,
                 cwd: None,
                 permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
-                history: &[],
+                history: None,
                 selected_skill_names: &[],
                 selected_capabilities: None,
             },
@@ -419,6 +1270,66 @@ mod tests {
     }
 
     #[test]
+    fn nested_child_bootstrap_preserves_each_accepted_level_before_current_input() {
+        for depth in 1..=3 {
+            let root = temp_workspace(format!("nested-{depth}").as_str());
+            let mut history = vec![ChatMessage::user("accepted immediate-parent basis")];
+            for level in 1..=depth {
+                history.push(ChatMessage::assistant(format!(
+                    "accepted child output level {level}"
+                )));
+            }
+            let plan = compile_cli_runtime_delivery_plan(
+                root.as_path(),
+                CLIRuntimeContextBuildInput {
+                    workspace_id: "workspace_nested",
+                    thread_id: "nested_child",
+                    initiating_thread_id: "root_thread",
+                    turn_id: "current_nested_turn",
+                    runtime_id: "codex-default",
+                    runtime_label: "Codex CLI",
+                    runtime_kind: CLIAgentRuntimeKind::Codex,
+                    model: Some("gpt-5-codex"),
+                    cwd: Some("/workspace"),
+                    permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(
+                    ),
+                    history: Some(history.as_slice()),
+                    selected_skill_names: &[],
+                    selected_capabilities: None,
+                },
+            )
+            .expect("nested accepted history should compile");
+            let mut mapping = CLIRuntimeTurnInputMapping {
+                input: vec![CLIRuntimeTurnInputItem::Text {
+                    text: "CURRENT NESTED QUESTION".to_owned(),
+                }],
+                diagnostics: Vec::new(),
+            };
+            assert!(prepend_cli_turn_context_input(
+                &mut mapping,
+                &plan,
+                "Codex CLI"
+            ));
+            let provider_input = serde_json::to_string(&mapping.input).unwrap();
+            let parent = provider_input
+                .find("accepted immediate-parent basis")
+                .unwrap();
+            let mut preceding = parent;
+            for level in 1..=depth {
+                let current = provider_input
+                    .find(format!("accepted child output level {level}").as_str())
+                    .unwrap();
+                assert!(preceding < current);
+                preceding = current;
+            }
+            let current = provider_input.find("CURRENT NESTED QUESTION").unwrap();
+            assert!(preceding < current);
+            assert!(!provider_input.contains("LATE PARENT APPEND"));
+            assert!(!provider_input.contains("UNAUTHORIZED SIBLING"));
+        }
+    }
+
+    #[test]
     fn cli_runtime_context_build_input_carries_restricted_permissions() {
         let root = temp_workspace("permissions");
         let plan = compile_cli_runtime_delivery_plan(
@@ -426,6 +1337,7 @@ mod tests {
             CLIRuntimeContextBuildInput {
                 workspace_id: "workspace_1",
                 thread_id: "thread_1",
+                initiating_thread_id: "thread_1",
                 turn_id: "turn_1",
                 runtime_id: "codex-default",
                 runtime_label: "Codex CLI",
@@ -436,7 +1348,7 @@ mod tests {
                     pioneer_protocol::TurnPermissionMode::Supervised,
                     pioneer_protocol::TurnPermissionProfileSource::Composer,
                 ),
-                history: &[],
+                history: None,
                 selected_skill_names: &[],
                 selected_capabilities: None,
             },
@@ -474,6 +1386,7 @@ mod tests {
             CLIRuntimeContextBuildInput {
                 workspace_id: "workspace_1",
                 thread_id: "thread_1",
+                initiating_thread_id: "thread_1",
                 turn_id: "turn_1",
                 runtime_id: "codex-default",
                 runtime_label: "Codex CLI",
@@ -481,7 +1394,7 @@ mod tests {
                 model: Some("gpt-5-codex"),
                 cwd: Some("/workspace"),
                 permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
-                history: &[],
+                history: None,
                 selected_skill_names: &[],
                 selected_capabilities: Some(selected),
             },

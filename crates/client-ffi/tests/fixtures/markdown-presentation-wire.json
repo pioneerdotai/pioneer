@@ -1,0 +1,18 @@
+{
+  "document_id": "markdown:10:1:a:answer:2",
+  "next_id": 2,
+  "nodes": [
+    {
+      "block": {
+        "language": "rust",
+        "text": "let value = 1;\n",
+        "type": "code"
+      },
+      "children": [],
+      "id": 1,
+      "revision": 2
+    }
+  ],
+  "revision": 2,
+  "source": "```rust\nlet value = 1;\n\n```"
+}

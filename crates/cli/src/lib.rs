@@ -7,8 +7,9 @@ use anyhow::Result;
 use pioneer_config::InstallManagedBy;
 use serde_json::json;
 use std::env;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
+use std::io::{self, Write};
 use tracing::warn;
 
 pub fn main_entry() {
@@ -25,13 +26,17 @@ pub fn main_entry() {
     // The service loads its persisted telemetry preference inside the Gateway.
     // Keep external reporting closed until then so an existing opt-out also
     // covers the service bootstrap performed by this shared CLI binary.
-    if env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new(service::SERVICE_MODE_ARG)) {
+    if env::args_os().nth(1).as_deref() == Some(OsStr::new(service::SERVICE_MODE_ARG)) {
         pioneer_observability::set_telemetry_enabled(false);
     }
 
     let sentry_guard =
         pioneer_observability::init_sentry(pioneer_observability::SentryTarget::Shared);
-    pioneer_observability::init_tracing(sentry_guard.is_some());
+    if requests_json_output(env::args_os().skip(1)) {
+        pioneer_observability::init_tracing_to_stderr(sentry_guard.is_some());
+    } else {
+        pioneer_observability::init_tracing(sentry_guard.is_some());
+    }
 
     if let Err(error) = run() {
         if is_usage_error(&error) {
@@ -48,6 +53,10 @@ pub fn main_entry() {
         drop(sentry_guard);
         std::process::exit(1);
     }
+}
+
+fn requests_json_output(args: impl Iterator<Item = OsString>) -> bool {
+    args.into_iter().any(|arg| arg == OsStr::new("--json"))
 }
 
 fn dispatch_hidden_cli_mcp_stdio(args: impl Iterator<Item = OsString>) -> Option<i32> {
@@ -116,37 +125,18 @@ fn run() -> Result<()> {
 
 fn run_with_args(mut args: impl Iterator<Item = String>) -> Result<()> {
     match args.next().as_deref() {
-        Some("install") => {
-            let (options, json_output) =
-                parse_install_options(installer::InstallCommand::Install, args)?;
-            match installer::run_install(options.clone()) {
-                Ok(report) => print_install_report(report, json_output),
-                Err(error) => {
-                    if json_output {
-                        print_install_failure_json(options.command, &error)?;
-                    }
-                    Err(error)
-                }
-            }
-        }
-        Some("update") | Some("self-update") => {
-            let (options, json_output) =
-                parse_install_options(installer::InstallCommand::Update, args)?;
-            match installer::run_install(options.clone()) {
-                Ok(report) => print_install_report(report, json_output),
-                Err(error) => {
-                    if json_output {
-                        print_install_failure_json(options.command, &error)?;
-                    }
-                    Err(error)
-                }
-            }
+        Some(command @ ("install" | "update" | "self-update")) => {
+            let (options, json_output) = parse_install_command_options(command, args)?;
+            let command = options.command;
+            // Complete installer side effects before acquiring stdout or writing the report.
+            let result = installer::run_install(options);
+            finish_install_result(command, result, json_output, &mut io::stdout().lock())
         }
         Some("start") => {
             let json_output = parse_optional_json_flag(args)?;
-            let warnings = service::start_gateway_service()?;
+            let report = service::start_gateway_service()?;
             if json_output {
-                print_start_report(warnings)
+                print_start_report(report)
             } else {
                 Ok(())
             }
@@ -388,35 +378,107 @@ fn parse_managed_by_flag(value: &str) -> Result<InstallManagedBy> {
     }
 }
 
-fn print_install_report(report: installer::InstallReport, json_output: bool) -> Result<()> {
-    if json_output {
-        println!("{}", serde_json::to_string_pretty(&report)?);
-        return Ok(());
-    }
+fn parse_install_command_options(
+    command: &str,
+    args: impl Iterator<Item = String>,
+) -> Result<(installer::InstallOptions, bool)> {
+    let command = match command {
+        "install" => installer::InstallCommand::Install,
+        "update" | "self-update" => installer::InstallCommand::Update,
+        _ => return Err(usage_error(format!("unknown install command: {command}"))),
+    };
+    parse_install_options(command, args)
+}
 
-    println!("Phase: {}", report.phase);
-    println!("Command: {}", report.command);
-    println!("Install root: {}", report.install_root);
-    println!("Installed binary: {}", report.installed_binary);
-    println!("Installed version: {}", report.installed_version);
-    println!("Service active before install: {}", report.was_active);
-    println!("Service started after install: {}", report.started);
-    println!("Command link created: {}", report.command_link_created);
-    println!("PATH updated: {}", report.path_updated);
-    println!("Service active now: {}", report.service_active);
-    println!("Gateway reachable now: {}", report.gateway_reachable);
-    if !report.warnings.is_empty() {
-        println!("Warnings:");
-        for warning in report.warnings {
-            println!("- [{}] {}", warning.code, warning.message);
+#[derive(Debug)]
+struct InstallFailureReportError(anyhow::Error);
+
+impl fmt::Display for InstallFailureReportError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "failed to output installation failure report: {:#}",
+            self.0
+        )
+    }
+}
+
+fn finish_install_result(
+    command: installer::InstallCommand,
+    result: Result<installer::InstallReport>,
+    json_output: bool,
+    writer: &mut impl Write,
+) -> Result<()> {
+    match result {
+        Ok(report) => print_install_report(report, json_output, writer),
+        Err(error) => {
+            if json_output {
+                if let Err(report_error) = print_install_failure_json(command, &error, writer) {
+                    // Keep the installer error as the source, including anyhow downcasts.
+                    return Err(error.context(InstallFailureReportError(report_error)));
+                }
+            }
+            Err(error)
         }
     }
-    Ok(())
+}
+
+fn write_install_report(writer: &mut impl Write, bytes: &[u8]) -> Result<()> {
+    // write_all handles short writes. Never flush or retry after a failed write.
+    let result = writer.write_all(bytes).and_then(|()| writer.flush());
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => Ok(()),
+        Err(error) => {
+            Err(anyhow::Error::new(error).context("failed to write or flush install report"))
+        }
+    }
+}
+
+fn print_install_report(
+    report: installer::InstallReport,
+    json_output: bool,
+    writer: &mut impl Write,
+) -> Result<()> {
+    if json_output {
+        let mut bytes = serde_json::to_vec_pretty(&report)?;
+        bytes.push(b'\n');
+        return write_install_report(writer, &bytes);
+    }
+
+    let mut bytes = Vec::new();
+    writeln!(bytes, "Phase: {}", report.phase)?;
+    writeln!(bytes, "Command: {}", report.command)?;
+    writeln!(bytes, "Install root: {}", report.install_root)?;
+    writeln!(bytes, "Installed binary: {}", report.installed_binary)?;
+    writeln!(bytes, "Installed version: {}", report.installed_version)?;
+    writeln!(
+        bytes,
+        "Service active before install: {}",
+        report.was_active
+    )?;
+    writeln!(bytes, "Service started after install: {}", report.started)?;
+    writeln!(
+        bytes,
+        "Command link created: {}",
+        report.command_link_created
+    )?;
+    writeln!(bytes, "PATH updated: {}", report.path_updated)?;
+    writeln!(bytes, "Service active now: {}", report.service_active)?;
+    writeln!(bytes, "Gateway reachable now: {}", report.gateway_reachable)?;
+    if !report.warnings.is_empty() {
+        writeln!(bytes, "Warnings:")?;
+        for warning in report.warnings {
+            writeln!(bytes, "- [{}] {}", warning.code, warning.message)?;
+        }
+    }
+    write_install_report(writer, &bytes)
 }
 
 fn print_install_failure_json(
     command: installer::InstallCommand,
     error: &anyhow::Error,
+    writer: &mut impl Write,
 ) -> Result<()> {
     let error_text = format!("{error:#}");
     let rolled_back = error_text.contains("rolled back");
@@ -435,10 +497,12 @@ fn print_install_failure_json(
         "rollback_performed": rolled_back,
         "error_code": error_code,
         "warnings": [],
+        "stage_timings": [],
         "error": error_text,
     });
-    println!("{}", serde_json::to_string_pretty(&payload)?);
-    Ok(())
+    let mut bytes = serde_json::to_vec_pretty(&payload)?;
+    bytes.push(b'\n');
+    write_install_report(writer, &bytes)
 }
 
 fn install_error_code(command: installer::InstallCommand, error_text: &str) -> &'static str {
@@ -467,8 +531,8 @@ fn install_error_code(command: installer::InstallCommand, error_text: &str) -> &
     }
 }
 
-fn print_start_report(warnings: Vec<service::GatewayServiceWarning>) -> Result<()> {
-    let status = service::gateway_service_status()?;
+fn print_start_report(mut report: service::GatewayServiceStartReport) -> Result<()> {
+    let status = report.observe("service.status.probe", service::gateway_service_status)?;
     let payload = json!({
         "phase": "started",
         "installed_version": env!("CARGO_PKG_VERSION"),
@@ -476,7 +540,8 @@ fn print_start_report(warnings: Vec<service::GatewayServiceWarning>) -> Result<(
         "gateway_reachable": status.gateway_reachable,
         "rollback_performed": false,
         "error_code": serde_json::Value::Null,
-        "warnings": warnings,
+        "warnings": report.warnings,
+        "stage_timings": report.stage_timings,
     });
     println!("{}", serde_json::to_string_pretty(&payload)?);
     Ok(())
@@ -585,6 +650,9 @@ fn binary_display_name() -> String {
 }
 
 #[cfg(test)]
+mod install_report_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -611,6 +679,17 @@ mod tests {
             .expect("ordinary args")
             .is_none()
         );
+    }
+
+    #[test]
+    fn json_commands_reserve_stdout_for_the_machine_protocol() {
+        assert!(requests_json_output(
+            [OsString::from("start"), OsString::from("--json")].into_iter()
+        ));
+        assert!(requests_json_output(
+            [OsString::from("install"), OsString::from("--json")].into_iter()
+        ));
+        assert!(!requests_json_output([OsString::from("start")].into_iter()));
     }
 
     #[test]

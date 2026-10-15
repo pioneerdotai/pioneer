@@ -2,6 +2,68 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::VoiceStatus;
+
+/// Bounded operational projection; contains no history, prompts, or provider error payloads.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct GatewaySelfImprovementStatus {
+    pub workspace_id: String,
+    pub phase: SelfImprovementPhase,
+    pub reason: SelfImprovementStatusReason,
+    pub observed_at_unix: i64,
+    pub last_run_at_unix: Option<i64>,
+    pub last_result: Option<SelfImprovementStatusReason>,
+    pub next_scheduled_at_unix: Option<i64>,
+    pub next_retry_at_unix: Option<i64>,
+    pub progress: Option<SelfImprovementProgress>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SelfImprovementProgress {
+    pub processed_chunks: u32,
+    pub total_chunks: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SelfImprovementPhase {
+    Disabled,
+    Unavailable,
+    Waiting,
+    Running,
+    Retrying,
+    Failed,
+    NoChange,
+    Completed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SelfImprovementStatusReason {
+    Disabled,
+    ModelUnavailable,
+    WorkerUnavailable,
+    Preparing,
+    NoNewSources,
+    AwaitingSchedule,
+    Analyzing,
+    Finalizing,
+    Pending,
+    Recovering,
+    Timeout,
+    OutputLimit,
+    InvalidResponse,
+    ProviderError,
+    ResponseFiltered,
+    NoCandidate,
+    ReviewerRejected,
+    ValidationRejected,
+    Created,
+    Updated,
+    RolledBack,
+    Cancelled,
+    Unknown,
+}
 use crate::turn::CLIAgentRuntimeKind;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
@@ -34,11 +96,33 @@ pub struct GatewaySettingsUpdate {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct GatewayGeneralSettingsUpdate {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction_model: Option<crate::GatewayModelSelection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keepawake: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub telemetry_enabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preflight_model: Option<GatewayMemoryModelSelection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_catalog_proxy: Option<GatewayModelCatalogProxyUpdate>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct GatewayModelCatalogProxyUpdate {
+    /// `Some` configures/replaces the proxy; `None` clears it. The value is
+    /// consumed by Gateway's keystore layer and is never persisted in settings.
+    pub proxy_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct GatewayModelCatalogSettings {
+    #[serde(default)]
+    pub proxy_configured: bool,
+    /// Credential-free display URL. Userinfo, query, and fragment are removed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_url: Option<String>,
+    #[serde(default)]
+    pub catalog_available: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -53,6 +137,9 @@ pub struct GatewaySettingsUpdateResponse {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct GatewaySettingsSnapshot {
+    /// Read-only status of learning in the connection's workspace. Absent on older gateways.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub self_improvement_status: Option<GatewaySelfImprovementStatus>,
     #[serde(default)]
     pub general: GatewayGeneralSettings,
     pub memory: GatewayMemorySettings,
@@ -155,19 +242,25 @@ pub struct GatewayVoiceInputStatusChangedNotification {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct GatewayGeneralSettings {
     #[serde(default)]
+    pub compaction_model: crate::GatewayModelSelection,
+    #[serde(default)]
     pub keepawake: bool,
     #[serde(default = "default_telemetry_enabled")]
     pub telemetry_enabled: bool,
     #[serde(default)]
     pub preflight_model: GatewayMemoryModelSelection,
+    #[serde(default)]
+    pub model_catalog: GatewayModelCatalogSettings,
 }
 
 impl Default for GatewayGeneralSettings {
     fn default() -> Self {
         Self {
+            compaction_model: Default::default(),
             keepawake: false,
             telemetry_enabled: default_telemetry_enabled(),
             preflight_model: GatewayMemoryModelSelection::default(),
+            model_catalog: GatewayModelCatalogSettings::default(),
         }
     }
 }
@@ -222,6 +315,9 @@ pub struct GatewaySelfImprovementSettings {
 pub struct GatewaySelfImprovementModelSelection {
     pub provider: String,
     pub model: String,
+    /// None delegates to the provider; `none` explicitly disables reasoning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
 }
 
 impl GatewaySelfImprovementModelSelection {
@@ -236,6 +332,14 @@ impl GatewaySelfImprovementModelSelection {
         Ok(Self {
             provider: provider.to_owned(),
             model: model.to_owned(),
+            reasoning_effort: self
+                .reasoning_effort
+                .map(|effort| {
+                    crate::ReasoningEffort::canonical_value(&effort)
+                        .map(str::to_owned)
+                        .ok_or_else(|| "invalid self-improvement reasoning effort".to_owned())
+                })
+                .transpose()?,
         })
     }
 }
@@ -444,6 +548,10 @@ impl Default for GatewayCliRuntimeSettings {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct GatewayCliRuntimeInstanceSettings {
+    /// Workspace override. Omission in updates preserves the stored value;
+    /// an explicit Inherit removes it without affecting other workspaces.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction_model: Option<crate::GatewayModelSelection>,
     pub id: String,
     pub kind: CLIAgentRuntimeKind,
     pub display_name: String,
@@ -462,6 +570,7 @@ pub struct GatewayCliRuntimeInstanceSettings {
 impl GatewayCliRuntimeInstanceSettings {
     pub fn default_codex() -> Self {
         Self {
+            compaction_model: None,
             id: "codex".to_owned(),
             kind: CLIAgentRuntimeKind::Codex,
             display_name: "Codex".to_owned(),
@@ -475,6 +584,7 @@ impl GatewayCliRuntimeInstanceSettings {
 
     pub fn default_claude() -> Self {
         Self {
+            compaction_model: None,
             id: "claude".to_owned(),
             kind: CLIAgentRuntimeKind::Claude,
             display_name: "Claude".to_owned(),
@@ -488,6 +598,7 @@ impl GatewayCliRuntimeInstanceSettings {
 
     pub fn default_opencode() -> Self {
         Self {
+            compaction_model: None,
             id: "opencode".to_owned(),
             kind: CLIAgentRuntimeKind::OpenCode,
             display_name: "OpenCode".to_owned(),
@@ -793,6 +904,32 @@ mod tests {
     use crate::turn::CLIAgentRuntimeKind;
 
     #[test]
+    fn general_settings_publish_only_supported_controls() {
+        let value = serde_json::to_value(GatewayGeneralSettings::default()).unwrap();
+        let keys: std::collections::BTreeSet<_> = value
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            std::collections::BTreeSet::from([
+                "compaction_model",
+                "keepawake",
+                "telemetry_enabled",
+                "preflight_model",
+                "model_catalog"
+            ])
+        );
+        let update: GatewayGeneralSettingsUpdate = serde_json::from_value(
+            serde_json::json!({"compaction_model": crate::GatewayModelSelection::Inherit}),
+        )
+        .unwrap();
+        assert!(update.compaction_model.is_some());
+    }
+
+    #[test]
     fn settings_general_defaults_to_thread_preflight_model() {
         let settings = GatewayGeneralSettings::default();
 
@@ -895,12 +1032,14 @@ mod tests {
     #[test]
     fn settings_general_update_roundtrips_preflight_model() {
         let update = GatewayGeneralSettingsUpdate {
+            compaction_model: None,
             keepawake: Some(true),
             telemetry_enabled: Some(false),
             preflight_model: Some(GatewayMemoryModelSelection::custom(
                 "planner-provider",
                 "planner-model",
             )),
+            model_catalog_proxy: None,
         };
 
         let serialized = serde_json::to_string(&update).expect("settings update should serialize");
@@ -915,12 +1054,32 @@ mod tests {
     }
 
     #[test]
+    fn model_catalog_proxy_update_is_explicit_and_snapshot_never_requires_a_secret() {
+        let update = GatewayGeneralSettingsUpdate {
+            model_catalog_proxy: Some(super::GatewayModelCatalogProxyUpdate {
+                proxy_url: Some("socks5://user:pass@127.0.0.1:1080".to_owned()),
+            }),
+            ..Default::default()
+        };
+        let value = serde_json::to_value(&update).unwrap();
+        let decoded: GatewayGeneralSettingsUpdate = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            decoded.model_catalog_proxy.unwrap().proxy_url.as_deref(),
+            Some("socks5://user:pass@127.0.0.1:1080")
+        );
+        let snapshot = GatewayGeneralSettings::default();
+        assert!(!snapshot.model_catalog.proxy_configured);
+        assert_eq!(snapshot.model_catalog.proxy_url, None);
+    }
+
+    #[test]
     fn self_improvement_snapshot_and_sectional_update_roundtrip() {
         let self_improvement = GatewaySelfImprovementSettings {
             enabled: true,
             default_model: Some(GatewaySelfImprovementModelSelection {
                 provider: "openai".to_owned(),
                 model: "gpt-5.4".to_owned(),
+                reasoning_effort: None,
             }),
             reviewer_model: None,
         };
@@ -942,6 +1101,7 @@ mod tests {
     #[test]
     fn settings_snapshot_roundtrips_thread_episodic_settings() {
         let snapshot = GatewaySettingsSnapshot {
+            self_improvement_status: None,
             general: GatewayGeneralSettings::default(),
             memory: Default::default(),
             self_improvement: Default::default(),
@@ -967,6 +1127,7 @@ mod tests {
             },
             cli_runtimes: GatewayCliRuntimeSettings {
                 instances: vec![GatewayCliRuntimeInstanceSettings {
+                    compaction_model: None,
                     id: "codex_work".to_owned(),
                     kind: CLIAgentRuntimeKind::Codex,
                     display_name: "Codex Work".to_owned(),
@@ -1002,6 +1163,7 @@ mod tests {
             }),
             cli_runtimes: Some(GatewayCliRuntimeSettings {
                 instances: vec![GatewayCliRuntimeInstanceSettings {
+                    compaction_model: None,
                     id: "codex_personal".to_owned(),
                     kind: CLIAgentRuntimeKind::Codex,
                     display_name: "Codex Personal".to_owned(),
@@ -1098,6 +1260,7 @@ mod tests {
     #[test]
     fn gateway_settings_snapshot_reports_vector_key_presence_without_secret_values() {
         let snapshot = GatewaySettingsSnapshot {
+            self_improvement_status: None,
             general: GatewayGeneralSettings::default(),
             memory: GatewayMemorySettings::default(),
             self_improvement: GatewaySelfImprovementSettings::default(),
@@ -1309,5 +1472,33 @@ mod tests {
         ] {
             assert_eq!(phase.coarse_voice_status(), expected);
         }
+    }
+    #[test]
+    fn self_improvement_reasoning_defaults_normalizes_and_rejects_unknown_efforts() {
+        let legacy: GatewaySelfImprovementModelSelection =
+            serde_json::from_str(r#"{"provider":"openrouter","model":"model"}"#).unwrap();
+        assert_eq!(legacy.reasoning_effort, None);
+        for (raw, expected) in [("High", "high"), ("off", "none"), ("extra-high", "xhigh")] {
+            let normalized = GatewaySelfImprovementModelSelection {
+                reasoning_effort: Some(raw.to_owned()),
+                ..legacy.clone()
+            }
+            .normalized()
+            .unwrap();
+            assert_eq!(normalized.reasoning_effort.as_deref(), Some(expected));
+            let encoded = serde_json::to_string(&normalized).unwrap();
+            assert_eq!(
+                serde_json::from_str::<GatewaySelfImprovementModelSelection>(&encoded).unwrap(),
+                normalized
+            );
+        }
+        assert!(
+            GatewaySelfImprovementModelSelection {
+                reasoning_effort: Some("unknown".to_owned()),
+                ..legacy
+            }
+            .normalized()
+            .is_err()
+        );
     }
 }

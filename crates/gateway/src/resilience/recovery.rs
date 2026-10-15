@@ -6,8 +6,8 @@ use pioneer_agent::{
 };
 use pioneer_config::GatewayCommandExecutionTimeoutConfig;
 use pioneer_crud::{
-    BlockedTurnRecoveryResumeOutcome, ClaimedRecoveryActivation, CrudStore,
-    NewTurnExecutionCheckpointRecord, NewTurnExecutionWindowRecord, RecoveryJobRecord,
+    AtomicRecoveryJobEnqueueOutcome, BlockedTurnRecoveryResumeOutcome, ClaimedRecoveryActivation,
+    CrudStore, NewTurnExecutionCheckpointRecord, NewTurnExecutionWindowRecord, RecoveryJobRecord,
     TimeoutCandidate, TurnExecutionCheckpointKind, TurnExecutionRecord, TurnExecutorKind,
 };
 use pioneer_protocol::{
@@ -80,6 +80,8 @@ struct RetainedProviderHistoryRow {
     sequence: i64,
     source: String,
     item_id: Option<String>,
+    // Retained only so test fixtures can reinsert the original context rows.
+    #[cfg(test)]
     tool_name: Option<String>,
     payload: String,
 }
@@ -303,7 +305,7 @@ impl Default for RecoveryPolicyRegistry {
                 action: CompactHistory,
                 max_attempts: 1,
                 base_backoff_secs: 1,
-                max_wall_clock_secs: 120,
+                max_wall_clock_secs: 900,
                 no_progress_limit: 1,
             },
         );
@@ -313,7 +315,7 @@ impl Default for RecoveryPolicyRegistry {
                 action: CompactHistory,
                 max_attempts: 1,
                 base_backoff_secs: 1,
-                max_wall_clock_secs: 120,
+                max_wall_clock_secs: 900,
                 no_progress_limit: 1,
             },
         );
@@ -521,6 +523,15 @@ pub enum RecoveryJobEnqueueOutcome {
     Reused(RecoveryJobRecord),
 }
 
+impl From<AtomicRecoveryJobEnqueueOutcome> for RecoveryJobEnqueueOutcome {
+    fn from(outcome: AtomicRecoveryJobEnqueueOutcome) -> Self {
+        match outcome {
+            AtomicRecoveryJobEnqueueOutcome::Created(job) => Self::Created(job),
+            AtomicRecoveryJobEnqueueOutcome::Reused(job) => Self::Reused(job),
+        }
+    }
+}
+
 impl RecoveryJobEnqueueOutcome {
     pub fn job(&self) -> &RecoveryJobRecord {
         match self {
@@ -655,14 +666,25 @@ enum RestoredRecoveryTurnUnavailable {
     MissingRuntimeSnapshot,
     MissingExecutionSecuritySnapshot,
     SnapshotMismatch,
-    SnapshotInvalid { error: String },
-    ExecutionWindowContinuationBlocked { reason: String },
+    SnapshotInvalid {
+        error: String,
+    },
+    ExecutionWindowContinuationBlocked {
+        reason: String,
+        stop_reason: Option<pioneer_protocol::RecoveryStopReason>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ExecutionWindowContinuationAdmission {
-    Open { window_index: u32 },
-    Block { total_windows: u32, reason: String },
+    Open {
+        window_index: u32,
+    },
+    Block {
+        total_windows: u32,
+        reason: String,
+        stop_reason: Option<pioneer_protocol::RecoveryStopReason>,
+    },
 }
 
 impl RestoredRecoveryTurnUnavailable {
@@ -683,7 +705,7 @@ impl RestoredRecoveryTurnUnavailable {
             Self::SnapshotInvalid { error } => Some(format!(
                 "cannot restore recovery after agent loop loss because durable turn runtime snapshot is invalid: {error}"
             )),
-            Self::ExecutionWindowContinuationBlocked { reason } => Some(reason.clone()),
+            Self::ExecutionWindowContinuationBlocked { reason, .. } => Some(reason.clone()),
             Self::TurnNotFound | Self::TurnNotInProgress => None,
         }
     }
@@ -726,6 +748,12 @@ impl RecoveryCoordinator {
             .into(),
             listener_starter: Arc::new(RwLock::new(None)),
         }
+    }
+
+    pub(crate) fn with_crud_store(&self, crud_store: Arc<CrudStore>) -> Self {
+        let mut scoped = self.clone();
+        scoped.crud_store = crud_store;
+        scoped
     }
 
     pub(crate) async fn set_listener_starter(&self, starter: RecoveryListenerStarter) {
@@ -777,21 +805,6 @@ impl RecoveryCoordinator {
         candidate: &TimeoutCandidate,
         now_unix: i64,
     ) -> Result<RecoveryJobEnqueueOutcome> {
-        if let Some(existing) = self
-            .open_recovery_for_turn(candidate.turn_id.as_str())
-            .await?
-        {
-            let _ = self
-                .crud_store
-                .mark_attempt_recovery_action(
-                    candidate.attempt_id.as_str(),
-                    existing.action,
-                    now_unix,
-                )
-                .await?;
-            return Ok(RecoveryJobEnqueueOutcome::Reused(existing));
-        }
-
         let decision = self.policy_for_timeout_candidate(candidate).await?;
         let policy = decision.policy;
 
@@ -817,9 +830,9 @@ impl RecoveryCoordinator {
                 serde_json::to_value(tool_snapshot).unwrap_or_else(|_| serde_json::json!({}));
         }
 
-        let record = self
+        let outcome: RecoveryJobEnqueueOutcome = self
             .crud_store
-            .enqueue_recovery_job(
+            .enqueue_recovery_job_if_no_unresolved(
                 candidate.turn_id.clone(),
                 candidate.item_id.clone(),
                 candidate.item_type,
@@ -839,14 +852,19 @@ impl RecoveryCoordinator {
                 snapshot,
                 now_unix,
             )
-            .await?;
+            .await?
+            .into();
 
         let _ = self
             .crud_store
-            .mark_attempt_recovery_action(candidate.attempt_id.as_str(), policy.action, now_unix)
+            .mark_attempt_recovery_action(
+                candidate.attempt_id.as_str(),
+                outcome.job().action,
+                now_unix,
+            )
             .await?;
 
-        Ok(RecoveryJobEnqueueOutcome::Created(record))
+        Ok(outcome)
     }
 
     pub async fn enqueue_provider_failure_job(
@@ -854,13 +872,6 @@ impl RecoveryCoordinator {
         candidate: &ProviderFailureCandidate,
         now_unix: i64,
     ) -> Result<RecoveryJobEnqueueOutcome> {
-        if let Some(existing) = self
-            .open_recovery_for_turn(candidate.turn_id.as_str())
-            .await?
-        {
-            return Ok(RecoveryJobEnqueueOutcome::Reused(existing));
-        }
-
         let provider_policy = self.provider_recovery_policy(&candidate.failure);
 
         // TODO(fallback_model): persist configured fallback model into provider snapshot,
@@ -879,9 +890,9 @@ impl RecoveryCoordinator {
             "is_recoverable_hint": candidate.failure.is_recoverable_hint,
         });
 
-        let record = self
+        let outcome = self
             .crud_store
-            .enqueue_recovery_job(
+            .enqueue_recovery_job_with_diagnostic_if_no_unresolved(
                 candidate.turn_id.clone(),
                 candidate.item_id.clone(),
                 candidate.item_type,
@@ -899,10 +910,13 @@ impl RecoveryCoordinator {
                 provider_policy.max_attempts,
                 snapshot.clone(),
                 snapshot,
+                Some(pioneer_protocol::RecoveryDiagnostic::provider(
+                    &candidate.failure,
+                )),
                 now_unix,
             )
             .await?;
-        Ok(RecoveryJobEnqueueOutcome::Created(record))
+        Ok(outcome.into())
     }
 
     pub async fn enqueue_runtime_failure_job(
@@ -910,13 +924,6 @@ impl RecoveryCoordinator {
         candidate: &RuntimeFailureCandidate,
         now_unix: i64,
     ) -> Result<RecoveryJobEnqueueOutcome> {
-        if let Some(existing) = self
-            .open_recovery_for_turn(candidate.turn_id.as_str())
-            .await?
-        {
-            return Ok(RecoveryJobEnqueueOutcome::Reused(existing));
-        }
-
         let mut snapshot = serde_json::json!({
             "source": "runtime_failure",
             "trigger": recovery_trigger_name(candidate.trigger),
@@ -931,9 +938,9 @@ impl RecoveryCoordinator {
             snapshot_object.insert("metadata".to_owned(), candidate.metadata.to_json());
         }
 
-        let record = self
+        let outcome = self
             .crud_store
-            .enqueue_recovery_job(
+            .enqueue_recovery_job_if_no_unresolved(
                 candidate.turn_id.clone(),
                 candidate.item_id.clone(),
                 candidate.item_type,
@@ -951,7 +958,7 @@ impl RecoveryCoordinator {
                 now_unix,
             )
             .await?;
-        Ok(RecoveryJobEnqueueOutcome::Created(record))
+        Ok(outcome.into())
     }
 
     pub async fn record_recovery_provider_failure(
@@ -960,6 +967,7 @@ impl RecoveryCoordinator {
         recovery_attempt_id: &str,
         failure: ProviderFailureDetails,
         now_unix: i64,
+        accepted_cli_outcome: Option<&pioneer_protocol::CliRuntimeBlockedTurnGuard>,
     ) -> Result<Vec<RecoveryCoordinatorEvent>> {
         let Some(job) = self.crud_store.get_recovery_job(recovery_job_id).await? else {
             return Ok(Vec::new());
@@ -978,16 +986,20 @@ impl RecoveryCoordinator {
                     recovery_attempt_id,
                     failure,
                     now_unix,
+                    accepted_cli_outcome,
                 )
                 .await;
         }
 
+        let diagnostic = pioneer_protocol::RecoveryDiagnostic::provider(&failure);
         self.record_active_recovery_failure(
             job,
             recovery_attempt_id,
             failure.message,
             failure.retry_after_ms,
+            Some(diagnostic),
             now_unix,
+            accepted_cli_outcome,
         )
         .await
     }
@@ -998,24 +1010,22 @@ impl RecoveryCoordinator {
         recovery_attempt_id: &str,
         failure: ProviderFailureDetails,
         now_unix: i64,
+        accepted_cli_outcome: Option<&pioneer_protocol::CliRuntimeBlockedTurnGuard>,
     ) -> Result<Vec<RecoveryCoordinatorEvent>> {
+        let mut diagnostic = pioneer_protocol::RecoveryDiagnostic::provider(&failure);
+        diagnostic.stop_reason = Some(pioneer_protocol::RecoveryStopReason::PolicyRejected);
+        let message = diagnostic.public_message();
         let attempt_number = attempt_number_for_job(&job);
-        let detail = failure
-            .message
-            .unwrap_or_else(|| "provider rejected the request".to_owned());
-        let message = format!(
-            "non-retryable provider request ({:?}); unchanged request will not be sent again: {detail}",
-            failure.class
-        );
-
         if !self
             .crud_store
-            .mark_recovery_job_terminal_after_attempt(
+            .mark_recovery_job_terminal_after_attempt_with_diagnostic(
                 job.id.as_str(),
                 recovery_attempt_id,
                 RecoveryJobStatus::Failed,
                 Some(message.clone()),
+                Some(diagnostic),
                 now_unix,
+                accepted_cli_outcome,
             )
             .await?
         {
@@ -1048,6 +1058,7 @@ impl RecoveryCoordinator {
         recovery_attempt_id: &str,
         failure_message: String,
         now_unix: i64,
+        accepted_cli_outcome: Option<&pioneer_protocol::CliRuntimeBlockedTurnGuard>,
     ) -> Result<Vec<RecoveryCoordinatorEvent>> {
         let Some(job) = self.crud_store.get_recovery_job(recovery_job_id).await? else {
             return Ok(Vec::new());
@@ -1063,7 +1074,9 @@ impl RecoveryCoordinator {
             recovery_attempt_id,
             Some(failure_message),
             None,
+            None,
             now_unix,
+            accepted_cli_outcome,
         )
         .await
     }
@@ -1151,7 +1164,9 @@ impl RecoveryCoordinator {
                     job_active_attempt_id.as_str(),
                     message.clone(),
                     None,
+                    None,
                     now_unix,
+                    None,
                 )
                 .await?,
             );
@@ -1166,7 +1181,63 @@ impl RecoveryCoordinator {
         active_attempt_id: &str,
         failure_message: Option<String>,
         retry_after_ms: Option<u64>,
+        diagnostic: Option<pioneer_protocol::RecoveryDiagnostic>,
         now_unix: i64,
+        accepted_cli_outcome: Option<&pioneer_protocol::CliRuntimeBlockedTurnGuard>,
+    ) -> Result<Vec<RecoveryCoordinatorEvent>> {
+        self.record_active_recovery_failure_with_native_source(
+            job,
+            active_attempt_id,
+            failure_message,
+            retry_after_ms,
+            diagnostic,
+            now_unix,
+            accepted_cli_outcome,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn record_native_recovery_start_failure(
+        &self,
+        execution: &TurnExecutionRecord,
+        recovery: &RecoveryAttemptContext,
+        failure_message: String,
+        now_unix: i64,
+    ) -> Result<Vec<RecoveryCoordinatorEvent>> {
+        let Some(job) = self.crud_store.get_recovery_job(&recovery.job_id).await? else {
+            return Ok(Vec::new());
+        };
+        if job.turn_id != execution.turn_id
+            || job.status != RecoveryJobStatus::Active
+            || job.active_attempt_id.as_deref() != Some(recovery.attempt_id.as_str())
+            || execution.owner_id != self.turn_execution_owner_id.as_ref()
+        {
+            return Ok(Vec::new());
+        }
+        self.record_active_recovery_failure_with_native_source(
+            job,
+            &recovery.attempt_id,
+            Some(failure_message),
+            None,
+            None,
+            now_unix,
+            None,
+            Some(execution),
+        )
+        .await
+    }
+
+    async fn record_active_recovery_failure_with_native_source(
+        &self,
+        job: RecoveryJobRecord,
+        active_attempt_id: &str,
+        failure_message: Option<String>,
+        retry_after_ms: Option<u64>,
+        diagnostic: Option<pioneer_protocol::RecoveryDiagnostic>,
+        now_unix: i64,
+        accepted_cli_outcome: Option<&pioneer_protocol::CliRuntimeBlockedTurnGuard>,
+        native_source: Option<&TurnExecutionRecord>,
     ) -> Result<Vec<RecoveryCoordinatorEvent>> {
         let policy = self.policy_for_recovery_job(&job).await?;
         let attempt_number = attempt_number_for_job(&job);
@@ -1180,30 +1251,47 @@ impl RecoveryCoordinator {
             policy.max_attempts >= 0 && consumed_run_count >= policy.max_attempts;
 
         if wall_clock_exceeded || no_progress_exceeded || attempts_exhausted {
-            let message = if wall_clock_exceeded {
-                "recovery wall-clock budget exhausted".to_owned()
-            } else if attempts_exhausted {
-                "recovery attempts exhausted".to_owned()
-            } else {
-                "recovery no-progress guardrail exhausted".to_owned()
-            };
+            let stop_reason = budget_stop_reason(wall_clock_exceeded, attempts_exhausted);
+            let mut diagnostic = diagnostic
+                .or_else(|| job.diagnostic.clone())
+                .unwrap_or_default();
+            diagnostic.stop_reason = Some(stop_reason);
+            let message = diagnostic.public_message();
 
             let last_error = failure_message
                 .clone()
                 .map(|detail| format!("{message}: {detail}"))
                 .unwrap_or_else(|| message.clone());
 
-            if self
-                .crud_store
-                .mark_recovery_job_terminal_after_attempt(
-                    job.id.as_str(),
-                    active_attempt_id,
-                    RecoveryJobStatus::Exhausted,
-                    Some(last_error),
-                    now_unix,
-                )
-                .await?
-            {
+            let applied = if let Some(execution) = native_source {
+                self.crud_store
+                    .record_native_recovery_start_failure_owned(
+                        execution,
+                        &RecoveryAttemptContext {
+                            job_id: job.id.clone(),
+                            attempt_id: active_attempt_id.to_owned(),
+                        },
+                        RecoveryJobStatus::Exhausted,
+                        None,
+                        Some(last_error),
+                        Some(diagnostic),
+                        now_unix,
+                    )
+                    .await?
+            } else {
+                self.crud_store
+                    .mark_recovery_job_terminal_after_attempt_with_diagnostic(
+                        job.id.as_str(),
+                        active_attempt_id,
+                        RecoveryJobStatus::Exhausted,
+                        Some(last_error),
+                        Some(diagnostic),
+                        now_unix,
+                        accepted_cli_outcome,
+                    )
+                    .await?
+            };
+            if applied {
                 self.cancel_other_open_jobs_after_terminal_recovery(
                     job.turn_id.as_str(),
                     job.id.as_str(),
@@ -1238,18 +1326,36 @@ impl RecoveryCoordinator {
             next_run_at_unix.saturating_sub(consumed_wall_clock_secs)
         });
         let reason = failure_message;
-        if self
-            .crud_store
-            .mark_recovery_job_retrying(
-                job.id.as_str(),
-                active_attempt_id,
-                next_run_at_unix,
-                budget_origin_after_cooldown_unix,
-                reason.clone(),
-                now_unix,
-            )
-            .await?
-        {
+        let applied = if let Some(execution) = native_source {
+            self.crud_store
+                .record_native_recovery_start_failure_owned(
+                    execution,
+                    &RecoveryAttemptContext {
+                        job_id: job.id.clone(),
+                        attempt_id: active_attempt_id.to_owned(),
+                    },
+                    RecoveryJobStatus::Pending,
+                    Some(next_run_at_unix),
+                    reason.clone(),
+                    diagnostic,
+                    now_unix,
+                )
+                .await?
+        } else {
+            self.crud_store
+                .mark_recovery_job_retrying_with_diagnostic(
+                    job.id.as_str(),
+                    active_attempt_id,
+                    next_run_at_unix,
+                    budget_origin_after_cooldown_unix,
+                    reason.clone(),
+                    diagnostic,
+                    now_unix,
+                    accepted_cli_outcome,
+                )
+                .await?
+        };
+        if applied {
             let next_attempt_number = attempt_number.saturating_add(1);
             return Ok(vec![RecoveryCoordinatorEvent::RetryScheduled {
                 job_id: job.id,
@@ -1385,6 +1491,18 @@ impl RecoveryCoordinator {
         error_message: &str,
         now_unix: i64,
     ) -> Result<Vec<RecoveryCoordinatorEvent>> {
+        self.block_active_recoveries_for_turn_if_owned(turn_id, recovery, error_message, now_unix)
+            .await?;
+        Ok(Vec::new())
+    }
+
+    pub async fn block_active_recoveries_for_turn_if_owned(
+        &self,
+        turn_id: &str,
+        recovery: Option<&RecoveryAttemptContext>,
+        error_message: &str,
+        now_unix: i64,
+    ) -> Result<bool> {
         let jobs = if let Some(recovery) = recovery {
             self.crud_store
                 .get_recovery_job(recovery.job_id.as_str())
@@ -1440,7 +1558,7 @@ impl RecoveryCoordinator {
                 .await?;
         }
 
-        Ok(Vec::new())
+        Ok(blocked_any)
     }
 
     async fn fail_active_recoveries_for_turn_with_cancel_reason(
@@ -1473,14 +1591,19 @@ impl RecoveryCoordinator {
                 continue;
             };
             let attempt_number = attempt_number_for_job(&job);
+            let diagnostic =
+                terminal_diagnostic(&job, pioneer_protocol::RecoveryStopReason::TerminalFailure);
+            let message = diagnostic.public_message();
             if self
                 .crud_store
-                .mark_recovery_job_terminal_after_attempt(
+                .mark_recovery_job_terminal_after_attempt_with_diagnostic(
                     job.id.as_str(),
                     active_attempt_id.as_str(),
                     RecoveryJobStatus::Failed,
                     Some(error_message.to_owned()),
+                    Some(diagnostic),
                     now_unix,
+                    None,
                 )
                 .await?
             {
@@ -1493,7 +1616,7 @@ impl RecoveryCoordinator {
                         item_type: job.item_type,
                         attempt_number,
                         status: RecoveryJobStatus::Failed,
-                        error_message: error_message.to_owned(),
+                        error_message: message,
                     },
                 ));
             }
@@ -1665,71 +1788,6 @@ impl RecoveryCoordinator {
                 .await?;
         }
 
-        // Compatibility for pre-migration Turns is deliberately restricted to
-        // positive native evidence: the legacy query requires a durable native
-        // runtime snapshot and excludes every Turn with a control-plane row.
-        for turn in self.crud_store.list_in_progress_native_turns(limit).await? {
-            if self
-                .open_recovery_for_turn(turn.turn_id.as_str())
-                .await?
-                .is_some()
-            {
-                continue;
-            }
-
-            if self
-                .crud_store
-                .get_turn_liveness(turn.turn_id.as_str())
-                .await?
-                .is_some_and(|liveness| {
-                    !liveness.last_activity_kind.starts_with("runtime/")
-                        && now_unix.saturating_sub(liveness.last_activity_at_unix)
-                            <= RECOVERY_PROGRESS_STALE_SECS
-                })
-            {
-                continue;
-            }
-
-            let has_snapshot = self
-                .crud_store
-                .get_turn_runtime_snapshot(turn.turn_id.as_str())
-                .await?
-                .is_some();
-            let policy = self
-                .policy_registry
-                .policy_for_item_type(TurnItemType::Reasoning);
-            let action = if has_snapshot {
-                RecoveryAction::RestartTurn
-            } else {
-                RecoveryAction::BlockResumable
-            };
-            let reason = if has_snapshot {
-                "native Turn was orphaned by a restart; resuming from its durable runtime snapshot"
-                    .to_owned()
-            } else {
-                "native Turn was orphaned by a restart without a durable runtime snapshot; preserving it as resumable blocked work"
-                    .to_owned()
-            };
-            let orphan_turn_id = turn.turn_id.clone();
-            let _ = self
-                .enqueue_runtime_failure_job(
-                    &RuntimeFailureCandidate {
-                        turn_id: orphan_turn_id.clone(),
-                        item_id: format!("orphan:{orphan_turn_id}"),
-                        item_type: TurnItemType::Reasoning,
-                        trigger: RecoveryTrigger::RuntimeFailure,
-                        action,
-                        reason,
-                        base_backoff_secs: policy.base_backoff_secs,
-                        max_attempts: if has_snapshot { policy.max_attempts } else { 0 },
-                        max_wall_clock_secs: policy.max_wall_clock_secs,
-                        no_progress_limit: policy.no_progress_limit,
-                        metadata: ToolMetadata::empty(),
-                    },
-                    now_unix,
-                )
-                .await?;
-        }
         Ok(())
     }
 
@@ -1738,6 +1796,16 @@ impl RecoveryCoordinator {
         execution: &TurnExecutionRecord,
         now_unix: i64,
     ) -> Result<()> {
+        if execution.executor_kind == TurnExecutorKind::CliRuntime
+            && self
+                .crud_store
+                .has_pending_cli_runtime_terminal_event(&execution.turn_id)
+                .await?
+        {
+            // Ownership takeover precedes the active scan. Preserve the exact
+            // accepted outcome for that scan instead of synthesizing a restart.
+            return Ok(());
+        }
         if self
             .open_recovery_for_turn(execution.turn_id.as_str())
             .await?
@@ -1878,14 +1946,17 @@ impl RecoveryCoordinator {
         }
 
         let attempt_number = attempt_number_for_job(&job);
-        let message = terminal_policy_error_message(&job);
+        let diagnostic =
+            terminal_diagnostic(&job, pioneer_protocol::RecoveryStopReason::PolicyRejected);
+        let message = diagnostic.public_message();
         if self
             .crud_store
-            .mark_due_pending_recovery_job_terminal_if_turn_idle(
+            .mark_due_pending_recovery_job_terminal_if_turn_idle_with_diagnostic(
                 job.id.as_str(),
                 RecoveryAction::MarkFailed,
                 RecoveryJobStatus::Failed,
                 Some(message.clone()),
+                Some(diagnostic),
                 now_unix,
             )
             .await?
@@ -1978,18 +2049,30 @@ impl RecoveryCoordinator {
                         active_attempt_id.as_str(),
                         message,
                         None,
+                        None,
                         now_unix,
+                        None,
                     )
                     .await?,
                 );
             } else {
                 let attempt_number = attempt_number_for_job(&job);
+                let diagnostic = terminal_diagnostic(
+                    &job,
+                    if job_budget_exceeded {
+                        pioneer_protocol::RecoveryStopReason::WallClockExhausted
+                    } else {
+                        pioneer_protocol::RecoveryStopReason::TerminalFailure
+                    },
+                );
+                let public_message = diagnostic.public_message();
                 if self
                     .crud_store
-                    .mark_malformed_active_recovery_job_terminal(
+                    .mark_malformed_active_recovery_job_terminal_with_diagnostic(
                         job.id.as_str(),
                         RecoveryJobStatus::Failed,
                         message.clone(),
+                        Some(diagnostic),
                         now_unix,
                     )
                     .await?
@@ -2008,9 +2091,7 @@ impl RecoveryCoordinator {
                             item_type: job.item_type,
                             attempt_number,
                             status: RecoveryJobStatus::Failed,
-                            error_message: message.unwrap_or_else(|| {
-                                "malformed active recovery job has no attempt id".to_owned()
-                            }),
+                            error_message: public_message,
                         },
                     ));
                 }
@@ -2031,6 +2112,46 @@ impl RecoveryCoordinator {
         let Some(claim_token) = job.claim_token.clone() else {
             bail!("claimed recovery job `{}` has no claim token", job.id);
         };
+
+        if self
+            .crud_store
+            .get_turn_execution(&job.turn_id)
+            .await?
+            .is_some_and(|execution| {
+                execution.executor_kind == TurnExecutorKind::CliRuntime
+                    && execution.status.is_active()
+                    && (execution.owner_id != self.turn_execution_owner_id.as_ref()
+                        || execution.lease_until.timestamp() <= now_unix)
+            })
+        {
+            self.crud_store
+                .release_claimed_recovery_job(
+                    &job.id,
+                    &claim_token,
+                    now_unix.saturating_add(5),
+                    Some("Turn execution authority awaits ownership takeover".into()),
+                    now_unix,
+                )
+                .await?;
+            return Ok(events);
+        }
+
+        if self
+            .crud_store
+            .has_pending_cli_runtime_terminal_event(&job.turn_id)
+            .await?
+        {
+            self.crud_store
+                .release_claimed_recovery_job(
+                    &job.id,
+                    &claim_token,
+                    now_unix.saturating_add(5),
+                    Some("accepted CLI terminal outcome awaits delivery".into()),
+                    now_unix,
+                )
+                .await?;
+            return Ok(events);
+        }
 
         let run_index = job.run_count.saturating_add(1);
 
@@ -2054,14 +2175,17 @@ impl RecoveryCoordinator {
         }
 
         if policy.action == RecoveryAction::MarkFailed {
-            let message = terminal_policy_error_message(&job);
+            let diagnostic =
+                terminal_diagnostic(&job, pioneer_protocol::RecoveryStopReason::PolicyRejected);
+            let message = diagnostic.public_message();
             if self
                 .crud_store
-                .mark_claimed_recovery_job_terminal(
+                .mark_claimed_recovery_job_terminal_with_diagnostic(
                     job.id.as_str(),
                     claim_token.as_str(),
                     RecoveryJobStatus::Failed,
                     Some(message.clone()),
+                    Some(diagnostic),
                     now_unix,
                 )
                 .await?
@@ -2125,21 +2249,20 @@ impl RecoveryCoordinator {
         let attempts_exhausted = policy.max_attempts >= 0 && run_index > policy.max_attempts;
 
         if wall_clock_exceeded || no_progress_exceeded || attempts_exhausted {
-            let message = if wall_clock_exceeded {
-                "recovery wall-clock budget exhausted".to_owned()
-            } else if attempts_exhausted {
-                "recovery attempts exhausted".to_owned()
-            } else {
-                "recovery no-progress guardrail exhausted".to_owned()
-            };
+            let diagnostic = terminal_diagnostic(
+                &job,
+                budget_stop_reason(wall_clock_exceeded, attempts_exhausted),
+            );
+            let message = diagnostic.public_message();
 
             if self
                 .crud_store
-                .mark_claimed_recovery_job_terminal(
+                .mark_claimed_recovery_job_terminal_with_diagnostic(
                     job.id.as_str(),
                     claim_token.as_str(),
                     RecoveryJobStatus::Exhausted,
                     Some(message.clone()),
+                    Some(diagnostic),
                     now_unix,
                 )
                 .await?
@@ -2314,14 +2437,18 @@ impl RecoveryCoordinator {
 
         let execution_plan = self.build_attempt_plan(&job, attempt_number).await?;
 
-        if let Some(message) = execution_plan.terminal_reason.clone() {
+        if execution_plan.terminal_reason.is_some() {
+            let diagnostic =
+                terminal_diagnostic(&job, pioneer_protocol::RecoveryStopReason::PolicyRejected);
+            let message = diagnostic.public_message();
             if self
                 .crud_store
-                .mark_claimed_recovery_job_terminal(
+                .mark_claimed_recovery_job_terminal_with_diagnostic(
                     job.id.as_str(),
                     claim_token.as_str(),
                     RecoveryJobStatus::Failed,
                     Some(message.clone()),
+                    Some(diagnostic),
                     now_unix,
                 )
                 .await?
@@ -2393,9 +2520,19 @@ impl RecoveryCoordinator {
                 .await
             {
                 Ok(ExecutionWindowContinuationAdmission::Open { window_index }) => window_index,
-                Ok(ExecutionWindowContinuationAdmission::Block { reason, .. }) => {
+                Ok(ExecutionWindowContinuationAdmission::Block {
+                    reason,
+                    stop_reason,
+                    ..
+                }) => {
                     return self
-                        .block_active_recovery(job, active_attempt_id, reason, now_unix)
+                        .block_active_recovery(
+                            job,
+                            active_attempt_id,
+                            reason,
+                            stop_reason,
+                            now_unix,
+                        )
                         .await;
                 }
                 Err(error) => {
@@ -2407,7 +2544,9 @@ impl RecoveryCoordinator {
                                 "failed to prepare CLI runtime recovery execution window: {error:#}"
                             )),
                             None,
+                            None,
                             now_unix,
+                            None,
                         )
                         .await;
                 }
@@ -2444,6 +2583,7 @@ impl RecoveryCoordinator {
                         format!(
                             "automatic recovery cannot safely replay the provider history: {error:#}"
                         ),
+                        None,
                         now_unix,
                     )
                     .await;
@@ -2458,7 +2598,11 @@ impl RecoveryCoordinator {
             )
             .await?;
         if let Some(context) = execution_checkpoint_context.as_ref()
-            && let ExecutionWindowContinuationAdmission::Block { reason, .. } = self
+            && let ExecutionWindowContinuationAdmission::Block {
+                reason,
+                stop_reason,
+                ..
+            } = self
                 .execution_window_continuation_admission_for_turn(
                     job.turn_id.as_str(),
                     Some(context.window_index),
@@ -2466,7 +2610,7 @@ impl RecoveryCoordinator {
                 .await?
         {
             return self
-                .block_active_recovery(job, active_attempt_id, reason, now_unix)
+                .block_active_recovery(job, active_attempt_id, reason, stop_reason, now_unix)
                 .await;
         }
         let continue_generation =
@@ -2483,6 +2627,12 @@ impl RecoveryCoordinator {
             disable_image_input: execution_plan.disable_image_input,
             refresh_provider_auth: execution_plan.refresh_provider_auth,
             compact_history: execution_plan.compact_history,
+            context_recovery_deadline_ms: execution_plan.compact_history.then(|| {
+                u64::try_from(job.scheduled_at_unix)
+                    .unwrap_or(0)
+                    .saturating_mul(1000)
+                    .saturating_add(pioneer_compaction::OPERATION_MILLIS)
+            }),
             continue_generation,
             model_override: execution_plan.model_override,
             retained_provider_history,
@@ -2526,7 +2676,9 @@ impl RecoveryCoordinator {
                             active_attempt_id.as_str(),
                             Some(reason),
                             None,
+                            None,
                             now_unix,
+                            None,
                         )
                         .await;
                 }
@@ -2590,6 +2742,18 @@ impl RecoveryCoordinator {
                                     )
                                     .await;
                             }
+                            let execution_source =
+                                self.crud_store.get_turn_execution(&job.turn_id).await?;
+                            if execution_source.as_ref().is_some_and(|execution| {
+                                execution.owner_id != self.turn_execution_owner_id.as_ref()
+                                    || execution.thread_id != thread_id
+                                    || execution.workspace_id != workspace_id
+                                    || !execution.status.is_active()
+                            }) {
+                                // Ownership may change after the earlier admission read.
+                                // Do not admit an actor or update another owner's execution.
+                                return Ok(events);
+                            }
                             match self
                                 .agent_manager
                                 .start_restored_recovery_turn(
@@ -2601,13 +2765,34 @@ impl RecoveryCoordinator {
                                 .await
                             {
                                 Ok(()) => {
-                                    if let Err(error) = self
-                                        .mark_recovered_execution_running(
-                                            job.turn_id.as_str(),
-                                            now_unix,
-                                        )
-                                        .await
-                                    {
+                                    let admission =
+                                        if let Some(execution) = execution_source.as_ref() {
+                                            self.crud_store
+                                                .mark_native_recovery_start_running_owned(
+                                                    execution,
+                                                    &RecoveryAttemptContext {
+                                                        job_id: job.id.clone(),
+                                                        attempt_id: active_attempt_id.clone(),
+                                                    },
+                                                    now_unix,
+                                                    now_unix.saturating_add(
+                                                        RECOVERY_JOB_CLAIM_LEASE_SECS as i64,
+                                                    ),
+                                                )
+                                                .await
+                                        } else {
+                                            self.mark_recovered_execution_running(
+                                                &job.turn_id,
+                                                now_unix,
+                                            )
+                                            .await
+                                            .map(|()| true)
+                                        };
+                                    if matches!(admission, Ok(false)) {
+                                        // A pre-start refusal or terminal transition already won.
+                                        return Ok(events);
+                                    }
+                                    if let Err(error) = admission {
                                         let reason = format!(
                                             "failed to commit restored Turn execution ownership: {error:#}"
                                         );
@@ -2625,7 +2810,9 @@ impl RecoveryCoordinator {
                                                 active_attempt_id.as_str(),
                                                 Some(reason),
                                                 None,
+                                                None,
                                                 now_unix,
+                                                None,
                                             )
                                             .await;
                                     }
@@ -2654,8 +2841,18 @@ impl RecoveryCoordinator {
                         }
                         RestoredRecoveryTurnRequestLookup::Unavailable(unavailable) => {
                             if let Some(reason) = unavailable.lost_loop_block_reason() {
+                                let stop_reason = match unavailable {
+                                    RestoredRecoveryTurnUnavailable::ExecutionWindowContinuationBlocked { stop_reason, .. } => stop_reason,
+                                    _ => None,
+                                };
                                 return self
-                                    .block_active_recovery(job, active_attempt_id, reason, now_unix)
+                                    .block_active_recovery(
+                                        job,
+                                        active_attempt_id,
+                                        reason,
+                                        stop_reason,
+                                        now_unix,
+                                    )
                                     .await;
                             }
                         }
@@ -2702,17 +2899,27 @@ impl RecoveryCoordinator {
         job: RecoveryJobRecord,
         active_attempt_id: String,
         reason: String,
+        stop_reason: Option<pioneer_protocol::RecoveryStopReason>,
         now_unix: i64,
     ) -> Result<Vec<RecoveryCoordinatorEvent>> {
+        let diagnostic = stop_reason.map(|stop_reason| terminal_diagnostic(&job, stop_reason));
+        // Keep the last provider failure separate from the reason retries stopped.
+        let last_error = if diagnostic.is_some() {
+            job.last_error.clone().or_else(|| job.reason.clone())
+        } else {
+            Some(reason.clone())
+        };
         let mut events = Vec::new();
         if self
             .crud_store
-            .mark_recovery_job_terminal_after_attempt(
+            .mark_recovery_job_terminal_after_attempt_with_diagnostic(
                 job.id.as_str(),
                 active_attempt_id.as_str(),
                 RecoveryJobStatus::Blocked,
-                Some(reason.clone()),
+                last_error,
+                diagnostic,
                 now_unix,
+                None,
             )
             .await?
         {
@@ -2732,6 +2939,29 @@ impl RecoveryCoordinator {
         Ok(events)
     }
 
+    #[cfg(test)]
+    pub(crate) async fn run_claimed_recovery_job_for_test(
+        &self,
+        job: RecoveryJobRecord,
+        now_unix: i64,
+    ) -> Result<Vec<RecoveryCoordinatorEvent>> {
+        self.run_single_job(job, now_unix).await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn handle_recovery_start_error_for_test(
+        &self,
+        job: RecoveryJobRecord,
+        attempt_id: String,
+        error: AgentControlError,
+        now_unix: i64,
+    ) -> Result<Vec<RecoveryCoordinatorEvent>> {
+        let policy = self.policy_for_recovery_job(&job).await?;
+        let attempt_number = attempt_number_for_job(&job);
+        self.handle_recovery_start_error(job, attempt_id, error, policy, attempt_number, now_unix)
+            .await
+    }
+
     async fn handle_recovery_start_error(
         &self,
         job: RecoveryJobRecord,
@@ -2741,9 +2971,19 @@ impl RecoveryCoordinator {
         attempt_number: u32,
         now_unix: i64,
     ) -> Result<Vec<RecoveryCoordinatorEvent>> {
-        if let AgentControlError::ExecutionWindowContinuationBlocked { reason } = &error {
+        if let AgentControlError::ExecutionWindowContinuationBlocked {
+            reason,
+            stop_reason,
+        } = &error
+        {
             return self
-                .block_active_recovery(job, active_attempt_id, reason.clone(), now_unix)
+                .block_active_recovery(
+                    job,
+                    active_attempt_id,
+                    reason.clone(),
+                    *stop_reason,
+                    now_unix,
+                )
                 .await;
         }
 
@@ -2753,15 +2993,19 @@ impl RecoveryCoordinator {
             AgentControlError::TurnMismatch | AgentControlError::ThreadNotFound
         );
         if terminal {
-            let message = error.to_string();
+            let diagnostic =
+                terminal_diagnostic(&job, pioneer_protocol::RecoveryStopReason::TerminalFailure);
+            let message = diagnostic.public_message();
             if self
                 .crud_store
-                .mark_recovery_job_terminal_after_attempt(
+                .mark_recovery_job_terminal_after_attempt_with_diagnostic(
                     job.id.as_str(),
                     active_attempt_id.as_str(),
                     RecoveryJobStatus::Failed,
-                    Some(message.clone()),
+                    Some(error.to_string()),
+                    Some(diagnostic),
                     now_unix,
+                    None,
                 )
                 .await?
             {
@@ -3040,6 +3284,7 @@ impl RecoveryCoordinator {
 
         let mut request =
             match crate::turn_runtime_snapshot::restored_recovery_turn_request_from_snapshot(
+                self.crud_store.as_ref(),
                 &snapshot,
                 turn.permission_profile,
                 match self
@@ -3062,7 +3307,9 @@ impl RecoveryCoordinator {
                     }
                 },
                 agent_skill_overlay,
-            ) {
+            )
+            .await
+            {
                 Ok(request) => request,
                 Err(error) => {
                     return Ok(RestoredRecoveryTurnRequestLookup::Unavailable(
@@ -3127,9 +3374,16 @@ impl RecoveryCoordinator {
             ExecutionWindowContinuationAdmission::Open { window_index } => {
                 request.execution_window_index = window_index;
             }
-            ExecutionWindowContinuationAdmission::Block { reason, .. } => {
+            ExecutionWindowContinuationAdmission::Block {
+                reason,
+                stop_reason,
+                ..
+            } => {
                 return Ok(RestoredRecoveryTurnRequestLookup::Unavailable(
-                    RestoredRecoveryTurnUnavailable::ExecutionWindowContinuationBlocked { reason },
+                    RestoredRecoveryTurnUnavailable::ExecutionWindowContinuationBlocked {
+                        reason,
+                        stop_reason,
+                    },
                 ));
             }
         }
@@ -3486,6 +3740,7 @@ impl RecoveryCoordinator {
                     && usage.total_tool_calls >= u64::from(limit)
                 {
                     return Ok(ExecutionWindowContinuationAdmission::Block {
+                        stop_reason: None,
                         total_windows: usage.total_windows,
                         reason: format!(
                             "max_total_tool_calls_per_turn reached: limit={limit}, observed={}",
@@ -3497,6 +3752,7 @@ impl RecoveryCoordinator {
                     && usage.total_wall_clock_ms >= limit
                 {
                     return Ok(ExecutionWindowContinuationAdmission::Block {
+                        stop_reason: None,
                         total_windows: usage.total_windows,
                         reason: format!(
                             "max_total_wall_clock_ms_per_turn reached: limit={limit}, observed={}",
@@ -3509,6 +3765,7 @@ impl RecoveryCoordinator {
                     && usage.total_provider_tokens >= limit
                 {
                     return Ok(ExecutionWindowContinuationAdmission::Block {
+                        stop_reason: None,
                         total_windows: usage.total_windows,
                         reason: format!(
                             "max_total_provider_tokens_per_turn reached: limit={limit}, observed={}",
@@ -3524,6 +3781,7 @@ impl RecoveryCoordinator {
                     .max(1);
                 if usage.consecutive_no_progress_windows >= limit {
                     return Ok(ExecutionWindowContinuationAdmission::Block {
+                        stop_reason: Some(pioneer_protocol::RecoveryStopReason::NoProgress),
                         total_windows: usage.total_windows,
                         reason: execution_window_no_progress_reason(
                             limit,
@@ -3537,6 +3795,7 @@ impl RecoveryCoordinator {
                 total_windows,
                 max_windows_per_turn,
             } => Ok(ExecutionWindowContinuationAdmission::Block {
+                stop_reason: None,
                 total_windows,
                 reason: execution_window_limit_reason(total_windows, max_windows_per_turn),
             }),
@@ -3816,7 +4075,19 @@ impl RecoveryCoordinator {
             action: job.action,
             max_attempts: job.max_attempts,
             base_backoff_secs: policy_snapshot_u64(job, "base_backoff_secs").unwrap_or(1),
-            max_wall_clock_secs: policy_snapshot_u64(job, "max_wall_clock_secs").unwrap_or(60),
+            // Legacy snapshots predate the single hour-long compaction/retry
+            // operation. Preserve their admission time, never restart the clock.
+            max_wall_clock_secs: if job.action == RecoveryAction::CompactHistory
+                && matches!(
+                    job.error_class,
+                    Some(
+                        ProviderFailureClass::ContextTooLarge | ProviderFailureClass::PromptTooLong
+                    )
+                ) {
+                pioneer_compaction::OPERATION_MILLIS / 1000
+            } else {
+                policy_snapshot_u64(job, "max_wall_clock_secs").unwrap_or(60)
+            },
             no_progress_limit: policy_snapshot_i64(job, "no_progress_limit")
                 .unwrap_or(job.max_attempts),
         })
@@ -3826,35 +4097,253 @@ impl RecoveryCoordinator {
         &self,
         turn_id: &str,
     ) -> Result<Vec<RetainedProviderHistoryMessage>> {
-        let rows = self
-            .crud_store
-            .list_turn_llm_context(turn_id)
+        use pioneer_crud::compaction::PagedSource;
+        let store = self.crud_store.with_maintenance_access();
+        let (thread, workspace) = store
+            .get_turn_location(turn_id)
             .await?
-            .into_iter()
-            .map(|row| RetainedProviderHistoryRow {
-                sequence: row.sequence,
-                source: row.source,
-                item_id: row.item_id,
-                tool_name: row.tool_name,
-                payload: row.payload,
-            })
-            .collect::<Vec<_>>();
-        let item_ids = retained_provider_history_item_ids(rows.as_slice());
-        let resumable_item_ids = self
-            .crud_store
-            .get_turn_items_by_ids(turn_id, item_ids.as_slice())
+            .ok_or_else(|| anyhow::anyhow!("retained history scope is missing"))?;
+        let mut preparation_after = 0;
+        while let Some(next) = store
+            .compaction_prepare_turn_context_quantum(
+                &workspace,
+                &thread,
+                turn_id,
+                preparation_after,
+            )
             .await?
-            .into_iter()
-            .filter_map(|(item_id, item)| {
-                item.recovery_policy()
-                    .is_some_and(|policy| {
-                        policy.can_resume
-                            && policy.idempotency_mode == ToolRecoveryIdempotencyMode::Safe
-                    })
-                    .then_some(item_id)
-            })
+        {
+            anyhow::ensure!(
+                next > preparation_after,
+                "retained history preparation made no progress"
+            );
+            preparation_after = next;
+            tokio::task::yield_now().await;
+        }
+        let high_water = store
+            .compaction_source_high_water(
+                &workspace,
+                &thread,
+                turn_id,
+                PagedSource::ProviderContext,
+            )
+            .await?;
+        let mut after = 0;
+        let mut rows = Vec::new();
+        let mut sources = HashMap::new();
+        while after < high_water {
+            let page = store
+                .compaction_source_metadata_page(
+                    &workspace,
+                    &thread,
+                    turn_id,
+                    PagedSource::ProviderContext,
+                    after,
+                )
+                .await?;
+            anyhow::ensure!(
+                page.next_sequence > after,
+                "retained history source disappeared"
+            );
+            after = page.next_sequence;
+            for row in page.entries.into_iter().filter(|row| {
+                row.sequence <= high_water
+                    && pioneer_crud::compaction::model_history_context_source(&row.source_type)
+            }) {
+                let payload = match row.payload {
+                    Some(payload) => payload,
+                    None => store
+                        .compaction_reference_payload(&workspace, &thread, &row.reference)
+                        .await?
+                        .ok_or_else(|| anyhow::anyhow!("retained source revision disappeared"))?,
+                };
+                sources.insert(row.sequence, row.reference);
+                rows.push(RetainedProviderHistoryRow {
+                    sequence: row.sequence,
+                    source: row.source_type,
+                    item_id: row.item_id,
+                    #[cfg(test)]
+                    tool_name: row.tool_name,
+                    payload,
+                });
+            }
+        }
+        // Legacy assistant calls cannot be replayed with their cleanup-eligible
+        // tool_result rows. Dropping that sequence is safe only when durable
+        // terminal item state proves every call completed. Never inspect the
+        // excluded tool_result payload to make this decision.
+        let mut verified_legacy = HashSet::new();
+        for row in rows.iter().filter(|row| row.source == "assistant_round") {
+            if serde_json::from_str::<pioneer_provider::CanonicalProviderRoundEnvelope>(
+                &row.payload,
+            )
+            .is_ok()
+            {
+                continue;
+            }
+            let legacy: ChatMessage = serde_json::from_str(&row.payload)?;
+            let calls = validated_legacy_assistant_calls(turn_id, &legacy)?;
+            for call in calls {
+                anyhow::ensure!(
+                    crate::compaction::retained_shell_outcome(
+                        &store, &workspace, &thread, turn_id, &call.id, &call.id, &call.name,
+                    )
+                    .await?
+                    .is_some(),
+                    "incomplete legacy tool outcome for call `{}`",
+                    call.id
+                );
+            }
+            verified_legacy.insert(row.sequence);
+        }
+        rows.retain(|row| !verified_legacy.contains(&row.sequence));
+        // Capture the exact round/item mapping before the existing recovery
+        // assembler orders results and synthesizes safe interrupted observations.
+        let origins = hydrated_retained_history_origins(
+            &store, &workspace, &thread, turn_id, &rows, &sources,
+        )
+        .await?;
+        // A terminal shell item is acknowledged before the replay row. Recover
+        // that known outcome if the process stopped between the two appends.
+        let recorded_items = rows
+            .iter()
+            .filter(|row| row.source == "tool_result_v2")
+            .filter_map(|row| row.item_id.as_deref())
             .collect::<HashSet<_>>();
-        assemble_retained_provider_history_with_recovery(turn_id, rows, &resumable_item_ids)
+        let mut recovered = HashMap::new();
+        let mut recovered_sources = HashMap::new();
+        for row in rows.iter().filter(|row| row.source == "assistant_round") {
+            let Ok(envelope) = serde_json::from_str::<
+                pioneer_provider::CanonicalProviderRoundEnvelope,
+            >(&row.payload) else {
+                continue;
+            };
+            for identity in &envelope.calls {
+                if recorded_items.contains(identity.turn_item_id.as_str()) {
+                    continue;
+                }
+                let call = envelope
+                    .message
+                    .tool_calls
+                    .as_ref()
+                    .and_then(|calls| calls.get(identity.ordinal as usize))
+                    .ok_or_else(|| anyhow::anyhow!("canonical call ordinal is missing"))?;
+                anyhow::ensure!(
+                    call.id == identity.provider_call_id,
+                    "canonical call identity mismatch"
+                );
+                if let Some((source, message)) = crate::compaction::retained_shell_outcome(
+                    &store,
+                    &workspace,
+                    &thread,
+                    turn_id,
+                    &identity.turn_item_id,
+                    &identity.provider_call_id,
+                    &call.name,
+                )
+                .await?
+                {
+                    anyhow::ensure!(
+                        recovered
+                            .insert(identity.turn_item_id.clone(), message)
+                            .is_none(),
+                        "terminal item belongs to multiple rounds"
+                    );
+                    recovered_sources.insert(identity.turn_item_id.clone(), source);
+                }
+            }
+        }
+        let mut resumable_item_ids = HashSet::new();
+        for tool in origins.values().flat_map(|round| round.tools.values()) {
+            if tool.provenance.is_some() || recovered.contains_key(&tool.item_id) {
+                continue;
+            }
+            if crate::compaction::retained_tool_policy(
+                &store,
+                &workspace,
+                &thread,
+                turn_id,
+                &tool.item_id,
+            )
+            .await?
+            .is_some_and(|policy| {
+                policy.can_resume && policy.idempotency_mode == ToolRecoveryIdempotencyMode::Safe
+            }) {
+                resumable_item_ids.insert(tool.item_id.clone());
+            }
+        }
+        let mut retained = assemble_retained_provider_history_with_outcomes(
+            turn_id,
+            rows,
+            &resumable_item_ids,
+            &recovered,
+        )?;
+        let mut round = None;
+        for entry in &mut retained {
+            if entry.message.role == Role::Assistant {
+                round = origins.get(&entry.sequence);
+                if let Some(origin) = round {
+                    entry.message.provenance = Some(origin.assistant.clone());
+                }
+            } else if entry.message.role == Role::User {
+                if let Some(origin) = origins.get(&entry.sequence) {
+                    entry.message.provenance = Some(origin.assistant.clone());
+                }
+                round = None;
+            } else if entry.message.role == Role::Tool {
+                let origin = round.and_then(|round| {
+                    entry
+                        .message
+                        .tool_call_id
+                        .as_ref()
+                        .and_then(|id| round.tools.get(id))
+                });
+                let Some(origin) = origin else {
+                    if let Some(item) = entry.message.tool_call_id.as_ref() {
+                        let reference = serde_json::json!({"workspace_id": workspace, "thread_id": thread, "turn_id": turn_id, "item_id": item}).to_string();
+                        entry.message = pioneer_agent::compaction::restored_tool_result_message(
+                            &entry.message,
+                            &reference,
+                        )?;
+                    }
+                    continue;
+                };
+                // Synthetic interrupted observations have no retained outcome;
+                // leave them protected and do not fabricate a durable source.
+                let Some(mut provenance) = origin.provenance.clone().or_else(|| {
+                    recovered_sources.get(&origin.item_id).and_then(|source| {
+                        round.map(|round| {
+                            let mut provenance = round.assistant.clone();
+                            provenance.sources = vec![pioneer_provider::MessageSourceRef {
+                                scope: source.scope.clone(),
+                                id: source.id.clone(),
+                                version: source.version.clone(),
+                            }];
+                            provenance
+                        })
+                    })
+                }) else {
+                    continue;
+                };
+                if let Some(full) = store
+                    .compaction_tool_item_reference(&workspace, &thread, turn_id, &origin.item_id)
+                    .await?
+                {
+                    provenance.sources = vec![pioneer_provider::MessageSourceRef {
+                        scope: full.scope,
+                        id: full.id,
+                        version: full.version,
+                    }];
+                }
+                entry.message.provenance = Some(provenance);
+                let reference = serde_json::json!({"workspace_id": workspace, "thread_id": thread, "turn_id": turn_id, "item_id": origin.item_id}).to_string();
+                entry.message = pioneer_agent::compaction::restored_tool_result_message(
+                    &entry.message,
+                    &reference,
+                )?;
+            }
+        }
+        Ok(retained)
     }
 
     async fn cancel_other_open_jobs_after_terminal_recovery(
@@ -3922,12 +4411,9 @@ impl RecoveryCoordinator {
     }
 
     async fn open_recovery_for_turn(&self, turn_id: &str) -> Result<Option<RecoveryJobRecord>> {
-        Ok(self
-            .crud_store
-            .find_open_recovery_jobs_for_turn(turn_id)
-            .await?
-            .into_iter()
-            .next())
+        self.crud_store
+            .find_unresolved_recovery_job_for_turn(turn_id)
+            .await
     }
 
     async fn build_attempt_plan(
@@ -4039,178 +4525,236 @@ fn provider_snapshot_field<'a>(job: &'a RecoveryJobRecord, key: &str) -> Option<
     job.policy_snapshot.get(key)?.as_str()
 }
 
+struct RetainedRoundOrigins {
+    assistant: pioneer_provider::MessageProvenance,
+    tools: HashMap<String, RetainedToolOrigin>,
+}
+struct RetainedToolOrigin {
+    item_id: String,
+    provenance: Option<pioneer_provider::MessageProvenance>,
+}
+
+async fn hydrated_retained_history_origins(
+    store: &pioneer_crud::CrudStore,
+    workspace: &str,
+    thread: &str,
+    turn: &str,
+    rows: &[RetainedProviderHistoryRow],
+    sources: &HashMap<i64, pioneer_compaction::SourceRef>,
+) -> Result<HashMap<i64, RetainedRoundOrigins>> {
+    let mut origins = retained_history_origins(workspace, thread, turn, rows, sources)?;
+    for row in rows.iter().filter(|row| row.source == "assistant_round") {
+        let Ok(envelope) =
+            serde_json::from_str::<pioneer_provider::CanonicalProviderRoundEnvelope>(&row.payload)
+        else {
+            continue;
+        };
+        if envelope.calls.is_empty() {
+            if let (Some(round), Some(source)) =
+                (origins.get_mut(&row.sequence), sources.get(&row.sequence))
+            {
+                let evidence = crate::compaction::final_response_aliases(
+                    store,
+                    workspace,
+                    thread,
+                    turn,
+                    source,
+                    &envelope.round_id,
+                    row.item_id.as_deref(),
+                )
+                .await?;
+                round.assistant.source_aliases = evidence.aliases;
+                round.assistant.complete &= evidence.ready;
+            }
+        }
+    }
+    Ok(origins)
+}
+
+// Uses the same durable hydration as recovery, without starting a coordinator,
+// provider or recovery runner in the regression fixture.
+#[cfg(test)]
+pub(crate) async fn recovered_final_origin_for_test(
+    store: &pioneer_crud::CrudStore,
+    workspace: &str,
+    thread: &str,
+    turn: &str,
+    row: &pioneer_crud::TurnLlmContextEntry,
+    source: &pioneer_compaction::SourceRef,
+) -> Result<pioneer_provider::MessageProvenance> {
+    let row = RetainedProviderHistoryRow {
+        sequence: row.sequence,
+        source: row.source.clone(),
+        item_id: row.item_id.clone(),
+        tool_name: row.tool_name.clone(),
+        payload: row.payload.clone(),
+    };
+    let sequence = row.sequence;
+    let mut origins = hydrated_retained_history_origins(
+        &store.with_maintenance_access(),
+        workspace,
+        thread,
+        turn,
+        &[row],
+        &HashMap::from([(sequence, source.clone())]),
+    )
+    .await?;
+    Ok(origins
+        .remove(&sequence)
+        .ok_or_else(|| anyhow::anyhow!("final origin missing"))?
+        .assistant)
+}
+
+fn retained_history_origins(
+    workspace: &str,
+    thread: &str,
+    turn: &str,
+    rows: &[RetainedProviderHistoryRow],
+    sources: &HashMap<i64, pioneer_compaction::SourceRef>,
+) -> Result<HashMap<i64, RetainedRoundOrigins>> {
+    use pioneer_provider::{MessageProvenance, MessageSourceRef};
+    let provenance = |unit: &str, source: &pioneer_compaction::SourceRef| MessageProvenance {
+        logical_turn_id: None,
+        workspace_id: workspace.into(),
+        thread_id: thread.into(),
+        context_thread: None,
+        unit_id: format!("{turn}:{unit}"),
+        sources: vec![MessageSourceRef {
+            scope: source.scope.clone(),
+            id: source.id.clone(),
+            version: source.version.clone(),
+        }],
+        source_aliases: vec![],
+        ambiguous_input_aliases: vec![],
+        complete: true,
+        protected_input: false,
+        inherited: false,
+    };
+    let mut result = HashMap::<i64, RetainedRoundOrigins>::new();
+    let mut current = None;
+    for row in rows {
+        if row.source == "assistant_round" {
+            current = None;
+            if let Ok(envelope) = serde_json::from_str::<
+                pioneer_provider::CanonicalProviderRoundEnvelope,
+            >(&row.payload)
+            {
+                let source = sources
+                    .get(&row.sequence)
+                    .ok_or_else(|| anyhow::anyhow!("canonical round source missing"))?;
+                result.insert(
+                    row.sequence,
+                    RetainedRoundOrigins {
+                        assistant: provenance(&envelope.round_id, source),
+                        tools: envelope
+                            .calls
+                            .into_iter()
+                            .map(|call| {
+                                (
+                                    call.provider_call_id,
+                                    RetainedToolOrigin {
+                                        item_id: call.turn_item_id,
+                                        provenance: None,
+                                    },
+                                )
+                            })
+                            .collect(),
+                    },
+                );
+                current = Some((row.sequence, envelope.round_id));
+            }
+        } else if row.source == "tool_result_v2"
+            && let Some((sequence, unit)) = &current
+        {
+            let source = sources
+                .get(&row.sequence)
+                .ok_or_else(|| anyhow::anyhow!("canonical result source missing"))?;
+            if let Some(tool) = result.get_mut(sequence).and_then(|round| {
+                round
+                    .tools
+                    .values_mut()
+                    .find(|tool| Some(&tool.item_id) == row.item_id.as_ref())
+            }) {
+                tool.provenance = Some(provenance(unit, source));
+            }
+        }
+    }
+    Ok(result)
+}
+
 #[cfg(test)]
 fn assemble_retained_provider_history(
     turn_id: &str,
     rows: Vec<RetainedProviderHistoryRow>,
 ) -> Result<Vec<RetainedProviderHistoryMessage>> {
-    assemble_retained_provider_history_with_recovery(turn_id, rows, &HashSet::new())
+    assemble_retained_provider_history_with_outcomes(
+        turn_id,
+        rows,
+        &HashSet::new(),
+        &HashMap::new(),
+    )
 }
 
-fn assemble_retained_provider_history_with_recovery(
+fn assemble_retained_provider_history_with_outcomes(
     turn_id: &str,
     mut rows: Vec<RetainedProviderHistoryRow>,
     resumable_item_ids: &HashSet<String>,
+    recovered: &HashMap<String, ChatMessage>,
 ) -> Result<Vec<RetainedProviderHistoryMessage>> {
+    rows.retain(|row| pioneer_crud::compaction::model_history_context_source(&row.source));
     rows.sort_by_key(|row| row.sequence);
-
-    let canonical_start = rows.iter().position(|row| {
-        row.source == "tool_result_v2"
-            || (row.source == "assistant_round"
-                && serde_json::from_str::<pioneer_provider::CanonicalProviderRoundEnvelope>(
-                    row.payload.as_str(),
-                )
-                .is_ok())
-    });
-    let Some(canonical_start) = canonical_start else {
-        return assemble_legacy_provider_history(turn_id, rows);
-    };
-
-    let canonical_rows = rows.split_off(canonical_start);
-    let mut retained = assemble_legacy_provider_history(turn_id, rows)?;
-    retained.extend(assemble_canonical_provider_history(
-        turn_id,
-        canonical_rows,
-        resumable_item_ids,
-    )?);
-    Ok(retained)
-}
-
-fn retained_provider_history_item_ids(rows: &[RetainedProviderHistoryRow]) -> Vec<String> {
-    let mut item_ids = HashSet::new();
+    let mut canonical_rows = Vec::with_capacity(rows.len());
     for row in rows {
-        if let Some(item_id) = row.item_id.as_ref() {
-            item_ids.insert(item_id.clone());
-        }
         if row.source == "assistant_round"
-            && let Ok(envelope) = serde_json::from_str::<
-                pioneer_provider::CanonicalProviderRoundEnvelope,
-            >(row.payload.as_str())
+            && serde_json::from_str::<pioneer_provider::CanonicalProviderRoundEnvelope>(
+                &row.payload,
+            )
+            .is_err()
         {
-            item_ids.extend(
-                envelope
-                    .calls
-                    .into_iter()
-                    .map(|identity| identity.turn_item_id),
-            );
+            // The coordinator must establish durable terminal outcomes before
+            // removing legacy calls. This assembler has no such evidence.
+            let legacy: ChatMessage = serde_json::from_str(&row.payload).map_err(|error| {
+                anyhow::anyhow!("invalid retained assistant round for turn `{turn_id}`: {error}")
+            })?;
+            validated_legacy_assistant_calls(turn_id, &legacy)?;
+            anyhow::bail!("incomplete legacy tool outcome for turn `{turn_id}`");
         }
+        canonical_rows.push(row);
     }
-    item_ids.into_iter().collect()
+    assemble_canonical_provider_history(turn_id, canonical_rows, resumable_item_ids, recovered)
 }
 
-fn assemble_legacy_provider_history(
+fn validated_legacy_assistant_calls<'a>(
     turn_id: &str,
-    rows: Vec<RetainedProviderHistoryRow>,
-) -> Result<Vec<RetainedProviderHistoryMessage>> {
-    if rows.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let mut retained = Vec::with_capacity(rows.len());
-    let mut pending_tool_calls = HashSet::<String>::new();
-    let mut answered_tool_calls = HashSet::<String>::new();
-
-    for row in rows {
-        match row.source.as_str() {
-            "assistant_round" => {
-                if pending_tool_calls
-                    .iter()
-                    .any(|call_id| !answered_tool_calls.contains(call_id))
-                {
-                    bail!(
-                        "retained provider history for turn `{turn_id}` starts a new assistant round before every prior tool call has a retained result"
-                    );
-                }
-
-                let message =
-                    serde_json::from_str::<ChatMessage>(row.payload.as_str()).map_err(|error| {
-                        anyhow::anyhow!(
-                            "invalid retained assistant round for turn `{turn_id}`: {error}"
-                        )
-                    })?;
-                if message.role != Role::Assistant {
-                    bail!(
-                        "retained provider history for turn `{turn_id}` contains a non-assistant round"
-                    );
-                }
-                let tool_calls = message.tool_calls.as_ref().ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "retained assistant round for turn `{turn_id}` has no tool calls"
-                    )
-                })?;
-                if tool_calls.is_empty() {
-                    bail!(
-                        "retained assistant round for turn `{turn_id}` has an empty tool-call list"
-                    );
-                }
-
-                pending_tool_calls.clear();
-                answered_tool_calls.clear();
-                for call in tool_calls {
-                    if !pending_tool_calls.insert(call.id.clone()) {
-                        bail!(
-                            "retained assistant round for turn `{turn_id}` contains duplicate tool call `{}`",
-                            call.id
-                        );
-                    }
-                }
-                retained.push(RetainedProviderHistoryMessage {
-                    sequence: row.sequence,
-                    message,
-                });
-            }
-            "tool_result" => {
-                let item_id = row.item_id.ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "retained tool result for turn `{turn_id}` is missing its call id"
-                    )
-                })?;
-                let tool_name = row.tool_name.ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "retained tool result for turn `{turn_id}` call `{item_id}` is missing its tool name"
-                    )
-                })?;
-                if !pending_tool_calls.contains(item_id.as_str()) {
-                    bail!(
-                        "retained tool result for turn `{turn_id}` call `{item_id}` has no preceding complete assistant round"
-                    );
-                }
-                if !answered_tool_calls.insert(item_id.clone()) {
-                    bail!(
-                        "retained provider history for turn `{turn_id}` contains duplicate result for tool call `{item_id}`"
-                    );
-                }
-                let view =
-                    serde_json::from_str::<pioneer_tools::ToolResultView>(row.payload.as_str())?;
-                retained.push(RetainedProviderHistoryMessage {
-                    sequence: row.sequence,
-                    message: recovered_tool_result_message(item_id, tool_name, view),
-                });
-            }
-            source => {
-                bail!(
-                    "retained provider history for turn `{turn_id}` contains unsupported source `{source}`"
-                );
-            }
-        }
-    }
-
-    if pending_tool_calls
-        .iter()
-        .any(|call_id| !answered_tool_calls.contains(call_id))
-    {
-        bail!(
-            "retained provider history for turn `{turn_id}` is incomplete; refusing to send a malformed provider request"
+    message: &'a ChatMessage,
+) -> Result<&'a [pioneer_provider::ProviderToolCall]> {
+    anyhow::ensure!(
+        message.role == Role::Assistant,
+        "retained provider history for turn `{turn_id}` contains a non-assistant round"
+    );
+    let calls = message.tool_calls.as_ref().ok_or_else(|| {
+        anyhow::anyhow!("retained assistant round for turn `{turn_id}` has no tool calls")
+    })?;
+    anyhow::ensure!(
+        !calls.is_empty(),
+        "retained assistant round for turn `{turn_id}` has an empty tool-call list"
+    );
+    let mut identities = HashSet::new();
+    for call in calls {
+        anyhow::ensure!(
+            identities.insert(call.id.as_str()),
+            "retained assistant round for turn `{turn_id}` contains duplicate tool call `{}`",
+            call.id
         );
     }
-
-    Ok(retained)
+    Ok(calls)
 }
 
 fn assemble_canonical_provider_history(
     turn_id: &str,
     rows: Vec<RetainedProviderHistoryRow>,
     resumable_item_ids: &HashSet<String>,
+    recovered: &HashMap<String, ChatMessage>,
 ) -> Result<Vec<RetainedProviderHistoryMessage>> {
     use pioneer_provider::{CanonicalProviderRoundEnvelope, ProviderTermination};
 
@@ -4224,6 +4768,7 @@ fn assemble_canonical_provider_history(
         turn_id: &str,
         mut pending: PendingRound,
         resumable_item_ids: &HashSet<String>,
+        recovered: &HashMap<String, ChatMessage>,
         retained: &mut Vec<RetainedProviderHistoryMessage>,
     ) -> Result<()> {
         if pending.envelope.version != 1 {
@@ -4241,6 +4786,25 @@ fn assemble_canonical_provider_history(
                 "retained provider round `{}` for turn `{turn_id}` is not an assistant message",
                 pending.envelope.round_id
             );
+        }
+        if pending
+            .envelope
+            .message
+            .tool_calls
+            .as_ref()
+            .is_none_or(|calls| calls.is_empty())
+        {
+            anyhow::ensure!(
+                pending.envelope.termination == ProviderTermination::Complete
+                    && pending.envelope.calls.is_empty()
+                    && pending.results.is_empty(),
+                "invalid retained canonical assistant response"
+            );
+            retained.push(RetainedProviderHistoryMessage {
+                sequence: pending.sequence,
+                message: pending.envelope.message,
+            });
+            return Ok(());
         }
         if pending.envelope.termination != ProviderTermination::ToolCalls {
             bail!(
@@ -4292,6 +4856,15 @@ fn assemble_canonical_provider_history(
             }
         }
 
+        for identity in &identities {
+            if !pending.results.contains_key(&identity.turn_item_id)
+                && let Some(message) = recovered.get(&identity.turn_item_id)
+            {
+                pending
+                    .results
+                    .insert(identity.turn_item_id.clone(), message.clone());
+            }
+        }
         let resumptions = identities
             .iter()
             .filter(|identity| {
@@ -4358,7 +4931,13 @@ fn assemble_canonical_provider_history(
         match row.source.as_str() {
             "assistant_round" => {
                 if let Some(previous) = pending.take() {
-                    flush_round(turn_id, previous, resumable_item_ids, &mut retained)?;
+                    flush_round(
+                        turn_id,
+                        previous,
+                        resumable_item_ids,
+                        recovered,
+                        &mut retained,
+                    )?;
                 }
                 let envelope =
                     serde_json::from_str::<CanonicalProviderRoundEnvelope>(row.payload.as_str())
@@ -4409,7 +4988,13 @@ fn assemble_canonical_provider_history(
         }
     }
     if let Some(pending) = pending {
-        flush_round(turn_id, pending, resumable_item_ids, &mut retained)?;
+        flush_round(
+            turn_id,
+            pending,
+            resumable_item_ids,
+            recovered,
+            &mut retained,
+        )?;
     }
     Ok(retained)
 }
@@ -4428,50 +5013,6 @@ fn resumable_tool_interruption_message(provider_call_id: &str, tool_name: &str) 
         Some(payload),
     )
     .into_chat_message()
-}
-
-fn recovered_tool_result_message(
-    item_id: String,
-    tool_name: String,
-    view: pioneer_tools::ToolResultView,
-) -> ChatMessage {
-    let (content, payload) = match view {
-        pioneer_tools::ToolResultView::Text { text, truncated } => (
-            text.clone(),
-            serde_json::json!({
-                "output": text,
-                "truncated": truncated,
-                "recovered_from_turn_llm_context": true,
-            }),
-        ),
-        pioneer_tools::ToolResultView::Json {
-            mut value,
-            truncated,
-        } => {
-            if !value.is_object() {
-                value = serde_json::json!({ "value": value });
-            }
-            if let Some(map) = value.as_object_mut() {
-                map.entry("truncated".to_owned())
-                    .or_insert(serde_json::Value::Bool(truncated));
-                map.insert(
-                    "recovered_from_turn_llm_context".to_owned(),
-                    serde_json::Value::Bool(true),
-                );
-            }
-            let content =
-                serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string());
-            (content, value)
-        }
-        pioneer_tools::ToolResultView::Empty => (
-            String::new(),
-            serde_json::json!({
-                "recovered_from_turn_llm_context": true
-            }),
-        ),
-    };
-
-    ModelInputItem::tool_result(item_id, tool_name, content, Some(payload)).into_chat_message()
 }
 
 fn policy_snapshot_i64(job: &RecoveryJobRecord, key: &str) -> Option<i64> {
@@ -4606,19 +5147,6 @@ pub(crate) fn provider_failure_class_name(class: ProviderFailureClass) -> &'stat
     }
 }
 
-fn terminal_policy_error_message(job: &RecoveryJobRecord) -> String {
-    const BASE: &str = "recovery policy marks this failure as terminal";
-    match job
-        .reason
-        .as_deref()
-        .map(str::trim)
-        .filter(|reason| !reason.is_empty())
-    {
-        Some(reason) => format!("{BASE}: {reason}"),
-        None => BASE.to_owned(),
-    }
-}
-
 fn block_resumable_policy_message(job: &RecoveryJobRecord) -> String {
     let base = match job.error_class {
         Some(class) => format!(
@@ -4702,7 +5230,7 @@ mod tests {
         ProviderFailureCandidate, RecoveryCoordinator, RecoveryCoordinatorEvent,
         RecoveryJobEnqueueOutcome, RecoveryPolicyRegistry, RetainedProviderHistoryRow,
         RuntimeFailureCandidate, TURN_RECOVERY_MAX_WALL_CLOCK_SECS,
-        assemble_retained_provider_history, is_causal_recovery_progress,
+        assemble_retained_provider_history, is_causal_recovery_progress, terminal_diagnostic,
     };
     use migration::{Migrator, MigratorTrait};
     use pioneer_agent::{
@@ -4763,7 +5291,33 @@ mod tests {
     }
 
     #[test]
-    fn retained_provider_history_replays_complete_assistant_round_losslessly() {
+    fn resumed_no_tool_response_keeps_native_state() {
+        let mut message = ChatMessage::assistant("answer");
+        message.provider_replay_state = Some(ProviderReplayState::for_model(
+            "anthropic",
+            "fixture",
+            serde_json::json!({"schema_version":2,"blocks":[{"type":"text","text":"answer"}]}),
+        ));
+        let envelope = CanonicalProviderRoundEnvelope {
+            version: 1,
+            round_id: "final".into(),
+            termination: ProviderTermination::Complete,
+            message: message.clone(),
+            calls: vec![],
+        };
+        let rows = vec![retained_history_row(
+            10,
+            "assistant_round",
+            Some("final"),
+            None,
+            serde_json::to_string(&envelope).unwrap(),
+        )];
+        let restored = assemble_retained_provider_history("turn", rows).unwrap();
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].message, message);
+    }
+    #[test]
+    fn legacy_round_requires_durable_outcome_even_with_result_rows() {
         let assistant = ChatMessage::assistant_tool_calls_with_provider_state(
             Some("working"),
             Some("private reasoning"),
@@ -4822,16 +5376,12 @@ mod tests {
             ),
         ];
 
-        let retained = assemble_retained_provider_history("turn_lossless", rows).unwrap();
-
-        assert_eq!(retained.len(), 3);
-        assert_eq!(retained[0].message, assistant);
-        assert_eq!(retained[1].message.tool_call_id.as_deref(), Some("call_b"));
-        assert_eq!(retained[2].message.tool_call_id.as_deref(), Some("call_a"));
+        let error = assemble_retained_provider_history("turn_lossless", rows).unwrap_err();
+        assert!(error.to_string().contains("incomplete legacy tool outcome"));
     }
 
     #[test]
-    fn retained_provider_history_rejects_legacy_tool_result_without_assistant_round() {
+    fn legacy_tool_result_without_assistant_round_is_excluded() {
         let rows = vec![retained_history_row(
             1,
             "tool_result",
@@ -4840,17 +5390,15 @@ mod tests {
             serde_json::to_string(&pioneer_tools::ToolResultView::Empty).unwrap(),
         )];
 
-        let error = assemble_retained_provider_history("turn_legacy", rows).unwrap_err();
-
         assert!(
-            error
-                .to_string()
-                .contains("no preceding complete assistant round")
+            assemble_retained_provider_history("turn_legacy", rows)
+                .unwrap()
+                .is_empty()
         );
     }
 
     #[test]
-    fn retained_provider_history_rejects_incomplete_parallel_tool_results() {
+    fn incomplete_legacy_tool_sequence_blocks_without_durable_outcomes() {
         let assistant = ChatMessage::assistant_tool_calls(
             None::<String>,
             vec![
@@ -4883,9 +5431,12 @@ mod tests {
             ),
         ];
 
-        let error = assemble_retained_provider_history("turn_incomplete", rows).unwrap_err();
-
-        assert!(error.to_string().contains("is incomplete"));
+        assert!(
+            assemble_retained_provider_history("turn_incomplete", rows)
+                .unwrap_err()
+                .to_string()
+                .contains("incomplete legacy tool outcome")
+        );
     }
 
     fn canonical_round_row(
@@ -4943,6 +5494,449 @@ mod tests {
     }
 
     #[test]
+    fn failed_partial_observation_is_excluded_without_replaying_its_calls() {
+        let mut partial = ChatMessage::assistant("unfinished answer");
+        partial.tool_calls = Some(vec![ProviderToolCall {
+            id: "already-called".into(),
+            name: "read_file".into(),
+            arguments: "{}".into(),
+        }]);
+        let observation = retained_history_row(
+            3,
+            "provider_observation",
+            Some("failed-round"),
+            None,
+            serde_json::to_string(&CanonicalProviderRoundEnvelope {
+                version: 1,
+                round_id: "failed-round".into(),
+                termination: ProviderTermination::ProviderError,
+                message: partial,
+                calls: Vec::new(),
+            })
+            .unwrap(),
+        );
+        let restored = assemble_retained_provider_history(
+            "turn",
+            vec![
+                canonical_round_row(1, "successful-round", "already-called", "item"),
+                exact_result_row(2, "item", "already-called", "completed outcome"),
+                observation,
+            ],
+        )
+        .unwrap();
+        assert_eq!(restored.len(), 2);
+        assert_eq!(
+            restored
+                .iter()
+                .filter(|entry| entry.message.tool_calls.is_some())
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_restore_bounds_full_results_and_keeps_round_scoped_sources() {
+        let (store, _, coordinator) = setup_coordinator_with_agent().await;
+        let workspace = "ws_restore_bounded";
+        let thread = "thr_restore_bounded";
+        let turn = "turn_restore_bounded";
+        materialize_turn_with_tool_item(store.as_ref(), workspace, thread, turn, "item_one", None)
+            .await;
+        let rows = vec![
+            canonical_round_row(1, "round_one", "reused_call", "item_one"),
+            exact_result_row(
+                2,
+                "item_one",
+                "reused_call",
+                &"large retained result 🦀\n".repeat(20000),
+            ),
+            canonical_round_row(3, "round_two", "reused_call", "item_two"),
+            exact_result_row(4, "item_two", "reused_call", "second outcome"),
+        ];
+        for row in rows {
+            store
+                .insert_turn_llm_context(NewTurnLlmContextEntry {
+                    turn_id: turn.into(),
+                    item_id: row.item_id,
+                    attempt_id: None,
+                    sequence: row.sequence,
+                    source: row.source,
+                    tool_name: row.tool_name,
+                    payload: row.payload,
+                    output_policy_snapshot: "{}".into(),
+                    created_at: chrono::Utc::now().fixed_offset(),
+                    expires_at: None,
+                })
+                .await
+                .unwrap();
+        }
+        for (sequence, source) in [
+            (5, "provider_observation"),
+            (6, "tool_result"),
+            (7, "unknown_future_source"),
+        ] {
+            store
+                .insert_turn_llm_context(NewTurnLlmContextEntry {
+                    turn_id: turn.into(),
+                    item_id: None,
+                    attempt_id: None,
+                    sequence,
+                    source: source.into(),
+                    tool_name: None,
+                    payload: "{broken payload".into(),
+                    output_policy_snapshot: "{}".into(),
+                    created_at: chrono::Utc::now().fixed_offset(),
+                    expires_at: None,
+                })
+                .await
+                .unwrap();
+        }
+        let messages = coordinator
+            .retained_provider_history_for_turn(turn)
+            .await
+            .unwrap();
+        assert_eq!(messages.len(), 4);
+        assert_eq!(
+            store.delete_turn_llm_context_for_turn(turn).await.unwrap(),
+            3
+        );
+        let after_cleanup = coordinator
+            .retained_provider_history_for_turn(turn)
+            .await
+            .unwrap();
+        assert_eq!(after_cleanup.len(), messages.len());
+        for (before, after) in messages.iter().zip(after_cleanup) {
+            assert_eq!(before.message, after.message);
+        }
+        for pair in messages.chunks_exact(2) {
+            let assistant = pair[0].message.provenance.as_ref().unwrap();
+            let tool = pair[1].message.provenance.as_ref().unwrap();
+            assert_eq!(assistant.unit_id, tool.unit_id);
+            assert_eq!(tool.workspace_id, workspace);
+            assert_eq!(tool.thread_id, thread);
+            assert_ne!(assistant.sources, tool.sources);
+            let wire = serde_json::to_string(&pair[1].message).unwrap();
+            assert!(wire.len() <= pioneer_compaction::RESULT_BYTES);
+            assert!(pioneer_compaction::text_tokens(&wire) <= pioneer_compaction::RESULT_TOKENS);
+        }
+        assert_ne!(
+            messages[1].message.provenance.as_ref().unwrap().sources,
+            messages[3].message.provenance.as_ref().unwrap().sources
+        );
+        assert!(messages[1].message.content.contains("item_one"));
+        assert_eq!(messages[3].message.content, "second outcome");
+        // Restore is a projection: it cannot rewrite the retained original.
+        let full = store.list_turn_llm_context(turn).await.unwrap();
+        assert!(
+            full.iter()
+                .find(|row| row.sequence == 2)
+                .unwrap()
+                .payload
+                .len()
+                > 256 * 1024
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_restore_uses_acknowledged_shell_outcome_without_replay_row() {
+        let (store, _, coordinator) = setup_coordinator_with_agent().await;
+        let (workspace, thread, turn, item) = (
+            "ws_terminal_restore",
+            "thr_terminal_restore",
+            "turn_terminal_restore",
+            "shell_terminal",
+        );
+        let legacy_item = "legacy_shell_terminal";
+        materialize_turn_with_tool_item(
+            store.as_ref(),
+            workspace,
+            thread,
+            turn,
+            "unrelated_item",
+            None,
+        )
+        .await;
+        let mut row = canonical_round_row(3, "shell_round", "provider_shell", item);
+        let mut envelope: pioneer_provider::CanonicalProviderRoundEnvelope =
+            serde_json::from_str(&row.payload).unwrap();
+        envelope.message.tool_calls.as_mut().unwrap()[0].name = "exec_command".into();
+        row.payload = serde_json::to_string(&envelope).unwrap();
+        store
+            .insert_turn_llm_context(NewTurnLlmContextEntry {
+                turn_id: turn.into(),
+                item_id: row.item_id,
+                attempt_id: None,
+                sequence: row.sequence,
+                source: row.source,
+                tool_name: None,
+                payload: row.payload,
+                output_policy_snapshot: "{}".into(),
+                created_at: chrono::Utc::now().fixed_offset(),
+                expires_at: None,
+            })
+            .await
+            .unwrap();
+        let shell = TurnItem::CommandExecution {
+            id: item.into(),
+            tool_name: "exec_command".into(),
+            arguments: serde_json::json!({"command":"fixture-only"}),
+            status: ToolCallStatus::Completed,
+            recovery_policy: None,
+            output_policy: ToolOutputPolicySnapshot::for_tool_name("exec_command"),
+            display: ToolDisplayPayload::Hidden,
+            storage: ToolStoragePayload::Shell {
+                stdout: Some("retained terminal output".into()),
+                stderr: None,
+                aggregated_output: None,
+                exit_code: Some(0),
+                duration_ms: Some(1),
+                timed_out: Some(false),
+                truncated: false,
+            },
+            recovery: None,
+            command: vec!["fixture-only".into()],
+            cwd: None,
+            success: Some(true),
+            outcome: None,
+            observation: None,
+        };
+        store
+            .materialize_item_completed(
+                pioneer_protocol::ItemCompletedNotification {
+                    workspace_id: workspace.into(),
+                    thread_id: thread.into(),
+                    turn_id: turn.into(),
+                    item: shell.clone(),
+                },
+                chrono::Utc::now().timestamp(),
+            )
+            .await
+            .unwrap();
+        let canonical_source = store
+            .compaction_tool_item_reference(workspace, thread, turn, item)
+            .await
+            .unwrap()
+            .unwrap();
+        // A completed legacy round can be discarded using the terminal item;
+        // its old result bytes are ignored, while the following canonical
+        // round keeps its own call/result identity.
+        let legacy = ChatMessage::assistant_tool_calls(
+            None::<String>,
+            vec![ProviderToolCall {
+                id: legacy_item.into(),
+                name: "exec_command".into(),
+                arguments: "{}".into(),
+            }],
+        );
+        store
+            .insert_turn_llm_context(NewTurnLlmContextEntry {
+                turn_id: turn.into(),
+                item_id: Some("legacy_shell_round".into()),
+                attempt_id: None,
+                sequence: 1,
+                source: "assistant_round".into(),
+                tool_name: None,
+                payload: serde_json::to_string(&legacy).unwrap(),
+                output_policy_snapshot: "{}".into(),
+                created_at: chrono::Utc::now().fixed_offset(),
+                expires_at: None,
+            })
+            .await
+            .unwrap();
+        store
+            .insert_turn_llm_context(NewTurnLlmContextEntry {
+                turn_id: turn.into(),
+                item_id: Some(legacy_item.into()),
+                attempt_id: None,
+                sequence: 2,
+                source: "tool_result".into(),
+                tool_name: Some("exec_command".into()),
+                payload: "{broken".into(),
+                output_policy_snapshot: "{}".into(),
+                created_at: chrono::Utc::now().fixed_offset(),
+                expires_at: None,
+            })
+            .await
+            .unwrap();
+        let unknown = coordinator
+            .retained_provider_history_for_turn(turn)
+            .await
+            .unwrap_err();
+        assert!(
+            unknown
+                .to_string()
+                .contains("incomplete legacy tool outcome")
+        );
+        let mut legacy_shell = shell.clone();
+        if let TurnItem::CommandExecution { id, .. } = &mut legacy_shell {
+            *id = legacy_item.into();
+        }
+        store
+            .materialize_item_completed(
+                pioneer_protocol::ItemCompletedNotification {
+                    workspace_id: workspace.into(),
+                    thread_id: thread.into(),
+                    turn_id: turn.into(),
+                    item: legacy_shell,
+                },
+                chrono::Utc::now().timestamp(),
+            )
+            .await
+            .unwrap();
+        let completed_legacy_source = store
+            .compaction_tool_item_reference(workspace, thread, turn, legacy_item)
+            .await
+            .unwrap()
+            .unwrap();
+        let restored = coordinator
+            .retained_provider_history_for_turn(turn)
+            .await
+            .unwrap();
+        assert_eq!(restored.len(), 2);
+        assert_eq!(
+            restored[0].message.tool_calls.as_ref().unwrap()[0].id,
+            "provider_shell"
+        );
+        assert_eq!(
+            restored[1].message.tool_call_id.as_deref(),
+            Some("provider_shell")
+        );
+        assert!(
+            restored[1]
+                .message
+                .content
+                .contains("retained terminal output")
+        );
+        assert!(!restored[1].message.content.contains("Reissue"));
+        let restored_source = &restored[1].message.provenance.as_ref().unwrap().sources[0];
+        assert_eq!(restored_source.scope, canonical_source.scope);
+        assert_eq!(restored_source.id, canonical_source.id);
+        assert_eq!(restored_source.version, canonical_source.version);
+        assert_ne!(restored_source.id, completed_legacy_source.id);
+        assert_eq!(
+            store.list_turn_llm_context(turn).await.unwrap().len(),
+            3,
+            "reconciliation must not write a second result copy"
+        );
+        assert_eq!(
+            store
+                .compaction_tool_item_reference(workspace, thread, turn, legacy_item)
+                .await
+                .unwrap(),
+            Some(completed_legacy_source),
+            "recovery history preparation must not reexecute the completed legacy call"
+        );
+        let legacy_row_id = store
+            .list_turn_llm_context(turn)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|row| row.item_id.as_deref() == Some("legacy_shell_round"))
+            .unwrap()
+            .id;
+        let mut wrong_role = ChatMessage::user("invalid assistant role");
+        wrong_role.tool_calls = legacy.tool_calls.clone();
+        let mut empty_calls = ChatMessage::assistant("empty calls");
+        empty_calls.tool_calls = Some(Vec::new());
+        let mut duplicate_calls = legacy.clone();
+        let repeated_call = duplicate_calls.tool_calls.as_ref().unwrap()[0].clone();
+        duplicate_calls
+            .tool_calls
+            .as_mut()
+            .unwrap()
+            .push(repeated_call);
+        for (invalid, expected) in [
+            (wrong_role, "non-assistant round"),
+            (ChatMessage::assistant("no calls"), "has no tool calls"),
+            (empty_calls, "empty tool-call list"),
+            (duplicate_calls, "duplicate tool call"),
+        ] {
+            store
+                .database_connection()
+                .execute_raw(sea_orm::Statement::from_sql_and_values(
+                    sea_orm::DbBackend::Sqlite,
+                    "UPDATE turn_llm_context SET payload=? WHERE id=?",
+                    [
+                        serde_json::to_string(&invalid).unwrap().into(),
+                        legacy_row_id.clone().into(),
+                    ],
+                ))
+                .await
+                .unwrap();
+            let error = coordinator
+                .retained_provider_history_for_turn(turn)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains(expected), "{error:#}");
+        }
+        store
+            .database_connection()
+            .execute_raw(sea_orm::Statement::from_sql_and_values(
+                sea_orm::DbBackend::Sqlite,
+                "UPDATE turn_llm_context SET payload=? WHERE id=?",
+                [
+                    serde_json::to_string(&legacy).unwrap().into(),
+                    legacy_row_id.into(),
+                ],
+            ))
+            .await
+            .unwrap();
+        // Explicit failure is still a known outcome, never a reason to repeat.
+        let mut failed = shell;
+        if let TurnItem::CommandExecution {
+            status, success, ..
+        } = &mut failed
+        {
+            *status = ToolCallStatus::Failed;
+            *success = Some(false);
+        }
+        store
+            .materialize_item_completed(
+                pioneer_protocol::ItemCompletedNotification {
+                    workspace_id: workspace.into(),
+                    thread_id: thread.into(),
+                    turn_id: turn.into(),
+                    item: failed,
+                },
+                chrono::Utc::now().timestamp() + 1,
+            )
+            .await
+            .unwrap();
+        let restored = coordinator
+            .retained_provider_history_for_turn(turn)
+            .await
+            .unwrap();
+        assert!(restored[1].message.content.contains("failed"));
+        assert!(
+            crate::compaction::retained_shell_outcome(
+                &store,
+                "foreign",
+                thread,
+                turn,
+                item,
+                "provider_shell",
+                "exec_command"
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            crate::compaction::retained_shell_outcome(
+                &store,
+                workspace,
+                thread,
+                turn,
+                item,
+                "provider_shell",
+                "another_tool"
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    #[test]
     fn canonical_provider_history_replays_exact_result_by_provider_identity() {
         let retained = assemble_retained_provider_history(
             "turn_v2",
@@ -4961,6 +5955,23 @@ mod tests {
             Some("provider_call")
         );
         assert_eq!(retained[1].message.content, "exact output");
+    }
+
+    #[test]
+    fn excluded_context_between_canonical_call_and_result_is_not_parsed() {
+        let retained = assemble_retained_provider_history(
+            "turn_filtered",
+            vec![
+                canonical_round_row(1, "round", "provider_call", "turn_item"),
+                retained_history_row(2, "provider_observation", None, None, "{broken".into()),
+                retained_history_row(3, "tool_result", None, None, "{broken".into()),
+                retained_history_row(4, "unknown_source", None, None, "{broken".into()),
+                exact_result_row(5, "turn_item", "provider_call", "known result"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(retained.len(), 2);
+        assert_eq!(retained[1].message.content, "known result");
     }
 
     #[test]
@@ -5002,7 +6013,7 @@ mod tests {
     }
 
     #[test]
-    fn completed_legacy_prefix_can_continue_with_canonical_rounds_after_upgrade() {
+    fn legacy_prefix_requires_durable_outcomes_before_canonical_rounds() {
         let legacy_assistant = ChatMessage::assistant_tool_calls(
             None::<String>,
             vec![ProviderToolCall {
@@ -5011,7 +6022,7 @@ mod tests {
                 arguments: "{}".to_owned(),
             }],
         );
-        let retained = assemble_retained_provider_history(
+        let error = assemble_retained_provider_history(
             "turn_upgraded",
             vec![
                 retained_history_row(
@@ -5036,19 +6047,8 @@ mod tests {
                 exact_result_row(4, "turn_item_v2", "provider_call", "canonical result"),
             ],
         )
-        .unwrap();
-
-        assert_eq!(retained.len(), 4);
-        let legacy_payload =
-            serde_json::from_str::<serde_json::Value>(&retained[1].message.content).unwrap();
-        assert_eq!(legacy_payload["output"], "legacy result");
-        assert_eq!(legacy_payload["truncated"], false);
-        assert_eq!(legacy_payload["recovered_from_turn_llm_context"], true);
-        assert_eq!(
-            retained[1].message.tool_call_id.as_deref(),
-            Some("legacy_call")
-        );
-        assert_eq!(retained[3].message.content, "canonical result");
+        .unwrap_err();
+        assert!(error.to_string().contains("incomplete legacy tool outcome"));
     }
 
     #[test]
@@ -5067,6 +6067,44 @@ mod tests {
         assert_eq!(policy.max_wall_clock_secs, 900);
     }
 
+    #[tokio::test]
+    async fn compaction_legacy_recovery_policy_preserves_admission_and_one_retry() {
+        let (_store, coordinator) = setup_coordinator().await;
+        let mut job = coordinator
+            .enqueue_provider_failure_job(
+                &ProviderFailureCandidate {
+                    turn_id: "turn_legacy_compaction_budget".into(),
+                    item_id: "reasoning_legacy".into(),
+                    item_type: TurnItemType::Reasoning,
+                    failure: provider_failure(ProviderFailureClass::ContextTooLarge, "capacity"),
+                },
+                1_700_000_000,
+            )
+            .await
+            .unwrap()
+            .into_job();
+        // A persisted pre-proposal job carries the old nested 120s policy.
+        job.policy_snapshot["max_wall_clock_secs"] = serde_json::json!(120);
+        let admission = job.scheduled_at_unix;
+        let policy = coordinator.policy_for_recovery_job(&job).await.unwrap();
+        assert_eq!(
+            policy.max_wall_clock_secs,
+            pioneer_compaction::OPERATION_MILLIS / 1000
+        );
+        assert_eq!(policy.max_attempts, 1);
+        assert_eq!(job.scheduled_at_unix, admission);
+        job.action = RecoveryAction::DisableStreaming;
+        job.error_class = Some(ProviderFailureClass::UnsupportedStreaming);
+        assert_eq!(
+            coordinator
+                .policy_for_recovery_job(&job)
+                .await
+                .unwrap()
+                .max_wall_clock_secs,
+            120
+        );
+    }
+
     #[test]
     fn recoverable_provider_failures_use_fifteen_minute_job_budget() {
         let registry = RecoveryPolicyRegistry::default();
@@ -5075,6 +6113,8 @@ mod tests {
             ProviderFailureClass::NetworkTransient,
             ProviderFailureClass::RateLimit,
             ProviderFailureClass::Provider5xx,
+            ProviderFailureClass::ContextTooLarge,
+            ProviderFailureClass::PromptTooLong,
         ] {
             assert_eq!(
                 registry
@@ -5107,7 +6147,10 @@ mod tests {
                 ddg_instant_api_url: "https://api.duckduckgo.com/".to_owned(),
                 default_user_agent: "Mozilla/5.0".to_owned(),
             },
-            computer_use: ComputerUseToolsConfig::default(),
+            computer_use: ComputerUseToolsConfig {
+                runtime_home_dir: std::env::temp_dir().join("pioneer-recovery-tests"),
+                ..ComputerUseToolsConfig::default()
+            },
             skills: SkillsLoopConfig {
                 enabled: true,
                 max_skills_per_source: 256,
@@ -5429,6 +6472,142 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn owned_recovering_execution_retries_job_creation_after_claim_crash() {
+        let (crud_store, coordinator) = setup_coordinator().await;
+        let now = 1_700_000_200;
+        for (suffix, kind) in [
+            ("native", TurnExecutorKind::NativeAgent),
+            ("api", TurnExecutorKind::ApiProvider),
+        ] {
+            let workspace_id = format!("ws_claim_crash_{suffix}");
+            let thread_id = format!("thr_claim_crash_{suffix}");
+            let turn_id = format!("turn_claim_crash_{suffix}");
+            materialize_turn_with_tool_item(
+                &crud_store,
+                &workspace_id,
+                &thread_id,
+                &turn_id,
+                &format!("item_claim_crash_{suffix}"),
+                None,
+            )
+            .await;
+            persist_test_runtime_snapshot(&crud_store, &workspace_id, &thread_id, &turn_id).await;
+            insert_test_turn_execution(
+                &crud_store,
+                &workspace_id,
+                &thread_id,
+                &turn_id,
+                "replaced-owner",
+                kind,
+                now - 1,
+            )
+            .await;
+            let previous = crud_store
+                .get_turn_execution(&turn_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let claimed = crud_store
+                .claim_expired_turn_execution(
+                    &previous,
+                    coordinator.turn_execution_owner_id.as_ref(),
+                    now,
+                    now + 45,
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(claimed.owner_generation, 2);
+            assert_eq!(claimed.status, TurnExecutionStatus::Recovering);
+            assert!(
+                coordinator
+                    .open_recovery_for_turn(&turn_id)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                !crud_store
+                    .mark_turn_execution_running_owned(
+                        &turn_id,
+                        "replaced-owner",
+                        now + 1,
+                        now + 46,
+                    )
+                    .await
+                    .unwrap(),
+                "the replaced owner must remain fenced"
+            );
+            assert!(
+                crud_store
+                    .claim_expired_turn_execution(&previous, "competing-owner", now + 1, now + 46,)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "a stale candidate cannot claim again"
+            );
+
+            // Model loss of the job-creation step after a durable CAS. This
+            // fresh handle has no process-local record of the claimed row.
+            let restarted =
+                CrudStore::new(crud_store.database_connection()).with_maintenance_access();
+            assert!(
+                restarted
+                    .list_expired_foreign_turn_executions(
+                        coordinator.turn_execution_owner_id.as_ref(),
+                        now + 1,
+                        64,
+                    )
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                restarted
+                    .list_owned_recovering_turn_executions(
+                        coordinator.turn_execution_owner_id.as_ref(),
+                        64,
+                    )
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|row| row == &claimed)
+            );
+            coordinator
+                .reconcile_orphan_turn_executions(now + 1, 64)
+                .await
+                .unwrap();
+            let job = coordinator
+                .open_recovery_for_turn(&turn_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(job.action, RecoveryAction::RestartTurn);
+            coordinator
+                .reconcile_orphan_turn_executions(now + 2, 64)
+                .await
+                .unwrap();
+            assert_eq!(
+                coordinator
+                    .open_recovery_for_turn(&turn_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .id,
+                job.id
+            );
+            assert_eq!(
+                crud_store
+                    .get_turn_execution(&turn_id)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                claimed
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn provider_start_transition_fences_a_recovery_candidate_selected_before_cas() {
         let (crud_store, coordinator) = setup_coordinator().await;
         let workspace_id = "ws_start_recovery_race";
@@ -5503,6 +6682,8 @@ mod tests {
 
     fn provider_failure(class: ProviderFailureClass, message: &str) -> ProviderFailureDetails {
         ProviderFailureDetails {
+            error_reason: None,
+            request_id: None,
             provider: "test-provider".to_owned(),
             model: "test-model".to_owned(),
             transport: ProviderTransportKind::NonStream,
@@ -5541,6 +6722,8 @@ mod tests {
 
     fn provider_plan_job(class: ProviderFailureClass, transport: &str) -> RecoveryJobRecord {
         RecoveryJobRecord {
+            last_failure_attempt_id: None,
+            diagnostic: None,
             id: format!("job_plan_{}", super::provider_failure_class_name(class)),
             turn_id: "turn_plan".to_owned(),
             item_id: "reasoning_plan".to_owned(),
@@ -5565,6 +6748,7 @@ mod tests {
             claim_token: None,
             active_attempt_id: None,
             active_attempt_started_at_unix: None,
+            resolution_pending: true,
         }
     }
 
@@ -6205,6 +7389,7 @@ mod tests {
                 request.recovery_attempt_id.as_str(),
                 "replacement native turn disconnected".to_owned(),
                 1_700_000_012,
+                None,
             )
             .await
             .expect("native CLI recovery failure should return to coordinator policy");
@@ -6524,6 +7709,7 @@ mod tests {
             admission,
             super::ExecutionWindowContinuationAdmission::Block {
                 total_windows: 3,
+                stop_reason: Some(pioneer_protocol::RecoveryStopReason::NoProgress),
                 ref reason,
             } if reason.contains("max_consecutive_no_progress_windows")
         ));
@@ -6952,6 +8138,7 @@ mod tests {
             super::RestoredRecoveryTurnRequestLookup::Unavailable(
                 super::RestoredRecoveryTurnUnavailable::ExecutionWindowContinuationBlocked {
                     ref reason,
+                    ..
                 }
             ) if reason.contains("limit=1, observed=1")
         ));
@@ -7365,6 +8552,24 @@ mod tests {
             })
             .await
             .expect("in-flight assistant round should persist");
+
+        // An old result row is cleanup-eligible and cannot prove that the
+        // side effect completed. Its payload must not be parsed in recovery.
+        crud_store
+            .insert_turn_llm_context(NewTurnLlmContextEntry {
+                turn_id: turn_id.to_owned(),
+                item_id: Some(item_id.to_owned()),
+                attempt_id: None,
+                sequence: 2,
+                source: "tool_result".to_owned(),
+                tool_name: Some("web_fetch".to_owned()),
+                payload: "{broken".to_owned(),
+                output_policy_snapshot: serde_json::json!({}).to_string(),
+                created_at: chrono::Utc::now().fixed_offset(),
+                expires_at: None,
+            })
+            .await
+            .expect("legacy result should persist");
 
         let job = crud_store
             .enqueue_recovery_job(
@@ -7871,6 +9076,201 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn time_and_no_progress_stops_preserve_last_provider_fact() {
+        for (max_wall_clock_secs, no_progress_limit, stop_reason) in [
+            (
+                0,
+                9,
+                pioneer_protocol::RecoveryStopReason::WallClockExhausted,
+            ),
+            (900, 1, pioneer_protocol::RecoveryStopReason::NoProgress),
+        ] {
+            let (store, coordinator) = setup_coordinator().await;
+            let job = coordinator
+                .enqueue_runtime_failure_job(
+                    &RuntimeFailureCandidate {
+                        turn_id: "turn_stop_fact".to_owned(),
+                        item_id: "reasoning_stop_fact".to_owned(),
+                        item_type: TurnItemType::Reasoning,
+                        trigger: RecoveryTrigger::RuntimeFailure,
+                        action: RecoveryAction::RestartTurn,
+                        reason: "raw initial runtime failure".to_owned(),
+                        base_backoff_secs: 1,
+                        max_attempts: 10,
+                        max_wall_clock_secs,
+                        no_progress_limit,
+                        metadata: pioneer_protocol::ToolMetadata::default(),
+                    },
+                    1_700_000_000,
+                )
+                .await
+                .unwrap()
+                .into_job();
+            let attempt = claim_and_activate(&store, &job.id).await;
+            let mut failure =
+                provider_failure(ProviderFailureClass::AuthOrPermission, "raw last failure");
+            failure.http_status = Some(403);
+            let events = coordinator
+                .record_recovery_provider_failure(
+                    &job.id,
+                    &attempt,
+                    failure.clone(),
+                    1_700_000_003,
+                    None,
+                )
+                .await
+                .unwrap();
+            let [RecoveryCoordinatorEvent::RecoveryExhausted(outcome)] = events.as_slice() else {
+                panic!("budget stop expected");
+            };
+            let saved = store.get_recovery_job(&job.id).await.unwrap().unwrap();
+            let diagnostic = saved.diagnostic.unwrap();
+            assert_eq!(diagnostic.stop_reason, Some(stop_reason));
+            assert_eq!(
+                diagnostic.last_failure,
+                Some(pioneer_protocol::RecoveryProviderFailure::from(&failure))
+            );
+            assert_eq!(outcome.error_message, diagnostic.public_message());
+            assert_eq!(saved.action, job.action);
+            assert_eq!(saved.error_class, job.error_class);
+            assert_eq!(saved.policy_snapshot, job.policy_snapshot);
+            assert_eq!(saved.run_count, 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn last_provider_failure_is_durable_without_replacing_initial_policy() {
+        let (store, coordinator) = setup_coordinator().await;
+        let initial = provider_failure(ProviderFailureClass::StreamTruncated, "raw stream secret");
+        let job = coordinator
+            .enqueue_provider_failure_job(
+                &ProviderFailureCandidate {
+                    turn_id: "turn_last_failure".to_owned(),
+                    item_id: "reasoning_last_failure".to_owned(),
+                    item_type: TurnItemType::Reasoning,
+                    failure: initial.clone(),
+                },
+                1_700_000_000,
+            )
+            .await
+            .unwrap()
+            .into_job();
+        assert_eq!(
+            job.diagnostic,
+            Some(pioneer_protocol::RecoveryDiagnostic::provider(&initial))
+        );
+        let attempt = claim_and_activate(&store, &job.id).await;
+        let mut last = provider_failure(
+            ProviderFailureClass::AuthOrPermission,
+            "HTTP 401 raw response https://secret.example/token /private/key",
+        );
+        last.http_status = Some(403);
+        last.stage = ProviderFailureStage::Connect;
+        last.provider_code = Some("credential=secret".to_owned());
+        let events = coordinator
+            .record_recovery_provider_failure(&job.id, &attempt, last.clone(), 1_700_000_002, None)
+            .await
+            .unwrap();
+        assert!(matches!(
+            events.as_slice(),
+            [RecoveryCoordinatorEvent::RetryScheduled { .. }]
+        ));
+        let pending = store.get_recovery_job(&job.id).await.unwrap().unwrap();
+        assert_eq!(
+            pending.error_class,
+            Some(ProviderFailureClass::StreamTruncated)
+        );
+        assert_eq!(pending.transport_stage, Some(initial.stage));
+        assert_eq!(pending.action, job.action);
+        assert_eq!(pending.policy_snapshot, job.policy_snapshot);
+        assert_eq!(
+            pending.diagnostic.as_ref().unwrap().last_failure,
+            Some(pioneer_protocol::RecoveryProviderFailure::from(&last))
+        );
+        let claimed = store
+            .claim_due_recovery_jobs(pending.next_run_at_unix, 45, 1)
+            .await
+            .unwrap();
+        assert_eq!(claimed.len(), 1);
+        let attempt2 = "last_failure_attempt2";
+        assert!(matches!(
+            store
+                .mark_claimed_recovery_job_active(
+                    &job.id,
+                    claimed[0].claim_token.as_deref().unwrap(),
+                    attempt2,
+                    pending.next_run_at_unix
+                )
+                .await
+                .unwrap(),
+            ClaimedRecoveryActivation::Activated
+        ));
+        assert!(
+            coordinator
+                .record_recovery_provider_failure(
+                    &job.id,
+                    &attempt,
+                    provider_failure(ProviderFailureClass::Unknown, "stale"),
+                    pending.next_run_at_unix,
+                    None,
+                )
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let events = coordinator
+            .record_recovery_provider_failure(
+                &job.id,
+                attempt2,
+                last.clone(),
+                pending.next_run_at_unix + 1,
+                None,
+            )
+            .await
+            .unwrap();
+        let [RecoveryCoordinatorEvent::RecoveryExhausted(outcome)] = events.as_slice() else {
+            panic!("terminal outcome expected");
+        };
+        let restarted = CrudStore::new(store.database_connection());
+        let terminal = restarted.get_recovery_job(&job.id).await.unwrap().unwrap();
+        let diagnostic = terminal.diagnostic.unwrap();
+        assert_eq!(
+            diagnostic.last_failure,
+            Some(pioneer_protocol::RecoveryProviderFailure::from(&last))
+        );
+        assert_eq!(
+            diagnostic.stop_reason,
+            Some(pioneer_protocol::RecoveryStopReason::AttemptsExhausted)
+        );
+        assert_eq!(diagnostic.public_message(), outcome.error_message);
+        assert!(outcome.error_message.contains("HTTP 403"));
+        assert!(!outcome.error_message.contains("secret"));
+        assert_eq!(terminal.run_count, 2);
+        assert_eq!(terminal.last_failure_attempt_id.as_deref(), Some(attempt2));
+        assert!(
+            coordinator
+                .record_recovery_provider_failure(
+                    &job.id,
+                    attempt2,
+                    last,
+                    pending.next_run_at_unix + 2,
+                    None,
+                )
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            restarted
+                .claim_due_recovery_terminalizations(pending.next_run_at_unix + 2, 45, 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn provider_failure_inside_recovery_requeues_same_job() {
         let (crud_store, coordinator) = setup_coordinator().await;
         let turn_id = "turn_same_recovery_job";
@@ -7898,6 +9298,7 @@ mod tests {
                     "failed inside recovery",
                 ),
                 1_700_000_002,
+                None,
             )
             .await
             .expect("active recovery failure should be recorded");
@@ -7994,6 +9395,7 @@ mod tests {
                 active_attempt_id.as_str(),
                 renewed,
                 failure_at_unix,
+                None,
             )
             .await
             .expect("renewed provider cooldown should requeue");
@@ -8759,6 +10161,7 @@ mod tests {
                     "late provider failure after timeout",
                 ),
                 1_700_000_003,
+                None,
             )
             .await
             .expect("late stale provider failure should not error");
@@ -8955,12 +10358,20 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(reloaded.status, RecoveryJobStatus::Exhausted);
+        // A watchdog timeout is not a new provider response.
+        assert_eq!(
+            reloaded.diagnostic,
+            Some(terminal_diagnostic(
+                &job,
+                pioneer_protocol::RecoveryStopReason::WallClockExhausted,
+            ))
+        );
         assert_eq!(reloaded.run_count, 1);
         assert!(reloaded.active_attempt_id.is_none());
     }
 
     #[tokio::test]
-    async fn terminal_active_recovery_cancels_pending_jobs_before_claiming_more_work() {
+    async fn terminal_active_recovery_exhausts_after_duplicate_pending_job_is_rejected() {
         let (crud_store, coordinator) = setup_coordinator().await;
         let turn_id = "turn_terminal_active_cancels_pending";
         let active_job = coordinator
@@ -8978,7 +10389,7 @@ mod tests {
             .into_job();
         let _active_attempt_id =
             claim_and_activate(crud_store.as_ref(), active_job.id.as_str()).await;
-        let pending_job = crud_store
+        let duplicate_error = crud_store
             .enqueue_recovery_job(
                 turn_id.to_owned(),
                 "reasoning_duplicate".to_owned(),
@@ -8997,7 +10408,11 @@ mod tests {
                 1_700_000_000,
             )
             .await
-            .expect("duplicate pending job should enqueue for regression setup");
+            .expect_err("a second unresolved recovery episode must be rejected");
+        assert!(
+            format!("{duplicate_error:#}")
+                .contains("UNIQUE constraint failed: recovery_job.turn_id")
+        );
 
         let events = coordinator
             .run_ready_jobs(1_700_000_901, 64)
@@ -9009,16 +10424,23 @@ mod tests {
             [RecoveryCoordinatorEvent::RecoveryExhausted(outcome)]
                 if outcome.job_id == active_job.id
         ));
-        let pending = crud_store
-            .get_recovery_job(pending_job.id.as_str())
+        let active = crud_store
+            .get_recovery_job(active_job.id.as_str())
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(pending.status, RecoveryJobStatus::Cancelled);
+        assert_eq!(active.status, RecoveryJobStatus::Exhausted);
+        assert_eq!(
+            crud_store
+                .count_recovery_jobs_for_turn(turn_id)
+                .await
+                .unwrap(),
+            1
+        );
     }
 
     #[tokio::test]
-    async fn claimed_pending_job_does_not_terminalize_while_turn_has_active_recovery() {
+    async fn duplicate_terminal_job_is_rejected_while_turn_has_active_recovery() {
         let (crud_store, coordinator) = setup_coordinator().await;
         let turn_id = "turn_pending_waits_for_active_recovery";
         let active_job = coordinator
@@ -9036,7 +10458,7 @@ mod tests {
             .into_job();
         let active_attempt_id =
             claim_and_activate(crud_store.as_ref(), active_job.id.as_str()).await;
-        let pending_terminal_job = crud_store
+        let duplicate_error = crud_store
             .enqueue_recovery_job(
                 turn_id.to_owned(),
                 "reasoning_terminal_duplicate".to_owned(),
@@ -9055,7 +10477,11 @@ mod tests {
                 1_700_000_001,
             )
             .await
-            .expect("duplicate terminal pending job should enqueue for regression setup");
+            .expect_err("a second unresolved terminal episode must be rejected");
+        assert!(
+            format!("{duplicate_error:#}")
+                .contains("UNIQUE constraint failed: recovery_job.turn_id")
+        );
 
         let events = coordinator
             .run_ready_jobs(1_700_000_002, 64)
@@ -9073,13 +10499,13 @@ mod tests {
             active.active_attempt_id.as_deref(),
             Some(active_attempt_id.as_str())
         );
-        let pending = crud_store
-            .get_recovery_job(pending_terminal_job.id.as_str())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(pending.status, RecoveryJobStatus::Pending);
-        assert_eq!(pending.run_count, 0);
+        assert_eq!(
+            crud_store
+                .count_recovery_jobs_for_turn(turn_id)
+                .await
+                .unwrap(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -9106,6 +10532,7 @@ mod tests {
                 active_attempt_id.as_str(),
                 provider_failure(ProviderFailureClass::ModelNotFound, "still missing"),
                 1_700_000_002,
+                None,
             )
             .await
             .expect("active recovery failure should be recorded");
@@ -9227,7 +10654,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn turn_completion_cancels_other_pending_recovery_jobs() {
+    async fn turn_completion_succeeds_after_duplicate_pending_recovery_is_rejected() {
         let (crud_store, coordinator) = setup_coordinator().await;
         let turn_id = "turn_completion_cancels_pending";
         let active_job = coordinator
@@ -9246,7 +10673,7 @@ mod tests {
         let active_attempt_id =
             claim_and_activate(crud_store.as_ref(), active_job.id.as_str()).await;
 
-        let stale_pending = crud_store
+        let duplicate_error = crud_store
             .enqueue_recovery_job(
                 turn_id.to_owned(),
                 "reasoning_stale".to_owned(),
@@ -9265,7 +10692,11 @@ mod tests {
                 1_700_000_001,
             )
             .await
-            .expect("stale pending job should enqueue for regression setup");
+            .expect_err("a second unresolved recovery episode must be rejected");
+        assert!(
+            format!("{duplicate_error:#}")
+                .contains("UNIQUE constraint failed: recovery_job.turn_id")
+        );
 
         let recovery = recovery_context(active_job.id.as_str(), active_attempt_id.as_str());
         let events = coordinator
@@ -9277,12 +10708,19 @@ mod tests {
             [RecoveryCoordinatorEvent::RecoverySucceeded { job_id, .. }] if job_id == &active_job.id
         ));
 
-        let stale = crud_store
-            .get_recovery_job(stale_pending.id.as_str())
+        let active = crud_store
+            .get_recovery_job(active_job.id.as_str())
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(stale.status, RecoveryJobStatus::Cancelled);
+        assert_eq!(active.status, RecoveryJobStatus::Succeeded);
+        assert_eq!(
+            crud_store
+                .count_recovery_jobs_for_turn(turn_id)
+                .await
+                .unwrap(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -9305,7 +10743,7 @@ mod tests {
         let active_attempt_id =
             claim_and_activate(crud_store.as_ref(), active_job.id.as_str()).await;
 
-        let stale_pending = crud_store
+        let duplicate_error = crud_store
             .enqueue_recovery_job(
                 turn_id.to_owned(),
                 "reasoning_stale".to_owned(),
@@ -9324,7 +10762,11 @@ mod tests {
                 1_700_000_001,
             )
             .await
-            .expect("stale pending job should enqueue for regression setup");
+            .expect_err("a second unresolved recovery episode must be rejected");
+        assert!(
+            format!("{duplicate_error:#}")
+                .contains("UNIQUE constraint failed: recovery_job.turn_id")
+        );
 
         let recovery = recovery_context(active_job.id.as_str(), active_attempt_id.as_str());
         let events = coordinator
@@ -9353,15 +10795,12 @@ mod tests {
         );
         assert!(active.active_attempt_id.is_none());
 
-        let stale = crud_store
-            .get_recovery_job(stale_pending.id.as_str())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(stale.status, RecoveryJobStatus::Cancelled);
         assert_eq!(
-            stale.last_error.as_deref(),
-            Some("turn blocked; pending recovery jobs cancelled")
+            crud_store
+                .count_recovery_jobs_for_turn(turn_id)
+                .await
+                .unwrap(),
+            1
         );
     }
 
@@ -9407,6 +10846,7 @@ mod tests {
                 active_attempt_id.as_str(),
                 provider_failure(ProviderFailureClass::NetworkTransient, "connection reset"),
                 1_700_000_002,
+                None,
             )
             .await
             .expect("active recovery failure should use persisted policy");
@@ -9454,6 +10894,7 @@ mod tests {
                     "HTTP 400 unchanged request",
                 ),
                 1_700_000_002,
+                None,
             )
             .await
             .expect("request rejection should terminalize active recovery");
@@ -9463,7 +10904,7 @@ mod tests {
             [RecoveryCoordinatorEvent::RecoveryExhausted(outcome)]
                 if outcome.job_id == job.id
                     && outcome.status == RecoveryJobStatus::Failed
-                    && outcome.error_message.contains("will not be sent again")
+                    && outcome.error_message.contains("final under the recovery policy")
         ));
         let reloaded = crud_store
             .get_recovery_job(job.id.as_str())
@@ -9722,6 +11163,16 @@ mod tests {
             None,
         )
         .await;
+        insert_test_turn_execution(
+            &crud_store,
+            workspace_id,
+            thread_id,
+            turn_id,
+            "previous-blocked-owner",
+            TurnExecutorKind::NativeAgent,
+            1_700_000_045,
+        )
+        .await;
         crud_store
             .update_turn_status(
                 thread_id,
@@ -9772,6 +11223,18 @@ mod tests {
             .expect("blocked turn resume should succeed")
             .expect("blocked recovery job should resume");
 
+        let receipt = crud_store
+            .get_turn_execution(turn_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            receipt.owner_id.as_str(),
+            coordinator.turn_execution_owner_id.as_ref()
+        );
+        assert_eq!(receipt.owner_generation, 2);
+        assert_eq!(receipt.status, TurnExecutionStatus::Starting);
+        assert!(receipt.completed_at.is_none());
         assert_eq!(resumed.id, job.id);
         assert_eq!(resumed.status, RecoveryJobStatus::Pending);
         assert_eq!(resumed.action, RecoveryAction::RestartTurn);
@@ -9898,9 +11361,9 @@ mod tests {
             [RecoveryCoordinatorEvent::RecoveryExhausted(outcome)]
                 if outcome.job_id == job.id
                     && outcome.status == RecoveryJobStatus::Failed
-                    && outcome
-                        .error_message
-                        .contains("recovery policy marks this failure as terminal")
+                    && outcome.error_message == terminal_diagnostic(
+                        &job, pioneer_protocol::RecoveryStopReason::PolicyRejected,
+                    ).public_message()
         ));
         let reloaded = crud_store
             .get_recovery_job(job.id.as_str())
@@ -9908,7 +11371,36 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(reloaded.status, RecoveryJobStatus::Failed);
+        assert_eq!(
+            reloaded.diagnostic,
+            Some(terminal_diagnostic(
+                &job,
+                pioneer_protocol::RecoveryStopReason::PolicyRejected,
+            ))
+        );
         assert_eq!(reloaded.run_count, 0);
         assert!(reloaded.claim_token.is_none());
     }
+}
+
+fn budget_stop_reason(
+    wall_clock_exceeded: bool,
+    attempts_exhausted: bool,
+) -> pioneer_protocol::RecoveryStopReason {
+    if wall_clock_exceeded {
+        pioneer_protocol::RecoveryStopReason::WallClockExhausted
+    } else if attempts_exhausted {
+        pioneer_protocol::RecoveryStopReason::AttemptsExhausted
+    } else {
+        pioneer_protocol::RecoveryStopReason::NoProgress
+    }
+}
+
+fn terminal_diagnostic(
+    job: &RecoveryJobRecord,
+    stop_reason: pioneer_protocol::RecoveryStopReason,
+) -> pioneer_protocol::RecoveryDiagnostic {
+    let mut diagnostic = job.diagnostic.clone().unwrap_or_default();
+    diagnostic.stop_reason = Some(stop_reason);
+    diagnostic
 }

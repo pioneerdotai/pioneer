@@ -216,8 +216,8 @@ mod platform {
 
     pub fn support_info() -> WindowsRestrictedTokenSupport {
         WindowsRestrictedTokenSupport {
-            supported: true,
-            details: "native Windows restricted-token APIs are available".to_owned(),
+            supported: false,
+            details: "native Windows restricted-token enforcement is unavailable because the dedicated token/job/ACL process runner is not implemented".to_owned(),
         }
     }
 }
@@ -257,6 +257,7 @@ mod tests {
             inherit_environment: false,
             environment,
             removed_environment: vec!["SECRET_TOKEN".to_owned()],
+            runtime_temp_dir: None,
         }
     }
 

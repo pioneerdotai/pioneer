@@ -7,10 +7,13 @@
 
 use crate::{
     AgentExecutionProfileProjection, AgentIdentityProjection, AgentLaunchSelection,
-    AgentPresentationSnapshot, PersistedActorRef,
+    AgentPresentationSnapshot, PersistedActorRef, TaskDeliveryMode, TaskDeliveryPolicy,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::fmt;
+
+const TASK_DERIVED_CHILD_LAUNCH_GRANT_MAX_BYTES: usize = 131_072;
 
 fn validate_task_route_receipt(
     receipt_json: &str,
@@ -68,8 +71,71 @@ pub enum TaskDerivedChildLaunchGrant {
     },
 }
 
+/// Migrates the nested child-launch contract through every registered adjacent
+/// version and returns a JSON document that current runtime code can consume.
+pub fn migrate_task_derived_child_launch_grant_json_to_current(
+    json: &str,
+) -> Result<String, TaskDerivedChildLaunchGrantMigrationError> {
+    if json.len() > TASK_DERIVED_CHILD_LAUNCH_GRANT_MAX_BYTES {
+        return Err(
+            TaskDerivedChildLaunchGrantMigrationError::InvalidCurrentContract(format!(
+                "task launch contract exceeds {} bytes",
+                TASK_DERIVED_CHILD_LAUNCH_GRANT_MAX_BYTES
+            )),
+        );
+    }
+    let migrated = crate::migrate_embedded_child_launch_grant_json_to_current(json)
+        .map_err(TaskDerivedChildLaunchGrantMigrationError::ChildGrant)?;
+    let current =
+        serde_json::from_str::<TaskDerivedChildLaunchGrant>(&migrated).map_err(|error| {
+            TaskDerivedChildLaunchGrantMigrationError::InvalidCurrentContract(error.to_string())
+        })?;
+    current.validate_embedded().map_err(|error| {
+        TaskDerivedChildLaunchGrantMigrationError::InvalidCurrentContract(format!("{error:?}"))
+    })?;
+    // Task actor contracts compare their immutable JSON on idempotent insert.
+    // Re-encode through the current typed outer contract so an upcast V1 row
+    // has exactly the same representation as a newly produced V2 row. The
+    // generic embedded migrator cannot do this because AgentExecution grants
+    // intentionally have a different, open outer document.
+    let encoded = serde_json::to_string(&current).map_err(|error| {
+        TaskDerivedChildLaunchGrantMigrationError::InvalidCurrentContract(error.to_string())
+    })?;
+    if encoded.len() > TASK_DERIVED_CHILD_LAUNCH_GRANT_MAX_BYTES {
+        return Err(
+            TaskDerivedChildLaunchGrantMigrationError::InvalidCurrentContract(format!(
+                "migrated task launch contract exceeds {} bytes",
+                TASK_DERIVED_CHILD_LAUNCH_GRANT_MAX_BYTES
+            )),
+        );
+    }
+    Ok(encoded)
+}
+
+#[derive(Debug)]
+pub enum TaskDerivedChildLaunchGrantMigrationError {
+    ChildGrant(crate::ChildAgentLaunchGrantMigrationError),
+    InvalidCurrentContract(String),
+}
+
+impl fmt::Display for TaskDerivedChildLaunchGrantMigrationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ChildGrant(error) => write!(formatter, "{error}"),
+            Self::InvalidCurrentContract(message) => {
+                write!(
+                    formatter,
+                    "invalid migrated task launch contract: {message}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for TaskDerivedChildLaunchGrantMigrationError {}
+
 impl TaskDerivedChildLaunchGrant {
-    fn validate_for(&self, contract: &TaskActorContract) -> Result<(), TaskActorContractError> {
+    fn validate_embedded(&self) -> Result<(), TaskActorContractError> {
         let Self::ResolvedTaskLaunch {
             identity,
             profile,
@@ -79,18 +145,6 @@ impl TaskDerivedChildLaunchGrant {
             agent_authorization_fingerprint,
             child_launch_grant,
         } = self;
-        if contract.resolved_identity_id.as_deref() != Some(identity.id.as_str())
-            || contract.resolved_profile_id.as_deref() != Some(profile.id.as_str())
-            || contract.source_config_fingerprint.as_deref()
-                != Some(identity.source_fingerprint.as_str())
-            || (identity.source_kind != crate::AgentIdentitySourceKind::Ephemeral
-                && !profile
-                    .compatible_agent_identity_ids
-                    .iter()
-                    .any(|candidate| candidate == &identity.id))
-        {
-            return Err(TaskActorContractError::ResolvedLaunchGrantMismatch);
-        }
         if role_key.trim().is_empty()
             || *agent_policy_generation == 0
             || allowed_actions.is_empty()
@@ -112,9 +166,42 @@ impl TaskDerivedChildLaunchGrant {
                 .profiles
                 .iter()
                 .any(|candidate| candidate == profile)
+            || (identity.source_kind != crate::AgentIdentitySourceKind::Ephemeral
+                && !profile
+                    .compatible_agent_identity_ids
+                    .iter()
+                    .any(|candidate| candidate == &identity.id))
         {
             return Err(TaskActorContractError::ResolvedLaunchGrantMismatch);
         }
+        let mut unique_actions = allowed_actions.clone();
+        unique_actions.sort();
+        unique_actions.dedup();
+        if unique_actions != *allowed_actions
+            || allowed_actions
+                .iter()
+                .any(|action| action.trim().is_empty())
+        {
+            return Err(TaskActorContractError::InvalidResolvedLaunchGrant);
+        }
+        Ok(())
+    }
+
+    fn validate_for(&self, contract: &TaskActorContract) -> Result<(), TaskActorContractError> {
+        let Self::ResolvedTaskLaunch {
+            identity,
+            profile,
+            child_launch_grant,
+            ..
+        } = self;
+        if contract.resolved_identity_id.as_deref() != Some(identity.id.as_str())
+            || contract.resolved_profile_id.as_deref() != Some(profile.id.as_str())
+            || contract.source_config_fingerprint.as_deref()
+                != Some(identity.source_fingerprint.as_str())
+        {
+            return Err(TaskActorContractError::ResolvedLaunchGrantMismatch);
+        }
+        self.validate_embedded()?;
         let launch = contract
             .launch
             .as_ref()
@@ -177,16 +264,6 @@ impl TaskDerivedChildLaunchGrant {
                 .any(|id| !child_launch_grant.mcp_server_ids.contains(id))
         {
             return Err(TaskActorContractError::ResolvedLaunchGrantMismatch);
-        }
-        let mut unique_actions = allowed_actions.clone();
-        unique_actions.sort();
-        unique_actions.dedup();
-        if unique_actions != *allowed_actions
-            || allowed_actions
-                .iter()
-                .any(|action| action.trim().is_empty())
-        {
-            return Err(TaskActorContractError::InvalidResolvedLaunchGrant);
         }
         Ok(())
     }
@@ -450,7 +527,7 @@ impl TaskActorContract {
             return Err(TaskActorContractError::IncompleteResolvedLaunch);
         }
         if let Some(grant_json) = self.derived_child_launch_grant_json.as_deref() {
-            if grant_json.len() > 131_072 {
+            if grant_json.len() > TASK_DERIVED_CHILD_LAUNCH_GRANT_MAX_BYTES {
                 return Err(TaskActorContractError::OversizedField(
                     "derived_child_launch_grant_json",
                 ));
@@ -476,6 +553,64 @@ pub enum TaskOccurrenceStatus {
     Cancelled,
 }
 
+/// Immutable delivery and presentation decision for one logical occurrence.
+///
+/// The Task policy may be edited while a run is in flight. Keeping the
+/// normalized policy beside the occurrence guarantees that retries, result
+/// delivery and the visible lifecycle card continue to use the same target.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TaskOccurrenceDeliveryPlan {
+    pub routing_version: u32,
+    pub policy: TaskDeliveryPolicy,
+    /// Thread that owns the TaskRun lifecycle card. Thread delivery uses the
+    /// exact normalized delivery target; non-thread delivery has no target and
+    /// therefore leaves this absent for the executor to use its local fallback.
+    pub presentation_thread_id: Option<String>,
+}
+
+impl TaskOccurrenceDeliveryPlan {
+    pub fn from_normalized_policy(policy: TaskDeliveryPolicy) -> Self {
+        let presentation_thread_id = (policy.mode == TaskDeliveryMode::Thread)
+            .then(|| policy.thread_id.clone())
+            .flatten();
+        Self {
+            routing_version: 1,
+            policy,
+            presentation_thread_id,
+        }
+    }
+
+    fn validate(&self) -> Result<(), TaskActorContractError> {
+        if self.routing_version != 1 {
+            return Err(TaskActorContractError::InvalidRevision);
+        }
+        match self.policy.mode {
+            TaskDeliveryMode::Thread => {
+                let target = self
+                    .policy
+                    .thread_id
+                    .as_deref()
+                    .filter(|value| !value.trim().is_empty())
+                    .ok_or(TaskActorContractError::MissingDeliveryDestination)?;
+                if self.policy.thread_target.is_none()
+                    || self.presentation_thread_id.as_deref() != Some(target)
+                {
+                    return Err(TaskActorContractError::InvalidDeliveryDestination);
+                }
+            }
+            TaskDeliveryMode::None
+            | TaskDeliveryMode::UserNotification
+            | TaskDeliveryMode::Webhook => {
+                if self.presentation_thread_id.is_some() {
+                    return Err(TaskActorContractError::UnexpectedDeliveryAuthority);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TaskOccurrenceContract {
@@ -494,6 +629,10 @@ pub struct TaskOccurrenceContract {
     pub action_idempotency_key: String,
     pub route_id: Option<String>,
     pub result_return_route_id: Option<String>,
+    /// Absent only on occurrences created before routing version 1 existed.
+    /// New occurrences always persist this snapshot before dispatch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_plan: Option<TaskOccurrenceDeliveryPlan>,
     pub terminal_reason: Option<String>,
 }
 
@@ -524,6 +663,9 @@ impl TaskOccurrenceContract {
         }
         if self.agent_execution_id.is_some() && self.work_graph_root_execution_id.is_none() {
             return Err(TaskActorContractError::MissingOccurrenceGraphRoot);
+        }
+        if let Some(plan) = self.delivery_plan.as_ref() {
+            plan.validate()?;
         }
         Ok(())
     }
@@ -766,6 +908,7 @@ mod tests {
                 permission_profile: None,
                 skill_ids: Vec::new(),
                 mcp_server_ids: Vec::new(),
+                selected_capabilities: Vec::new(),
             },
         });
         value.requested_identity_json = Some(serde_json::to_string(&requested).unwrap());
@@ -845,6 +988,7 @@ mod tests {
             action_idempotency_key: "task:occurrence-key".to_owned(),
             route_id: None,
             result_return_route_id: None,
+            delivery_plan: None,
             terminal_reason: Some("temporary saturation".to_owned()),
         };
         let retry = occurrence.retry(2).unwrap();
@@ -893,6 +1037,7 @@ mod tests {
             action_idempotency_key: "task:recurring:3".to_owned(),
             route_id: None,
             result_return_route_id: None,
+            delivery_plan: None,
             terminal_reason: None,
         };
         let next = occurrence
@@ -933,6 +1078,7 @@ mod tests {
             action_idempotency_key: "task:recurring:max".to_owned(),
             route_id: None,
             result_return_route_id: None,
+            delivery_plan: None,
             terminal_reason: None,
         };
 

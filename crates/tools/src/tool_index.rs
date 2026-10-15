@@ -5,21 +5,13 @@ use std::collections::BTreeMap;
 
 const PREFLIGHT_SUMMARY_MAX_CHARS: usize = 160;
 
-pub const PREFLIGHT_CORE_FILE_TOOL_NAMES: &[&str] = &[
-    "read_file",
-    "write_file",
-    "edit_file",
-    "list_dir",
-    "grep_files",
-    "apply_patch",
-];
+pub const PREFLIGHT_CORE_FILE_TOOL_NAMES: &[&str] =
+    &["read_file", "list_dir", "grep_files", "apply_patch"];
 
 pub const PREFLIGHT_CORE_TOOL_NAMES: &[&str] = &[
     "exec_command",
     "write_stdin",
     "read_file",
-    "write_file",
-    "edit_file",
     "list_dir",
     "grep_files",
     "apply_patch",
@@ -29,6 +21,18 @@ pub const PREFLIGHT_CORE_TOOL_NAMES: &[&str] = &[
     "read_skill",
     "request_tools",
 ];
+
+/// Stable model-facing filesystem catalog used by prompt/evaluation snapshots.
+/// Provider adapters may transform the wire schema, but they must preserve
+/// this semantic hierarchy and its single general text mutator.
+pub fn filesystem_catalog_snapshot() -> serde_json::Value {
+    serde_json::json!({
+        "read_file": "bounded_paginated_utf8_text",
+        "list_dir": "directory_discovery",
+        "grep_files": "scoped_text_search",
+        "apply_patch": "add_update_move_delete_multi_file_utf8_text_mutation"
+    })
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -42,6 +46,8 @@ pub struct PreflightToolIndex {
 pub struct PreflightCandidateToolDescriptor {
     pub name: String,
     pub domain: BuiltinToolDomain,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub additional_domains: Vec<BuiltinToolDomain>,
     pub summary: String,
     pub mutation: bool,
 }
@@ -61,16 +67,25 @@ pub fn build_preflight_tool_index<'a>(
         .map(str::to_owned)
         .collect();
 
-    let mut candidate_tools = Vec::new();
+    let mut candidate_tools: Vec<PreflightCandidateToolDescriptor> = Vec::new();
+    let mut candidate_positions = BTreeMap::<&str, usize>::new();
     for domain in BuiltinToolDomain::ALL {
         for tool_name in domain.tool_names() {
             let Some(configured) = specs_by_name.get(tool_name).copied() else {
                 continue;
             };
 
+            if let Some(&position) = candidate_positions.get(*tool_name) {
+                candidate_tools[position].additional_domains.push(domain);
+                candidate_tools[position].mutation |= candidate_tool_mutation(domain, configured);
+                continue;
+            }
+
+            candidate_positions.insert(*tool_name, candidate_tools.len());
             candidate_tools.push(PreflightCandidateToolDescriptor {
                 name: (*tool_name).to_owned(),
                 domain,
+                additional_domains: Vec::new(),
                 summary: compact_tool_summary(configured.spec.description.as_str()),
                 mutation: candidate_tool_mutation(domain, configured),
             });
@@ -236,8 +251,6 @@ mod tests {
             "exec_command",
             "write_stdin",
             "read_file",
-            "write_file",
-            "edit_file",
             "list_dir",
             "grep_files",
             "apply_patch",
@@ -249,14 +262,7 @@ mod tests {
 
         let index = build_preflight_tool_index(&specs);
 
-        for name in [
-            "read_file",
-            "write_file",
-            "edit_file",
-            "list_dir",
-            "grep_files",
-            "apply_patch",
-        ] {
+        for name in ["read_file", "list_dir", "grep_files", "apply_patch"] {
             assert!(
                 index.core_tools.contains(&name.to_owned()),
                 "core tools must include default-visible file tool `{name}`"
@@ -268,14 +274,27 @@ mod tests {
     fn tool_index_defines_core_file_tool_identity() {
         assert_eq!(
             PREFLIGHT_CORE_FILE_TOOL_NAMES,
-            [
-                "read_file",
-                "write_file",
-                "edit_file",
-                "list_dir",
-                "grep_files",
-                "apply_patch",
-            ]
+            ["read_file", "list_dir", "grep_files", "apply_patch",]
+        );
+    }
+
+    #[test]
+    fn filesystem_catalog_snapshot_is_semantic_and_single_writer() {
+        let snapshot = filesystem_catalog_snapshot();
+        let mut keys = snapshot
+            .as_object()
+            .expect("catalog object")
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec!["apply_patch", "grep_files", "list_dir", "read_file"]
+        );
+        assert_eq!(
+            snapshot["apply_patch"],
+            "add_update_move_delete_multi_file_utf8_text_mutation"
         );
     }
 
@@ -351,6 +370,24 @@ mod tests {
                 .candidate_tools
                 .iter()
                 .all(|candidate| candidate.domain == BuiltinToolDomain::Memory)
+        );
+    }
+
+    #[test]
+    fn tool_index_lists_shared_tool_once_with_both_domains() {
+        let specs = vec![configured_spec(
+            "threads_start_options",
+            "List permitted launch options.",
+            ToolIdempotencyMode::Safe,
+        )];
+
+        let index = build_preflight_tool_index(&specs);
+        assert_eq!(index.candidate_tools.len(), 1);
+        assert_eq!(index.candidate_tools[0].name, "threads_start_options");
+        assert_eq!(index.candidate_tools[0].domain, BuiltinToolDomain::Threads);
+        assert_eq!(
+            index.candidate_tools[0].additional_domains,
+            [BuiltinToolDomain::Task]
         );
     }
 

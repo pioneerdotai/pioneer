@@ -481,6 +481,38 @@ fn post_turn_extractor_subscription_is_retryable_with_idempotency_proof() {
     ));
 }
 
+#[test]
+fn post_turn_extractor_runtime_fingerprint_fences_configuration_and_provider_binding() {
+    let key = HookMetadataKey::new("runtime_config_sha256").expect("valid metadata key");
+    let base = MemoryPostTurnExtractorConfig::default();
+    let configured = MemoryPostTurnExtractorConfig {
+        model: Some("different-model".to_owned()),
+        ..base.clone()
+    };
+    let fingerprint = |config: &MemoryPostTurnExtractorConfig, extractor_available: bool| {
+        let capabilities =
+            memory_post_turn_extractor_capabilities(config, true, extractor_available);
+        let HookValue::Text(value) = capabilities
+            .metadata
+            .get(&key)
+            .expect("post-turn handler must publish a runtime fingerprint")
+        else {
+            panic!("runtime fingerprint must be text");
+        };
+        value.clone()
+    };
+
+    let base_fingerprint = fingerprint(&base, true);
+    assert_eq!(base_fingerprint.len(), 64);
+    assert!(
+        base_fingerprint
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    );
+    assert_ne!(base_fingerprint, fingerprint(&configured, true));
+    assert_ne!(base_fingerprint, fingerprint(&base, false));
+}
+
 fn assert_subscription_registered(runtime: &HookRuntime, subscription_id: &str) {
     let subscription_id =
         HookSubscriptionId::new(subscription_id).expect("static subscription id is valid");

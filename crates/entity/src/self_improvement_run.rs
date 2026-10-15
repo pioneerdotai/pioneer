@@ -43,6 +43,10 @@ pub struct Model {
     pub last_error: Option<String>,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub learner_reasoning_effort: Option<String>,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub reviewer_reasoning_effort: Option<String>,
     #[sea_orm(has_many)]
     pub agent_skill_versions: HasMany<super::agent_skill_version::Entity>,
     #[sea_orm(

@@ -3,11 +3,12 @@
 //! `PIONEER_SENTRY_DSN` is used by non-desktop binaries. `PIONEER_DESKTOP_SENTRY_DSN`
 //! is used by the desktop app. A local `.env` file is loaded automatically before
 //! reading these values. Runtime environment variables take precedence over `.env`
-//! and build-time values with the same names.
+//! and build-time values with the same names. Sentry is initialized only when
+//! `PIONEER_SENTRY_ENVIRONMENT` is exactly `production`.
 
 use std::borrow::Cow;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Once};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, Once};
 
 use sentry::integrations::tracing::{
     EventFilter, EventMapping, breadcrumb_from_event, event_from_event,
@@ -15,34 +16,94 @@ use sentry::integrations::tracing::{
 use sentry::{ClientInitGuard, ClientOptions};
 use tracing::field::{Field, Visit};
 use tracing_subscriber::Layer as _;
-use tracing_subscriber::filter::{LevelFilter, Targets};
+use tracing_subscriber::filter::{LevelFilter, Targets, filter_fn};
 use tracing_subscriber::layer::Context as TracingContext;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::util::SubscriberInitExt;
 
+mod database_workload;
+mod desktop_gateway;
 mod metrics;
 mod operations;
+mod patch_telemetry;
+mod performance;
+#[cfg(feature = "qualification-diagnostics")]
+mod qualification_diagnostics;
 mod startup;
 mod telemetry;
+pub mod turn_startup;
 
+pub use database_workload::{
+    DatabaseQueryKind, DatabaseWorkload, DatabaseWorkloadContext, DatabaseWorkloadOutcome,
+    DatabaseWorkloadTrace,
+};
+pub use desktop_gateway::{DesktopGatewayLifecycleOperation, DesktopGatewayLifecycleTrace};
 pub use metrics::{
-    DatabaseOperation, DatabasePoolSnapshot, DatabaseRole, record_database_operation,
-    register_database_pool_observer,
+    DatabaseAdmissionMetric, DatabaseOperation, DatabaseOperationMetric, DatabasePoolSnapshot,
+    DatabaseReadAdmissionMetric, DatabaseReadMetric, DatabaseRole, NativeLifecycleDepthKind,
+    NativeLifecycleEventMetric, NativeLifecycleOutcome, NativeLifecycleStage, NativeProviderClass,
+    NativeReadinessComponent, NativeReadinessState, PatchOperationMetric,
+    record_database_admission, record_database_operation, record_database_read,
+    record_database_read_admission, record_gateway_active_connections,
+    record_gateway_database_size_bytes, record_native_lifecycle_depth,
+    record_native_lifecycle_event, record_native_readiness_component,
+    record_patch_mutation_fallback, record_patch_operation, register_database_pool_observer,
 };
 pub use operations::{
-    GatewayCliRuntimeKind, GatewayCliRuntimeRefreshStage, GatewayCliRuntimeRefreshStageGuard,
-    GatewayCliRuntimeRefreshTrace,
+    GatewayCliRuntimeKind, GatewayOperation, GatewayOperationItemKind, GatewayOperationStage,
+    GatewayOperationStageGuard, GatewayOperationTrace, GatewayOperationVariant,
+    GatewayProviderReadinessState, GatewayProviderType, GatewayProviderWarmupScope,
+    GatewayProviderWarmupStage, GatewayProviderWarmupStageGuard, GatewayProviderWarmupTrace,
 };
+pub use patch_telemetry::{PatchTelemetrySnapshot, register_patch_telemetry_snapshot_provider};
+pub use performance::{
+    DesktopCodeHighlightCacheStatus, DesktopCodeHighlightFallbackReason,
+    DesktopCodeHighlightMetric, DesktopCodeHighlightOutcome, DesktopCodeHighlightTheme,
+    DesktopTimelineCacheStatus, DesktopTimelineContentKind, DesktopTimelineOutcome,
+    DesktopTimelineStage, DesktopTimelineStageMetric, GatewayMarkdownMessageMetric,
+    GatewayMarkdownMessageOutcome, GatewayMarkdownOutcome, GatewayMarkdownStage,
+    GatewayMarkdownStageMetric, GatewayMarkdownStreamKind, record_desktop_code_highlight,
+    record_desktop_timeline_stage, record_gateway_markdown_message, record_gateway_markdown_stage,
+};
+#[cfg(feature = "qualification-diagnostics")]
+pub use qualification_diagnostics::*;
 pub use startup::{
-    DesktopStartupOutcome, DesktopStartupStage, DesktopStartupStageGuard, DesktopStartupTrace,
-    GatewayStartupStage, GatewayStartupStageGuard, GatewayStartupTrace, MobileStartupOutcome,
-    MobileStartupReport, MobileStartupStage, MobileStartupStageTiming, record_mobile_startup,
+    DesktopGatewayConnectFailureClass, DesktopPostUpdateContext, DesktopPostUpdateStage,
+    DesktopPostUpdateStageGuard, DesktopStartupOutcome, DesktopStartupStage,
+    DesktopStartupStageGuard, DesktopStartupTrace, GatewayStartupStage, GatewayStartupStageGuard,
+    GatewayStartupTrace, MobileStartupOutcome, MobileStartupReport, MobileStartupStage,
+    MobileStartupStageTiming, record_mobile_startup,
 };
 pub use telemetry::{
-    OtlpTelemetryConfig, TelemetryTarget, init_otlp_observability, init_otlp_observability_for,
-    shutdown_observability,
+    OtlpTelemetryConfig, TelemetryTarget, force_flush_observability, init_otlp_observability,
+    init_otlp_observability_for, schedule_observability_flush, shutdown_observability,
 };
+
+/// Compiles a diagnostic call out at its consumer unless that consumer's
+/// explicit qualification feature is enabled. Arguments are not evaluated in
+/// ordinary builds.
+#[macro_export]
+macro_rules! record_qualification_diagnostic {
+    ($function:ident($($argument:expr),* $(,)?)) => {
+        #[cfg(feature = "qualification-diagnostics")]
+        {
+            $crate::$function($($argument),*);
+        }
+    };
+}
+
+#[cfg(all(test, not(feature = "qualification-diagnostics")))]
+mod qualification_diagnostics_disabled_tests {
+    #[test]
+    fn diagnostic_macro_does_not_evaluate_arguments_when_disabled() {
+        let evaluated = std::cell::Cell::new(false);
+        crate::record_qualification_diagnostic!(unavailable_diagnostic_recorder({
+            evaluated.set(true);
+        }));
+        assert!(!evaluated.get());
+    }
+}
 
 /// DSN for non-desktop runtime binaries.
 pub const SENTRY_DSN_ENV: &str = "PIONEER_SENTRY_DSN";
@@ -54,11 +115,29 @@ pub const SENTRY_ENVIRONMENT_ENV: &str = "PIONEER_SENTRY_ENVIRONMENT";
 const BUILD_SENTRY_DSN: Option<&str> = option_env!("PIONEER_SENTRY_DSN");
 const BUILD_DESKTOP_SENTRY_DSN: Option<&str> = option_env!("PIONEER_DESKTOP_SENTRY_DSN");
 const BUILD_SENTRY_ENVIRONMENT: Option<&str> = option_env!("PIONEER_SENTRY_ENVIRONMENT");
+const PRODUCTION_SENTRY_ENVIRONMENT: &str = "production";
 
 static LOAD_DOTENV: Once = Once::new();
 // Runtime binaries participate by default. The gateway explicitly closes this
 // gate before Sentry initialization and reopens it only after loading consent.
-static TELEMETRY_ENABLED: AtomicBool = AtomicBool::new(true);
+// One atomic value keeps consent and its generation consistent. Bit zero is
+// the current gate; upper bits change on every actual opt-in/opt-out
+// transition so a long-running operation cannot be exported after consent was
+// revoked and later re-enabled.
+static TELEMETRY_CONSENT: AtomicU64 = AtomicU64::new(1);
+static TELEMETRY_CONSENT_TRANSITION: Mutex<TelemetryConsentTransition> =
+    Mutex::new(TelemetryConsentTransition {
+        desired_enabled: true,
+        revision: 0,
+        enable_worker_running: false,
+    });
+
+#[derive(Debug)]
+struct TelemetryConsentTransition {
+    desired_enabled: bool,
+    revision: u64,
+    enable_worker_running: bool,
+}
 
 #[derive(Clone, Copy, Debug)]
 pub enum SentryTarget {
@@ -93,18 +172,21 @@ impl SentryTarget {
 pub fn init_sentry(target: SentryTarget) -> Option<ClientInitGuard> {
     load_local_dotenv();
 
-    let dsn = configured_value(target.dsn_env(), target.build_dsn())?;
-    let dsn = dsn.parse().ok()?;
-    let environment =
-        configured_value(SENTRY_ENVIRONMENT_ENV, BUILD_SENTRY_ENVIRONMENT).map(Cow::Owned);
+    let environment = configured_value(SENTRY_ENVIRONMENT_ENV, BUILD_SENTRY_ENVIRONMENT);
+    if !sentry_enabled_for_environment(environment.as_deref()) {
+        return None;
+    }
 
-    let guard = sentry::init(ClientOptions {
-        dsn: Some(dsn),
-        release: Some(Cow::Owned(format!("pioneer@{}", env!("CARGO_PKG_VERSION")))),
-        environment,
-        before_send: Some(Arc::new(|event| telemetry_enabled().then_some(event))),
-        ..Default::default()
-    });
+    let dsn = configured_value(target.dsn_env(), target.build_dsn())?;
+    let dsn = dsn.parse::<sentry::types::Dsn>().ok()?;
+
+    let mut options = ClientOptions::new()
+        .release(format!("pioneer@{}", env!("CARGO_PKG_VERSION")))
+        .before_send(|event| telemetry_enabled().then_some(event));
+    if let Some(environment) = environment {
+        options = options.environment(Cow::Owned(environment));
+    }
+    let guard = sentry::init((dsn, options));
 
     sentry::configure_scope(|scope| {
         scope.set_tag("pioneer.target", target.tag());
@@ -113,29 +195,60 @@ pub fn init_sentry(target: SentryTarget) -> Option<ClientInitGuard> {
     Some(guard)
 }
 
+fn sentry_enabled_for_environment(environment: Option<&str>) -> bool {
+    environment == Some(PRODUCTION_SENTRY_ENVIRONMENT)
+}
+
 pub fn init_tracing(sentry_enabled: bool) {
+    init_tracing_with_writer(sentry_enabled, std::io::stdout);
+}
+
+/// Initializes tracing while reserving stdout for a machine-readable protocol.
+pub fn init_tracing_to_stderr(sentry_enabled: bool) {
+    init_tracing_with_writer(sentry_enabled, std::io::stderr);
+}
+
+fn init_tracing_with_writer<W>(sentry_enabled: bool, make_writer: W)
+where
+    W: for<'writer> tracing_subscriber::fmt::MakeWriter<'writer> + Send + Sync + 'static,
+{
     let filter = Targets::new()
         .with_default(LevelFilter::INFO)
         .with_target("rmcp::service", LevelFilter::WARN);
+    // The OTLP crate deliberately keeps the concrete reqwest failure at DEBUG
+    // and returns a redacted `network error` to the SDK. Send only that target
+    // through the Sentry mapper so the first outage event has a useful DNS,
+    // TLS, connect, or timeout breadcrumb. The formatter remains at INFO.
+    let sentry_filter = filter
+        .clone()
+        .with_target("opentelemetry-otlp", LevelFilter::DEBUG);
 
     let format_layer = tracing_subscriber::fmt::layer()
+        .with_writer(make_writer)
         .with_target(false)
         .without_time()
         .with_filter(filter.clone());
-    let database_metrics_filter = Targets::new()
-        .with_default(LevelFilter::OFF)
-        .with_target("sqlx::pool::acquire", LevelFilter::TRACE);
+    // This filter is deliberately dynamic. Telemetry consent can change while
+    // the process is running, and disabled telemetry must not pay the cost of
+    // creating one attribution span and visiting one SQLx event per query.
+    let database_metrics_filter = filter_fn(|metadata| {
+        database_metrics_target_enabled(metadata.target(), telemetry_enabled())
+    });
     let subscriber = tracing_subscriber::registry()
         .with(metrics::DatabasePoolAcquireMetricsLayer.with_filter(database_metrics_filter))
         .with(format_layer);
 
     if sentry_enabled {
         let _ = subscriber
-            .with(sentry_tracing_layer().with_filter(filter))
+            .with(sentry_tracing_layer().with_filter(sentry_filter))
             .try_init();
     } else {
         let _ = subscriber.try_init();
     }
+}
+
+fn database_metrics_target_enabled(target: &str, consent_enabled: bool) -> bool {
+    consent_enabled && matches!(target, "sqlx::pool::acquire" | "pioneer_sqlite::pool")
 }
 
 pub fn capture_anyhow(error: &anyhow::Error) {
@@ -145,11 +258,135 @@ pub fn capture_anyhow(error: &anyhow::Error) {
 }
 
 pub fn set_telemetry_enabled(enabled: bool) {
-    TELEMETRY_ENABLED.store(enabled, Ordering::Release);
+    let mut transition = TELEMETRY_CONSENT_TRANSITION
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    if transition.desired_enabled != enabled {
+        transition.desired_enabled = enabled;
+        transition.revision = transition.revision.wrapping_add(1);
+    }
+
+    if !enabled {
+        set_telemetry_gate(false);
+        return;
+    }
+
+    if telemetry_enabled() {
+        return;
+    }
+
+    // During process startup no SDK buffers exist yet, so consent can be
+    // applied synchronously without delaying initialization. At runtime the
+    // old buffers must be drained while the exporter gate is still closed;
+    // do that in one coalesced worker so a settings UI or Gateway request is
+    // never blocked by an exporter timeout.
+    if telemetry::state().is_none() {
+        set_telemetry_gate(true);
+        return;
+    }
+
+    if transition.enable_worker_running {
+        return;
+    }
+    transition.enable_worker_running = true;
+    drop(transition);
+
+    if let Err(error) = std::thread::Builder::new()
+        .name("pioneer-telemetry-consent".to_owned())
+        .spawn(enable_telemetry_after_buffer_discard)
+    {
+        let mut transition = TELEMETRY_CONSENT_TRANSITION
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        transition.enable_worker_running = false;
+        tracing::error!(
+            error = %error,
+            "telemetry remains disabled because the consent transition worker could not start"
+        );
+    }
+}
+
+fn enable_telemetry_after_buffer_discard() {
+    loop {
+        let revision = {
+            let mut transition = TELEMETRY_CONSENT_TRANSITION
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !transition.desired_enabled {
+                transition.enable_worker_running = false;
+                return;
+            }
+            transition.revision
+        };
+
+        // Metrics and spans recorded before an opt-out can still be buffered
+        // by the SDK. Drain them through the closed exporter gate before
+        // reopening consent; otherwise a quick off -> on transition could
+        // export data that predates the new opt-in.
+        let flush_result = telemetry::force_flush_observability();
+
+        let mut transition = TELEMETRY_CONSENT_TRANSITION
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !transition.desired_enabled {
+            transition.enable_worker_running = false;
+            return;
+        }
+        if transition.revision != revision {
+            // Consent changed while buffers were being discarded. Keep the
+            // gate closed and flush once more for the latest opt-in request.
+            continue;
+        }
+        if let Err(error) = flush_result {
+            transition.enable_worker_running = false;
+            drop(transition);
+            tracing::error!(
+                error = %format!("{error:#}"),
+                "telemetry remains disabled because buffered signals could not be discarded"
+            );
+            return;
+        }
+
+        set_telemetry_gate(true);
+        transition.enable_worker_running = false;
+        return;
+    }
+}
+
+fn set_telemetry_gate(enabled: bool) {
+    let current = TELEMETRY_CONSENT.load(Ordering::Acquire);
+    if current & 1 == u64::from(enabled) {
+        return;
+    }
+    let generation = (current >> 1).wrapping_add(1);
+    let next = (generation << 1) | u64::from(enabled);
+    TELEMETRY_CONSENT.store(next, Ordering::Release);
+    if !enabled {
+        turn_startup::discard_on_opt_out();
+    }
 }
 
 pub fn telemetry_enabled() -> bool {
-    TELEMETRY_ENABLED.load(Ordering::Acquire)
+    TELEMETRY_CONSENT.load(Ordering::Acquire) & 1 == 1
+}
+
+pub(crate) fn telemetry_consent_snapshot() -> (bool, u64) {
+    let state = TELEMETRY_CONSENT.load(Ordering::Acquire);
+    (state & 1 == 1, state >> 1)
+}
+
+pub(crate) fn telemetry_sample_allowed(started_generation: Option<u64>) -> bool {
+    let (enabled, current_generation) = telemetry_consent_snapshot();
+    telemetry_sample_allowed_for_state(started_generation, enabled, current_generation)
+}
+
+fn telemetry_sample_allowed_for_state(
+    started_generation: Option<u64>,
+    enabled: bool,
+    current_generation: u64,
+) -> bool {
+    enabled && started_generation == Some(current_generation)
 }
 
 fn load_local_dotenv() {
@@ -160,7 +397,9 @@ fn load_local_dotenv() {
     });
 }
 
-fn sentry_tracing_layer<S>() -> impl tracing_subscriber::Layer<S>
+/// Production event mapper, also usable with thread-local subscribers for local capture.
+#[doc(hidden)]
+pub fn sentry_tracing_layer<S>() -> impl tracing_subscriber::Layer<S>
 where
     S: tracing::Subscriber + for<'span> tracing_subscriber::registry::LookupSpan<'span>,
 {
@@ -175,7 +414,28 @@ where
         return EventMapping::Ignore;
     }
     let fields = tracing_event_fields(event);
+    if should_ignore_otlp_internal_event(
+        event.metadata().level(),
+        event.metadata().target(),
+        fields.name.as_deref(),
+    ) {
+        return EventMapping::Ignore;
+    }
+    if should_keep_otlp_network_diagnostic(
+        event.metadata().level(),
+        event.metadata().target(),
+        fields.name.as_deref(),
+    ) {
+        return EventMapping::Breadcrumb(breadcrumb_from_event(
+            event,
+            None::<&TracingContext<'_, S>>,
+        ));
+    }
     if should_demote_rmcp_transport_worker_failure(
+        event.metadata().level(),
+        event.metadata().target(),
+        fields.message.as_deref(),
+    ) || should_demote_rmcp_common_stream_request_failure(
         event.metadata().level(),
         event.metadata().target(),
         fields.message.as_deref(),
@@ -188,6 +448,20 @@ where
         event.metadata().level(),
         event.metadata().target(),
         fields.log_target.as_deref(),
+        fields.message.as_deref(),
+    ) || should_demote_gpui_closed_window_activation_event(
+        event.metadata().level(),
+        event.metadata().target(),
+        fields.log_target.as_deref(),
+        fields.log_file.as_deref(),
+        fields.log_line,
+        fields.message.as_deref(),
+    ) || should_demote_gpui_closed_window_teardown_error(
+        event.metadata().level(),
+        event.metadata().target(),
+        fields.log_target.as_deref(),
+        fields.log_file.as_deref(),
+        fields.log_line,
         fields.message.as_deref(),
     ) || should_demote_rathole_client_control_channel_retry(
         event.metadata().level(),
@@ -210,10 +484,18 @@ where
         )));
     }
     if filter.contains(EventFilter::Event) {
-        items.push(EventMapping::Event(event_from_event(
-            event,
-            None::<&TracingContext<'_, S>>,
-        )));
+        let mut sentry_event = event_from_event(event, None::<&TracingContext<'_, S>>);
+        if effective_event_target(event.metadata().target(), fields.log_target.as_deref())
+            == "pioneer::memory_post_turn_extractor"
+            && let Some(root_error_code) = fields.root_error_code.as_deref()
+        {
+            sentry_event.fingerprint = vec![
+                Cow::Borrowed("memory-post-turn-extractor"),
+                Cow::Owned(root_error_code.to_owned()),
+            ]
+            .into();
+        }
+        items.push(EventMapping::Event(Box::new(sentry_event)));
     }
     EventMapping::Combined(items.into())
 }
@@ -230,6 +512,29 @@ fn effective_event_target<'a>(target: &'a str, log_target: Option<&'a str>) -> &
     log_target.unwrap_or(target)
 }
 
+fn should_ignore_otlp_internal_event(
+    level: &tracing::Level,
+    target: &str,
+    name: Option<&str>,
+) -> bool {
+    (*level == tracing::Level::ERROR
+        && target == "opentelemetry_sdk"
+        && name == Some("BatchSpanProcessor.ExportError"))
+        || (*level == tracing::Level::DEBUG
+            && target == "opentelemetry-otlp"
+            && name != Some("HttpClient.NetworkError"))
+}
+
+fn should_keep_otlp_network_diagnostic(
+    level: &tracing::Level,
+    target: &str,
+    name: Option<&str>,
+) -> bool {
+    *level == tracing::Level::DEBUG
+        && target == "opentelemetry-otlp"
+        && name == Some("HttpClient.NetworkError")
+}
+
 fn should_demote_rmcp_transport_worker_failure(
     level: &tracing::Level,
     target: &str,
@@ -242,6 +547,30 @@ fn should_demote_rmcp_transport_worker_failure(
                 || is_rmcp_streamable_http_auth_rejection(message)
                 || is_rmcp_streamable_http_transport_connect_failure(message)
                 || is_rmcp_streamable_http_initialized_notification_send_failure(message)
+        })
+}
+
+// rmcp 3.5.0 reports this common GET/SSE opening failure from a task with
+// request_id=None. Its worker then warns and continues; retain the diagnostic
+// as a breadcrumb without changing the SDK's local ERROR or transport behavior.
+fn should_demote_rmcp_common_stream_request_failure(
+    level: &tracing::Level,
+    target: &str,
+    message: Option<&str>,
+) -> bool {
+    const PREFIX: &str = "fail to get common stream: Client error: error sending request for url (";
+    *level == tracing::Level::ERROR
+        && target == "rmcp::transport::streamable_http_client"
+        && message.is_some_and(|message| {
+            message
+                .strip_prefix(PREFIX)
+                .and_then(|rest| rest.strip_suffix(')'))
+                .is_some_and(|address| {
+                    !address.is_empty()
+                        && !address
+                            .chars()
+                            .any(|c| c.is_whitespace() || matches!(c, '(' | ')'))
+                })
         })
 }
 
@@ -265,6 +594,47 @@ fn should_demote_gpui_asset_cache_http_not_found(
     *level == tracing::Level::ERROR
         && effective_event_target(target, log_target) == "gpui::asset_cache"
         && message.is_some_and(is_gpui_asset_cache_http_not_found)
+}
+
+fn should_demote_gpui_closed_window_activation_event(
+    level: &tracing::Level,
+    target: &str,
+    log_target: Option<&str>,
+    log_file: Option<&str>,
+    log_line: Option<u64>,
+    message: Option<&str>,
+) -> bool {
+    *level == tracing::Level::ERROR
+        && target == "log"
+        && log_target.is_none_or(str::is_empty)
+        && log_file.is_some_and(|file| {
+            file.ends_with("gpui-pre-0.3.5/src/window.rs")
+                || file.ends_with(r"gpui-pre-0.3.5\src\window.rs")
+        })
+        && log_line == Some(1899)
+        && message == Some("window not found")
+}
+
+fn should_demote_gpui_closed_window_teardown_error(
+    level: &tracing::Level,
+    target: &str,
+    log_target: Option<&str>,
+    log_file: Option<&str>,
+    log_line: Option<u64>,
+    message: Option<&str>,
+) -> bool {
+    *level == tracing::Level::ERROR
+        && target == "log"
+        && log_target == Some("gpui_windows::window")
+        && log_file.is_some_and(|file| {
+            file.ends_with("gpui-pre-windows-0.3.5/src/window.rs")
+                || file.ends_with(r"gpui-pre-windows-0.3.5\src\window.rs")
+        })
+        && matches!(
+            (log_line, message),
+            (Some(618), Some("Invalid window handle (0x80040102)"))
+                | (Some(619), Some("Invalid window handle. (0x80070578)"))
+        )
 }
 
 fn should_demote_rathole_client_control_channel_retry(
@@ -358,6 +728,10 @@ fn tracing_event_fields(event: &tracing::Event<'_>) -> EventFieldVisitor {
 struct EventFieldVisitor {
     message: Option<String>,
     log_target: Option<String>,
+    log_file: Option<String>,
+    log_line: Option<u64>,
+    name: Option<String>,
+    root_error_code: Option<String>,
 }
 
 impl Visit for EventFieldVisitor {
@@ -365,7 +739,16 @@ impl Visit for EventFieldVisitor {
         match field.name() {
             "message" => self.message = Some(value.to_owned()),
             "log.target" => self.log_target = Some(value.to_owned()),
+            "log.file" => self.log_file = Some(value.to_owned()),
+            "name" => self.name = Some(value.to_owned()),
+            "root_error_code" => self.root_error_code = Some(value.to_owned()),
             _ => {}
+        }
+    }
+
+    fn record_u64(&mut self, field: &Field, value: u64) {
+        if field.name() == "log.line" {
+            self.log_line = Some(value);
         }
     }
 
@@ -374,6 +757,11 @@ impl Visit for EventFieldVisitor {
             "message" => self.message = Some(format!("{value:?}")),
             "log.target" => {
                 self.log_target = Some(format!("{value:?}").trim_matches('"').to_owned())
+            }
+            "log.file" => self.log_file = Some(format!("{value:?}").trim_matches('"').to_owned()),
+            "name" => self.name = Some(format!("{value:?}").trim_matches('"').to_owned()),
+            "root_error_code" => {
+                self.root_error_code = Some(format!("{value:?}").trim_matches('"').to_owned())
             }
             _ => {}
         }
@@ -397,10 +785,15 @@ fn non_empty(value: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::{
-        sentry_event_filter, should_demote_gpui_asset_cache_http_not_found,
+        database_metrics_target_enabled, sentry_enabled_for_environment, sentry_event_filter,
+        should_demote_gpui_asset_cache_http_not_found,
+        should_demote_gpui_closed_window_activation_event,
+        should_demote_gpui_closed_window_teardown_error,
         should_demote_rathole_client_control_channel_retry,
+        should_demote_rmcp_common_stream_request_failure,
         should_demote_rmcp_transport_worker_failure,
-        should_demote_tantivy_reader_commit_reload_not_found,
+        should_demote_tantivy_reader_commit_reload_not_found, should_ignore_otlp_internal_event,
+        should_keep_otlp_network_diagnostic,
     };
     use sentry::integrations::tracing::EventFilter;
     use std::sync::Arc;
@@ -410,6 +803,15 @@ mod tests {
     use tracing_subscriber::layer::{Context as TracingContext, Layer, SubscriberExt};
 
     struct CountingLayer(Arc<AtomicUsize>);
+
+    #[test]
+    fn sentry_is_enabled_only_for_production() {
+        assert!(sentry_enabled_for_environment(Some("production")));
+        assert!(!sentry_enabled_for_environment(Some("development")));
+        assert!(!sentry_enabled_for_environment(Some("staging")));
+        assert!(!sentry_enabled_for_environment(Some("Production")));
+        assert!(!sentry_enabled_for_environment(None));
+    }
 
     impl<S> Layer<S> for CountingLayer
     where
@@ -425,7 +827,8 @@ mod tests {
         let events = Arc::new(AtomicUsize::new(0));
         let database_metrics_filter = Targets::new()
             .with_default(LevelFilter::OFF)
-            .with_target("sqlx::pool::acquire", LevelFilter::TRACE);
+            .with_target("sqlx::pool::acquire", LevelFilter::TRACE)
+            .with_target("pioneer_sqlite::pool", LevelFilter::TRACE);
         let log_filter = Targets::new().with_default(LevelFilter::INFO);
         let subscriber = tracing_subscriber::registry()
             .with(
@@ -442,6 +845,24 @@ mod tests {
     }
 
     #[test]
+    fn database_metrics_attribution_is_consent_gated_and_target_bounded() {
+        assert!(!database_metrics_target_enabled(
+            "sqlx::pool::acquire",
+            false
+        ));
+        assert!(!database_metrics_target_enabled(
+            "pioneer_sqlite::pool",
+            false
+        ));
+        assert!(database_metrics_target_enabled("sqlx::pool::acquire", true));
+        assert!(database_metrics_target_enabled(
+            "pioneer_sqlite::pool",
+            true
+        ));
+        assert!(!database_metrics_target_enabled("pioneer::other", true));
+    }
+
+    #[test]
     fn demotes_expected_rmcp_streamable_http_initialize_response_failure() {
         assert!(should_demote_rmcp_transport_worker_failure(
             &tracing::Level::ERROR,
@@ -450,6 +871,141 @@ mod tests {
                 "worker quit with fatal: unexpected server response: expect initialized, accepted, when process initialize response",
             ),
         ));
+    }
+
+    const COMMON_STREAM_TARGET: &str = "rmcp::transport::streamable_http_client";
+    const POSTHOG_COMMON_STREAM_FAILURE: &str = "fail to get common stream: Client error: error sending request for url (https://mcp.posthog.com/mcp)";
+
+    #[test]
+    fn demotes_only_the_fixed_rmcp_common_stream_request_failure_template() {
+        for message in [
+            POSTHOG_COMMON_STREAM_FAILURE,
+            "fail to get common stream: Client error: error sending request for url (https://mcp.axiom.co/mcp)",
+            "fail to get common stream: Client error: error sending request for url (http://localhost:8123/other/path?mode=sse)",
+        ] {
+            assert!(
+                should_demote_rmcp_common_stream_request_failure(
+                    &tracing::Level::ERROR,
+                    COMMON_STREAM_TARGET,
+                    Some(message),
+                ),
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn keeps_common_stream_request_failure_with_other_metadata() {
+        for target in [
+            "pioneer_gateway",
+            "rmcp::transport::worker",
+            "rmcp::transport::streamable_http_client::other",
+        ] {
+            assert!(!should_demote_rmcp_common_stream_request_failure(
+                &tracing::Level::ERROR,
+                target,
+                Some(POSTHOG_COMMON_STREAM_FAILURE),
+            ));
+        }
+        for level in [
+            tracing::Level::WARN,
+            tracing::Level::INFO,
+            tracing::Level::DEBUG,
+            tracing::Level::TRACE,
+        ] {
+            assert!(!should_demote_rmcp_common_stream_request_failure(
+                &level,
+                COMMON_STREAM_TARGET,
+                Some(POSTHOG_COMMON_STREAM_FAILURE),
+            ));
+        }
+        assert!(!should_demote_rmcp_common_stream_request_failure(
+            &tracing::Level::ERROR,
+            COMMON_STREAM_TARGET,
+            None,
+        ));
+    }
+
+    #[test]
+    fn keeps_other_rmcp_streamable_http_failures_outside_the_new_rule() {
+        for message in [
+            "fail to send initialized notification: Client error: error sending request for url (https://mcp.posthog.com/mcp)",
+            "prefix: fail to get common stream: Client error: error sending request for url (https://mcp.posthog.com/mcp)",
+            "fail to get common stream: Client error: error sending request for url (https://mcp.posthog.com/mcp), when call tools/list",
+            "fail to get common stream: Client error: error sending request for url (https://mcp.posthog.com/mcp) (diagnostic tail)",
+            "fail to get common stream: Client error: error sending request for url (https://mcp.posthog.com/mcp),diagnostic)",
+            "fail to get common stream: Client error: error sending request for url ()",
+            "fail to get common stream: Client error: error sending request for url (https://mcp.posthog.com/mcp",
+            "fail to get common stream: AuthRequired(www-authenticate)",
+            "fail to get common stream: InsufficientScope(read)",
+            "fail to get common stream: Client error: HTTP status client error (401 Unauthorized) for url (https://mcp.posthog.com/mcp)",
+            "fail to get common stream: Client error: HTTP status client error (403 Forbidden) for url (https://mcp.posthog.com/mcp)",
+            "fail to get common stream: UnexpectedServerResponse(HTTP 403 Forbidden)",
+            "fail to get common stream: unexpected server response: HTTP 401 Unauthorized",
+            "fail to get common stream: UnexpectedContentType(text/html)",
+            "fail to get common stream: Unexpected content type: Some(\"text/html\")",
+            "fail to get common stream: Deserialize error: expected value at line 1 column 1",
+            "fail to get common stream: TokioJoinError(task panicked)",
+            "fail to get common stream: Tokio join error: task panicked",
+            "fail to get common stream: unknown failure",
+            "fail to get common stream: Client error: unknown failure",
+            "Client error: error sending request for url (https://mcp.posthog.com/mcp), when call tools/list",
+            "Client error: error sending request for url (https://mcp.posthog.com/mcp), when call tools/call",
+            "streamable HTTP response stream closed before its final response",
+            "fail to get common stream: unexpected end of stream",
+        ] {
+            assert!(
+                !should_demote_rmcp_common_stream_request_failure(
+                    &tracing::Level::ERROR,
+                    COMMON_STREAM_TARGET,
+                    Some(message),
+                ),
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn real_sentry_mapper_retains_common_stream_breadcrumb_and_neighboring_error() {
+        // Share the existing consent-test lock without mutating consent or
+        // installing a global subscriber/client. The test helper creates a fresh
+        // hub and replaces the transport with TestTransport (no network sends).
+        let _guard = super::telemetry::tests::TELEMETRY_TEST_LOCK
+            .lock()
+            .expect("telemetry test lock");
+        let events = sentry::test::with_captured_events(|| {
+            let subscriber = tracing_subscriber::registry().with(super::sentry_tracing_layer());
+            tracing::subscriber::with_default(subscriber, || {
+                tracing::error!(target: "rmcp::transport::streamable_http_client",
+                    "fail to get common stream: Client error: error sending request for url ({})",
+                    "https://mcp.posthog.com/mcp"
+                );
+                tracing::error!(target: "rmcp::transport::streamable_http_client",
+                    "fail to get common stream: unexpected server response: HTTP 401 Unauthorized"
+                );
+            });
+        });
+
+        assert_eq!(
+            events.len(),
+            1,
+            "only the neighboring ERROR is a Sentry event"
+        );
+        let event = &events[0];
+        assert_eq!(event.level, sentry::Level::Error);
+        assert_eq!(event.logger.as_deref(), Some(COMMON_STREAM_TARGET));
+        assert_eq!(
+            event.message.as_deref(),
+            Some("fail to get common stream: unexpected server response: HTTP 401 Unauthorized")
+        );
+        assert_eq!(event.breadcrumbs.len(), 1);
+        let breadcrumb = &event.breadcrumbs.values[0];
+        assert_eq!(breadcrumb.level, sentry::Level::Error);
+        assert_eq!(breadcrumb.category.as_deref(), Some(COMMON_STREAM_TARGET));
+        assert_eq!(
+            breadcrumb.message.as_deref(),
+            Some(POSTHOG_COMMON_STREAM_FAILURE)
+        );
     }
 
     #[test]
@@ -625,6 +1181,102 @@ mod tests {
     }
 
     #[test]
+    fn demotes_gpui_closed_window_activation_event_on_windows() {
+        assert!(should_demote_gpui_closed_window_activation_event(
+            &tracing::Level::ERROR,
+            "log",
+            Some(""),
+            Some(
+                r"C:\Users\runneradmin\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\gpui-pre-0.3.5\src\window.rs",
+            ),
+            Some(1899),
+            Some("window not found"),
+        ));
+    }
+
+    #[test]
+    fn keeps_gpui_window_not_found_from_other_callbacks_as_event() {
+        assert!(!should_demote_gpui_closed_window_activation_event(
+            &tracing::Level::ERROR,
+            "log",
+            Some(""),
+            Some(
+                r"C:\Users\runneradmin\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\gpui-pre-0.3.5\src\window.rs",
+            ),
+            Some(1900),
+            Some("window not found"),
+        ));
+    }
+
+    #[test]
+    fn keeps_window_not_found_from_application_code_as_event() {
+        assert!(!should_demote_gpui_closed_window_activation_event(
+            &tracing::Level::ERROR,
+            "pioneer_desktop",
+            None,
+            Some("crates/desktop/src/window.rs"),
+            Some(1899),
+            Some("window not found"),
+        ));
+    }
+
+    #[test]
+    fn demotes_gpui_closed_window_drag_drop_teardown_error() {
+        assert!(should_demote_gpui_closed_window_teardown_error(
+            &tracing::Level::ERROR,
+            "log",
+            Some("gpui_windows::window"),
+            Some(
+                r"C:\Users\runneradmin\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\gpui-pre-windows-0.3.5\src\window.rs",
+            ),
+            Some(618),
+            Some("Invalid window handle (0x80040102)"),
+        ));
+    }
+
+    #[test]
+    fn demotes_gpui_closed_window_destroy_teardown_error() {
+        assert!(should_demote_gpui_closed_window_teardown_error(
+            &tracing::Level::ERROR,
+            "log",
+            Some("gpui_windows::window"),
+            Some(
+                r"C:\Users\runneradmin\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\gpui-pre-windows-0.3.5\src\window.rs",
+            ),
+            Some(619),
+            Some("Invalid window handle. (0x80070578)"),
+        ));
+    }
+
+    #[test]
+    fn keeps_gpui_invalid_window_handle_from_other_calls_as_event() {
+        assert!(!should_demote_gpui_closed_window_teardown_error(
+            &tracing::Level::ERROR,
+            "log",
+            Some("gpui_windows::window"),
+            Some(
+                r"C:\Users\runneradmin\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\gpui-pre-windows-0.3.5\src\window.rs",
+            ),
+            Some(620),
+            Some("Invalid window handle (0x80040102)"),
+        ));
+    }
+
+    #[test]
+    fn keeps_gpui_invalid_window_handle_from_other_versions_as_event() {
+        assert!(!should_demote_gpui_closed_window_teardown_error(
+            &tracing::Level::ERROR,
+            "log",
+            Some("gpui_windows::window"),
+            Some(
+                r"C:\Users\runneradmin\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\gpui-pre-windows-0.3.6\src\window.rs",
+            ),
+            Some(618),
+            Some("Invalid window handle (0x80040102)"),
+        ));
+    }
+
+    #[test]
     fn demotes_rathole_client_control_channel_network_retry() {
         assert!(should_demote_rathole_client_control_channel_retry(
             &tracing::Level::ERROR,
@@ -665,6 +1317,16 @@ mod tests {
     }
 
     #[test]
+    fn keeps_single_typed_rathole_rejection_as_event() {
+        assert!(!should_demote_rathole_client_control_channel_retry(
+            &tracing::Level::ERROR,
+            "rathole::client",
+            None,
+            Some("Remote access control channel rejected"),
+        ));
+    }
+
+    #[test]
     fn keeps_rathole_client_control_channel_retry_from_other_targets_as_event() {
         assert!(!should_demote_rathole_client_control_channel_retry(
             &tracing::Level::ERROR,
@@ -690,5 +1352,33 @@ mod tests {
             sentry_event_filter(&tracing::Level::INFO).bits(),
             EventFilter::Breadcrumb.bits()
         );
+    }
+
+    #[test]
+    fn replaces_repeated_otlp_sdk_export_errors_with_one_owned_outage_event() {
+        assert!(should_ignore_otlp_internal_event(
+            &tracing::Level::ERROR,
+            "opentelemetry_sdk",
+            Some("BatchSpanProcessor.ExportError"),
+        ));
+        assert!(!should_ignore_otlp_internal_event(
+            &tracing::Level::ERROR,
+            "opentelemetry_sdk",
+            Some("TracerProvider.ShutdownError"),
+        ));
+    }
+
+    #[test]
+    fn retains_only_the_detailed_otlp_network_debug_breadcrumb() {
+        assert!(should_keep_otlp_network_diagnostic(
+            &tracing::Level::DEBUG,
+            "opentelemetry-otlp",
+            Some("HttpClient.NetworkError"),
+        ));
+        assert!(should_ignore_otlp_internal_event(
+            &tracing::Level::DEBUG,
+            "opentelemetry-otlp",
+            Some("HttpClient.ExportStarted"),
+        ));
     }
 }

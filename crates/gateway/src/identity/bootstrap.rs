@@ -10,11 +10,11 @@ use pioneer_protocol::{
     generate_id,
 };
 use pioneer_sqlite::{
-    DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, is_anyhow_sqlite_lock,
-    retry_with_backoff,
+    DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, SqliteDatabase,
+    is_anyhow_sqlite_lock, retry_with_backoff,
 };
 use sea_orm::{
-    DatabaseConnection, DatabaseTransaction, SqliteTransactionMode, TransactionOptions,
+    ConnectionTrait, SqliteTransactionMode, TransactionOptions, TransactionSession,
     TransactionTrait,
 };
 use std::time::Duration;
@@ -57,14 +57,17 @@ pub(crate) struct IdentityBootstrapOutcome {
     pub superuser_created: bool,
 }
 
-struct IdentityBootstrapTransaction {
-    transaction: DatabaseTransaction,
+struct IdentityBootstrapTransaction<T> {
+    transaction: T,
     snapshot: IdentityBootstrapSnapshot,
     gateway_created: bool,
     superuser_created: bool,
 }
 
-impl IdentityBootstrapTransaction {
+impl<T> IdentityBootstrapTransaction<T>
+where
+    T: ConnectionTrait + TransactionSession,
+{
     #[cfg(test)]
     pub(crate) fn snapshot(&self) -> &IdentityBootstrapSnapshot {
         &self.snapshot
@@ -109,9 +112,10 @@ impl IdentityBootstrapTransaction {
 }
 
 pub(crate) async fn bootstrap_identity(
-    connection: &DatabaseConnection,
+    connection: impl Into<SqliteDatabase>,
 ) -> Result<IdentityBootstrapOutcome> {
-    let mut bootstrap = begin_identity_bootstrap(connection).await?;
+    let connection = connection.into().maintenance();
+    let mut bootstrap = begin_identity_bootstrap(&connection).await?;
     let (gateway_created, superuser_created) = bootstrap.created_flags();
     let work = async {
         let backfill_counts = bootstrap.backfill_legacy_actors().await?;
@@ -137,9 +141,12 @@ pub(crate) async fn bootstrap_identity(
     }
 }
 
-async fn begin_identity_bootstrap(
-    connection: &DatabaseConnection,
-) -> Result<IdentityBootstrapTransaction> {
+async fn begin_identity_bootstrap<D>(
+    connection: &D,
+) -> Result<IdentityBootstrapTransaction<D::Transaction>>
+where
+    D: TransactionTrait,
+{
     retry_with_backoff(
         || begin_identity_bootstrap_once(connection),
         is_anyhow_sqlite_lock,
@@ -149,9 +156,12 @@ async fn begin_identity_bootstrap(
     .await
 }
 
-async fn begin_identity_bootstrap_once(
-    connection: &DatabaseConnection,
-) -> Result<IdentityBootstrapTransaction> {
+async fn begin_identity_bootstrap_once<D>(
+    connection: &D,
+) -> Result<IdentityBootstrapTransaction<D::Transaction>>
+where
+    D: TransactionTrait,
+{
     let transaction = connection
         .begin_with_options(TransactionOptions {
             sqlite_transaction_mode: Some(SqliteTransactionMode::Immediate),
@@ -177,9 +187,12 @@ async fn begin_identity_bootstrap_once(
     }
 }
 
-async fn load_or_create_identity(
-    transaction: &DatabaseTransaction,
-) -> Result<(IdentityBootstrapSnapshot, bool, bool)> {
+async fn load_or_create_identity<C>(
+    transaction: &C,
+) -> Result<(IdentityBootstrapSnapshot, bool, bool)>
+where
+    C: ConnectionTrait,
+{
     let (gateway, gateway_created) = match load_gateway_singleton(transaction).await? {
         Some(existing) => (existing, false),
         None => {
@@ -503,11 +516,12 @@ mod tests {
         let directory = tempfile::tempdir().expect("temporary database directory");
         let url = pioneer_sqlite::sqlite_connection_url(&directory.path().join("gateway.db"));
         let mut options = ConnectOptions::new(url);
-        options.max_connections(4);
+        options.max_connections(1);
         let database = Database::connect(options)
             .await
             .expect("connect sqlite file");
         Migrator::up(&database, None).await.expect("run migrations");
+        let database = pioneer_sqlite::SqliteDatabase::from_single_connection(database);
 
         let (first, second) =
             tokio::join!(bootstrap_identity(&database), bootstrap_identity(&database));

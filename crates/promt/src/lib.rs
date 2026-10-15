@@ -64,6 +64,7 @@ pub use render::{
         request_tools_hidden_domain_catalog_section, runtime_sections_with_request_tools_catalog,
     },
     task_run::{TaskRevisionPromptInput, TaskRunPromptCompiler, TaskRunPromptInput},
+    text::render_thread_ids,
     tool_loop::tool_loop_final_answer_instruction,
     tool_retry::{ToolRetryInstructionKind, render_tool_retry_instruction},
     turn_preflight::{
@@ -73,7 +74,7 @@ pub use render::{
 };
 pub use runtime_files::{RuntimeIdentityFilesReport, ensure_runtime_identity_files};
 pub use section::{
-    DynamicPromptSectionInput, PromptDynamicSectionId, PromptRuntimeBuiltInSectionId,
-    PromptRuntimeSectionId, PromptRuntimeSectionInput, PromptSection, PromptSectionId,
-    PromptSectionIdError, PromptStability,
+    DynamicPromptSectionInput, FILESYSTEM_CAPABILITY_RUNTIME_SECTION_ID, PromptDynamicSectionId,
+    PromptRuntimeBuiltInSectionId, PromptRuntimeSectionId, PromptRuntimeSectionInput,
+    PromptSection, PromptSectionId, PromptSectionIdError, PromptStability,
 };

@@ -1,5 +1,8 @@
 //! Codex app-server runtime implementation boundary.
 
+#[path = "codex_service.rs"]
+pub mod service;
+
 #[path = "codex_schema.rs"]
 mod schema;
 pub use schema::{
@@ -39,21 +42,28 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::error::Error;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
+use std::io::{BufReader as StdBufReader, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufRead, AsyncWrite, BufReader};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tokio::time::Instant;
 
 const DEFAULT_COMMAND_QUEUE_CAPACITY: usize = 64;
 const DEFAULT_INCOMING_QUEUE_CAPACITY: usize = 256;
+/// Codex can persist a single provider event containing generated file
+/// contents hundreds of MiB in size. The frame is admitted only to an
+/// anonymous disk spool and then normalized through method-specific streaming
+/// decoders; it is never a permission to materialize this many bytes in RAM.
+pub const CODEX_MAX_RECOVERY_FRAME_BYTES: usize = 512 * 1024 * 1024;
+const CODEX_MAX_MATERIALIZED_FRAME_BYTES: usize = 8 * 1024 * 1024;
 const DEFAULT_SERVER_REQUEST_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 const CODEX_SERVER_REQUEST_HANDLER_UNAVAILABLE_CODE: i64 = -32000;
 const CODEX_SERVER_REQUEST_TIMEOUT_CODE: i64 = -32001;
+const CODEX_SERVER_REQUEST_PAYLOAD_TOO_LARGE_CODE: i64 = -32002;
 const CODEX_SERVER_REQUEST_DUPLICATE_ID_CODE: i64 = -32600;
 const LOGIN_SESSION_TIMEOUT: Duration = Duration::from_secs(600);
 const CODEX_HOME_OVERLAY_POLICY_VERSION: u32 = 1;
@@ -76,6 +86,28 @@ skill_mcp_dependency_install = false
 "#;
 static CODEX_GENERATION_OVERLAY_NONCE_COUNTER: AtomicU64 = AtomicU64::new(1);
 
+struct CountingReader<R> {
+    inner: R,
+    bytes_read: Arc<AtomicU64>,
+}
+
+impl<R> CountingReader<R> {
+    fn new(inner: R, bytes_read: Arc<AtomicU64>) -> Self {
+        Self { inner, bytes_read }
+    }
+}
+
+impl<R> Read for CountingReader<R>
+where
+    R: Read,
+{
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.inner.read(buffer)?;
+        self.bytes_read.fetch_add(read as u64, Ordering::Relaxed);
+        Ok(read)
+    }
+}
+
 #[derive(Clone)]
 pub struct CodexJsonlRpcClient {
     command_tx: mpsc::Sender<CodexJsonlRpcCommand>,
@@ -85,7 +117,64 @@ pub struct CodexJsonlRpcClient {
     diagnostic_rx: Arc<StdMutex<Option<mpsc::Receiver<CodexJsonlRpcClientDiagnostic>>>>,
 }
 
+/// Owns only this transport's reader, writer/dispatcher and ordered ingress.
+/// A service attempt joins these after terminating its own App Server process.
+/// Dropping the owner aborts every task even when client clones remain alive.
+pub struct CodexJsonlRpcOwner {
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+impl CodexJsonlRpcOwner {
+    pub async fn shutdown(mut self) {
+        self.abort_and_join().await;
+    }
+
+    pub async fn abort_and_join(&mut self) {
+        for task in &self.tasks {
+            task.abort();
+        }
+        while let Some(task) = self.tasks.last_mut() {
+            let _ = task.await;
+            self.tasks.pop();
+        }
+    }
+
+    fn detach(mut self) {
+        // Preserve the existing persistent transport's lifecycle contract.
+        self.tasks.clear();
+    }
+}
+impl Drop for CodexJsonlRpcOwner {
+    fn drop(&mut self) {
+        for task in &self.tasks {
+            task.abort();
+        }
+    }
+}
+
 impl CodexJsonlRpcClient {
+    pub fn new_owned<R, W>(reader: R, writer: W) -> (Self, CodexJsonlRpcOwner)
+    where
+        R: AsyncBufRead + Send + Unpin + 'static,
+        W: AsyncWrite + Send + Unpin + 'static,
+    {
+        Self::new_owned_with_server_request_policy(
+            reader,
+            writer,
+            DEFAULT_INCOMING_QUEUE_CAPACITY,
+            DEFAULT_INCOMING_QUEUE_CAPACITY,
+            DEFAULT_COMMAND_QUEUE_CAPACITY,
+            DEFAULT_SERVER_REQUEST_TIMEOUT,
+            // Service responses are bounded in memory. Disabling the larger
+            // disk recovery path also prevents detached spawn_blocking spool
+            // decoders from surviving cancellation of this attempt's owner.
+            crate::NativeEventBudget {
+                max_frame_bytes: CODEX_MAX_MATERIALIZED_FRAME_BYTES,
+                max_recovery_frame_bytes: CODEX_MAX_MATERIALIZED_FRAME_BYTES,
+                ..crate::NativeEventBudget::default()
+            },
+        )
+    }
+
     pub fn new<R, W>(reader: R, writer: W) -> Self
     where
         R: AsyncBufRead + Send + Unpin + 'static,
@@ -117,7 +206,7 @@ impl CodexJsonlRpcClient {
             notification_capacity,
             server_request_capacity,
             diagnostic_capacity,
-            crate::NativeEventBudget::default(),
+            codex_native_event_budget(),
         )
     }
 
@@ -157,6 +246,32 @@ impl CodexJsonlRpcClient {
         R: AsyncBufRead + Send + Unpin + 'static,
         W: AsyncWrite + Send + Unpin + 'static,
     {
+        let (client, owner) = Self::new_owned_with_server_request_policy(
+            reader,
+            writer,
+            notification_capacity,
+            server_request_capacity,
+            diagnostic_capacity,
+            server_request_timeout,
+            native_event_budget,
+        );
+        owner.detach();
+        client
+    }
+
+    fn new_owned_with_server_request_policy<R, W>(
+        reader: R,
+        writer: W,
+        notification_capacity: usize,
+        server_request_capacity: usize,
+        diagnostic_capacity: usize,
+        server_request_timeout: Duration,
+        native_event_budget: crate::NativeEventBudget,
+    ) -> (Self, CodexJsonlRpcOwner)
+    where
+        R: AsyncBufRead + Send + Unpin + 'static,
+        W: AsyncWrite + Send + Unpin + 'static,
+    {
         let server_request_capacity = server_request_capacity.max(1);
         let server_request_timeout = if server_request_timeout.is_zero() {
             Duration::from_millis(1)
@@ -168,7 +283,7 @@ impl CodexJsonlRpcClient {
         let (notification_tx, notification_rx) = mpsc::channel(notification_capacity.max(1));
         let (server_request_tx, server_request_rx) = mpsc::channel(server_request_capacity);
         let (diagnostic_tx, diagnostic_rx) = mpsc::channel(diagnostic_capacity.max(1));
-        let notification_ingress = OrderedEventIngress::spawn(
+        let (notification_ingress, ingress_worker) = OrderedEventIngress::spawn_owned(
             notification_tx,
             OrderedIngressConfig {
                 flush_interval: CODEX_NOTIFICATION_PROGRESS_FLUSH_INTERVAL,
@@ -177,12 +292,12 @@ impl CodexJsonlRpcClient {
             },
         );
 
-        tokio::spawn(run_codex_jsonl_rpc_reader(
+        let reader_worker = tokio::spawn(run_codex_jsonl_rpc_reader(
             reader,
             incoming_tx,
             native_event_budget,
         ));
-        tokio::spawn(run_codex_jsonl_rpc_worker(
+        let rpc_worker = tokio::spawn(run_codex_jsonl_rpc_worker(
             writer,
             command_rx,
             incoming_rx,
@@ -195,13 +310,19 @@ impl CodexJsonlRpcClient {
             server_request_timeout,
         ));
 
-        Self {
+        let client = Self {
             command_tx,
             next_request_id: Arc::new(AtomicI64::new(0)),
             notification_rx: Arc::new(StdMutex::new(Some(notification_rx))),
             server_request_rx: Arc::new(StdMutex::new(Some(server_request_rx))),
             diagnostic_rx: Arc::new(StdMutex::new(Some(diagnostic_rx))),
-        }
+        };
+        (
+            client,
+            CodexJsonlRpcOwner {
+                tasks: vec![reader_worker, rpc_worker, ingress_worker],
+            },
+        )
     }
 
     pub async fn request<TResponse, TParams>(
@@ -235,6 +356,23 @@ impl CodexJsonlRpcClient {
         let id = self.next_request_id();
         self.request_value_with_id(id, method, params, timeout)
             .await
+    }
+
+    async fn request_thread_open_value(
+        &self,
+        method: &'static str,
+        params: Option<JsonValue>,
+        timeout: Duration,
+    ) -> Result<JsonValue, CodexJsonlRpcClientError> {
+        let id = self.next_request_id();
+        self.request_value_with_id_and_recovery(
+            id,
+            method,
+            params,
+            timeout,
+            Some(OversizedSuccessRecovery::ThreadOpenSnapshot { method }),
+        )
+        .await
     }
 
     async fn request_thread_turn_snapshot_value(
@@ -428,6 +566,13 @@ impl CodexJsonlRpcClient {
     }
 }
 
+pub fn codex_native_event_budget() -> crate::NativeEventBudget {
+    crate::NativeEventBudget {
+        max_recovery_frame_bytes: CODEX_MAX_RECOVERY_FRAME_BYTES,
+        ..crate::NativeEventBudget::default()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum CodexJsonlRpcClientError {
     Native(CodexJsonlRpcNativeError),
@@ -458,6 +603,14 @@ pub enum CodexJsonlRpcClientError {
 impl CodexJsonlRpcClientError {
     pub const fn is_method_not_found(&self) -> bool {
         matches!(self, Self::Native(error) if error.code == -32601)
+    }
+
+    /// These failures happen before thread/fork can commit a provider thread.
+    /// Transport loss, timeout, decode errors and other server errors have an
+    /// unknown outcome and must retain the durable fork fence.
+    pub const fn proves_fork_not_created(&self) -> bool {
+        matches!(self, Self::Encode { .. } | Self::DuplicateRequestId { .. })
+            || matches!(self, Self::Native(error) if error.code == -32601 || error.code == -32602)
     }
 }
 
@@ -521,6 +674,9 @@ impl CodexAppServerClient {
         &self,
         timeout: Duration,
     ) -> Result<CodexInitializeSnapshot, CodexJsonlRpcClientError> {
+        let _startup_stage = pioneer_observability::turn_startup::current_stage(
+            pioneer_observability::turn_startup::Stage::CliHandshake,
+        );
         let params = CodexInitializeParams::pioneer_desktop();
         let params_value =
             serde_json::to_value(&params).map_err(|error| CodexJsonlRpcClientError::Encode {
@@ -705,7 +861,7 @@ impl CodexAppServerClient {
             })?;
         let result = self
             .rpc
-            .request_value("thread/start", Some(params), timeout)
+            .request_thread_open_value("thread/start", Some(params), timeout)
             .await?;
         decode_codex_thread_open_response("thread/start", result)
     }
@@ -727,9 +883,11 @@ impl CodexAppServerClient {
         rollout_path: Option<PathBuf>,
         timeout: Duration,
     ) -> Result<CodexThreadOpenSnapshot, CodexJsonlRpcClientError> {
+        let requested_thread_id = thread_id.into();
         let params = serde_json::to_value(CodexThreadResumeParams {
-            thread_id: thread_id.into(),
+            thread_id: requested_thread_id.clone(),
             path: rollout_path,
+            exclude_turns: true,
             start: params,
         })
         .map_err(|error| CodexJsonlRpcClientError::Encode {
@@ -738,9 +896,19 @@ impl CodexAppServerClient {
         })?;
         let result = self
             .rpc
-            .request_value("thread/resume", Some(params), timeout)
+            .request_thread_open_value("thread/resume", Some(params), timeout)
             .await?;
-        decode_codex_thread_open_response("thread/resume", result)
+        let opened = decode_codex_thread_open_response("thread/resume", result)?;
+        if opened.native_thread_id != requested_thread_id {
+            return Err(CodexJsonlRpcClientError::Decode {
+                method: "thread/resume".to_owned(),
+                message: format!(
+                    "thread/resume returned native thread `{}` instead of requested native thread `{requested_thread_id}`",
+                    opened.native_thread_id
+                ),
+            });
+        }
+        Ok(opened)
     }
 
     pub async fn thread_compact_start(
@@ -855,16 +1023,149 @@ impl CodexAppServerClient {
         params: CodexThreadForkParams,
         timeout: Duration,
     ) -> Result<CodexThreadOpenSnapshot, CodexJsonlRpcClientError> {
-        let params =
-            serde_json::to_value(&params).map_err(|error| CodexJsonlRpcClientError::Encode {
-                method: "thread/fork".to_owned(),
-                message: error.to_string(),
-            })?;
+        let params = serde_json::to_value(CodexThreadForkRequestParams {
+            thread_id: params.thread_id,
+            last_turn_id: params.last_turn_id,
+            thread_source: params.thread_source,
+            exclude_turns: true,
+        })
+        .map_err(|error| CodexJsonlRpcClientError::Encode {
+            method: "thread/fork".to_owned(),
+            message: error.to_string(),
+        })?;
         let result = self
             .rpc
-            .request_value("thread/fork", Some(params), timeout)
+            .request_thread_open_value("thread/fork", Some(params), timeout)
             .await?;
         decode_codex_thread_open_response("thread/fork", result)
+    }
+
+    /// Reconcile an interrupted fork by its caller-supplied durable marker.
+    /// A source and boundary alone are ambiguous when another actor forks the
+    /// same conversation. `threadSource` is persisted by the app-server and
+    /// returned by `thread/list`, so only the exact intent can be adopted.
+    pub async fn find_marked_thread_fork(
+        &self,
+        source_thread_id: &str,
+        boundary_turn_id: &str,
+        marker: &str,
+        timeout: Duration,
+    ) -> Result<Option<CodexThreadOpenSnapshot>, CodexJsonlRpcClientError> {
+        let mut candidate: Option<(CodexThreadOpenSnapshot, bool)> = None;
+        // `archived: null` searches only live threads. A negative result is
+        // proof only after both disjoint provider partitions are exhausted.
+        for archived in [false, true] {
+            let mut cursor: Option<String> = None;
+            let mut cursors = HashSet::new();
+            let mut complete = false;
+            for _ in 0..100 {
+                let response = self
+                    .rpc
+                    .request_value(
+                        "thread/list",
+                        Some(json!({
+                            "cursor": cursor,
+                            "limit": 100,
+                            "archived": archived,
+                        })),
+                        timeout,
+                    )
+                    .await?;
+                let data = response
+                    .get("data")
+                    .and_then(JsonValue::as_array)
+                    .ok_or_else(|| CodexJsonlRpcClientError::Decode {
+                        method: "thread/list".to_owned(),
+                        message: "fork reconciliation response omitted data".to_owned(),
+                    })?;
+                for thread in data {
+                    if thread.get("threadSource").and_then(JsonValue::as_str) != Some(marker) {
+                        continue;
+                    }
+                    if thread.get("forkedFromId").and_then(JsonValue::as_str)
+                        != Some(source_thread_id)
+                    {
+                        return Err(CodexJsonlRpcClientError::Decode {
+                            method: "thread/list".to_owned(),
+                            message: "marked fork has a different source thread".to_owned(),
+                        });
+                    }
+                    let id = thread
+                        .get("id")
+                        .and_then(JsonValue::as_str)
+                        .ok_or_else(|| CodexJsonlRpcClientError::Decode {
+                            method: "thread/list".to_owned(),
+                            message: "marked fork has no thread ID".to_owned(),
+                        })?;
+                    let turns = self
+                        .rpc
+                        .request_value(
+                            "thread/turns/list",
+                            Some(json!({
+                                "threadId": id,
+                                "limit": 1,
+                                "sortDirection": "desc",
+                                "itemsView": "notLoaded",
+                            })),
+                            timeout,
+                        )
+                        .await?;
+                    let last_turn = turns
+                        .get("data")
+                        .and_then(JsonValue::as_array)
+                        .and_then(|turns| turns.first())
+                        .and_then(|turn| turn.get("id"))
+                        .and_then(JsonValue::as_str);
+                    if last_turn != Some(boundary_turn_id) || candidate.is_some() {
+                        return Err(CodexJsonlRpcClientError::Decode {
+                            method: "thread/turns/list".to_owned(),
+                            message:
+                                "marked fork is ambiguous or does not end at the requested boundary"
+                                    .to_owned(),
+                        });
+                    }
+                    candidate = Some((
+                        decode_codex_thread_open_response(
+                            "thread/list",
+                            json!({"thread": thread}),
+                        )?,
+                        archived,
+                    ));
+                }
+                cursor = response
+                    .get("nextCursor")
+                    .and_then(JsonValue::as_str)
+                    .filter(|cursor| !cursor.is_empty())
+                    .map(str::to_owned);
+                let Some(next) = cursor.as_ref() else {
+                    complete = true;
+                    break;
+                };
+                if !cursors.insert(next.clone()) {
+                    return Err(CodexJsonlRpcClientError::Decode {
+                        method: "thread/list".to_owned(),
+                        message: "fork reconciliation pagination repeated a cursor".to_owned(),
+                    });
+                }
+            }
+            if !complete {
+                return Err(CodexJsonlRpcClientError::Decode {
+                    method: "thread/list".to_owned(),
+                    message: "fork reconciliation exceeded its bounded page limit".to_owned(),
+                });
+            }
+        }
+        match candidate {
+            Some((fork, true)) => Err(CodexJsonlRpcClientError::Decode {
+                method: "thread/list".to_owned(),
+                message: format!(
+                    "marked fork {} is archived; unarchive that provider thread before retrying reconciliation",
+                    fork.native_thread_id
+                ),
+            }),
+            Some((fork, false)) => Ok(Some(fork)),
+            None => Ok(None),
+        }
     }
 
     pub async fn review_start(
@@ -1840,7 +2141,26 @@ pub fn cleanup_codex_generation_overlay(
             "Codex generation overlay cleanup refused a replacement path",
         ));
     }
-    fs::remove_dir_all(overlay_path.as_path()).map_err(|error| {
+    // Forked histories retain references to their source's persisted path.
+    // Keep storage aliases and the ownership marker, but no process state.
+    let cleanup = || -> std::io::Result<()> {
+        for entry in fs::read_dir(&overlay_path)? {
+            let entry = entry?;
+            if matches!(
+                entry.file_name().to_str(),
+                Some("sessions" | "archived_sessions" | CODEX_GENERATION_OVERLAY_MARKER)
+            ) {
+                continue;
+            }
+            if entry.file_type()?.is_dir() {
+                fs::remove_dir_all(entry.path())?;
+            } else {
+                fs::remove_file(entry.path())?;
+            }
+        }
+        Ok(())
+    };
+    cleanup().map_err(|error| {
         CodexShadowHomeError::with_context(
             "remove Codex generation overlay",
             overlay_path.as_path(),
@@ -1849,21 +2169,71 @@ pub fn cleanup_codex_generation_overlay(
     })
 }
 
-/// Recovers a stale Codex rollout path through the durable shared home used
-/// behind a generation overlay. An existing path needs no override because
-/// Codex should resume it by thread id. Once a generation has been removed,
-/// the lexical `CODEX_HOME/sessions` path is stale while the rollout itself is
-/// still present in the shared home, so the caller must explicitly resume the
-/// durable path.
+/// The caller must supply the authorized source's logical thread, not the
+/// destination child. Reuse the same exact-path recovery as ordinary resume.
+pub fn recover_codex_fork_source_rollout_path(
+    descriptor: &CodexGenerationOverlayDescriptor,
+    source_logical_thread_id: &str,
+    persisted_path: &Path,
+) -> Result<Option<PathBuf>, CodexShadowHomeError> {
+    if source_logical_thread_id.trim().is_empty() {
+        return Err(CodexShadowHomeError::new(
+            "Codex fork source identity is empty",
+        ));
+    }
+    let runtime_root = descriptor
+        .effective_home_path
+        .ancestors()
+        .nth(3)
+        .ok_or_else(|| CodexShadowHomeError::new("Codex overlay has no runtime root"))?;
+    let mut source = descriptor.clone();
+    source.identity.logical_thread_id = source_logical_thread_id.to_owned();
+    source.effective_home_path = runtime_root
+        .join(codex_overlay_identity_component(
+            "thread",
+            source_logical_thread_id,
+        ))
+        .join(codex_overlay_identity_component(
+            "boot",
+            &source.identity.gateway_boot_id,
+        ))
+        .join(format!(
+            "generation-{:020}",
+            source.identity.process_generation
+        ));
+    recover_codex_stale_rollout_path(&source, persisted_path)
+}
+
+/// Resolves the selected rollout to durable storage. For a removed generation,
+/// restore only its storage alias: paginated Codex verifies the requested path
+/// against its persisted path and loads model context through that persisted
+/// path before opening the writer. Passing a different path alone is insufficient.
+/// The canonical override lets the resumed writer persist a durable path.
+/// Storage aliases must remain available for historical rollout references;
+/// they contain no process configuration, credentials, or MCP bootstrap state.
 pub fn recover_codex_stale_rollout_path(
     descriptor: &CodexGenerationOverlayDescriptor,
     persisted_path: &Path,
 ) -> Result<Option<PathBuf>, CodexShadowHomeError> {
     let persisted_path = normalize_absolute_codex_path(persisted_path)?;
+    let logical_thread_root = descriptor
+        .effective_home_path
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| {
+            CodexShadowHomeError::new("Codex generation overlay has no logical thread root")
+        })?;
+    if persisted_path.starts_with(&descriptor.managed_root_path)
+        && !persisted_path.starts_with(logical_thread_root)
+    {
+        return Err(CodexShadowHomeError::new(
+            "Codex rollout path is outside the logical thread overlay",
+        ));
+    }
     match fs::canonicalize(persisted_path.as_path()) {
         Ok(canonical_path) => {
             validate_codex_shared_rollout_path(descriptor, canonical_path.as_path())?;
-            return Ok(None);
+            return Ok(Some(canonical_path));
         }
         Err(error) if error.kind() == ErrorKind::NotFound => {}
         Err(error) => {
@@ -1875,13 +2245,6 @@ pub fn recover_codex_stale_rollout_path(
         }
     }
 
-    let logical_thread_root = descriptor
-        .effective_home_path
-        .parent()
-        .and_then(Path::parent)
-        .ok_or_else(|| {
-            CodexShadowHomeError::new("Codex generation overlay has no logical thread root")
-        })?;
     let relative = persisted_path
         .strip_prefix(logical_thread_root)
         .map_err(|_| {
@@ -1929,7 +2292,30 @@ pub fn recover_codex_stale_rollout_path(
             error,
         )
     })?;
-    validate_codex_shared_rollout_path(descriptor, canonical_path.as_path()).map(Some)
+    let canonical_path = validate_codex_shared_rollout_path(descriptor, canonical_path.as_path())?;
+    // Derive the alias only from the exact persisted generation path in this
+    // logical thread, never by searching rollouts by thread id or file name.
+    // Do not overwrite existing entries or follow symlinked parent directories.
+    let retired_overlay = logical_thread_root.join(boot).join(generation);
+    ensure_codex_directory_no_follow(retired_overlay.as_path(), true)?;
+    ensure_codex_shadow_symlink(
+        descriptor.shared_home_path.as_path(),
+        retired_overlay.as_path(),
+        storage,
+    )?;
+    let restored_path = fs::canonicalize(persisted_path.as_path()).map_err(|error| {
+        CodexShadowHomeError::with_context(
+            "verify restored Codex rollout alias",
+            persisted_path.as_path(),
+            error,
+        )
+    })?;
+    if restored_path != canonical_path {
+        return Err(CodexShadowHomeError::new(
+            "restored Codex rollout alias does not resolve to the selected shared rollout",
+        ));
+    }
+    Ok(Some(canonical_path))
 }
 
 fn validate_codex_shared_rollout_path(
@@ -2254,7 +2640,7 @@ fn materialize_codex_generation_overlay(
 
     let marker_path = overlay_path.join(CODEX_GENERATION_OVERLAY_MARKER);
     let marker = if overlay_existed {
-        let marker =
+        let mut marker =
             read_codex_generation_overlay_marker(marker_path.as_path()).map_err(|error| {
                 CodexShadowHomeError::new(format!(
                     "stale or unmanaged Codex generation overlay `{}`: {error}",
@@ -2266,6 +2652,16 @@ fn materialize_codex_generation_overlay(
                 "stale Codex generation overlay identity at `{}`",
                 overlay_path.display()
             )));
+        }
+        if !overlay_path.join("config.toml").exists() {
+            // A retired storage-only generation is a new process if reused.
+            // Rotate ownership so its old cleanup cannot remove the replacement.
+            marker.materialization_nonce = codex_generation_overlay_nonce(&identity);
+            marker.mcp_artifact = None;
+            let serialized = serde_json::to_vec(&marker).map_err(|error| {
+                CodexShadowHomeError::new(format!("serialize Codex overlay marker failed: {error}"))
+            })?;
+            overwrite_codex_private_file(marker_path.as_path(), &serialized)?;
         }
         marker
     } else {
@@ -3391,6 +3787,10 @@ struct CodexThreadResumeParams {
     pub thread_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<PathBuf>,
+    /// Resume the same durable native thread without echoing its full rollout
+    /// over the JSONL control plane. Codex still loads the entire history and
+    /// retains it as model context for this native thread.
+    pub exclude_turns: bool,
     #[serde(flatten)]
     pub start: CodexThreadStartParams,
 }
@@ -3401,6 +3801,7 @@ impl fmt::Debug for CodexThreadResumeParams {
             .debug_struct("CodexThreadResumeParams")
             .field("thread_id", &self.thread_id)
             .field("path", &self.path)
+            .field("exclude_turns", &self.exclude_turns)
             .field("start", &self.start)
             .finish()
     }
@@ -3541,6 +3942,21 @@ pub struct CodexThreadNameSetSnapshot {
 #[serde(rename_all = "camelCase")]
 pub struct CodexThreadForkParams {
     pub thread_id: String,
+    pub last_turn_id: Option<String>,
+    pub thread_source: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexThreadForkRequestParams {
+    pub thread_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_turn_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thread_source: Option<String>,
+    /// Fork the durable provider thread without echoing the copied rollout
+    /// over JSONL. The fork still owns the complete provider-side history.
+    pub exclude_turns: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -3655,6 +4071,52 @@ impl CodexCommandApprovalDecision {
 
 pub fn codex_command_approval_response(decision: CodexCommandApprovalDecision) -> JsonValue {
     json!({ "decision": decision.as_codex_value() })
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CodexPermissionApprovalRequest {
+    pub native_request_id: String,
+    pub native_request_id_json: JsonValue,
+    pub cwd: Option<String>,
+    pub reason: Option<String>,
+    pub native_thread_id: Option<String>,
+    pub native_turn_id: Option<String>,
+    pub native_item_id: Option<String>,
+    pub requested_permissions: JsonValue,
+    pub started_at_ms: Option<i64>,
+    pub raw: JsonValue,
+}
+
+pub fn decode_codex_permission_approval_request(
+    request: &CodexJsonlRpcServerRequest,
+) -> CodexPermissionApprovalRequest {
+    let raw = request.params.clone().unwrap_or(JsonValue::Null);
+    CodexPermissionApprovalRequest {
+        native_request_id: request.id.to_string(),
+        native_request_id_json: jsonl_rpc_id_value(&request.id),
+        cwd: optional_string_field(&raw, &["cwd"]),
+        reason: optional_string_field(&raw, &["reason", "message"]),
+        native_thread_id: optional_string_field(&raw, &["threadId", "thread_id"]),
+        native_turn_id: optional_string_field(&raw, &["turnId", "turn_id"]),
+        native_item_id: optional_string_field(&raw, &["itemId", "item_id"]),
+        requested_permissions: raw.get("permissions").cloned().unwrap_or_else(|| json!({})),
+        started_at_ms: optional_i64_field(&raw, &["startedAtMs", "started_at_ms"]),
+        raw,
+    }
+}
+
+pub fn codex_permission_approval_response(
+    permissions: JsonValue,
+    approved: bool,
+    session_scope: bool,
+) -> JsonValue {
+    json!({
+        "permissions": if approved { permissions } else { json!({}) },
+        "scope": if session_scope { "session" } else { "turn" },
+        // Keep later commands behind their normal typed approval even after
+        // Codex receives the requested provider-side sandbox capability.
+        "strictAutoReview": true,
+    })
 }
 
 pub fn decode_codex_command_approval_request(
@@ -4689,6 +5151,7 @@ pub enum CodexJsonlRpcClientDiagnosticKind {
     NotificationChannelClosed,
     ServerRequestChannelFull,
     ServerRequestChannelClosed,
+    ServerRequestPayloadTooLarge,
     DuplicateServerRequestId,
     /// The owning runtime session lost protocol alignment or exceeded its
     /// finite spool allowance and must be recovered by the gateway.
@@ -4731,6 +5194,13 @@ enum CodexJsonlRpcIncoming {
         id: JsonlRpcId,
         file: File,
         kind: OversizedCodexResponseKind,
+        total_bytes: usize,
+        spool_permit: OwnedSemaphorePermit,
+    },
+    OversizedServerRequestRejected {
+        id: JsonlRpcId,
+        method: String,
+        total_bytes: usize,
     },
     DecodeError(JsonlRpcDecodeError),
     Closed,
@@ -4748,6 +5218,10 @@ enum OversizedCodexFrame {
         file: File,
         kind: OversizedCodexResponseKind,
     },
+    ServerRequestRejected {
+        id: JsonlRpcId,
+        method: String,
+    },
     Message(JsonlRpcIncomingMessage),
 }
 
@@ -4757,6 +5231,9 @@ struct PendingCodexJsonlRpcRequest {
 }
 
 enum OversizedSuccessRecovery {
+    ThreadOpenSnapshot {
+        method: &'static str,
+    },
     ThreadTurnSnapshot {
         native_thread_id: String,
         native_turn_id: String,
@@ -4769,6 +5246,7 @@ enum CodexServerRequestTerminalState {
     Evicted,
     IngressClosed,
     TimedOut,
+    PayloadTooLarge,
     Shutdown,
 }
 
@@ -4847,9 +5325,6 @@ fn codex_notification_is_progress(method: &str) -> bool {
             | "item/reasoning/summaryTextDelta"
             | "item/reasoning/summaryPartAdded"
             | "item/plan/delta"
-            | "item/commandExecution/outputDelta"
-            | "item/fileChange/outputDelta"
-            | "item/fileChange/patchUpdated"
     )
 }
 
@@ -4947,9 +5422,18 @@ async fn run_codex_jsonl_rpc_reader<R>(
     R: AsyncBufRead + Send + Unpin + 'static,
 {
     let codec = crate::BoundedNativeEventCodec::new(native_event_budget);
+    // At most one disk-backed response may cross the reader/worker boundary.
+    // Acquiring before the next read also prevents a second temporary file
+    // from being created while the first response is still being resolved.
+    let spool_gate = Arc::new(Semaphore::new(1));
     loop {
+        let spool_permit = match spool_gate.clone().acquire_owned().await {
+            Ok(permit) => permit,
+            Err(_) => return,
+        };
         match codec.read_frame_or_spool(&mut reader).await {
             Ok(Some(crate::native_event::SpooledNativeFrame::Complete(frame))) => {
+                drop(spool_permit);
                 let message = match decode_jsonl_rpc_frame(frame.as_slice()) {
                     Ok(message) => message,
                     Err(error) => {
@@ -4967,9 +5451,11 @@ async fn run_codex_jsonl_rpc_reader<R>(
                     return;
                 }
             }
-            Ok(Some(crate::native_event::SpooledNativeFrame::Oversized { file, .. })) => {
-                let decoded =
-                    tokio::task::spawn_blocking(move || decode_oversized_codex_frame(file)).await;
+            Ok(Some(crate::native_event::SpooledNativeFrame::Oversized { file, total_bytes })) => {
+                let decoded = tokio::task::spawn_blocking(move || {
+                    decode_oversized_codex_frame(file, total_bytes)
+                })
+                .await;
                 let decoded = match decoded {
                     Ok(Ok(decoded)) => decoded,
                     Ok(Err(error)) => {
@@ -4992,9 +5478,24 @@ async fn run_codex_jsonl_rpc_reader<R>(
                 };
                 let incoming = match decoded {
                     OversizedCodexFrame::Response { id, file, kind } => {
-                        CodexJsonlRpcIncoming::OversizedResponse { id, file, kind }
+                        CodexJsonlRpcIncoming::OversizedResponse {
+                            id,
+                            file,
+                            kind,
+                            total_bytes,
+                            spool_permit,
+                        }
+                    }
+                    OversizedCodexFrame::ServerRequestRejected { id, method } => {
+                        drop(spool_permit);
+                        CodexJsonlRpcIncoming::OversizedServerRequestRejected {
+                            id,
+                            method,
+                            total_bytes,
+                        }
                     }
                     OversizedCodexFrame::Message(message) => {
+                        drop(spool_permit);
                         CodexJsonlRpcIncoming::Message(message)
                     }
                 };
@@ -5003,10 +5504,12 @@ async fn run_codex_jsonl_rpc_reader<R>(
                 }
             }
             Ok(None) => {
+                drop(spool_permit);
                 let _ = incoming_tx.send(CodexJsonlRpcIncoming::Closed).await;
                 return;
             }
             Err(error) => {
+                drop(spool_permit);
                 let _ = incoming_tx
                     .send(CodexJsonlRpcIncoming::DecodeError(
                         JsonlRpcDecodeError::new(
@@ -5023,7 +5526,7 @@ async fn run_codex_jsonl_rpc_reader<R>(
 
 struct OversizedCodexEnvelope {
     id: Option<JsonlRpcId>,
-    has_method: bool,
+    method: Option<String>,
     has_result: bool,
     has_error: bool,
 }
@@ -5055,7 +5558,7 @@ impl<'de> Visitor<'de> for OversizedCodexEnvelopeVisitor {
         A: MapAccess<'de>,
     {
         let mut id = None;
-        let mut has_method = false;
+        let mut method = None;
         let mut has_result = false;
         let mut has_error = false;
         while let Some(key) = map.next_key::<String>()? {
@@ -5069,13 +5572,12 @@ impl<'de> Visitor<'de> for OversizedCodexEnvelopeVisitor {
                     id = Some(map.next_value::<JsonlRpcId>()?);
                 }
                 "method" => {
-                    if has_method {
+                    if method.is_some() {
                         return Err(serde::de::Error::custom(
                             "oversized JSONL-RPC frame contains duplicate method",
                         ));
                     }
-                    has_method = true;
-                    map.next_value::<IgnoredAny>()?;
+                    method = Some(map.next_value::<String>()?);
                 }
                 "result" => {
                     if has_result {
@@ -5102,15 +5604,1121 @@ impl<'de> Visitor<'de> for OversizedCodexEnvelopeVisitor {
         }
         Ok(OversizedCodexEnvelope {
             id,
-            has_method,
+            method,
             has_result,
             has_error,
         })
     }
 }
 
+const MAX_STREAMED_CODEX_FILE_CHANGES: usize = 4_096;
+const MAX_STREAMED_CODEX_TURN_ITEMS: usize = 4_096;
+
+fn decode_streamed_oversized_codex_notification(
+    mut file: File,
+    expected_method: &str,
+    omit_unbounded_payloads: bool,
+) -> Result<JsonlRpcIncomingMessage, JsonlRpcDecodeError> {
+    file.seek(SeekFrom::Start(0)).map_err(|error| {
+        JsonlRpcDecodeError::new(
+            JsonlRpcDecodeErrorKind::InvalidMessage,
+            format!("failed to rewind oversized Codex notification: {error}"),
+        )
+    })?;
+    let mut reader = StdBufReader::with_capacity(64 * 1024, file);
+    let mut deserializer = serde_json::Deserializer::from_reader(&mut reader);
+    let notification = StreamedCodexNotificationSeed {
+        expected_method,
+        omit_unbounded_payloads,
+    }
+    .deserialize(&mut deserializer)
+    .map_err(|error| {
+        JsonlRpcDecodeError::new(
+            JsonlRpcDecodeErrorKind::MalformedJson,
+            format!("failed to stream oversized Codex notification: {error}"),
+        )
+    })?;
+    deserializer.end().map_err(|error| {
+        JsonlRpcDecodeError::new(
+            JsonlRpcDecodeErrorKind::MalformedJson,
+            format!("oversized Codex notification has trailing data: {error}"),
+        )
+    })?;
+    Ok(JsonlRpcIncomingMessage::Notification(notification))
+}
+
+struct StreamedCodexNotificationSeed<'a> {
+    expected_method: &'a str,
+    omit_unbounded_payloads: bool,
+}
+
+impl<'de> DeserializeSeed<'de> for StreamedCodexNotificationSeed<'_> {
+    type Value = JsonlRpcNotification;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_map(StreamedCodexNotificationVisitor {
+            expected_method: self.expected_method,
+            omit_unbounded_payloads: self.omit_unbounded_payloads,
+        })
+    }
+}
+
+struct StreamedCodexNotificationVisitor<'a> {
+    expected_method: &'a str,
+    omit_unbounded_payloads: bool,
+}
+
+impl<'de> Visitor<'de> for StreamedCodexNotificationVisitor<'_> {
+    type Value = JsonlRpcNotification;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a Codex JSONL-RPC notification")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut method = None;
+        let mut params = None;
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "method" => method = Some(map.next_value::<String>()?),
+                "params" => {
+                    params = map.next_value_seed(StreamedOptionalCodexParamsSeed {
+                        method: self.expected_method,
+                        omit_unbounded_payloads: self.omit_unbounded_payloads,
+                    })?
+                }
+                _ => {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+        }
+        let method = method.ok_or_else(|| {
+            serde::de::Error::custom("oversized Codex notification is missing method")
+        })?;
+        if method != self.expected_method {
+            return Err(serde::de::Error::custom(
+                "oversized Codex notification method changed while decoding",
+            ));
+        }
+        let mut notification = JsonlRpcNotification::new(method.clone(), params);
+        notification.raw = json!({
+            "method": method,
+            "_pioneerStreamedOversizedNotification": true,
+        });
+        Ok(notification)
+    }
+}
+
+struct StreamedOptionalCodexParamsSeed<'a> {
+    method: &'a str,
+    omit_unbounded_payloads: bool,
+}
+
+impl<'de> DeserializeSeed<'de> for StreamedOptionalCodexParamsSeed<'_> {
+    type Value = Option<JsonValue>;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_option(StreamedOptionalCodexParamsVisitor {
+            method: self.method,
+            omit_unbounded_payloads: self.omit_unbounded_payloads,
+        })
+    }
+}
+
+struct StreamedOptionalCodexParamsVisitor<'a> {
+    method: &'a str,
+    omit_unbounded_payloads: bool,
+}
+
+impl<'de> Visitor<'de> for StreamedOptionalCodexParamsVisitor<'_> {
+    type Value = Option<JsonValue>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("null or a Codex notification params object")
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(None)
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(None)
+    }
+
+    fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        if self.omit_unbounded_payloads {
+            StreamedLargeCodexParamsSeed {
+                method: self.method,
+            }
+            .deserialize(deserializer)
+            .map(Some)
+        } else {
+            StreamedCodexParamsSeed.deserialize(deserializer).map(Some)
+        }
+    }
+}
+
+/// Conservative projection used only after a frame crosses the bounded
+/// in-memory materialization ceiling. It retains protocol identity and
+/// terminal state while draining arbitrary provider payloads with
+/// `IgnoredAny`, whose serde_json reader path does not allocate the skipped
+/// string or object.
+struct StreamedLargeCodexParamsSeed<'a> {
+    method: &'a str,
+}
+
+impl<'de> DeserializeSeed<'de> for StreamedLargeCodexParamsSeed<'_> {
+    type Value = JsonValue;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_map(StreamedLargeCodexParamsVisitor {
+            method: self.method,
+        })
+    }
+}
+
+struct StreamedLargeCodexParamsVisitor<'a> {
+    method: &'a str,
+}
+
+impl<'de> Visitor<'de> for StreamedLargeCodexParamsVisitor<'_> {
+    type Value = JsonValue;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("an oversized Codex notification params object")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut object = serde_json::Map::new();
+        let mut payload_omitted = false;
+        let mut diff_omitted = false;
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "item" => {
+                    object.insert(key, map.next_value_seed(StreamedLargeCodexItemSeed)?);
+                }
+                "turn" => {
+                    object.insert(key, map.next_value_seed(StreamedLargeCodexTurnSeed)?);
+                }
+                "thread" => {
+                    object.insert(key, map.next_value_seed(StreamedLargeCodexThreadSeed)?);
+                }
+                "changes" => {
+                    let changes = map.next_value_seed(StreamedCodexFileChangesSeed)?;
+                    if !object.contains_key("changedFiles") && !changes.changed_files.is_empty() {
+                        object.insert(
+                            "changedFiles".to_owned(),
+                            JsonValue::Array(
+                                changes
+                                    .changed_files
+                                    .into_iter()
+                                    .map(JsonValue::String)
+                                    .collect(),
+                            ),
+                        );
+                    }
+                    payload_omitted |= changes.payload_omitted;
+                    object.insert(key, changes.value);
+                }
+                "changedFiles" | "changed_files" => {
+                    object.insert(key, map.next_value_seed(StreamedCodexChangedFilesSeed)?);
+                }
+                "error" => {
+                    object.insert(key, map.next_value_seed(StreamedLargeCodexErrorSeed)?);
+                }
+                // These are the bounded identity/status fields needed by the
+                // canonical mapper and progress coalescer. App-server's wire
+                // contract defines them as scalar identifiers or counters.
+                "threadId" | "thread_id" | "turnId" | "turn_id" | "itemId" | "item_id"
+                | "callId" | "call_id" | "eventId" | "event_id" | "id" | "type" | "status"
+                | "phase" | "revision" | "version" | "sequence" | "exact" | "startedAtMs"
+                | "started_at_ms" | "exitCode" | "exit_code" => {
+                    object.insert(key, map.next_value::<JsonValue>()?);
+                }
+                "delta" | "output" | "text" | "message"
+                    if matches!(
+                        self.method,
+                        "item/commandExecution/outputDelta"
+                            | "item/fileChange/outputDelta"
+                            | "item/mcpToolCall/progress"
+                    ) =>
+                {
+                    object.insert(key, map.next_value::<JsonValue>()?);
+                }
+                "diff" => {
+                    map.next_value::<IgnoredAny>()?;
+                    payload_omitted = true;
+                    diff_omitted = true;
+                }
+                // Provider text, output, command and raw nested payloads can
+                // be arbitrarily large. Their lifecycle is retained by the
+                // method and scalar identities above.
+                _ => {
+                    map.next_value::<IgnoredAny>()?;
+                    payload_omitted = true;
+                }
+            }
+        }
+        if payload_omitted {
+            object.insert(
+                "_pioneerOversizedPayloadOmitted".to_owned(),
+                JsonValue::Bool(true),
+            );
+        }
+        if diff_omitted || self.method == "turn/diff/updated" {
+            object.insert("_pioneerDiffOmitted".to_owned(), JsonValue::Bool(true));
+        }
+        Ok(JsonValue::Object(object))
+    }
+}
+
+struct StreamedLargeCodexItemSeed;
+
+impl<'de> DeserializeSeed<'de> for StreamedLargeCodexItemSeed {
+    type Value = JsonValue;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_map(StreamedLargeCodexItemVisitor)
+    }
+}
+
+struct StreamedLargeCodexItemVisitor;
+
+impl<'de> Visitor<'de> for StreamedLargeCodexItemVisitor {
+    type Value = JsonValue;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("an oversized native ThreadItem object")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut object = serde_json::Map::new();
+        let mut payload_omitted = false;
+        let mut file_change_payload_omitted = false;
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "changes" => {
+                    let changes = map.next_value_seed(StreamedCodexFileChangesSeed)?;
+                    if !object.contains_key("changedFiles") && !changes.changed_files.is_empty() {
+                        object.insert(
+                            "changedFiles".to_owned(),
+                            JsonValue::Array(
+                                changes
+                                    .changed_files
+                                    .into_iter()
+                                    .map(JsonValue::String)
+                                    .collect(),
+                            ),
+                        );
+                    }
+                    payload_omitted |= changes.payload_omitted;
+                    file_change_payload_omitted |= changes.payload_omitted;
+                    object.insert(key, changes.value);
+                }
+                "changedFiles" | "changed_files" => {
+                    object.insert(key, map.next_value_seed(StreamedCodexChangedFilesSeed)?);
+                }
+                "error" => {
+                    object.insert(key, map.next_value::<JsonValue>()?);
+                }
+                "id" | "itemId" | "item_id" | "callId" | "call_id" | "threadId" | "thread_id"
+                | "turnId" | "turn_id" | "type" | "status" | "phase" | "exitCode" | "exit_code" => {
+                    object.insert(key, map.next_value::<JsonValue>()?);
+                }
+                // The spool is bounded by max_recovery_frame_bytes. Retain
+                // command/result facts even above the in-memory frame threshold.
+                "command" | "cmd" | "argv" | "cwd" | "workingDirectory" | "aggregatedOutput"
+                | "aggregated_output" | "stdout" | "stderr" | "durationMs" | "duration_ms"
+                | "tookMs" | "timedOut" | "timed_out" | "truncated" | "success" | "result"
+                | "contentItems" | "content" | "arguments" | "tool" | "toolName" | "server" => {
+                    object.insert(key, map.next_value::<JsonValue>()?);
+                }
+                _ => {
+                    map.next_value::<IgnoredAny>()?;
+                    payload_omitted = true;
+                }
+            }
+        }
+        if payload_omitted {
+            object.insert(
+                "_pioneerOversizedPayloadOmitted".to_owned(),
+                JsonValue::Bool(true),
+            );
+        }
+        if file_change_payload_omitted {
+            object.insert(
+                "_pioneerFileChangePayloadOmitted".to_owned(),
+                JsonValue::Bool(true),
+            );
+        }
+        Ok(JsonValue::Object(object))
+    }
+}
+
+struct StreamedLargeCodexTurnSeed;
+
+impl<'de> DeserializeSeed<'de> for StreamedLargeCodexTurnSeed {
+    type Value = JsonValue;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_map(StreamedLargeCodexTurnVisitor)
+    }
+}
+
+struct StreamedLargeCodexTurnVisitor;
+
+impl<'de> Visitor<'de> for StreamedLargeCodexTurnVisitor {
+    type Value = JsonValue;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("an oversized native Turn object")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut object = serde_json::Map::new();
+        let mut payload_omitted = false;
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "items" => {
+                    object.insert(key, map.next_value_seed(StreamedLargeCodexItemsSeed)?);
+                }
+                "error" => {
+                    object.insert(key, map.next_value_seed(StreamedLargeCodexErrorSeed)?);
+                }
+                "id" | "turnId" | "turn_id" | "status" | "phase" => {
+                    object.insert(key, map.next_value::<JsonValue>()?);
+                }
+                _ => {
+                    map.next_value::<IgnoredAny>()?;
+                    payload_omitted = true;
+                }
+            }
+        }
+        if payload_omitted {
+            object.insert(
+                "_pioneerOversizedPayloadOmitted".to_owned(),
+                JsonValue::Bool(true),
+            );
+        }
+        Ok(JsonValue::Object(object))
+    }
+}
+
+struct StreamedLargeCodexItemsSeed;
+
+impl<'de> DeserializeSeed<'de> for StreamedLargeCodexItemsSeed {
+    type Value = JsonValue;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_seq(StreamedLargeCodexItemsVisitor)
+    }
+}
+
+struct StreamedLargeCodexItemsVisitor;
+
+impl<'de> Visitor<'de> for StreamedLargeCodexItemsVisitor {
+    type Value = JsonValue;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("an oversized array of native ThreadItems")
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut items = Vec::new();
+        let mut truncated = false;
+        loop {
+            if items.len() < MAX_STREAMED_CODEX_TURN_ITEMS {
+                match sequence.next_element_seed(StreamedLargeCodexItemSeed)? {
+                    Some(item) => items.push(item),
+                    None => break,
+                }
+            } else if sequence.next_element::<IgnoredAny>()?.is_some() {
+                truncated = true;
+            } else {
+                break;
+            }
+        }
+        if truncated {
+            items.push(json!({ "_pioneerItemsTruncated": true }));
+        }
+        Ok(JsonValue::Array(items))
+    }
+}
+
+struct StreamedLargeCodexThreadSeed;
+
+impl<'de> DeserializeSeed<'de> for StreamedLargeCodexThreadSeed {
+    type Value = JsonValue;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_map(StreamedLargeCodexThreadVisitor)
+    }
+}
+
+struct StreamedLargeCodexThreadVisitor;
+
+impl<'de> Visitor<'de> for StreamedLargeCodexThreadVisitor {
+    type Value = JsonValue;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("an oversized native Thread object")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut object = serde_json::Map::new();
+        let mut payload_omitted = false;
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "id" | "threadId" | "thread_id" | "status" | "model" | "cwd" => {
+                    object.insert(key, map.next_value::<JsonValue>()?);
+                }
+                _ => {
+                    map.next_value::<IgnoredAny>()?;
+                    payload_omitted = true;
+                }
+            }
+        }
+        if payload_omitted {
+            object.insert(
+                "_pioneerOversizedPayloadOmitted".to_owned(),
+                JsonValue::Bool(true),
+            );
+        }
+        Ok(JsonValue::Object(object))
+    }
+}
+
+struct StreamedLargeCodexErrorSeed;
+
+impl<'de> DeserializeSeed<'de> for StreamedLargeCodexErrorSeed {
+    type Value = JsonValue;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_map(StreamedLargeCodexErrorVisitor)
+    }
+}
+
+struct StreamedLargeCodexErrorVisitor;
+
+impl<'de> Visitor<'de> for StreamedLargeCodexErrorVisitor {
+    type Value = JsonValue;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("an oversized native error object")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut object = serde_json::Map::new();
+        while let Some(key) = map.next_key::<String>()? {
+            if matches!(key.as_str(), "code" | "retryable") {
+                object.insert(key, map.next_value::<JsonValue>()?);
+            } else {
+                map.next_value::<IgnoredAny>()?;
+            }
+        }
+        object.insert(
+            "message".to_owned(),
+            JsonValue::String("oversized provider error details omitted".to_owned()),
+        );
+        object.insert(
+            "_pioneerOversizedPayloadOmitted".to_owned(),
+            JsonValue::Bool(true),
+        );
+        Ok(JsonValue::Object(object))
+    }
+}
+
+struct StreamedCodexChangedFilesSeed;
+
+impl<'de> DeserializeSeed<'de> for StreamedCodexChangedFilesSeed {
+    type Value = JsonValue;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(StreamedCodexChangedFilesVisitor)
+    }
+}
+
+struct StreamedCodexChangedFilesVisitor;
+
+impl<'de> Visitor<'de> for StreamedCodexChangedFilesVisitor {
+    type Value = JsonValue;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a changed-files string or array")
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(JsonValue::Array(vec![JsonValue::String(value.to_owned())]))
+    }
+
+    fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(JsonValue::Array(vec![JsonValue::String(value)]))
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut paths = Vec::new();
+        loop {
+            if paths.len() < MAX_STREAMED_CODEX_FILE_CHANGES {
+                match sequence.next_element_seed(StreamedCodexChangedFilePathSeed)? {
+                    Some(Some(path)) => paths.push(JsonValue::String(path)),
+                    Some(None) => {}
+                    None => break,
+                }
+            } else if sequence.next_element::<IgnoredAny>()?.is_none() {
+                break;
+            }
+        }
+        Ok(JsonValue::Array(paths))
+    }
+}
+
+struct StreamedCodexChangedFilePathSeed;
+
+impl<'de> DeserializeSeed<'de> for StreamedCodexChangedFilePathSeed {
+    type Value = Option<String>;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(StreamedCodexChangedFilePathVisitor)
+    }
+}
+
+struct StreamedCodexChangedFilePathVisitor;
+
+impl<'de> Visitor<'de> for StreamedCodexChangedFilePathVisitor {
+    type Value = Option<String>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a changed-file path string or object")
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(Some(value.to_owned()))
+    }
+
+    fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(Some(value))
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut path = None;
+        while let Some(key) = map.next_key::<String>()? {
+            if matches!(key.as_str(), "path" | "file" | "name") && path.is_none() {
+                path = Some(map.next_value::<String>()?);
+            } else {
+                map.next_value::<IgnoredAny>()?;
+            }
+        }
+        Ok(path)
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(None)
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(None)
+    }
+}
+
+struct StreamedCodexParamsSeed;
+
+impl<'de> DeserializeSeed<'de> for StreamedCodexParamsSeed {
+    type Value = JsonValue;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_map(StreamedCodexParamsVisitor)
+    }
+}
+
+struct StreamedCodexParamsVisitor;
+
+impl<'de> Visitor<'de> for StreamedCodexParamsVisitor {
+    type Value = JsonValue;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a Codex notification params object")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut object = serde_json::Map::new();
+        let mut summarized_changes = None;
+        while let Some(key) = map.next_key::<String>()? {
+            let value = match key.as_str() {
+                "item" => map.next_value_seed(StreamedCodexItemSeed)?,
+                "turn" => map.next_value_seed(StreamedCodexTurnSeed)?,
+                "thread" => map.next_value_seed(StreamedCodexThreadSeed)?,
+                "changes" => {
+                    let changes = map.next_value_seed(StreamedCodexFileChangesSeed)?;
+                    summarized_changes = Some(changes.changed_files.clone());
+                    changes.value
+                }
+                _ => map.next_value::<JsonValue>()?,
+            };
+            object.insert(key, value);
+        }
+        if !object.contains_key("changedFiles")
+            && let Some(changed_files) = summarized_changes
+            && !changed_files.is_empty()
+        {
+            object.insert(
+                "changedFiles".to_owned(),
+                JsonValue::Array(changed_files.into_iter().map(JsonValue::String).collect()),
+            );
+        }
+        Ok(JsonValue::Object(object))
+    }
+}
+
+struct StreamedCodexThreadSeed;
+
+impl<'de> DeserializeSeed<'de> for StreamedCodexThreadSeed {
+    type Value = JsonValue;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_map(StreamedCodexThreadVisitor)
+    }
+}
+
+struct StreamedCodexThreadVisitor;
+
+impl<'de> Visitor<'de> for StreamedCodexThreadVisitor {
+    type Value = JsonValue;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a native Thread notification object")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut object = serde_json::Map::new();
+        let mut omitted_turns = false;
+        while let Some(key) = map.next_key::<String>()? {
+            if key == "turns" {
+                map.next_value::<IgnoredAny>()?;
+                object.insert(key, JsonValue::Array(Vec::new()));
+                omitted_turns = true;
+            } else {
+                object.insert(key, map.next_value::<JsonValue>()?);
+            }
+        }
+        if omitted_turns {
+            object.insert("_pioneerTurnsOmitted".to_owned(), JsonValue::Bool(true));
+        }
+        Ok(JsonValue::Object(object))
+    }
+}
+
+struct StreamedCodexTurnSeed;
+
+impl<'de> DeserializeSeed<'de> for StreamedCodexTurnSeed {
+    type Value = JsonValue;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_map(StreamedCodexTurnVisitor)
+    }
+}
+
+struct StreamedCodexTurnVisitor;
+
+impl<'de> Visitor<'de> for StreamedCodexTurnVisitor {
+    type Value = JsonValue;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a native Turn object")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut object = serde_json::Map::new();
+        while let Some(key) = map.next_key::<String>()? {
+            let value = if key == "items" {
+                map.next_value_seed(StreamedCodexItemsSeed)?
+            } else {
+                map.next_value::<JsonValue>()?
+            };
+            object.insert(key, value);
+        }
+        Ok(JsonValue::Object(object))
+    }
+}
+
+struct StreamedCodexItemsSeed;
+
+impl<'de> DeserializeSeed<'de> for StreamedCodexItemsSeed {
+    type Value = JsonValue;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_seq(StreamedCodexItemsVisitor)
+    }
+}
+
+struct StreamedCodexItemsVisitor;
+
+impl<'de> Visitor<'de> for StreamedCodexItemsVisitor {
+    type Value = JsonValue;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("an array of native ThreadItems")
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut items = Vec::new();
+        let mut truncated = false;
+        loop {
+            if items.len() < MAX_STREAMED_CODEX_TURN_ITEMS {
+                match sequence.next_element_seed(StreamedCodexItemSeed)? {
+                    Some(item) => items.push(item),
+                    None => break,
+                }
+            } else if sequence.next_element::<IgnoredAny>()?.is_some() {
+                truncated = true;
+            } else {
+                break;
+            }
+        }
+        if truncated {
+            items.push(json!({ "_pioneerItemsTruncated": true }));
+        }
+        Ok(JsonValue::Array(items))
+    }
+}
+
+struct StreamedCodexItemSeed;
+
+impl<'de> DeserializeSeed<'de> for StreamedCodexItemSeed {
+    type Value = JsonValue;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_map(StreamedCodexItemVisitor)
+    }
+}
+
+struct StreamedCodexItemVisitor;
+
+impl<'de> Visitor<'de> for StreamedCodexItemVisitor {
+    type Value = JsonValue;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a native ThreadItem object")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut object = serde_json::Map::new();
+        let mut summarized_changes = None;
+        let mut payload_omitted = false;
+        while let Some(key) = map.next_key::<String>()? {
+            if key == "changes" {
+                let changes = map.next_value_seed(StreamedCodexFileChangesSeed)?;
+                summarized_changes = Some(changes.changed_files.clone());
+                payload_omitted |= changes.payload_omitted;
+                object.insert(key, changes.value);
+            } else {
+                object.insert(key, map.next_value::<JsonValue>()?);
+            }
+        }
+        if !object.contains_key("changedFiles")
+            && let Some(changed_files) = summarized_changes
+            && !changed_files.is_empty()
+        {
+            object.insert(
+                "changedFiles".to_owned(),
+                JsonValue::Array(changed_files.into_iter().map(JsonValue::String).collect()),
+            );
+        }
+        if payload_omitted {
+            object.insert(
+                "_pioneerFileChangePayloadOmitted".to_owned(),
+                JsonValue::Bool(true),
+            );
+        }
+        Ok(JsonValue::Object(object))
+    }
+}
+
+struct StreamedCodexFileChanges {
+    value: JsonValue,
+    changed_files: Vec<String>,
+    payload_omitted: bool,
+}
+
+struct StreamedCodexFileChangesSeed;
+
+impl<'de> DeserializeSeed<'de> for StreamedCodexFileChangesSeed {
+    type Value = StreamedCodexFileChanges;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(StreamedCodexFileChangesVisitor)
+    }
+}
+
+struct StreamedCodexFileChangesVisitor;
+
+impl<'de> Visitor<'de> for StreamedCodexFileChangesVisitor {
+    type Value = StreamedCodexFileChanges;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("an array or object of native file changes")
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut values = Vec::new();
+        let mut changed_files = Vec::new();
+        let mut payload_omitted = false;
+        loop {
+            if values.len() < MAX_STREAMED_CODEX_FILE_CHANGES {
+                match sequence.next_element_seed(StreamedCodexFileChangeSeed {
+                    fallback_path: None,
+                })? {
+                    Some(change) => {
+                        if let Some(path) = change.path.as_ref()
+                            && !changed_files.contains(path)
+                        {
+                            changed_files.push(path.clone());
+                        }
+                        payload_omitted |= change.payload_omitted;
+                        values.push(change.value);
+                    }
+                    None => break,
+                }
+            } else if sequence.next_element::<IgnoredAny>()?.is_some() {
+                payload_omitted = true;
+            } else {
+                break;
+            }
+        }
+        Ok(StreamedCodexFileChanges {
+            value: JsonValue::Array(values),
+            changed_files,
+            payload_omitted,
+        })
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut values = Vec::new();
+        let mut changed_files = Vec::new();
+        let mut payload_omitted = false;
+        while let Some(path) = map.next_key::<String>()? {
+            if values.len() < MAX_STREAMED_CODEX_FILE_CHANGES {
+                let change = map.next_value_seed(StreamedCodexFileChangeSeed {
+                    fallback_path: Some(path),
+                })?;
+                if let Some(path) = change.path.as_ref()
+                    && !changed_files.contains(path)
+                {
+                    changed_files.push(path.clone());
+                }
+                payload_omitted |= change.payload_omitted;
+                values.push(change.value);
+            } else {
+                map.next_value::<IgnoredAny>()?;
+                payload_omitted = true;
+            }
+        }
+        Ok(StreamedCodexFileChanges {
+            value: JsonValue::Array(values),
+            changed_files,
+            payload_omitted,
+        })
+    }
+}
+
+struct StreamedCodexFileChange {
+    value: JsonValue,
+    path: Option<String>,
+    payload_omitted: bool,
+}
+
+struct StreamedCodexFileChangeSeed {
+    fallback_path: Option<String>,
+}
+
+impl<'de> DeserializeSeed<'de> for StreamedCodexFileChangeSeed {
+    type Value = StreamedCodexFileChange;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_map(StreamedCodexFileChangeVisitor {
+            fallback_path: self.fallback_path,
+        })
+    }
+}
+
+struct StreamedCodexFileChangeVisitor {
+    fallback_path: Option<String>,
+}
+
+impl<'de> Visitor<'de> for StreamedCodexFileChangeVisitor {
+    type Value = StreamedCodexFileChange;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a native file-change object")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut object = serde_json::Map::new();
+        let mut path = self.fallback_path;
+        let mut payload_omitted = false;
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "diff" | "content" | "newContent" | "oldContent" | "patch" => {
+                    map.next_value::<IgnoredAny>()?;
+                    payload_omitted = true;
+                }
+                "path" => {
+                    let value = map.next_value::<String>()?;
+                    path = Some(value.clone());
+                    object.insert(key, JsonValue::String(value));
+                }
+                _ => {
+                    object.insert(key, map.next_value::<JsonValue>()?);
+                }
+            }
+        }
+        if !object.contains_key("path")
+            && let Some(path) = path.as_ref()
+        {
+            object.insert("path".to_owned(), JsonValue::String(path.clone()));
+        }
+        if payload_omitted {
+            object.insert("_pioneerPayloadOmitted".to_owned(), JsonValue::Bool(true));
+        }
+        Ok(StreamedCodexFileChange {
+            value: JsonValue::Object(object),
+            path,
+            payload_omitted,
+        })
+    }
+}
+
 fn decode_oversized_codex_frame(
     mut file: File,
+    total_bytes: usize,
 ) -> Result<OversizedCodexFrame, JsonlRpcDecodeError> {
     file.seek(SeekFrom::Start(0)).map_err(|error| {
         JsonlRpcDecodeError::new(
@@ -5118,21 +6726,25 @@ fn decode_oversized_codex_frame(
             format!("failed to rewind oversized JSONL-RPC frame: {error}"),
         )
     })?;
-    let mut deserializer = serde_json::Deserializer::from_reader(&mut file);
-    let envelope = OversizedCodexEnvelopeSeed
-        .deserialize(&mut deserializer)
-        .map_err(|error| {
+    let envelope = {
+        let mut reader = StdBufReader::with_capacity(64 * 1024, &mut file);
+        let mut deserializer = serde_json::Deserializer::from_reader(&mut reader);
+        let envelope = OversizedCodexEnvelopeSeed
+            .deserialize(&mut deserializer)
+            .map_err(|error| {
+                JsonlRpcDecodeError::new(
+                    JsonlRpcDecodeErrorKind::MalformedJson,
+                    format!("failed to stream oversized JSONL-RPC frame: {error}"),
+                )
+            })?;
+        deserializer.end().map_err(|error| {
             JsonlRpcDecodeError::new(
                 JsonlRpcDecodeErrorKind::MalformedJson,
-                format!("failed to stream oversized JSONL-RPC frame: {error}"),
+                format!("oversized JSONL-RPC frame has trailing data: {error}"),
             )
         })?;
-    deserializer.end().map_err(|error| {
-        JsonlRpcDecodeError::new(
-            JsonlRpcDecodeErrorKind::MalformedJson,
-            format!("oversized JSONL-RPC frame has trailing data: {error}"),
-        )
-    })?;
+        envelope
+    };
     file.seek(SeekFrom::Start(0)).map_err(|error| {
         JsonlRpcDecodeError::new(
             JsonlRpcDecodeErrorKind::InvalidMessage,
@@ -5141,7 +6753,7 @@ fn decode_oversized_codex_frame(
     })?;
 
     if envelope.has_result || envelope.has_error {
-        if envelope.has_result == envelope.has_error || envelope.has_method {
+        if envelope.has_result == envelope.has_error || envelope.method.is_some() {
             return Err(JsonlRpcDecodeError::new(
                 JsonlRpcDecodeErrorKind::InvalidMessage,
                 "oversized JSONL-RPC response must contain exactly one of result or error",
@@ -5164,7 +6776,32 @@ fn decode_oversized_codex_frame(
         });
     }
 
-    let raw = serde_json::from_reader(&mut file).map_err(|error| {
+    if envelope.id.is_none()
+        && let Some(method) = envelope.method.as_deref()
+    {
+        return decode_streamed_oversized_codex_notification(
+            file,
+            method,
+            total_bytes > CODEX_MAX_MATERIALIZED_FRAME_BYTES,
+        )
+        .map(OversizedCodexFrame::Message);
+    }
+
+    if let (Some(id), Some(method)) = (envelope.id, envelope.method)
+        && total_bytes > CODEX_MAX_MATERIALIZED_FRAME_BYTES
+    {
+        return Ok(OversizedCodexFrame::ServerRequestRejected { id, method });
+    }
+
+    if total_bytes > CODEX_MAX_MATERIALIZED_FRAME_BYTES {
+        return Err(JsonlRpcDecodeError::new(
+            JsonlRpcDecodeErrorKind::InvalidMessage,
+            "oversized JSONL-RPC frame has no bounded recovery contract",
+        ));
+    }
+
+    let mut reader = StdBufReader::with_capacity(64 * 1024, file);
+    let raw = serde_json::from_reader(&mut reader).map_err(|error| {
         JsonlRpcDecodeError::new(
             JsonlRpcDecodeErrorKind::MalformedJson,
             format!("failed to decode spooled JSONL-RPC frame: {error}"),
@@ -5173,9 +6810,324 @@ fn decode_oversized_codex_frame(
     decode_jsonl_rpc_value(raw).map(OversizedCodexFrame::Message)
 }
 
+#[derive(Default)]
+struct StreamedThreadOpenFields {
+    thread_id: Option<String>,
+    cwd: Option<String>,
+    model: Option<String>,
+}
+
+fn extract_thread_open_snapshot_from_spooled_response(
+    mut file: File,
+    method: &str,
+) -> Result<JsonValue, String> {
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| format!("failed to rewind spooled {method} response: {error}"))?;
+    let mut reader = StdBufReader::with_capacity(64 * 1024, file);
+    let mut deserializer = serde_json::Deserializer::from_reader(&mut reader);
+    let fields = ThreadOpenEnvelopeSeed
+        .deserialize(&mut deserializer)
+        .map_err(|error| format!("failed to stream {method} response metadata: {error}"))?
+        .ok_or_else(|| format!("{method} response omitted result"))?;
+    deserializer
+        .end()
+        .map_err(|error| format!("{method} response has trailing data: {error}"))?;
+
+    let native_thread_id = fields
+        .thread_id
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| format!("{method} response did not include thread.id"))?;
+    let mut thread = serde_json::Map::new();
+    thread.insert("id".to_owned(), JsonValue::String(native_thread_id));
+    if let Some(cwd) = fields.cwd {
+        thread.insert("cwd".to_owned(), JsonValue::String(cwd));
+    }
+    if let Some(model) = fields.model {
+        thread.insert("model".to_owned(), JsonValue::String(model));
+    }
+    Ok(json!({
+        "thread": JsonValue::Object(thread),
+        "_pioneerStreamedThreadOpen": true,
+    }))
+}
+
+fn extract_oversized_codex_error_response(
+    mut file: File,
+    expected_id: &JsonlRpcId,
+) -> Result<JsonlRpcResponse, JsonlRpcDecodeError> {
+    file.seek(SeekFrom::Start(0)).map_err(|error| {
+        JsonlRpcDecodeError::new(
+            JsonlRpcDecodeErrorKind::InvalidMessage,
+            format!("failed to rewind oversized JSONL-RPC error response: {error}"),
+        )
+    })?;
+    let mut reader = StdBufReader::with_capacity(64 * 1024, file);
+    let mut deserializer = serde_json::Deserializer::from_reader(&mut reader);
+    let extracted = StreamedCodexErrorResponseSeed
+        .deserialize(&mut deserializer)
+        .map_err(|error| {
+            JsonlRpcDecodeError::new(
+                JsonlRpcDecodeErrorKind::MalformedJson,
+                format!("failed to stream oversized JSONL-RPC error response: {error}"),
+            )
+        })?;
+    deserializer.end().map_err(|error| {
+        JsonlRpcDecodeError::new(
+            JsonlRpcDecodeErrorKind::MalformedJson,
+            format!("oversized JSONL-RPC error response has trailing data: {error}"),
+        )
+    })?;
+    if extracted.id.as_ref() != Some(expected_id) {
+        return Err(JsonlRpcDecodeError::new(
+            JsonlRpcDecodeErrorKind::InvalidMessage,
+            "oversized JSONL-RPC error response id changed while decoding",
+        ));
+    }
+    let code = extracted.code.ok_or_else(|| {
+        JsonlRpcDecodeError::new(
+            JsonlRpcDecodeErrorKind::InvalidMessage,
+            "oversized JSONL-RPC error response omitted error.code",
+        )
+    })?;
+    Ok(JsonlRpcResponse {
+        id: extracted.id,
+        result: None,
+        error: Some(JsonlRpcError {
+            code,
+            message: "oversized native error details omitted".to_owned(),
+            data: None,
+            extra: BTreeMap::new(),
+        }),
+        extra: BTreeMap::new(),
+        raw: json!({
+            "_pioneerOversizedPayloadOmitted": true,
+        }),
+    })
+}
+
+#[derive(Default)]
+struct StreamedCodexErrorResponseFields {
+    id: Option<JsonlRpcId>,
+    code: Option<i64>,
+}
+
+struct StreamedCodexErrorResponseSeed;
+
+impl<'de> DeserializeSeed<'de> for StreamedCodexErrorResponseSeed {
+    type Value = StreamedCodexErrorResponseFields;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_map(StreamedCodexErrorResponseVisitor)
+    }
+}
+
+struct StreamedCodexErrorResponseVisitor;
+
+impl<'de> Visitor<'de> for StreamedCodexErrorResponseVisitor {
+    type Value = StreamedCodexErrorResponseFields;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("an oversized JSONL-RPC error response")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut fields = StreamedCodexErrorResponseFields::default();
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "id" => fields.id = Some(map.next_value::<JsonlRpcId>()?),
+                "error" => fields.code = map.next_value_seed(StreamedCodexErrorCodeSeed)?,
+                _ => {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+        }
+        Ok(fields)
+    }
+}
+
+struct StreamedCodexErrorCodeSeed;
+
+impl<'de> DeserializeSeed<'de> for StreamedCodexErrorCodeSeed {
+    type Value = Option<i64>;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_map(StreamedCodexErrorCodeVisitor)
+    }
+}
+
+struct StreamedCodexErrorCodeVisitor;
+
+impl<'de> Visitor<'de> for StreamedCodexErrorCodeVisitor {
+    type Value = Option<i64>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a JSONL-RPC error object")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut code = None;
+        while let Some(key) = map.next_key::<String>()? {
+            if key == "code" {
+                code = Some(map.next_value::<i64>()?);
+            } else {
+                map.next_value::<IgnoredAny>()?;
+            }
+        }
+        Ok(code)
+    }
+}
+
+struct ThreadOpenEnvelopeSeed;
+
+impl<'de> DeserializeSeed<'de> for ThreadOpenEnvelopeSeed {
+    type Value = Option<StreamedThreadOpenFields>;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_map(ThreadOpenEnvelopeVisitor)
+    }
+}
+
+struct ThreadOpenEnvelopeVisitor;
+
+impl<'de> Visitor<'de> for ThreadOpenEnvelopeVisitor {
+    type Value = Option<StreamedThreadOpenFields>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a JSON-RPC thread-open response")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut result = None;
+        while let Some(key) = map.next_key::<String>()? {
+            if key == "result" {
+                result = Some(map.next_value_seed(ThreadOpenResultSeed)?);
+            } else {
+                map.next_value::<IgnoredAny>()?;
+            }
+        }
+        Ok(result)
+    }
+}
+
+struct ThreadOpenResultSeed;
+
+impl<'de> DeserializeSeed<'de> for ThreadOpenResultSeed {
+    type Value = StreamedThreadOpenFields;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_map(ThreadOpenResultVisitor)
+    }
+}
+
+struct ThreadOpenResultVisitor;
+
+impl<'de> Visitor<'de> for ThreadOpenResultVisitor {
+    type Value = StreamedThreadOpenFields;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a thread-open result object")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut fields = StreamedThreadOpenFields::default();
+        let mut flat_thread_id = None;
+        let mut flat_cwd = None;
+        let mut flat_model = None;
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "thread" => fields = map.next_value_seed(ThreadOpenThreadSeed)?,
+                "threadId" | "thread_id" | "id" => {
+                    flat_thread_id = map.next_value::<Option<String>>()?;
+                }
+                "cwd" => flat_cwd = map.next_value::<Option<String>>()?,
+                "model" => flat_model = map.next_value::<Option<String>>()?,
+                _ => {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+        }
+        fields.thread_id = fields.thread_id.or(flat_thread_id);
+        fields.cwd = fields.cwd.or(flat_cwd);
+        fields.model = fields.model.or(flat_model);
+        Ok(fields)
+    }
+}
+
+struct ThreadOpenThreadSeed;
+
+impl<'de> DeserializeSeed<'de> for ThreadOpenThreadSeed {
+    type Value = StreamedThreadOpenFields;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_map(ThreadOpenThreadVisitor)
+    }
+}
+
+struct ThreadOpenThreadVisitor;
+
+impl<'de> Visitor<'de> for ThreadOpenThreadVisitor {
+    type Value = StreamedThreadOpenFields;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a native Thread object")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut fields = StreamedThreadOpenFields::default();
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "id" | "threadId" | "thread_id" => {
+                    fields.thread_id = map.next_value::<Option<String>>()?;
+                }
+                "cwd" => fields.cwd = map.next_value::<Option<String>>()?,
+                "model" => fields.model = map.next_value::<Option<String>>()?,
+                _ => {
+                    // In particular, `thread.turns` can contain the complete
+                    // durable rollout. `IgnoredAny` validates and drains it
+                    // without materializing its strings or objects.
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+        }
+        Ok(fields)
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct LocatedThreadTurn {
     index: usize,
+    encoded_bytes: usize,
 }
 
 fn extract_thread_turn_snapshot_from_spooled_response(
@@ -5185,28 +7137,39 @@ fn extract_thread_turn_snapshot_from_spooled_response(
 ) -> Result<JsonValue, String> {
     file.seek(SeekFrom::Start(0))
         .map_err(|error| format!("failed to rewind spooled thread/read response: {error}"))?;
-    let mut deserializer = serde_json::Deserializer::from_reader(&mut file);
-    let located = ThreadTurnLocationResponseSeed {
-        native_thread_id,
-        native_turn_id,
-    }
-    .deserialize(&mut deserializer)
-    .map_err(|error| format!("failed to locate requested Turn in thread/read response: {error}"))?
-    .ok_or_else(|| {
-        format!(
-            "thread/read response omitted native Turn `{native_turn_id}` from thread `{native_thread_id}`"
-        )
-    })?;
-    deserializer
-        .end()
-        .map_err(|error| format!("thread/read response has trailing data: {error}"))?;
+    let bytes_read = Arc::new(AtomicU64::new(0));
+    let located = {
+        let buffered = StdBufReader::with_capacity(64 * 1024, &mut file);
+        let mut counting = CountingReader::new(buffered, bytes_read.clone());
+        let mut deserializer = serde_json::Deserializer::from_reader(&mut counting);
+        let located = ThreadTurnLocationResponseSeed {
+            native_thread_id,
+            native_turn_id,
+            bytes_read,
+        }
+        .deserialize(&mut deserializer)
+        .map_err(|error| {
+            format!("failed to locate requested Turn in thread/read response: {error}")
+        })?
+        .ok_or_else(|| {
+            format!(
+                "thread/read response omitted native Turn `{native_turn_id}` from thread `{native_thread_id}`"
+            )
+        })?;
+        deserializer
+            .end()
+            .map_err(|error| format!("thread/read response has trailing data: {error}"))?;
+        located
+    };
 
     file.seek(SeekFrom::Start(0))
         .map_err(|error| format!("failed to rewind spooled thread/read response: {error}"))?;
-    let mut deserializer = serde_json::Deserializer::from_reader(&mut file);
+    let mut reader = StdBufReader::with_capacity(64 * 1024, file);
+    let mut deserializer = serde_json::Deserializer::from_reader(&mut reader);
     let turn = ThreadTurnExtractionResponseSeed {
         native_thread_id,
         target_index: located.index,
+        omit_unbounded_payloads: located.encoded_bytes > CODEX_MAX_MATERIALIZED_FRAME_BYTES,
     }
     .deserialize(&mut deserializer)
     .map_err(|error| {
@@ -5238,6 +7201,7 @@ fn extract_thread_turn_snapshot_from_spooled_response(
 struct ThreadTurnLocationResponseSeed<'a> {
     native_thread_id: &'a str,
     native_turn_id: &'a str,
+    bytes_read: Arc<AtomicU64>,
 }
 
 impl<'de> DeserializeSeed<'de> for ThreadTurnLocationResponseSeed<'_> {
@@ -5250,6 +7214,7 @@ impl<'de> DeserializeSeed<'de> for ThreadTurnLocationResponseSeed<'_> {
         deserializer.deserialize_map(ThreadTurnLocationResponseVisitor {
             native_thread_id: self.native_thread_id,
             native_turn_id: self.native_turn_id,
+            bytes_read: self.bytes_read,
         })
     }
 }
@@ -5257,6 +7222,7 @@ impl<'de> DeserializeSeed<'de> for ThreadTurnLocationResponseSeed<'_> {
 struct ThreadTurnLocationResponseVisitor<'a> {
     native_thread_id: &'a str,
     native_turn_id: &'a str,
+    bytes_read: Arc<AtomicU64>,
 }
 
 impl<'de> Visitor<'de> for ThreadTurnLocationResponseVisitor<'_> {
@@ -5276,6 +7242,7 @@ impl<'de> Visitor<'de> for ThreadTurnLocationResponseVisitor<'_> {
                 located = map.next_value_seed(ThreadTurnLocationResultSeed {
                     native_thread_id: self.native_thread_id,
                     native_turn_id: self.native_turn_id,
+                    bytes_read: self.bytes_read.clone(),
                 })?;
             } else {
                 map.next_value::<IgnoredAny>()?;
@@ -5288,6 +7255,7 @@ impl<'de> Visitor<'de> for ThreadTurnLocationResponseVisitor<'_> {
 struct ThreadTurnLocationResultSeed<'a> {
     native_thread_id: &'a str,
     native_turn_id: &'a str,
+    bytes_read: Arc<AtomicU64>,
 }
 
 impl<'de> DeserializeSeed<'de> for ThreadTurnLocationResultSeed<'_> {
@@ -5300,6 +7268,7 @@ impl<'de> DeserializeSeed<'de> for ThreadTurnLocationResultSeed<'_> {
         deserializer.deserialize_map(ThreadTurnLocationResultVisitor {
             native_thread_id: self.native_thread_id,
             native_turn_id: self.native_turn_id,
+            bytes_read: self.bytes_read,
         })
     }
 }
@@ -5307,6 +7276,7 @@ impl<'de> DeserializeSeed<'de> for ThreadTurnLocationResultSeed<'_> {
 struct ThreadTurnLocationResultVisitor<'a> {
     native_thread_id: &'a str,
     native_turn_id: &'a str,
+    bytes_read: Arc<AtomicU64>,
 }
 
 impl<'de> Visitor<'de> for ThreadTurnLocationResultVisitor<'_> {
@@ -5326,6 +7296,7 @@ impl<'de> Visitor<'de> for ThreadTurnLocationResultVisitor<'_> {
                 located = map.next_value_seed(ThreadTurnLocationThreadSeed {
                     native_thread_id: self.native_thread_id,
                     native_turn_id: self.native_turn_id,
+                    bytes_read: self.bytes_read.clone(),
                 })?;
             } else {
                 map.next_value::<IgnoredAny>()?;
@@ -5338,6 +7309,7 @@ impl<'de> Visitor<'de> for ThreadTurnLocationResultVisitor<'_> {
 struct ThreadTurnLocationThreadSeed<'a> {
     native_thread_id: &'a str,
     native_turn_id: &'a str,
+    bytes_read: Arc<AtomicU64>,
 }
 
 impl<'de> DeserializeSeed<'de> for ThreadTurnLocationThreadSeed<'_> {
@@ -5350,6 +7322,7 @@ impl<'de> DeserializeSeed<'de> for ThreadTurnLocationThreadSeed<'_> {
         deserializer.deserialize_map(ThreadTurnLocationThreadVisitor {
             native_thread_id: self.native_thread_id,
             native_turn_id: self.native_turn_id,
+            bytes_read: self.bytes_read,
         })
     }
 }
@@ -5357,6 +7330,7 @@ impl<'de> DeserializeSeed<'de> for ThreadTurnLocationThreadSeed<'_> {
 struct ThreadTurnLocationThreadVisitor<'a> {
     native_thread_id: &'a str,
     native_turn_id: &'a str,
+    bytes_read: Arc<AtomicU64>,
 }
 
 impl<'de> Visitor<'de> for ThreadTurnLocationThreadVisitor<'_> {
@@ -5378,6 +7352,7 @@ impl<'de> Visitor<'de> for ThreadTurnLocationThreadVisitor<'_> {
                 "turns" => {
                     located = map.next_value_seed(ThreadTurnIndexSeed {
                         native_turn_id: self.native_turn_id,
+                        bytes_read: self.bytes_read.clone(),
                     })?;
                 }
                 _ => {
@@ -5390,16 +7365,17 @@ impl<'de> Visitor<'de> for ThreadTurnLocationThreadVisitor<'_> {
                 "thread/read returned a different native thread id",
             ));
         }
-        Ok(located.map(|index| LocatedThreadTurn { index }))
+        Ok(located)
     }
 }
 
 struct ThreadTurnIndexSeed<'a> {
     native_turn_id: &'a str,
+    bytes_read: Arc<AtomicU64>,
 }
 
 impl<'de> DeserializeSeed<'de> for ThreadTurnIndexSeed<'_> {
-    type Value = Option<usize>;
+    type Value = Option<LocatedThreadTurn>;
 
     fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
     where
@@ -5407,16 +7383,18 @@ impl<'de> DeserializeSeed<'de> for ThreadTurnIndexSeed<'_> {
     {
         deserializer.deserialize_seq(ThreadTurnIndexVisitor {
             native_turn_id: self.native_turn_id,
+            bytes_read: self.bytes_read,
         })
     }
 }
 
 struct ThreadTurnIndexVisitor<'a> {
     native_turn_id: &'a str,
+    bytes_read: Arc<AtomicU64>,
 }
 
 impl<'de> Visitor<'de> for ThreadTurnIndexVisitor<'_> {
-    type Value = Option<usize>;
+    type Value = Option<LocatedThreadTurn>;
 
     fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("an array of native Turns")
@@ -5428,9 +7406,17 @@ impl<'de> Visitor<'de> for ThreadTurnIndexVisitor<'_> {
     {
         let mut index = 0usize;
         let mut located = None;
-        while let Some(turn_id) = sequence.next_element_seed(ThreadTurnIdSeed)? {
+        loop {
+            let start = self.bytes_read.load(Ordering::Relaxed) as usize;
+            let Some(turn_id) = sequence.next_element_seed(ThreadTurnIdSeed)? else {
+                break;
+            };
+            let end = self.bytes_read.load(Ordering::Relaxed) as usize;
             if located.is_none() && turn_id.as_deref() == Some(self.native_turn_id) {
-                located = Some(index);
+                located = Some(LocatedThreadTurn {
+                    index,
+                    encoded_bytes: end.saturating_sub(start),
+                });
             }
             index = index.saturating_add(1);
         }
@@ -5479,6 +7465,7 @@ impl<'de> Visitor<'de> for ThreadTurnIdVisitor {
 struct ThreadTurnExtractionResponseSeed<'a> {
     native_thread_id: &'a str,
     target_index: usize,
+    omit_unbounded_payloads: bool,
 }
 
 impl<'de> DeserializeSeed<'de> for ThreadTurnExtractionResponseSeed<'_> {
@@ -5491,6 +7478,7 @@ impl<'de> DeserializeSeed<'de> for ThreadTurnExtractionResponseSeed<'_> {
         deserializer.deserialize_map(ThreadTurnExtractionResponseVisitor {
             native_thread_id: self.native_thread_id,
             target_index: self.target_index,
+            omit_unbounded_payloads: self.omit_unbounded_payloads,
         })
     }
 }
@@ -5498,6 +7486,7 @@ impl<'de> DeserializeSeed<'de> for ThreadTurnExtractionResponseSeed<'_> {
 struct ThreadTurnExtractionResponseVisitor<'a> {
     native_thread_id: &'a str,
     target_index: usize,
+    omit_unbounded_payloads: bool,
 }
 
 impl<'de> Visitor<'de> for ThreadTurnExtractionResponseVisitor<'_> {
@@ -5517,6 +7506,7 @@ impl<'de> Visitor<'de> for ThreadTurnExtractionResponseVisitor<'_> {
                 turn = map.next_value_seed(ThreadTurnExtractionResultSeed {
                     native_thread_id: self.native_thread_id,
                     target_index: self.target_index,
+                    omit_unbounded_payloads: self.omit_unbounded_payloads,
                 })?;
             } else {
                 map.next_value::<IgnoredAny>()?;
@@ -5529,6 +7519,7 @@ impl<'de> Visitor<'de> for ThreadTurnExtractionResponseVisitor<'_> {
 struct ThreadTurnExtractionResultSeed<'a> {
     native_thread_id: &'a str,
     target_index: usize,
+    omit_unbounded_payloads: bool,
 }
 
 impl<'de> DeserializeSeed<'de> for ThreadTurnExtractionResultSeed<'_> {
@@ -5541,6 +7532,7 @@ impl<'de> DeserializeSeed<'de> for ThreadTurnExtractionResultSeed<'_> {
         deserializer.deserialize_map(ThreadTurnExtractionResultVisitor {
             native_thread_id: self.native_thread_id,
             target_index: self.target_index,
+            omit_unbounded_payloads: self.omit_unbounded_payloads,
         })
     }
 }
@@ -5548,6 +7540,7 @@ impl<'de> DeserializeSeed<'de> for ThreadTurnExtractionResultSeed<'_> {
 struct ThreadTurnExtractionResultVisitor<'a> {
     native_thread_id: &'a str,
     target_index: usize,
+    omit_unbounded_payloads: bool,
 }
 
 impl<'de> Visitor<'de> for ThreadTurnExtractionResultVisitor<'_> {
@@ -5567,6 +7560,7 @@ impl<'de> Visitor<'de> for ThreadTurnExtractionResultVisitor<'_> {
                 turn = map.next_value_seed(ThreadTurnExtractionThreadSeed {
                     native_thread_id: self.native_thread_id,
                     target_index: self.target_index,
+                    omit_unbounded_payloads: self.omit_unbounded_payloads,
                 })?;
             } else {
                 map.next_value::<IgnoredAny>()?;
@@ -5579,6 +7573,7 @@ impl<'de> Visitor<'de> for ThreadTurnExtractionResultVisitor<'_> {
 struct ThreadTurnExtractionThreadSeed<'a> {
     native_thread_id: &'a str,
     target_index: usize,
+    omit_unbounded_payloads: bool,
 }
 
 impl<'de> DeserializeSeed<'de> for ThreadTurnExtractionThreadSeed<'_> {
@@ -5591,6 +7586,7 @@ impl<'de> DeserializeSeed<'de> for ThreadTurnExtractionThreadSeed<'_> {
         deserializer.deserialize_map(ThreadTurnExtractionThreadVisitor {
             native_thread_id: self.native_thread_id,
             target_index: self.target_index,
+            omit_unbounded_payloads: self.omit_unbounded_payloads,
         })
     }
 }
@@ -5598,6 +7594,7 @@ impl<'de> DeserializeSeed<'de> for ThreadTurnExtractionThreadSeed<'_> {
 struct ThreadTurnExtractionThreadVisitor<'a> {
     native_thread_id: &'a str,
     target_index: usize,
+    omit_unbounded_payloads: bool,
 }
 
 impl<'de> Visitor<'de> for ThreadTurnExtractionThreadVisitor<'_> {
@@ -5619,6 +7616,7 @@ impl<'de> Visitor<'de> for ThreadTurnExtractionThreadVisitor<'_> {
                 "turns" => {
                     turn = map.next_value_seed(ThreadTurnAtIndexSeed {
                         target_index: self.target_index,
+                        omit_unbounded_payloads: self.omit_unbounded_payloads,
                     })?;
                 }
                 _ => {
@@ -5637,6 +7635,7 @@ impl<'de> Visitor<'de> for ThreadTurnExtractionThreadVisitor<'_> {
 
 struct ThreadTurnAtIndexSeed {
     target_index: usize,
+    omit_unbounded_payloads: bool,
 }
 
 impl<'de> DeserializeSeed<'de> for ThreadTurnAtIndexSeed {
@@ -5648,12 +7647,14 @@ impl<'de> DeserializeSeed<'de> for ThreadTurnAtIndexSeed {
     {
         deserializer.deserialize_seq(ThreadTurnAtIndexVisitor {
             target_index: self.target_index,
+            omit_unbounded_payloads: self.omit_unbounded_payloads,
         })
     }
 }
 
 struct ThreadTurnAtIndexVisitor {
     target_index: usize,
+    omit_unbounded_payloads: bool,
 }
 
 impl<'de> Visitor<'de> for ThreadTurnAtIndexVisitor {
@@ -5671,7 +7672,11 @@ impl<'de> Visitor<'de> for ThreadTurnAtIndexVisitor {
         let mut target = None;
         while index <= self.target_index {
             if index == self.target_index {
-                target = sequence.next_element::<JsonValue>()?;
+                target = if self.omit_unbounded_payloads {
+                    sequence.next_element_seed(StreamedLargeCodexTurnSeed)?
+                } else {
+                    sequence.next_element_seed(StreamedCodexTurnSeed)?
+                };
                 break;
             }
             if sequence.next_element::<IgnoredAny>()?.is_none() {
@@ -5802,7 +7807,12 @@ async fn run_codex_jsonl_rpc_worker<W>(
                         id,
                         file,
                         kind,
+                        total_bytes,
+                        spool_permit,
                     }) => {
+                        // Keep the permit alive until the file-backed response
+                        // has been fully resolved and dropped.
+                        let _spool_permit = spool_permit;
                         let Some(pending_request) = pending.remove(&id) else {
                             continue;
                         };
@@ -5811,6 +7821,35 @@ async fn run_codex_jsonl_rpc_worker<W>(
                             id,
                             kind,
                             file,
+                            total_bytes,
+                        ).await;
+                    }
+                    Some(CodexJsonlRpcIncoming::OversizedServerRequestRejected {
+                        id,
+                        method,
+                        total_bytes,
+                    }) => {
+                        emit_diagnostic(
+                            &event_sinks,
+                            CodexJsonlRpcClientDiagnostic {
+                                kind: CodexJsonlRpcClientDiagnosticKind::ServerRequestPayloadTooLarge,
+                                message: format!(
+                                    "codex server request exceeded the {}-byte bounded materialization ceiling",
+                                    CODEX_MAX_MATERIALIZED_FRAME_BYTES,
+                                ),
+                                method: Some(method.clone()),
+                                raw: Some(json!({
+                                    "id": jsonl_rpc_id_value(&id),
+                                    "method": method,
+                                    "totalBytes": total_bytes,
+                                    "_pioneerOversizedPayloadOmitted": true,
+                                })),
+                            },
+                        );
+                        let _ = write_codex_server_request_terminal_error(
+                            &mut writer,
+                            id,
+                            CodexServerRequestTerminalState::PayloadTooLarge,
                         ).await;
                     }
                     Some(CodexJsonlRpcIncoming::DecodeError(error)) => {
@@ -5873,9 +7912,24 @@ async fn resolve_oversized_codex_response(
     id: JsonlRpcId,
     kind: OversizedCodexResponseKind,
     mut file: File,
+    total_bytes: usize,
 ) {
     if kind == OversizedCodexResponseKind::Success {
         match pending_request.oversized_success_recovery {
+            Some(OversizedSuccessRecovery::ThreadOpenSnapshot { method }) => {
+                let recovered = tokio::task::spawn_blocking(move || {
+                    extract_thread_open_snapshot_from_spooled_response(file, method)
+                })
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|result| result)
+                .map_err(|message| CodexJsonlRpcClientError::Decode {
+                    method: method.to_owned(),
+                    message,
+                });
+                let _ = pending_request.response_tx.send(recovered);
+                return;
+            }
             Some(OversizedSuccessRecovery::ThreadTurnSnapshot {
                 native_thread_id,
                 native_turn_id,
@@ -5900,6 +7954,41 @@ async fn resolve_oversized_codex_response(
             None => {}
         }
     }
+    if total_bytes > CODEX_MAX_MATERIALIZED_FRAME_BYTES {
+        if kind == OversizedCodexResponseKind::Error {
+            let expected_id = id.clone();
+            let recovered = tokio::task::spawn_blocking(move || {
+                extract_oversized_codex_error_response(file, &expected_id)
+            })
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(|result| result.map_err(|error| error.to_string()));
+            match recovered {
+                Ok(response) => complete_codex_jsonl_rpc_response(pending_request, id, response),
+                Err(message) => {
+                    let _ =
+                        pending_request
+                            .response_tx
+                            .send(Err(CodexJsonlRpcClientError::Decode {
+                                method: "jsonl-rpc".to_owned(),
+                                message,
+                            }));
+                }
+            }
+        } else {
+            let _ = pending_request
+                .response_tx
+                .send(Err(CodexJsonlRpcClientError::Decode {
+                    method: "jsonl-rpc".to_owned(),
+                    message: format!(
+                        "oversized response exceeded the {}-byte bounded materialization ceiling and has no method-specific recovery contract",
+                        CODEX_MAX_MATERIALIZED_FRAME_BYTES,
+                    ),
+                }));
+        }
+        return;
+    }
+
     let decoded = tokio::task::spawn_blocking(move || {
         file.seek(SeekFrom::Start(0)).map_err(|error| {
             JsonlRpcDecodeError::new(
@@ -5907,7 +7996,8 @@ async fn resolve_oversized_codex_response(
                 format!("failed to rewind spooled JSONL-RPC response: {error}"),
             )
         })?;
-        let raw = serde_json::from_reader(&mut file).map_err(|error| {
+        let mut reader = StdBufReader::with_capacity(64 * 1024, file);
+        let raw = serde_json::from_reader(&mut reader).map_err(|error| {
             JsonlRpcDecodeError::new(
                 JsonlRpcDecodeErrorKind::MalformedJson,
                 format!("malformed spooled JSONL-RPC response: {error}"),
@@ -6175,6 +8265,10 @@ async fn write_codex_server_request_terminal_error(
             CODEX_SERVER_REQUEST_TIMEOUT_CODE,
             "server request timed out",
         ),
+        CodexServerRequestTerminalState::PayloadTooLarge => (
+            CODEX_SERVER_REQUEST_PAYLOAD_TOO_LARGE_CODE,
+            "server request payload too large",
+        ),
         CodexServerRequestTerminalState::Shutdown => (
             CODEX_SERVER_REQUEST_HANDLER_UNAVAILABLE_CODE,
             "server request cancelled during shutdown",
@@ -6242,7 +8336,108 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, split};
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, split};
+
+    #[tokio::test]
+    async fn owned_codex_transport_joins_all_tasks_between_attempts() {
+        for _ in 0..3 {
+            let (client_io, mut server_io) = tokio::io::duplex(1024);
+            let (reader, writer) = split(client_io);
+            let (client, owner) = CodexJsonlRpcClient::new_owned(BufReader::new(reader), writer);
+            let mut notifications = client.take_notification_receiver().unwrap();
+            owner.shutdown().await;
+            let mut byte = [0_u8; 1];
+            assert_eq!(server_io.read(&mut byte).await.unwrap(), 0);
+            assert!(server_io.write_all(b"x").await.is_err());
+            assert!(notifications.recv().await.is_none());
+            assert!(
+                client
+                    .request_value("unused", None, Duration::from_secs(60))
+                    .await
+                    .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn owned_codex_transport_shutdown_releases_pending_request() {
+        let (client_io, server_io) = tokio::io::duplex(1024);
+        let (reader, writer) = split(client_io);
+        let (client, owner) = CodexJsonlRpcClient::new_owned(BufReader::new(reader), writer);
+        let pending = tokio::spawn(async move {
+            client
+                .request_value("fixture/pending", None, Duration::from_secs(60))
+                .await
+        });
+        let mut server = BufReader::new(server_io);
+        let mut line = String::new();
+        server.read_line(&mut line).await.unwrap();
+        assert!(line.contains("fixture/pending"));
+        owner.shutdown().await;
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), pending)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_err()
+        );
+        assert_eq!(server.read_line(&mut String::new()).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn owned_codex_transport_rejects_oversized_frames_without_spool_recovery() {
+        let (client_io, mut server_io) = tokio::io::duplex(1024);
+        let (reader, writer) = split(client_io);
+        let (client, owner) = CodexJsonlRpcClient::new_owned(BufReader::new(reader), writer);
+        let oversized = vec![b'x'; CODEX_MAX_MATERIALIZED_FRAME_BYTES + 2048];
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), server_io.write_all(&oversized))
+                .await
+                .unwrap()
+                .is_err()
+        );
+        owner.shutdown().await;
+        assert!(
+            client
+                .request_value("unused", None, Duration::from_secs(60))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn owned_codex_transport_drop_aborts_even_with_live_client_clone() {
+        let (client_io, mut server_io) = tokio::io::duplex(1024);
+        let (reader, writer) = split(client_io);
+        let (client, owner) = CodexJsonlRpcClient::new_owned(BufReader::new(reader), writer);
+        let clone = client.clone();
+        drop(owner);
+        let mut byte = [0_u8; 1];
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), server_io.read(&mut byte))
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
+        assert!(
+            clone
+                .request_value("unused", None, Duration::from_secs(60))
+                .await
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn codex_recovery_budget_is_disk_only_and_provider_specific() {
+        let budget = codex_native_event_budget();
+        assert_eq!(budget.max_frame_bytes, 1024 * 1024);
+        assert_eq!(
+            budget.max_recovery_frame_bytes,
+            CODEX_MAX_RECOVERY_FRAME_BYTES,
+        );
+        assert_eq!(CODEX_MAX_RECOVERY_FRAME_BYTES, 512 * 1024 * 1024);
+    }
 
     fn client_pair() -> (
         CodexJsonlRpcClient,
@@ -7007,6 +9202,61 @@ while read line; do :; done
         assert_eq!(decoded.native_item_id.as_deref(), Some("codex-item-1"));
         assert_eq!(decoded.started_at_ms, Some(1234));
         assert_eq!(decoded.raw["futureField"], json!(true));
+    }
+
+    #[test]
+    fn permission_approval_request_preserves_native_profile_and_response_scope() {
+        let permissions = json!({
+            "fileSystem": {
+                "write": ["/tmp/project/output"],
+                "entries": [{
+                    "access": "read",
+                    "path": {"type": "path", "path": "/tmp/project/input"}
+                }]
+            },
+            "network": {"enabled": true}
+        });
+        let request = CodexJsonlRpcServerRequest {
+            id: JsonlRpcId::String("permission-42".to_owned()),
+            method: "item/permissions/requestApproval".to_owned(),
+            params: Some(json!({
+                "cwd": "/tmp/project",
+                "reason": "build needs an output directory",
+                "threadId": "codex-thread-1",
+                "turnId": "codex-turn-1",
+                "itemId": "codex-item-1",
+                "permissions": permissions,
+                "startedAtMs": 1234
+            })),
+            raw: json!({"id": "permission-42"}),
+        };
+
+        let decoded = decode_codex_permission_approval_request(&request);
+        assert_eq!(decoded.native_request_id, "permission-42");
+        assert_eq!(decoded.native_request_id_json, json!("permission-42"));
+        assert_eq!(decoded.cwd.as_deref(), Some("/tmp/project"));
+        assert_eq!(decoded.native_thread_id.as_deref(), Some("codex-thread-1"));
+        assert_eq!(decoded.native_turn_id.as_deref(), Some("codex-turn-1"));
+        assert_eq!(decoded.native_item_id.as_deref(), Some("codex-item-1"));
+        assert_eq!(decoded.requested_permissions, permissions);
+        assert_eq!(decoded.started_at_ms, Some(1234));
+
+        assert_eq!(
+            codex_permission_approval_response(permissions.clone(), true, false),
+            json!({
+                "permissions": permissions,
+                "scope": "turn",
+                "strictAutoReview": true
+            })
+        );
+        assert_eq!(
+            codex_permission_approval_response(json!({"network": {"enabled": true}}), false, false),
+            json!({
+                "permissions": {},
+                "scope": "turn",
+                "strictAutoReview": true
+            })
+        );
     }
 
     #[tokio::test]
@@ -8464,6 +10714,8 @@ while read line; do :; done
                 .thread_fork(
                     CodexThreadForkParams {
                         thread_id: "codex-thread-existing".to_owned(),
+                        last_turn_id: Some("codex-turn-finished".to_owned()),
+                        thread_source: Some("pioneer-cli-fork:test".to_owned()),
                     },
                     Duration::from_secs(2),
                 )
@@ -8475,7 +10727,10 @@ while read line; do :; done
         assert_eq!(
             request["params"],
             json!({
-                "threadId": "codex-thread-existing"
+                "threadId": "codex-thread-existing",
+                "lastTurnId": "codex-turn-finished",
+                "threadSource": "pioneer-cli-fork:test",
+                "excludeTurns": true
             })
         );
         fake.write_result_response(
@@ -8495,6 +10750,184 @@ while read line; do :; done
             .expect("fork task should join")
             .expect("fork should succeed");
         assert_eq!(snapshot.native_thread_id, "codex-thread-fork");
+    }
+
+    #[tokio::test]
+    async fn marked_fork_recovery_requires_exact_marker_parent_and_inclusive_boundary() {
+        let mut fake = FakeCodexAppServer::new();
+        let client = fake.client.clone();
+        let recovery = tokio::spawn(async move {
+            client
+                .find_marked_thread_fork(
+                    "source-thread",
+                    "completed-boundary",
+                    "pioneer-cli-fork:nonce",
+                    Duration::from_secs(2),
+                )
+                .await
+        });
+        let listing = fake.read_message().await;
+        assert_eq!(listing["method"], json!("thread/list"));
+        assert!(listing["params"].get("parentThreadId").is_none());
+        fake.write_result_response(listing["id"].clone(), json!({
+            "data": [
+                {"id":"unrelated", "forkedFromId":"source-thread", "threadSource":"other"},
+                {"id":"recovered", "forkedFromId":"source-thread", "threadSource":"pioneer-cli-fork:nonce", "cwd":"/tmp"}
+            ],
+            "nextCursor": null
+        })).await;
+        let turns = fake.read_message().await;
+        assert_eq!(turns["method"], json!("thread/turns/list"));
+        assert_eq!(turns["params"]["threadId"], json!("recovered"));
+        assert_eq!(turns["params"]["itemsView"], json!("notLoaded"));
+        fake.write_result_response(
+            turns["id"].clone(),
+            json!({
+                "data": [{"id":"completed-boundary"}], "nextCursor": null
+            }),
+        )
+        .await;
+        let archived = fake.read_message().await;
+        assert_eq!(archived["method"], json!("thread/list"));
+        assert_eq!(archived["params"]["archived"], json!(true));
+        fake.write_result_response(
+            archived["id"].clone(),
+            json!({
+                "data": [], "nextCursor": null
+            }),
+        )
+        .await;
+        let found = recovery.await.unwrap().unwrap().unwrap();
+        assert_eq!(found.native_thread_id, "recovered");
+        assert_eq!(found.cwd.as_deref(), Some("/tmp"));
+    }
+
+    #[tokio::test]
+    async fn marked_fork_negative_proof_includes_archived_threads() {
+        for archived_fork in [false, true] {
+            let mut fake = FakeCodexAppServer::new();
+            let client = fake.client.clone();
+            let recovery = tokio::spawn(async move {
+                client
+                    .find_marked_thread_fork(
+                        "source-thread",
+                        "completed-boundary",
+                        "pioneer-cli-fork:nonce",
+                        Duration::from_secs(2),
+                    )
+                    .await
+            });
+            let active = fake.read_message().await;
+            assert_eq!(active["params"]["archived"], json!(false));
+            fake.write_result_response(active["id"].clone(), json!({"data":[],"nextCursor":null}))
+                .await;
+            let archived = fake.read_message().await;
+            assert_eq!(archived["params"]["archived"], json!(true));
+            fake.write_result_response(
+                archived["id"].clone(),
+                json!({
+                    "data": if archived_fork { json!([{
+                        "id":"archived-fork", "forkedFromId":"source-thread",
+                        "threadSource":"pioneer-cli-fork:nonce"
+                    }]) } else { json!([]) },
+                    "nextCursor":null
+                }),
+            )
+            .await;
+            if archived_fork {
+                let turns = fake.read_message().await;
+                assert_eq!(turns["method"], json!("thread/turns/list"));
+                fake.write_result_response(
+                    turns["id"].clone(),
+                    json!({
+                        "data":[{"id":"completed-boundary"}], "nextCursor":null
+                    }),
+                )
+                .await;
+                assert!(
+                    recovery
+                        .await
+                        .unwrap()
+                        .unwrap_err()
+                        .to_string()
+                        .contains("archived")
+                );
+            } else {
+                assert!(recovery.await.unwrap().unwrap().is_none());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn marked_fork_incomplete_listing_is_not_negative_proof() {
+        let mut fake = FakeCodexAppServer::new();
+        let client = fake.client.clone();
+        let recovery = tokio::spawn(async move {
+            client
+                .find_marked_thread_fork(
+                    "source-thread",
+                    "completed-boundary",
+                    "pioneer-cli-fork:nonce",
+                    Duration::from_secs(2),
+                )
+                .await
+        });
+        let first = fake.read_message().await;
+        fake.write_result_response(first["id"].clone(), json!({"data":[],"nextCursor":"same"}))
+            .await;
+        let second = fake.read_message().await;
+        fake.write_result_response(second["id"].clone(), json!({"data":[],"nextCursor":"same"}))
+            .await;
+        assert!(
+            recovery
+                .await
+                .unwrap()
+                .unwrap_err()
+                .to_string()
+                .contains("cursor")
+        );
+    }
+
+    #[tokio::test]
+    async fn marked_fork_ambiguous_marker_preserves_unknown_outcome() {
+        let mut fake = FakeCodexAppServer::new();
+        let client = fake.client.clone();
+        let recovery = tokio::spawn(async move {
+            client
+                .find_marked_thread_fork(
+                    "source-thread",
+                    "completed-boundary",
+                    "pioneer-cli-fork:nonce",
+                    Duration::from_secs(2),
+                )
+                .await
+        });
+        let listing = fake.read_message().await;
+        fake.write_result_response(listing["id"].clone(), json!({
+            "data":[
+                {"id":"fork-one","forkedFromId":"source-thread","threadSource":"pioneer-cli-fork:nonce"},
+                {"id":"fork-two","forkedFromId":"source-thread","threadSource":"pioneer-cli-fork:nonce"}
+            ], "nextCursor":null
+        })).await;
+        for id in ["fork-one", "fork-two"] {
+            let turns = fake.read_message().await;
+            assert_eq!(turns["params"]["threadId"], json!(id));
+            fake.write_result_response(
+                turns["id"].clone(),
+                json!({
+                    "data":[{"id":"completed-boundary"}], "nextCursor":null
+                }),
+            )
+            .await;
+        }
+        assert!(
+            recovery
+                .await
+                .unwrap()
+                .unwrap_err()
+                .to_string()
+                .contains("ambiguous")
+        );
     }
 
     #[tokio::test]
@@ -8579,7 +11012,8 @@ while read line; do :; done
                 "path": "/stable/sessions/rollout.jsonl",
                 "cwd": "/tmp/project",
                 "approvalPolicy": "never",
-                "sandbox": "danger-full-access"
+                "sandbox": "danger-full-access",
+                "excludeTurns": true
             })
         );
         fake.write_result_response(
@@ -8602,7 +11036,53 @@ while read line; do :; done
     }
 
     #[tokio::test]
-    async fn codex_thread_resume_preserves_spooled_history_and_keeps_transport_aligned() {
+    async fn codex_thread_resume_rejects_a_different_native_thread() {
+        let mut fake = FakeCodexAppServer::new();
+        let client = fake.client.clone();
+        let resume = tokio::spawn(async move {
+            client
+                .thread_resume(
+                    "codex-thread-existing",
+                    CodexThreadStartParams {
+                        cwd: "/tmp/project".to_owned(),
+                        approval_policy: "never".to_owned(),
+                        ephemeral: false,
+                        sandbox: Some("read-only".to_owned()),
+                        permissions: None,
+                        model: None,
+                        service_tier: None,
+                    },
+                    Duration::from_secs(2),
+                )
+                .await
+        });
+
+        let request = fake.read_message().await;
+        fake.write_result_response(
+            request["id"].clone(),
+            json!({
+                "thread": {
+                    "id": "codex-thread-replacement",
+                    "cwd": "/tmp/project"
+                }
+            }),
+        )
+        .await;
+
+        let error = resume
+            .await
+            .expect("thread resume task should join")
+            .expect_err("a replacement native thread must be rejected");
+        assert!(matches!(error, CodexJsonlRpcClientError::Decode { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("instead of requested native thread")
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_thread_resume_streams_metadata_without_materializing_spooled_history() {
         let budget = crate::NativeEventBudget {
             max_frame_bytes: 256,
             ..crate::NativeEventBudget::default()
@@ -8623,18 +11103,22 @@ while read line; do :; done
                         model: Some("gpt-test".to_owned()),
                         service_tier: None,
                     },
-                    Duration::from_secs(2),
+                    Duration::from_secs(30),
                 )
                 .await
         });
 
         let request = read_server_line(&mut server_reader).await;
+        assert_eq!(request["params"]["threadId"], json!("codex-thread-large"));
+        assert_eq!(request["params"]["excludeTurns"], json!(true));
         let payload = format!(
             "{{\"id\":{},\"result\":{{\"thread\":{{\"id\":\"codex-thread-large\",\"cwd\":\"/tmp/project\",\"model\":\"gpt-test\",\"turns\":[\"{}\"]}}}}}}\n",
             request["id"],
-            "history".repeat(256),
+            "h".repeat(CODEX_MAX_MATERIALIZED_FRAME_BYTES + 1024),
         );
         assert!(payload.len() > budget.max_frame_bytes);
+        assert!(payload.len() > CODEX_MAX_MATERIALIZED_FRAME_BYTES);
+        assert!(payload.len() <= budget.max_recovery_frame_bytes);
         server_writer
             .write_all(payload.as_bytes())
             .await
@@ -8643,14 +11127,12 @@ while read line; do :; done
         let snapshot = resume
             .await
             .expect("resume task should join")
-            .expect("spooled resume history should be preserved");
+            .expect("spooled resume metadata should be recovered");
         assert_eq!(snapshot.native_thread_id, "codex-thread-large");
         assert_eq!(snapshot.cwd.as_deref(), Some("/tmp/project"));
         assert_eq!(snapshot.model.as_deref(), Some("gpt-test"));
-        assert_eq!(
-            snapshot.raw["thread"]["turns"][0],
-            json!("history".repeat(256))
-        );
+        assert!(snapshot.raw["thread"].get("turns").is_none());
+        assert_eq!(snapshot.raw["_pioneerStreamedThreadOpen"], json!(true));
 
         let metadata_client = client.clone();
         let metadata = tokio::spawn(async move {
@@ -8682,7 +11164,7 @@ while read line; do :; done
     async fn codex_terminal_snapshot_streams_only_the_requested_turn_from_large_history() {
         let budget = crate::NativeEventBudget {
             max_frame_bytes: 512,
-            max_recovery_frame_bytes: 4 * 1024 * 1024,
+            max_recovery_frame_bytes: 16 * 1024 * 1024,
             ..crate::NativeEventBudget::default()
         };
         let (rpc, mut server_reader, mut server_writer) = client_pair_with_budget(budget);
@@ -8693,7 +11175,7 @@ while read line; do :; done
                 .thread_read_turn_snapshot_raw(
                     "native-thread",
                     "target-turn",
-                    Duration::from_secs(5),
+                    Duration::from_secs(30),
                 )
                 .await
         });
@@ -8714,17 +11196,29 @@ while read line; do :; done
                             "items": [{
                                 "id": "large-history-item",
                                 "type": "agentMessage",
-                                "text": "x".repeat(1024 * 1024),
+                                "text": "x".repeat(CODEX_MAX_MATERIALIZED_FRAME_BYTES + 1024),
                             }],
                         },
                         {
                             "id": "target-turn",
                             "status": "completed",
-                            "items": [{
-                                "id": "target-message",
-                                "type": "agentMessage",
-                                "text": "done",
-                            }],
+                            "items": [
+                                {
+                                    "id": "target-message",
+                                    "type": "agentMessage",
+                                    "text": "done",
+                                },
+                                {
+                                    "id": "target-file-change",
+                                    "type": "fileChange",
+                                    "status": "completed",
+                                    "changes": [{
+                                        "path": "generated/parser.c",
+                                        "kind": { "type": "delete" },
+                                        "diff": "x".repeat(1024 * 1024),
+                                    }],
+                                },
+                            ],
                         },
                     ],
                 },
@@ -8732,6 +11226,8 @@ while read line; do :; done
         })
         .to_string();
         assert!(response.len() > budget.max_frame_bytes);
+        assert!(response.len() > CODEX_MAX_MATERIALIZED_FRAME_BYTES);
+        assert!(response.len() <= budget.max_recovery_frame_bytes);
         server_writer
             .write_all(format!("{response}\n").as_bytes())
             .await
@@ -8747,6 +11243,14 @@ while read line; do :; done
         assert_eq!(turns.len(), 1);
         assert_eq!(turns[0]["id"], json!("target-turn"));
         assert_eq!(turns[0]["items"][0]["text"], json!("done"));
+        let file_change = &turns[0]["items"][1];
+        assert_eq!(file_change["changedFiles"], json!(["generated/parser.c"]));
+        assert_eq!(
+            file_change["changes"][0]["path"],
+            json!("generated/parser.c")
+        );
+        assert!(file_change["changes"][0].get("diff").is_none());
+        assert_eq!(file_change["_pioneerFileChangePayloadOmitted"], json!(true));
         assert_eq!(recovered["_pioneerTargetedSnapshot"], json!(true));
 
         let metadata_client = client.clone();
@@ -8783,6 +11287,76 @@ while read line; do :; done
                 .native_thread_id,
             "native-thread"
         );
+    }
+
+    #[tokio::test]
+    async fn codex_terminal_snapshot_retains_oversized_command_output() {
+        let budget = crate::NativeEventBudget {
+            max_frame_bytes: 512,
+            max_recovery_frame_bytes: 16 * 1024 * 1024,
+            ..crate::NativeEventBudget::default()
+        };
+        let (rpc, mut server_reader, mut server_writer) = client_pair_with_budget(budget);
+        let client = CodexAppServerClient::new(rpc);
+        let snapshot_client = client.clone();
+        let snapshot = tokio::spawn(async move {
+            snapshot_client
+                .thread_read_turn_snapshot_raw(
+                    "native-thread",
+                    "target-turn",
+                    Duration::from_secs(30),
+                )
+                .await
+        });
+
+        let request = read_server_line(&mut server_reader).await;
+        let response = json!({
+            "id": request["id"].clone(),
+            "result": {
+                "thread": {
+                    "id": "native-thread",
+                    "turns": [{
+                        "id": "target-turn",
+                        "status": "completed",
+                        "items": [{
+                            "id": "large-command",
+                            "type": "commandExecution",
+                            "status": "completed",
+                            "exitCode": 0,
+                            "aggregatedOutput": "x".repeat(
+                                CODEX_MAX_MATERIALIZED_FRAME_BYTES + 1024,
+                            ),
+                        }],
+                    }],
+                },
+            },
+        })
+        .to_string();
+        assert!(response.len() > CODEX_MAX_MATERIALIZED_FRAME_BYTES);
+        assert!(response.len() <= budget.max_recovery_frame_bytes);
+        server_writer
+            .write_all(format!("{response}\n").as_bytes())
+            .await
+            .expect("write oversized target snapshot");
+        drop(response);
+
+        let recovered = snapshot
+            .await
+            .expect("snapshot task should join")
+            .expect("oversized target lifecycle should recover");
+        let turn = &recovered["thread"]["turns"][0];
+        assert_eq!(turn["id"], json!("target-turn"));
+        assert_eq!(turn["status"], json!("completed"));
+        let item = &turn["items"][0];
+        assert_eq!(item["id"], json!("large-command"));
+        assert_eq!(item["type"], json!("commandExecution"));
+        assert_eq!(item["status"], json!("completed"));
+        assert_eq!(item["exitCode"], json!(0));
+        assert_eq!(
+            item["aggregatedOutput"].as_str().unwrap().len(),
+            CODEX_MAX_MATERIALIZED_FRAME_BYTES + 1024
+        );
+        assert!(item.get("_pioneerOversizedPayloadOmitted").is_none());
     }
 
     #[tokio::test]
@@ -8900,6 +11474,301 @@ while read line; do :; done
                 .expect("pending task should join")
                 .expect("oversized notification must not close transport"),
             json!({"ok": true})
+        );
+    }
+
+    #[tokio::test]
+    async fn spooled_file_change_omits_huge_diff_and_keeps_transport_aligned() {
+        let budget = crate::NativeEventBudget {
+            max_frame_bytes: 256,
+            max_recovery_frame_bytes: 16 * 1024 * 1024,
+            ..crate::NativeEventBudget::default()
+        };
+        let (client, mut server_reader, mut server_writer) = client_pair_with_budget(budget);
+        let mut notifications = client
+            .take_notification_receiver()
+            .expect("notification receiver");
+        let pending_client = client.clone();
+        let pending = tokio::spawn(async move {
+            pending_client
+                .request_value("account/read", Some(json!({})), Duration::from_secs(30))
+                .await
+        });
+        let request = read_server_line(&mut server_reader).await;
+        let payload = format!(
+            "{{\"method\":\"item/completed\",\"params\":{{\"threadId\":\"thread-control\",\"turnId\":\"turn-control\",\"item\":{{\"id\":\"file-change\",\"type\":\"fileChange\",\"status\":\"completed\",\"changes\":[{{\"path\":\"generated/parser.c\",\"kind\":{{\"type\":\"delete\"}},\"diff\":\"{}\"}}]}}}}}}\n",
+            "x".repeat(CODEX_MAX_MATERIALIZED_FRAME_BYTES + 1024),
+        );
+        assert!(payload.len() > budget.max_frame_bytes);
+        assert!(payload.len() <= budget.max_recovery_frame_bytes);
+        server_writer
+            .write_all(payload.as_bytes())
+            .await
+            .expect("write oversized file-change notification");
+
+        let notification = tokio::time::timeout(Duration::from_secs(30), notifications.recv())
+            .await
+            .expect("file-change notification should arrive")
+            .expect("notification channel should remain open");
+        assert_eq!(notification.method, "item/completed");
+        let params = notification.params.expect("notification params");
+        assert_eq!(params["threadId"], json!("thread-control"));
+        assert_eq!(params["turnId"], json!("turn-control"));
+        let item = &params["item"];
+        assert_eq!(item["id"], json!("file-change"));
+        assert_eq!(item["changedFiles"], json!(["generated/parser.c"]));
+        assert_eq!(item["changes"][0]["path"], json!("generated/parser.c"));
+        assert_eq!(item["changes"][0]["kind"]["type"], json!("delete"));
+        assert!(item["changes"][0].get("diff").is_none());
+        assert_eq!(item["_pioneerFileChangePayloadOmitted"], json!(true));
+
+        server_writer
+            .write_all(
+                format!(
+                    "{}\n",
+                    json!({"id": request["id"].clone(), "result": {"ok": true}})
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("write response after oversized file-change notification");
+        assert_eq!(
+            pending
+                .await
+                .expect("pending task should join")
+                .expect("file-change frame must not close transport"),
+            json!({"ok": true})
+        );
+    }
+
+    #[tokio::test]
+    async fn spooled_turn_diff_above_materialization_ceiling_is_omitted_and_aligned() {
+        let budget = crate::NativeEventBudget {
+            max_frame_bytes: 256,
+            max_recovery_frame_bytes: 16 * 1024 * 1024,
+            ..crate::NativeEventBudget::default()
+        };
+        let (client, mut server_reader, mut server_writer) = client_pair_with_budget(budget);
+        let mut notifications = client
+            .take_notification_receiver()
+            .expect("notification receiver");
+        let pending_client = client.clone();
+        let pending = tokio::spawn(async move {
+            pending_client
+                .request_value("account/read", Some(json!({})), Duration::from_secs(30))
+                .await
+        });
+        let request = read_server_line(&mut server_reader).await;
+        let payload = format!(
+            "{{\"params\":{{\"threadId\":\"thread-control\",\"turnId\":\"turn-control\",\"revision\":7,\"exact\":true,\"diff\":\"{}\"}},\"method\":\"turn/diff/updated\"}}\n",
+            "x".repeat(CODEX_MAX_MATERIALIZED_FRAME_BYTES + 1024),
+        );
+        assert!(payload.len() > CODEX_MAX_MATERIALIZED_FRAME_BYTES);
+        assert!(payload.len() <= budget.max_recovery_frame_bytes);
+        server_writer
+            .write_all(payload.as_bytes())
+            .await
+            .expect("write oversized diff notification");
+        drop(payload);
+
+        let notification = tokio::time::timeout(Duration::from_secs(30), notifications.recv())
+            .await
+            .expect("oversized diff notification should arrive")
+            .expect("notification channel should remain open");
+        assert_eq!(notification.method, "turn/diff/updated");
+        let params = notification.params.expect("diff params");
+        assert_eq!(params["threadId"], json!("thread-control"));
+        assert_eq!(params["turnId"], json!("turn-control"));
+        assert_eq!(params["revision"], json!(7));
+        assert_eq!(params["exact"], json!(true));
+        assert!(params.get("diff").is_none());
+        assert_eq!(params["_pioneerDiffOmitted"], json!(true));
+        assert_eq!(params["_pioneerOversizedPayloadOmitted"], json!(true));
+
+        server_writer
+            .write_all(
+                format!(
+                    "{}\n",
+                    json!({"id": request["id"].clone(), "result": {"ok": true}})
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("write response after oversized diff notification");
+        assert_eq!(
+            pending
+                .await
+                .expect("pending task should join")
+                .expect("oversized diff must not close transport"),
+            json!({"ok": true}),
+        );
+    }
+
+    #[tokio::test]
+    async fn generic_response_above_materialization_ceiling_fails_only_its_request() {
+        let budget = crate::NativeEventBudget {
+            max_frame_bytes: 256,
+            max_recovery_frame_bytes: 16 * 1024 * 1024,
+            ..crate::NativeEventBudget::default()
+        };
+        let (client, mut server_reader, mut server_writer) = client_pair_with_budget(budget);
+        let first_client = client.clone();
+        let first = tokio::spawn(async move {
+            first_client
+                .request_value("model/list", Some(json!({})), Duration::from_secs(30))
+                .await
+        });
+        let first_request = read_server_line(&mut server_reader).await;
+        let payload = format!(
+            "{{\"id\":{},\"result\":{{\"opaque\":\"{}\"}}}}\n",
+            first_request["id"],
+            "x".repeat(CODEX_MAX_MATERIALIZED_FRAME_BYTES + 1024),
+        );
+        server_writer
+            .write_all(payload.as_bytes())
+            .await
+            .expect("write generic oversized response");
+        drop(payload);
+        let error = first
+            .await
+            .expect("first request should join")
+            .expect_err("generic oversized response must not be materialized");
+        assert!(matches!(error, CodexJsonlRpcClientError::Decode { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("no method-specific recovery contract")
+        );
+
+        let second_client = client.clone();
+        let second = tokio::spawn(async move {
+            second_client
+                .request_value("account/read", Some(json!({})), Duration::from_secs(30))
+                .await
+        });
+        let second_request = read_server_line(&mut server_reader).await;
+        server_writer
+            .write_all(
+                format!(
+                    "{}\n",
+                    json!({"id": second_request["id"].clone(), "result": {"ok": true}})
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("write aligned response");
+        assert_eq!(
+            second
+                .await
+                .expect("second request should join")
+                .expect("transport should remain aligned"),
+            json!({"ok": true}),
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_error_response_streams_code_without_materializing_details() {
+        let budget = crate::NativeEventBudget {
+            max_frame_bytes: 256,
+            max_recovery_frame_bytes: 16 * 1024 * 1024,
+            ..crate::NativeEventBudget::default()
+        };
+        let (client, mut server_reader, mut server_writer) = client_pair_with_budget(budget);
+        let pending_client = client.clone();
+        let pending = tokio::spawn(async move {
+            pending_client
+                .request_value("model/list", Some(json!({})), Duration::from_secs(30))
+                .await
+        });
+        let request = read_server_line(&mut server_reader).await;
+        let payload = format!(
+            "{{\"id\":{},\"error\":{{\"code\":-32099,\"message\":\"{}\",\"data\":{{\"opaque\":\"ignored\"}}}}}}\n",
+            request["id"],
+            "x".repeat(CODEX_MAX_MATERIALIZED_FRAME_BYTES + 1024),
+        );
+        server_writer
+            .write_all(payload.as_bytes())
+            .await
+            .expect("write oversized error response");
+        drop(payload);
+        let error = pending
+            .await
+            .expect("request should join")
+            .expect_err("native error should propagate");
+        match error {
+            CodexJsonlRpcClientError::Native(error) => {
+                assert_eq!(error.code, -32099);
+                assert_eq!(error.message, "oversized native error details omitted");
+                assert!(error.data.is_none());
+            }
+            other => panic!("expected native error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_server_request_is_rejected_without_closing_transport() {
+        let budget = crate::NativeEventBudget {
+            max_frame_bytes: 256,
+            max_recovery_frame_bytes: 16 * 1024 * 1024,
+            ..crate::NativeEventBudget::default()
+        };
+        let (client, mut server_reader, mut server_writer) = client_pair_with_budget(budget);
+        let mut diagnostics = client
+            .take_diagnostic_receiver()
+            .expect("diagnostic receiver");
+        let pending_client = client.clone();
+        let pending = tokio::spawn(async move {
+            pending_client
+                .request_value("account/read", Some(json!({})), Duration::from_secs(30))
+                .await
+        });
+        let pending_request = read_server_line(&mut server_reader).await;
+        let payload = format!(
+            "{{\"id\":77,\"method\":\"item/commandExecution/requestApproval\",\"params\":{{\"command\":\"{}\"}}}}\n",
+            "x".repeat(CODEX_MAX_MATERIALIZED_FRAME_BYTES + 1024),
+        );
+        server_writer
+            .write_all(payload.as_bytes())
+            .await
+            .expect("write oversized server request");
+        drop(payload);
+
+        let response = tokio::time::timeout(
+            Duration::from_secs(30),
+            read_server_line(&mut server_reader),
+        )
+        .await
+        .expect("oversized server request should receive a response");
+        assert_eq!(response["id"], json!(77));
+        assert_eq!(
+            response["error"]["code"],
+            json!(CODEX_SERVER_REQUEST_PAYLOAD_TOO_LARGE_CODE)
+        );
+        let diagnostic = tokio::time::timeout(Duration::from_secs(30), diagnostics.recv())
+            .await
+            .expect("payload diagnostic should arrive")
+            .expect("diagnostic channel should remain open");
+        assert_eq!(
+            diagnostic.kind,
+            CodexJsonlRpcClientDiagnosticKind::ServerRequestPayloadTooLarge
+        );
+
+        server_writer
+            .write_all(
+                format!(
+                    "{}\n",
+                    json!({"id": pending_request["id"].clone(), "result": {"ok": true}})
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("write response after rejected server request");
+        assert_eq!(
+            pending
+                .await
+                .expect("pending request should join")
+                .expect("transport should remain aligned"),
+            json!({"ok": true}),
         );
     }
 
@@ -9513,10 +12382,19 @@ while read line; do :; done
         assert_eq!(
             recover_codex_stale_rollout_path(&first, persisted_generation_path.as_path())
                 .expect("live generation path should validate"),
-            None,
+            Some(fs::canonicalize(shared_rollout.as_path()).expect("canonical shared rollout")),
         );
 
         cleanup_codex_generation_overlay(&first).expect("clean first overlay");
+        assert!(
+            persisted_generation_path.exists(),
+            "retirement must preserve fork source references"
+        );
+        for private in ["config.toml", "auth.json", "bootstrap", "sqlite"] {
+            assert!(!first.effective_home_path.join(private).exists());
+        }
+        // Simulate a generation removed by an older Pioneer version.
+        fs::remove_file(first.effective_home_path.join("sessions")).unwrap();
         assert!(!persisted_generation_path.exists());
         let (_, second) = codex_generation_app_server_process_config(
             &config,
@@ -9528,6 +12406,31 @@ while read line; do :; done
             recover_codex_stale_rollout_path(&second, persisted_generation_path.as_path())
                 .expect("stale generation path should rebase to shared storage"),
             Some(fs::canonicalize(shared_rollout.as_path()).expect("canonical shared rollout"))
+        );
+        assert_eq!(
+            fs::canonicalize(&persisted_generation_path).expect("restored selected alias"),
+            fs::canonicalize(&shared_rollout).expect("durable rollout")
+        );
+        assert_eq!(
+            fs::read_dir(&first.effective_home_path)
+                .expect("retired generation")
+                .map(|entry| entry.expect("entry").file_name())
+                .collect::<std::collections::BTreeSet<_>>(),
+            [
+                "sessions",
+                "archived_sessions",
+                CODEX_GENERATION_OVERLAY_MARKER
+            ]
+            .into_iter()
+            .map(std::ffi::OsString::from)
+            .collect(),
+            "recovery must not resurrect credentials, config, or MCP bootstrap"
+        );
+        assert_eq!(
+            recover_codex_stale_rollout_path(&second, &persisted_generation_path)
+                .expect("idempotent alias repair"),
+            recover_codex_stale_rollout_path(&second, &shared_rollout)
+                .expect("durable path needs no repair")
         );
 
         let (_, other_thread) = codex_generation_app_server_process_config(
@@ -9543,6 +12446,52 @@ while read line; do :; done
             error
                 .to_string()
                 .contains("outside the logical thread overlay")
+        );
+        fs::remove_file(first.effective_home_path.join("sessions")).unwrap();
+        assert_eq!(
+            recover_codex_fork_source_rollout_path(
+                &other_thread,
+                "thread-a",
+                &persisted_generation_path
+            )
+            .expect("an authorized child fork must repair its exact parent path"),
+            Some(fs::canonicalize(&shared_rollout).unwrap())
+        );
+        assert!(
+            recover_codex_fork_source_rollout_path(
+                &other_thread,
+                "wrong-parent",
+                &persisted_generation_path
+            )
+            .is_err()
+        );
+
+        // Never redirect an existing alias or create storage for an absent
+        // selected rollout. A missing file is not authority to choose another.
+        let absent = second.effective_home_path.join("sessions/missing.jsonl");
+        assert!(recover_codex_stale_rollout_path(&second, &absent).is_err());
+        let alias = first.effective_home_path.join("sessions");
+        fs::remove_file(&alias).expect("remove test alias");
+        let outside = root.join("outside");
+        fs::create_dir(&outside).expect("outside directory");
+        std::os::unix::fs::symlink(&outside, &alias).expect("conflicting alias");
+        assert!(recover_codex_stale_rollout_path(&second, &persisted_generation_path).is_err());
+        assert_eq!(fs::read_link(&alias).expect("preserved alias"), outside);
+        fs::remove_file(&alias).expect("remove conflicting test alias");
+        fs::remove_file(first.effective_home_path.join("archived_sessions")).unwrap();
+        fs::remove_file(
+            first
+                .effective_home_path
+                .join(CODEX_GENERATION_OVERLAY_MARKER),
+        )
+        .unwrap();
+        fs::remove_dir(&first.effective_home_path).expect("empty retired test directory");
+        std::os::unix::fs::symlink(&outside, &first.effective_home_path)
+            .expect("symlinked retired generation");
+        assert!(recover_codex_stale_rollout_path(&second, &persisted_generation_path).is_err());
+        assert_eq!(
+            fs::read_dir(&outside).expect("outside untouched").count(),
+            0
         );
 
         cleanup_codex_generation_overlay(&second).expect("clean second overlay");
@@ -9787,6 +12736,12 @@ while read line; do :; done
         )
         .expect("initial materialization");
         cleanup_codex_generation_overlay(&descriptor).expect("clean initial overlay");
+        fs::remove_file(
+            descriptor
+                .effective_home_path
+                .join(CODEX_GENERATION_OVERLAY_MARKER),
+        )
+        .expect("simulate an unowned directory");
         fs::create_dir_all(descriptor.effective_home_path.as_path())
             .expect("create stale unmarked directory");
         let error =

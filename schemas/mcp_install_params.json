@@ -14,6 +14,17 @@
       "type": "boolean",
       "default": true
     },
+    "oauth_callback_unavailable": {
+      "description": "Shell preparation failed; report it only if the server challenges.",
+      "type": "boolean",
+      "default": false
+    },
+    "oauth_redirect_uri": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "scope_kind": {
       "$ref": "#/$defs/McpScopeKind",
       "default": "workspace"

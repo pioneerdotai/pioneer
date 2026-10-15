@@ -5,9 +5,10 @@ use rmcp::transport::{
 };
 use std::collections::HashMap;
 
-pub fn build_streamable_http_transport(
+pub(crate) fn build_streamable_http_transport(
     transport: &MaterializedHttpTransport,
-) -> Result<StreamableHttpClientTransport<reqwest_0_13::Client>, McpRuntimeError> {
+    client: crate::oauth::ManagedHttpClient,
+) -> Result<StreamableHttpClientTransport<crate::oauth::ManagedHttpClient>, McpRuntimeError> {
     let mut headers = HashMap::new();
     for (name, value) in &transport.headers {
         let name = HeaderName::from_bytes(name.as_bytes()).map_err(|error| {
@@ -23,5 +24,5 @@ pub fn build_streamable_http_transport(
         .custom_headers(headers)
         .reinit_on_expired_session(true);
 
-    Ok(StreamableHttpClientTransport::from_config(config))
+    Ok(StreamableHttpClientTransport::with_client(client, config))
 }

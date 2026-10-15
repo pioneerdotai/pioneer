@@ -20,12 +20,17 @@ use tokio::sync::mpsc;
 
 const MCP_CANCELLATION_NOTIFICATION_GRACE: Duration = Duration::from_millis(250);
 
-#[derive(Debug, Default)]
-pub struct RmcpRuntimeConnector;
+#[derive(Default)]
+pub struct RmcpRuntimeConnector {
+    oauth: Option<Arc<dyn crate::McpOAuthProvider>>,
+}
 
 impl RmcpRuntimeConnector {
     pub fn new() -> Self {
-        Self
+        Self::default()
+    }
+    pub fn with_oauth(oauth: Arc<dyn crate::McpOAuthProvider>) -> Self {
+        Self { oauth: Some(oauth) }
     }
 }
 
@@ -86,6 +91,7 @@ impl McpRuntimeConnector for RmcpRuntimeConnector {
                         return Err(McpRuntimeError {
                             kind: error.kind,
                             state: error.state,
+                            oauth_failure: error.oauth_failure,
                             message,
                         });
                     }
@@ -108,7 +114,25 @@ impl McpRuntimeConnector for RmcpRuntimeConnector {
                 let secrets = transport.secrets.clone();
                 let startup_timeout = Duration::from_millis(transport.startup_timeout_ms.max(1));
                 let tool_timeout = Duration::from_millis(transport.tool_timeout_ms.max(1));
-                let transport = build_streamable_http_transport(&transport)?;
+                let authorized = match &self.oauth {
+                    Some(owner) => owner.client(&installation_id, &installation).await?,
+                    None => None,
+                };
+                let had_authorization = authorized.is_some();
+                let http = crate::oauth::ManagedHttpClient {
+                    plain: reqwest_0_13::Client::builder().build().map_err(|_| {
+                        McpRuntimeError::failed("HTTP client initialization failed")
+                    })?,
+                    authorized,
+                    owner: if installation.transport.has_authorization_header() {
+                        None
+                    } else {
+                        self.oauth.clone()
+                    },
+                    id: installation_id.clone(),
+                    installation: installation.clone(),
+                };
+                let transport = build_streamable_http_transport(&transport, http)?;
                 let (event_tx, event_rx) = mpsc::unbounded_channel();
                 let handler = RuntimeClientHandler { event_tx };
                 let mut client = tokio::time::timeout(startup_timeout, handler.serve(transport))
@@ -126,7 +150,7 @@ impl McpRuntimeConnector for RmcpRuntimeConnector {
 
                 let collected = match collect_catalog(
                     &client,
-                    installation_id,
+                    installation_id.clone(),
                     now_unix,
                     tool_timeout,
                     secrets.as_slice(),
@@ -144,6 +168,11 @@ impl McpRuntimeConnector for RmcpRuntimeConnector {
                     degraded_reason,
                 } = collected;
 
+                if let Some(owner) = &self.oauth {
+                    owner
+                        .connection_established(&installation_id, &installation, had_authorization)
+                        .await;
+                }
                 Ok(Box::new(RmcpRuntimeSession {
                     client: Some(client),
                     event_rx,
@@ -214,10 +243,18 @@ impl McpRuntimeSession for RmcpRuntimeSession {
     }
 
     async fn wait_for_event(&mut self) -> McpSessionEvent {
-        self.event_rx
-            .recv()
-            .await
-            .unwrap_or(McpSessionEvent::Closed)
+        let Some(client) = self.client.as_ref() else {
+            return McpSessionEvent::Closed;
+        };
+        loop {
+            if client.is_closed() || client.peer().is_transport_closed() {
+                return McpSessionEvent::Closed;
+            }
+            tokio::select! {
+                event = self.event_rx.recv() => return event.unwrap_or(McpSessionEvent::Closed),
+                _ = tokio::time::sleep(Duration::from_secs(1)) => {},
+            }
+        }
     }
 
     async fn refresh_catalog(&mut self) -> Result<McpCatalogSnapshot, McpRuntimeError> {
@@ -413,6 +450,17 @@ async fn collect_catalog(
         match tokio::time::timeout(tool_timeout, peer.list_all_resources()).await {
             Ok(Ok(resources)) => resources,
             Ok(Err(error)) => {
+                let classified =
+                    classify_runtime_error("MCP catalog authorization failed", &error, secrets);
+                if classified.state == crate::McpRuntimeState::AuthRequired
+                    || matches!(
+                        classified.kind,
+                        crate::McpRuntimeErrorKind::CredentialStore
+                            | crate::McpRuntimeErrorKind::TransientRefresh
+                    )
+                {
+                    return Err(classified);
+                }
                 if let Some(message) = optional_catalog_error("resources/list", &error, secrets) {
                     optional_errors.push(message);
                 }
@@ -432,6 +480,17 @@ async fn collect_catalog(
         match tokio::time::timeout(tool_timeout, peer.list_all_resource_templates()).await {
             Ok(Ok(resource_templates)) => resource_templates,
             Ok(Err(error)) => {
+                let classified =
+                    classify_runtime_error("MCP catalog authorization failed", &error, secrets);
+                if classified.state == crate::McpRuntimeState::AuthRequired
+                    || matches!(
+                        classified.kind,
+                        crate::McpRuntimeErrorKind::CredentialStore
+                            | crate::McpRuntimeErrorKind::TransientRefresh
+                    )
+                {
+                    return Err(classified);
+                }
                 if let Some(message) =
                     optional_catalog_error("resources/templates/list", &error, secrets)
                 {
@@ -453,6 +512,17 @@ async fn collect_catalog(
         match tokio::time::timeout(tool_timeout, peer.list_all_prompts()).await {
             Ok(Ok(prompts)) => prompts,
             Ok(Err(error)) => {
+                let classified =
+                    classify_runtime_error("MCP catalog authorization failed", &error, secrets);
+                if classified.state == crate::McpRuntimeState::AuthRequired
+                    || matches!(
+                        classified.kind,
+                        crate::McpRuntimeErrorKind::CredentialStore
+                            | crate::McpRuntimeErrorKind::TransientRefresh
+                    )
+                {
+                    return Err(classified);
+                }
                 if let Some(message) = optional_catalog_error("prompts/list", &error, secrets) {
                     optional_errors.push(message);
                 }
@@ -515,36 +585,71 @@ fn is_method_not_found(error: &ServiceError) -> bool {
     )
 }
 
-fn classify_runtime_error<E: std::fmt::Display + std::fmt::Debug>(
+fn classify_runtime_error<E: std::error::Error + 'static>(
     context: &str,
     error: &E,
     secrets: &[String],
 ) -> McpRuntimeError {
-    let raw = format!("{context}: {error:#?}");
-    let redacted = redact_text(raw.as_str(), secrets);
-    let lower = redacted.to_ascii_lowercase();
-    let message = compact_transport_error_message(context, redacted.as_str()).unwrap_or(redacted);
-    if lower.contains("auth required")
-        || lower.contains("authrequired")
-        || lower.contains("unauthorized")
-        || lower.contains("forbidden")
-        || lower.contains("http 401")
-        || lower.contains("http 403")
-        || lower.contains("status(401")
-        || lower.contains("status(403")
-        || lower.contains(" 401")
-        || lower.contains(" 403")
-    {
-        McpRuntimeError::auth_required(message)
-    } else {
-        McpRuntimeError::failed(message)
+    use rmcp::transport::{
+        auth::AuthError,
+        streamable_http_client::{AuthRequiredError, InsufficientScopeError},
+    };
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(error) = source {
+        if let Some(crate::oauth::ManagedHttpError::OAuth(runtime)) =
+            error.downcast_ref::<crate::oauth::ManagedHttpError>()
+        {
+            return runtime.clone();
+        }
+        if let Some(crate::oauth::ManagedHttpError::Forbidden) =
+            error.downcast_ref::<crate::oauth::ManagedHttpError>()
+        {
+            let mut error = McpRuntimeError::failed("MCP server denied access (403)");
+            error.kind = crate::McpRuntimeErrorKind::Forbidden;
+            return error;
+        }
+        if let Some(auth) = error.downcast_ref::<AuthError>() {
+            return crate::oauth_runtime_error(auth);
+        }
+        if error.is::<AuthRequiredError>() {
+            return McpRuntimeError::auth_required("OAuth sign-in required");
+        }
+        if error.is::<InsufficientScopeError>() {
+            let mut error =
+                McpRuntimeError::auth_required("OAuth consent required for additional permissions");
+            error.kind = crate::McpRuntimeErrorKind::InsufficientScope;
+            return error;
+        }
+        source = if let Some(http) = error
+            .downcast_ref::<rmcp::transport::streamable_http_client::StreamableHttpError<
+            crate::oauth::ManagedHttpError,
+        >>() {
+            match http {
+                rmcp::transport::streamable_http_client::StreamableHttpError::Client(e) => Some(e),
+                _ => error.source(),
+            }
+        } else if let Some(init) = error.downcast_ref::<rmcp::service::ClientInitializeError>() {
+            match init {
+                rmcp::service::ClientInitializeError::TransportError { error, .. } => {
+                    Some(error.error.as_ref())
+                }
+                rmcp::service::ClientInitializeError::LegacyFallbackFailed { fallback, .. } => {
+                    Some(fallback.as_ref())
+                }
+                _ => error.source(),
+            }
+        } else if let Some(ServiceError::TransportSend(transport)) =
+            error.downcast_ref::<ServiceError>()
+        {
+            Some(transport.error.as_ref())
+        } else {
+            error.source()
+        };
     }
+    McpRuntimeError::failed(redact_text(&format!("{context}: {error}"), secrets))
 }
 
-fn compact_transport_error_message(context: &str, message: &str) -> Option<String> {
-    extract_http_response_message(message).map(|http| format!("{context}: {http}"))
-}
-
+#[cfg(test)]
 fn extract_http_response_message(message: &str) -> Option<String> {
     let start = http_status_start(message)?;
     let tail = &message[start..];
@@ -557,6 +662,7 @@ fn extract_http_response_message(message: &str) -> Option<String> {
     (!http.is_empty()).then(|| http.to_owned())
 }
 
+#[cfg(test)]
 fn http_status_start(message: &str) -> Option<usize> {
     message
         .match_indices("HTTP ")
@@ -571,9 +677,27 @@ fn http_status_start(message: &str) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn oauth_failure_cause_survives_sdk_transport_error_classification() {
+        let mut expected = super::McpRuntimeError::failed("OAuth provider temporarily unavailable");
+        expected.kind = crate::McpRuntimeErrorKind::TransientRefresh;
+        expected.oauth_failure = Some(crate::OAuthFailureCause {
+            generation: "manager-A".into(),
+            revision: 7,
+        });
+        let error = rmcp::transport::streamable_http_client::StreamableHttpError::<
+            crate::oauth::ManagedHttpError,
+        >::Client(crate::oauth::ManagedHttpError::OAuth(expected.clone()));
+        assert_eq!(
+            super::classify_runtime_error("MCP call failed", &error, &[]),
+            expected
+        );
+    }
+
     use super::{extract_http_response_message, http_status_start};
 
     #[test]
+    #[cfg(test)]
     fn http_status_start_ignores_transport_prefix() {
         let message = "Streamable HTTP MCP initialize failed: HTTP 403 Forbidden";
         let start = http_status_start(message).expect("HTTP status start");

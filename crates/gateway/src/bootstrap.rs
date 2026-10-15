@@ -1,34 +1,86 @@
 use anyhow::{Context, Result};
 use pioneer_entity::workspace;
 use pioneer_sqlite::{
-    DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, is_anyhow_sqlite_lock,
-    retry_with_backoff,
+    DEFAULT_LOCK_RETRY_ATTEMPTS, DEFAULT_LOCK_RETRY_BASE_DELAY_MS, SqliteDatabase,
+    is_anyhow_sqlite_lock, retry_with_backoff,
 };
-use sea_orm::{ActiveModelTrait, DatabaseConnection, EntityTrait, Set};
+use sea_orm::{ActiveModelTrait, ConnectionTrait, EntityTrait, Set};
 use std::time::Duration;
 use tracing::info;
 
 use crate::workspace::{DEFAULT_WORKSPACE_ID, DEFAULT_WORKSPACE_NAME};
 
-pub async fn bootstrap(connection: &DatabaseConnection) -> Result<()> {
-    let created_default_workspace = ensure_default_workspace_exists(connection).await?;
-    let reconciled_prepared_turn_finalizations =
-        reconcile_prepared_turn_finalizations(connection).await?;
+const STARTUP_TURN_PROJECTION_REPLAY_LIMIT: u64 = 256;
+const STARTUP_TURN_FINALIZATION_RECONCILIATION_LIMIT: u64 = 256;
+
+pub async fn bootstrap(connection: impl Into<SqliteDatabase>) -> Result<()> {
+    let connection = connection.into().maintenance();
+    let patch_intents =
+        pioneer_tools::apply_patch::history::SqliteCommitIntentStore::new(connection.clone());
+    let patch_records =
+        pioneer_tools::apply_patch::history::SqliteAppliedPatchStore::new(connection.clone());
+    let terminalized_patch_intents = patch_intents
+        .terminalize_pending_gaps(&patch_records)
+        .await
+        .context("failed to reconcile pending patch commit intents")?;
+    if terminalized_patch_intents > 0 {
+        tracing::warn!(
+            count = terminalized_patch_intents,
+            "terminalized pending patch commit intents as explicit history gaps"
+        );
+    }
+    let repaired_patch_projections = repair_patch_history_projections(&connection).await?;
+    let patch_snapshot_reconciliation =
+        pioneer_tools::apply_patch::history::SqliteSnapshotStore::new(connection.clone())
+            .reconcile_references()
+            .await
+            .context("failed to reconcile patch snapshot references")?;
+    let snapshot_metrics =
+        pioneer_tools::apply_patch::history::SqliteSnapshotStore::new(connection.clone())
+            .metrics()
+            .await
+            .context("failed to read patch snapshot metrics")?;
+    pioneer_tools::apply_patch::patch_telemetry().record_snapshot_metrics(
+        snapshot_metrics.logical_bytes,
+        snapshot_metrics.physical_bytes,
+        snapshot_metrics.references,
+        snapshot_metrics.referenced_logical_bytes,
+        patch_snapshot_reconciliation.collected_blobs,
+        patch_snapshot_reconciliation.collected_bytes,
+    );
+    let created_default_workspace = ensure_default_workspace_exists(&connection).await?;
+    let recovery_now = chrono::Utc::now().fixed_offset().timestamp();
+    let turn_projection_replay =
+        replay_due_turn_event_projections(&connection, recovery_now).await?;
+    let turn_finalization_reconciliation =
+        reconcile_prepared_turn_finalizations(&connection, recovery_now).await?;
     let reconciled_recovery_terminalizations =
-        reconcile_recovery_terminalization_outbox(connection).await?;
+        reconcile_recovery_terminalization_outbox(&connection).await?;
     let repaired_completed_turn_rows =
-        repair_turns_completed_after_final_agent_message(connection).await?;
+        repair_turns_completed_after_final_agent_message(&connection).await?;
     let repaired_thread_foreground_status_rows =
-        repair_thread_foreground_statuses(connection).await?;
+        repair_thread_foreground_statuses(&connection).await?;
     let repaired_terminal_execution_window_rows =
-        repair_terminal_turn_execution_windows(connection).await?;
+        repair_terminal_turn_execution_windows(&connection).await?;
     let (deleted_terminal_llm_context_rows, deleted_expired_llm_context_rows) =
-        cleanup_turn_llm_context(connection).await?;
-    let deleted_closed_runtime_snapshot_rows = cleanup_turn_runtime_snapshots(connection).await?;
+        cleanup_turn_llm_context(&connection).await?;
+    let deleted_closed_runtime_snapshot_rows = cleanup_turn_runtime_snapshots(&connection).await?;
 
     info!(
         created_default_workspace,
-        reconciled_prepared_turn_finalizations,
+        repaired_patch_projections,
+        repaired_patch_snapshot_references = patch_snapshot_reconciliation.repaired_references,
+        collected_patch_snapshot_blobs = patch_snapshot_reconciliation.collected_blobs,
+        collected_patch_snapshot_bytes = patch_snapshot_reconciliation.collected_bytes,
+        replayed_turn_event_projections = turn_projection_replay.projected,
+        deferred_turn_event_projections = turn_projection_replay.deferred,
+        quarantined_turn_projection_streams = turn_projection_replay.quarantined,
+        scanned_prepared_turn_finalizations = turn_finalization_reconciliation.scanned,
+        reconciled_prepared_turn_finalizations = turn_finalization_reconciliation.committed_count(),
+        deferred_prepared_turn_finalizations =
+            turn_finalization_reconciliation.deferred_by_predecessor,
+        superseded_prepared_turn_finalizations =
+            turn_finalization_reconciliation.superseded_by_terminal_status,
         reconciled_recovery_terminalizations,
         repaired_completed_turn_rows,
         repaired_thread_foreground_status_rows,
@@ -41,8 +93,93 @@ pub async fn bootstrap(connection: &DatabaseConnection) -> Result<()> {
     Ok(())
 }
 
-async fn reconcile_recovery_terminalization_outbox(connection: &DatabaseConnection) -> Result<u64> {
-    let store = pioneer_crud::CrudStore::new(connection.clone());
+async fn repair_patch_history_projections(connection: impl Into<SqliteDatabase>) -> Result<u64> {
+    const REPLAY_PAGE_SIZE: usize = 256;
+    let connection = connection.into();
+    let records_store =
+        pioneer_tools::apply_patch::history::SqliteAppliedPatchStore::new(connection.clone());
+    let intent_store =
+        pioneer_tools::apply_patch::history::SqliteCommitIntentStore::new(connection.clone());
+    let projection_store =
+        pioneer_tools::apply_patch::history::SqliteTurnDiffStore::new(connection.clone());
+    let mut repaired = 0u64;
+    let mut turn_cursor = None::<(String, String)>;
+    loop {
+        let after = turn_cursor
+            .as_ref()
+            .map(|(thread_id, turn_id)| (thread_id.as_str(), turn_id.as_str()));
+        let turn_keys = records_store
+            .turn_keys_page(after, REPLAY_PAGE_SIZE)
+            .await
+            .context("failed to load applied patch turn keys for projection repair")?;
+        if turn_keys.is_empty() {
+            break;
+        }
+        for (thread_id, turn_id) in &turn_keys {
+            if repair_patch_history_turn(
+                &records_store,
+                &intent_store,
+                &projection_store,
+                thread_id,
+                turn_id,
+                REPLAY_PAGE_SIZE,
+            )
+            .await?
+            {
+                repaired = repaired.saturating_add(1);
+            }
+        }
+        turn_cursor = turn_keys.last().cloned();
+        if turn_keys.len() < REPLAY_PAGE_SIZE {
+            break;
+        }
+    }
+    Ok(repaired)
+}
+
+async fn repair_patch_history_turn(
+    records_store: &pioneer_tools::apply_patch::history::SqliteAppliedPatchStore,
+    intent_store: &pioneer_tools::apply_patch::history::SqliteCommitIntentStore,
+    projection_store: &pioneer_tools::apply_patch::history::SqliteTurnDiffStore,
+    thread_id: &str,
+    turn_id: &str,
+    replay_page_size: usize,
+) -> Result<bool> {
+    if projection_store
+        .get(thread_id, turn_id)
+        .await?
+        .is_some_and(|state| state.final_state)
+    {
+        return Ok(false);
+    }
+    let authority = intent_store
+        .authority_for_turn(thread_id, turn_id)
+        .await?
+        .unwrap_or(pioneer_tools::apply_patch::history::TurnDiffAuthority::NativePatchEngine);
+    let replay = pioneer_tools::apply_patch::history::replay_turn_pages(
+        records_store,
+        intent_store,
+        thread_id,
+        turn_id,
+        replay_page_size,
+    )
+    .await
+    .with_context(|| {
+        format!("failed to replay applied patch history for turn {thread_id}:{turn_id}")
+    })?;
+    let state = pioneer_tools::apply_patch::history::TurnDiffState::from_aggregate(
+        replay.aggregate,
+        authority,
+        replay.revision,
+        false,
+    );
+    projection_store.repair_live(&state).await
+}
+
+async fn reconcile_recovery_terminalization_outbox(
+    connection: impl Into<SqliteDatabase>,
+) -> Result<u64> {
+    let store = pioneer_crud::CrudStore::new(connection);
     store
         .enqueue_missing_recovery_terminalizations(
             4096,
@@ -52,24 +189,41 @@ async fn reconcile_recovery_terminalization_outbox(connection: &DatabaseConnecti
         .context("failed to reconcile terminal recovery jobs during bootstrap")
 }
 
-async fn reconcile_prepared_turn_finalizations(connection: &DatabaseConnection) -> Result<u64> {
-    let store = pioneer_crud::CrudStore::new(connection.clone());
+async fn reconcile_prepared_turn_finalizations(
+    connection: impl Into<SqliteDatabase>,
+    now_unix: i64,
+) -> Result<pioneer_crud::TurnFinalizationReconciliationSummary> {
+    let store = pioneer_crud::CrudStore::new(connection);
     store
-        .reconcile_prepared_turn_finalizations(4096, chrono::Utc::now().fixed_offset().timestamp())
+        .reconcile_prepared_turn_finalizations(
+            STARTUP_TURN_FINALIZATION_RECONCILIATION_LIMIT,
+            now_unix,
+        )
         .await
         .context("failed to reconcile prepared native Turn finalizations during bootstrap")
 }
 
-async fn repair_thread_foreground_statuses(connection: &DatabaseConnection) -> Result<u64> {
-    let store = pioneer_crud::CrudStore::new(connection.clone());
+async fn replay_due_turn_event_projections(
+    connection: impl Into<SqliteDatabase>,
+    now_unix: i64,
+) -> Result<pioneer_crud::TurnProjectionReplaySummary> {
+    let store = pioneer_crud::CrudStore::new(connection);
+    store
+        .replay_due_turn_event_projections(now_unix, STARTUP_TURN_PROJECTION_REPLAY_LIMIT)
+        .await
+        .context("failed to replay pending Turn event projections during bootstrap")
+}
+
+async fn repair_thread_foreground_statuses(connection: impl Into<SqliteDatabase>) -> Result<u64> {
+    let store = pioneer_crud::CrudStore::new(connection);
     store
         .reconcile_thread_foreground_statuses(chrono::Utc::now().fixed_offset().timestamp())
         .await
         .context("failed to reconcile thread foreground statuses during bootstrap")
 }
 
-async fn cleanup_turn_llm_context(connection: &DatabaseConnection) -> Result<(u64, u64)> {
-    let store = pioneer_crud::CrudStore::new(connection.clone());
+async fn cleanup_turn_llm_context(connection: impl Into<SqliteDatabase>) -> Result<(u64, u64)> {
+    let store = pioneer_crud::CrudStore::new(connection).with_maintenance_access();
     let terminal = store
         .delete_turn_llm_context_for_terminal_turns()
         .await
@@ -81,9 +235,9 @@ async fn cleanup_turn_llm_context(connection: &DatabaseConnection) -> Result<(u6
 }
 
 async fn repair_turns_completed_after_final_agent_message(
-    connection: &DatabaseConnection,
+    connection: impl Into<SqliteDatabase>,
 ) -> Result<u64> {
-    let store = pioneer_crud::CrudStore::new(connection.clone());
+    let store = pioneer_crud::CrudStore::new(connection);
     store
         .complete_in_progress_turns_after_final_agent_message(
             chrono::Utc::now().fixed_offset().timestamp(),
@@ -92,23 +246,25 @@ async fn repair_turns_completed_after_final_agent_message(
         .context("failed to repair completed turns missing terminal event during bootstrap")
 }
 
-async fn repair_terminal_turn_execution_windows(connection: &DatabaseConnection) -> Result<u64> {
-    let store = pioneer_crud::CrudStore::new(connection.clone());
+async fn repair_terminal_turn_execution_windows(
+    connection: impl Into<SqliteDatabase>,
+) -> Result<u64> {
+    let store = pioneer_crud::CrudStore::new(connection);
     store
         .close_active_execution_windows_for_terminal_turns(chrono::Utc::now().fixed_offset())
         .await
         .context("failed to repair active execution windows for terminal turns during bootstrap")
 }
 
-async fn cleanup_turn_runtime_snapshots(connection: &DatabaseConnection) -> Result<u64> {
-    let store = pioneer_crud::CrudStore::new(connection.clone());
+async fn cleanup_turn_runtime_snapshots(connection: impl Into<SqliteDatabase>) -> Result<u64> {
+    let store = pioneer_crud::CrudStore::new(connection);
     store
         .delete_turn_runtime_snapshots_for_closed_turns()
         .await
         .context("failed to cleanup closed turn_runtime_snapshot rows during bootstrap")
 }
 
-async fn ensure_default_workspace_exists(connection: &DatabaseConnection) -> Result<bool> {
+async fn ensure_default_workspace_exists(connection: &impl ConnectionTrait) -> Result<bool> {
     retry_with_backoff(
         || async {
             let inserted = workspace::ActiveModel {
@@ -148,7 +304,7 @@ async fn ensure_default_workspace_exists(connection: &DatabaseConnection) -> Res
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_WORKSPACE_ID, DEFAULT_WORKSPACE_NAME, cleanup_turn_llm_context,
+        DEFAULT_WORKSPACE_ID, DEFAULT_WORKSPACE_NAME, bootstrap, cleanup_turn_llm_context,
         cleanup_turn_runtime_snapshots, ensure_default_workspace_exists,
         repair_terminal_turn_execution_windows, repair_turns_completed_after_final_agent_message,
     };
@@ -158,9 +314,14 @@ mod tests {
     };
     use pioneer_entity::{thread, turn, workspace};
     use pioneer_protocol::{
-        ExecutionWindowStatus, ItemCompletedNotification, TurnItem, TurnStatus,
+        AgentMessagePhase, ExecutionWindowStatus, ItemCompletedNotification, PersistedActorRef,
+        SandboxMode, Thread, ThreadMode, ThreadOriginKind, ThreadSidebarVisibility, ThreadStatus,
+        Turn, TurnItem, TurnOrigin, TurnStatus,
     };
-    use sea_orm::{ActiveModelTrait, Database, EntityTrait, Set};
+    use sea_orm::sea_query::Expr;
+    use sea_orm::{
+        ActiveModelTrait, ColumnTrait, Database, EntityTrait, QueryFilter, QueryOrder, Set,
+    };
 
     const DEFAULT_WORKSPACE_ID_LEN: usize = 21;
 
@@ -206,6 +367,134 @@ mod tests {
             .await
             .expect("must read workspaces");
         assert_eq!(workspaces.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn bootstrap_replays_a_predecessor_before_reconciling_its_finalization() {
+        let connection = setup_workspace_database().await;
+        ensure_default_workspace_exists(&connection)
+            .await
+            .expect("default workspace should exist");
+        let timestamp = 1_700_000_000;
+        let thread_id = "thr_boot_recovery";
+        let turn_id = "turn_boot_recovery";
+        let final_item_id = "final_boot_recovery";
+        let store = CrudStore::new(connection.clone());
+        store
+            .materialize_turn_start(
+                &Thread {
+                    workspace_id: DEFAULT_WORKSPACE_ID.to_owned(),
+                    id: thread_id.to_owned(),
+                    name: Some("Bootstrap recovery".to_owned()),
+                    preview: "recover".to_owned(),
+                    preview_author: None,
+                    mode: ThreadMode::Agent,
+                    model: "test-model".to_owned(),
+                    model_provider: "test-provider".to_owned(),
+                    reasoning_effort: None,
+                    created_at: timestamp,
+                    updated_at: timestamp,
+                    status: ThreadStatus::Active,
+                    origin_kind: ThreadOriginKind::User,
+                    sidebar_visibility: ThreadSidebarVisibility::Visible,
+                    agent_nickname: None,
+                    agent_role: None,
+                    visibility: None,
+                    turns: Vec::new(),
+                },
+                SandboxMode::FullAccess,
+                &Turn {
+                    id: turn_id.to_owned(),
+                    status: TurnStatus::InProgress,
+                    turn_kind: Default::default(),
+                    origin: TurnOrigin::User,
+                    mode: Default::default(),
+                    author: None,
+                    reply_to_turn_id: None,
+                    mentions: Vec::new(),
+                    message_revision: 0,
+                    message_deleted: false,
+                    error: None,
+                    prompt_manifest: None,
+                    permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(
+                    ),
+                },
+                &[],
+                PersistedActorRef::System,
+            )
+            .await
+            .expect("turn start should persist");
+        store
+            .prepare_turn_finalization(
+                &ItemCompletedNotification {
+                    workspace_id: DEFAULT_WORKSPACE_ID.to_owned(),
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    item: TurnItem::AgentMessage {
+                        id: final_item_id.to_owned(),
+                        text: "durable final answer".to_owned(),
+                        phase: AgentMessagePhase::FinalAnswer,
+                        markdown: None,
+                        markdown_version: None,
+                    },
+                },
+                1,
+                None,
+                timestamp + 1,
+            )
+            .await
+            .expect("finalization intent should prepare");
+
+        let first_event = pioneer_entity::turn_event::Entity::find()
+            .filter(pioneer_entity::turn_event::Column::TurnId.eq(turn_id.to_owned()))
+            .order_by_asc(pioneer_entity::turn_event::Column::Sequence)
+            .one(&connection)
+            .await
+            .expect("turn event lookup should succeed")
+            .expect("turn start event should exist");
+        pioneer_entity::turn_event_projection_state::Entity::update_many()
+            .col_expr(
+                pioneer_entity::turn_event_projection_state::Column::Status,
+                Expr::value("failed"),
+            )
+            .col_expr(
+                pioneer_entity::turn_event_projection_state::Column::NextRunAt,
+                Expr::value(
+                    chrono::DateTime::from_timestamp(timestamp + 2, 0)
+                        .unwrap()
+                        .fixed_offset(),
+                ),
+            )
+            .col_expr(
+                pioneer_entity::turn_event_projection_state::Column::ClaimToken,
+                Expr::value(Option::<String>::None),
+            )
+            .col_expr(
+                pioneer_entity::turn_event_projection_state::Column::ClaimExpiresAt,
+                Expr::value(Option::<sea_orm::entity::prelude::DateTimeWithTimeZone>::None),
+            )
+            .filter(pioneer_entity::turn_event_projection_state::Column::EventId.eq(first_event.id))
+            .exec(&connection)
+            .await
+            .expect("turn start projection should become replayable");
+
+        bootstrap(&connection)
+            .await
+            .expect("causal recovery backlog must not create a bootstrap restart loop");
+
+        let (_, recovered_turn) = store
+            .get_turn(thread_id, turn_id)
+            .await
+            .expect("recovered Turn should load")
+            .expect("recovered Turn should exist");
+        assert_eq!(recovered_turn.status, TurnStatus::Completed);
+        assert!(
+            store
+                .get_turn_item(turn_id, final_item_id)
+                .await
+                .expect("final item should load")
+                .is_some()
+        );
     }
 
     #[tokio::test]

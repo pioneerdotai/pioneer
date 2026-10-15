@@ -59,6 +59,104 @@ pub struct ExecutionDraftReconciliation {
     pub reasons: Vec<ExecutionDraftReconciliationReason>,
 }
 
+pub(crate) fn reconcile_composer_policy(
+    domain: &mut super::state_machine::ComposerDomainState,
+    fingerprint: &mut Option<String>,
+    policy: &AuthorizationExecutionDraftPolicyProjection,
+) -> ExecutionDraftReconciliation {
+    use super::{capabilities::ComposerCapabilityKind, skill_selection::ComposerSkillSelection};
+    let mut skill_ids = Vec::new();
+    let mut mcp_server_ids = Vec::new();
+    for capability in &domain.capabilities {
+        match &capability.kind {
+            ComposerCapabilityKind::Skill { skill_id, .. } => {
+                skill_ids.push(skill_id.as_str().to_owned());
+            }
+            ComposerCapabilityKind::McpServer { name, .. } => {
+                mcp_server_ids.push(name.clone());
+            }
+            ComposerCapabilityKind::McpTool { server_name, .. } => {
+                mcp_server_ids.push(server_name.clone());
+            }
+        }
+    }
+    for selection in &domain.skill_selections {
+        match selection {
+            ComposerSkillSelection::Skill { skill_id, .. } => {
+                skill_ids.push(skill_id.as_str().to_owned());
+            }
+            ComposerSkillSelection::SkillPack { pack_id } => {
+                skill_ids.push(pack_id.as_str().to_owned());
+            }
+        }
+    }
+    skill_ids.sort();
+    skill_ids.dedup();
+    mcp_server_ids.sort();
+    mcp_server_ids.dedup();
+
+    let reconciliation = reconcile_execution_draft(
+        &ExecutionDraftSelection {
+            policy_fingerprint: fingerprint.clone(),
+            provider: domain.selected_provider.clone(),
+            model: domain.selected_model.clone(),
+            permission_mode: Some(domain.selected_permission_mode),
+            skill_ids,
+            mcp_server_ids,
+            has_attachments: !domain.attachments.is_empty(),
+        },
+        policy,
+    );
+    let allowed_skills = reconciliation
+        .draft
+        .skill_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<std::collections::HashSet<_>>();
+    let allowed_mcp = reconciliation
+        .draft
+        .mcp_server_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<std::collections::HashSet<_>>();
+    domain
+        .capabilities
+        .retain(|capability| match &capability.kind {
+            ComposerCapabilityKind::Skill { skill_id, .. } => {
+                allowed_skills.contains(skill_id.as_str())
+            }
+            ComposerCapabilityKind::McpServer { name, .. } => allowed_mcp.contains(name.as_str()),
+            ComposerCapabilityKind::McpTool { server_name, .. } => {
+                allowed_mcp.contains(server_name.as_str())
+            }
+        });
+    domain.skill_selections.retain(|selection| match selection {
+        ComposerSkillSelection::Skill { skill_id, .. } => {
+            allowed_skills.contains(skill_id.as_str())
+        }
+        ComposerSkillSelection::SkillPack { pack_id } => allowed_skills.contains(pack_id.as_str()),
+    });
+    if !reconciliation.draft.has_attachments {
+        domain.attachments.clear();
+    }
+    domain.selected_provider = reconciliation.draft.provider.clone();
+    domain.selected_model = reconciliation.draft.model.clone();
+    if domain.selected_provider.is_none() || domain.selected_model.is_none() {
+        domain.selected_reasoning_effort = None;
+    }
+    *fingerprint = reconciliation.draft.policy_fingerprint.clone();
+    if let Some(mode) = reconciliation.draft.permission_mode {
+        domain.selected_permission_mode = mode;
+    }
+    if domain.selected_provider.is_none() {
+        domain.capability_target = super::capabilities::ComposerCapabilityTarget::native();
+    }
+    if domain.selected_provider.is_none() || domain.selected_model.is_none() {
+        domain.model_manually_selected = false;
+    }
+    reconciliation
+}
+
 pub fn reconcile_execution_draft(
     draft: &ExecutionDraftSelection,
     policy: &AuthorizationExecutionDraftPolicyProjection,

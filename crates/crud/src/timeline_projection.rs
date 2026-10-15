@@ -493,6 +493,14 @@ fn classify_system_event(
     details: Option<&JsonValue>,
     status: &'static str,
 ) -> TurnItemProjectionClassification {
+    let status = match pioneer_protocol::context_compaction_status(code, details) {
+        Some(pioneer_protocol::TurnWorkItemStatus::Running) => WORK_ITEM_STATUS_RUNNING,
+        Some(pioneer_protocol::TurnWorkItemStatus::Completed) => WORK_ITEM_STATUS_COMPLETED,
+        Some(pioneer_protocol::TurnWorkItemStatus::Failed) => WORK_ITEM_STATUS_FAILED,
+        Some(pioneer_protocol::TurnWorkItemStatus::Cancelled) => WORK_ITEM_STATUS_CANCELLED,
+        Some(pioneer_protocol::TurnWorkItemStatus::Blocked) => "blocked",
+        None => status,
+    };
     if matches!(level, SystemEventLevel::Error) {
         return visible_work(
             item_id,
@@ -533,7 +541,7 @@ fn classify_system_event(
             status,
             "internal plan update",
         ),
-        Some("agent_runtime_event") => {
+        Some("agent_runtime_event" | "provider_usage") => {
             classify_runtime_event(item_id, item_type, message, details, status)
         }
         Some("agent_runtime_item") => hidden_work(
@@ -618,7 +626,7 @@ fn classify_runtime_event(
         .or_else(|| message.strip_prefix("Runtime event: "));
 
     match native_method {
-        Some("thread/tokenUsage/updated") => hidden_work(
+        Some("thread/tokenUsage/updated" | "provider/usage/observed") => hidden_work(
             item_id,
             item_type,
             WorkItemClassification::InternalTokenUsage,
@@ -787,6 +795,7 @@ mod tests {
             updated_at: now,
             turn_kind: turn_kind.to_owned(),
             origin: "detached_task".to_owned(),
+            work_owner: "turn".to_owned(),
             reasoning_effort: None,
             permission_profile_mode: None,
             permission_profile_source: None,
@@ -913,6 +922,24 @@ mod tests {
         assert_eq!(
             classify_turn_item_row_for_turn(&detached, &turn_row("conversation")).placement,
             ProjectionPlacement::TurnWork
+        );
+    }
+
+    #[test]
+    fn provider_usage_is_hidden_without_becoming_context_or_work() {
+        let item = info_system(
+            Some("provider_usage"),
+            "Provider usage observation",
+            Some(
+                json!({"nativeMethod":"provider/usage/observed","schema_version":1,
+                "usage":{"input_tokens":100,"cache_read_input_tokens":80}}),
+            ),
+        );
+        let classified = classify_turn_item_with_db_status(&item, Some("completed"));
+        assert_eq!(classified.visibility, ProjectionVisibility::Hidden);
+        assert_eq!(
+            classified.classification,
+            WorkItemClassification::InternalTokenUsage
         );
     }
 

@@ -148,12 +148,11 @@ impl ComposerCapabilityTarget {
     /// Structural capability target used at the CLI turn-submission boundary.
     ///
     /// Runtime summaries are suitable for presenting the composer picker, but
-    /// they are not authoritative at submission time: the phase-zero catalog
-    /// intentionally reports MCP as unavailable until a live readiness probe
-    /// has run. The Gateway performs that live, fail-closed validation while
-    /// preparing the turn, so clients must preserve an explicit selection on
-    /// the wire instead of silently reducing it from a stale catalog summary.
-    /// CLI-only source restrictions still apply to skills.
+    /// they are not authoritative at submission time. The Gateway owns and
+    /// validates its current readiness snapshot while preparing the turn, so
+    /// clients must preserve an explicit selection on the wire instead of
+    /// silently reducing it from a stale local snapshot. CLI-only source
+    /// restrictions still apply to skills.
     pub const fn cli_submission() -> Self {
         Self::cli(ComposerCapabilityPolicy::cli(true, true))
     }
@@ -246,10 +245,7 @@ pub fn composer_capability_target_for_provider(
     let Some(runtime) = runtimes.iter().find(|runtime| {
         runtime.runtime_id == runtime_id
             && runtime.enabled
-            && matches!(
-                runtime.status,
-                RuntimeStatus::Ready | RuntimeStatus::Degraded { .. }
-            )
+            && matches!(runtime.status, RuntimeStatus::Ready)
     }) else {
         return ComposerCapabilityTarget::cli(ComposerCapabilityPolicy::unsupported_cli());
     };
@@ -259,10 +255,10 @@ pub fn composer_capability_target_for_provider(
 
 /// Structural capability target used when a turn is submitted.
 ///
-/// Live runtime summaries are presentation evidence only. Submission keeps an
-/// explicit selection intact and lets Gateway perform the authoritative live
-/// readiness and projection validation. The only client-side reduction here
-/// is the stable source rule for skills exported to CLI runtimes.
+/// Gateway runtime summaries are presentation evidence only. Submission keeps
+/// an explicit selection intact and lets Gateway perform the authoritative
+/// cached-readiness and projection validation. The only client-side reduction
+/// here is the stable source rule for skills exported to CLI runtimes.
 pub fn composer_submission_target_for_provider(provider: Option<&str>) -> ComposerCapabilityTarget {
     if provider
         .map(str::trim)
@@ -1880,6 +1876,8 @@ mod tests {
                 prompts: Vec::new(),
             },
             management: Some(McpManagementDetails {
+                oauth_cleanup_available: None,
+                oauth_state: None,
                 scope: McpScopeKind::Workspace,
                 source_kind: McpSourceKind::Config,
                 transport: McpTransportSummary::Stdio {
@@ -2378,6 +2376,35 @@ mod tests {
     }
 
     #[test]
+    fn combined_mcp_picker_projection_obeys_query_and_whole_server_selection() {
+        let server = selectable_mcp_server_from_item(&mcp_server("browser"));
+        let rows = filter_mcp_tool_capability_rows(
+            &mcp_details("browser", vec![mcp_tool("open", "Open page")]),
+            "",
+        );
+        let servers = vec![server.clone()];
+        let (visible, tools, searching) =
+            project_mcp_picker_rows(&servers, &rows, &[], Some(&server.server_id), "  ");
+        assert_eq!(visible, servers);
+        assert_eq!(tools, rows);
+        assert!(!searching);
+        let (_, tools, searching) = project_mcp_picker_rows(
+            &servers,
+            &rows,
+            &[server.key.clone()],
+            Some(&server.server_id),
+            "",
+        );
+        assert!(tools.is_empty());
+        assert!(!searching);
+        let (_, tools, searching) = project_mcp_picker_rows(&servers, &rows, &[], None, "page");
+        assert_eq!(tools, rows);
+        assert!(searching);
+        let (_, tools, _) = project_mcp_picker_rows(&servers, &rows, &[server.key], None, "page");
+        assert!(tools.is_empty());
+    }
+
+    #[test]
     fn mcp_search_can_match_tools_from_unopened_servers() {
         let browser = mcp_details("browser", vec![mcp_tool("open", "Open page")]);
         let resend = mcp_details("resend", vec![mcp_tool("add_contact", "Add contact")]);
@@ -2588,4 +2615,31 @@ mod tests {
             Vec::new(),
         ));
     }
+}
+
+/// Shared picker presentation for native shells. Search/open state is supplied by
+/// the view; selection and capability filtering use the same Client rules.
+pub fn project_mcp_picker_rows(
+    server_rows: &[SelectableMcpCapability],
+    tool_rows: &[SelectableMcpCapability],
+    selected_keys: &[String],
+    active_server_id: Option<&str>,
+    query: &str,
+) -> (
+    Vec<SelectableMcpCapability>,
+    Vec<SelectableMcpCapability>,
+    bool,
+) {
+    let selected = selected_keys.iter().cloned().collect::<HashSet<_>>();
+    let selected_server_ids = selected_mcp_server_ids(server_rows, &selected);
+    let has_query = !query.trim().is_empty();
+    let servers = filter_selectable_mcp_capability_rows(server_rows, query);
+    let tools = if has_query {
+        filter_search_mcp_tool_capability_rows(tool_rows, &selected_server_ids, query)
+    } else if active_server_id.is_some_and(|id| selected_server_ids.contains(id)) {
+        Vec::new()
+    } else {
+        filter_active_mcp_tool_capability_rows(tool_rows, active_server_id, query)
+    };
+    (servers, tools, has_query)
 }

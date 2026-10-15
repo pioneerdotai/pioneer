@@ -3,6 +3,27 @@
   "title": "AgentDurableEvent",
   "oneOf": [
     {
+      "description": "A unique output chunk on the acknowledged lane, retained across interruption.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string",
+          "const": "tool_output_recorded"
+        },
+        "notification": {
+          "$ref": "#/$defs/ItemDeltaNotification"
+        }
+      },
+      "required": [
+        "kind",
+        "id",
+        "notification"
+      ]
+    },
+    {
       "type": "object",
       "properties": {
         "kind": {
@@ -495,6 +516,44 @@
       ]
     },
     {
+      "description": "Frozen cancellation description, registered before provider/tool work.\nRecovery may only confirm an existing description, never replace missing\nhistory with current configuration. This does not activate outbox work.",
+      "type": "object",
+      "properties": {
+        "initial_turn": {
+          "type": "boolean"
+        },
+        "kind": {
+          "type": "string",
+          "const": "native_cancellation_context_prepared"
+        },
+        "preparation": {
+          "$ref": "#/$defs/NativeTerminalEffectPreparation"
+        }
+      },
+      "required": [
+        "kind",
+        "preparation",
+        "initial_turn"
+      ]
+    },
+    {
+      "description": "Bounded obligations prepared before a canonical terminal result; the\nsubsequent terminal projection atomically makes the current batch runnable.",
+      "type": "object",
+      "properties": {
+        "kind": {
+          "type": "string",
+          "const": "native_terminal_effects_prepared"
+        },
+        "preparation": {
+          "$ref": "#/$defs/NativeTerminalEffectPreparation"
+        }
+      },
+      "required": [
+        "kind",
+        "preparation"
+      ]
+    },
+    {
       "type": "object",
       "properties": {
         "kind": {
@@ -796,6 +855,13 @@
               "type": "null"
             }
           ]
+        },
+        "selectedCapabilities": {
+          "description": "Exact normalized capabilities for a durable Task launch. Legacy launches\nuse skill_ids and mcp_server_ids when this field is empty.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TurnCapability"
+          }
         },
         "skillIds": {
           "type": "array",
@@ -1340,6 +1406,13 @@
         "provider_budget": {
           "$ref": "#/$defs/ExecutionCheckpointProviderBudgetSummary"
         },
+        "requested_tool_names": {
+          "description": "Explicit request_tools selections for this turn, not authorization grants.\nResume must revalidate these names against the current tool registry and policy.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
         "schema_version": {
           "type": "integer",
           "format": "uint32",
@@ -1792,6 +1865,74 @@
         "item"
       ]
     },
+    "ItemDeltaNotification": {
+      "type": "object",
+      "properties": {
+        "delta": {
+          "type": "string"
+        },
+        "item_id": {
+          "type": "string"
+        },
+        "markdown": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MarkdownDocument"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "markdown_version": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "payload": true,
+        "stream": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ItemDeltaStream"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "thread_id": {
+          "type": "string"
+        },
+        "turn_id": {
+          "type": "string"
+        },
+        "workspace_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "workspace_id",
+        "thread_id",
+        "turn_id",
+        "item_id",
+        "delta"
+      ]
+    },
+    "ItemDeltaStream": {
+      "type": "string",
+      "enum": [
+        "agent_message",
+        "stdout",
+        "stderr",
+        "tool_progress",
+        "file_change",
+        "generic"
+      ]
+    },
     "ItemStartedNotification": {
       "type": "object",
       "properties": {
@@ -2178,6 +2319,47 @@
           ]
         },
         {
+          "description": "Structured cells and the original GFM fragment with its used reference\ndefinitions, without Quote/List prefixes.",
+          "type": "object",
+          "properties": {
+            "alignments": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/MarkdownTableAlignment"
+              }
+            },
+            "headers": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/MarkdownInline"
+              }
+            },
+            "rows": {
+              "type": "array",
+              "items": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/$defs/MarkdownInline"
+                }
+              }
+            },
+            "source": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "const": "table"
+            }
+          },
+          "required": [
+            "type",
+            "headers",
+            "rows",
+            "alignments",
+            "source"
+          ]
+        },
+        {
           "type": "object",
           "properties": {
             "type": {
@@ -2354,6 +2536,15 @@
         }
       ]
     },
+    "MarkdownTableAlignment": {
+      "type": "string",
+      "enum": [
+        "none",
+        "left",
+        "center",
+        "right"
+      ]
+    },
     "McpScopeKind": {
       "type": "string",
       "enum": [
@@ -2400,6 +2591,157 @@
         "catalog_version",
         "fingerprint",
         "selection_reason"
+      ]
+    },
+    "NativeTerminalEffectGate": {
+      "type": "string",
+      "enum": [
+        "terminal_commit",
+        "accepted_task_result"
+      ]
+    },
+    "NativeTerminalEffectKind": {
+      "type": "string",
+      "enum": [
+        "post_turn_hook",
+        "attached_task_cleanup"
+      ]
+    },
+    "NativeTerminalEffectPayload": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "post_turn_hook"
+            },
+            "request": true,
+            "runtime_snapshot": {
+              "description": "Versioned immutable subscriptions and handler descriptors captured\nby the Turn. The outbox schema is new, so there is no valid legacy\nrow whose execution may fall back to mutable process configuration."
+            }
+          },
+          "required": [
+            "kind",
+            "request",
+            "runtime_snapshot"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "failure": {
+              "$ref": "#/$defs/NativeTerminalEffectPreparationFailure"
+            },
+            "kind": {
+              "type": "string",
+              "const": "post_turn_hook_preparation_failed"
+            }
+          },
+          "required": [
+            "kind",
+            "failure"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "attached_task_cleanup"
+            },
+            "reason": {
+              "type": "string"
+            },
+            "runtime_contract": {
+              "description": "Immutable semantic contract of the cleanup adapter captured by the\noriginating Turn. A worker may rebind the durable obligation to a\ncurrent provider after restart only when this value matches.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "reason",
+            "runtime_contract"
+          ]
+        }
+      ]
+    },
+    "NativeTerminalEffectPreparation": {
+      "type": "object",
+      "properties": {
+        "batchId": {
+          "type": "string"
+        },
+        "effects": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/NativeTerminalEffectSpec"
+          }
+        },
+        "runtimeGeneration": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "threadId": {
+          "type": "string"
+        },
+        "turnId": {
+          "type": "string"
+        },
+        "workspaceId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "batchId",
+        "workspaceId",
+        "threadId",
+        "turnId",
+        "runtimeGeneration"
+      ]
+    },
+    "NativeTerminalEffectPreparationFailure": {
+      "type": "string",
+      "enum": [
+        "invalid_hook_request",
+        "hook_runtime_unavailable",
+        "subscription_snapshot_unavailable",
+        "handler_snapshot_unavailable",
+        "snapshot_serialization_failed",
+        "payload_serialization_failed",
+        "payload_too_large"
+      ]
+    },
+    "NativeTerminalEffectSpec": {
+      "type": "object",
+      "properties": {
+        "effectId": {
+          "type": "string"
+        },
+        "effectKind": {
+          "$ref": "#/$defs/NativeTerminalEffectKind"
+        },
+        "gate": {
+          "$ref": "#/$defs/NativeTerminalEffectGate"
+        },
+        "maxAttempts": {
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "payload": {
+          "$ref": "#/$defs/NativeTerminalEffectPayload"
+        }
+      },
+      "required": [
+        "effectId",
+        "effectKind",
+        "gate",
+        "payload",
+        "maxAttempts"
       ]
     },
     "PermissionBehavior": {
@@ -2625,6 +2967,39 @@
         "cli_runtime"
       ]
     },
+    "ProviderErrorReason": {
+      "description": "Allowlisted OpenRouter Chat Completions metadata.error_type values.\nDiagnostic only: these values must not drive recovery policy.",
+      "type": "string",
+      "enum": [
+        "context_length_exceeded",
+        "max_tokens_exceeded",
+        "token_limit_exceeded",
+        "string_too_long",
+        "authentication",
+        "permission_denied",
+        "payment_required",
+        "rate_limit_exceeded",
+        "provider_overloaded",
+        "provider_unavailable",
+        "invalid_request",
+        "invalid_prompt",
+        "not_found",
+        "precondition_failed",
+        "payload_too_large",
+        "unprocessable",
+        "content_policy_violation",
+        "refusal",
+        "invalid_image",
+        "image_too_large",
+        "image_too_small",
+        "unsupported_image_format",
+        "image_not_found",
+        "image_download_failed",
+        "server",
+        "timeout",
+        "unmapped"
+      ]
+    },
     "ProviderFailureClass": {
       "type": "string",
       "enum": [
@@ -2658,6 +3033,16 @@
         "class": {
           "$ref": "#/$defs/ProviderFailureClass"
         },
+        "error_reason": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProviderErrorReason"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "http_status": {
           "type": [
             "integer",
@@ -2686,6 +3071,16 @@
           "type": [
             "string",
             "null"
+          ]
+        },
+        "request_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProviderRequestId"
+            },
+            {
+              "type": "null"
+            }
           ]
         },
         "retry_after_ms": {
@@ -2720,6 +3115,11 @@
         "mid_stream",
         "finalize"
       ]
+    },
+    "ProviderRequestId": {
+      "type": "string",
+      "maxLength": 128,
+      "pattern": "^(gen-|req-|cmpl-|chatcmpl-)[A-Za-z0-9_-]+$"
     },
     "ProviderTransportKind": {
       "type": "string",
@@ -2765,6 +3165,32 @@
         "job_id",
         "attempt_id"
       ]
+    },
+    "RecoveryDiagnostic": {
+      "type": "object",
+      "properties": {
+        "lastFailure": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RecoveryProviderFailure"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "stopReason": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RecoveryStopReason"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
     },
     "RecoveryOutputPolicy": {
       "oneOf": [
@@ -2824,6 +3250,73 @@
             "mode"
           ]
         }
+      ]
+    },
+    "RecoveryProviderFailure": {
+      "type": "object",
+      "properties": {
+        "class": {
+          "$ref": "#/$defs/ProviderFailureClass"
+        },
+        "errorReason": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProviderErrorReason"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "httpStatus": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "requestId": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProviderRequestId"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "retryAfterMs": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "stage": {
+          "$ref": "#/$defs/ProviderFailureStage"
+        },
+        "transport": {
+          "$ref": "#/$defs/ProviderTransportKind"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "class",
+        "stage",
+        "transport"
+      ]
+    },
+    "RecoveryStopReason": {
+      "type": "string",
+      "enum": [
+        "attempts_exhausted",
+        "wall_clock_exhausted",
+        "no_progress",
+        "policy_rejected",
+        "terminal_failure"
       ]
     },
     "SandboxMode": {
@@ -3481,6 +3974,17 @@
           "items": {
             "$ref": "#/$defs/TurnFilesystemSandboxEntry"
           }
+        },
+        "maxFilesystemKind": {
+          "description": "Distinguishes a restricted cap with zero roots from an unrestricted\ncap, whose bounded-root list is also empty. Legacy records omit this\nfield and are interpreted conservatively by the Gateway.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TurnFilesystemSandboxKind"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "maxNetworkPolicy": {
           "$ref": "#/$defs/TurnNetworkPolicySnapshot"
@@ -4186,6 +4690,16 @@
         },
         "message": {
           "type": "string"
+        },
+        "recoveryDiagnostic": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RecoveryDiagnostic"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       },
       "required": [
@@ -8061,17 +8575,28 @@
     "ToolPermissionPolicySnapshot": {
       "type": "object",
       "properties": {
+        "agent_action": {
+          "$ref": "#/$defs/PermissionBehavior"
+        },
         "allowed_paths": {
           "type": "array",
           "items": {
             "type": "string"
           }
         },
+        "allowed_paths_restricted": {
+          "description": "See `allowed_tools_restricted`.  A restricted empty path set is a\ndurable deny-all result, while an unrestricted empty set is the legacy\nwildcard.",
+          "type": "boolean"
+        },
         "allowed_tools": {
           "type": "array",
           "items": {
             "type": "string"
           }
+        },
+        "allowed_tools_restricted": {
+          "description": "`allowed_tools = []` historically means \"no allow-list\".  This bit\npreserves the distinct result of intersecting two disjoint allow-lists:\na restricted empty set must deny every tool rather than reopen all of\nthem.",
+          "type": "boolean"
         },
         "computer_use": {
           "$ref": "#/$defs/PermissionBehavior"
@@ -8100,6 +8625,9 @@
         "mcp_write_or_unknown": {
           "$ref": "#/$defs/PermissionBehavior"
         },
+        "memory_write": {
+          "$ref": "#/$defs/PermissionBehavior"
+        },
         "network": {
           "$ref": "#/$defs/PermissionBehavior"
         },
@@ -8120,7 +8648,9 @@
         "mcp_write_or_unknown",
         "dynamic_skill_tool",
         "computer_use",
-        "task_subagent"
+        "task_subagent",
+        "memory_write",
+        "agent_action"
       ]
     },
     "ToolRecoveryIdempotencyMode": {
@@ -9020,6 +9550,13 @@
         "path",
         "access",
         "provenance"
+      ]
+    },
+    "TurnFilesystemSandboxKind": {
+      "type": "string",
+      "enum": [
+        "restricted",
+        "unrestricted"
       ]
     },
     "TurnFilesystemSandboxPath": {
@@ -10040,6 +10577,10 @@
             "display": {
               "$ref": "#/$defs/ToolDisplayPayload"
             },
+            "executionClass": {
+              "description": "Operational supervision semantics declared by the tool contract.\nThis is independent from the presentation-level item type.",
+              "$ref": "#/$defs/TurnItemExecutionClass"
+            },
             "id": {
               "type": "string"
             },
@@ -10116,6 +10657,23 @@
             "display",
             "storage"
           ]
+        }
+      ]
+    },
+    "TurnItemExecutionClass": {
+      "description": "Operational execution semantics persisted with a turn-item attempt.\n\nThis is intentionally independent from [`TurnItemType`]: multiple runtime\noperations may project to the same presentation item while requiring\ndifferent supervision policies.",
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "standard",
+            "context_compaction"
+          ]
+        },
+        {
+          "description": "A durable observation whose lifetime is renewed only by confirmed\nactivity from the external execution it is joining.",
+          "type": "string",
+          "const": "durable_wait"
         }
       ]
     },
@@ -10236,6 +10794,8 @@
         "dynamic_skill_tool",
         "computer_use",
         "task_subagent",
+        "memory_write",
+        "agent_action",
         "internal",
         "unknown"
       ]

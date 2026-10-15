@@ -3,8 +3,8 @@ use anyhow::{Context as _, Result};
 use pioneer_config::AppConfig;
 use std::{fs, path::PathBuf};
 
-use gpui::{App, SharedString};
-use gpui_component::{Theme, ThemeMode, ThemeRegistry};
+use gpui_kit::component::{Theme, ThemeMode, ThemeRegistry};
+use gpui_kit::{App, SharedString};
 
 const THEME_LIGHT: &str = "Pioneer Light";
 const THEME_DARK: &str = "Pioneer Dark";
@@ -28,12 +28,14 @@ pub fn init(cx: &mut App) {
         let light_theme = ThemeRegistry::global(cx).themes().get(&light).cloned();
         let dark_theme = ThemeRegistry::global(cx).themes().get(&dark).cloned();
 
-        if let Some(theme) = light_theme {
-            Theme::global_mut(cx).apply_config(&theme);
-        }
-        if let Some(theme) = dark_theme {
-            Theme::global_mut(cx).apply_config(&theme);
-        }
+        Theme::update(cx, |theme| {
+            if let Some(config) = light_theme {
+                theme.apply_config(&config);
+            }
+            if let Some(config) = dark_theme {
+                theme.apply_config(&config);
+            }
+        });
 
         apply_theme_preference(cx);
     }) {
@@ -90,5 +92,26 @@ fn apply_theme_preference(cx: &mut App) {
         WindowThemePreference::System => Theme::sync_system_appearance(None, cx),
         WindowThemePreference::Light => Theme::change(ThemeMode::Light, None, cx),
         WindowThemePreference::Dark => Theme::change(ThemeMode::Dark, None, cx),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn bundled_themes_keep_selection_and_focus_without_rectangular_list_outlines() {
+        use gpui_kit::component::{Theme, ThemeSet};
+        let set: ThemeSet = serde_json::from_str(super::BUNDLED_THEME).unwrap();
+        assert_eq!(set.themes.len(), 2);
+        for config in set.themes {
+            let mut theme = Theme {
+                mode: config.mode,
+                ..Theme::default()
+            };
+            theme.apply_config(&std::rc::Rc::new(config));
+            assert_eq!(theme.list_active_border.a, 0.0);
+            assert!(theme.sidebar_accent.a > 0.0);
+            assert!(theme.ring.a > 0.0);
+            assert!(theme.focus_ring);
+        }
     }
 }

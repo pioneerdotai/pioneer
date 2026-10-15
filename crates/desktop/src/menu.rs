@@ -1,4 +1,4 @@
-use gpui::{
+use gpui_kit::{
     App, ClipboardItem, KeyBinding, Menu, MenuItem, PromptButton, PromptLevel, SystemMenuType,
     actions,
 };
@@ -86,5 +86,5 @@ fn show_all_apps(_: &ShowAllApps, cx: &mut App) {
 }
 
 fn quit_app(_: &QuitApp, cx: &mut App) {
-    cx.quit();
+    crate::client_runtime::DesktopRuntimeCoordinator::request_quit(cx);
 }

@@ -30,6 +30,8 @@ pub struct Model {
     pub terminal_reason: Option<String>,
     pub created_at: DateTimeWithTimeZone,
     pub updated_at: DateTimeWithTimeZone,
+    #[sea_orm(column_type = "Text", nullable)]
+    pub delivery_plan_json: Option<String>,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

@@ -8,8 +8,10 @@ use std::collections::BTreeSet;
 
 use pioneer_protocol::{
     AuthorizationWorkspaceCapabilities, MemberSummary, PrincipalId, PrincipalStatus, Thread,
-    ThreadOriginKind, ThreadParticipantSummary, ThreadStatus, ThreadVisibility, WorkspaceId,
+    ThreadOriginKind, ThreadParticipantSummary, WorkspaceId,
 };
+
+pub use pioneer_protocol::{ThreadStatus, ThreadVisibility};
 
 use crate::authorization::ThreadPresentationCapabilities;
 

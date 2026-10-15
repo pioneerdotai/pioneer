@@ -9,8 +9,8 @@ use std::collections::{BTreeMap, HashMap};
 /// Complete, shell-neutral draft payload used by desktop and mobile.
 ///
 /// Hot editor state (cursor, IME composition, focus, keyboard, sheets) is not
-/// part of this value. A shell snapshots its text only at lifecycle boundaries
-/// such as switching threads.
+/// part of this value. Client owns the text; shells publish user edits and
+/// apply controlled publications without moving cursor or IME state into Client.
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]

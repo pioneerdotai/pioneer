@@ -1029,6 +1029,11 @@ impl MessageProcessor {
     }
 
     pub(crate) async fn cleanup_stale_skill_uploads(&self, now: i64) {
+        let maintenance = self.scoped_with_database_class(SqliteWriteClass::Maintenance);
+        maintenance.cleanup_stale_skill_uploads_scoped(now).await;
+    }
+
+    async fn cleanup_stale_skill_uploads_scoped(&self, now: i64) {
         let uploads = match self.crud_store.list_stale_skill_upload_sessions(now).await {
             Ok(uploads) => uploads,
             Err(error) => {

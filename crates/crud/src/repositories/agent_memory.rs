@@ -269,11 +269,52 @@ pub async fn update_memory_metadata<C: ConnectionTrait>(
     find_memory_by_id(db, memory_id, true).await
 }
 
+enum MemoryListOrder {
+    RecentUpdates,
+    Inventory { before: Option<(i64, String)> },
+}
+
 pub async fn list_memory_records<C: ConnectionTrait>(
     db: &C,
     filter: AgentMemoryListFilter,
     resolved_scopes: Vec<MemoryScopeResolution>,
     now: DateTimeWithTimeZone,
+) -> Result<Vec<agent_memory::Model>> {
+    list_memory_records_ordered(
+        db,
+        filter,
+        resolved_scopes,
+        now,
+        MemoryListOrder::RecentUpdates,
+    )
+    .await
+}
+
+/// Inventory uses immutable creation order, so updating a record while paging
+/// does not move it across the continuation boundary.
+pub async fn list_memory_record_page<C: ConnectionTrait>(
+    db: &C,
+    filter: AgentMemoryListFilter,
+    resolved_scopes: Vec<MemoryScopeResolution>,
+    now: DateTimeWithTimeZone,
+    before: Option<(i64, String)>,
+) -> Result<Vec<agent_memory::Model>> {
+    list_memory_records_ordered(
+        db,
+        filter,
+        resolved_scopes,
+        now,
+        MemoryListOrder::Inventory { before },
+    )
+    .await
+}
+
+async fn list_memory_records_ordered<C: ConnectionTrait>(
+    db: &C,
+    filter: AgentMemoryListFilter,
+    resolved_scopes: Vec<MemoryScopeResolution>,
+    now: DateTimeWithTimeZone,
+    order: MemoryListOrder,
 ) -> Result<Vec<agent_memory::Model>> {
     let mut query = agent_memory::Entity::find();
 
@@ -285,15 +326,20 @@ pub async fn list_memory_records<C: ConnectionTrait>(
         query = query.filter(workspace_guard_condition(guard));
     }
     if let Some(thread_ids) = filter.allowed_source_thread_ids {
-        query = if thread_ids.is_empty() {
-            query.filter(
-                Condition::all()
-                    .add(agent_memory::Column::SourceThreadId.is_null())
-                    .add(agent_memory::Column::SourceThreadId.is_not_null()),
-            )
-        } else {
-            query.filter(agent_memory::Column::SourceThreadId.is_in(thread_ids))
-        };
+        let mut access =
+            Condition::any().add(agent_memory::Column::SourceThreadId.is_in(thread_ids));
+        for scope in filter.owned_scopes {
+            if matches!(scope.kind, MemoryScopeKind::Thread | MemoryScopeKind::Task) {
+                access = access.add(
+                    Condition::all()
+                        .add(
+                            agent_memory::Column::ScopeKind.eq(memory_scope_kind_to_db(scope.kind)),
+                        )
+                        .add(agent_memory::Column::ScopeKey.eq(scope.key)),
+                );
+            }
+        }
+        query = query.filter(access);
     }
 
     let statuses = if filter.statuses.is_empty() {
@@ -352,8 +398,27 @@ pub async fn list_memory_records<C: ConnectionTrait>(
         query = query.limit(limit);
     }
 
+    let query = match order {
+        MemoryListOrder::Inventory { before } => {
+            if let Some((created_at, id)) = before {
+                let created_at = unix_to_datetime(created_at);
+                query = query.filter(
+                    Condition::any()
+                        .add(agent_memory::Column::CreatedAt.lt(created_at))
+                        .add(
+                            Condition::all()
+                                .add(agent_memory::Column::CreatedAt.eq(created_at))
+                                .add(agent_memory::Column::Id.lt(id)),
+                        ),
+                );
+            }
+            query
+                .order_by_desc(agent_memory::Column::CreatedAt)
+                .order_by_desc(agent_memory::Column::Id)
+        }
+        MemoryListOrder::RecentUpdates => query.order_by_desc(agent_memory::Column::UpdatedAt),
+    };
     query
-        .order_by_desc(agent_memory::Column::UpdatedAt)
         .all(db)
         .await
         .context("failed to list agent memory records")

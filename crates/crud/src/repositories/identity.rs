@@ -566,6 +566,84 @@ pub async fn backfill_legacy_actor_references<C: ConnectionTrait>(
     })
 }
 
+/// Backfills only the Thread/Turn pair owned by one legacy TurnStarted
+/// projection. Global legacy cleanup remains a maintenance concern and must
+/// never be smuggled into an interactive writer transaction.
+pub(crate) async fn backfill_legacy_actor_references_for_turn<C: ConnectionTrait>(
+    db: &C,
+    thread_id: &str,
+    turn_id: &str,
+    superuser_id: &PrincipalId,
+) -> Result<()> {
+    thread::Entity::update_many()
+        .col_expr(thread::Column::CreatedByActorKind, Expr::value("principal"))
+        .col_expr(
+            thread::Column::CreatedByActorId,
+            Expr::value(superuser_id.to_string()),
+        )
+        .filter(thread::Column::Id.eq(thread_id.to_owned()))
+        .filter(thread::Column::CreatedByActorKind.is_null())
+        .filter(thread::Column::CreatedByActorId.is_null())
+        .filter(
+            Condition::any()
+                .add(thread::Column::OriginKind.eq("collaborative"))
+                .add(thread::Column::OriginKind.eq("direct_message"))
+                .add(thread::Column::OriginKind.eq("user")),
+        )
+        .exec(db)
+        .await
+        .context("failed to backfill principal-owned legacy thread")?;
+    thread::Entity::update_many()
+        .col_expr(thread::Column::CreatedByActorKind, Expr::value("system"))
+        .col_expr(
+            thread::Column::CreatedByActorId,
+            Expr::value(Option::<String>::None),
+        )
+        .filter(thread::Column::Id.eq(thread_id.to_owned()))
+        .filter(thread::Column::CreatedByActorKind.is_null())
+        .filter(thread::Column::CreatedByActorId.is_null())
+        .filter(
+            Condition::any()
+                .add(thread::Column::OriginKind.eq("task_run"))
+                .add(thread::Column::OriginKind.eq("system")),
+        )
+        .exec(db)
+        .await
+        .context("failed to backfill System-owned legacy thread")?;
+    turn::Entity::update_many()
+        .col_expr(turn::Column::InitiatedByActorKind, Expr::value("principal"))
+        .col_expr(
+            turn::Column::InitiatedByActorId,
+            Expr::value(superuser_id.to_string()),
+        )
+        .filter(turn::Column::Id.eq(turn_id.to_owned()))
+        .filter(turn::Column::InitiatedByActorKind.is_null())
+        .filter(turn::Column::InitiatedByActorId.is_null())
+        .filter(turn::Column::Origin.eq("user"))
+        .exec(db)
+        .await
+        .context("failed to backfill principal-initiated legacy turn")?;
+    turn::Entity::update_many()
+        .col_expr(turn::Column::InitiatedByActorKind, Expr::value("system"))
+        .col_expr(
+            turn::Column::InitiatedByActorId,
+            Expr::value(Option::<String>::None),
+        )
+        .filter(turn::Column::Id.eq(turn_id.to_owned()))
+        .filter(turn::Column::InitiatedByActorKind.is_null())
+        .filter(turn::Column::InitiatedByActorId.is_null())
+        .filter(
+            Condition::any()
+                .add(turn::Column::Origin.eq("scheduled_task"))
+                .add(turn::Column::Origin.eq("detached_task"))
+                .add(turn::Column::Origin.eq("attached_task")),
+        )
+        .exec(db)
+        .await
+        .context("failed to backfill System-initiated legacy turn")?;
+    Ok(())
+}
+
 pub fn gateway_identity_record_from_model(
     model: gateway_identity::Model,
 ) -> Result<GatewayIdentityRecord> {

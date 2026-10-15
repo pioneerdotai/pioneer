@@ -1,6 +1,6 @@
 use super::{ActiveTurnRequest, RecoveryAttemptRequest};
 use pioneer_protocol::{TurnCapabilityKind, UserInput};
-use pioneer_provider::{ChatMessage, InputContentType, Role};
+use pioneer_provider::InputContentType;
 
 pub(super) fn apply_recovery_adjustments(
     turn_request: &mut ActiveTurnRequest,
@@ -11,10 +11,11 @@ pub(super) fn apply_recovery_adjustments(
     {
         turn_request.model = model_override;
     }
-    if request.compact_history {
-        turn_request.history =
-            compact_history_for_recovery(std::mem::take(&mut turn_request.history));
-    }
+    // Never delete an arbitrary suffix/prefix to recover capacity. The full
+    // request must pass the registered compactor before the one provider retry.
+    turn_request.execution_options.context_overflow_recovery = request.compact_history;
+    turn_request.execution_options.context_recovery_deadline_ms =
+        request.context_recovery_deadline_ms;
     if request.disable_tool_calling {
         turn_request.capabilities.retain(|capability| {
             !matches!(
@@ -48,30 +49,6 @@ pub(super) fn apply_recovery_adjustments(
     }
 }
 
-fn compact_history_for_recovery(history: Vec<ChatMessage>) -> Vec<ChatMessage> {
-    if history.len() <= 12 {
-        return history;
-    }
-
-    let keep = (history.len() / 2).max(12);
-    let start = history.len().saturating_sub(keep);
-    let mut compacted = history[start..].to_vec();
-
-    let has_system = compacted
-        .iter()
-        .any(|message| matches!(message.role, Role::System));
-    if !has_system
-        && let Some(system_message) = history
-            .iter()
-            .find(|message| matches!(message.role, Role::System))
-            .cloned()
-    {
-        compacted.insert(0, system_message);
-    }
-
-    compacted
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -85,6 +62,7 @@ mod tests {
         TurnCapability, TurnCapabilityKind, TurnItemType, UserInput,
         build_execution_checkpoint_payload,
     };
+    use pioneer_provider::ChatMessage;
     use pioneer_provider::MessageAttachment;
     use std::collections::HashMap;
 
@@ -117,7 +95,9 @@ mod tests {
             capabilities: Vec::new(),
             resolved_artifacts: Vec::<ResolvedArtifactInput>::new(),
             runtime_environment: HashMap::new(),
-            history: vec![ChatMessage::user("retry")],
+            history: (0..100)
+                .map(|index| ChatMessage::user(format!("original message {index}")))
+                .collect(),
             retained_provider_history: Vec::new(),
             execution_checkpoint_context: None,
             execution_usage: TurnExecutionUsageCounters::default(),
@@ -135,6 +115,7 @@ mod tests {
             disable_tool_calling: false,
             disable_image_input: false,
             refresh_provider_auth: false,
+            context_recovery_deadline_ms: Some(900_123),
             compact_history: true,
             continue_generation: true,
             model_override: Some("recovery-model".to_owned()),
@@ -153,6 +134,14 @@ mod tests {
                 text: "retry".to_owned(),
                 text_elements: Vec::new(),
             }]
+        );
+        assert_eq!(turn_request.history.len(), 100);
+        assert_eq!(turn_request.history[0].content, "original message 0");
+        assert_eq!(turn_request.history[99].content, "original message 99");
+        assert!(turn_request.execution_options.context_overflow_recovery);
+        assert_eq!(
+            turn_request.execution_options.context_recovery_deadline_ms,
+            Some(900_123)
         );
         assert_eq!(turn_request.model, "recovery-model");
         assert_eq!(turn_request.execution_window_index, 3);
@@ -257,6 +246,7 @@ mod tests {
             disable_tool_calling: false,
             disable_image_input: false,
             refresh_provider_auth: false,
+            context_recovery_deadline_ms: None,
             compact_history: false,
             continue_generation: true,
             model_override: None,
@@ -381,6 +371,7 @@ mod tests {
             disable_tool_calling: true,
             disable_image_input: true,
             refresh_provider_auth: false,
+            context_recovery_deadline_ms: None,
             compact_history: false,
             continue_generation: false,
             model_override: None,

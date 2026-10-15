@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ThreadToolResultReadResponse",
+  "description": "A Unicode text fragment of the saved canonical result JSON, including any\nupstream truncation markers and attachment references. Cursor is source-version bound.",
+  "type": "object",
+  "properties": {
+    "eof": {
+      "type": "boolean"
+    },
+    "next": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ThreadToolResultCursor"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "text": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "text",
+    "eof"
+  ],
+  "$defs": {
+    "ThreadToolResultCursor": {
+      "type": "object",
+      "properties": {
+        "offset": {
+          "description": "Unicode scalar offset in the source, not a UTF-8 byte offset.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "version": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "version",
+        "offset"
+      ]
+    }
+  }
+}

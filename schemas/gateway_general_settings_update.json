@@ -3,10 +3,30 @@
   "title": "GatewayGeneralSettingsUpdate",
   "type": "object",
   "properties": {
+    "compaction_model": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/GatewayModelSelection"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "keepawake": {
       "type": [
         "boolean",
         "null"
+      ]
+    },
+    "model_catalog_proxy": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/GatewayModelCatalogProxyUpdate"
+        },
+        {
+          "type": "null"
+        }
       ]
     },
     "preflight_model": {
@@ -53,6 +73,75 @@
       "enum": [
         "thread",
         "custom"
+      ]
+    },
+    "GatewayModelCatalogProxyUpdate": {
+      "type": "object",
+      "properties": {
+        "proxy_url": {
+          "description": "`Some` configures/replaces the proxy; `None` clears it. The value is\nconsumed by Gateway's keystore layer and is never persisted in settings.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "GatewayModelSelection": {
+      "description": "Inherit is a real absence of an override. It never stores a resolved fallback.\nThe tagged value also distinguishes an explicit reset from an omitted update.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "source": {
+              "type": "string",
+              "const": "inherit"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "source"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "instance": {
+              "type": "string"
+            },
+            "model": {
+              "type": "string"
+            },
+            "reasoning_effort": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "source": {
+              "type": "string",
+              "const": "explicit"
+            },
+            "transport": {
+              "$ref": "#/$defs/ModelSelectionTransport"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "source",
+            "transport",
+            "instance",
+            "model"
+          ]
+        }
+      ]
+    },
+    "ModelSelectionTransport": {
+      "type": "string",
+      "enum": [
+        "api",
+        "codex",
+        "claude"
       ]
     }
   }

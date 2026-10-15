@@ -8,8 +8,8 @@ use axum::extract::ws::{CloseFrame, Message, WebSocket};
 use futures_util::{SinkExt, StreamExt};
 use pioneer_config::AppConfig;
 use pioneer_protocol::{
-    AuthAccessExpiringNotification, AuthSessionTerminationReason, JsonRpcNotification,
-    constants::events,
+    AuthAccessExpiringNotification, AuthSessionTerminationReason, GatewayReadinessStatus,
+    JsonRpcNotification, constants::events,
 };
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, watch};
@@ -40,11 +40,20 @@ pub struct GatewayServerHandle {
     local_addr: SocketAddr,
     shutdown_tx: watch::Sender<bool>,
     join_handle: JoinHandle<Result<()>>,
+    readiness: super::http::ReadinessState,
 }
 
 impl GatewayServerHandle {
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
+    }
+
+    pub fn set_readiness(&self, status: GatewayReadinessStatus) {
+        self.readiness.set_status(status);
+    }
+
+    pub(crate) fn readiness_state(&self) -> super::http::ReadinessState {
+        self.readiness.clone()
     }
 
     pub async fn shutdown(self) -> Result<()> {
@@ -81,7 +90,7 @@ pub async fn spawn_server(
     .map_err(|error| anyhow::anyhow!("invalid Gateway HTTP configuration: {error:?}"))?;
     let app = gateway_router(state.clone());
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    state.set_ready(true);
+    let readiness = state.readiness();
     let join_handle = tokio::spawn(async move {
         axum::serve(
             listener,
@@ -96,6 +105,7 @@ pub async fn spawn_server(
         local_addr,
         shutdown_tx,
         join_handle,
+        readiness,
     })
 }
 
@@ -105,7 +115,7 @@ async fn shutdown_signal(mut shutdown_rx: watch::Receiver<bool>, state: GatewayH
             break;
         }
     }
-    state.set_ready(false);
+    state.set_readiness(GatewayReadinessStatus::Starting);
     state.view_grants.begin_shutdown();
     state.http_streams.begin_shutdown();
     state.active_connections.cancel_all().await;
@@ -144,6 +154,12 @@ pub(super) async fn run_admitted_connection(
                     permit.record_success();
                     tracing::debug!(event = "websocket_auth", outcome = "restricted_succeeded",);
                 }
+                Ok(Some(RestrictedExchangeOutcome::RetryableFailure)) => {
+                    tracing::debug!(
+                        event = "websocket_auth",
+                        outcome = "restricted_retryable_failure",
+                    );
+                }
                 Ok(Some(RestrictedExchangeOutcome::Failed)) | Err(_) => {
                     permit.record_failure();
                     tracing::debug!(event = "websocket_auth", outcome = "restricted_failed",);
@@ -157,7 +173,7 @@ pub(super) async fn run_admitted_connection(
     }
 }
 
-async fn run_normal_connection(
+pub(crate) async fn run_normal_connection(
     ws: WebSocket,
     config: AppConfig,
     principal: Arc<AuthenticatedSessionPrincipal>,
@@ -233,11 +249,59 @@ async fn run_normal_connection(
 
     let mut writer_task = tokio::spawn(async move {
         while let Some(message) = outbound_rx.recv().await {
+            let startup_output = if let Message::Text(text) = &message {
+                if !pioneer_observability::turn_startup::active() {
+                    None
+                } else {
+                    serde_json::from_str::<serde_json::Value>(text)
+                        .ok()
+                        .and_then(|v| {
+                            let params = v.get("params")?;
+                            let method = v.get("method")?.as_str()?;
+                            let output = pioneer_observability::turn_startup::notification_output(
+                                method, params,
+                            );
+                            let outcome = pioneer_observability::turn_startup::notification_outcome(
+                                method, params,
+                            );
+                            if output.is_none() && outcome.is_none() {
+                                return None;
+                            }
+                            Some((
+                                pioneer_observability::turn_startup::request_key(params)?,
+                                output,
+                                outcome,
+                            ))
+                        })
+                }
+            } else {
+                None
+            };
+            let startup_write = startup_output.as_ref().map(|(key, _, _)| {
+                pioneer_observability::turn_startup::socket_write_started(key, connection_id);
+                pioneer_observability::turn_startup::stage(
+                    key,
+                    pioneer_observability::turn_startup::Stage::SocketWrite,
+                )
+            });
             let terminal = matches!(message, Message::Close(_));
             ws_writer
                 .send(message)
                 .await
                 .context("websocket write failed")?;
+            drop(startup_write);
+            if let Some((key, output, outcome)) = startup_output {
+                if output.is_some() {
+                    pioneer_observability::turn_startup::sent_on_connection(&key, connection_id);
+                }
+                if let Some(outcome) = outcome {
+                    pioneer_observability::turn_startup::finish_on_connection(
+                        &key,
+                        connection_id,
+                        outcome,
+                    );
+                }
+            }
             if terminal {
                 return Ok::<(), anyhow::Error>(());
             }
@@ -297,7 +361,8 @@ async fn run_normal_connection(
                         break;
                     }
                     let outcome = await_message_processing(
-                        message_processor.process_request(&connection_context, payload.as_ref()),
+                        Arc::clone(&message_processor)
+                            .process_owned_request(connection_context.clone(), payload.to_string()),
                         &mut termination_rx,
                         &mut server_cancellation,
                         &mut access_expired_rx,
@@ -352,6 +417,7 @@ async fn run_normal_connection(
     let _ = lease_cancel_tx.send(true);
     session_manager.unregister_connection(connection_id).await;
     message_processor.connection_closed(connection_id).await;
+    pioneer_observability::turn_startup::connection_lost(connection_id);
     drop(outbound_tx);
     match writer_completion {
         Some(result) => result.context("writer task join failed")??,
@@ -554,6 +620,16 @@ mod tests {
 
     use super::*;
 
+    struct DropNotifier(Option<tokio::sync::oneshot::Sender<()>>);
+
+    impl Drop for DropNotifier {
+        fn drop(&mut self) {
+            if let Some(sender) = self.0.take() {
+                let _ = sender.send(());
+            }
+        }
+    }
+
     #[test]
     fn access_deadline_uses_exact_expiry_boundary() {
         assert_eq!(
@@ -638,15 +714,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn server_shutdown_interrupts_in_flight_message_processing() {
+    async fn server_shutdown_aborts_in_flight_owned_message_task() {
         let (_termination_tx, mut termination_rx) = watch::channel(None);
         let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
         let (_expired_tx, mut expired_rx) = watch::channel(false);
         let mut writer_task = tokio::spawn(std::future::pending::<Result<()>>());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
 
-        shutdown_tx.send(true).unwrap();
+        let processing = async move {
+            crate::message::message_fresh_task(async move {
+                let _drop_notifier = DropNotifier(Some(dropped_tx));
+                started_tx.send(()).expect("report message task start");
+                std::future::pending::<()>().await;
+            })
+            .await
+            .expect("owned message task should remain pending until shutdown");
+        };
+        let shutdown_task = tokio::spawn(async move {
+            started_rx.await.expect("observe message task start");
+            shutdown_tx.send(true).expect("signal server shutdown");
+        });
+
         let outcome = await_message_processing(
-            std::future::pending(),
+            processing,
             &mut termination_rx,
             &mut shutdown_rx,
             &mut expired_rx,
@@ -655,6 +746,11 @@ mod tests {
         .await;
 
         assert!(matches!(outcome, MessageProcessingOutcome::ServerShutdown));
+        shutdown_task.await.expect("join shutdown signal task");
+        tokio::time::timeout(Duration::from_secs(5), dropped_rx)
+            .await
+            .expect("owned message task should be aborted promptly")
+            .expect("observe owned message future drop");
         writer_task.abort();
         let _ = writer_task.await;
     }

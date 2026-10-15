@@ -221,6 +221,12 @@ impl ExecutionAdmissionRequest {
             execution_backend: launch.and_then(|launch| launch.execution_backend.clone()),
             capabilities: launch
                 .map(|launch| launch.capabilities.clone())
+                .or_else(|| {
+                    params
+                        .launch
+                        .as_ref()
+                        .map(|selection| selection.execution.selected_capabilities.clone())
+                })
                 .unwrap_or_default(),
             artifacts: input_sources.artifacts,
             has_local_attachment_sources: input_sources.has_local_paths,
@@ -1468,6 +1474,80 @@ impl ExecutionAuthorizationContext {
         Ok(hex::encode(Sha256::digest(encoded)))
     }
 
+    /// Stable authority scope for a provider-owned CLI process shared by the
+    /// collaborators of one root Thread capsule.
+    ///
+    /// The full execution fingerprint deliberately includes the initiating
+    /// principal and authentication session because it is the immutable
+    /// provenance used to bind durable Turns and stale approval requests. A
+    /// long-lived Codex/Claude process has a different boundary: changing the
+    /// collaborator who starts the next Turn must not discard provider-session
+    /// state or session-scoped approvals. Only an actual change to the shared
+    /// execution capability, policy, resource or runtime ceiling belongs in
+    /// this fingerprint.
+    pub(crate) fn cli_runtime_collaboration_scope_fingerprint(&self) -> Result<String> {
+        #[derive(Serialize)]
+        struct CollaborationScope<'a> {
+            schema: &'static str,
+            context_version: u32,
+            workspace_id: &'a str,
+            root_thread_id: &'a str,
+            policy_revision: u64,
+            policy_fingerprint: &'a str,
+            capability_projection_fingerprint: &'a str,
+            permission_profile_cap: &'a TurnPermissionProfileCap,
+            human_interaction_budget: HumanInteractionBudget,
+            mcp_invocation_limits: pioneer_protocol::McpInvocationResourceLimits,
+            native_event_budget: pioneer_cli_agent_runtime::NativeEventBudget,
+            continuity_policy: ExecutionContinuityPolicy,
+            resource_boundary: ExecutionResourceBoundary,
+            entry_point: ExecutionAdmissionEntryPoint,
+            actions: &'a [String],
+            cli: &'a ExecutionCliGrant,
+            skills: &'a [String],
+            mcp_servers: &'a [String],
+            mcp_server_capability_ids: &'a [String],
+            root_route_grants: &'a [RootAgentRouteGrant],
+            mcp_projection: &'a Option<ExecutionMcpProjectionIdentity>,
+            skill_projection: &'a Option<ExecutionSkillProjectionIdentity>,
+            cli_runtime_projection: &'a Option<ExecutionCliRuntimeProjectionIdentity>,
+        }
+
+        let cli = self
+            .grant_manifest
+            .cli
+            .as_ref()
+            .context("execution has no CLI runtime grant")?;
+        let scope = CollaborationScope {
+            schema: "pioneer.cli_runtime.collaboration_scope.v1",
+            context_version: self.version,
+            workspace_id: self.workspace_id.as_str(),
+            root_thread_id: self.root_thread_id.as_str(),
+            policy_revision: self.policy_revision,
+            policy_fingerprint: self.policy_fingerprint.as_str(),
+            capability_projection_fingerprint: self.capability_projection_fingerprint.as_str(),
+            permission_profile_cap: &self.permission_profile_cap,
+            human_interaction_budget: self.human_interaction_budget,
+            mcp_invocation_limits: self.mcp_invocation_limits,
+            native_event_budget: self.native_event_budget,
+            continuity_policy: self.continuity_policy,
+            resource_boundary: self.resource_boundary,
+            entry_point: self.grant_manifest.entry_point,
+            actions: self.grant_manifest.actions.as_slice(),
+            cli,
+            skills: self.grant_manifest.skills.as_slice(),
+            mcp_servers: self.grant_manifest.mcp_servers.as_slice(),
+            mcp_server_capability_ids: self.grant_manifest.mcp_server_capability_ids.as_slice(),
+            root_route_grants: self.root_route_grants.as_slice(),
+            mcp_projection: &self.mcp_projection,
+            skill_projection: &self.skill_projection,
+            cli_runtime_projection: &self.cli_runtime_projection,
+        };
+        let encoded = serde_json::to_vec(&scope)
+            .context("failed to encode collaborative CLI runtime authority scope")?;
+        Ok(hex::encode(Sha256::digest(encoded)))
+    }
+
     pub(crate) fn root_route_grants(&self) -> &[RootAgentRouteGrant] {
         self.root_route_grants.as_slice()
     }
@@ -1482,7 +1562,7 @@ impl ExecutionAuthorizationContext {
         let current = registry.authority_fingerprint_for_workspace(
             self.workspace_id.as_str(),
             provider.provider.as_str(),
-        );
+        )?;
         if current.as_str() != provider.authority_fingerprint {
             bail!("provider authority changed; execution requires a fresh admission");
         }
@@ -1674,6 +1754,32 @@ impl ExecutionAuthorizationContext {
                     .await?
             }
         };
+        // A Task occurrence is a user-visible projection of the run.  Its
+        // execution authority still derives from the source capsule, while
+        // its Turn may intentionally live in a different delivery thread.
+        // Do not classify that projection as an execution child merely
+        // because the presentation thread is outside the source root.
+        if matches!(
+            initiator,
+            pioneer_protocol::PersistedActorRef::AgentExecution(_)
+        ) && turn.turn_kind == pioneer_protocol::TurnKind::TaskRun
+            && matches!(
+                turn.origin,
+                pioneer_protocol::TurnOrigin::AttachedTask
+                    | pioneer_protocol::TurnOrigin::DetachedTask
+                    | pioneer_protocol::TurnOrigin::ScheduledTask
+            )
+            && let Some(occurrence) = store
+                .get_task_occurrence_contract_by_run(turn.id.as_str())
+                .await?
+            && occurrence
+                .delivery_plan
+                .as_ref()
+                .and_then(|plan| plan.presentation_thread_id.as_deref())
+                == Some(scope.thread_id.as_str())
+        {
+            return Ok(ancestor_turn_id);
+        }
         if scope.thread_id == self.root_thread_id {
             if scope.thread.access_class == PersistedThreadAccessClass::Internal {
                 bail!("execution authority root points at an internal child thread");
@@ -1848,12 +1954,19 @@ impl ExecutionAuthorizationContext {
                     .get_task_actor_contract(run.task_id.as_str())
                     .await?
                     .context("agent-authored Task occurrence has no exact actor contract")?;
-                let occurrence_thread_id = actor_contract
-                    .execution_destination_thread_id
-                    .as_deref()
+                let occurrence = store
+                    .get_task_occurrence_contract_by_run(run.id.as_str())
+                    .await?
+                    .context("agent-authored Task occurrence has no occurrence contract")?;
+                let occurrence_thread_id = occurrence
+                    .delivery_plan
+                    .as_ref()
+                    .and_then(|plan| plan.presentation_thread_id.as_deref())
+                    .or(actor_contract.execution_destination_thread_id.as_deref())
                     .or(task.created_by_thread_id.as_deref());
                 if task.executor_kind != pioneer_protocol::TaskExecutorKind::Agent
                     || task.workspace_id != self.workspace_id
+                    || occurrence.task_id != task.id
                     || occurrence_thread_id != Some(scope.thread_id.as_str())
                 {
                     bail!("agent-authored Task occurrence differs from its durable Task");
@@ -2023,6 +2136,66 @@ impl ExecutionAuthorizationContext {
                 let admission_context = Self::load_for_task_admission(store, &admission).await?;
                 self.verify_authority_derivation(&admission_context)?;
                 return Ok(Some(parent_turn_id.to_owned()));
+            }
+
+            // A direct `threads_turn_start` Turn has the same two-actor shape as a
+            // Task child without a TaskRun: the canonical input author is the
+            // parent AgentExecution, while the durable response binding and
+            // runtime authority belong to the newly admitted child. Resolve
+            // that exact response before falling back to legacy child-thread
+            // lineage validation.
+            if let Some(child_response) = pioneer_crud::load_agent_turn_response(
+                &store.database_connection(),
+                turn.id.as_str(),
+            )
+            .await?
+            {
+                let child_execution = pioneer_crud::load_agent_execution(
+                    &store.database_connection(),
+                    child_response.execution_id.as_str(),
+                )
+                .await?
+                .context("direct Agent child response has no execution graph row")?;
+                let parent_execution = pioneer_crud::load_agent_execution(
+                    &store.database_connection(),
+                    execution_id.as_str(),
+                )
+                .await?
+                .context("direct Agent child author execution is missing")?;
+                let expected_child_generation = parent_execution
+                    .execution_generation
+                    .checked_add(1)
+                    .context("direct Agent child generation exceeds persistence bounds")?;
+                if child_response.presentation_snapshot_id
+                    != child_execution
+                        .presentation_snapshot_id
+                        .as_deref()
+                        .unwrap_or_default()
+                    || child_execution.id == parent_execution.id
+                    || child_execution.parent_execution_id.as_deref()
+                        != Some(parent_execution.id.as_str())
+                    || child_execution.parent_task_id.is_some()
+                    || child_execution.parent_thread_id.as_deref() != Some(scope.thread_id.as_str())
+                    || child_execution.home_root_thread_id != self.root_thread_id
+                    || child_execution.work_graph_root_execution_id
+                        != parent_execution.work_graph_root_execution_id
+                    || child_execution.execution_generation != expected_child_generation
+                    || child_execution.authorization_context_fingerprint
+                        != self.authorization_fingerprint()?
+                    || child_execution.status == "finished"
+                {
+                    bail!("direct Agent child Turn differs from its durable execution graph");
+                }
+                if scope.thread_id != self.root_thread_id {
+                    let lineage = store
+                        .get_task_thread_lineage(scope.thread_id.as_str())
+                        .await?
+                        .context("direct Agent child execution has no durable lineage")?;
+                    if lineage.root_thread_id != self.root_thread_id {
+                        bail!("direct Agent child execution left its collaboration capsule");
+                    }
+                }
+                return Ok(None);
             }
 
             if let Some(execution) = pioneer_crud::load_agent_execution(
@@ -3132,6 +3305,38 @@ impl RevalidatedExecutionAuthorization {
         self.resource_boundary
     }
 
+    /// Global owner memory follows the initiating principal's admission and
+    /// current policy. The collaborator selected to keep a shared execution
+    /// alive must not lend its personal-memory authority to that execution.
+    /// RootThreadCapsule alone cannot answer this: every Turn carries it,
+    /// including interactive Turns admitted by the instance owner.
+    pub(crate) async fn memory_runtime_principal_policy(
+        &self,
+        store: &CrudStore,
+    ) -> Result<RuntimePrincipalPolicy> {
+        let role_key = RoleKey::new(self.admitted_role_key.clone())?;
+        let admitted_role = super::RoleDefinitionRegistry::new()
+            .resolve_key(&role_key)
+            .context("memory execution role is not registered")?;
+        if admitted_role.runtime_principal != RuntimePrincipalPolicy::Absolute {
+            return Ok(RuntimePrincipalPolicy::ScopedCollaboration);
+        }
+        let initiator = pioneer_crud::load_principal_by_id(
+            &store.database_connection(),
+            &self.admitted_principal_id,
+        )
+        .await?;
+        let Some(initiator) = initiator
+            .filter(|principal| principal.status == pioneer_protocol::PrincipalStatus::Active)
+        else {
+            return Ok(RuntimePrincipalPolicy::ScopedCollaboration);
+        };
+        let current_role = initiator.role_key.map(RoleKey::new).transpose()?;
+        Ok(AuthorizationService::new()
+            .runtime_principal_policy(initiator.kind, current_role.as_ref())
+            .unwrap_or(RuntimePrincipalPolicy::ScopedCollaboration))
+    }
+
     pub(crate) fn effective_permission_profile(&self) -> &TurnPermissionProfileSnapshot {
         &self.effective_permission_profile
     }
@@ -3503,7 +3708,7 @@ impl ExecutionAuthorizationAdmission {
             let current = provider_registry.authority_fingerprint_for_workspace(
                 self.workspace_id.as_str(),
                 provider.provider.as_str(),
-            );
+            )?;
             if current.as_str() != provider.authority_fingerprint {
                 bail!("provider authority changed before durable execution start");
             }
@@ -4152,6 +4357,146 @@ mod tests {
             context.initiating_session_id()
         );
         assert_eq!(derived.root_thread_id(), context.root_thread_id());
+    }
+
+    #[test]
+    fn cli_runtime_session_scope_is_collaboration_neutral_and_capability_exact() {
+        let request = member_request();
+        let proof = authorized_thread(&request);
+        let admission =
+            ExecutionAuthorizationAdmission::from_authorized_thread(&request, &proof, 4)
+                .expect("authorized admission");
+        let supervised = admission
+            .cap_permission_profile(&pioneer_protocol::default_turn_permission_profile_snapshot());
+        let backend = AgentExecutionBackend::CLIAgentRuntime {
+            runtime_id: "codex-work".to_owned(),
+            runtime_kind: CLIAgentRuntimeKind::Codex,
+        };
+        let context = admission
+            .finalize(
+                "workspace-a",
+                "thread-a",
+                "cli_runtime:codex-work",
+                "model-a",
+                Some(&backend),
+                &[],
+                &supervised,
+            )
+            .expect("execution context");
+        let admission_fingerprint = context
+            .authorization_fingerprint()
+            .expect("exact admission fingerprint");
+        let collaboration_scope = context
+            .cli_runtime_collaboration_scope_fingerprint()
+            .expect("collaborative CLI scope");
+
+        let mut another_collaborator = context.clone();
+        let principal_id = PrincipalId::new("Q".repeat(21)).expect("second principal id");
+        let session_id = AuthSessionId::new("T".repeat(21)).expect("second session id");
+        another_collaborator.authority = ExecutionAuthorityEnvelope::PrincipalGrant {
+            principal_id: principal_id.clone(),
+            session_id: session_id.clone(),
+            principal_kind: PrincipalKind::User,
+            role_key: RoleKey::member().to_string(),
+        };
+        another_collaborator.initiating_principal_id = principal_id;
+        another_collaborator.initiating_session_id = session_id;
+
+        assert_ne!(
+            another_collaborator
+                .authorization_fingerprint()
+                .expect("second exact admission fingerprint"),
+            admission_fingerprint,
+            "durable execution provenance must remain initiator-exact"
+        );
+        assert_eq!(
+            another_collaborator
+                .cli_runtime_collaboration_scope_fingerprint()
+                .expect("second collaborator CLI scope"),
+            collaboration_scope,
+            "changing only the initiating collaborator must preserve the shared provider session"
+        );
+
+        let mut changed_policy = context.clone();
+        changed_policy.policy_revision += 1;
+        assert_ne!(
+            changed_policy
+                .cli_runtime_collaboration_scope_fingerprint()
+                .expect("changed-policy CLI scope"),
+            collaboration_scope,
+            "policy generation changes must reset provider-session grants"
+        );
+
+        let mut changed_capability = context;
+        changed_capability.capability_projection_fingerprint = "c".repeat(64);
+        assert_ne!(
+            changed_capability
+                .cli_runtime_collaboration_scope_fingerprint()
+                .expect("changed-capability CLI scope"),
+            collaboration_scope,
+            "capability projection changes must reset provider-session grants"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_policy_uses_current_initiator_without_borrowing_collaborator_authority() {
+        use crate::tests::authorization::{
+            IsolatedEpic4Harness, MEMBER_A_ID, REMOVED_MEMBER_ID, SUSPENDED_MEMBER_ID,
+        };
+        let harness = IsolatedEpic4Harness::new().await.unwrap();
+        let store = CrudStore::new(harness.database.clone());
+        let request = member_request();
+        let owner = crate::auth::test_support::TEST_SUPERUSER_ID;
+        let owner_role = AuthorizationService::new()
+            .resolved_role_key(PrincipalKind::Superuser, None)
+            .unwrap()
+            .to_owned();
+        let fingerprint = super::super::RoleDefinitionRegistry::new().policy_fingerprint();
+        let mut proof = RevalidatedExecutionAuthorization {
+            principal: request.principal().clone(),
+            authorization: authorized_thread(&request),
+            resource_boundary: ExecutionResourceBoundary::RootThreadCapsule,
+            effective_permission_profile:
+                pioneer_protocol::default_turn_permission_profile_snapshot(),
+            admitted_workspace_id: "workspace-a".to_owned(),
+            admitted_root_thread_id: "thread-a".to_owned(),
+            admitted_principal_id: PrincipalId::new(owner).unwrap(),
+            admitted_session_id: request.principal().session_id.clone(),
+            admitted_role_key: owner_role.clone(),
+            admitted_policy_generation: 1,
+            admitted_policy_fingerprint: fingerprint.clone(),
+            validated_policy_generation: 1,
+            validated_policy_fingerprint: fingerprint,
+        };
+        // A different collaborator may supply the execution's continuation
+        // proof; personal memory still belongs to the actual initiator.
+        assert_eq!(
+            proof.memory_runtime_principal_policy(&store).await.unwrap(),
+            RuntimePrincipalPolicy::Absolute,
+        );
+        for principal_id in [
+            MEMBER_A_ID,
+            SUSPENDED_MEMBER_ID,
+            REMOVED_MEMBER_ID,
+            &"Z".repeat(21),
+        ] {
+            proof.admitted_principal_id = PrincipalId::new(principal_id).unwrap();
+            assert_eq!(
+                proof.memory_runtime_principal_policy(&store).await.unwrap(),
+                RuntimePrincipalPolicy::ScopedCollaboration,
+                "an old absolute admission cannot override the initiator's current status/role",
+            );
+        }
+        // Neither a promoted initiator nor an absolute collaborator widens an
+        // admission that originally had only collaborative memory authority.
+        proof.admitted_principal_id = PrincipalId::new(owner).unwrap();
+        proof.admitted_role_key = "member".to_owned();
+        proof.principal.kind = PrincipalKind::Superuser;
+        proof.principal.role_key = None;
+        assert_eq!(
+            proof.memory_runtime_principal_policy(&store).await.unwrap(),
+            RuntimePrincipalPolicy::ScopedCollaboration,
+        );
     }
 
     #[test]

@@ -68,7 +68,10 @@ pub(crate) struct CLIAgentRuntimeThreadNameSetResult {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CLIAgentRuntimeThreadForkRequest {
+    pub source_logical_thread_id: String,
     pub native_thread_id: String,
+    pub last_turn_id: Option<String>,
+    pub thread_source: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -97,9 +100,15 @@ pub(crate) struct CLIAgentRuntimeTurnSteerResult {
 pub(crate) struct CLIAgentRuntimeSessionStartOptions {
     pub cwd: Option<PathBuf>,
     pub approval_policy: Option<String>,
+    /// Stable identity of the principal, role, permission ceiling and maximum
+    /// security authority allowed to share provider-side session grants.
+    pub authorization_scope_fingerprint: Option<String>,
     pub app_server_args: Vec<String>,
     pub env: SensitiveEnvironment,
-    pub enable_user_skills: bool,
+    /// Exact selected Claude skill installations. Claude receives these as
+    /// generation-scoped managed plugins; the shared user settings source is
+    /// never enabled for skill discovery.
+    pub selected_skills: Vec<super::skills::CliRuntimeSelectedSkill>,
     pub elevated_instructions: Option<CLIRuntimeElevatedInstructions>,
 }
 
@@ -377,6 +386,15 @@ pub(crate) trait CLIAgentRuntimeSession: Send + Sync {
         bail!("CLI runtime session does not support thread fork");
     }
 
+    async fn find_marked_fork(
+        &self,
+        _source_thread_id: &str,
+        _boundary_turn_id: &str,
+        _marker: &str,
+    ) -> Result<Option<CLIAgentRuntimeThreadForkResult>> {
+        bail!("CLI runtime session does not support fork reconciliation");
+    }
+
     async fn steer_turn(
         &self,
         request: CLIAgentRuntimeTurnSteerRequest,
@@ -609,15 +627,28 @@ impl CLIAgentRuntimeManager {
         now_ms: u64,
     ) -> Result<CLIAgentRuntimeSessionHandle> {
         let start_lock = self.start_lock_for_key(&key).await;
+        let startup_wait = pioneer_observability::turn_startup::current_stage(
+            pioneer_observability::turn_startup::Stage::CliSessionWait,
+        );
         let _guard = start_lock.lock().await;
+        drop(startup_wait);
 
         if let Some(handle) = self
             .touch_reusable_session(&key, &launch_spec, now_ms)
             .await
         {
+            pioneer_observability::turn_startup::session_state(
+                pioneer_observability::turn_startup::SessionState::Reused,
+            );
             return Ok(handle);
         }
+        pioneer_observability::turn_startup::session_state(
+            pioneer_observability::turn_startup::SessionState::New,
+        );
         if let Some(stale) = self.session_requiring_restart(&key, &launch_spec).await {
+            pioneer_observability::turn_startup::session_state(
+                pioneer_observability::turn_startup::SessionState::Replaced,
+            );
             validate_replacement_continuation(&stale.launch_spec, &launch_spec)?;
             stale
                 .session
@@ -697,6 +728,9 @@ impl CLIAgentRuntimeManager {
         launch_spec: CliSessionLaunchSpec,
         now_ms: u64,
     ) -> Result<CLIAgentRuntimeSessionHandle> {
+        let _startup_initialize = pioneer_observability::turn_startup::current_stage(
+            pioneer_observability::turn_startup::Stage::CliInitialize,
+        );
         let instance = self.generations.allocate(key.clone())?;
         let session = match self
             .factory
@@ -1045,6 +1079,10 @@ fn validate_replacement_continuation(
             }
             | CliProviderContinuation::ClaudeResume {
                 provider_session_id: old_id,
+            }
+            | CliProviderContinuation::ClaudeFork {
+                provider_session_id: old_id,
+                ..
             },
             CliProviderContinuation::ClaudeResume {
                 provider_session_id: new_id,
@@ -1052,12 +1090,14 @@ fn validate_replacement_continuation(
         ) if old_id == new_id => Ok(()),
         (
             CliProviderContinuation::ClaudeNew { .. }
-            | CliProviderContinuation::ClaudeResume { .. },
+            | CliProviderContinuation::ClaudeResume { .. }
+            | CliProviderContinuation::ClaudeFork { .. },
             CliProviderContinuation::ClaudeNew { .. },
         ) => bail!("Claude process replacement requires spawn-time resume of the durable UUID"),
         (
             CliProviderContinuation::ClaudeNew { .. }
-            | CliProviderContinuation::ClaudeResume { .. },
+            | CliProviderContinuation::ClaudeResume { .. }
+            | CliProviderContinuation::ClaudeFork { .. },
             CliProviderContinuation::ClaudeResume { .. },
         ) => bail!("Claude process replacement cannot change the durable provider UUID"),
         (
@@ -1346,17 +1386,19 @@ mod tests {
         let options_a = CLIAgentRuntimeSessionStartOptions {
             cwd: None,
             approval_policy: Some("on-request".to_owned()),
+            authorization_scope_fingerprint: Some("scope-a".to_owned()),
             app_server_args: vec!["-c".to_owned(), "model=\"gpt-5-codex\"".to_owned()],
             env: Default::default(),
-            enable_user_skills: false,
+            selected_skills: Vec::new(),
             elevated_instructions: None,
         };
         let options_b = CLIAgentRuntimeSessionStartOptions {
             cwd: None,
             approval_policy: Some("never".to_owned()),
+            authorization_scope_fingerprint: Some("scope-b".to_owned()),
             app_server_args: vec!["-c".to_owned(), "model=\"gpt-5\"".to_owned()],
             env: Default::default(),
-            enable_user_skills: false,
+            selected_skills: Vec::new(),
             elevated_instructions: None,
         };
 
@@ -1899,13 +1941,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cli_runtime_manager_restarts_session_when_user_skills_mode_changes() {
+    async fn cli_runtime_manager_restarts_session_when_selected_skills_change() {
         let factory = Arc::new(FakeFactory::default());
         let manager = manager_with_factory(factory.clone());
         let key = key("thread-skill-mode");
         let normal = CLIAgentRuntimeSessionStartOptions::default();
         let skill_enabled = CLIAgentRuntimeSessionStartOptions {
-            enable_user_skills: true,
+            selected_skills: vec![crate::cli_runtime::skills::CliRuntimeSelectedSkill {
+                install_name: "selected".to_owned(),
+                installed_path: std::path::PathBuf::from("/tmp/selected"),
+                source_folder_hash: "selected-hash".to_owned(),
+            }],
             ..Default::default()
         };
 

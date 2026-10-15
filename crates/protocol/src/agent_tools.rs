@@ -23,9 +23,11 @@ use std::collections::BTreeSet;
 )]
 #[serde(rename_all = "snake_case")]
 pub enum AgentModelToolName {
+    #[serde(rename = "threads_start_options", alias = "agent_start_options")]
     AgentStartOptions,
     SendMessage,
     CreateThread,
+    #[serde(rename = "threads_turn_start", alias = "start_agent")]
     StartAgent,
     CreateTask,
     ScheduleTask,
@@ -38,10 +40,10 @@ pub enum AgentModelToolName {
 impl AgentModelToolName {
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::AgentStartOptions => "agent_start_options",
+            Self::AgentStartOptions => "threads_start_options",
             Self::SendMessage => "thread_message_send",
             Self::CreateThread => "thread_create",
-            Self::StartAgent => "agent_start",
+            Self::StartAgent => "threads_turn_start",
             Self::CreateTask => "task_create",
             Self::ScheduleTask => "task_schedule",
             Self::ReviewTask => "task_review",
@@ -241,6 +243,7 @@ impl AgentToolLaunchSelection {
                 permission_profile: self.permission_profile,
                 skill_ids: self.skill_ids,
                 mcp_server_ids: self.mcp_server_ids,
+                selected_capabilities: Vec::new(),
             },
         }
     }
@@ -430,20 +433,20 @@ pub fn project_agent_model_tool_catalog(
     push(
         AgentModelToolName::SendMessage,
         AgentToolCapability::MessageCreate,
-        "Send authored content to a server-approved target.",
+        "Post an agent-authored message to a permitted thread without starting a turn.",
         schema::<AgentSendMessageToolInput>(),
     );
     push(
         AgentModelToolName::CreateThread,
         AgentToolCapability::ThreadCreate,
-        "Create a server-approved thread.",
+        "Create a thread using a server-approved thread creation option. This does not start an Agent-turn.",
         schema::<AgentCreateThreadToolInput>(),
     );
     if options.is_some() {
         push(
             AgentModelToolName::AgentStartOptions,
             AgentToolCapability::ChildStart,
-            "List identities and execution profiles currently available for agent_start.",
+            "List permitted identity, execution profile, thread creation, and target options. Use these when explicitly selecting a task launch or a thread action; options do not grant permission to execute it.",
             schema::<AgentStartOptionsToolInput>(),
         );
     }
@@ -451,7 +454,7 @@ pub fn project_agent_model_tool_catalog(
         push(
             AgentModelToolName::StartAgent,
             AgentToolCapability::ChildStart,
-            "Start an agent using one identity and one execution profile from agent_start_options.",
+            "Start an Agent-turn in a permitted thread with authored input and a selected identity and execution profile. Use task_create for task delegation and attached subagents.",
             schema::<AgentStartToolInput>(),
         );
     }
@@ -609,17 +612,32 @@ mod tests {
                 .iter()
                 .any(|entry| entry.name == AgentModelToolName::SendMessage)
         );
+        let names = catalog
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"threads_start_options"));
+        assert!(names.contains(&"threads_turn_start"));
+        assert_eq!(
+            names
+                .iter()
+                .filter(|name| **name == "threads_start_options")
+                .count(),
+            1
+        );
+        assert!(!names.contains(&"agent_start_options"));
+        assert!(!names.contains(&"agent_start"));
     }
 
     #[test]
-    fn agent_start_options_accepts_no_model_controlled_selector() {
+    fn threads_start_options_accepts_no_model_controlled_selector() {
         let mut capabilities = BTreeSet::new();
         capabilities.insert(AgentToolCapability::ChildStart);
         let catalog = project_agent_model_tool_catalog(&capabilities, Some(&options()));
         let entry = catalog
             .iter()
             .find(|entry| entry.name == AgentModelToolName::AgentStartOptions)
-            .expect("agent_start_options should be projected");
+            .expect("threads_start_options should be projected");
         assert_eq!(
             entry.parameters.get("additionalProperties"),
             Some(&json!(false))

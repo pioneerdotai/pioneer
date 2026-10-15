@@ -6,7 +6,14 @@
 //! adapters.
 
 pub mod attachments;
+pub mod catalog;
+pub mod continuation;
+pub mod definition;
 pub mod factory;
+pub mod failure;
+pub mod file_tools;
+mod generation;
+pub mod history;
 mod http;
 pub mod providers;
 pub mod reasoning_registry;
@@ -14,6 +21,7 @@ pub mod registry;
 pub mod tools;
 pub mod traits;
 pub mod types;
+pub mod usage;
 
 pub use attachments::{
     ArtifactExternalRefCacheBackend, ArtifactExternalRefCachePolicy,
@@ -26,16 +34,31 @@ pub use attachments::{
     set_default_attachment_pipeline_config, store_uploaded_reference_for_authority,
     upload_registry_key_for_authority,
 };
+pub use definition::{
+    ProviderEndpointDefinition, provider_definition, provider_definitions, provider_is_available,
+    validate_provider_base_url,
+};
 pub use factory::create_provider;
+pub use file_tools::{
+    NATIVE_FILE_TOOL_SCHEMA_VERSION, NativeFileToolCapability, NativePatchPayload,
+    NativePatchWireShape, apply_patch_tool_schema, read_file_tool_schema,
+    select_native_file_tool_capability,
+};
 pub use http::validate_proxy_url;
-pub use registry::{ProviderAuthorityFingerprint, ProviderRegistry};
-pub use traits::Provider;
+pub use registry::{
+    ProviderAuthorityFingerprint, ProviderAuthorityRevoked, ProviderRegistry,
+    ProviderRegistryCapacityExceeded, ProviderRegistryDefinitionCapacityExceeded,
+    ProviderRegistryLimits, ProviderRegistryStats,
+};
+pub use traits::{Provider, ProviderWarmupOutcome};
 pub use types::{
     AttachmentArtifactContext, AttachmentDataSource, CanonicalProviderRoundEnvelope, ChatMessage,
     ChatRequest, ChatResponse, CompiledPromptPayload, EmbeddingRequest, EmbeddingResponse,
-    InputContentType, InputTypeSupport, MessageAttachment, MessageContentPart, ModelInputItem,
+    InputContentType, InputTypeSupport, MessageAttachment, MessageContentPart, MessageProvenance,
+    MessageSourceAlias, MessageSourceIdentity, MessageSourceRef, ModelInputItem,
     ProviderCallIdentity, ProviderCapabilities, ProviderFailureClassification,
-    ProviderInputCapabilities, ProviderReplayState, ProviderTermination, ProviderTimeoutPolicy,
-    ProviderToolCall, ReasoningConfig, ReasoningEffort, Role, StreamChunk, TokenUsage, ToolChoice,
-    ToolDefinition,
+    ProviderHttpErrorBodyTooLarge, ProviderInputCapabilities, ProviderReplayState,
+    ProviderResponseLimits, ProviderResponseTooLarge, ProviderStream, ProviderStreamDiagnostics,
+    ProviderTermination, ProviderTimeoutPolicy, ProviderToolCall, ReasoningConfig, ReasoningEffort,
+    Role, StreamChunk, TokenUsage, ToolChoice, ToolDefinition,
 };

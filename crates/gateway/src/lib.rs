@@ -4,14 +4,6 @@
 //! providers continue through `pioneer-agent`, while local `CLIAgentRuntime`
 //! executions are routed through `pioneer-cli-agent-runtime`.
 
-/// Native stack reserved for each Gateway Tokio worker.
-///
-/// Gateway message and Task workflows compose large generated async poll
-/// frames. Keep the production runtime aligned with the stack contract used by
-/// the Gateway message-test runtime instead of relying on Tokio's smaller
-/// platform default.
-pub const GATEWAY_WORKER_STACK_SIZE_BYTES: usize = 8 * 1024 * 1024;
-
 mod administrative_audit;
 mod artifact_delivery;
 mod artifact_prompt_refs;
@@ -24,6 +16,7 @@ pub mod claude_mcp_conformance;
 pub mod cli_mcp_client_validation;
 mod cli_runtime;
 pub mod codex_mcp_conformance;
+pub(crate) mod compaction;
 mod database;
 mod epic5_observability;
 mod helpers;
@@ -33,6 +26,7 @@ mod human_interaction;
 mod identity;
 mod invitation;
 mod keep_awake;
+mod mcp_oauth;
 mod mcp_secrets;
 mod mcp_service;
 mod member;
@@ -41,7 +35,9 @@ mod memory_runtime;
 mod memory_tools;
 mod message;
 mod operations;
+mod patch_history_observer;
 mod permissions;
+mod post_startup;
 mod profile_avatar;
 mod prompt_hooks;
 mod public_error;
@@ -61,11 +57,12 @@ mod thread;
 mod thread_episodic;
 mod thread_episodic_embedding;
 mod thread_episodic_hooks;
-mod tokenizer;
+mod thread_file_delivery;
 mod transport;
 mod turn_mcp;
 mod turn_runtime_snapshot;
 mod turn_security;
+mod usage_journal;
 mod view_grants;
 mod voice;
 mod workspace;
@@ -81,6 +78,7 @@ use pioneer_crud::CrudStore;
 use pioneer_hooks::HookAwaitPolicy;
 use pioneer_memory::hooks::{MemoryActiveRecallMode, MemoryLoopConfig};
 use pioneer_protocol::AuthDeviceCreateResponse;
+use pioneer_protocol::GatewayReadinessStatus;
 use pioneer_provider::{
     ArtifactExternalRefCachePolicy, AttachmentCircuitBreakerPolicy, AttachmentNormalizationPolicy,
     AttachmentPipelineConfig, AttachmentRetryPolicy, AttachmentRuntimePolicy,
@@ -105,8 +103,8 @@ use crate::database::initialize_with_startup as initialize_database;
 use crate::identity::bootstrap_identity;
 use crate::mcp_secrets::garbage_collection_orphan_mcp_secrets;
 use crate::memory_runtime::GatewayMemoryRuntime;
+use crate::message::SummaryConfig;
 use crate::message::now_timestamp_secs;
-use crate::message::{ContextBudget, SummaryConfig};
 use crate::message::{MessageProcessor, MessageProcessorResilienceConfig};
 use crate::secrets::GatewaySecrets;
 use crate::self_improvement::supervisor::SelfImprovementSupervisor;
@@ -116,7 +114,7 @@ use crate::thread_episodic::{
     ThreadEpisodicIndexExecutorConfig, ThreadEpisodicRecallServiceConfig,
     ThreadEpisodicRuntimeConfig,
 };
-use crate::transport::spawn_server;
+use crate::transport::{ReadinessDegradation, spawn_server};
 use crate::voice::model_catalog::voice_model_catalog;
 use crate::voice::supervisor::{
     EagerVoiceEngineLoader, FilesystemVoiceModelInstaller, VoiceEngineLoader,
@@ -136,6 +134,21 @@ pub use crate::settings::{
 };
 
 const HOME_DIRECTORY_TOKEN: &str = "{homeDirectory}";
+const GATEWAY_WORKER_STACK_SIZE: usize = 8 * 1024 * 1024;
+
+/// Builds the multi-thread runtime used by every Gateway executable.
+///
+/// The Gateway composes several legitimate, non-recursive async state machines
+/// (authorization, persistence, projection, and SQL execution). Their combined
+/// poll stack can exceed Tokio's 2 MiB default in debug builds, so the runtime
+/// uses a bounded 8 MiB worker stack. Keeping this policy here prevents the
+/// standalone and service entry points from drifting apart.
+pub fn build_gateway_runtime() -> std::io::Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(GATEWAY_WORKER_STACK_SIZE)
+        .build()
+}
 
 fn create_voice_input_supervisor(
     installer: Arc<dyn VoiceModelInstaller>,
@@ -202,6 +215,7 @@ async fn run_gateway_until_shutdown_inner(
     config = gateway_settings.apply_to_app_config(config);
     settings_stage.succeed();
     pioneer_observability::set_telemetry_enabled(config.gateway.telemetry.enabled);
+    startup.bind_consent();
     let observability_stage =
         startup.stage(pioneer_observability::GatewayStartupStage::ObservabilityInit);
     match pioneer_observability::init_otlp_observability(
@@ -211,6 +225,7 @@ async fn run_gateway_until_shutdown_inner(
             export_interval: Duration::from_millis(config.gateway.telemetry.export_interval_ms),
             export_timeout: Duration::from_millis(config.gateway.telemetry.export_timeout_ms),
             deployment_environment: None,
+            service_version: None,
         },
     ) {
         Ok(()) => observability_stage.succeed(),
@@ -301,7 +316,7 @@ async fn run_gateway_until_shutdown_inner(
             "stale auth sessions were expired before auth readiness"
         );
     }
-    ensure_auth_readiness(&database, identity_snapshot.as_ref())
+    ensure_auth_readiness(&database.maintenance(), identity_snapshot.as_ref())
         .await
         .context("Gateway auth readiness failed")?;
     match gateway_secrets.purge_retired_superuser_jwt_tokens() {
@@ -363,7 +378,7 @@ async fn run_gateway_until_shutdown_inner(
         &agent_identity_settings,
     )?;
     pioneer_crud::sync_cli_runtime_identity_catalog(
-        &database,
+        &database.maintenance(),
         agent_identity_catalog.as_slice(),
         chrono::Utc::now().fixed_offset(),
     )
@@ -372,10 +387,20 @@ async fn run_gateway_until_shutdown_inner(
     database::startup::enforce_execution_authority_integrity(crud_store.as_ref())
         .await
         .context("Gateway execution authority integrity gate failed")?;
+    // No MessageProcessor, listener or resilience worker exists yet. Every
+    // running episodic claim belongs to the previous runtime, regardless of
+    // timestamps (including claims in this same Unix second).
+    database::startup::recover_inherited_thread_episodic_jobs(
+        crud_store.as_ref(),
+        config.gateway.thread_episodic.max_attempts,
+    )
+    .await
+    .context("failed to recover inherited episodic index claims before runtime admission")?;
     let thread_manager = Arc::new(ThreadManager::from_app_config(&config));
 
+    let maintenance_workspace_manager = workspace_manager.with_database(database.maintenance());
     migrate_legacy_provider_api_keys_to_current_workspace(
-        workspace_manager.as_ref(),
+        &maintenance_workspace_manager,
         gateway_secrets.as_ref(),
     )
     .await;
@@ -426,39 +451,57 @@ async fn run_gateway_until_shutdown_inner(
         config.gateway.provider.max_stream_duration_secs,
     );
 
-    let provider_registry = Arc::new(ProviderRegistry::new_scoped_with_timeout_policy_and_proxy(
-        {
-            let gateway_secrets = gateway_secrets.clone();
-            move |workspace_id, provider_name| {
-                workspace_id
-                    .map(|workspace_id| {
-                        gateway_secrets
-                            .resolve_workspace_provider_api_key(workspace_id, provider_name)
-                    })
-                    .unwrap_or_else(|| gateway_secrets.resolve_provider_api_key(provider_name))
-            }
-        },
-        {
-            let gateway_secrets = gateway_secrets.clone();
-            move |workspace_id, provider_name| {
-                workspace_id.and_then(|workspace_id| {
-                    gateway_secrets.resolve_workspace_provider_proxy(workspace_id, provider_name)
-                })
-            }
-        },
-        provider_timeout_policy,
-    ));
+    let provider_registry = Arc::new(
+        ProviderRegistry::new_scoped_fallible_with_timeout_policy_proxy_and_base_url(
+            {
+                let gateway_secrets = gateway_secrets.clone();
+                move |workspace_id, provider_name| {
+                    if crate::secrets::is_local_provider(provider_name) {
+                        return Ok(String::new());
+                    }
+                    match workspace_id {
+                        Some(workspace_id) => Ok(gateway_secrets
+                            .get_workspace_provider_api_key(workspace_id, provider_name)?
+                            .unwrap_or_default()),
+                        None => Ok(gateway_secrets
+                            .get_provider_api_key(provider_name)?
+                            .unwrap_or_default()),
+                    }
+                }
+            },
+            {
+                let gateway_secrets = gateway_secrets.clone();
+                move |workspace_id, provider_name| {
+                    workspace_id
+                        .map(|workspace_id| {
+                            gateway_secrets
+                                .get_workspace_provider_proxy(workspace_id, provider_name)
+                        })
+                        .transpose()
+                        .map(Option::flatten)
+                }
+            },
+            {
+                let gateway_secrets = gateway_secrets.clone();
+                move |workspace_id, provider_name| {
+                    workspace_id
+                        .map(|workspace_id| {
+                            gateway_secrets
+                                .get_workspace_provider_base_url(workspace_id, provider_name)
+                        })
+                        .transpose()
+                        .map(Option::flatten)
+                }
+            },
+            provider_timeout_policy,
+        ),
+    );
 
     let summary_config = SummaryConfig {
         summary_model: config.gateway.thread.summary_model.clone(),
         summary_model_provider: config.gateway.thread.summary_model_provider.clone(),
         title_model: config.gateway.thread.title_model.clone(),
         title_model_provider: config.gateway.thread.title_model_provider.clone(),
-    };
-
-    let context_budget = ContextBudget {
-        max_context_tokens: config.gateway.thread.max_context_tokens,
-        response_reserve_tokens: config.gateway.thread.response_reserve_tokens,
     };
 
     let web_cfg = &config.gateway.tools.web;
@@ -743,7 +786,6 @@ async fn run_gateway_until_shutdown_inner(
         crud_store.clone(),
         gateway_secrets.clone(),
         summary_config,
-        context_budget,
         tool_loop_config,
         memory_runtime,
         runtime_home.clone(),
@@ -760,6 +802,7 @@ async fn run_gateway_until_shutdown_inner(
     )
     .with_cli_mcp_limits(cli_mcp_limits)
     .with_invitation_gateway_base_url(invitation_gateway_base_url);
+    message_processor.apply_workspace_compaction_settings(&gateway_settings)?;
     let cli_runtime_manager = build_cli_runtime_manager(
         &runtime_home,
         &config,
@@ -781,13 +824,12 @@ async fn run_gateway_until_shutdown_inner(
         message_processor.with_remote_access_supervisor(remote_access_supervisor.clone());
     message_processor = message_processor.with_auth_service(auth_service.clone());
     let message_processor = Arc::new(message_processor);
-    services_initialize_stage.succeed();
-    let agent_domain_upgrade_stage =
-        startup.stage(pioneer_observability::GatewayStartupStage::AgentDomainUpgrade);
-    database::startup::upgrade_agent_domain_data(message_processor.as_ref())
+    message_processor.bind_context_compaction().await;
+    message_processor
+        .initialize_authorization_generation()
         .await
-        .context("failed to complete the blocking Agent domain data upgrade")?;
-    agent_domain_upgrade_stage.succeed();
+        .context("failed to initialize durable authorization policy generation")?;
+    services_initialize_stage.succeed();
     let services_prepare_stage =
         startup.stage(pioneer_observability::GatewayStartupStage::ServicesPrepare);
     auth_service.set_invitation_accept_post_commit_hook(message_processor.clone());
@@ -805,6 +847,11 @@ async fn run_gateway_until_shutdown_inner(
     let remote_access_config = config.gateway.remote_access.clone();
     let startup_thread_episodic_vector_search_config =
         config.gateway.thread_episodic.vector_search.clone();
+    let startup_thread_episodic_indexing_enabled =
+        config.gateway.thread_episodic.enabled && config.gateway.thread_episodic.indexing_enabled;
+    let startup_thread_episodic_index_executor_config =
+        thread_episodic_runtime_config_from_gateway_config(&config.gateway.thread_episodic)
+            .index_executor;
     let telemetry_shutdown_timeout =
         Duration::from_millis(config.gateway.telemetry.export_timeout_ms);
     services_prepare_stage.succeed();
@@ -822,48 +869,223 @@ async fn run_gateway_until_shutdown_inner(
     let services_start_stage =
         startup.stage(pioneer_observability::GatewayStartupStage::ServicesStart);
     let services_start_result: Result<()> = async {
+        let stage =
+            startup.stage(pioneer_observability::GatewayStartupStage::ServicesVoiceInputStart);
         start_voice_input_supervisor(&voice_input_supervisor, voice_input_desired_state)?;
-        self_improvement_supervisor
-            .start()
-            .await
-            .context("failed to start self-improvement supervisor")?;
+        stage.succeed();
+
+        let stage =
+            startup.stage(pioneer_observability::GatewayStartupStage::ServicesNotificationsStart);
         message_processor.start_remote_access_status_notifications();
         message_processor.start_voice_input_status_notifications();
         message_processor.start_thread_episodic_vector_refill_status_notifications();
-        message_processor.start_resilience_workers().await;
-        message_processor.start_mcp_workspace_supervisor().await;
-        message_processor.start_skills_watcher().await;
-        // Long-running migrations and backfills start only after the Gateway listener exists.
-        database::startup::spawn(
-            message_processor.clone(),
-            message_processor.crud_store.clone(),
-            thread_episodic_storage_root.clone(),
-            startup_thread_episodic_vector_search_config,
-            thread_episodic_workspace_vector_search_configs.clone(),
-            provider_registry.clone(),
-            runtime_home.clone(),
-            Some(message_processor.thread_episodic_vector_refill_status_sender()),
-            message_processor.thread_episodic_workspace_refill_supervisor(),
-            context_compaction_timeout_config,
-        );
-        database::maintenance::spawn(message_processor.crud_store.clone());
-        remote_access_supervisor
-            .apply(remote_access_desired_state(
-                &remote_access_config,
-                &gateway_settings,
-                gateway_secrets.as_ref(),
-            )?)
-            .await
-            .context("failed to apply initial remote access settings")?;
+        stage.succeed();
 
         Ok(())
     }
     .await;
+    let post_message_processor = message_processor.clone();
+    let post_crud_store = message_processor.crud_store.clone();
+    let post_self_improvement_supervisor = self_improvement_supervisor.clone();
+    let post_remote_access_supervisor = remote_access_supervisor.clone();
+    let post_remote_access_config = remote_access_config.clone();
+    let post_gateway_settings = gateway_settings.clone();
+    let post_gateway_secrets = gateway_secrets.clone();
+    let post_thread_episodic_storage_root = thread_episodic_storage_root.clone();
+    let post_workspace_vector_search_configs =
+        thread_episodic_workspace_vector_search_configs.clone();
+    let post_provider_registry = provider_registry.clone();
+    let post_runtime_home = runtime_home.clone();
+    let post_readiness = handle.readiness_state();
+    let mut post_startup = None;
     let runtime_result = match services_start_result {
         Ok(()) => {
             services_start_stage.succeed();
+            let catalog_directory = runtime_home.join("providers").join("models");
+            match gateway_secrets.get_model_catalog_proxy() {
+                Ok(proxy_url) => {
+                    if let Err(error) =
+                        pioneer_provider::catalog::runtime::configure_refresh_proxy(proxy_url)
+                    {
+                        warn!(
+                            error = %format!("{error:#}"),
+                            "stored model catalog proxy is invalid; using direct transport"
+                        );
+                    }
+                }
+                Err(error) => warn!(
+                    error = %format!("{error:#}"),
+                    "model catalog proxy unavailable; using direct transport"
+                ),
+            }
+            let restore_directory = catalog_directory.clone();
+            match tokio::task::spawn_blocking(move || {
+                pioneer_provider::catalog::runtime::restore_or_install_catalog(
+                    restore_directory.as_path(),
+                )
+            })
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => warn!(
+                    error = %format!("{error:#}"),
+                    "model catalog bootstrap unavailable; background refresh will retry"
+                ),
+                Err(error) => warn!(
+                    error = %format!("{error:#}"),
+                    "model catalog bootstrap task failed; background refresh will retry"
+                ),
+            }
+            // Schema, identity, authorization and the fast in-process service
+            // bindings are complete. Clients may now authenticate while the
+            // single owned post-startup pipeline brings optional subsystems
+            // online without competing background jobs.
+            handle.set_readiness(GatewayReadinessStatus::AcceptingSessions);
             startup.finish_success();
             info!(listen_addr = %handle.local_addr(), "gateway daemon started");
+            post_startup = Some(post_startup::PostStartupSupervisor::start(
+                move |scope| async move {
+                    let cancellation = scope.cancellation();
+                    let catalog_directory = post_runtime_home.join("providers").join("models");
+                    let catalog_cancellation = cancellation.clone();
+                    scope.spawn(async move {
+                        pioneer_provider::catalog::runtime::run_catalog_updates(
+                            catalog_directory,
+                            catalog_cancellation,
+                        )
+                        .await;
+                    });
+                    // Resilience owns an independent, joined retry loop. A
+                    // persistent repair/runtime failure must be visible in
+                    // readiness, but must not head-of-line block unrelated
+                    // providers, MCP, remote access, or database maintenance.
+                    let resilience_message_processor = post_message_processor.clone();
+                    let resilience_cancellation = cancellation.clone();
+                    let resilience_readiness = post_readiness.clone();
+                    scope.spawn(async move {
+                        let readiness_updates = resilience_readiness.clone();
+                        let result = tokio::select! {
+                            _ = resilience_cancellation.cancelled() => return,
+                            result = resilience_message_processor.start_resilience_workers_with_cancellation(
+                                &resilience_cancellation,
+                                move |degraded| {
+                                    readiness_updates
+                                        .set_degraded(ReadinessDegradation::Resilience, degraded);
+                                },
+                            ) => result,
+                        };
+                        if let Err(error) = result
+                            && !resilience_cancellation.is_cancelled()
+                        {
+                            resilience_readiness
+                                .set_degraded(ReadinessDegradation::Resilience, true);
+                            warn!(error = %format!("{error:#}"), "resilience retry worker stopped");
+                        }
+                    });
+
+                    let self_improvement_result = tokio::select! {
+                        _ = cancellation.cancelled() => return,
+                        result = post_self_improvement_supervisor.start() => result,
+                    };
+                    if let Err(error) = self_improvement_result {
+                        warn!(error = %format!("{error:#}"), "failed to start self-improvement supervisor");
+                        post_readiness.set_degraded(ReadinessDegradation::SelfImprovement, true);
+                    }
+
+                    // MCP has its own owned retry loop. A broken workspace must
+                    // degrade MCP readiness without head-of-line blocking
+                    // skills, providers, remote access, or DB maintenance.
+                    let mcp_message_processor = post_message_processor.clone();
+                    let mcp_cancellation = cancellation.clone();
+                    let mcp_readiness = post_readiness.clone();
+                    scope.spawn(async move {
+                        let readiness_updates = mcp_readiness.clone();
+                        let result = tokio::select! {
+                            _ = mcp_cancellation.cancelled() => return,
+                            result = mcp_message_processor.initialize_mcp_workspaces_with_retry(
+                                &mcp_cancellation,
+                                move |degraded| {
+                                    readiness_updates.set_degraded(
+                                        ReadinessDegradation::Mcp,
+                                        degraded,
+                                    );
+                                },
+                            ) => result,
+                        };
+                        if let Err(error) = result
+                            && !mcp_cancellation.is_cancelled()
+                        {
+                            mcp_readiness.set_degraded(ReadinessDegradation::Mcp, true);
+                            warn!(error = %format!("{error:#}"), "MCP workspace retry worker stopped");
+                        }
+                    });
+                    tokio::select! {
+                        _ = cancellation.cancelled() => return,
+                        _ = post_message_processor.start_skills_watcher() => {}
+                    }
+
+                    match remote_access_desired_state(
+                        &post_remote_access_config,
+                        &post_gateway_settings,
+                        post_gateway_secrets.as_ref(),
+                    ) {
+                        Ok(desired) => {
+                            let result = tokio::select! {
+                                _ = cancellation.cancelled() => return,
+                                result = post_remote_access_supervisor.apply(desired) => result,
+                            };
+                            if let Err(error) = result {
+                                warn!(error = %format!("{error:#}"), "failed to apply initial remote access settings");
+                                post_readiness
+                                    .set_degraded(ReadinessDegradation::RemoteAccess, true);
+                            }
+                        }
+                        Err(error) => {
+                            warn!(error = %format!("{error:#}"), "failed to resolve initial remote access state");
+                            post_readiness.set_degraded(ReadinessDegradation::RemoteAccess, true);
+                        }
+                    }
+
+                    tokio::select! {
+                        _ = cancellation.cancelled() => return,
+                        _ = post_message_processor.start_provider_readiness_supervisor() => {}
+                    }
+                    post_readiness.set_status(GatewayReadinessStatus::Operational);
+
+                    // Phase 2: post-startup maintenance is best-effort and
+                    // cooperative. It runs only after the operational runtime
+                    // exists and is the sole owner of periodic database
+                    // maintenance afterwards.
+                    // Poll cooperative maintenance through its FS join. Dropping
+                    // this future on cancellation would finish the refill lease
+                    // while its blocking capsule write is still running.
+                    let maintenance = database::startup::run(
+                        post_crud_store.clone(),
+                        startup_thread_episodic_indexing_enabled,
+                        startup_thread_episodic_index_executor_config,
+                        post_thread_episodic_storage_root,
+                        startup_thread_episodic_vector_search_config,
+                        post_workspace_vector_search_configs,
+                        post_provider_registry,
+                        post_runtime_home,
+                        Some(post_message_processor.thread_episodic_vector_refill_status_sender()),
+                        post_message_processor.thread_episodic_workspace_refill_supervisor(),
+                        cancellation.clone(),
+                    )
+                    .await;
+                    if let Err(error) = maintenance {
+                        if cancellation.is_cancelled() {
+                            return;
+                        }
+                        warn!(error = %format!("{error:#}"), "post-startup database maintenance ended early");
+                        post_readiness
+                            .set_degraded(ReadinessDegradation::DatabaseMaintenance, true);
+                    }
+                    // Workers observe cancellation themselves. Keep polling them
+                    // so shutdown joins an already-started bounded zstd CPU batch.
+                    database::maintenance::run(post_crud_store, cancellation.clone()).await;
+                },
+            ));
             wait_for_shutdown_signal().await
         }
         Err(error) => {
@@ -874,8 +1096,42 @@ async fn run_gateway_until_shutdown_inner(
     };
 
     info!("gateway daemon stopping with telemetry snapshot");
+    handle.set_readiness(GatewayReadinessStatus::Starting);
+    message_processor
+        .shutdown_thread_episodic_index_runner()
+        .await;
+    if let Some(post_startup) = post_startup.as_mut() {
+        post_startup.shutdown().await;
+    }
+    message_processor
+        .thread_episodic_workspace_refill_supervisor()
+        .shutdown()
+        .await;
+    message_processor
+        .shutdown_provider_readiness_supervisor()
+        .await;
+    message_processor.shutdown_skills_watcher().await;
+    message_processor.shutdown_resilience_workers().await;
+    let patch_telemetry = pioneer_tools::apply_patch::patch_telemetry().snapshot();
+    info!(
+        calls = patch_telemetry.calls,
+        applied = patch_telemetry.applied,
+        partial = patch_telemetry.partial,
+        rejected = patch_telemetry.rejected,
+        failed = patch_telemetry.failed,
+        uncertain = patch_telemetry.uncertain,
+        committed_changes = patch_telemetry.committed_changes,
+        committed_bytes = patch_telemetry.committed_bytes,
+        exact_reports = patch_telemetry.exact_reports,
+        inexact_reports = patch_telemetry.inexact_reports,
+        pending_tracking = patch_telemetry.pending_tracking,
+        tracker_publication_failures = patch_telemetry.tracker_publication_failures,
+        duplicate_suppressions = patch_telemetry.duplicate_suppressions,
+        "gateway daemon stopping with apply_patch telemetry snapshot"
+    );
     message_processor.shutdown_remote_access_supervisor().await;
     let server_shutdown_result = handle.shutdown().await;
+    message_processor.shutdown_voice_finalizations().await;
     message_processor.shutdown_cli_runtime_manager().await;
     message_processor.shutdown_mcp_service().await;
     self_improvement_supervisor.shutdown().await;
@@ -1791,3 +2047,18 @@ mod runtime_tests {
         );
     }
 }
+
+/// Unit-test configuration is the embedded baseline only. The copied local.toml
+/// and the user's configuration/environment must not supply test credentials.
+#[cfg(test)]
+pub(crate) fn isolated_test_app_config() -> anyhow::Result<pioneer_config::AppConfig> {
+    Ok(toml::from_str(include_str!(
+        "../../../config/default.toml"
+    ))?)
+}
+
+#[cfg(test)]
+pub(crate) mod media_test_fixtures;
+
+#[cfg(test)]
+mod provider_media_regression_tests;

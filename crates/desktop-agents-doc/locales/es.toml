@@ -1,0 +1,24 @@
+[editor.agents_doc]
+title = "AGENTS.md"
+loading = "Cargando AGENTS.md..."
+load_error = "No se pudo cargar AGENTS.md"
+retry = "Reintentar"
+retry_save = "Reintentar guardado"
+save_conflict = "AGENTS.md cambió en otro lugar. Recarga o reintenta después de resolver el conflicto."
+save_conflict_missing_remote = "AGENTS.md cambió en otro lugar, pero no se pudo cargar el documento remoto."
+
+[editor.agents_doc.conflict]
+title = "Conflicto de AGENTS.md"
+description = "El documento remoto cambió antes de que esta edición pudiera guardarse."
+reload_remote = "Recargar remoto"
+overwrite_remote = "Sobrescribir remoto"
+local = "Local"
+remote = "Remoto"
+
+[editor.agents_doc.save_state]
+clean = "Sin cambios sin guardar"
+dirty = "Cambios sin guardar"
+saving = "Guardando..."
+saved = "Guardado"
+error = "Error al guardar: %{message}"
+conflict = "Resuelve el conflicto antes de guardar"

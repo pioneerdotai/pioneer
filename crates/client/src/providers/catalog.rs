@@ -28,17 +28,13 @@ pub const PROVIDER_CATALOG: &[ProviderCatalogEntry] = &[
     ProviderCatalogEntry::new("copilot", &["github-copilot"]),
     ProviderCatalogEntry::new("deepseek", &[]),
     ProviderCatalogEntry::new("gemini", &["google", "google-gemini"]),
+    ProviderCatalogEntry::new("glm", &["zhipu", "bigmodel", "glm-cn", "zhipu-cn"]),
+    ProviderCatalogEntry::new("zai", &["glm-global", "zhipu-global", "z.ai", "z-ai"]),
     ProviderCatalogEntry::new(
-        "glm",
-        &[
-            "zhipu",
-            "bigmodel",
-            "glm-global",
-            "zhipu-global",
-            "glm-cn",
-            "zhipu-cn",
-        ],
+        "glm-coding",
+        &["glm-coding-cn", "zhipu-coding", "zai-coding-cn"],
     ),
+    ProviderCatalogEntry::new("zai-coding", &["glm-coding-global", "zai-coding-plan"]),
     ProviderCatalogEntry::new("groq", &[]),
     ProviderCatalogEntry::new("litellm", &["lite-llm"]),
     ProviderCatalogEntry::new("mistral", &[]),
@@ -110,6 +106,14 @@ mod tests {
         assert_eq!(canonical_provider_id("google-gemini"), "gemini");
         assert_eq!(canonical_provider_id("lm_studio"), "lmstudio");
         assert_eq!(canonical_provider_id("custom provider"), "customprovider");
+        for alias in ["glm", "zhipu", "bigmodel", "glm-cn", "zhipu-cn"] {
+            assert_eq!(canonical_provider_id(alias), "glm");
+        }
+        for alias in ["glm-global", "zhipu-global", "z.ai", "z-ai"] {
+            assert_eq!(canonical_provider_id(alias), "zai");
+        }
+        assert_eq!(canonical_provider_id("zai-coding-cn"), "glm-coding");
+        assert_eq!(canonical_provider_id("zai-coding-plan"), "zai-coding");
     }
 
     #[test]

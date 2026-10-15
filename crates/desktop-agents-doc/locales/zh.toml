@@ -1,0 +1,24 @@
+[editor.agents_doc]
+title = "AGENTS.md"
+loading = "正在加载 AGENTS.md..."
+load_error = "无法加载 AGENTS.md"
+retry = "重试"
+retry_save = "重试保存"
+save_conflict = "AGENTS.md 已在其他位置更改。请重新加载或解决冲突后重试。"
+save_conflict_missing_remote = "AGENTS.md 已在其他位置更改，但无法加载远程文档。"
+
+[editor.agents_doc.conflict]
+title = "AGENTS.md 冲突"
+description = "保存此次编辑之前，远程文档已更改。"
+reload_remote = "重新加载远程"
+overwrite_remote = "覆盖远程"
+local = "本地"
+remote = "远程"
+
+[editor.agents_doc.save_state]
+clean = "没有未保存的更改"
+dirty = "有未保存的更改"
+saving = "正在保存..."
+saved = "已保存"
+error = "保存失败：%{message}"
+conflict = "保存前请先解决冲突"

@@ -5,22 +5,43 @@ on:
   push:
     tags:
       - "*"
-  pull_request:
-    paths:
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "crates/desktop/**"
-      - "crates/desktop-updater/**"
-      - "crates/cli/**"
-      - "scripts/packaging/desktop/**"
-      - ".github/workflows/release-app.yml"
 
 permissions:
   contents: write
 
 jobs:
+  generate-model-catalog:
+    name: generate-model-catalog
+    runs-on: ubuntu-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.sha }}
+          submodules: recursive
+
+      - name: setup-rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: generate-and-validate-model-catalog
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-model-catalog
+          cargo run --locked --release -p pioneer-provider --bin pioneer-model-catalog -- \
+            release-model-catalog/catalog.json
+
+      - name: upload-model-catalog
+        uses: actions/upload-artifact@v6
+        with:
+          name: pioneer-release-model-catalog
+          path: release-model-catalog/catalog.json
+          if-no-files-found: error
+
   package-desktop:
     name: package-${{ matrix.target }}
+    needs: generate-model-catalog
     runs-on: ${{ matrix.os }}
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
@@ -28,6 +49,7 @@ jobs:
       PIONEER_DESKTOP_SENTRY_DSN: ${{ secrets.PIONEER_DESKTOP_SENTRY_DSN }}
       PIONEER_SENTRY_ENVIRONMENT: production
       PIONEER_APP_URL_SCHEME: pioneer
+      PIONEER_BUNDLED_MODEL_CATALOG: ${{ github.workspace }}/release-model-catalog/catalog.json
     timeout-minutes: 90
     strategy:
       fail-fast: false
@@ -80,6 +102,12 @@ jobs:
           ref: ${{ github.sha }}
           submodules: recursive
 
+      - name: download-model-catalog
+        uses: actions/download-artifact@v7
+        with:
+          name: pioneer-release-model-catalog
+          path: release-model-catalog
+
       - name: setup-rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -103,6 +131,7 @@ jobs:
             libegl1-mesa-dev \
             libfontconfig-dev \
             libfreetype6-dev \
+            libwebkit2gtk-4.1-dev \
             libx11-dev \
             libxcb-shape0-dev \
             libxcb-xfixes0-dev \
@@ -489,7 +518,9 @@ jobs:
             prerelease_flag="--prerelease"
           fi
 
-          gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1 || \
-            gh release create "${GITHUB_REF_NAME}" --title "${GITHUB_REF_NAME}" ${prerelease_flag} || true
+          if ! gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            gh release create "${GITHUB_REF_NAME}" --title "${GITHUB_REF_NAME}" \
+              --draft ${prerelease_flag} || gh release view "${GITHUB_REF_NAME}" >/dev/null
+          fi
 
           gh release upload "${GITHUB_REF_NAME}" "${files[@]}" --clobber

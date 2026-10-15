@@ -38,6 +38,8 @@ pub enum RuntimeTimeoutObservation {
     Active,
     Terminal,
     Unavailable,
+    /// Another owner is transitioning this session; no timeout evidence.
+    Deferred,
 }
 
 pub const fn hard_deadline_mode(
@@ -358,6 +360,13 @@ impl TimeoutSupervisor {
         Self {
             crud_store,
             policy_registry,
+        }
+    }
+
+    pub(crate) fn with_crud_store(&self, crud_store: Arc<CrudStore>) -> Self {
+        Self {
+            crud_store,
+            policy_registry: self.policy_registry.clone(),
         }
     }
 
