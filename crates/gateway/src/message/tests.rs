@@ -2169,7 +2169,7 @@ async fn capability_persistence_order_impl() {
         );
         let committed_capabilities = timeout(Duration::from_secs(1), committed_rx.recv())
             .await
-            .expect("committed empty MCP capability event should arrive")
+            .expect("committed MCP capability event should arrive")
             .expect("committed lane should stay open");
         assert!(matches!(
             committed_capabilities,
@@ -2182,7 +2182,12 @@ async fn capability_persistence_order_impl() {
             } if committed_turn_id == turn_id
                 && accepted.is_empty()
                 && rejected.is_empty()
-                && mcp_bindings.is_empty()
+                && mcp_bindings.len() == 2
+                && mcp_bindings.iter().all(|binding| {
+                    binding.server_installation_id == pioneer_tools::html::HTML_SERVER_ID
+                })
+                && mcp_bindings.iter().map(|binding| binding.raw_tool_name.as_str())
+                    .eq(["html_preview", "html_render"])
         ));
         let committed_skills = timeout(Duration::from_secs(1), committed_rx.recv())
             .await
@@ -30515,7 +30520,10 @@ async fn detached_native_tasks_keep_the_parent_cli_continuation_impl() {
             test_summary_config(),
             test_tool_loop_config(),
         )
-        .with_cli_runtime_manager_for_tests(cli_manager.clone()),
+        .with_cli_runtime_manager_for_tests(cli_manager.clone())
+        .with_cli_mcp_readiness_override_for_tests(supported_test_cli_mcp_readiness(
+            CLIAgentRuntimeKind::Codex,
+        )),
     ));
     processor
         .mark_cli_runtimes_ready_for_tests(workspace_id.as_str())

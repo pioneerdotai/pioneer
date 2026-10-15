@@ -213,7 +213,7 @@ fn row_sources_keep_the_approved_element_and_no_optional_reuse_mechanisms() {
         .split("impl Element for MarkdownLinkText {")
         .nth(1)
         .unwrap()
-        .split("#[derive(IntoElement)]")
+        .split("#[derive(gpui_kit::IntoElement)]")
         .next()
         .unwrap();
     for forbidden in [
