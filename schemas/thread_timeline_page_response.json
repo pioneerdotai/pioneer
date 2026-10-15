@@ -469,6 +469,39 @@
         "inaccessible"
       ]
     },
+    "HtmlPublication": {
+      "description": "An exact Gateway-created HTML publication. Generic HTML attachments never\nacquire this descriptor based on MIME alone.",
+      "type": "object",
+      "properties": {
+        "artifact": {
+          "$ref": "#/$defs/ArtifactRef"
+        },
+        "callId": {
+          "type": "string"
+        },
+        "threadId": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        },
+        "turnId": {
+          "type": "string"
+        },
+        "workspaceId": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "workspaceId",
+        "threadId",
+        "turnId",
+        "callId",
+        "title",
+        "artifact"
+      ]
+    },
     "MarkdownBlock": {
       "oneOf": [
         {
@@ -1287,6 +1320,13 @@
                 }
               ]
             },
+            "htmlPublications": {
+              "description": "Exact HTML content of this canonical response; source ownership is unchanged.",
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/HtmlPublication"
+              }
+            },
             "itemId": {
               "type": "string"
             },
@@ -1748,6 +1788,12 @@
           "type": "integer",
           "format": "uint64",
           "minimum": 0
+        },
+        "htmlPublications": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/HtmlPublication"
+          }
         },
         "lastWorkItemId": {
           "type": [

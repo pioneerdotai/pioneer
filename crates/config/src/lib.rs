@@ -3867,7 +3867,12 @@ request_timeout_ms = 60000
                 .expect("load config with default CLI runtimes enabled");
         let instances = config.gateway.effective_cli_agent_runtime_instances();
 
-        assert_eq!(instances.len(), 2);
+        assert_eq!(instances.len(), 3);
+        assert_eq!(
+            instances[2].kind,
+            GatewayCliAgentRuntimeKindConfig::OpenCode
+        );
+        assert_eq!(instances[2].id, "opencode");
         assert_eq!(instances[0].id, "codex");
         assert_eq!(instances[0].kind, GatewayCliAgentRuntimeKindConfig::Codex);
         assert_eq!(instances[0].display_name, "Codex");
@@ -3919,7 +3924,8 @@ request_timeout_ms = 45000
         assert_eq!(config.gateway.cli_agent_runtimes.instances.len(), 1);
 
         let instances = config.gateway.effective_cli_agent_runtime_instances();
-        assert_eq!(instances.len(), 3);
+        assert_eq!(instances.len(), 4);
+        assert_eq!(instances[3].id, "opencode");
         let instance = &instances[0];
         assert_eq!(instance.id, "codex_personal");
         assert_eq!(instance.kind, GatewayCliAgentRuntimeKindConfig::Codex);
@@ -3973,7 +3979,8 @@ request_timeout_ms = 0
                 .expect("load config with multiple codex runtime instances");
         let instances = config.gateway.effective_cli_agent_runtime_instances();
 
-        assert_eq!(instances.len(), 4);
+        assert_eq!(instances.len(), 5);
+        assert_eq!(instances[4].id, "opencode");
         assert_eq!(instances[0].id, "codex_personal");
         assert_eq!(instances[0].display_name, "Codex Personal");
         assert!(instances[0].enabled);

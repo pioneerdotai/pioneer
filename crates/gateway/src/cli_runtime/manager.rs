@@ -217,6 +217,10 @@ pub(crate) trait CLIAgentRuntimeSession: Send + Sync {
         Ok(())
     }
 
+    async fn validate_replacement_launch(&self, _launch: &CliSessionLaunchSpec) -> Result<()> {
+        Ok(())
+    }
+
     /// Confirm the provider continuity checkpoint after the old process has
     /// closed but before its generation is revoked and a replacement starts.
     async fn confirm_replacement_checkpoint(&self) -> Result<()> {
@@ -652,6 +656,10 @@ impl CLIAgentRuntimeManager {
             validate_replacement_continuation(&stale.launch_spec, &launch_spec)?;
             stale
                 .session
+                .validate_replacement_launch(&launch_spec)
+                .await?;
+            stale
+                .session
                 .prepare_for_replacement()
                 .await
                 .map_err(|error| {
@@ -710,15 +718,21 @@ impl CLIAgentRuntimeManager {
     pub(crate) async fn existing_or_start_management(
         &self,
         key: CLIAgentRuntimeSessionKey,
-        options: CLIAgentRuntimeSessionStartOptions,
+        launch_spec: CliSessionLaunchSpec,
     ) -> Result<CLIAgentRuntimeSessionHandle> {
+        if !matches!(
+            launch_spec.mcp,
+            crate::cli_runtime::continuation::CliMcpSessionLaunch::ManagementOnly
+        ) {
+            bail!("management acquisition requires an isolated management launch");
+        }
         let start_lock = self.start_lock_for_key(&key).await;
         let _guard = start_lock.lock().await;
         let now_ms = current_time_millis();
         if let Some(handle) = self.touch_any_existing_session(&key, now_ms).await {
             return Ok(handle);
         }
-        self.start_and_publish_locked(key, CliSessionLaunchSpec::codex_management(options), now_ms)
+        self.start_and_publish_locked(key, launch_spec, now_ms)
             .await
     }
 
@@ -1104,7 +1118,17 @@ fn validate_replacement_continuation(
             CliProviderContinuation::CodexRpcThread { .. },
             CliProviderContinuation::CodexRpcThread { .. },
         ) => Ok(()),
-        _ => bail!("CLI process replacement cannot change provider continuation kind"),
+        (
+            CliProviderContinuation::OpenCodeServerSession {
+                native_session_id: old_id,
+            },
+            CliProviderContinuation::OpenCodeServerSession {
+                native_session_id: Some(new_id),
+            },
+        ) if !new_id.is_empty() && old_id.as_ref().is_none_or(|old_id| old_id == new_id) => Ok(()),
+        _ => bail!(
+            "CLI process replacement cannot change provider continuation kind or durable session"
+        ),
     }
 }
 
@@ -1793,10 +1817,10 @@ mod tests {
         let management = manager
             .existing_or_start_management(
                 key,
-                CLIAgentRuntimeSessionStartOptions {
+                CliSessionLaunchSpec::codex_management(CLIAgentRuntimeSessionStartOptions {
                     approval_policy: Some("management-defaults-must-not-replace".to_owned()),
                     ..Default::default()
-                },
+                }),
             )
             .await
             .unwrap();
@@ -1825,10 +1849,10 @@ mod tests {
         let management = manager
             .existing_or_start_management(
                 key,
-                CLIAgentRuntimeSessionStartOptions {
+                CliSessionLaunchSpec::codex_management(CLIAgentRuntimeSessionStartOptions {
                     approval_policy: Some("different-management-policy".to_owned()),
                     ..Default::default()
-                },
+                }),
             )
             .await
             .unwrap();

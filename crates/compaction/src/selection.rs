@@ -6,6 +6,7 @@ pub enum Transport {
     Api,
     Codex,
     Claude,
+    #[serde(rename = "opencode")]
     OpenCode,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

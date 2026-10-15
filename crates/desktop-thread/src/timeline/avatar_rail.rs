@@ -340,13 +340,8 @@ fn cli_runtime_identity_matches(
     agent: &pioneer_client::timeline::types::AgentPresentationSnapshot,
     expected: &str,
 ) -> bool {
-    agent.nickname.eq_ignore_ascii_case(expected)
-        || agent.role_label.as_deref().is_some_and(|role_label| {
-            role_label.eq_ignore_ascii_case(expected)
-                || role_label
-                    .strip_suffix(" CLI")
-                    .is_some_and(|kind| kind.eq_ignore_ascii_case(expected))
-        })
+    let kind = agent.role_label.as_deref().unwrap_or(&agent.nickname).trim();
+    kind.eq_ignore_ascii_case(expected) || kind.strip_suffix(" CLI").is_some_and(|kind| kind.eq_ignore_ascii_case(expected))
 }
 
 fn render_timeline_avatar(visual: &TimelineAvatarVisual) -> AnyElement {

@@ -23,6 +23,9 @@ use crate::cli_runtime::mcp::coordinator::{
 use crate::cli_runtime::mcp::facade::CliMcpFacadeProjection;
 use crate::cli_runtime::mcp::grants::{CliMcpGrantScope, CliMcpManifestHash};
 use crate::cli_runtime::mcp::limits::{CliMcpFacadeLimits, CliMcpRuntimeLimits};
+use crate::cli_runtime::mcp::native_correlation::{
+    CorrelatingTurnMcpInvoker, NativeMcpCorrelationLedger, NativeMcpItemBinding,
+};
 use crate::cli_runtime::mcp::server::{CliMcpBridgeFacadeHandle, CliMcpBridgeFacadeServer};
 use crate::cli_runtime::mcp::supervisor::{CliMcpBridgeLaunch, CliMcpBridgeSupervisor};
 use crate::cli_runtime::opencode_mcp::{
@@ -33,7 +36,7 @@ use crate::turn_mcp::invoker::TurnMcpInvoker;
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use base64::Engine as _;
-use futures_util::StreamExt as _;
+use futures_util::{StreamExt as _, TryStreamExt as _};
 use pioneer_cli_agent_runtime::event::{
     RuntimeAgentMessagePhase, RuntimeDiffUpdated, RuntimeErrorEvent, RuntimeEvent,
     RuntimeItemCompleted, RuntimeItemDelta, RuntimeItemDeltaKind, RuntimeItemStarted,
@@ -57,14 +60,29 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::ChildStdin;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout as tokio_timeout};
 use tokio_util::sync::CancellationToken;
 
 const OPENCODE_SERVER_USERNAME: &str = "pioneer";
 const OPENCODE_SERVER_PREFIX: &str = "opencode server listening on ";
-const OPENCODE_API_CONTRACT_VERSION: u32 = 1;
+const OPENCODE_API_CONTRACT_VERSION: u32 = 2;
+const OPENCODE_SUPPORTED_VERSION: &str = "1.4.14";
+
+#[derive(Debug)]
+struct UnsupportedOpenCodeVersion;
+impl std::fmt::Display for UnsupportedOpenCodeVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "OpenCode {} server contract is required",
+            OPENCODE_SUPPORTED_VERSION
+        )
+    }
+}
+impl std::error::Error for UnsupportedOpenCodeVersion {}
+
 const OPENCODE_BUILTIN_TOOLS: &[&str] = &[
     "bash",
     "read",
@@ -72,7 +90,6 @@ const OPENCODE_BUILTIN_TOOLS: &[&str] = &[
     "grep",
     "edit",
     "write",
-    "task",
     "webfetch",
     "todowrite",
     "websearch",
@@ -260,9 +277,25 @@ impl OpenCodeApiClient {
         if status == StatusCode::NO_CONTENT {
             return Ok(JsonValue::Null);
         }
-        let bytes = tokio_timeout(request_timeout, response.bytes())
-            .await
-            .map_err(|_| anyhow!("OpenCode response from `{label}` timed out"))??;
+        let max_bytes = if status.is_success() {
+            pioneer_cli_agent_runtime::DEFAULT_MAX_RECOVERY_FRAME_BYTES
+        } else {
+            2048
+        };
+        let bytes = tokio_timeout(request_timeout, async {
+            let mut stream = response.bytes_stream();
+            let mut bytes = Vec::new();
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk?;
+                if bytes.len().saturating_add(chunk.len()) > max_bytes {
+                    bail!("OpenCode HTTP response exceeds bounded capacity");
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            Ok::<_, anyhow::Error>(bytes)
+        })
+        .await
+        .map_err(|_| anyhow!("OpenCode response from `{label}` timed out"))??;
         if !status.is_success() {
             let detail = bounded_safe_detail(String::from_utf8_lossy(&bytes).as_ref());
             bail!("OpenCode `{label}` returned HTTP {status}: {detail}");
@@ -332,12 +365,20 @@ impl OpenCodeApiClient {
         .await
     }
 
-    async fn fork_session(&self, session_id: &str, request_timeout: Duration) -> Result<JsonValue> {
+    async fn fork_session(
+        &self,
+        session_id: &str,
+        exclusive_message_id: Option<&str>,
+        request_timeout: Duration,
+    ) -> Result<JsonValue> {
         validate_opencode_id(session_id, "session")?;
+        let body = exclusive_message_id
+            .map(|id| json!({"messageID": id}))
+            .unwrap_or_else(|| json!({}));
         self.json(
             Method::POST,
             format!("/session/{session_id}/fork").as_str(),
-            Some(&json!({})),
+            Some(&body),
             request_timeout,
         )
         .await
@@ -536,11 +577,71 @@ impl OpenCodeServerProcess {
     }
 }
 
+fn opencode_managed_data_home(
+    runtime_home: &Path,
+    workspace: &str,
+    instance: &EffectiveGatewayCliAgentRuntimeInstanceConfig,
+) -> PathBuf {
+    let scope = pioneer_cli_agent_runtime::codex_attestation::sha256_json(&json!([
+        workspace,
+        instance.id,
+        instance.home_path,
+        instance.shadow_home_path
+    ]))
+    .expect("OpenCode managed scope is serializable");
+    runtime_home
+        .join("cli-runtime/opencode-data-v1")
+        .join(scope)
+}
+
+async fn prepare_opencode_auth_link(
+    managed_data_home: &Path,
+    environment: &SensitiveEnvironment,
+) -> Result<()> {
+    let data_home = environment
+        .expose("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("XDG_DATA_HOME").map(PathBuf::from))
+        .filter(|path| path.is_absolute())
+        .unwrap_or(expand_home_path("~/.local/share", None)?);
+    let auth = data_home.join("opencode/auth.json");
+    let link = managed_data_home.join("opencode/auth.json");
+    tokio::fs::create_dir_all(link.parent().unwrap()).await?;
+    // Keep auth in the ordinary store. OpenCode Auth.set/remove use writeFile
+    // through this link, so OAuth refreshes remain visible to the normal CLI.
+    match tokio::fs::symlink_metadata(&link).await {
+        Ok(metadata) => {
+            if !metadata.file_type().is_symlink() || tokio::fs::read_link(&link).await? != auth {
+                bail!("OpenCode managed auth link does not target the ordinary auth store");
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            tokio::fs::create_dir_all(auth.parent().unwrap()).await?;
+            #[cfg(unix)]
+            let result = tokio::fs::symlink(&auth, &link).await;
+            #[cfg(windows)]
+            let result = tokio::fs::symlink_file(&auth, &link).await;
+            match result {
+                Ok(()) => {}
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::AlreadyExists
+                        && tokio::fs::read_link(&link).await? == auth => {}
+                Err(error) => {
+                    return Err(error).context("OpenCode managed auth link could not be created");
+                }
+            }
+        }
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
+}
+
 async fn spawn_opencode_server(
     instance: &EffectiveGatewayCliAgentRuntimeInstanceConfig,
     cwd: &Path,
     environment: &SensitiveEnvironment,
     process_generation: Option<u64>,
+    managed_data_home: &Path,
 ) -> Result<OpenCodeServerProcess> {
     validate_opencode_custom_args(&instance.app_server_args)
         .context("invalid OpenCode custom launch arguments")?;
@@ -567,11 +668,40 @@ async fn spawn_opencode_server(
         "XDG_CONFIG_HOME",
         xdg_config_home.to_string_lossy().into_owned(),
     );
-    if let Some(extra_config_dir) = extra_config_dir {
+    if let Some(extra_config_dir) = extra_config_dir.as_ref() {
         env.insert_plain(
             "OPENCODE_CONFIG_DIR",
             extra_config_dir.to_string_lossy().into_owned(),
         );
+    }
+    // Isolate the whole provider data root as well as the supported DB path:
+    // v1.4.14's CLI JSON migration reads Global.Path.data/storage even with
+    // OPENCODE_DB set. A DB override alone can import remembered permissions.
+    prepare_opencode_auth_link(managed_data_home, environment).await?;
+    env.insert_plain(
+        "XDG_DATA_HOME",
+        managed_data_home.to_string_lossy().into_owned(),
+    );
+    env.insert_plain(
+        "OPENCODE_DB",
+        managed_data_home
+            .join("opencode/opencode.db")
+            .to_string_lossy()
+            .into_owned(),
+    );
+    let mut env_remove = vec![
+        "OPENCODE_CONFIG",
+        "OPENCODE_CONFIG_CONTENT",
+        "OPENCODE_PERMISSION",
+        "OPENCODE_AUTH_CONTENT",
+        "OPENCODE_TEST_HOME",
+        "OPENCODE_SKIP_MIGRATIONS",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect::<Vec<_>>();
+    if extra_config_dir.is_none() {
+        env_remove.push("OPENCODE_CONFIG_DIR".into());
     }
     let http_client = reqwest::Client::builder()
         .no_proxy()
@@ -592,7 +722,7 @@ async fn spawn_opencode_server(
         home_path: None,
         home_dir: None,
         env,
-        env_remove: Vec::new(),
+        env_remove,
         stderr_ring_lines: instance.stderr_ring_lines.max(1),
         process_group: true,
         process_generation,
@@ -663,7 +793,17 @@ async fn spawn_opencode_server(
         username: OPENCODE_SERVER_USERNAME.to_owned(),
         password,
     };
-    let health = api.health(startup_timeout).await;
+    let health = api.health(startup_timeout).await.and_then(|health| {
+        if health["healthy"] != true
+            || health["version"]
+                .as_str()
+                .map(|v| v.trim_start_matches('v'))
+                != Some(OPENCODE_SUPPORTED_VERSION)
+        {
+            return Err(UnsupportedOpenCodeVersion.into());
+        }
+        Ok(health)
+    });
     if let Err(error) = health {
         stdout_reader.abort();
         let _ = process.terminate_with_grace(Duration::from_secs(2)).await;
@@ -677,6 +817,128 @@ async fn spawn_opencode_server(
         stderr,
         shutdown_grace: Duration::from_secs(5),
     })
+}
+
+// The shared compaction runner owns timeout/cancellation and calls cleanup,
+// just as it does for Codex/Claude services. No interactive session is reused.
+pub(crate) struct OpenCodeSummaryService {
+    instance: EffectiveGatewayCliAgentRuntimeInstanceConfig,
+    environment: SensitiveEnvironment,
+    owner: Mutex<Option<(Arc<OpenCodeServerProcess>, tempfile::TempDir)>>,
+}
+impl OpenCodeSummaryService {
+    pub(crate) fn new(
+        instance: EffectiveGatewayCliAgentRuntimeInstanceConfig,
+        environment: SensitiveEnvironment,
+    ) -> Self {
+        Self {
+            instance,
+            environment,
+            owner: Mutex::new(None),
+        }
+    }
+    pub(crate) async fn summarize(
+        &self,
+        model: String,
+        effort: Option<String>,
+        instructions: &str,
+        input: String,
+        timeout: Duration,
+    ) -> Result<(String, Option<u64>, Option<u64>, JsonValue)> {
+        let (provider, model_id) = parse_optional_opencode_model(Some(&model))?
+            .context("OpenCode summary model is missing")?;
+        let temporary = tempfile::tempdir()?;
+        let server = Arc::new(
+            spawn_opencode_server(
+                &self.instance,
+                temporary.path(),
+                &self.environment,
+                None,
+                &temporary.path().join("data"),
+            )
+            .await?,
+        );
+        {
+            let mut owner = self.owner.lock().await;
+            if owner.is_some() {
+                let _ = server.close().await;
+                bail!("OpenCode summary service already owns a process");
+            }
+            *owner = Some((server.clone(), temporary));
+        }
+        server.api.disconnect_unmanaged_mcp(timeout).await?;
+        let tools = server
+            .api
+            .tool_ids(timeout)
+            .await?
+            .into_iter()
+            .map(|name| (name, JsonValue::Bool(false)))
+            .collect::<JsonMap<_, _>>();
+        let session = server
+            .api
+            .create_session(
+                json!([{"permission":"*","pattern":"*","action":"deny"}]),
+                timeout,
+            )
+            .await?;
+        let id = session["id"]
+            .as_str()
+            .context("OpenCode summary session identity is missing")?;
+        validate_opencode_id(id, "summary session")?;
+        let mut prompt = json!({
+            "model":{"providerID":provider,"modelID":model_id},
+            "system":instructions, "tools":tools, "parts":[{"type":"text","text":input}]
+        });
+        if let Some(effort) = effort {
+            prompt["variant"] = json!(effort);
+        }
+        let result = server
+            .api
+            .json(
+                Method::POST,
+                &format!("/session/{id}/message"),
+                Some(&prompt),
+                timeout,
+            )
+            .await?;
+        anyhow::ensure!(
+            result["info"]["error"].is_null()
+                && result["info"]["time"]["completed"].as_u64().is_some()
+                && result["info"]["finish"]
+                    .as_str()
+                    .is_some_and(|s| !matches!(s, "tool-calls" | "unknown")),
+            "OpenCode summary ended without a final completion"
+        );
+        anyhow::ensure!(
+            result["info"]["providerID"] == provider && result["info"]["modelID"] == model_id,
+            "OpenCode summary model changed"
+        );
+        let text = result["parts"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|p| p["type"] == "text")
+            .filter_map(|p| p["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        anyhow::ensure!(!text.trim().is_empty(), "OpenCode summary returned no text");
+        let tokens = &result["info"]["tokens"];
+        let input_tokens = tokens["input"].as_u64();
+        let output_tokens = tokens["output"].as_u64();
+        Ok((
+            text,
+            input_tokens,
+            output_tokens,
+            json!({"input_tokens":input_tokens,"output_tokens":output_tokens,
+            "cache_read_input_tokens":tokens["cache"]["read"].as_u64(),"cache_creation_input_tokens":tokens["cache"]["write"].as_u64()}),
+        ))
+    }
+    pub(crate) async fn cleanup(&self) -> Result<()> {
+        if let Some((server, _temporary)) = self.owner.lock().await.take() {
+            server.close().await?;
+        }
+        Ok(())
+    }
 }
 
 pub(crate) async fn probe_opencode_instance(
@@ -695,7 +957,9 @@ pub(crate) async fn probe_opencode_instance(
             models: Vec::new(),
         };
     }
-    let server = match spawn_opencode_server(instance, cwd, environment, None).await {
+    let managed_home = opencode_managed_data_home(cwd, "probe", instance);
+    let server = match spawn_opencode_server(instance, cwd, environment, None, &managed_home).await
+    {
         Ok(server) => server,
         Err(error) => {
             let missing = error.chain().any(|source| {
@@ -703,7 +967,9 @@ pub(crate) async fn probe_opencode_instance(
                     .downcast_ref::<std::io::Error>()
                     .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
             });
-            let status = if missing {
+            let status = if error.downcast_ref::<UnsupportedOpenCodeVersion>().is_some() {
+                OpenCodeProbeStatus::UnsupportedVersion
+            } else if missing {
                 OpenCodeProbeStatus::MissingBinary
             } else {
                 OpenCodeProbeStatus::SpawnFailed
@@ -765,24 +1031,22 @@ pub(crate) async fn probe_opencode_instance(
         .get("healthy")
         .and_then(JsonValue::as_bool)
         .unwrap_or(false);
-    let major = version
-        .as_deref()
-        .and_then(|value| value.trim_start_matches('v').split('.').next())
-        .and_then(|value| value.parse::<u64>().ok());
-    if !healthy || major.is_some_and(|major| major < 1) {
+    if !healthy
+        || version.as_deref().map(|v| v.trim_start_matches('v')) != Some(OPENCODE_SUPPORTED_VERSION)
+    {
         return OpenCodeProbeSnapshot {
-            status: if major.is_some_and(|major| major < 1) {
+            status: if healthy {
                 OpenCodeProbeStatus::UnsupportedVersion
             } else {
                 OpenCodeProbeStatus::Error
             },
-            message: Some("OpenCode server API v1 or newer is required".to_owned()),
+            message: Some("OpenCode 1.4.14 server contract is required".to_owned()),
             version,
             account: None,
             diagnostics: vec![OpenCodeProbeDiagnostic {
                 level: OpenCodeProbeDiagnosticLevel::Error,
                 code: "opencode_probe.unsupported_server".to_owned(),
-                message: "OpenCode server API v1 or newer is required".to_owned(),
+                message: "OpenCode 1.4.14 server contract is required".to_owned(),
             }],
             stderr: stderr_before_close,
             models: Vec::new(),
@@ -977,7 +1241,12 @@ struct OpenCodeRuntimeState {
     turn_started: bool,
     terminal_emitted: bool,
     interrupted: bool,
+    last_error: Option<JsonValue>,
+    item_order: Vec<String>,
+    snapshot_items: HashSet<String>,
     assistant_message_ids: HashSet<String>,
+    turn_user_ids: HashSet<String>,
+    cwd: Option<String>,
     items: HashMap<String, OpenCodeItemState>,
     pending_requests: HashMap<String, OpenCodePendingRequestKind>,
     last_model: Option<(String, String)>,
@@ -987,10 +1256,14 @@ struct OpenCodeRuntimeState {
 impl OpenCodeRuntimeState {
     fn begin_turn(&mut self, native_thread_id: String, native_turn_id: String) {
         self.native_thread_id = Some(native_thread_id);
+        self.turn_user_ids = HashSet::from([native_turn_id.clone()]);
         self.active_turn_id = Some(native_turn_id);
         self.turn_started = false;
         self.terminal_emitted = false;
         self.interrupted = false;
+        self.last_error = None;
+        self.item_order.clear();
+        self.snapshot_items.clear();
         self.assistant_message_ids.clear();
         self.items.clear();
         self.pending_requests.clear();
@@ -1008,29 +1281,25 @@ fn spawn_opencode_event_stream(
     event_tx: mpsc::Sender<RuntimeEvent>,
     cancellation: CancellationToken,
     include_native: bool,
+    budget: pioneer_cli_agent_runtime::NativeEventBudget,
+    ready: watch::Sender<bool>,
+    request_timeout: Duration,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
+        let codec = pioneer_cli_agent_runtime::BoundedNativeEventCodec::new(budget);
         while !cancellation.is_cancelled() {
-            let response = api.request(Method::GET, "/event").send().await;
+            ready.send_replace(false);
+            let response = tokio::select! {
+                _ = cancellation.cancelled() => break,
+                response = api.request(Method::GET, "/event").send() => response,
+            };
             let response = match response {
                 Ok(response) if response.status().is_success() => response,
-                Ok(response) => {
+                _ => {
                     emit_opencode_stream_diagnostic(
                         &state,
                         &event_tx,
-                        format!("OpenCode event stream returned HTTP {}", response.status()),
-                    )
-                    .await;
-                    if wait_or_cancel(&cancellation, Duration::from_millis(500)).await {
-                        break;
-                    }
-                    continue;
-                }
-                Err(error) => {
-                    emit_opencode_stream_diagnostic(
-                        &state,
-                        &event_tx,
-                        format!("OpenCode event stream failed: {error}"),
+                        "OpenCode event stream connection failed".into(),
                     )
                     .await;
                     if wait_or_cancel(&cancellation, Duration::from_millis(500)).await {
@@ -1039,109 +1308,189 @@ fn spawn_opencode_event_stream(
                     continue;
                 }
             };
-            let mut stream = response.bytes_stream();
-            let mut pending = Vec::new();
-            let mut disconnected = false;
-            while let Some(chunk) = tokio::select! {
-                _ = cancellation.cancelled() => None,
-                chunk = stream.next() => chunk,
-            } {
-                let chunk = match chunk {
-                    Ok(chunk) => chunk,
-                    Err(error) => {
-                        emit_opencode_stream_diagnostic(
-                            &state,
-                            &event_tx,
-                            format!("OpenCode event stream disconnected: {error}"),
-                        )
-                        .await;
-                        disconnected = true;
+            let stream = response.bytes_stream().map_err(std::io::Error::other);
+            let mut reader = BufReader::new(tokio_util::io::StreamReader::new(stream));
+            let mut data = Vec::new();
+            loop {
+                let line = tokio::select! {
+                    _ = cancellation.cancelled() => return,
+                    line = codec.read_frame_or_spool(&mut reader) => line,
+                };
+                let line = match line {
+                    Ok(Some(pioneer_cli_agent_runtime::SpooledNativeFrame::Complete(line))) => line,
+                    Ok(None) => break,
+                    Err(error)
+                        if error.kind == pioneer_cli_agent_runtime::NativeIngressErrorKind::Io =>
+                    {
                         break;
                     }
+                    // SSE cannot replay a discarded frame. Fail this generation once;
+                    // do not reconnect forever and silently discard the tool result.
+                    _ => {
+                        fail_opencode_ingress(&api, &state, &event_tx, request_timeout).await;
+                        ready.send_replace(false);
+                        return;
+                    }
                 };
-                pending.extend_from_slice(&chunk);
-                if pending.len() > 4 * 1024 * 1024 {
-                    pending.clear();
-                    emit_opencode_stream_diagnostic(
-                        &state,
-                        &event_tx,
-                        "OpenCode event stream frame exceeded the 4 MiB adapter budget".to_owned(),
-                    )
-                    .await;
-                    disconnected = true;
-                    break;
+                let line = line.strip_suffix(b"\n").unwrap_or(&line);
+                let line = line.strip_suffix(b"\r").unwrap_or(line);
+                if !line.is_empty() {
+                    if let Some(value) = line.strip_prefix(b"data:") {
+                        let value = value.strip_prefix(b" ").unwrap_or(value);
+                        if data.len().saturating_add(value.len()).saturating_add(1)
+                            > budget.max_frame_bytes
+                        {
+                            fail_opencode_ingress(&api, &state, &event_tx, request_timeout).await;
+                            ready.send_replace(false);
+                            return;
+                        }
+                        if !data.is_empty() {
+                            data.push(b'\n');
+                        }
+                        data.extend_from_slice(value);
+                    }
+                    continue;
                 }
-                while let Some((frame, consumed)) = take_sse_frame(pending.as_slice()) {
-                    let frame = frame.to_vec();
-                    pending.drain(..consumed);
-                    let Ok(frame) = std::str::from_utf8(frame.as_slice()) else {
-                        let state = state.lock().await;
+                if data.is_empty() {
+                    continue;
+                }
+                let raw = serde_json::from_slice::<JsonValue>(&data);
+                data.clear();
+                let raw = match raw {
+                    Ok(raw) => raw,
+                    Err(_) => {
+                        let snapshot = state.lock().await;
                         let event = RuntimeEvent::Raw(RuntimeRawEvent {
-                            native_method: "event/invalid_utf8".to_owned(),
-                            reason: "OpenCode SSE event was not valid UTF-8".to_owned(),
-                            native_thread_id: state.native_thread_id.clone(),
-                            native_turn_id: state.active_turn_id.clone(),
+                            native_method: "event/invalid_json".into(),
+                            reason: "OpenCode SSE event was not valid JSON or UTF-8".into(),
+                            native_thread_id: snapshot.native_thread_id.clone(),
+                            native_turn_id: snapshot.active_turn_id.clone(),
                             native_item_id: None,
                             payload_redacted: None,
                             raw_redacted: None,
                         });
-                        drop(state);
+                        drop(snapshot);
                         if event_tx.send(event).await.is_err() {
                             return;
                         }
                         continue;
-                    };
-                    let data = frame
-                        .lines()
-                        .filter_map(|line| line.strip_prefix("data:"))
-                        .map(str::trim_start)
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    if data.is_empty() {
+                    }
+                };
+                let kind = raw["type"].as_str().unwrap_or("");
+                let events = if kind == "server.connected" {
+                    match reconcile_opencode_turn(&api, &state, request_timeout, true).await {
+                        Ok(events) => {
+                            ready.send_replace(true);
+                            events
+                        }
+                        Err(_) => break,
+                    }
+                } else if kind == "session.idle"
+                    || (kind == "session.status" && raw["properties"]["status"]["type"] == "idle")
+                {
+                    if !event_belongs_to_active_session(&*state.lock().await, &raw["properties"]) {
                         continue;
                     }
-                    match serde_json::from_str::<JsonValue>(data.as_str()) {
-                        Ok(raw) => {
-                            let events = map_opencode_event(&state, raw, include_native).await;
-                            for event in events {
-                                if event_tx.send(event).await.is_err() {
-                                    return;
+                    match reconcile_opencode_turn(&api, &state, request_timeout, true).await {
+                        Ok(events) => events,
+                        Err(_) => break,
+                    }
+                } else {
+                    if kind == "message.updated" && raw["properties"]["info"]["role"] == "assistant"
+                    {
+                        let _ = accept_opencode_assistant_info(
+                            &api,
+                            &state,
+                            &raw["properties"]["info"],
+                            request_timeout,
+                        )
+                        .await;
+                    }
+                    // A part may precede message.updated after reconnect. Fetch its
+                    // authoritative parent identity before attributing it to a turn.
+                    if kind.starts_with("message.part.") {
+                        let properties = &raw["properties"];
+                        let mid = properties["messageID"]
+                            .as_str()
+                            .or_else(|| properties["part"]["messageID"].as_str());
+                        let session = state.lock().await.native_thread_id.clone();
+                        if let (Some(mid), Some(session)) = (mid, session) {
+                            let known = state.lock().await.assistant_message_ids.contains(mid);
+                            if !known {
+                                let url = match api
+                                    .url_with_segments(&["session", &session, "message", mid])
+                                {
+                                    Ok(url) => url,
+                                    Err(_) => continue,
+                                };
+                                if let Ok(message) = api
+                                    .json_url(
+                                        Method::GET,
+                                        url,
+                                        "message identity",
+                                        None,
+                                        request_timeout,
+                                    )
+                                    .await
+                                {
+                                    let _ = accept_opencode_assistant_info(
+                                        &api,
+                                        &state,
+                                        &message["info"],
+                                        request_timeout,
+                                    )
+                                    .await;
+                                    map_opencode_event(&state, json!({"type":"message.updated","properties":{"info":message["info"]}}), false).await;
                                 }
                             }
                         }
-                        Err(_) => {
-                            let event = RuntimeEvent::Raw(RuntimeRawEvent {
-                                native_method: "event/invalid_json".to_owned(),
-                                reason: "OpenCode SSE event was not valid JSON".to_owned(),
-                                native_thread_id: state.lock().await.native_thread_id.clone(),
-                                native_turn_id: state.lock().await.active_turn_id.clone(),
-                                native_item_id: None,
-                                payload_redacted: None,
-                                raw_redacted: None,
-                            });
-                            if event_tx.send(event).await.is_err() {
-                                return;
-                            }
-                        }
+                    }
+                    map_opencode_event(&state, raw, include_native).await
+                };
+                for event in events {
+                    tokio::select! {
+                        _ = cancellation.cancelled() => return,
+                        result = event_tx.send(event) => if result.is_err() { return; },
                     }
                 }
             }
-            if cancellation.is_cancelled() {
-                break;
-            }
-            if !disconnected {
-                emit_opencode_stream_diagnostic(
-                    &state,
-                    &event_tx,
-                    "OpenCode event stream ended unexpectedly".to_owned(),
-                )
-                .await;
-            }
+            ready.send_replace(false);
+            emit_opencode_stream_diagnostic(
+                &state,
+                &event_tx,
+                "OpenCode event stream disconnected; reconciling on reconnect".into(),
+            )
+            .await;
             if wait_or_cancel(&cancellation, Duration::from_millis(250)).await {
                 break;
             }
         }
     })
+}
+
+async fn fail_opencode_ingress(
+    api: &OpenCodeApiClient,
+    state: &Arc<Mutex<OpenCodeRuntimeState>>,
+    tx: &mpsc::Sender<RuntimeEvent>,
+    timeout: Duration,
+) {
+    let (session, events) = {
+        let mut state = state.lock().await;
+        let session = state.native_thread_id.clone();
+        state.last_error = Some(
+            json!({"name":"NativeEventBudgetExceeded","data":{"message":"OpenCode SSE frame exceeds the admitted native event budget"}}),
+        );
+        let events = terminalize_opencode_failure(&mut state, None);
+        (session, events)
+    };
+    if let Some(session) = session {
+        let _ = api.abort_session(&session, timeout).await;
+    }
+    for event in events {
+        if tx.send(event).await.is_err() {
+            break;
+        }
+    }
 }
 
 async fn wait_or_cancel(cancellation: &CancellationToken, duration: Duration) -> bool {
@@ -1151,6 +1500,7 @@ async fn wait_or_cancel(cancellation: &CancellationToken, duration: Duration) ->
     }
 }
 
+#[cfg(test)]
 fn take_sse_frame(buffer: &[u8]) -> Option<(&[u8], usize)> {
     if let Some(index) = buffer.windows(2).position(|window| window == b"\n\n") {
         return Some((&buffer[..index], index + 2));
@@ -1167,16 +1517,16 @@ async fn emit_opencode_stream_diagnostic(
     message: String,
 ) {
     let state = state.lock().await;
-    let _ = event_tx
-        .send(RuntimeEvent::Error(RuntimeErrorEvent {
-            native_thread_id: state.native_thread_id.clone(),
-            native_turn_id: state.active_turn_id.clone(),
-            message: bounded_safe_detail(message.as_str()),
-            code: Some("opencode_event_stream_disconnected".to_owned()),
-            retryable: true,
-            native: None,
-        }))
-        .await;
+    let event = RuntimeEvent::Error(RuntimeErrorEvent {
+        native_thread_id: state.native_thread_id.clone(),
+        native_turn_id: state.active_turn_id.clone(),
+        message: bounded_safe_detail(message.as_str()),
+        code: Some("opencode_event_stream_disconnected".to_owned()),
+        retryable: true,
+        native: None,
+    });
+    drop(state);
+    let _ = event_tx.send(event).await;
 }
 
 async fn map_opencode_event(
@@ -1192,6 +1542,14 @@ async fn map_opencode_event(
     let properties = raw.get("properties").cloned().unwrap_or_else(|| json!({}));
     let mut state = state.lock().await;
     if !event_belongs_to_active_session(&state, &properties) {
+        return Vec::new();
+    }
+    if state.terminal_emitted
+        && !matches!(
+            event_type.as_str(),
+            "session.created" | "session.updated" | "server.connected" | "server.heartbeat"
+        )
+    {
         return Vec::new();
     }
     let native = || opencode_native_event(event_type.as_str(), &properties, &raw, include_native);
@@ -1218,6 +1576,11 @@ async fn map_opencode_event(
         "message.updated" => {
             if let Some(info) = properties.get("info")
                 && info.get("role").and_then(JsonValue::as_str) == Some("assistant")
+                && !state.terminal_emitted
+                && info
+                    .get("parentID")
+                    .and_then(JsonValue::as_str)
+                    .is_some_and(|parent| state.turn_user_ids.contains(parent))
                 && let Some(message_id) = info.get("id").and_then(JsonValue::as_str)
             {
                 state.assistant_message_ids.insert(message_id.to_owned());
@@ -1227,7 +1590,7 @@ async fn map_opencode_event(
         "message.part.delta" => map_opencode_part_delta(&mut state, &properties, native()),
         "message.part.updated" => map_opencode_part_updated(&mut state, &properties, native()),
         "session.status" => map_opencode_session_status(&mut state, &properties, native()),
-        "session.idle" => complete_opencode_turn(&mut state, "completed", native()),
+        "session.idle" => Vec::new(),
         "session.error" => fail_opencode_turn(&mut state, &properties, native()),
         "session.diff" => {
             let Some(native_turn_id) = state.active_turn_id.clone() else {
@@ -1237,6 +1600,10 @@ async fn map_opencode_event(
                 native_thread_id: state.native_thread_id.clone(),
                 native_turn_id,
                 diff_redacted: properties.get("diff").map(redact_opencode_json),
+                diff_text: None,
+                revision: None,
+                event_id: None,
+                provider_exact: Some(false),
                 native: native(),
             })]
         }
@@ -1352,7 +1719,7 @@ fn map_opencode_part_delta(
         .get("messageID")
         .and_then(JsonValue::as_str)
         .unwrap_or_default();
-    if message_id == native_turn_id {
+    if state.terminal_emitted || !state.assistant_message_ids.contains(message_id) {
         return Vec::new();
     }
     let part_id = properties
@@ -1364,9 +1731,13 @@ fn map_opencode_part_delta(
         .get("delta")
         .and_then(JsonValue::as_str)
         .unwrap_or_default();
-    if part_id.is_empty() || delta.is_empty() {
+    if part_id.is_empty() || delta.is_empty() || state.snapshot_items.contains(part_id) {
         return Vec::new();
     }
+    if properties.get("field").and_then(JsonValue::as_str) != Some("text") {
+        return Vec::new();
+    }
+    let newly_started = !state.items.contains_key(part_id);
     let item = state
         .items
         .entry(part_id.to_owned())
@@ -1376,7 +1747,9 @@ fn map_opencode_part_delta(
             metadata: None,
             completed: false,
         });
-    let newly_started = item.text.is_empty();
+    if item.completed {
+        return Vec::new();
+    }
     item.text.push_str(delta);
     let delta_kind = if normalize_opencode_kind(item.kind.as_str()) == "reasoning" {
         RuntimeItemDeltaKind::ReasoningText
@@ -1387,6 +1760,7 @@ fn map_opencode_part_delta(
     };
     let mut events = Vec::with_capacity(2);
     if newly_started {
+        state.item_order.push(part_id.to_owned());
         events.push(RuntimeEvent::ItemStarted(RuntimeItemStarted {
             native_thread_id: Some(native_thread_id.clone()),
             native_turn_id: native_turn_id.clone(),
@@ -1430,7 +1804,7 @@ fn map_opencode_part_updated(
         .get("messageID")
         .and_then(JsonValue::as_str)
         .unwrap_or_default();
-    if message_id == native_turn_id {
+    if state.terminal_emitted || !state.assistant_message_ids.contains(message_id) {
         return Vec::new();
     }
     let part_id = part
@@ -1457,6 +1831,11 @@ fn map_opencode_part_updated(
                 .unwrap_or_default();
             let completed = part.pointer("/time/end").is_some();
             let existing = state.items.get(part_id).cloned();
+            if existing.as_ref().is_some_and(|item| {
+                item.completed || (item.text.len() > text.len() && item.text.starts_with(text))
+            }) {
+                return Vec::new();
+            }
             let previous_text = existing
                 .as_ref()
                 .map(|item| item.text.as_str())
@@ -1464,6 +1843,9 @@ fn map_opencode_part_updated(
             let started = existing.is_some();
             let suffix = text.strip_prefix(previous_text).unwrap_or(text);
             let already_completed = existing.as_ref().is_some_and(|item| item.completed);
+            if !started {
+                state.item_order.push(part_id.to_owned());
+            }
             state.items.insert(
                 part_id.to_owned(),
                 OpenCodeItemState {
@@ -1532,6 +1914,10 @@ fn map_opencode_part_updated(
             native_thread_id: Some(native_thread_id),
             native_turn_id,
             diff_redacted: Some(redact_opencode_json(part)),
+            diff_text: None,
+            revision: None,
+            event_id: None,
+            provider_exact: Some(false),
             native,
         })],
         _ => Vec::new(),
@@ -1556,13 +1942,26 @@ fn map_opencode_tool_part(
         .get("status")
         .and_then(JsonValue::as_str)
         .unwrap_or("pending");
-    let metadata = opencode_tool_metadata(tool_name, &tool_state, status);
+    if status == "pending" {
+        return Vec::new();
+    }
+    let mut metadata = opencode_tool_metadata(tool_name, &tool_state, status);
+    metadata["nativeCallId"] = part.get("callID").cloned().unwrap_or(JsonValue::Null);
+    if metadata.get("cwd").is_none() {
+        metadata["cwd"] = json!(state.cwd);
+    }
     let output = tool_state
         .get("output")
         .and_then(JsonValue::as_str)
         .unwrap_or_default();
     let existing = state.items.get(part_id).cloned();
+    if existing.as_ref().is_some_and(|item| item.completed) {
+        return Vec::new();
+    }
     let completed = matches!(status, "completed" | "error");
+    if existing.is_none() {
+        state.item_order.push(part_id.to_owned());
+    }
     state.items.insert(
         part_id.to_owned(),
         OpenCodeItemState {
@@ -1589,10 +1988,9 @@ fn map_opencode_tool_part(
             native: native.clone(),
         }));
     }
-    if !output.is_empty()
-        && existing
-            .as_ref()
-            .is_none_or(|item| item.text.as_str() != output)
+    if existing
+        .as_ref()
+        .is_some_and(|item| item.metadata.as_ref() != Some(&metadata) || item.text != output)
         && !completed
     {
         events.push(RuntimeEvent::ItemDelta(RuntimeItemDelta {
@@ -1601,7 +1999,15 @@ fn map_opencode_tool_part(
             native_item_id: part_id.to_owned(),
             item_kind: item_kind.clone(),
             delta_kind: RuntimeItemDeltaKind::ToolProgress,
-            delta: output.to_owned(),
+            delta: output
+                .strip_prefix(
+                    existing
+                        .as_ref()
+                        .map(|item| item.text.as_str())
+                        .unwrap_or(""),
+                )
+                .unwrap_or("")
+                .to_owned(),
             metadata: Some(metadata.clone()),
             native: native.clone(),
         }));
@@ -1619,6 +2025,14 @@ fn map_opencode_tool_part(
             metadata: Some(metadata),
             native_item_redacted: None,
             native,
+        }));
+    }
+    if completed && tool_name == "todowrite" && tool_state["input"]["todos"].is_array() {
+        events.push(RuntimeEvent::PlanUpdated(RuntimePlanUpdated {
+            native_thread_id: state.native_thread_id.clone(),
+            native_turn_id: state.active_turn_id.clone().unwrap(),
+            plan_redacted: Some(redact_opencode_json(&tool_state["input"]["todos"])),
+            native: None,
         }));
     }
     events
@@ -1663,7 +2077,7 @@ fn map_opencode_session_status(
             code: Some("opencode_retry".to_owned()),
             native,
         })],
-        "idle" => complete_opencode_turn(state, "completed", native),
+        "idle" => Vec::new(),
         _ => Vec::new(),
     }
 }
@@ -1682,7 +2096,10 @@ fn complete_opencode_turn(
         return Vec::new();
     };
     let mut events = Vec::new();
-    for (item_id, item) in state.items.iter_mut() {
+    for item_id in &state.item_order {
+        let Some(item) = state.items.get_mut(item_id) else {
+            continue;
+        };
         if item.completed {
             continue;
         }
@@ -1735,35 +2152,62 @@ fn fail_opencode_turn(
     properties: &JsonValue,
     native: Option<RuntimeNativeEvent>,
 ) -> Vec<RuntimeEvent> {
-    if state.terminal_emitted {
+    if state.terminal_emitted || state.active_turn_id.is_none() {
         return Vec::new();
     }
     let error = properties.get("error").unwrap_or(properties);
-    let message = error
-        .pointer("/data/message")
-        .or_else(|| error.get("message"))
-        .and_then(JsonValue::as_str)
-        .unwrap_or("OpenCode turn failed")
-        .to_owned();
-    let code = error
-        .get("name")
-        .or_else(|| error.get("code"))
-        .and_then(JsonValue::as_str)
-        .map(str::to_owned);
-    let event = RuntimeEvent::TurnFailed(RuntimeTurnFailed {
+    let name = error["name"].as_str().unwrap_or("OpenCodeError");
+    if name == "MessageAbortedError" {
+        state.interrupted = true;
+    }
+    if name != "ContextOverflowError" {
+        state.last_error = Some(error.clone());
+    }
+    // RuntimeEvent::Error(retryable=false) itself terminalizes in the shared
+    // projector. Keep structured evidence here and emit TurnFailed only once
+    // the authoritative loop status is idle.
+    vec![RuntimeEvent::Raw(RuntimeRawEvent {
+        native_method: "session.error".into(),
+        reason: name.to_owned(),
         native_thread_id: state.native_thread_id.clone(),
         native_turn_id: state.active_turn_id.clone(),
-        message: message.clone(),
-        code,
+        native_item_id: None,
+        payload_redacted: Some(redact_opencode_json(error)),
+        raw_redacted: native.and_then(|native| native.raw_redacted),
+    })]
+}
+
+fn terminalize_opencode_failure(
+    state: &mut OpenCodeRuntimeState,
+    native: Option<RuntimeNativeEvent>,
+) -> Vec<RuntimeEvent> {
+    if state.terminal_emitted || state.active_turn_id.is_none() {
+        return Vec::new();
+    }
+    if state.interrupted {
+        return complete_opencode_turn(state, "interrupted", native);
+    }
+    let error = state.last_error.clone().unwrap_or_else(|| json!({"name":"ExecutionLost","data":{"message":"OpenCode is idle without a completed final response"}}));
+    let message = bounded_safe_detail(
+        error
+            .pointer("/data/message")
+            .and_then(JsonValue::as_str)
+            .unwrap_or("OpenCode turn failed"),
+    );
+    let mut events = complete_opencode_turn(state, "failed", None);
+    events.pop();
+    if let Some(observation) = state.last_turn_observation.as_mut() {
+        observation.status = CLIAgentRuntimeObservedTurnStatus::Failed;
+        observation.message = Some(message.clone());
+    }
+    events.push(RuntimeEvent::TurnFailed(RuntimeTurnFailed {
+        native_thread_id: state.native_thread_id.clone(),
+        native_turn_id: state.active_turn_id.clone(),
+        message,
+        code: error["name"].as_str().map(str::to_owned),
         native,
-    });
-    state.terminal_emitted = true;
-    state.last_turn_observation = Some(CLIAgentRuntimeTurnObservation {
-        status: CLIAgentRuntimeObservedTurnStatus::Failed,
-        message: Some(message),
-        reconciliation_events: Vec::new(),
-    });
-    vec![event]
+    }));
+    events
 }
 
 fn map_opencode_permission_request(
@@ -1775,7 +2219,11 @@ fn map_opencode_permission_request(
         .get("id")
         .and_then(JsonValue::as_str)
         .unwrap_or_default();
-    if request_id.is_empty() {
+    if request_id.is_empty()
+        || state.terminal_emitted
+        || state.active_turn_id.is_none()
+        || state.pending_requests.contains_key(request_id)
+    {
         return Vec::new();
     }
     let permission = properties
@@ -1815,7 +2263,17 @@ fn map_opencode_permission_request(
     let item_id = properties
         .pointer("/tool/callID")
         .and_then(JsonValue::as_str)
-        .map(str::to_owned);
+        .and_then(|call| {
+            state
+                .items
+                .iter()
+                .find(|(_, item)| {
+                    item.metadata
+                        .as_ref()
+                        .is_some_and(|m| m["nativeCallId"] == call)
+                })
+                .map(|(id, _)| id.clone())
+        });
     let payload = json!({
         "nativeRequestId": request_id,
         "nativeRequestIdJson": request_id,
@@ -1825,6 +2283,11 @@ fn map_opencode_permission_request(
         "title": properties.pointer("/metadata/title"),
         "description": format!("OpenCode requests permission for `{tool_name}`"),
         "patterns": properties.get("patterns").map(redact_opencode_json),
+        "changedFiles": changed_files_from_opencode_input(&metadata),
+        "diffPreview": metadata.get("diff").and_then(JsonValue::as_str).map(opencode_diff_preview),
+        "cwd": input.get("cwd").or_else(|| input.get("workdir")).or_else(|| metadata.get("cwd")).and_then(JsonValue::as_str).or(state.cwd.as_deref()),
+        "reason": metadata.get("description").or_else(|| metadata.get("title")),
+        "grantRoot": metadata.get("grantRoot"),
         "threadId": state.native_thread_id,
         "turnId": state.active_turn_id,
         "itemId": item_id,
@@ -1854,7 +2317,11 @@ fn map_opencode_question_request(
         .get("id")
         .and_then(JsonValue::as_str)
         .unwrap_or_default();
-    if request_id.is_empty() {
+    if request_id.is_empty()
+        || state.terminal_emitted
+        || state.active_turn_id.is_none()
+        || state.pending_requests.contains_key(request_id)
+    {
         return Vec::new();
     }
     let questions = properties
@@ -1881,7 +2348,17 @@ fn map_opencode_question_request(
     let item_id = properties
         .pointer("/tool/callID")
         .and_then(JsonValue::as_str)
-        .map(str::to_owned);
+        .and_then(|call| {
+            state
+                .items
+                .iter()
+                .find(|(_, item)| {
+                    item.metadata
+                        .as_ref()
+                        .is_some_and(|m| m["nativeCallId"] == call)
+                })
+                .map(|(id, _)| id.clone())
+        });
     state
         .pending_requests
         .insert(request_id.to_owned(), OpenCodePendingRequestKind::Question);
@@ -1972,7 +2449,13 @@ fn opencode_tool_metadata(tool_name: &str, state: &JsonValue, status: &str) -> J
     {
         metadata.insert("cwd".to_owned(), JsonValue::String(cwd.to_owned()));
     }
-    let changed_files = changed_files_from_opencode_input(&input);
+    let mut changed_files = changed_files_from_opencode_input(&input);
+    changed_files.extend(changed_files_from_opencode_input(&state["metadata"]));
+    changed_files.sort();
+    changed_files.dedup();
+    if let Some(diff) = state["metadata"]["diff"].as_str() {
+        metadata.insert("diffPreview".into(), opencode_diff_preview(diff));
+    }
     if !changed_files.is_empty() {
         metadata.insert("changedFiles".to_owned(), json!(changed_files));
     }
@@ -2018,6 +2501,13 @@ fn command_from_opencode_input(input: &JsonValue) -> Option<String> {
 fn changed_files_from_opencode_input(input: &JsonValue) -> Vec<String> {
     let mut paths = Vec::new();
     for key in ["filePath", "filepath", "path"] {
+        if input
+            .get("files")
+            .and_then(JsonValue::as_array)
+            .is_some_and(|files| !files.is_empty())
+        {
+            break;
+        }
         if let Some(path) = input.get(key).and_then(JsonValue::as_str) {
             paths.push(path.to_owned());
         }
@@ -2026,13 +2516,24 @@ fn changed_files_from_opencode_input(input: &JsonValue) -> Vec<String> {
         paths.extend(
             files
                 .iter()
-                .filter_map(JsonValue::as_str)
+                .filter_map(|file| {
+                    file.as_str()
+                        .or_else(|| file["movePath"].as_str())
+                        .or_else(|| file["filePath"].as_str())
+                        .or_else(|| file["relativePath"].as_str())
+                })
                 .map(str::to_owned),
         );
     }
     paths.sort();
     paths.dedup();
     paths
+}
+
+fn opencode_diff_preview(diff: &str) -> JsonValue {
+    const MAX_CHARS: usize = 32_768;
+    let original_chars = diff.chars().count();
+    json!({"text": diff.chars().take(MAX_CHARS).collect::<String>(), "truncated": original_chars > MAX_CHARS, "originalChars": original_chars})
 }
 
 fn normalize_opencode_kind(value: &str) -> String {
@@ -2086,7 +2587,9 @@ fn redact_opencode_json(value: &JsonValue) -> JsonValue {
         JsonValue::Array(values) => {
             JsonValue::Array(values.iter().take(512).map(redact_opencode_json).collect())
         }
-        JsonValue::String(value) => JsonValue::String(bounded_safe_detail(value)),
+        // Content and diffs preserve line boundaries. Diagnostic strings use
+        // bounded_safe_detail separately; event ingress has its own admitted cap.
+        JsonValue::String(value) => JsonValue::String(value.clone()),
         other => other.clone(),
     }
 }
@@ -2132,6 +2635,7 @@ struct OpenCodeRequiredMcpBridge {
     provider_contract_fingerprint: String,
     isolation_contract_fingerprint: String,
     invoker: Arc<dyn TurnMcpInvoker>,
+    native_items: Arc<NativeMcpCorrelationLedger>,
     facade_limits: CliMcpFacadeLimits,
     state: Mutex<OpenCodeRequiredMcpBridgeState>,
 }
@@ -2163,7 +2667,10 @@ impl OpenCodeRequiredMcpBridge {
                     let (handle, server) = CliMcpBridgeFacadeServer::build(
                         transport,
                         self.supervisor.coordinator(),
-                        self.invoker.clone(),
+                        Arc::new(CorrelatingTurnMcpInvoker {
+                            inner: self.invoker.clone(),
+                            native_items: self.native_items.clone(),
+                        }),
                         self.projection_generation,
                         self.projection.clone(),
                         self.facade_limits.clone(),
@@ -2300,6 +2807,8 @@ impl OpenCodeRequiredMcpBridge {
             )
             .await
             .map_err(|error| anyhow!("failed to activate OpenCode MCP turn: {error:?}"))?;
+        self.native_items
+            .activate_scope(native_thread_id, native_turn_id);
         handle
             .set_activation(Some(turn.activation_generation))
             .await;
@@ -2330,6 +2839,7 @@ impl OpenCodeRequiredMcpBridge {
             .await
             .map_err(|error| anyhow!("failed to terminalize OpenCode MCP turn: {error:?}"))?;
         handle.set_activation(None).await;
+        self.native_items.deactivate_scope();
         Ok(())
     }
 }
@@ -2407,6 +2917,11 @@ impl CLIAgentRuntimeSessionFactory for OpenCodeCLIAgentRuntimeSessionFactory {
                 instance.id
             );
         }
+        if matches!(launch_spec.mcp, CliMcpSessionLaunch::ManagementOnly)
+            && launch_spec.options.cwd.is_none()
+        {
+            bail!("OpenCode management requires the durable binding working directory");
+        }
         let cwd = launch_spec
             .options
             .cwd
@@ -2467,6 +2982,7 @@ impl CLIAgentRuntimeSessionFactory for OpenCodeCLIAgentRuntimeSessionFactory {
             cwd.as_path(),
             &launch_spec.options.env,
             Some(process_instance.generation()),
+            &opencode_managed_data_home(&self.runtime_home, &key.workspace_id, &instance),
         )
         .await
         {
@@ -2516,6 +3032,7 @@ impl CLIAgentRuntimeSessionFactory for OpenCodeCLIAgentRuntimeSessionFactory {
                     provider_contract_fingerprint: prepared.provider_contract_fingerprint,
                     isolation_contract_fingerprint: prepared.isolation_contract_fingerprint,
                     invoker: self.turn_mcp_invoker.clone(),
+                    native_items: Arc::new(NativeMcpCorrelationLedger::scoped()),
                     facade_limits: self.mcp_limits.facade_limits(),
                     state: Mutex::new(OpenCodeRequiredMcpBridgeState::Pending),
                 });
@@ -2553,16 +3070,39 @@ impl CLIAgentRuntimeSessionFactory for OpenCodeCLIAgentRuntimeSessionFactory {
         let (event_tx, event_rx) = mpsc::channel(instance.event_channel_capacity.max(1));
         let state = Arc::new(Mutex::new(OpenCodeRuntimeState {
             native_thread_id: native_session_id,
+            cwd: Some(cwd.to_string_lossy().into_owned()),
             ..Default::default()
         }));
         let cancellation = CancellationToken::new();
+        if !launch_spec.native_event_budget.is_valid() {
+            let _ = server.close().await;
+            if let Some(bridge) = &required_mcp_bridge {
+                bridge.fail_closed().await;
+            }
+            bail!("invalid admitted OpenCode native event budget");
+        }
+        let (ready_tx, ready_rx) = watch::channel(false);
         let event_stream = spawn_opencode_event_stream(
             server.api.clone(),
             state.clone(),
             event_tx.clone(),
             cancellation.clone(),
             instance.debug_native_events,
+            launch_spec.native_event_budget,
+            ready_tx,
+            request_timeout,
         );
+        if let Err(error) =
+            wait_opencode_subscription(ready_rx.clone(), &cancellation, request_timeout).await
+        {
+            cancellation.cancel();
+            event_stream.abort();
+            if let Some(bridge) = &required_mcp_bridge {
+                bridge.fail_closed().await;
+            }
+            let _ = server.close().await;
+            return Err(error);
+        }
         Ok(Arc::new(OpenCodeCLIAgentRuntimeSession {
             runtime_id: key.runtime_id.clone(),
             process_instance: process_instance.clone(),
@@ -2579,6 +3119,7 @@ impl CLIAgentRuntimeSessionFactory for OpenCodeCLIAgentRuntimeSessionFactory {
             event_stream: std::sync::Mutex::new(Some(event_stream)),
             cancellation,
             required_mcp_bridge,
+            stream_ready: ready_rx,
             mcp_launch_projection: launch_projection,
             pending_prompt: Mutex::new(None),
             turn_prepared_for_mcp: Mutex::new(false),
@@ -2598,6 +3139,7 @@ struct OpenCodeCLIAgentRuntimeSession {
     event_stream: std::sync::Mutex<Option<JoinHandle<()>>>,
     cancellation: CancellationToken,
     required_mcp_bridge: Option<Arc<OpenCodeRequiredMcpBridge>>,
+    stream_ready: watch::Receiver<bool>,
     mcp_launch_projection: Option<OpenCodeMcpSessionLaunchProjection>,
     pending_prompt: Mutex<Option<PendingOpenCodePrompt>>,
     turn_prepared_for_mcp: Mutex<bool>,
@@ -2620,6 +3162,19 @@ impl CLIAgentRuntimeSession for OpenCodeCLIAgentRuntimeSession {
             bridge.fail_closed().await;
         }
         self.server.close().await
+    }
+
+    async fn validate_replacement_launch(&self, launch: &CliSessionLaunchSpec) -> Result<()> {
+        let CliProviderContinuation::OpenCodeServerSession {
+            native_session_id: Some(id),
+        } = &launch.continuation
+        else {
+            bail!("OpenCode replacement requires its durable session identity");
+        };
+        if self.state.lock().await.native_thread_id.as_deref() != Some(id.as_str()) {
+            bail!("OpenCode replacement cannot change its durable session identity");
+        }
+        Ok(())
     }
 
     async fn prepare_for_replacement(&self) -> Result<()> {
@@ -2738,7 +3293,12 @@ impl CLIAgentRuntimeSession for OpenCodeCLIAgentRuntimeSession {
                 bail!("OpenCode session already has an active turn");
             }
         }
-        let native_turn_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
+        let messages = self
+            .server
+            .api
+            .session_messages(&params.native_thread_id, timeout)
+            .await?;
+        let native_turn_id = next_opencode_message_id(&messages, &self.cancellation).await?;
         let model = parse_optional_opencode_model(params.model.as_deref())?;
         let parts = opencode_prompt_parts(&params.input).await?;
         if parts.is_empty() {
@@ -2762,8 +3322,10 @@ impl CLIAgentRuntimeSession for OpenCodeCLIAgentRuntimeSession {
         {
             body["variant"] = JsonValue::String(variant.to_owned());
         }
-        let defer_for_mcp =
-            self.required_mcp_bridge.is_some() && *self.turn_prepared_for_mcp.lock().await;
+        let defer_for_mcp = self.required_mcp_bridge.is_some();
+        if defer_for_mcp && !*self.turn_prepared_for_mcp.lock().await {
+            bail!("OpenCode MCP prompt requires a reserved turn before start");
+        }
         if defer_for_mcp && self.pending_prompt.lock().await.is_some() {
             bail!("OpenCode already has a deferred MCP prompt");
         }
@@ -2867,6 +3429,11 @@ impl CLIAgentRuntimeSession for OpenCodeCLIAgentRuntimeSession {
         *self.turn_prepared_for_mcp.lock().await = false;
         if let Some(bridge) = self.required_mcp_bridge.as_ref() {
             bridge.terminal_turn(pioneer_turn_id).await?;
+            let state = self.state.lock().await;
+            bridge.native_items.clear_turn(
+                state.native_thread_id.as_deref(),
+                state.active_turn_id.as_deref(),
+            );
         }
         Ok(())
     }
@@ -2878,6 +3445,49 @@ impl CLIAgentRuntimeSession for OpenCodeCLIAgentRuntimeSession {
                 self.process_instance.generation(),
                 event,
             )?;
+            if let Some(bridge) = &self.required_mcp_bridge {
+                let binding = match event {
+                    RuntimeEvent::ItemStarted(item) => item.metadata.as_ref().map(|m| {
+                        (
+                            &item.native_thread_id,
+                            &item.native_turn_id,
+                            &item.native_item_id,
+                            m,
+                        )
+                    }),
+                    RuntimeEvent::ItemDelta(item) => item.metadata.as_ref().map(|m| {
+                        (
+                            &item.native_thread_id,
+                            &item.native_turn_id,
+                            &item.native_item_id,
+                            m,
+                        )
+                    }),
+                    RuntimeEvent::ItemCompleted(item) => item.metadata.as_ref().map(|m| {
+                        (
+                            &item.native_thread_id,
+                            &item.native_turn_id,
+                            &item.native_item_id,
+                            m,
+                        )
+                    }),
+                    _ => None,
+                };
+                if let Some((Some(thread), turn, item, metadata)) = binding
+                    && let (Some(callable), Some(fingerprint)) = (
+                        metadata["canonicalCallableName"].as_str(),
+                        metadata["argumentsFingerprint"].as_str(),
+                    )
+                {
+                    bridge.native_items.register(NativeMcpItemBinding {
+                        native_thread_id: thread.clone(),
+                        native_turn_id: turn.clone(),
+                        native_item_id: item.clone(),
+                        canonical_callable_name: callable.to_owned(),
+                        arguments_fingerprint: fingerprint.to_owned(),
+                    })?;
+                }
+            }
         }
         Ok(())
     }
@@ -2910,7 +3520,7 @@ impl CLIAgentRuntimeSession for OpenCodeCLIAgentRuntimeSession {
                     .get("reply")
                     .and_then(JsonValue::as_str)
                     .unwrap_or("reject");
-                if !matches!(reply, "once" | "always" | "reject") {
+                if !matches!(reply, "once" | "reject") {
                     bail!("invalid OpenCode permission reply");
                 }
                 self.server
@@ -3072,26 +3682,29 @@ impl CLIAgentRuntimeSession for OpenCodeCLIAgentRuntimeSession {
         native_thread_id: &str,
         native_turn_id: &str,
     ) -> Result<Option<CLIAgentRuntimeTurnObservation>> {
-        {
-            let state = self.state.lock().await;
-            if state.native_thread_id.as_deref() == Some(native_thread_id)
-                && state.active_turn_id.as_deref() == Some(native_turn_id)
-                && let Some(observation) = state.last_turn_observation.clone()
-                && observation.status != CLIAgentRuntimeObservedTurnStatus::InProgress
-            {
-                return Ok(Some(observation));
-            }
-        }
+        let statuses = self.server.api.session_status(self.request_timeout).await?;
         let messages = self
             .server
             .api
             .session_messages(native_thread_id, self.request_timeout)
             .await?;
-        Ok(opencode_observation_from_messages(
-            native_thread_id,
-            native_turn_id,
-            &messages,
-        ))
+        let live = statuses[native_thread_id]["type"]
+            .as_str()
+            .is_some_and(|s| matches!(s, "busy" | "retry"));
+        let mut observation =
+            opencode_observation_from_messages(native_thread_id, native_turn_id, &messages, live);
+        if let (Some(observation), Some(projection)) =
+            (&mut observation, &self.mcp_launch_projection)
+        {
+            for event in &mut observation.reconciliation_events {
+                projection.enrich_native_event(
+                    &self.runtime_id,
+                    self.process_instance.generation(),
+                    event,
+                )?;
+            }
+        }
+        Ok(observation)
     }
 
     async fn thread_compact(
@@ -3144,10 +3757,52 @@ impl CLIAgentRuntimeSession for OpenCodeCLIAgentRuntimeSession {
         &self,
         request: CLIAgentRuntimeThreadForkRequest,
     ) -> Result<CLIAgentRuntimeThreadForkResult> {
+        let cutoff = if let Some(boundary) = request.last_turn_id.as_deref() {
+            let messages = self
+                .server
+                .api
+                .session_messages(&request.native_thread_id, self.request_timeout)
+                .await?;
+            let observation = opencode_observation_from_messages(
+                &request.native_thread_id,
+                boundary,
+                &messages,
+                false,
+            )
+            .context("OpenCode fork boundary is missing")?;
+            if observation.status != CLIAgentRuntimeObservedTurnStatus::Completed {
+                bail!("OpenCode fork boundary is not a completed turn");
+            }
+            let users = opencode_turn_user_ids(&messages, boundary);
+            let last = messages
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|m| {
+                    m["info"]["id"]
+                        .as_str()
+                        .is_some_and(|id| users.contains(id))
+                        || m["info"]["parentID"]
+                            .as_str()
+                            .is_some_and(|parent| users.contains(parent))
+                })
+                .filter_map(|m| m["info"]["id"].as_str())
+                .max()
+                .context("OpenCode fork has no native boundary messages")?;
+            // Session.fork's bound is exclusive; fixed-width ascending IDs make
+            // this sentinel include the final assistant and exclude later turns.
+            Some(format!("{last}0"))
+        } else {
+            None
+        };
         let raw = self
             .server
             .api
-            .fork_session(request.native_thread_id.as_str(), self.request_timeout)
+            .fork_session(
+                request.native_thread_id.as_str(),
+                cutoff.as_deref(),
+                self.request_timeout,
+            )
             .await?;
         let native_thread_id = raw
             .get("id")
@@ -3155,6 +3810,20 @@ impl CLIAgentRuntimeSession for OpenCodeCLIAgentRuntimeSession {
             .filter(|value| !value.is_empty())
             .ok_or_else(|| anyhow!("OpenCode session/fork response is missing its id"))?
             .to_owned();
+        validate_opencode_id(&native_thread_id, "fork session")?;
+        if let Some(marker) = request.thread_source.as_deref() {
+            self.server
+                .api
+                .update_session(
+                    &native_thread_id,
+                    &json!({"title":marker}),
+                    self.request_timeout,
+                )
+                .await?;
+        }
+        if native_thread_id == request.native_thread_id {
+            bail!("OpenCode fork returned the source session identity");
+        }
         Ok(CLIAgentRuntimeThreadForkResult {
             native_thread_id,
             native_cwd: raw
@@ -3171,6 +3840,54 @@ impl CLIAgentRuntimeSession for OpenCodeCLIAgentRuntimeSession {
             raw: Some(raw),
         })
     }
+    async fn find_marked_fork(
+        &self,
+        source_thread_id: &str,
+        _boundary_turn_id: &str,
+        marker: &str,
+    ) -> Result<Option<CLIAgentRuntimeThreadForkResult>> {
+        let mut url = self.server.api.url_with_segments(&["session"])?;
+        url.query_pairs_mut()
+            .append_pair("search", marker)
+            .append_pair("limit", "2");
+        let sessions = self
+            .server
+            .api
+            .json_url(
+                Method::GET,
+                url,
+                "marked fork lookup",
+                None,
+                self.request_timeout,
+            )
+            .await?;
+        let matches = sessions
+            .as_array()
+            .context("OpenCode session list is invalid")?
+            .iter()
+            .filter(|s| s["title"] == marker)
+            .collect::<Vec<_>>();
+        if matches.len() != 1 {
+            // Create and title PATCH are separate official operations. Absence
+            // cannot prove the fork was never created; retain the existing
+            // durable intent instead of discarding it and duplicating a fork.
+            bail!("OpenCode marked fork outcome is unknown; durable intent is retained");
+        }
+        let session = matches[0];
+        let id = session["id"]
+            .as_str()
+            .context("OpenCode marked fork identity is missing")?;
+        validate_opencode_id(id, "marked fork session")?;
+        if id == source_thread_id {
+            bail!("OpenCode marked fork points to its source");
+        }
+        Ok(Some(CLIAgentRuntimeThreadForkResult {
+            native_thread_id: id.to_owned(),
+            native_cwd: session["directory"].as_str().map(str::to_owned),
+            native_model: None,
+            raw: Some(session.clone()),
+        }))
+    }
 }
 
 impl OpenCodeCLIAgentRuntimeSession {
@@ -3181,13 +3898,14 @@ impl OpenCodeCLIAgentRuntimeSession {
         body: &JsonValue,
         timeout: Duration,
     ) -> Result<()> {
+        wait_opencode_subscription(self.stream_ready.clone(), &self.cancellation, timeout).await?;
         self.server
             .api
             .prompt_async(native_thread_id, body, timeout)
             .await?;
         let emit_started = {
             let mut state = self.state.lock().await;
-            if state.turn_started {
+            if state.turn_started || state.terminal_emitted {
                 false
             } else {
                 state.turn_started = true;
@@ -3266,6 +3984,7 @@ fn opencode_permission_rules(
         }));
     }
     result.extend([
+        json!({"permission":"task", "pattern":"*", "action":"deny"}),
         json!({
             "permission": "external_directory",
             "pattern": "*",
@@ -3327,6 +4046,9 @@ async fn opencode_prompt_parts(input: &JsonValue) -> Result<Vec<JsonValue>> {
                     .get("path")
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| anyhow!("OpenCode local image input is missing its path"))?;
+                if tokio::fs::metadata(path).await?.len() > 25 * 1024 * 1024 {
+                    bail!("OpenCode local image exceeds the 25 MiB adapter limit");
+                }
                 let bytes = tokio::fs::read(path)
                     .await
                     .with_context(|| format!("failed to read OpenCode image `{path}`"))?;
@@ -3387,84 +4109,353 @@ fn parse_optional_opencode_model(value: Option<&str>) -> Result<Option<(String, 
     })
 }
 
+// Compaction creates a user message and can then replay the original user or
+// add a synthetic continuation. These are one managed prompt's runLoop, not a
+// new Pioneer turn. Stop at the next adapter-authored (counter-zero) user ID.
+fn opencode_turn_user_ids(messages: &JsonValue, root: &str) -> HashSet<String> {
+    let mut users = HashSet::from([root.to_owned()]);
+    let mut inside = false;
+    let mut compaction_followup = false;
+    for message in messages.as_array().into_iter().flatten() {
+        let Some(id) = message["info"]["id"].as_str() else {
+            continue;
+        };
+        if id == root {
+            inside = true;
+            continue;
+        }
+        if !inside || message["info"]["role"] != "user" {
+            continue;
+        }
+        let adapter_authored = id
+            .strip_prefix("msg_")
+            .and_then(|s| s.get(..12))
+            .and_then(|s| u64::from_str_radix(s, 16).ok())
+            .is_some_and(|n| n & 0xfff == 0);
+        if adapter_authored {
+            break;
+        }
+        let compaction = message["parts"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|p| p["type"] == "compaction" && p["auto"] == true);
+        if compaction {
+            users.insert(id.to_owned());
+            compaction_followup = true;
+        } else if compaction_followup {
+            users.insert(id.to_owned());
+            compaction_followup = false;
+        } else {
+            break;
+        }
+    }
+    users
+}
+
+async fn accept_opencode_assistant_info(
+    api: &OpenCodeApiClient,
+    state: &Arc<Mutex<OpenCodeRuntimeState>>,
+    info: &JsonValue,
+    timeout: Duration,
+) -> Result<()> {
+    let Some(parent) = info["parentID"].as_str() else {
+        return Ok(());
+    };
+    let (session, turn, known) = {
+        let state = state.lock().await;
+        (
+            state.native_thread_id.clone(),
+            state.active_turn_id.clone(),
+            state.turn_user_ids.contains(parent),
+        )
+    };
+    if known {
+        return Ok(());
+    }
+    if let (Some(session), Some(turn)) = (session, turn) {
+        if info["sessionID"] != session {
+            return Ok(());
+        }
+        let messages = api.session_messages(&session, timeout).await?;
+        let users = opencode_turn_user_ids(&messages, &turn);
+        let mut state = state.lock().await;
+        if state.active_turn_id.as_deref() == Some(&turn) {
+            state.turn_user_ids = users;
+        }
+    }
+    Ok(())
+}
+
+fn project_opencode_messages(
+    state: &mut OpenCodeRuntimeState,
+    messages: &JsonValue,
+) -> Vec<RuntimeEvent> {
+    let mut events = Vec::new();
+    if let Some(root) = state.active_turn_id.as_deref() {
+        state.turn_user_ids = opencode_turn_user_ids(messages, root);
+    }
+    for message in messages.as_array().into_iter().flatten() {
+        let info = &message["info"];
+        if info["role"] != "assistant"
+            || !info["parentID"]
+                .as_str()
+                .is_some_and(|parent| state.turn_user_ids.contains(parent))
+        {
+            continue;
+        }
+        let Some(mid) = info["id"].as_str() else {
+            continue;
+        };
+        state.assistant_message_ids.insert(mid.to_owned());
+        for part in message["parts"].as_array().into_iter().flatten() {
+            // The REST part has the same identity as message.part.updated.
+            events.extend(map_opencode_part_updated(
+                state,
+                &json!({"part":part}),
+                None,
+            ));
+        }
+    }
+    events
+}
+
+fn opencode_snapshot_terminal(
+    state: &mut OpenCodeRuntimeState,
+    messages: &JsonValue,
+    live: bool,
+) -> Vec<RuntimeEvent> {
+    if live || state.terminal_emitted {
+        return Vec::new();
+    }
+    let last = messages.as_array().into_iter().flatten().rev().find(|m| {
+        m["info"]["role"] == "assistant"
+            && m["info"]["parentID"]
+                .as_str()
+                .is_some_and(|parent| state.turn_user_ids.contains(parent))
+    });
+    if let Some(error) = last
+        .and_then(|m| m["info"].get("error"))
+        .filter(|e| !e.is_null())
+    {
+        if error["name"] == "MessageAbortedError" {
+            state.interrupted = true;
+        }
+        state.last_error = Some(error.clone());
+        return terminalize_opencode_failure(state, None);
+    }
+    let final_answer = last.is_some_and(|m| {
+        !m["parts"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|p| p["type"] == "tool" && p["metadata"]["providerExecuted"] != true)
+            && m["info"]["time"]["completed"].as_u64().is_some()
+            && m["info"]["finish"]
+                .as_str()
+                .is_some_and(|s| !matches!(s, "tool-calls" | "unknown"))
+    });
+    if state.interrupted {
+        complete_opencode_turn(state, "interrupted", None)
+    } else if final_answer {
+        complete_opencode_turn(state, "completed", None)
+    } else {
+        terminalize_opencode_failure(state, None)
+    }
+}
+
 fn opencode_observation_from_messages(
     native_thread_id: &str,
     native_turn_id: &str,
     messages: &JsonValue,
+    live: bool,
 ) -> Option<CLIAgentRuntimeTurnObservation> {
-    let messages = messages.as_array()?;
-    let user_exists = messages.iter().any(|message| {
-        message.pointer("/info/id").and_then(JsonValue::as_str) == Some(native_turn_id)
-            && message.pointer("/info/role").and_then(JsonValue::as_str) == Some("user")
-    });
-    if !user_exists {
+    if !messages
+        .as_array()?
+        .iter()
+        .any(|m| m["info"]["id"] == native_turn_id && m["info"]["role"] == "user")
+    {
         return None;
     }
-    let assistant = messages.iter().rev().find(|message| {
-        message.pointer("/info/role").and_then(JsonValue::as_str) == Some("assistant")
-            && message
-                .pointer("/info/parentID")
-                .and_then(JsonValue::as_str)
-                == Some(native_turn_id)
-    });
-    let Some(assistant) = assistant else {
-        return Some(CLIAgentRuntimeTurnObservation {
-            status: CLIAgentRuntimeObservedTurnStatus::InProgress,
-            message: None,
-            reconciliation_events: Vec::new(),
-        });
+    let mut state = OpenCodeRuntimeState::default();
+    state.begin_turn(native_thread_id.to_owned(), native_turn_id.to_owned());
+    let mut events = project_opencode_messages(&mut state, messages);
+    events.extend(opencode_snapshot_terminal(&mut state, messages, live));
+    let mut observation = state.last_turn_observation.unwrap();
+    // Reconciliation can recreate the entire supported item lifecycle, including
+    // tool steps already completed before a disconnect, in provider order.
+    observation.reconciliation_events = events
+        .into_iter()
+        .filter(|e| {
+            !matches!(
+                e,
+                RuntimeEvent::ItemDelta(_)
+                    | RuntimeEvent::TurnCompleted(_)
+                    | RuntimeEvent::TurnFailed(_)
+                    | RuntimeEvent::TurnInterrupted(_)
+            )
+        })
+        .collect();
+    Some(observation)
+}
+
+async fn reconcile_opencode_turn(
+    api: &OpenCodeApiClient,
+    state: &Arc<Mutex<OpenCodeRuntimeState>>,
+    timeout: Duration,
+    pending: bool,
+) -> Result<Vec<RuntimeEvent>> {
+    let (Some(session), Some(turn)) = ({
+        let state = state.lock().await;
+        (state.native_thread_id.clone(), state.active_turn_id.clone())
+    }) else {
+        return Ok(Vec::new());
     };
-    if let Some(error) = assistant.pointer("/info/error") {
-        return Some(CLIAgentRuntimeTurnObservation {
-            status: CLIAgentRuntimeObservedTurnStatus::Failed,
-            message: error
-                .pointer("/data/message")
-                .or_else(|| error.get("message"))
-                .and_then(JsonValue::as_str)
-                .map(str::to_owned),
-            reconciliation_events: Vec::new(),
+    let statuses = api.session_status(timeout).await?;
+    let messages = api.session_messages(&session, timeout).await?;
+    let live = statuses[&session]["type"]
+        .as_str()
+        .is_some_and(|s| matches!(s, "busy" | "retry"));
+    let permissions = if pending && live {
+        api.json(Method::GET, "/permission", None, timeout).await?
+    } else {
+        json!([])
+    };
+    let questions = if pending && live {
+        api.json(Method::GET, "/question", None, timeout).await?
+    } else {
+        json!([])
+    };
+    let mut state = state.lock().await;
+    if state.native_thread_id.as_deref() != Some(&session)
+        || state.active_turn_id.as_deref() != Some(&turn)
+        || state.terminal_emitted
+    {
+        return Ok(Vec::new());
+    }
+    // A reconnect can race a prompt which has not yet reached the server.
+    if !messages
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|m| m["info"]["id"] == turn)
+    {
+        return Ok(if !live && state.last_error.is_some() {
+            terminalize_opencode_failure(&mut state, None)
+        } else {
+            Vec::new()
         });
     }
-    let mut reconciliation_events = Vec::new();
-    if let Some(parts) = assistant.get("parts").and_then(JsonValue::as_array) {
-        for part in parts {
-            let Some(item_id) = part.get("id").and_then(JsonValue::as_str) else {
-                continue;
-            };
-            let Some(part_type) = part.get("type").and_then(JsonValue::as_str) else {
-                continue;
-            };
-            if !matches!(part_type, "text" | "reasoning") {
-                continue;
-            }
-            let kind = if part_type == "reasoning" {
-                "reasoning"
-            } else {
-                "agentMessage"
-            };
-            reconciliation_events.push(RuntimeEvent::ItemCompleted(RuntimeItemCompleted {
-                native_thread_id: Some(native_thread_id.to_owned()),
-                native_turn_id: native_turn_id.to_owned(),
-                native_item_id: item_id.to_owned(),
-                item_kind: kind.to_owned(),
-                text: part
-                    .get("text")
-                    .and_then(JsonValue::as_str)
-                    .map(str::to_owned),
-                summary: Vec::new(),
-                content: Vec::new(),
-                phase: RuntimeAgentMessagePhase::FinalAnswer,
-                metadata: None,
-                native_item_redacted: None,
-                native: None,
-            }));
-        }
+    let mut events = project_opencode_messages(&mut state, &messages);
+    let snapshot_ids = state.items.keys().cloned().collect::<Vec<_>>();
+    state.snapshot_items.extend(snapshot_ids);
+    let current_requests = permissions
+        .as_array()
+        .into_iter()
+        .flatten()
+        .chain(questions.as_array().into_iter().flatten())
+        .filter(|r| r["sessionID"] == session)
+        .filter_map(|r| r["id"].as_str())
+        .collect::<HashSet<_>>();
+    let resolved = state
+        .pending_requests
+        .keys()
+        .filter(|id| !current_requests.contains(id.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    for id in resolved {
+        state.pending_requests.remove(&id);
+        events.push(RuntimeEvent::RequestResolved(RuntimeRequestResolved {
+            native_request_id: id,
+            native: None,
+        }));
     }
-    Some(CLIAgentRuntimeTurnObservation {
-        status: CLIAgentRuntimeObservedTurnStatus::Completed,
-        message: None,
-        reconciliation_events,
+    for request in permissions
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|r| r["sessionID"] == session)
+    {
+        events.extend(map_opencode_permission_request(&mut state, request, None));
+    }
+    for request in questions
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|r| r["sessionID"] == session)
+    {
+        events.extend(map_opencode_question_request(&mut state, request, None));
+    }
+    events.extend(opencode_snapshot_terminal(&mut state, &messages, live));
+    Ok(events)
+}
+
+async fn wait_opencode_subscription(
+    mut ready: watch::Receiver<bool>,
+    cancellation: &CancellationToken,
+    timeout: Duration,
+) -> Result<()> {
+    tokio_timeout(timeout, async {
+        loop {
+            if *ready.borrow_and_update() {
+                return Ok(());
+            }
+            tokio::select! {
+                _ = cancellation.cancelled() => bail!("OpenCode subscription cancelled"),
+                result = ready.changed() => result.context("OpenCode event reader stopped")?,
+            }
+        }
     })
+    .await
+    .context("OpenCode event subscription readiness timed out")?
+}
+
+// v1.4.14 Identifier.create: 6 low bytes of (Date.now() * 0x1000 + counter),
+// then 14 base62 characters. Reserve counter zero: the server's first ID in the
+// same millisecond uses counter one, so its assistant sorts after this user.
+async fn next_opencode_message_id(
+    messages: &JsonValue,
+    cancellation: &CancellationToken,
+) -> Result<String> {
+    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let latest = messages
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|m| m.pointer("/info/id").and_then(JsonValue::as_str))
+        .filter_map(|id| id.strip_prefix("msg_").and_then(|s| s.get(..12)))
+        .filter_map(|prefix| u64::from_str_radix(prefix, 16).ok())
+        .max()
+        .unwrap_or(0);
+    tokio_timeout(Duration::from_secs(2), async {
+        loop {
+            let millis = u64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis())?;
+            let encoded = (millis << 12) & 0xffffffffffff;
+            let previous = LAST.load(std::sync::atomic::Ordering::SeqCst);
+            if encoded > latest
+                && encoded > previous
+                && LAST
+                    .compare_exchange(
+                        previous,
+                        encoded,
+                        std::sync::atomic::Ordering::SeqCst,
+                        std::sync::atomic::Ordering::SeqCst,
+                    )
+                    .is_ok()
+            {
+                return Ok(format!(
+                    "msg_{encoded:012x}{}",
+                    &uuid::Uuid::new_v4().simple().to_string()[..14]
+                ));
+            }
+            tokio::select! {
+                _ = cancellation.cancelled() => bail!("OpenCode message ID allocation cancelled"),
+                _ = sleep(Duration::from_millis(1)) => {},
+            }
+        }
+    })
+    .await
+    .context("OpenCode clock cannot allocate an ordered message ID")?
 }
 
 fn opencode_mcp_bootstrap_expiry(startup_timeout_ms: u64) -> Result<u64> {
@@ -3690,6 +4681,7 @@ mod tests {
         .await;
         assert!(matches!(started.as_slice(), [RuntimeEvent::TurnStarted(_)]));
 
+        map_opencode_event(&state, json!({"type":"message.updated","properties":{"info":{"id":"assistant-message-1","role":"assistant","sessionID":"session-1","parentID":"user-message-1"}}}), false).await;
         let item = map_opencode_event(
             &state,
             json!({
@@ -3717,12 +4709,7 @@ mod tests {
             ]
         ));
 
-        let completed = map_opencode_event(
-            &state,
-            json!({"type": "session.idle", "properties": {"sessionID": "session-1"}}),
-            false,
-        )
-        .await;
+        let completed = complete_opencode_turn(&mut *state.lock().await, "completed", None);
         assert!(matches!(
             completed.as_slice(),
             [RuntimeEvent::TurnCompleted(_)]
@@ -3761,7 +4748,7 @@ mod tests {
         };
         assert_eq!(permission.native_request_id, "permission-1");
         assert_eq!(permission.request_kind, "file_change_approval");
-        assert_eq!(permission.native_item_id.as_deref(), Some("call-1"));
+        assert_eq!(permission.native_item_id, None); // Unknown callID is not a timeline part ID.
         assert_eq!(
             permission
                 .payload_redacted
@@ -3825,11 +4812,13 @@ mod tests {
                     "info": {
                         "id": "assistant-message-1",
                         "role": "assistant",
-                        "parentID": "user-message-1"
+                        "parentID": "user-message-1",
+                        "time": {"completed": 2}, "finish":"stop"
                     },
-                    "parts": [{"id": "part-1", "type": "text", "text": "done"}]
+                    "parts": [{"id": "part-1", "messageID":"assistant-message-1", "sessionID":"session-1", "type": "text", "text": "done", "time":{"end":2}}]
                 }
             ]),
+            false,
         )
         .expect("turn should be observable");
         assert_eq!(
@@ -3838,7 +4827,149 @@ mod tests {
         );
         assert!(matches!(
             observation.reconciliation_events.as_slice(),
-            [RuntimeEvent::ItemCompleted(item)] if item.text.as_deref() == Some("done")
+            [RuntimeEvent::ItemStarted(_), RuntimeEvent::ItemCompleted(item)] if item.text.as_deref() == Some("done")
         ));
+    }
+    #[tokio::test]
+    async fn message_ids_sort_between_previous_messages_and_server_counter_one() {
+        let cancellation = CancellationToken::new();
+        let user = next_opencode_message_id(&json!([]), &cancellation)
+            .await
+            .unwrap();
+        let time_counter = u64::from_str_radix(&user[4..16], 16).unwrap();
+        assert_eq!(time_counter & 0xfff, 0);
+        let assistant = format!("msg_{:012x}00000000000000", time_counter + 1);
+        assert!(user < assistant);
+        let next = next_opencode_message_id(&json!([{"info":{"id":assistant}}]), &cancellation)
+            .await
+            .unwrap();
+        assert!(assistant < next);
+    }
+
+    fn recovery_messages(final_answer: bool) -> JsonValue {
+        json!([
+            {"info":{"id":"user","role":"user"},"parts":[]},
+            {"info":{"id":"assistant-tool","role":"assistant","parentID":"user","time":{"completed":2},"finish":"tool-calls"},
+             "parts":[{"id":"tool-part","messageID":"assistant-tool","sessionID":"session","type":"tool","tool":"bash","callID":"model-call",
+                 "state":{"status":"completed","input":{"command":"pwd"},"output":"/workspace","time":{"start":1,"end":2}}}]},
+            {"info":{"id":"assistant-final","role":"assistant","parentID":"user","time":{"completed":if final_answer {json!(3)} else {JsonValue::Null}},"finish":if final_answer {json!("stop")} else {JsonValue::Null}},
+             "parts":[{"id":"text-part","messageID":"assistant-final","sessionID":"session","type":"text","text":"answer"}]}
+        ])
+    }
+
+    #[test]
+    fn authoritative_snapshot_requires_idle_final_and_retains_all_tool_steps() {
+        let messages = recovery_messages(false);
+        assert_eq!(
+            opencode_observation_from_messages("session", "user", &messages, true)
+                .unwrap()
+                .status,
+            CLIAgentRuntimeObservedTurnStatus::InProgress
+        );
+        assert_eq!(
+            opencode_observation_from_messages("session", "user", &messages, false)
+                .unwrap()
+                .status,
+            CLIAgentRuntimeObservedTurnStatus::Failed
+        );
+        let observation =
+            opencode_observation_from_messages("session", "user", &recovery_messages(true), false)
+                .unwrap();
+        assert_eq!(
+            observation.status,
+            CLIAgentRuntimeObservedTurnStatus::Completed
+        );
+        assert!(observation.reconciliation_events.iter().any(|event| matches!(event, RuntimeEvent::ItemCompleted(item) if item.native_item_id == "tool-part" && item.metadata.as_ref().unwrap()["stdout"] == "/workspace")));
+        assert!(
+            !observation
+                .reconciliation_events
+                .iter()
+                .any(|event| matches!(event, RuntimeEvent::ItemDelta(_)))
+        );
+    }
+
+    #[test]
+    fn abort_and_compaction_errors_wait_for_authoritative_lifecycle() {
+        let mut state = OpenCodeRuntimeState::default();
+        state.begin_turn("session".into(), "user".into());
+        let error =
+            json!({"error":{"name":"ContextOverflowError","data":{"message":"context full"}}});
+        assert!(matches!(
+            fail_opencode_turn(&mut state, &error, None).as_slice(),
+            [RuntimeEvent::Raw(_)]
+        ));
+        assert!(!state.terminal_emitted);
+        let error = json!({"error":{"name":"MessageAbortedError","data":{"message":"aborted"}}});
+        fail_opencode_turn(&mut state, &error, None);
+        assert!(!state.terminal_emitted);
+        let terminal = opencode_snapshot_terminal(&mut state, &recovery_messages(false), false);
+        assert!(matches!(
+            terminal.last(),
+            Some(RuntimeEvent::TurnInterrupted(_))
+        ));
+        assert!(
+            opencode_snapshot_terminal(&mut state, &recovery_messages(false), false).is_empty()
+        );
+    }
+
+    #[test]
+    fn empty_text_start_delta_fields_and_completed_turn_attribution_are_independent() {
+        let mut state = OpenCodeRuntimeState::default();
+        state.begin_turn("session".into(), "user".into());
+        state.assistant_message_ids.insert("assistant".into());
+        let part = json!({"part":{"id":"part","messageID":"assistant","type":"text","text":""}});
+        assert!(matches!(
+            map_opencode_part_updated(&mut state, &part, None).as_slice(),
+            [RuntimeEvent::ItemStarted(_)]
+        ));
+        let delta = json!({"partID":"part","messageID":"assistant","field":"text","delta":"hello"});
+        assert!(matches!(
+            map_opencode_part_delta(&mut state, &delta, None).as_slice(),
+            [RuntimeEvent::ItemDelta(_)]
+        ));
+        let mut invalid = delta.clone();
+        invalid["field"] = json!("other");
+        assert!(map_opencode_part_delta(&mut state, &invalid, None).is_empty());
+        invalid["field"] = json!("text");
+        invalid["messageID"] = json!("previous-assistant");
+        assert!(map_opencode_part_delta(&mut state, &invalid, None).is_empty());
+        state.terminal_emitted = true;
+        assert!(map_opencode_part_delta(&mut state, &delta, None).is_empty());
+    }
+
+    #[test]
+    fn native_task_is_denied_and_patch_metadata_preserves_files_and_diff_lines() {
+        let rules = opencode_permission_rules(Some("allow"), &available_tool_ids(), None);
+        assert_eq!(effective_permission_action(&rules, "task"), "deny");
+        let metadata = opencode_tool_metadata(
+            "apply_patch",
+            &json!({"input":{"patchText":"patch"},"metadata":{"files":[{"filePath":"a.rs"},{"filePath":"b.rs","movePath":"c.rs"}],"diff":"--- a\n+++ b\n"}}),
+            "completed",
+        );
+        assert_eq!(metadata["changedFiles"], json!(["a.rs", "c.rs"]));
+        assert_eq!(metadata["diffPreview"]["text"], "--- a\n+++ b\n");
+        assert_eq!(metadata["diffPreview"]["truncated"], false);
+    }
+    #[test]
+    fn compaction_followups_stay_in_the_root_turn_but_a_later_prompt_does_not() {
+        let messages = json!([
+            {"info":{"id":"root","role":"user"}},
+            {"info":{"id":"compact-user","role":"user"},"parts":[{"type":"compaction","auto":true}]},
+            {"info":{"id":"compact-assistant","role":"assistant","parentID":"compact-user","time":{"completed":2},"finish":"stop"},"parts":[]},
+            {"info":{"id":"followup","role":"user"},"parts":[{"type":"text","synthetic":true,"metadata":{"compaction_continue":true}}]},
+            {"info":{"id":"final-assistant","role":"assistant","parentID":"followup","time":{"completed":3},"finish":"stop"},"parts":[{"id":"answer","messageID":"final-assistant","sessionID":"session","type":"text","text":"continued"}]},
+            {"info":{"id":"msg_10000000100000000000000000","role":"user"},"parts":[]},
+            {"info":{"id":"later-assistant","role":"assistant","parentID":"msg_10000000100000000000000000","time":{"completed":4},"finish":"stop"},"parts":[]}
+        ]);
+        let observation =
+            opencode_observation_from_messages("session", "root", &messages, false).unwrap();
+        assert_eq!(
+            observation.status,
+            CLIAgentRuntimeObservedTurnStatus::Completed
+        );
+        assert!(observation.reconciliation_events.iter().any(|e| matches!(e, RuntimeEvent::ItemCompleted(item) if item.text.as_deref() == Some("continued"))));
+        let users = opencode_turn_user_ids(&messages, "root");
+        assert!(users.contains("followup"));
+        assert!(!users.contains("msg_10000000100000000000000000"));
     }
 }

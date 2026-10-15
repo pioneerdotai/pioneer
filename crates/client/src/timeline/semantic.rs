@@ -836,6 +836,7 @@ pub fn timeline_cli_runtime_execution_author(
                 author.avatar_revision.as_deref(),
                 Some(pioneer_protocol::CODEX_AGENT_AVATAR_REVISION)
                     | Some(pioneer_protocol::CLAUDE_AGENT_AVATAR_REVISION)
+                    | Some(pioneer_protocol::OPENCODE_AGENT_AVATAR_REVISION)
             )
             && author.agent.is_none()
     })

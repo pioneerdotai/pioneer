@@ -4083,32 +4083,6 @@ impl MessageProcessor {
                             })?,
                         );
                     } else if runtime_kind == CLIAgentRuntimeKind::OpenCode {
-                        let readiness = match readiness_override {
-                            Some(readiness) => readiness,
-                            None => crate::cli_runtime::mcp::readiness::opencode_mcp_readiness_for_instance(
-                                runtime_config,
-                                matches!(readiness_summary.status, RuntimeStatus::Ready),
-                                readiness_summary.version.as_deref(),
-                                max_tools,
-                                max_schema_bytes,
-                            )
-                            .await,
-                        };
-                        if !readiness.supported {
-                            let diagnostic = readiness
-                                .diagnostics
-                                .iter()
-                                .find(|diagnostic| diagnostic.code.starts_with("cli_runtime.mcp."));
-                            return Err(TurnStartFailure::unavailable(format!(
-                                "{}: {}",
-                                diagnostic
-                                    .map(|diagnostic| diagnostic.code.as_str())
-                                    .unwrap_or("cli_runtime.mcp.readiness_unavailable"),
-                                diagnostic
-                                    .map(|diagnostic| diagnostic.message.as_str())
-                                    .unwrap_or("MCP tool readiness is not available")
-                            )));
-                        }
                         opencode_mcp_launch_projection = Some(
                             crate::cli_runtime::opencode_mcp::build_opencode_mcp_session_launch_projection(
                                 projection.clone(),
@@ -4516,7 +4490,7 @@ impl MessageProcessor {
             {
                 let recovered: anyhow::Result<Option<pioneer_crud::CliRuntimeThreadBindingRecord>> = async {
                     anyhow::ensure!(pending.runtime_id == runtime_id
-                        && pending.runtime_kind == "codex"
+                        && pending.runtime_kind == cli_runtime_protocol_kind_label(runtime_kind)
                         && pending.workspace_id == thread.workspace_id,
                         "pending CLI fork belongs to a different runtime or workspace");
                     let intent = crate::cli_runtime::thread_binding::pending_codex_fork_intent(pending)?
@@ -4537,12 +4511,12 @@ impl MessageProcessor {
                     let proxy_url = self.cli_runtime_proxy_url(thread.workspace_id.as_str(), runtime_id.as_str()).await;
                     let management = manager.existing_or_start_management(
                         session_key.clone(),
-                        crate::cli_runtime::manager::CLIAgentRuntimeSessionStartOptions {
+                        crate::cli_runtime::continuation::CliSessionLaunchSpec::management(crate::cli_runtime::manager::CLIAgentRuntimeSessionStartOptions {
                             cwd: Some(std::path::PathBuf::from(source.cwd.as_deref()
                                 .context("Codex fork source has no authorized working directory")?)),
                             env: crate::cli_runtime::config::proxy_env(proxy_url.as_deref()),
                             ..Default::default()
-                        },
+                        }, runtime_kind, source.native_thread_id.clone())?,
                     ).await?;
                     let found = management.session().find_marked_fork(
                         pending.native_thread_id.as_str(),
@@ -5083,12 +5057,12 @@ impl MessageProcessor {
                     let management = manager
                         .existing_or_start_management(
                             session_key.clone(),
-                            crate::cli_runtime::manager::CLIAgentRuntimeSessionStartOptions {
+                            crate::cli_runtime::continuation::CliSessionLaunchSpec::management(crate::cli_runtime::manager::CLIAgentRuntimeSessionStartOptions {
                                 cwd: Some(std::path::PathBuf::from(source.cwd.as_deref()
                                     .context("Codex fork source has no authorized working directory")?)),
                                 env: crate::cli_runtime::config::proxy_env(proxy_url.as_deref()),
                                 ..Default::default()
-                            },
+                            }, runtime_kind, source.native_thread_id.clone())?,
                         )
                         .await?;
                     let now = chrono::Utc::now().fixed_offset();
@@ -5101,7 +5075,7 @@ impl MessageProcessor {
                         thread_id: continuation_thread_id.clone(),
                         workspace_id: thread.workspace_id.clone(),
                         runtime_id: runtime_id.clone(),
-                        runtime_kind: "codex".to_owned(),
+                        runtime_kind: cli_runtime_protocol_kind_label(runtime_kind).to_owned(),
                         native_thread_id: source.native_thread_id.clone(),
                         native_session_id: None,
                         native_root_thread_id: Some(source.native_thread_id.clone()),
@@ -8154,6 +8128,12 @@ impl MessageProcessor {
             .cli_runtime_manager
             .as_ref()
             .context("CLI runtime manager is unavailable")?;
+        let opencode = restored.runtime_kind == CLIAgentRuntimeKind::OpenCode;
+        if opencode {
+            // A recovery attempt owns a new native turn and a new MCP lease.
+            // Close/revoke the old process generation before reserving either.
+            manager.close_session(&restored.session_key).await?;
+        }
         let session_handle = manager
             .get_or_start_with_launch_spec(
                 restored.session_key.clone(),
@@ -8212,6 +8192,47 @@ impl MessageProcessor {
             return Err(error.into());
         }
 
+        if opencode {
+            let reservation: anyhow::Result<()> = async {
+                if let Some(metadata) = cli_session
+                    .prepare_mcp_turn(&prepared_binding.thread_id, &prepared_binding.turn_id)
+                    .await?
+                {
+                    self.crud_store
+                        .bind_cli_runtime_turn_mcp_activation(
+                            &prepared_binding.turn_id,
+                            pioneer_crud::CliRuntimeTurnMcpMetadata {
+                                adapter_kind: metadata.adapter_kind,
+                                manifest_hash: metadata.manifest_hash,
+                                projection_fingerprint: metadata.projection_fingerprint,
+                                provider_contract_fingerprint: metadata
+                                    .provider_contract_fingerprint,
+                                isolation_contract_fingerprint: metadata
+                                    .isolation_contract_fingerprint,
+                                session_generation: i64::try_from(metadata.session_generation)?,
+                                projection_activation_generation: i64::try_from(
+                                    metadata.projection_activation_generation,
+                                )?,
+                            },
+                        )
+                        .await?;
+                }
+                Ok(())
+            }
+            .await;
+            if let Err(error) = reservation {
+                let _ = cli_session
+                    .terminal_mcp_turn(&prepared_binding.turn_id)
+                    .await;
+                self.fail_cli_runtime_turn_attempt(
+                    &attempt.id,
+                    format!("failed to reserve recovery MCP lease: {error:#}"),
+                )
+                .await;
+                return Err(error.into());
+            }
+        }
+
         let native_turn = match cli_session
             .start_turn(
                 crate::cli_runtime::manager::CLIAgentRuntimeTurnStartParams {
@@ -8236,6 +8257,11 @@ impl MessageProcessor {
         {
             Ok(native_turn) => native_turn,
             Err(error) => {
+                if opencode {
+                    let _ = cli_session
+                        .terminal_mcp_turn(&prepared_binding.turn_id)
+                        .await;
+                }
                 self.fail_cli_runtime_turn_attempt(
                     attempt.id.as_str(),
                     format!("failed to start native CLI recovery turn: {error:#}"),
@@ -8265,12 +8291,43 @@ impl MessageProcessor {
                     Some(native_turn_id.as_str()),
                 )
                 .await;
+            if opencode {
+                let _ = cli_session
+                    .terminal_mcp_turn(&prepared_binding.turn_id)
+                    .await;
+            }
             self.fail_cli_runtime_turn_attempt(
                 attempt.id.as_str(),
                 format!("failed to persist native recovery owner: {error:#}"),
             )
             .await;
             return Err(error.into());
+        }
+        if opencode {
+            if let Err(error) = cli_session
+                .activate_mcp_turn(
+                    &prepared_binding.turn_id,
+                    &prepared_binding.native_thread_id,
+                    &native_turn_id,
+                )
+                .await
+            {
+                let _ = cli_session
+                    .interrupt_turn(
+                        Some(&prepared_binding.native_thread_id),
+                        Some(&native_turn_id),
+                    )
+                    .await;
+                let _ = cli_session
+                    .terminal_mcp_turn(&prepared_binding.turn_id)
+                    .await;
+                self.fail_cli_runtime_turn_attempt(
+                    &attempt.id,
+                    format!("failed to activate recovery MCP lease: {error:#}"),
+                )
+                .await;
+                return Err(error.into());
+            }
         }
         drop(_transition);
         if prepared_binding.runtime_kind == "codex" {
@@ -9008,6 +9065,7 @@ impl MessageProcessor {
             let transport = match runtime_kind {
                 CLIAgentRuntimeKind::Codex => pioneer_compaction::Transport::Codex,
                 CLIAgentRuntimeKind::Claude => pioneer_compaction::Transport::Claude,
+                CLIAgentRuntimeKind::OpenCode => pioneer_compaction::Transport::OpenCode,
             };
             let current = pioneer_compaction::ModelSelection {
                 transport,
@@ -9022,12 +9080,12 @@ impl MessageProcessor {
                 .map_err(|_| anyhow::anyhow!("workspace compaction settings unavailable"))?
                 .get(workspace_id)
                 .and_then(|workspace| workspace.cli_overrides.get(runtime_id).cloned());
-            let catalog_provider = if runtime_kind == CLIAgentRuntimeKind::Codex {
-                "openai-codex"
-            } else {
-                "anthropic"
+            let (catalog_provider, catalog_model) = match runtime_kind {
+                CLIAgentRuntimeKind::Codex => ("openai-codex", model),
+                CLIAgentRuntimeKind::Claude => ("anthropic", model),
+                CLIAgentRuntimeKind::OpenCode => model.split_once('/').unwrap_or(("opencode", model)),
             };
-            let limits = pioneer_provider::catalog::model_catalog()?.limits(catalog_provider, model);
+            let limits = pioneer_provider::catalog::model_catalog()?.limits(catalog_provider, catalog_model);
             let fraction = 2_u64.saturating_pow(attempt.saturating_add(1));
             let desired = limits
                 .context_window

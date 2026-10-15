@@ -1241,15 +1241,25 @@ impl MessageProcessor {
             let proxy_url = self
                 .cli_runtime_proxy_url(workspace_id.as_str(), params.runtime_id.as_str())
                 .await;
-            let handle = match manager
-                .existing_or_start_management(
-                    key,
-                    crate::cli_runtime::manager::CLIAgentRuntimeSessionStartOptions {
-                        cwd: binding.native_cwd.as_ref().map(std::path::PathBuf::from),
-                        env: crate::cli_runtime::config::proxy_env(proxy_url.as_deref()),
-                        ..Default::default()
-                    },
+            let management_options =
+                crate::cli_runtime::manager::CLIAgentRuntimeSessionStartOptions {
+                    cwd: binding.native_cwd.as_ref().map(std::path::PathBuf::from),
+                    env: crate::cli_runtime::config::proxy_env(proxy_url.as_deref()),
+                    ..Default::default()
+                };
+            let management_launch = if binding.runtime_kind == "opencode" {
+                crate::cli_runtime::continuation::CliSessionLaunchSpec::opencode(
+                    management_options,
+                    crate::cli_runtime::continuation::CliMcpSessionLaunch::ManagementOnly,
+                    Some(binding.native_thread_id.clone()),
                 )
+            } else {
+                crate::cli_runtime::continuation::CliSessionLaunchSpec::codex_management(
+                    management_options,
+                )
+            };
+            let handle = match manager
+                .existing_or_start_management(key, management_launch)
                 .await
             {
                 Ok(handle) => handle,
@@ -3352,7 +3362,12 @@ impl MessageProcessor {
         self.rehydrate_cli_runtime_command_items(Some(instance), 1_024)
             .await;
         if let Some(receivers) = event_receivers {
-            self.spawn_cli_runtime_event_pump(instance.clone(), receivers, debug_native_events);
+            self.spawn_cli_runtime_event_pump(
+                instance.clone(),
+                session.clone(),
+                receivers,
+                debug_native_events,
+            );
         }
         if let Some(receivers) = codex_receivers {
             self.spawn_codex_event_pumps(instance.clone(), session, receivers, debug_native_events);
@@ -3685,6 +3700,7 @@ impl MessageProcessor {
     fn spawn_cli_runtime_event_pump(
         &self,
         instance: CliSessionInstanceId,
+        session: Arc<dyn CLIAgentRuntimeSession>,
         receivers: crate::cli_runtime::manager::CLIAgentRuntimeEventReceivers,
         debug_native_events: bool,
     ) {
@@ -3693,10 +3709,16 @@ impl MessageProcessor {
             let key = instance.key();
             let mut events = receivers.events;
             let runtime_kind = receivers.runtime_kind;
-            while let Some(event) = events.recv().await {
+            while let Some(mut event) = events.recv().await {
                 if !processor.cli_runtime_instance_is_current(&instance).await {
                     processor.audit_stale_cli_runtime_process_activity(&instance, "event");
                     continue;
+                }
+                if runtime_kind == "opencode" {
+                    if let Err(error) = session.enrich_runtime_event(&mut event) {
+                        warn!(error = %error, "rejected invalid OpenCode native MCP lifecycle event");
+                        continue;
+                    }
                 }
                 if cli_runtime_event_requires_native_journal(&event) {
                     processor
@@ -11795,7 +11817,7 @@ fn apply_opencode_probe_to_summary(
         },
         OpenCodeProbeStatus::UnsupportedVersion => RuntimeStatus::UnsupportedVersion {
             version: probe.version.clone(),
-            minimum_version: Some("1.0.0".to_owned()),
+            minimum_version: None,
         },
         OpenCodeProbeStatus::Error => RuntimeStatus::Error {
             message: probe
@@ -13131,6 +13153,28 @@ fn opencode_request_response_from_resolution(
                             })
                         })
                         .collect::<anyhow::Result<Vec<_>>>()?;
+                    let payload: JsonValue = serde_json::from_str(&request.payload_json)?;
+                    for (question, answer) in payload["questions"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .zip(&ordered)
+                    {
+                        if question["multiple"].as_bool() != Some(true) && answer.len() > 1 {
+                            anyhow::bail!("OpenCode question permits one selected answer");
+                        }
+                        if question["isOther"] == false
+                            && answer.iter().any(|answer| {
+                                !question["options"]
+                                    .as_array()
+                                    .into_iter()
+                                    .flatten()
+                                    .any(|option| option["label"] == *answer)
+                            })
+                        {
+                            anyhow::bail!("OpenCode question does not permit custom answers");
+                        }
+                    }
                     json!({ "kind": "question", "answers": ordered })
                 }
                 CLIRuntimeRequestResolution::Cancelled
@@ -13139,6 +13183,7 @@ fn opencode_request_response_from_resolution(
                     json!({ "kind": "question", "reject": true })
                 }
                 CLIRuntimeRequestResolution::Approved
+                | CLIRuntimeRequestResolution::ApprovedForSession
                 | CLIRuntimeRequestResolution::Denied { .. } => {
                     anyhow::bail!("OpenCode question requests must be answered or cancelled")
                 }
@@ -13150,9 +13195,13 @@ fn opencode_request_response_from_resolution(
         }
         CLIRuntimeRequestKind::CommandApproval
         | CLIRuntimeRequestKind::FileChangeApproval
+        | CLIRuntimeRequestKind::PermissionApproval
         | CLIRuntimeRequestKind::Other => {
             let (reply, message) = match resolution {
                 CLIRuntimeRequestResolution::Approved => ("once", None),
+                CLIRuntimeRequestResolution::ApprovedForSession => {
+                    anyhow::bail!("OpenCode permission grants are scoped to one request")
+                }
                 CLIRuntimeRequestResolution::Denied { reason } => (
                     "reject",
                     reason.clone().or_else(|| Some("Denied by user".to_owned())),

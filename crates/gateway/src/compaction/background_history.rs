@@ -303,6 +303,12 @@ pub(crate) async fn prepare_completed_history_owned(
         let catalog = match current.transport {
             Transport::Codex => "openai-codex".to_owned(),
             Transport::Claude => "anthropic".to_owned(),
+            Transport::OpenCode => current
+                .model
+                .split_once('/')
+                .map(|(provider, _)| provider)
+                .unwrap_or("opencode")
+                .to_owned(),
             Transport::Api => processor
                 .provider_registry()
                 .get_or_create_for_workspace(workspace, &current.instance)?

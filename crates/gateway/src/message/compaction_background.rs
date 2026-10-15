@@ -451,6 +451,7 @@ impl MessageProcessor {
             let transport = match row.runtime_kind.as_str() {
                 "codex" => Transport::Codex,
                 "claude" => Transport::Claude,
+                "opencode" => Transport::OpenCode,
                 _ => {
                     diagnostic.code = "unknown_transport".into();
                     return Ok(HistoryCheckOutcome::Failed);

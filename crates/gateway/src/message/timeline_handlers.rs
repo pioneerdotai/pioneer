@@ -1907,14 +1907,20 @@ impl MessageProcessor {
                                 .role_label
                                 .as_deref()
                                 .unwrap_or(presentation.nickname.as_str());
-                            let runtime_avatar_revision =
-                                if runtime_marker.eq_ignore_ascii_case("codex") {
-                                    Some(pioneer_protocol::CODEX_AGENT_AVATAR_REVISION.to_owned())
-                                } else if runtime_marker.eq_ignore_ascii_case("claude") {
-                                    Some(pioneer_protocol::CLAUDE_AGENT_AVATAR_REVISION.to_owned())
-                                } else {
-                                    presentation.avatar_revision.clone()
-                                };
+                            let runtime_marker = runtime_marker
+                                .strip_suffix(" CLI")
+                                .unwrap_or(runtime_marker);
+                            let runtime_avatar_revision = if runtime_marker
+                                .eq_ignore_ascii_case("codex")
+                            {
+                                Some(pioneer_protocol::CODEX_AGENT_AVATAR_REVISION.to_owned())
+                            } else if runtime_marker.eq_ignore_ascii_case("claude") {
+                                Some(pioneer_protocol::CLAUDE_AGENT_AVATAR_REVISION.to_owned())
+                            } else if runtime_marker.eq_ignore_ascii_case("opencode") {
+                                Some(pioneer_protocol::OPENCODE_AGENT_AVATAR_REVISION.to_owned())
+                            } else {
+                                presentation.avatar_revision.clone()
+                            };
                             pioneer_protocol::TurnAuthorSnapshot {
                                 // Foreground CLI turns have a real runtime executor but no
                                 // AgentExecution. Keep that distinction explicit instead of

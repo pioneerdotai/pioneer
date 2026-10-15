@@ -8,6 +8,7 @@ pub enum ModelSelectionTransport {
     Api,
     Codex,
     Claude,
+    #[serde(rename = "opencode")]
     OpenCode,
 }
 
@@ -106,6 +107,7 @@ mod tests {
             ModelSelectionTransport::Api,
             ModelSelectionTransport::Codex,
             ModelSelectionTransport::Claude,
+            ModelSelectionTransport::OpenCode,
         ] {
             let selected = GatewayModelSelection::Explicit {
                 transport,

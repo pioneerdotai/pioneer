@@ -189,7 +189,7 @@ fn render_pioneer_runtime_instructions(runtime_kind: CLIAgentRuntimeKind) -> Str
         "For text work use the projected Pioneer filesystem hierarchy: read_file, list_dir, grep_files, and one general apply_patch mutator. Do not infer tools that are absent from the current catalog.",
     ];
     lines.push(match runtime_kind {
-        CLIAgentRuntimeKind::Codex => {
+        CLIAgentRuntimeKind::Codex | CLIAgentRuntimeKind::OpenCode => {
             "Follow each available filesystem tool's current description and input schema exactly; they define the complete call format for this turn."
         }
         CLIAgentRuntimeKind::Claude => {

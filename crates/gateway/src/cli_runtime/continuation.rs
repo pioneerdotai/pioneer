@@ -120,6 +120,24 @@ impl CliSessionLaunchSpec {
         Self::codex(options, CliMcpSessionLaunch::ManagementOnly, None)
     }
 
+    pub(crate) fn management(
+        options: CLIAgentRuntimeSessionStartOptions,
+        kind: pioneer_protocol::CLIAgentRuntimeKind,
+        native_thread_id: String,
+    ) -> anyhow::Result<Self> {
+        match kind {
+            pioneer_protocol::CLIAgentRuntimeKind::Codex => Ok(Self::codex_management(options)),
+            pioneer_protocol::CLIAgentRuntimeKind::OpenCode => Ok(Self::opencode(
+                options,
+                CliMcpSessionLaunch::ManagementOnly,
+                Some(native_thread_id),
+            )),
+            pioneer_protocol::CLIAgentRuntimeKind::Claude => {
+                anyhow::bail!("Claude forks require a typed transcript continuation")
+            }
+        }
+    }
+
     pub(crate) fn claude_new(
         options: CLIAgentRuntimeSessionStartOptions,
         mcp: CliMcpSessionLaunch,

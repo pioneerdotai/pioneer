@@ -54,7 +54,8 @@
       "enum": [
         "api",
         "codex",
-        "claude"
+        "claude",
+        "open_code"
       ]
     }
   }

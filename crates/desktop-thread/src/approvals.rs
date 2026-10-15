@@ -431,6 +431,9 @@ impl PendingRequestView {
             })
             .collect::<Vec<_>>();
         let inputs = Rc::new(inputs);
+        let selections = Rc::new(RefCell::new(
+            std::collections::HashMap::<String, Vec<String>>::new(),
+        ));
         let desktop_entity = cx.weak_entity();
         let submit_request = request.clone();
 
@@ -438,10 +441,28 @@ impl PendingRequestView {
             let desktop_entity = desktop_entity.clone();
             let inputs = inputs.clone();
             let request = submit_request;
+            let selections = selections.clone();
+            let questions = questions.clone();
             move |cx| {
-                let answers = inputs
-                    .iter()
-                    .map(|(id, input)| (id.clone(), input.value(cx)));
+                let answers = inputs.iter().map(|(id, input)| {
+                    let question = questions.iter().find(|q| &q.id == id).unwrap();
+                    let value = input.value(cx);
+                    let mut selected = selections.borrow().get(id).cloned().unwrap_or_default();
+                    let answer = if question.multiple {
+                        if question.allow_custom
+                            && !value.trim().is_empty()
+                            && !selected.contains(&value)
+                        {
+                            selected.push(value);
+                        }
+                        serde_json::json!(selected)
+                    } else if question.allow_custom {
+                        serde_json::json!(value)
+                    } else {
+                        serde_json::json!(selected.first().cloned().unwrap_or_default())
+                    };
+                    (id.clone(), answer)
+                });
                 let resolution = pending_request_answered_resolution(answers);
 
                 let _ = desktop_entity.update(cx, |view, cx| {
@@ -461,7 +482,10 @@ impl PendingRequestView {
         self.dialog_generation.set(Some(request_generation));
         self.dialog_open.set(true);
         let dialog_open = self.dialog_open.clone();
-        let first_input = inputs.first().map(|(_, input)| input.clone());
+        let first_input = inputs
+            .iter()
+            .find(|(id, _)| questions.iter().any(|q| &q.id == id && q.allow_custom))
+            .map(|(_, input)| input.clone());
         window.open_dialog(cx, move |dialog, _window, cx| {
             dialog
                 .w(px(520.))
@@ -526,7 +550,12 @@ impl PendingRequestView {
                                 .iter()
                                 .find(|(id, _)| id == &question.id)
                                 .map(|(_, input)| input.clone())?;
-                            Some(render_user_input_question(question.clone(), input, cx))
+                            Some(render_user_input_question(
+                                question.clone(),
+                                input,
+                                selections.clone(),
+                                cx,
+                            ))
                         })),
                 )
         });
@@ -647,6 +676,7 @@ fn pending_request_action_element_prefix(kind: PendingRequestActionKind) -> &'st
 fn render_user_input_question(
     question: PendingRequestUserInputQuestion,
     input: PendingRequestAnswerInput,
+    selections: Rc<RefCell<std::collections::HashMap<String, Vec<String>>>>,
     cx: &mut App,
 ) -> Field {
     let label = question
@@ -674,18 +704,46 @@ fn render_user_input_question(
                                 format!("{}-{}", question.id, option.label).as_str(),
                             ))
                             .label(option.label.clone())
+                            .selected(if question.multiple || !question.allow_custom {
+                                selections
+                                    .borrow()
+                                    .get(&question.id)
+                                    .is_some_and(|values| values.contains(&option.label))
+                            } else {
+                                input.value(cx) == option.label
+                            })
                             .on_click({
                                 let input = input.clone();
                                 let label = option.label.clone();
+                                let id = question.id.clone();
+                                let selections = selections.clone();
+                                let multiple = question.multiple;
+                                let allow_custom = question.allow_custom;
                                 move |_, window, cx| {
-                                    input.set_value(label.clone(), window, cx);
+                                    let mut selections = selections.borrow_mut();
+                                    let selected = selections.entry(id.clone()).or_default();
+                                    if multiple {
+                                        if let Some(index) =
+                                            selected.iter().position(|value| value == &label)
+                                        {
+                                            selected.remove(index);
+                                        } else {
+                                            selected.push(label.clone());
+                                        }
+                                    } else {
+                                        *selected = vec![label.clone()];
+                                        if allow_custom {
+                                            input.set_value(label.clone(), window, cx);
+                                        }
+                                    }
+                                    window.refresh();
                                 }
                             })
                             .into_any_element()
                         })),
                 )
             })
-            .child(input.render())
+            .when(question.allow_custom, |this| this.child(input.render()))
             .when(question.is_secret, |this| {
                 this.child(
                     div()

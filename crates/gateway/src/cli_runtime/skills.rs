@@ -201,6 +201,7 @@ pub(crate) fn restore_cli_runtime_selected_skills(
     let runtime_kind_name = match runtime_kind {
         pioneer_protocol::CLIAgentRuntimeKind::Codex => "codex",
         pioneer_protocol::CLIAgentRuntimeKind::Claude => "claude",
+        pioneer_protocol::CLIAgentRuntimeKind::OpenCode => "opencode",
     };
     let native_skills_root = cli_runtime_native_skills_root(runtime, runtime_kind)?;
     let receipt = read_external_runtime_receipt(receipt_path)?;
