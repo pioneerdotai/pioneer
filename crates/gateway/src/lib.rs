@@ -1087,7 +1087,8 @@ async fn run_gateway_until_shutdown_inner(
                         post_crud_store,
                         post_message_processor.artifact_service.clone(),
                         cancellation.clone(),
-                    ).await;
+                    )
+                    .await;
                 },
             ));
             wait_for_shutdown_signal().await
