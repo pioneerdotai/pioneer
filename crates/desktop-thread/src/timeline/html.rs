@@ -258,7 +258,10 @@ impl HtmlView {
             viewport.origin - point(px(0.), viewport.size.height),
             size(viewport.size.width, viewport.size.height * 3.),
         );
-        self.nearby = document_intersects_viewport(bounds, preparation);
+        // Admission follows the whole document, even while a parent is still
+        // laid out at its previous (smaller) intrinsic height.
+        let document = Bounds::new(bounds.origin, size(bounds.size.width, self.height));
+        self.nearby = document_intersects_viewport(document, preparation);
         if !self.nearby {
             let live = self.webview.is_some()
                 || self.messages.is_some()
@@ -611,7 +614,8 @@ impl Render for HtmlView {
         let weak = cx.weak_entity();
         let instance = self.instance;
         let auth_generation = self.auth_generation;
-        let content = div().relative().w_full().child(content).child(
+        let content = div().relative().w_full().flex_shrink_0().child(content);
+        let content = content.child(
             canvas(
                 move |bounds, window, cx| {
                     let weak = weak.clone();
@@ -826,6 +830,14 @@ mod tests {
                         assert_eq!(sibling.bounds.size.height, px(height));
                         assert_eq!(sibling.source.as_deref(), Some("<p>verified source</p>"));
                     }
+                    // A stale, shorter wrapper must not retire the still-visible
+                    // tail of a long document during intrinsic-height reconciliation.
+                    sibling.bounds =
+                        Bounds::new(point(px(100.), px(-50_000.)), size(px(768.), px(700.)));
+                    assert!(sibling.retain_nearby(sibling.bounds, viewport, cx));
+                    assert_eq!(sibling.instance, 88);
+                    assert!(sibling.messages.is_some() && sibling.download.is_some());
+                    assert_eq!(sibling.height, px(100_000.));
                     // The entire document is now above the preparation zone (-700px).
                     sibling.bounds.origin.y = px(-100_701.);
                     assert!(!sibling.retain_nearby(sibling.bounds, viewport, cx));
