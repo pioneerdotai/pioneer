@@ -1001,10 +1001,7 @@ async fn child_continuation_uses_saved_branch_second_after_expiry_and_runtime_re
             db.execute_raw(Statement::from_sql_and_values(
                 DbBackend::Sqlite,
                 "UPDATE compaction_context SET head=NULL WHERE owner=?",
-                [
-                    crate::compaction::native::native_owner(&f.h.workspace_id, "frozen-source")
-                        .into(),
-                ],
+                [crate::compaction::native_owner(&f.h.workspace_id, "frozen-source").into()],
             ))
             .await
             .unwrap();

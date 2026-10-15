@@ -13513,12 +13513,12 @@ async fn check_nested_task_basis(legacy: bool) {
         .unwrap();
     let child_started = f
         .store
-        .get_turn("child", "child-turn")
+        .compaction_child_history_parent("ws", "child")
         .await
         .unwrap()
         .unwrap()
-        .1
-        .created_at;
+        .started_at
+        .timestamp();
     let branch_start = chrono::DateTime::from_timestamp(child_started, 0)
         .unwrap()
         .fixed_offset();
