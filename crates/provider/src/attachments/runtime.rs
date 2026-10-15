@@ -186,10 +186,11 @@ impl AttachmentOperationError {
         matches!(self, Self::Retryable(_))
     }
 
-    fn message(&self) -> String {
-        match self {
-            Self::Retryable(error) | Self::NonRetryable(error) => error.to_string(),
-        }
+    fn failure_class(&self) -> pioneer_protocol::ProviderFailureClass {
+        let (Self::Retryable(error) | Self::NonRetryable(error)) = self;
+        crate::failure::classify_transport_error(error)
+            .map(|failure| failure.class)
+            .unwrap_or(pioneer_protocol::ProviderFailureClass::Unknown)
     }
 }
 
@@ -355,7 +356,7 @@ where
                 last_error = Some(error.into_error());
             }
             Err(error) => {
-                let reason = error.message();
+                let class = error.failure_class();
                 if error.is_retryable() {
                     record_failure(operation_key, policy);
                 }
@@ -364,7 +365,7 @@ where
                     operation,
                     attempt,
                     "ATTACHMENT_OPERATION_FAILED",
-                    reason.as_str(),
+                    class,
                 );
                 return Err(error.into_error());
             }
@@ -422,7 +423,7 @@ where
                 last_error = Some(error.into_error());
             }
             Err(error) => {
-                let reason = error.message();
+                let class = error.failure_class();
                 if error.is_retryable() {
                     record_failure(operation_key, policy);
                 }
@@ -431,7 +432,7 @@ where
                     operation,
                     attempt,
                     "ATTACHMENT_OPERATION_FAILED",
-                    reason.as_str(),
+                    class,
                 );
                 return Err(error.into_error());
             }

@@ -86,7 +86,7 @@ pub fn emit_upload_fail(
     operation: &str,
     attempt: usize,
     error_code: &str,
-    _error_message: &str,
+    error_class: pioneer_protocol::ProviderFailureClass,
 ) {
     warn!(
         target: "pioneer_provider::attachments",
@@ -95,6 +95,7 @@ pub fn emit_upload_fail(
         operation,
         attempt,
         error_code,
+        error_class = ?error_class,
         "attachment operation failed"
     );
 }

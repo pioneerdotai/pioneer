@@ -556,6 +556,13 @@ fn prepare_messages_for_provider_target(
     // Public diagnostics own only typed, fixed safe facts. Parser/I/O chains
     // may contain input bytes or locators and never escape this boundary.
     let result = result.map_err(|error| {
+        // Replay incompatibility is a typed continuation decision. Retain only
+        // its provider/model identity, without any outer parser or I/O context.
+        let error = match error.downcast::<crate::history::IncompatibleProviderReplayContinuation>()
+        {
+            Ok(incompatible) => return anyhow::Error::new(incompatible),
+            Err(error) => error,
+        };
         if let Some(classification) = crate::failure::classify_transport_error(&error) {
             return anyhow::Error::new(crate::failure::ProviderTransportFailure { classification });
         }
