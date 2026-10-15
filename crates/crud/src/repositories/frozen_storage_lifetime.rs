@@ -2918,6 +2918,7 @@ mod tests {
             deadline_ms: 1000,
             attempts: 0,
             retries: 0,
+            portion_attempts: 0,
             corrections: 0,
             target_tokens: 10,
             source_text_projection_version: 0,

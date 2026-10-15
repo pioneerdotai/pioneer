@@ -2827,6 +2827,7 @@ async fn publication_candidate(fixture: &Fixture, operation: &str, sources: usiz
         deadline_ms: 900_000,
         attempts: 1,
         retries: 0,
+        portion_attempts: 0,
         corrections: 0,
         target_tokens: 100,
         source_text_projection_version: 1,

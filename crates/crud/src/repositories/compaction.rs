@@ -241,6 +241,7 @@ pub struct OperationRecord {
     pub owner: String,
     pub status: String,
     pub snapshot: String,
+    pub execution_turn: Option<String>,
     pub deadline_ms: i64,
     pub attempts: i64,
     pub transient_retries: i64,
@@ -256,6 +257,7 @@ impl From<compaction_operation::Model> for OperationRecord {
             owner: row.owner,
             status: row.status,
             snapshot: row.snapshot,
+            execution_turn: row.execution_turn,
             deadline_ms: row.deadline_ms,
             attempts: row.attempts,
             transient_retries: row.transient_retries,
@@ -1036,6 +1038,46 @@ pub(crate) async fn compaction_operation_for_plan<C: ConnectionTrait>(
         .filter(compaction_context::Column::ThreadId.eq(thread))
         .filter(compaction_operation::Column::Owner.eq(owner))
         .filter(compaction_operation::Column::Fingerprint.eq(fingerprint))
+        .one(db)
+        .await?
+        .map(OperationRecord::from))
+}
+
+/// One bounded diagnostic lookup for progress on the current context head.
+/// Historical failures cannot obstruct new plans after the head advances.
+/// Never supplies a cursor to a different plan.
+pub(crate) async fn compaction_invalid_completion_progress<C: ConnectionTrait>(
+    db: &C,
+    workspace: &str,
+    thread: &str,
+    owner: &str,
+) -> Result<Option<OperationRecord>> {
+    Ok(compaction_operation::Entity::find()
+        .inner_join(compaction_context::Entity)
+        .filter(compaction_context::Column::WorkspaceId.eq(workspace))
+        .filter(compaction_context::Column::ThreadId.eq(thread))
+        .filter(compaction_operation::Column::Owner.eq(owner))
+        .filter(compaction_operation::Column::Status.eq("failed"))
+        .filter(
+            Expr::col((
+                compaction_operation::Entity,
+                compaction_operation::Column::ExpectedHead,
+            ))
+            .binary(
+                BinOper::Is,
+                Expr::col((compaction_context::Entity, compaction_context::Column::Head)),
+            ),
+        )
+        .filter(Expr::cust(
+            r#"EXISTS (SELECT 1 FROM compaction_runner_state s
+            WHERE s.operation_id=compaction_operation.id
+            AND json_extract(s.state,'$.phase.Failed.kind')='InvalidCompletion'
+            AND (json_extract(s.state,'$.cursor.unit')>0
+                OR json_extract(s.state,'$.cursor.source')>0
+                OR json_extract(s.state,'$.cursor.character')>0))"#,
+        ))
+        .order_by_asc(compaction_operation::Column::Id)
+        .limit(1)
         .one(db)
         .await?
         .map(OperationRecord::from))

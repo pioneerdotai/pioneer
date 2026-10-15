@@ -56,7 +56,8 @@ use pioneer_compaction::runner::{
     SourceCursor,
 };
 use pioneer_compaction::summary::{
-    ReferenceMaterial, Summarizer, SummaryInput, SummaryPart, SummaryRequest, validate_summary,
+    ReferenceMaterial, Summarizer, SummaryInput, SummaryPart, SummaryRequest,
+    validate_summary_classified,
 };
 use pioneer_compaction::{Checkpoint, OperationSnapshot, SourceRef};
 use pioneer_crud::{
@@ -398,6 +399,7 @@ pub(crate) struct CompactionRunner {
     store: CrudStore,
     workspace: String,
     snapshot: OperationSnapshot,
+    execution_turn: Option<String>,
     summarizer: Arc<dyn Summarizer>,
     target: Arc<dyn CompactionTarget>,
     observer: Arc<dyn CompactionObserver>,
@@ -425,6 +427,7 @@ impl CompactionRunner {
             store,
             workspace,
             snapshot,
+            execution_turn: None,
             summarizer,
             target,
             observer,
@@ -434,6 +437,23 @@ impl CompactionRunner {
             #[cfg(test)]
             active_payload_loads: std::sync::atomic::AtomicUsize::new(0),
         }
+    }
+
+    pub fn with_execution_turn(mut self, turn: String) -> Self {
+        self.execution_turn = Some(turn);
+        self
+    }
+
+    fn ensure_execution(&self, record: &pioneer_crud::compaction::OperationRecord) -> Result<()> {
+        ensure!(
+            record.deadline_ms == i64::try_from(self.snapshot.admission.deadline_ms)?
+                && self
+                    .execution_turn
+                    .as_ref()
+                    .is_none_or(|turn| record.execution_turn.as_ref() == Some(turn)),
+            "compaction execution superseded"
+        );
+        Ok(())
     }
 
     #[cfg(test)]
@@ -622,7 +642,13 @@ impl CompactionRunner {
             ("failed", "deadline")
         };
         self.store
-            .compaction_finish(&self.snapshot.id, status, outcome)
+            .compaction_finish_execution(
+                &self.snapshot.id,
+                self.execution_turn.as_deref(),
+                self.snapshot.admission.deadline_ms,
+                status,
+                outcome,
+            )
             .await?;
         // The caller may have dropped run itself on its enclosing deadline.
         self.summarizer.cleanup().await?;
@@ -631,6 +657,7 @@ impl CompactionRunner {
             .compaction_operation(&self.snapshot.id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("operation missing during reconciliation"))?;
+        self.ensure_execution(&durable)?;
         let state = self
             .store
             .compaction_reconcile_runner_state(&self.snapshot.id)
@@ -678,6 +705,12 @@ impl CompactionRunner {
 
     async fn drive(&self) -> Result<CompactionExit> {
         let operation = &self.snapshot.id;
+        let durable = self
+            .store
+            .compaction_operation(operation)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("compaction operation missing"))?;
+        self.ensure_execution(&durable)?;
         let plan = self
             .store
             .compaction_runner_plan(operation)
@@ -703,6 +736,7 @@ impl CompactionRunner {
                 .compaction_operation(operation)
                 .await?
                 .ok_or_else(|| anyhow::anyhow!("compaction operation missing"))?;
+            self.ensure_execution(&durable)?;
             if durable.status == "completed" {
                 let applied = self
                     .store
@@ -862,23 +896,30 @@ impl CompactionRunner {
                                 observation.input_tokens = completion.input_tokens;
                                 observation.output_tokens = completion.output_tokens;
                             }
-                            let summary = match validate_summary(
+                            let summary = match validate_summary_classified(
                                 &completion,
                                 portion.request.output_cap,
                             ) {
                                 Ok(text) => text,
-                                Err(_) => {
+                                Err(reason) => {
                                     state = self
-                                            .persist(
-                                                &state,
-                                                Self::diagnose(state.attempt_failed(
+                                        .persist(
+                                            &state,
+                                            Self::diagnose(
+                                                self.attempt_failed(
+                                                    &state,
                                                     FailureKind::InvalidCompletion,
-                                                    self.clock.now_ms(),
                                                     None,
-                                                )?, FailureDiagnostic::new("summary_validation", "invalid_completion", "Summary completion did not satisfy the required format or output budget")),
-                                                None,
-                                            )
-                                            .await?;
+                                                )?,
+                                                FailureDiagnostic::new(
+                                                    "summary_validation",
+                                                    "invalid_completion",
+                                                    reason.explanation(),
+                                                ),
+                                            ),
+                                            None,
+                                        )
+                                        .await?;
                                     continue;
                                 }
                             };
