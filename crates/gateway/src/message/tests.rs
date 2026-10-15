@@ -55333,6 +55333,7 @@ async fn agent_skill_snapshot_failure_retries_the_gateway_path_without_overlay()
             &runtime_environment,
             &[],
             &mut overlay,
+            None,
         )
         .await
         .expect("optional Agent pin failure must preserve the base Gateway turn path");
@@ -55408,6 +55409,7 @@ async fn persist_agent_skill_snapshot_for_resolution_tests(
             &runtime_environment,
             &[],
             &mut overlay,
+            None,
         )
         .await
         .expect("Agent skill snapshot fixture must persist");
@@ -75188,6 +75190,7 @@ async fn compaction_failed_partial_writer_preserves_event_but_excludes_observati
             &std::collections::HashMap::new(),
             &history,
             &[],
+            None,
         )
         .await
         .unwrap();

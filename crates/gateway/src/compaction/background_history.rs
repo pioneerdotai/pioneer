@@ -298,7 +298,7 @@ pub(crate) async fn prepare_completed_history_owned(
         .await?;
         super::history::normalize_task_input_copies(&store, workspace, &mut messages).await?;
         super::origins::validate_message_origins(&store, workspace, &messages).await?;
-        super::frozen::order_history_by_creation(&store, workspace, &mut messages).await?;
+        super::frozen::order_conversation_history(&store, workspace, &mut messages).await?;
         diagnostic.stage = "target_configuration".into();
         let catalog = match current.transport {
             Transport::Codex => "openai-codex".to_owned(),

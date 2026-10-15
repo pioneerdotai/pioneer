@@ -337,14 +337,20 @@ async fn prepare_native_projection_with_prepared(
         } else {
             None
         };
-        let mut authorized = super::frozen::execution_history_scopes(
-            &store,
-            workspace,
-            thread,
-            &context.turn_id,
-            context.conversation_thread_id.as_deref(),
-        )
-        .await?;
+        let mut authorized = if accepted_projection.is_some() {
+            let mut allowed = BTreeSet::from([thread.to_owned()]);
+            allowed.extend(context.conversation_thread_id.iter().cloned());
+            allowed
+        } else {
+            super::frozen::execution_history_scopes(
+                &store,
+                workspace,
+                thread,
+                &context.turn_id,
+                context.conversation_thread_id.as_deref(),
+            )
+            .await?
+        };
         if let Some(projection) = &accepted_projection {
             match projection {
                 AcceptedProjection::Prepared(prepared) => {
@@ -450,7 +456,21 @@ async fn prepare_native_projection_with_prepared(
         )
         .await?;
         super::origins::validate_message_origins(&store, workspace, &request.messages).await?;
-        super::frozen::order_history_by_creation(&store, workspace, &mut request.messages).await?;
+        // Attached Task hooks have no conversation_thread_id either. Classify
+        // this native execution by its durable Task turn, without opening input.
+        // Completed-history preparation uses the separate conversation path.
+        if matches!(&accepted_projection, Some(AcceptedProjection::Prepared(_)))
+            && store
+                .get_task_run_turn_by_turn(thread, &context.turn_id)
+                .await?
+                .is_none()
+        {
+            super::frozen::order_conversation_history(&store, workspace, &mut request.messages)
+                .await?;
+        } else {
+            super::frozen::order_history_by_creation(&store, workspace, &mut request.messages)
+                .await?;
+        }
         if request.messages.iter().any(|message| {
             message.content_parts.iter().any(|part| match part {
                 pioneer_provider::MessageContentPart::File { file } => {
@@ -954,7 +974,7 @@ async fn refresh_native_history(
     mut request: ChatRequest,
 ) -> Result<(ChatRequest, PreparedProjection)> {
     let prepared = processor
-        .capture_current_context_basis_prepared(
+        .capture_running_context_basis_prepared(
             store,
             &context.workspace_id,
             &context.thread_id,

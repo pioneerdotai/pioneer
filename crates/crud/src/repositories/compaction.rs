@@ -28,8 +28,8 @@ pub use frozen_import::{
     FrozenImportRecord, PreparedFrozenImport, frozen_import_identity,
 };
 pub use history::{
-    AcceptedTaskBasis, HistoryCausalBoundary, HistoryReadFence, HistoryTurnBoundary,
-    TaskInputCopyAlias, event_projection_metadata,
+    AcceptedTaskBasis, ChildHistoryParent, HistoryCausalBoundary, HistoryReadFence,
+    HistoryTurnBoundary, TaskInputCopyAlias, event_projection_metadata,
 };
 pub use lifecycle::PreparedCompactionLifecycle;
 use pioneer_compaction::{Checkpoint, FORMAT_VERSION, OperationSnapshot, SourceRef};
@@ -453,6 +453,31 @@ pub(crate) async fn compaction_source_page_inner<C: ConnectionTrait>(
     include_payload: bool,
     capture_order: i64,
 ) -> Result<SourcePage> {
+    compaction_source_page_inner_bounded(
+        db,
+        workspace,
+        thread,
+        turn,
+        kind,
+        after,
+        include_payload,
+        capture_order,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn compaction_source_page_inner_bounded<C: ConnectionTrait>(
+    db: &C,
+    workspace: &str,
+    thread: &str,
+    turn: &str,
+    kind: PagedSource,
+    after: i64,
+    include_payload: bool,
+    capture_order: i64,
+    before: Option<sea_orm::prelude::DateTimeWithTimeZone>,
+) -> Result<SourcePage> {
     match kind {
         PagedSource::Input => {
             read_source_page(
@@ -463,6 +488,7 @@ pub(crate) async fn compaction_source_page_inner<C: ConnectionTrait>(
                 after,
                 include_payload,
                 capture_order,
+                before,
             )
             .await
         }
@@ -475,6 +501,7 @@ pub(crate) async fn compaction_source_page_inner<C: ConnectionTrait>(
                 after,
                 include_payload,
                 capture_order,
+                before,
             )
             .await
         }
@@ -487,6 +514,7 @@ pub(crate) async fn compaction_source_page_inner<C: ConnectionTrait>(
                 after,
                 include_payload,
                 capture_order,
+                before,
             )
             .await
         }
@@ -536,6 +564,7 @@ async fn read_source_page<C: ConnectionTrait, E: EntityTrait>(
     after: i64,
     include_payload: bool,
     capture_order: i64,
+    before: Option<sea_orm::prelude::DateTimeWithTimeZone>,
 ) -> Result<SourcePage> {
     let kind = CanonicalSource::from(kind);
     let payload_bytes: Expr = Func::char_length(
@@ -548,7 +577,7 @@ async fn read_source_page<C: ConnectionTrait, E: EntityTrait>(
         .select_only()
         .column(projection.id)
         .expr_as(projection.paging.sequence.clone(), "sequence")
-        .expr_as(projection.paging.created_at, "created_at")
+        .expr_as(projection.paging.created_at.clone(), "created_at")
         .expr_as(projection.paging.source_type, "source_type")
         .expr_as(projection.paging.item_id, "item_id")
         .expr_as(projection.paging.tool_name, "tool_name")
@@ -564,6 +593,10 @@ async fn read_source_page<C: ConnectionTrait, E: EntityTrait>(
         )
         .filter(projection.paging.sequence.clone().gt(after))
         .filter(projection.paging.capture_order.lte(capture_order))
+        .filter(match before {
+            Some(before) => history::history_before(projection.paging.created_at, before),
+            None => Expr::val(true).into(),
+        })
         .order_by(projection.paging.sequence, Order::Asc)
         .limit(SOURCE_PAGE_ROWS)
         .into_model::<CanonicalSourceMetadata>()
