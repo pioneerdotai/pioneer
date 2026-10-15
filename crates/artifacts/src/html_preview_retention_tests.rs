@@ -1,5 +1,7 @@
 // Included in the existing service fixture module. Execution requires review.
 
+use sea_orm::{DbBackend, Statement};
+
 async fn preview_fixture() -> TestHarness {
     let harness = setup().await;
     let db = harness.store.database_connection();
