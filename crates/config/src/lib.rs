@@ -3819,10 +3819,19 @@ kind = "claude"
             4
         );
 
-        assert_eq!(
-            config.gateway.effective_cli_agent_runtime_instances().len(),
-            2
-        );
+        let instances = config.gateway.effective_cli_agent_runtime_instances();
+        assert_eq!(instances.len(), 3);
+        for (id, kind) in [
+            ("codex", GatewayCliAgentRuntimeKindConfig::Codex),
+            ("claude", GatewayCliAgentRuntimeKindConfig::Claude),
+            ("opencode", GatewayCliAgentRuntimeKindConfig::OpenCode),
+        ] {
+            let instance = instances
+                .iter()
+                .find(|instance| instance.id == id)
+                .expect(id);
+            assert_eq!(instance.kind, kind);
+        }
 
         let _ = fs::remove_file(workspace_override);
     }
