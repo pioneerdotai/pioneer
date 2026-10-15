@@ -595,6 +595,8 @@ impl ClientCore {
         state.failure = None;
         sessions.finish_transport_verification(&endpoint.id, true);
         self.publish_gateway_session(&sessions);
+        drop(sessions);
+        self.resume_visible_thread_delivery();
         Ok(None)
     }
 
@@ -610,7 +612,54 @@ impl ClientCore {
             storage,
             exchange_refresh,
             |base, access, session| cleanup_session(base, access, session, cleanup_timeout),
-            |spec| sender.replace_access_and_wait(spec.clone().into_connect_spec()),
+            |spec| {
+                let publication = self.gateway_session();
+                let state = publication.connections.get(&spec.endpoint_id);
+                if publication.startup.transport_ready
+                    && let Some(connected) = state.and_then(|state| state.connected.as_ref())
+                    && connected.metadata.gateway_id == spec.identity.server_gateway_id
+                    && connected.metadata.session_id == spec.identity.session_id
+                    && connected.metadata.device_id == spec.identity.device_id
+                {
+                    let generation = self
+                        .gateway_session
+                        .lock()
+                        .expect("Gateway session owner poisoned")
+                        .connections
+                        .get(&spec.endpoint_id)
+                        .and_then(|state| state.ready.as_ref())
+                        .map(|ready| ready.metadata.refresh_generation)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("Gateway session preparation unavailable")
+                        })?;
+                    let result = sender.renew_access_and_wait(
+                        connected.connection_id,
+                        spec.clone().into_connect_spec(),
+                        generation,
+                    );
+                    if result.is_err() {
+                        // An unconfirmed lease cannot keep the lifecycle looking connected.
+                        // Retain persisted access and verified identity for the real reconnect.
+                        let _ = sender.disconnect_connection(connected.connection_id);
+                        let mut sessions = self
+                            .gateway_session
+                            .lock()
+                            .expect("Gateway session owner poisoned");
+                        if let Some(state) = sessions.connections.get_mut(&spec.endpoint_id)
+                            && state
+                                .connected
+                                .as_ref()
+                                .is_some_and(|old| old.connection_id == connected.connection_id)
+                        {
+                            state.connected = None;
+                        }
+                        self.publish_gateway_session(&sessions);
+                    }
+                    result
+                } else {
+                    sender.replace_access_and_wait(spec.clone().into_connect_spec())
+                }
+            },
             || sender.auth_me(),
             || sender.disconnect(),
         )
@@ -778,6 +827,7 @@ impl ClientCore {
                                 .get_or_insert(connected.connection_id);
                             state.connected = Some(connected.clone());
                             state.verified_session = Some(connected.clone());
+                            state.refresh_requested = false;
                             state.retry_attempt = 0;
                             state.retry_delay_ms = None;
                         }
@@ -816,6 +866,9 @@ impl ClientCore {
             .lock()
             .expect("session request result poisoned") = Some(outcome.clone());
         flight.ready.notify_all();
+        if outcome.is_ok() {
+            self.resume_visible_thread_delivery();
+        }
         outcome
     }
 
@@ -872,7 +925,7 @@ impl ClientCore {
             .filter(|ready| ready.spec.identity.access_expires_at_unix > now.saturating_add(60))
         {
             Some(ready) => {
-                if let Some(connected) = connected {
+                if let Some(connected) = connected.as_ref() {
                     if connected.connection_generation == ready.connection_generation
                         && self
                             .session_transport
@@ -881,7 +934,7 @@ impl ClientCore {
                             .as_deref()
                             == Some(endpoint)
                     {
-                        return Ok(connected);
+                        return Ok(connected.clone());
                     }
                 }
                 ready
@@ -930,6 +983,7 @@ impl ClientCore {
         if !self.session_request_is_current(endpoint, epoch) {
             return Err(GatewaySessionConnectionFailure::Suspended);
         }
+        let transport_revision = self.gateway_session().startup.transport_revision;
         let connect_started = std::time::Instant::now();
         let connection_id = match self.observe_session_stage(
             endpoint,
@@ -992,12 +1046,30 @@ impl ClientCore {
             }
             state.candidate_connection_id = Some(connection_id);
         }
-        self.begin_authorization_epoch(Some((endpoint.clone(), connection_id)));
+        let renewed = connected.as_ref().is_some_and(|old| {
+            old.connection_id == connection_id
+                && old.metadata.gateway_id == ready.metadata.gateway_id
+                && old.metadata.device_id == ready.metadata.device_id
+                && old.metadata.session_id == ready.metadata.session_id
+        }) && self.gateway_session().startup.transport_revision == transport_revision
+            && self.gateway_session().startup.transport_ready;
+        if !renewed {
+            self.begin_authorization_epoch(Some((endpoint.clone(), connection_id)));
+        }
         let (identity_generation, http_generation) = self.current_auth_ticket();
         let verification =
             self.observe_session_stage(endpoint, SessionDiagnosticStage::IdentityVerify, || {
                 if !self.session_request_is_current(endpoint, epoch) {
                     return Err(GatewaySessionConnectionFailure::Suspended);
+                }
+                if renewed {
+                    return self
+                        .finish_gateway_access_renewal(
+                            identity_generation,
+                            http_generation,
+                            &ready.metadata,
+                        )
+                        .map_err(connection_failure);
                 }
                 let stored = storage
                     .load(request.endpoint)
@@ -1128,25 +1200,18 @@ impl ClientCore {
         rejected_connection_id: u64,
     ) -> ConnectionOutcome {
         {
-            let mut lease = self
-                .session_transport
-                .lock()
-                .expect("Gateway transport lease poisoned");
-            let matches = self
+            let mut sessions = self
                 .gateway_session
                 .lock()
-                .expect("Gateway session owner poisoned")
-                .connections
-                .get(&request.endpoint.id)
-                .and_then(|state| state.connected.as_ref())
-                .is_some_and(|connected| connected.connection_id == rejected_connection_id);
-            if matches && lease.as_deref() == Some(&request.endpoint.id) {
-                self.retire_session_connection(&request.endpoint.id, false);
-                *lease = None;
-                self.transport_runtime()
-                    .ws_command_sender()
-                    .disconnect()
-                    .map_err(connection_failure)?;
+                .expect("Gateway session owner poisoned");
+            if let Some(state) = sessions.connections.get_mut(&request.endpoint.id)
+                && state
+                    .connected
+                    .as_ref()
+                    .is_some_and(|connected| connected.connection_id == rejected_connection_id)
+            {
+                state.refresh_requested = true;
+                self.publish_gateway_session(&sessions);
             }
         }
         self.ensure_gateway_session(request, storage)
@@ -1273,6 +1338,7 @@ impl ClientCore {
                     if state.connected.as_ref().is_some_and(|connected| {
                         connected.connection_id == *connection_id
                             && connected.metadata.session_id == change.session_id
+                            && connected.access_expires_at_unix == change.access_expires_at_unix
                     }) {
                         state.refresh_requested = true;
                     }
@@ -1341,6 +1407,23 @@ fn connection_failure(error: anyhow::Error) -> GatewaySessionConnectionFailure {
     let code = error
         .downcast_ref::<AuthExchangeError>()
         .and_then(|error| error.code.clone())
+        .or_else(|| {
+            error
+                .downcast_ref::<crate::rpc::JsonRpcResponseError>()
+                .and_then(|error| error.machine_code())
+                .filter(|code| {
+                    super::session_lifecycle::terminal_reason_from_auth_code(code).is_some()
+                        || super::session_lifecycle::auth_code_requires_refresh(code)
+                        || matches!(
+                            *code,
+                            "temporarily_unavailable"
+                                | "auth_not_ready"
+                                | "auth_exchange_timeout"
+                                | "auth_method_not_allowed"
+                        )
+                })
+                .map(str::to_owned)
+        })
         .or_else(|| {
             error
                 .downcast_ref::<super::session_refresh::GatewaySessionStorageError>()
@@ -1662,6 +1745,95 @@ mod tests {
         });
         assert!(core.current_auth().is_none());
         assert!(core.authorization_connection_generation() > generation);
+    }
+
+    #[test]
+    fn acknowledged_in_place_rotation_preserves_auth_ticket_and_transport_revision() {
+        let core = ClientCore::new();
+        let endpoint = endpoint("endpoint");
+        let storage = storage();
+        let previous = connect(&core, &endpoint, &storage, 1).unwrap();
+        {
+            let mut session = core.gateway_session.lock().unwrap();
+            session.observe_transport(&crate::transport::ws::GatewayWsEvent::Connected {
+                connection_id: 1,
+                endpoint_id: endpoint.id.clone(),
+                endpoint_name: endpoint.name.clone(),
+                gateway_base_url: endpoint.gateway_base_url.clone(),
+            });
+            core.publish_gateway_session(&session);
+        }
+        let ticket = core.current_auth_ticket();
+        let revision = core.gateway_session().startup.transport_revision;
+        let mut refresh_request = request(&endpoint);
+        refresh_request.now_unix = 1950;
+        let mut successor = grant(2);
+        successor.access_expires_at_unix = 3000;
+        let result = core
+            .ensure_gateway_session_with_ports(
+                refresh_request,
+                &storage,
+                |_, _, _, _| Ok(successor.clone()),
+                |_, _, _| Ok(()),
+                |_| {
+                    assert_eq!(storage.0.lock().unwrap().refresh_generation, 2);
+                    Ok(1)
+                },
+                || panic!("acknowledged renewal must not wait for another identity RPC"),
+                || panic!("acknowledged renewal must retain socket"),
+            )
+            .unwrap();
+        assert_eq!(result.connection_id, 1);
+        assert_eq!(result.connection_id, previous.connection_id);
+        assert_eq!(result.metadata.session_id, previous.metadata.session_id);
+        assert_eq!(
+            result.access_expires_at_unix,
+            successor.access_expires_at_unix
+        );
+        assert_eq!(core.current_auth_ticket(), ticket);
+        assert_eq!(core.gateway_session().startup.transport_revision, revision);
+        assert_eq!(core.current_auth().unwrap().session.refresh_generation, 2);
+
+        let acknowledged = core.gateway_session();
+        assert_eq!(
+            acknowledged.connections["endpoint"].connected.as_ref(),
+            Some(&result)
+        );
+        assert!(!acknowledged.connections["endpoint"].refresh_requested);
+        let expiring =
+            |access_expires_at_unix| crate::transport::ws::GatewayWsEvent::Notification {
+                connection_id: result.connection_id,
+                notification: GatewayNotification::AuthAccessExpiring(
+                    AuthAccessExpiringNotification {
+                        session_id: result.metadata.session_id.clone(),
+                        access_expires_at_unix,
+                    },
+                ),
+            };
+        let stale = expiring(previous.access_expires_at_unix);
+        core.observe_session_connection(&stale);
+        assert!(!core.gateway_session().connections["endpoint"].refresh_requested);
+        assert!(Arc::ptr_eq(&acknowledged, &core.gateway_session()));
+
+        core.observe_session_connection(&expiring(result.access_expires_at_unix));
+        let refreshing = core.gateway_session();
+        assert!(refreshing.connections["endpoint"].refresh_requested);
+        core.observe_session_connection(&stale);
+        assert!(core.gateway_session().connections["endpoint"].refresh_requested);
+        assert!(Arc::ptr_eq(&refreshing, &core.gateway_session()));
+
+        core.observe_session_connection(&crate::transport::ws::GatewayWsEvent::Notification {
+            connection_id: previous.connection_id,
+            notification: GatewayNotification::AuthSessionRevoked(AuthSessionRevokedNotification {
+                session_id: previous.metadata.session_id,
+                reason: AuthSessionTerminationReason::SessionRevoked,
+            }),
+        });
+        assert!(core.current_auth().is_none());
+        assert_eq!(
+            core.gateway_session().terminal_reason("endpoint"),
+            Some(SessionTerminalReason::SessionRevoked)
+        );
     }
 
     #[test]

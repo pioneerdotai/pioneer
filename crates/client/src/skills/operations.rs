@@ -331,8 +331,36 @@ impl ClientCore {
                         })
             }
     }
+    fn retire_skills_action(&self, action: &Action) {
+        let mut owner = self
+            .skills_controller
+            .lock()
+            .expect("Skills controller poisoned");
+        if !owner
+            .publications
+            .get(&(action.workspace.clone(), action.target.clone()))
+            .is_some_and(|p| {
+                p.operation_id == action.operation && p.state == SkillsActionState::Pending
+            })
+        {
+            return;
+        }
+        self.publish_skills_action(
+            &mut owner,
+            &action.workspace,
+            &action.target,
+            action.operation,
+            SkillsActionState::Cancelled,
+            action.intent.kind(),
+        );
+        drop(owner);
+        if self.capability_management_allowed(&action.workspace) {
+            self.fence_skills_reads_after_action(&action.workspace);
+        }
+    }
     fn complete_skills_action(&self, action: Action, result: anyhow::Result<()>) {
         if !self.skills_action_current(&action) {
+            self.retire_skills_action(&action);
             return;
         }
         let mut owner = self
@@ -348,9 +376,7 @@ impl ClientCore {
         {
             return;
         }
-        if result.is_ok() {
-            self.fence_skills_reads_after_action(&action.workspace);
-        }
+        self.fence_skills_reads_after_action(&action.workspace);
         self.publish_skills_action(
             &mut owner,
             &action.workspace,
@@ -523,18 +549,33 @@ impl ClientCore {
             self.publish_skill_upload(workspace, upload);
         }
     }
+    fn retire_skill_upload(&self, workspace: &str, upload: &mut Upload) -> bool {
+        if upload.flow.publication.state.is_terminal() {
+            return false;
+        }
+        upload.flow.terminate(SkillUploadState::Cancelled);
+        self.publish_skill_upload(workspace, upload);
+        true
+    }
     fn skill_preparation_target(
         &self,
         workspace: &str,
         operation: u64,
     ) -> Option<SkillUploadTarget> {
-        let owner = self
+        let mut owner = self
             .skills_controller
             .lock()
             .expect("Skills controller poisoned");
-        let upload = owner.uploads.get(&(workspace.into(), operation))?;
-        self.upload_current(workspace, upload)
-            .then(|| upload.target.clone())
+        let upload = owner.uploads.get_mut(&(workspace.into(), operation))?;
+        if !self.upload_current(workspace, upload) {
+            let retired = self.retire_skill_upload(workspace, upload);
+            drop(owner);
+            if retired && self.capability_management_allowed(workspace) {
+                self.fence_skills_reads_after_action(workspace);
+            }
+            return None;
+        }
+        Some(upload.target.clone())
     }
     fn complete_skill_preparation(
         &self,
@@ -549,9 +590,15 @@ impl ClientCore {
         let Some(upload) = owner.uploads.get_mut(&(workspace.into(), operation)) else {
             return;
         };
-        if !self.upload_current(workspace, upload)
-            || upload.flow.publication.state != SkillUploadState::Preparing
-        {
+        if upload.flow.publication.state != SkillUploadState::Preparing {
+            return;
+        }
+        if !self.upload_current(workspace, upload) {
+            let retired = self.retire_skill_upload(workspace, upload);
+            drop(owner);
+            if retired && self.capability_management_allowed(workspace) {
+                self.fence_skills_reads_after_action(workspace);
+            }
             return;
         }
         match prepared {
@@ -577,6 +624,11 @@ impl ClientCore {
             .expect("Skills controller poisoned");
         let upload = owner.uploads.get_mut(&(workspace.into(), operation))?;
         if !self.upload_current(workspace, upload) {
+            let retired = self.retire_skill_upload(workspace, upload);
+            drop(owner);
+            if retired && self.capability_management_allowed(workspace) {
+                self.fence_skills_reads_after_action(workspace);
+            }
             return None;
         }
         Some((
@@ -600,12 +652,18 @@ impl ClientCore {
         let Some(upload) = owner.uploads.get_mut(&(workspace.into(), operation)) else {
             return;
         };
-        if !self.upload_current(workspace, upload) {
-            return;
-        }
         if !upload.flow.accepts_effect(effect_generation) {
             return;
         }
+        if !self.upload_current(workspace, upload) {
+            let retired = self.retire_skill_upload(workspace, upload);
+            drop(owner);
+            if retired && self.capability_management_allowed(workspace) {
+                self.fence_skills_reads_after_action(workspace);
+            }
+            return;
+        }
+        let failed = result.is_err();
         match result {
             Ok(completion) => {
                 if !upload.flow.complete(effect_generation, completion) {
@@ -630,7 +688,7 @@ impl ClientCore {
             });
         }
         drop(owner);
-        if succeeded {
+        if succeeded || failed {
             self.fence_skills_reads_after_action(workspace);
         }
     }
@@ -640,7 +698,7 @@ impl ClientCore {
         let task=std::thread::Builder::new().name("client-skills-actions".into()).spawn(move||while let Ok(work)=receiver.recv(){
             match work {
                 Work::Action(action)=>{
-                    let Some(core)=weak.upgrade() else{return;};if !core.skills_action_current(&action){continue;}let sender=core.transport_runtime().ws_command_sender();drop(core);
+                    let Some(core)=weak.upgrade() else{return;};if !core.skills_action_current(&action){core.retire_skills_action(&action);continue;}let sender=core.transport_runtime().ws_command_sender();drop(core);
                     let result=match &action.intent {
                         SkillsIntent::Policy{skill_id,enabled,allow_implicit_invocation}=>sender.skills_policy_set(super::actions::skills_policy_set_params(&action.workspace,skill_id.clone(),*enabled,*allow_implicit_invocation)).map(|_|()),
                         SkillsIntent::Remove{skill_id}=>sender.skills_uninstall(super::actions::skills_uninstall_params(&action.workspace,skill_id.clone())).map(|_|()),
@@ -710,6 +768,69 @@ mod tests {
         let (sender, receiver) = mpsc::sync_channel(4);
         core.skills_controller.lock().unwrap().sender = Some(sender);
         (core, receiver)
+    }
+    #[test]
+    fn retired_ticket_releases_action_and_archive_without_touching_replacements() {
+        let (core, queue) = fixture();
+        let skill_id = skill('A').skill_id;
+        let intent = || SkillsIntent::Remove {
+            skill_id: skill_id.clone(),
+        };
+        core.skills_intent("workspace", intent()).unwrap();
+        let Work::Action(action) = queue.try_recv().unwrap() else {
+            panic!()
+        };
+        let late = Action {
+            workspace: action.workspace.clone(),
+            target: action.target.clone(),
+            operation: action.operation,
+            epoch: action.epoch,
+            intent: intent(),
+            previous_policy: None,
+        };
+        let upload = core
+            .start_skill_upload("workspace", SkillUploadTarget::Install, "unused".into())
+            .unwrap();
+        let _ = queue.try_recv().unwrap();
+        crate::catalog_test_support::replace_connection(&core, 8);
+        core.complete_skills_action(action, Ok(()));
+        assert_eq!(
+            core.skills_action_snapshot("workspace", &skill_id.to_string())
+                .unwrap()
+                .state,
+            SkillsActionState::Cancelled
+        );
+        assert!(
+            core.skill_preparation_target("workspace", upload.id())
+                .is_none()
+        );
+        assert_eq!(
+            core.skill_upload_snapshot("workspace", upload.id())
+                .unwrap()
+                .state,
+            SkillUploadState::Cancelled
+        );
+        core.skills_intent("workspace", intent()).unwrap();
+        let pending = core
+            .skills_action_snapshot("workspace", &skill_id.to_string())
+            .unwrap();
+        let next = core
+            .start_skill_upload("workspace", SkillUploadTarget::Install, "unused".into())
+            .unwrap();
+        core.complete_skills_action(late, Err(anyhow::anyhow!("late")));
+        core.complete_skill_preparation("workspace", upload.id(), Err(anyhow::anyhow!("late")));
+        assert!(Arc::ptr_eq(
+            &pending,
+            &core
+                .skills_action_snapshot("workspace", &skill_id.to_string())
+                .unwrap()
+        ));
+        assert_eq!(
+            core.skill_upload_snapshot("workspace", next.id())
+                .unwrap()
+                .state,
+            SkillUploadState::Preparing
+        );
     }
     #[test]
     fn skill_policy_remove_failure_retry_and_access_fence_share_one_controller() {

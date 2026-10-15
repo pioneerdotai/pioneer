@@ -332,6 +332,14 @@ pub fn protocol_schema_documents() -> Vec<SchemaDocument> {
         ),
         schema_doc!("auth_me_response.json", AuthMeResponse),
         schema_doc!(
+            "auth_access_renew_params.json",
+            crate::AuthAccessRenewParams
+        ),
+        schema_doc!(
+            "auth_access_renew_response.json",
+            crate::AuthAccessRenewResponse
+        ),
+        schema_doc!(
             "authorization_capabilities_params.json",
             AuthorizationCapabilitiesParams
         ),

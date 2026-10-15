@@ -673,6 +673,7 @@ async fn prepare_native_projection_with_prepared(
             PreparedOperation {
                 owner: owner.clone(),
                 execution_turn: context.turn_id.clone(),
+                user_initiated: true,
                 source_projection,
                 expected_checkpoint: head,
                 summary_basis: basis,
@@ -724,7 +725,8 @@ async fn prepare_native_projection_with_prepared(
         Arc::new(NativeRequestTarget(projection.clone())),
         observer,
         clock.clone(),
-    );
+    )
+    .with_execution_turn(context.turn_id.clone());
     let execution = tokio::select! { biased;
         _ = clock.sleep_until(request_deadline) => CompactionExit::Reconcile(FailureKind::Deadline),
         result = runner.run(context.cancellation.clone()) => result?,

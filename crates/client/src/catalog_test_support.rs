@@ -44,6 +44,25 @@ pub fn client() -> Arc<ClientCore> {
     core
 }
 
+/// Advance only transport presentation, retaining operation owners as a same-session update does.
+pub fn replace_connection(core: &ClientCore, connection: u64) {
+    let scope = ClientScope::Administration { workspace_id: None };
+    let previous = core.snapshot(&scope).unwrap();
+    let mut identity = (*previous
+        .snapshot()
+        .payload::<crate::gateway::identity_authorization::IdentityAuthorizationPublication>()
+        .unwrap())
+    .clone();
+    identity.connection_id = Some(connection);
+    core.publish(
+        &ClientMutationAuthority { _private: () },
+        scope,
+        crate::threads::registry::revisions(previous.revisions().scoped().get() + 1),
+        Arc::new(identity),
+        vec![],
+    );
+}
+
 /// A current principal for direct/native-boundary profile replay; no transport.
 pub fn settings_client() -> Arc<ClientCore> {
     let core = client();
