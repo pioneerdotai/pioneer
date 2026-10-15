@@ -200,6 +200,8 @@ pub(crate) async fn fit_checkpoint_replay_aliases(
 pub(crate) struct PreparedOperation {
     pub owner: String,
     pub execution_turn: String,
+    /// Set by foreground turn preparation, never by completed-history polling.
+    pub user_initiated: bool,
     pub source_projection: Option<pioneer_compaction::frozen::FrozenHistoryRef>,
     pub expected_checkpoint: Option<String>,
     /// Published checkpoint selected as the atomic previous-summary input.
@@ -230,6 +232,12 @@ pub(crate) async fn admit_operation(
     mut prepared: PreparedOperation,
     now_ms: u64,
 ) -> Result<OperationSnapshot> {
+    // A changed identity must fail visibly instead of creating a fresh operation
+    // over history that already has saved progress. This lookup is bounded to one
+    // stopped operation and is never used to transplant its plan or cursor.
+    let stopped_progress = store
+        .compaction_invalid_completion_progress(workspace, thread, &prepared.owner)
+        .await?;
     // Filter the canonical manifest before fingerprinting, budgeting or
     // publishing an operation. Older cached classifications can still name a
     // source whose current typed model projection is empty.
@@ -246,7 +254,13 @@ pub(crate) async fn admit_operation(
             let payload = store
                 .compaction_reference_payload(workspace, &entry.thread_id, &entry.source)
                 .await?
-                .ok_or_else(|| anyhow::anyhow!("compaction source unavailable during admission"))?;
+                .ok_or_else(|| {
+                    anyhow::anyhow!(if stopped_progress.is_some() {
+                        "compaction resume sources changed"
+                    } else {
+                        "compaction source unavailable during admission"
+                    })
+                })?;
             if super::model_source_payload(&entry.source, payload)?.is_none() {
                 continue;
             }
@@ -263,7 +277,14 @@ pub(crate) async fn admit_operation(
     let projection_identity = if let Some(projection) = &prepared.source_projection {
         let owner = store
             .compaction_frozen_history_owner(workspace, projection)
-            .await?
+            .await
+            .map_err(|error| {
+                if stopped_progress.is_some() && error.downcast_ref::<sea_orm::DbErr>().is_none() {
+                    error.context("compaction resume snapshot is unavailable")
+                } else {
+                    error
+                }
+            })?
             .ok_or_else(|| anyhow::anyhow!("source projection is unavailable"))?;
         let imports = store
             .compaction_frozen_import_state(workspace, &owner, &projection.manifest_id)
@@ -319,6 +340,17 @@ pub(crate) async fn admit_operation(
     let mut record = if let Some(record) = existing {
         record
     } else {
+        if let Some(saved) = &stopped_progress {
+            store
+                .compaction_bound_source_projection(&saved.id)
+                .await
+                .map_err(|error| error.context("compaction resume snapshot is unavailable"))?;
+            ensure!(
+                store.compaction_manifest_sources_current(&saved.id).await?,
+                "compaction resume sources changed"
+            );
+            anyhow::bail!("compaction resume plan changed");
+        }
         let mut admission = settings.admit(current, cli_override, now_ms)?;
         if let Some(deadline) = prepared.operation_deadline_ms {
             admission.deadline_ms = admission.deadline_ms.min(deadline);
@@ -363,6 +395,40 @@ pub(crate) async fn admit_operation(
             store
                 .compaction_resume_deadline(&record.id, &prepared.execution_turn, deadline)
                 .await?;
+            record = store
+                .compaction_operation(&record.id)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("operation missing"))?;
+        }
+    }
+    if record.status == "failed" && prepared.user_initiated {
+        let state = store.compaction_runner_state(&record.id).await?;
+        if state.as_ref().is_some_and(|state| {
+            matches!(
+                state.phase,
+                RunnerPhase::Failed {
+                    kind: FailureKind::InvalidCompletion
+                }
+            ) && state.cursor > pioneer_compaction::runner::SourceCursor::default()
+        }) {
+            let deadline = settings
+                .admit(current, cli_override, now_ms)?
+                .deadline_ms
+                .min(prepared.operation_deadline_ms.unwrap_or(u64::MAX));
+            ensure!(
+                deadline > now_ms,
+                "compaction resume request deadline expired"
+            );
+            ensure!(
+                store
+                    .compaction_resume_invalid_completion(
+                        &record.id,
+                        &prepared.execution_turn,
+                        deadline,
+                    )
+                    .await?,
+                "compaction resume state or execution fence changed"
+            );
             record = store
                 .compaction_operation(&record.id)
                 .await?

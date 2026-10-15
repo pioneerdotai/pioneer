@@ -1,6 +1,8 @@
 use super::*;
 #[path = "checkpoint_input_alias_tests.rs"]
 mod checkpoint_input_alias_tests;
+#[path = "invalid_completion_resume_tests.rs"]
+mod invalid_completion_resume_tests;
 #[path = "invalid_completion_tests.rs"]
 mod invalid_completion_tests;
 use migration::{Migrator, MigratorTrait};
@@ -186,6 +188,7 @@ async fn raw_layout_publication_preserves_actual_ownership(filtered_empty: bool)
         PreparedOperation {
             owner: "raw-layout-owner".into(),
             execution_turn: "turn".into(),
+            user_initiated: true,
             source_projection: None,
             expected_checkpoint: None,
             summary_basis: None,
@@ -1876,6 +1879,7 @@ async fn turn_started_and_edited_payload_projection_matches_history_without_even
         PreparedOperation {
             owner: "input-model-projection-owner".into(),
             execution_turn: "turn".into(),
+            user_initiated: true,
             source_projection: None,
             expected_checkpoint: None,
             summary_basis: None,
@@ -5334,6 +5338,7 @@ async fn admission_resumes_exact_plan_without_resetting_deadline() {
     let mut prepared = PreparedOperation {
         owner: "admission-owner".into(),
         execution_turn: "turn".into(),
+        user_initiated: true,
         source_projection: Some(projection.clone()),
         expected_checkpoint: None,
         summary_basis: None,
@@ -5518,6 +5523,7 @@ async fn admission_and_runner_remove_technical_compact_and_reference_only_payloa
     let prepared = PreparedOperation {
         owner: "typed-admission-filter-owner".into(),
         execution_turn: "turn".into(),
+        user_initiated: true,
         source_projection: Some(projection),
         expected_checkpoint: None,
         summary_basis: None,
@@ -6428,6 +6434,7 @@ async fn expected_head_does_not_force_a_projection_basis_after_historical_edit()
     let prepared = PreparedOperation {
         owner: "owner".into(),
         execution_turn: "turn".into(),
+        user_initiated: true,
         source_projection: None,
         expected_checkpoint: Some(head.clone()),
         summary_basis: None,
@@ -26703,6 +26710,7 @@ async fn new_admission_omits_service_sources_from_compact_and_reference_only() {
         PreparedOperation {
             owner: "filtered-admission".into(),
             execution_turn: "turn".into(),
+            user_initiated: true,
             source_projection: None,
             expected_checkpoint: None,
             summary_basis: None,

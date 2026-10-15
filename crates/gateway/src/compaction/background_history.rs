@@ -557,6 +557,7 @@ pub(crate) async fn prepare_completed_history_owned(
             PreparedOperation {
                 owner,
                 execution_turn: turn.into(),
+                user_initiated: priority == super::ContextWorkPriority::Foreground,
                 source_projection: Some(descriptor),
                 expected_checkpoint: head,
                 summary_basis: basis,
@@ -593,7 +594,8 @@ pub(crate) async fn prepare_completed_history_owned(
         Arc::new(projection),
         observer,
         clock.clone(),
-    );
+    )
+    .with_execution_turn(turn.into());
     let exit = tokio::select! { biased;
         _ = clock.sleep_until(operation_deadline) => CompactionExit::Reconcile(FailureKind::Deadline),
         result = runner.run(cancellation) => result?,
