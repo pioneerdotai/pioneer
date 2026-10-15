@@ -56,7 +56,8 @@ use pioneer_compaction::runner::{
     SourceCursor,
 };
 use pioneer_compaction::summary::{
-    ReferenceMaterial, Summarizer, SummaryInput, SummaryPart, SummaryRequest, validate_summary,
+    ReferenceMaterial, Summarizer, SummaryInput, SummaryPart, SummaryRequest,
+    validate_summary_classified,
 };
 use pioneer_compaction::{Checkpoint, OperationSnapshot, SourceRef};
 use pioneer_crud::{
@@ -862,23 +863,30 @@ impl CompactionRunner {
                                 observation.input_tokens = completion.input_tokens;
                                 observation.output_tokens = completion.output_tokens;
                             }
-                            let summary = match validate_summary(
+                            let summary = match validate_summary_classified(
                                 &completion,
                                 portion.request.output_cap,
                             ) {
                                 Ok(text) => text,
-                                Err(_) => {
+                                Err(reason) => {
                                     state = self
-                                            .persist(
-                                                &state,
-                                                Self::diagnose(state.attempt_failed(
+                                        .persist(
+                                            &state,
+                                            Self::diagnose(
+                                                self.attempt_failed(
+                                                    &state,
                                                     FailureKind::InvalidCompletion,
-                                                    self.clock.now_ms(),
                                                     None,
-                                                )?, FailureDiagnostic::new("summary_validation", "invalid_completion", "Summary completion did not satisfy the required format or output budget")),
-                                                None,
-                                            )
-                                            .await?;
+                                                )?,
+                                                FailureDiagnostic::new(
+                                                    "summary_validation",
+                                                    "invalid_completion",
+                                                    reason.explanation(),
+                                                ),
+                                            ),
+                                            None,
+                                        )
+                                        .await?;
                                     continue;
                                 }
                             };
