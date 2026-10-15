@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "DeviceActivationPublication",
+  "type": "object",
+  "properties": {
+    "error": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "generation": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "loading": {
+      "type": "boolean"
+    },
+    "ready": {
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "generation",
+    "loading",
+    "ready"
+  ]
+}

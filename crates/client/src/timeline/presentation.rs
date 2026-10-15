@@ -530,9 +530,35 @@ pub(crate) fn project(
     let page = top_level
         .map(|cache| cache.loaded_range.clone())
         .unwrap_or_default();
-    let status = top_level
+    let mut status = top_level
         .map(|cache| cache.request_status.clone())
         .unwrap_or_default();
+    // An expanded work group's initial failure uses the existing timeline Retry.
+    if matches!(
+        status,
+        super::semantic::TimelineRequestStatus::Idle
+            | super::semantic::TimelineRequestStatus::Ready
+    ) && let Some(thread) = semantic.thread(id)
+        && let Some(failure) = semantic_rows.rows.iter().find_map(|row| {
+            let SemanticTimelineRowKind::WorkHeader {
+                work,
+                expanded: true,
+                ..
+            } = &row.kind
+            else {
+                return None;
+            };
+            let range = thread.work_range(&work.turn_id)?;
+            (!range.has_loaded_page
+                && matches!(
+                    range.initial_request_status,
+                    super::semantic::TimelineRequestStatus::Failed { .. }
+                ))
+            .then(|| range.initial_request_status.clone())
+        })
+    {
+        status = failure;
+    }
     (
         Arc::new(TimelineSnapshot {
             has_loaded_page: top_level.is_some_and(|cache| cache.has_loaded_page),

@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ThreadFileViewGrantCreateResponse",
+  "type": "object",
+  "properties": {
+    "column": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "minimum": 0
+    },
+    "content_type": {
+      "type": "string",
+      "maxLength": 255,
+      "minLength": 1
+    },
+    "expires_at": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "file_name": {
+      "type": "string",
+      "maxLength": 255,
+      "minLength": 1
+    },
+    "line": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "minimum": 0
+    },
+    "relative_url": {
+      "type": "string",
+      "maxLength": 58,
+      "minLength": 58
+    },
+    "size_bytes": {
+      "type": "integer",
+      "format": "uint64",
+      "maximum": 10485760,
+      "minimum": 0
+    }
+  },
+  "required": [
+    "relative_url",
+    "expires_at",
+    "file_name",
+    "content_type",
+    "size_bytes"
+  ]
+}

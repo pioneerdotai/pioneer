@@ -10,10 +10,10 @@ use pioneer_protocol::{
     TaskStatus, TaskTriggerKind, ThreadComposerExecutionMode, ThreadMode,
     ThreadTimelineBlocksChangedNotification, ThreadTimelinePageParams, ThreadTimelinePageResponse,
     TimelineBlock, TimelineBlockKind, TimelineCursor, TimelinePageAnchor, TimelinePageInfo, Turn,
-    TurnItem, TurnKind, TurnOrigin, TurnStatus, TurnWorkBlock, TurnWorkItem, TurnWorkItemStatus,
-    TurnWorkItemsChangedNotification, TurnWorkItemsGetParams, TurnWorkItemsGetResponse,
-    TurnWorkPageParams, TurnWorkPageResponse, TurnWorkPresentation, TurnWorkState,
-    TurnWorkStateChangedNotification, UserMessageAttachment,
+    TurnAuthorSnapshot, TurnItem, TurnKind, TurnOrigin, TurnStatus, TurnWorkBlock, TurnWorkItem,
+    TurnWorkItemStatus, TurnWorkItemsChangedNotification, TurnWorkItemsGetParams,
+    TurnWorkItemsGetResponse, TurnWorkPageParams, TurnWorkPageResponse, TurnWorkPresentation,
+    TurnWorkState, TurnWorkStateChangedNotification, UserMessageAttachment,
 };
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
@@ -356,6 +356,11 @@ impl TopLevelTimelineCache {
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct TurnWorkRangeCache {
+    #[serde(default)]
+    pub has_loaded_page: bool,
+    // Owned by initial history requests, independently of item reads/invalidation.
+    #[serde(default)]
+    pub initial_request_status: TimelineRequestStatus,
     pub thread_id: ThreadId,
     pub turn_id: TurnId,
     pub work: Option<TurnWorkBlock>,
@@ -503,7 +508,16 @@ pub struct ThreadSemanticTimelineState {
     detached_task_run_turn_ids: HashSet<TurnId>,
     #[serde(skip)]
     #[cfg_attr(any(feature = "schema", test), schemars(skip))]
-    suppressed_optimistic_turn_work_ids: HashSet<TurnId>,
+    task_run_contexts: HashMap<TurnId, Turn>,
+    #[serde(skip)]
+    #[cfg_attr(any(feature = "schema", test), schemars(skip))]
+    admission_turn_ids: HashSet<TurnId>,
+    #[serde(skip)]
+    #[cfg_attr(any(feature = "schema", test), schemars(skip))]
+    confirmed_admission_turn_ids: HashSet<TurnId>,
+    #[serde(skip)]
+    #[cfg_attr(any(feature = "schema", test), schemars(skip))]
+    local_admission_reject_ids: HashSet<TurnId>,
     #[serde(skip)]
     #[cfg_attr(any(feature = "schema", test), schemars(skip))]
     turn_work_tombstone_revisions: HashMap<TurnId, (i64, i64)>,
@@ -638,6 +652,8 @@ pub fn turn_work_range_from_page(page: TurnWorkPageResponse) -> TurnWorkRangeCac
         items_by_id.insert(item.work_item_id.clone(), item);
     }
     let mut range = TurnWorkRangeCache {
+        has_loaded_page: true,
+        initial_request_status: TimelineRequestStatus::Ready,
         thread_id: page.thread_id,
         turn_id: page.turn_id,
         work: page.work,
@@ -760,9 +776,28 @@ pub fn flatten_thread_semantic_timeline(
                     },
                 });
             }
-            TimelineBlockKind::TurnState { author, .. } => {
-                let Some(author) = ready_timeline_state_author(author.as_ref()) else {
-                    continue;
+            TimelineBlockKind::TurnState { author, state, .. } => {
+                // A Composer admission's refusal belongs to its exact user author.
+                // Keep the execution-author policy for work and other Turn states.
+                let admission_principal_outcome = block
+                    .turn_id
+                    .as_deref()
+                    .is_some_and(|turn_id| thread.admission_turn_ids.contains(turn_id))
+                    && matches!(
+                        state,
+                        TurnWorkState::Failed | TurnWorkState::Blocked | TurnWorkState::Interrupted
+                    )
+                    && matches!(
+                        author.as_ref().map(|author| &author.actor),
+                        Some(pioneer_protocol::PersistedActorRef::Principal(_))
+                    );
+                let author = if admission_principal_outcome {
+                    author.as_ref()
+                } else {
+                    let Some(author) = ready_timeline_state_author(author.as_ref()) else {
+                        continue;
+                    };
+                    author
                 };
                 rows.push(SemanticTimelineRow {
                     id: SemanticTimelineRowId::TopLevelBlock {
@@ -1033,11 +1068,49 @@ pub fn apply_thread_timeline_page(
 ) -> bool {
     let thread_id = page.thread_id.clone();
     let thread = state.thread_mut(thread_id);
+    for block in &mut page.blocks {
+        if block.workspace_id == page.workspace_id && block.thread_id == page.thread_id {
+            enrich_task_run_block_author(thread, block);
+            // A stale admission page cannot replace a confirmed refusal with
+            // Running/Completed. Local RPC errors remain replaceable by the server.
+            if let Some(turn_id) = block.turn_id.as_ref()
+                && thread.confirmed_admission_turn_ids.contains(turn_id)
+                && !thread.local_admission_reject_ids.contains(turn_id)
+                && matches!(&block.kind, TimelineBlockKind::TurnState { state, .. }
+                    if !matches!(state, TurnWorkState::Failed | TurnWorkState::Blocked | TurnWorkState::Interrupted))
+                && let Some(known) = thread.top_level.blocks_by_id.get(&block.block_id)
+                && matches!(
+                    &known.kind,
+                    TimelineBlockKind::TurnState {
+                        state: TurnWorkState::Failed
+                            | TurnWorkState::Blocked
+                            | TurnWorkState::Interrupted,
+                        ..
+                    }
+                )
+            {
+                *block = known.clone();
+            }
+            if let Some(turn_id) = block.turn_id.as_ref()
+                && thread.admission_turn_ids.contains(turn_id)
+                && matches!(
+                    &block.kind,
+                    TimelineBlockKind::TurnState {
+                        state: TurnWorkState::Failed
+                            | TurnWorkState::Blocked
+                            | TurnWorkState::Interrupted,
+                        ..
+                    }
+                )
+            {
+                thread.confirmed_admission_turn_ids.insert(turn_id.clone());
+                thread.local_admission_reject_ids.remove(turn_id);
+            }
+        }
+    }
     page.blocks.retain(|block| match &block.kind {
         TimelineBlockKind::TurnWork { work } => {
-            !thread
-                .suppressed_optimistic_turn_work_ids
-                .contains(work.turn_id.as_str())
+            !thread.admission_turn_ids.contains(work.turn_id.as_str())
                 && !thread
                     .turn_work_tombstone_revisions
                     .contains_key(work.turn_id.as_str())
@@ -1165,6 +1238,7 @@ pub fn apply_thread_timeline_blocks_changed(
     }
     let mut tombstoned_block_ids = HashSet::new();
     for tombstone in notification.turn_work_tombstones {
+        tombstoned_block_ids.insert(tombstone.block_id.clone());
         let incoming_revision = (
             tombstone.source_high_watermark,
             tombstone.projection_updated_at_unix_micros,
@@ -1176,7 +1250,6 @@ pub fn apply_thread_timeline_blocks_changed(
         {
             continue;
         }
-        tombstoned_block_ids.insert(tombstone.block_id);
         thread
             .turn_work_tombstone_revisions
             .insert(tombstone.turn_id.clone(), incoming_revision);
@@ -1252,7 +1325,16 @@ pub fn apply_conversation_event_to_semantic_timeline(
     event: &ConversationEvent,
     now_unix_ms: i64,
 ) -> bool {
-    match event {
+    let context_changed = match event {
+        ConversationEvent::TurnStarted { thread_id, turn }
+        | ConversationEvent::TurnCompleted { thread_id, turn }
+        | ConversationEvent::TurnFailed { thread_id, turn }
+        | ConversationEvent::TurnBlocked {
+            thread_id, turn, ..
+        } => retain_task_run_context(state.thread_mut(thread_id.clone()), workspace_id, turn),
+        _ => false,
+    };
+    let changed = match event {
         ConversationEvent::LocalTurnStartRequested {
             thread_id,
             turn_id,
@@ -1403,7 +1485,8 @@ pub fn apply_conversation_event_to_semantic_timeline(
             now_unix_ms,
         ),
         _ => false,
-    }
+    };
+    changed || context_changed
 }
 
 pub fn apply_conversation_event_to_semantic_timeline_with_patch(
@@ -1427,7 +1510,7 @@ pub fn apply_conversation_event_to_semantic_timeline_with_patch(
     semantic_timeline_cache_patch_from_diff(workspace_id, thread_id, before.as_ref(), after)
 }
 
-/// Applies an optimistic local Composer event according to the thread product policy.
+/// Applies Composer ownership policy to local and server lifecycle events.
 ///
 /// A collaborative parent submission is admission for a detached Task. Its user
 /// message is optimistic, but foreground work is not: the canonical Task card
@@ -1439,25 +1522,49 @@ pub fn apply_local_composer_event_to_semantic_timeline(
     execution_mode: ThreadComposerExecutionMode,
     now_unix_ms: i64,
 ) -> bool {
-    let changed =
-        apply_conversation_event_to_semantic_timeline(state, workspace_id, event, now_unix_ms);
-    if execution_mode != ThreadComposerExecutionMode::DetachedTask {
-        return changed;
-    }
-    let ConversationEvent::LocalTurnStartRequested {
-        thread_id, turn_id, ..
-    } = event
-    else {
-        return changed;
+    let Some(thread_id) = event.thread_id() else {
+        return false;
     };
-
-    let thread = state.thread_mut(thread_id.to_owned());
-    let before = thread.clone();
-    thread
-        .suppressed_optimistic_turn_work_ids
-        .insert(turn_id.to_owned());
-    remove_turn_work_state(thread, turn_id);
-    changed || before != *thread
+    let mut changed = false;
+    let admission_id = match event {
+        ConversationEvent::LocalTurnStartRequested { turn_id, mode, .. }
+            if *mode != ThreadMode::Message
+                && execution_mode == ThreadComposerExecutionMode::DetachedTask =>
+        {
+            Some(turn_id)
+        }
+        ConversationEvent::TurnStarted { turn, .. }
+        | ConversationEvent::TurnCompleted { turn, .. }
+        | ConversationEvent::TurnFailed { turn, .. }
+        | ConversationEvent::TurnBlocked { turn, .. }
+            if execution_mode.is_detached_admission(turn) =>
+        {
+            Some(&turn.id)
+        }
+        _ => None,
+    };
+    if let Some(turn_id) = admission_id {
+        let thread = state.thread_mut(thread_id.to_owned());
+        changed |= thread.admission_turn_ids.insert(turn_id.clone());
+        changed |= remove_foreground_turn_work_state(thread, turn_id);
+        match event {
+            ConversationEvent::TurnStarted { turn, .. }
+            | ConversationEvent::TurnCompleted { turn, .. }
+            | ConversationEvent::TurnFailed { turn, .. }
+            | ConversationEvent::TurnBlocked { turn, .. } => {
+                changed |= project_admission_turn(thread, workspace_id, turn, now_unix_ms);
+            }
+            _ => {}
+        }
+    }
+    if let ConversationEvent::LocalTurnStartAccepted { turn_id, mode, .. } = event
+        && *mode != ThreadMode::Message
+        && execution_mode == ThreadComposerExecutionMode::DetachedTask
+    {
+        let thread = state.thread_mut(thread_id.to_owned());
+        changed |= confirm_admission_status(thread, turn_id, TurnStatus::Completed);
+    }
+    changed | apply_conversation_event_to_semantic_timeline(state, workspace_id, event, now_unix_ms)
 }
 
 pub fn apply_local_composer_event_to_semantic_timeline_with_patch(
@@ -1528,6 +1635,82 @@ fn apply_local_turn_start_requested_to_semantic_timeline(
     before != *thread
 }
 
+/// Reuse the product policy and exact Turn role on snapshot/reconnect paths.
+pub(crate) fn apply_thread_context_to_semantic_timeline(
+    state: &mut SemanticTimelineState,
+    snapshot: &pioneer_protocol::Thread,
+) {
+    let thread = state.thread_mut(snapshot.id.clone());
+    for turn in &snapshot.turns {
+        if snapshot
+            .origin_kind
+            .composer_execution_mode()
+            .is_detached_admission(turn)
+        {
+            project_admission_turn(
+                thread,
+                &snapshot.workspace_id,
+                turn,
+                snapshot.updated_at.saturating_mul(1_000),
+            );
+        }
+        retain_task_run_context(thread, &snapshot.workspace_id, turn);
+    }
+}
+
+fn retain_task_run_context(
+    thread: &mut ThreadSemanticTimelineState,
+    workspace_id: &str,
+    turn: &Turn,
+) -> bool {
+    if turn.turn_kind != TurnKind::TaskRun {
+        return false;
+    }
+    if thread.task_run_contexts.get(&turn.id) == Some(turn) {
+        return false;
+    }
+    let mut changed = false;
+    let mut context = turn.clone();
+    if let Some(existing) = thread.task_run_contexts.get(&turn.id) {
+        preserve_turn_author(&existing.author, &mut context.author);
+        if existing.status != pioneer_protocol::TurnStatus::InProgress {
+            context.status = existing.status;
+        }
+    }
+    if thread.task_run_contexts.get(&turn.id) == Some(&context) {
+        return false;
+    }
+    if task_run_projects_detached(thread, &context) {
+        changed |= thread.detached_task_run_turn_ids.insert(turn.id.clone());
+        changed |= remove_turn_work_state(thread, &turn.id);
+        if let Some(author) = &context.author {
+            for block in thread.top_level.blocks_by_id.values_mut() {
+                if block.workspace_id == workspace_id
+                    && block.thread_id == thread.thread_id
+                    && block.turn_id.as_ref() == Some(&turn.id)
+                    && let TimelineBlockKind::DetachedTaskRun {
+                        task,
+                        author: current,
+                    } = &mut block.kind
+                    && task
+                        .run_id
+                        .as_deref()
+                        .is_none_or(|run_id| run_id == turn.id)
+                {
+                    let previous = current.clone();
+                    preserve_turn_author(&Some(author.clone()), current);
+                    changed |= previous != *current;
+                }
+            }
+        }
+    }
+    if thread.task_run_contexts.get(&turn.id) != Some(&context) {
+        thread.task_run_contexts.insert(turn.id.clone(), context);
+        changed = true;
+    }
+    changed
+}
+
 fn apply_started_turn_to_semantic_timeline(
     state: &mut SemanticTimelineState,
     workspace_id: &str,
@@ -1541,7 +1724,22 @@ fn apply_started_turn_to_semantic_timeline(
         remove_turn_work_state(thread, turn.id.as_str());
         return before != *thread;
     }
-    if !turn_is_detached_task_run(turn) {
+    let thread = state.thread_mut(thread_id.to_owned());
+    if task_run_attachment_unresolved(thread, turn) {
+        // ScheduledTask describes the trigger, not attachment. Wait for the
+        // occurrence anchor or canonical work/card instead of guessing ownership.
+        return false;
+    }
+    if !task_run_projects_detached(thread, turn) {
+        if turn.turn_kind == TurnKind::TaskRun
+            && turn.origin == TurnOrigin::ScheduledTask
+            && turn.status == TurnStatus::InProgress
+            && thread
+                .cached_turn_work_block(&turn.id)
+                .is_some_and(|work| work.state == TurnWorkState::Running)
+        {
+            return false;
+        }
         return apply_turn_state_to_semantic_timeline(
             state,
             workspace_id,
@@ -1574,7 +1772,11 @@ fn apply_terminal_or_detached_turn_to_semantic_timeline(
         remove_turn_work_state(thread, turn.id.as_str());
         return before != *thread;
     }
-    if turn_is_detached_task_run(turn) {
+    let thread = state.thread_mut(thread_id.to_owned());
+    if task_run_attachment_unresolved(thread, turn) {
+        return false;
+    }
+    if task_run_projects_detached(thread, turn) {
         let thread = state.thread_mut(thread_id.to_owned());
         let before = thread.clone();
         thread.detached_task_run_turn_ids.insert(turn.id.clone());
@@ -1603,7 +1805,7 @@ fn apply_turn_state_to_semantic_timeline(
 ) -> bool {
     let thread = state.thread_mut(thread_id.to_owned());
     let before = thread.clone();
-    if thread.suppressed_optimistic_turn_work_ids.contains(turn_id) {
+    if thread.admission_turn_ids.contains(turn_id) {
         remove_turn_work_state(thread, turn_id);
         return before != *thread;
     }
@@ -1655,6 +1857,10 @@ fn apply_terminal_turn_to_semantic_timeline(
     fallback_state: TurnWorkState,
     now_unix_ms: i64,
 ) -> bool {
+    let thread = state.thread_mut(thread_id.to_owned());
+    if thread.admission_turn_ids.contains(&turn.id) {
+        return project_admission_turn(thread, workspace_id, turn, now_unix_ms);
+    }
     let work_state = turn_status_to_work_state(turn.status).unwrap_or(fallback_state);
     if work_state == TurnWorkState::Completed {
         let thread = state.thread_mut(thread_id.to_owned());
@@ -1713,6 +1919,13 @@ fn apply_local_turn_start_rejected_to_semantic_timeline(
     error: &str,
     now_unix_ms: i64,
 ) -> bool {
+    let thread = state.thread_mut(thread_id.to_owned());
+    if mode != ThreadMode::Message && thread.admission_turn_ids.contains(turn_id) {
+        if thread.confirmed_admission_turn_ids.contains(turn_id) {
+            return false;
+        }
+        thread.local_admission_reject_ids.insert(turn_id.to_owned());
+    }
     let changed = if mode == ThreadMode::Message {
         let thread = state.thread_mut(thread_id.to_owned());
         let before = thread.clone();
@@ -2181,9 +2394,7 @@ pub fn apply_turn_work_page(
         }
         return false;
     }
-    if thread
-        .suppressed_optimistic_turn_work_ids
-        .contains(turn_id.as_str())
+    if thread.admission_turn_ids.contains(turn_id.as_str())
         || thread
             .turn_work_tombstone_revisions
             .get(turn_id.as_str())
@@ -2207,7 +2418,7 @@ pub fn apply_work_range_page(
     merge_mode: WorkPageMergeMode,
 ) -> bool {
     let before = range.clone();
-    let was_empty = range.ordered_item_ids.is_empty();
+    let initialize_loaded_range = !range.has_loaded_page || range.ordered_item_ids.is_empty();
     let incoming_projection_revision = (
         page.source_high_watermark,
         page.projection_updated_at_unix_micros,
@@ -2240,11 +2451,22 @@ pub fn apply_work_range_page(
             range.stale_work_item_ids.clear();
             range.source_high_watermark = page.source_high_watermark;
             range.projection_updated_at_unix_micros = page.projection_updated_at_unix_micros;
+            range.has_loaded_page = true;
+            range.initial_request_status = TimelineRequestStatus::Ready;
             range.request_status = TimelineRequestStatus::Ready;
             return before != *range;
         };
         if let Some(existing_work) = range.work.as_ref() {
             preserve_newer_agent_work_graph(existing_work, &mut incoming_work);
+            // A page requested before live completion must not reopen the work group.
+            if is_terminal_turn_work_state(existing_work.state)
+                && !is_terminal_turn_work_state(incoming_work.state)
+            {
+                incoming_work.state = existing_work.state;
+                incoming_work.presentation = existing_work.presentation;
+                incoming_work.completed_at_unix_ms = existing_work.completed_at_unix_ms;
+                incoming_work.elapsed_ms = existing_work.elapsed_ms;
+            }
         }
         range.work = Some(incoming_work);
         range.source_high_watermark = page.source_high_watermark;
@@ -2259,9 +2481,11 @@ pub fn apply_work_range_page(
         range,
         &page.page,
         merge_mode,
-        was_empty,
+        initialize_loaded_range,
         page_can_advance_newest_boundary,
     );
+    range.has_loaded_page = true;
+    range.initial_request_status = TimelineRequestStatus::Ready;
     range.request_status = TimelineRequestStatus::Ready;
 
     before != *range
@@ -2333,9 +2557,7 @@ pub fn apply_work_items_get_response(
 }
 
 fn merge_turn_work_item(range: &mut TurnWorkRangeCache, item: TurnWorkItem) -> bool {
-    if let Some(existing) = range.items_by_id.get(item.work_item_id.as_str())
-        && !incoming_work_item_is_newer(existing, &item)
-    {
+    if !should_merge_turn_work_item(range, &item) {
         return range.stale_work_item_ids.remove(item.work_item_id.as_str());
     }
 
@@ -2350,6 +2572,14 @@ fn merge_turn_work_item(range: &mut TurnWorkRangeCache, item: TurnWorkItem) -> b
         changed = true;
     }
     changed
+}
+
+// Shared by the cache merge and initial-response admission.
+pub(crate) fn should_merge_turn_work_item(range: &TurnWorkRangeCache, item: &TurnWorkItem) -> bool {
+    range
+        .items_by_id
+        .get(item.work_item_id.as_str())
+        .is_none_or(|existing| incoming_work_item_is_newer(existing, item))
 }
 
 fn incoming_work_item_is_newer(existing: &TurnWorkItem, incoming: &TurnWorkItem) -> bool {
@@ -2437,6 +2667,13 @@ pub fn apply_turn_work_items_changed(
     notification: TurnWorkItemsChangedNotification,
 ) -> bool {
     let thread = state.thread_mut(notification.thread_id);
+    if thread
+        .turn_work_tombstone_revisions
+        .contains_key(&notification.turn_id)
+        || thread.admission_turn_ids.contains(&notification.turn_id)
+    {
+        return false;
+    }
     let range = thread.work_range_mut(notification.turn_id);
     let mut changed = false;
     let mut removed_item = false;
@@ -2472,9 +2709,7 @@ pub fn apply_turn_work_state_changed(
         notification.projection_updated_at_unix_micros,
     );
 
-    if thread
-        .suppressed_optimistic_turn_work_ids
-        .contains(turn_id.as_str())
+    if thread.admission_turn_ids.contains(turn_id.as_str())
         || thread
             .turn_work_tombstone_revisions
             .get(turn_id.as_str())
@@ -2638,9 +2873,11 @@ fn live_item_placement(
 ) -> LiveItemPlacement {
     match item {
         TurnItem::UserMessage { .. } => LiveItemPlacement::TopLevelUser,
+        _ if thread.admission_turn_ids.contains(turn_id) => LiveItemPlacement::Hidden,
         TurnItem::Task { item }
             if item.attachment == TaskAttachmentMode::Detached
-                && thread_has_detached_task_run(thread, turn_id) =>
+                && (thread_has_detached_task_run(thread, turn_id)
+                    || item.run_id.as_deref() == Some(turn_id)) =>
         {
             LiveItemPlacement::DetachedTaskRun
         }
@@ -2762,7 +2999,10 @@ fn work_item_projection_id(turn_id: &str, item_id: &str) -> String {
 
 fn turn_sort_base(thread: &ThreadSemanticTimelineState, turn_id: &str, now_unix_ms: i64) -> String {
     for block in thread.top_level.blocks_by_id.values() {
-        if block_turn_id(block) == Some(turn_id)
+        let causal_match = matches!(&block.kind, TimelineBlockKind::DetachedTaskRun { task, .. }
+            if task.created_by_turn_id.as_deref() == Some(turn_id)
+                && task.trigger_kind == TaskTriggerKind::Immediate);
+        if (block_turn_id(block) == Some(turn_id) || causal_match)
             && let Some((millis, rest)) = block.sort_key.split_once(':')
             && let Some((existing_turn_id, _)) = rest.split_once(':')
             && existing_turn_id == turn_id
@@ -2893,36 +3133,92 @@ fn newest_top_level_block(
         }
         return incoming;
     };
-    if existing_task.id != incoming_task.id {
+    if existing_task.id != incoming_task.id
+        || existing_task.task_id != incoming_task.task_id
+        || matches!((&existing_task.run_id, &incoming_task.run_id), (Some(existing), Some(incoming)) if existing != incoming)
+    {
         return incoming;
     }
 
-    // Task terminality is monotonic. A live optimistic update may carry a
-    // later client timestamp than the authoritative task projection, but it
-    // must never keep a completed/failed/blocked/cancelled task rendered as
-    // running. Conversely, a delayed non-terminal event cannot reopen a task
-    // that the server has already made terminal.
-    match (
+    // Terminality and revision choose state; identity can still be enriched by
+    // an older canonical page. An incomplete live update cannot erase it.
+    let keep_existing = match (
         existing_task.status.is_terminal(),
         incoming_task.status.is_terminal(),
     ) {
-        (true, false) => return existing.clone(),
-        (false, true) => return incoming,
-        _ => {}
-    }
-
-    let existing_revision = (
-        existing_task.updated_at,
-        detached_task_status_rank(existing_task.status),
-    );
-    let incoming_revision = (
-        incoming_task.updated_at,
-        detached_task_status_rank(incoming_task.status),
-    );
-    if existing_revision > incoming_revision {
+        (true, false) => true,
+        (false, true) => false,
+        _ => {
+            (
+                existing_task.updated_at,
+                detached_task_status_rank(existing_task.status),
+            ) > (
+                incoming_task.updated_at,
+                detached_task_status_rank(incoming_task.status),
+            )
+        }
+    };
+    let other = if keep_existing { &incoming } else { existing };
+    let mut selected = if keep_existing {
         existing.clone()
     } else {
-        incoming
+        incoming.clone()
+    };
+    if let (
+        TimelineBlockKind::DetachedTaskRun { task, author },
+        TimelineBlockKind::DetachedTaskRun {
+            task: other_task,
+            author: other_author,
+        },
+    ) = (&mut selected.kind, &other.kind)
+    {
+        preserve_turn_author(other_author, author);
+        if task.created_by_turn_id.is_none() {
+            task.created_by_turn_id = other_task.created_by_turn_id.clone();
+        }
+        if task.run_id.is_none() {
+            task.run_id = other_task.run_id.clone();
+        }
+        if task.child_thread_id.is_none() {
+            task.child_thread_id = other_task.child_thread_id.clone();
+        }
+        if task.child_turn_id.is_none() {
+            task.child_turn_id = other_task.child_turn_id.clone();
+        }
+        if task.agent_role.is_none() {
+            task.agent_role = other_task.agent_role.clone();
+        }
+        if task.started_at.is_none() {
+            task.started_at = other_task.started_at;
+        }
+        if task.parent_task_id.is_none() {
+            task.parent_task_id = other_task.parent_task_id.clone();
+        }
+        if task.root_task_id.is_none() {
+            task.root_task_id = other_task.root_task_id.clone();
+        }
+    }
+    selected
+}
+
+fn preserve_turn_author(
+    existing: &Option<TurnAuthorSnapshot>,
+    incoming: &mut Option<TurnAuthorSnapshot>,
+) {
+    let Some(existing) = existing else {
+        return;
+    };
+    let Some(incoming_author) = incoming else {
+        *incoming = Some(existing.clone());
+        return;
+    };
+    if incoming_author.actor == existing.actor {
+        if incoming_author.avatar_revision.is_none() {
+            incoming_author.avatar_revision = existing.avatar_revision.clone();
+        }
+        if incoming_author.agent.is_none() {
+            incoming_author.agent = existing.agent.clone();
+        }
     }
 }
 
@@ -3053,6 +3349,14 @@ fn upsert_assistant_message_block(
             .or(Some(now_unix_ms)),
         updated_at_unix_ms: Some(now_unix_ms),
         kind: TimelineBlockKind::AssistantMessage {
+            html_publications: existing
+                .and_then(|block| match &block.kind {
+                    TimelineBlockKind::AssistantMessage {
+                        html_publications, ..
+                    } => Some(html_publications.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default(),
             item_id: id.clone(),
             text: text.clone(),
             status,
@@ -3078,10 +3382,23 @@ fn upsert_detached_task_run_block(
     thread.detached_task_run_turn_ids.insert(turn_id.to_owned());
     let block_id = detached_task_run_block_id(turn_id, task.id.as_str());
     let existing = thread.top_level.blocks_by_id.get(block_id.as_str());
-    let author = existing.and_then(|block| match &block.kind {
-        TimelineBlockKind::DetachedTaskRun { author, .. } => author.clone(),
-        _ => None,
-    });
+    let author = existing
+        .and_then(|block| match &block.kind {
+            TimelineBlockKind::DetachedTaskRun { author, .. } => author.clone(),
+            _ => None,
+        })
+        .or_else(|| {
+            task.run_id
+                .as_deref()
+                .is_none_or(|run_id| run_id == turn_id)
+                .then(|| {
+                    thread
+                        .task_run_contexts
+                        .get(turn_id)
+                        .and_then(|turn| turn.author.clone())
+                })
+                .flatten()
+        });
     let suffix = format!("detached-task-run:{}", task.id);
     let block = TimelineBlock {
         workspace_id: workspace_id.to_owned(),
@@ -3120,28 +3437,46 @@ fn upsert_detached_task_run_block(
     upsert_top_level_block(thread, block);
 }
 
-fn remove_turn_work_state(thread: &mut ThreadSemanticTimelineState, turn_id: &str) -> bool {
+fn remove_foreground_turn_work_state(
+    thread: &mut ThreadSemanticTimelineState,
+    turn_id: &str,
+) -> bool {
     let mut changed = thread.work_ranges_by_turn.remove(turn_id).is_some();
     let removed_work_block = thread
         .top_level
         .blocks_by_id
         .remove(work_block_id(turn_id).as_str())
         .is_some();
-    let removed_terminal_block = thread
-        .top_level
-        .blocks_by_id
-        .remove(terminal_state_block_id(turn_id).as_str())
-        .is_some();
-    changed |= removed_work_block || removed_terminal_block;
+    changed |= removed_work_block;
     changed |= thread.expansion.expanded_turn_work.remove(turn_id);
     changed |= thread.expansion.collapsed_turn_work.remove(turn_id);
-    if removed_work_block || removed_terminal_block {
+    if removed_work_block {
         thread
             .top_level
             .ordered_block_ids
             .retain(|block_id| thread.top_level.blocks_by_id.contains_key(block_id));
     }
     changed
+}
+
+fn remove_turn_work_state(thread: &mut ThreadSemanticTimelineState, turn_id: &str) -> bool {
+    let changed = remove_foreground_turn_work_state(thread, turn_id);
+    // An admission's outcome is independent of its foreground work tombstone.
+    if thread.admission_turn_ids.contains(turn_id) {
+        return changed;
+    }
+    let removed_terminal = thread
+        .top_level
+        .blocks_by_id
+        .remove(terminal_state_block_id(turn_id).as_str())
+        .is_some();
+    if removed_terminal {
+        thread
+            .top_level
+            .ordered_block_ids
+            .retain(|block_id| thread.top_level.blocks_by_id.contains_key(block_id));
+    }
+    changed || removed_terminal
 }
 
 fn reconcile_task_attachment_marker(
@@ -3164,12 +3499,127 @@ fn thread_has_detached_task_run(thread: &ThreadSemanticTimelineState, turn_id: &
         })
 }
 
-fn turn_is_detached_task_run(turn: &Turn) -> bool {
+fn turn_has_attached_task_anchor(thread: &ThreadSemanticTimelineState, turn_id: &str) -> bool {
+    thread.work_range(turn_id).is_some_and(|range| range.items_by_id.values().any(|item|
+        matches!(&item.item, TurnItem::Task { item }
+            if item.attachment == TaskAttachmentMode::Attached && item.run_id.as_deref() == Some(turn_id))))
+}
+
+fn task_run_projects_detached(thread: &ThreadSemanticTimelineState, turn: &Turn) -> bool {
     turn.turn_kind == TurnKind::TaskRun
-        && matches!(
-            &turn.origin,
-            TurnOrigin::ScheduledTask | TurnOrigin::DetachedTask
-        )
+        && !turn_has_attached_task_anchor(thread, &turn.id)
+        && (turn.origin == TurnOrigin::DetachedTask
+            || thread_has_detached_task_run(thread, &turn.id))
+}
+
+fn task_run_attachment_unresolved(thread: &ThreadSemanticTimelineState, turn: &Turn) -> bool {
+    turn.turn_kind == TurnKind::TaskRun
+        && turn.origin == TurnOrigin::ScheduledTask
+        && !task_run_projects_detached(thread, turn)
+        && !turn_has_attached_task_anchor(thread, &turn.id)
+        && thread.cached_turn_work_block(&turn.id).is_none()
+        && thread
+            .work_range(&turn.id)
+            .and_then(|range| range.work.as_ref())
+            .is_none()
+}
+
+fn enrich_task_run_block_author(thread: &ThreadSemanticTimelineState, block: &mut TimelineBlock) {
+    let Some(turn_id) = block.turn_id.as_ref() else {
+        return;
+    };
+    let Some(context) = thread.task_run_contexts.get(turn_id) else {
+        return;
+    };
+    if let TimelineBlockKind::DetachedTaskRun { task, author } = &mut block.kind
+        && task
+            .run_id
+            .as_deref()
+            .is_none_or(|run_id| run_id == turn_id)
+    {
+        preserve_turn_author(&context.author, author);
+    }
+}
+
+fn confirm_admission_status(
+    thread: &mut ThreadSemanticTimelineState,
+    turn_id: &str,
+    status: TurnStatus,
+) -> bool {
+    let mut changed = thread
+        .confirmed_admission_turn_ids
+        .insert(turn_id.to_owned());
+    if thread.local_admission_reject_ids.remove(turn_id) {
+        changed = true;
+        if matches!(status, TurnStatus::InProgress | TurnStatus::Completed) {
+            remove_terminal_state_block(thread, turn_id);
+        }
+    }
+    changed
+}
+
+fn project_admission_turn(
+    thread: &mut ThreadSemanticTimelineState,
+    workspace_id: &str,
+    turn: &Turn,
+    now_unix_ms: i64,
+) -> bool {
+    let local_reject = thread.local_admission_reject_ids.contains(&turn.id);
+    let mut changed = thread.admission_turn_ids.insert(turn.id.clone());
+    changed |= remove_foreground_turn_work_state(thread, &turn.id);
+    changed |= confirm_admission_status(thread, &turn.id, turn.status);
+    let state = match turn.status {
+        TurnStatus::Failed => TurnWorkState::Failed,
+        TurnStatus::Blocked => TurnWorkState::Blocked,
+        TurnStatus::Interrupted => TurnWorkState::Interrupted,
+        TurnStatus::InProgress | TurnStatus::Completed => return changed,
+    };
+    let block_id = terminal_state_block_id(&turn.id);
+    let existing = thread.top_level.blocks_by_id.get(&block_id);
+    let (state, message, mut author) = match existing.map(|block| &block.kind) {
+        Some(TimelineBlockKind::TurnState {
+            state: known_state,
+            message,
+            author,
+            ..
+        }) if !local_reject
+            && matches!(
+                known_state,
+                TurnWorkState::Failed | TurnWorkState::Blocked | TurnWorkState::Interrupted
+            ) =>
+        {
+            (
+                *known_state,
+                message.clone().or_else(|| turn.error.clone()),
+                author.clone(),
+            )
+        }
+        _ => (state, turn.error.clone(), None),
+    };
+    preserve_turn_author(&turn.author, &mut author);
+    if existing.is_some_and(|block| matches!(&block.kind,
+        TimelineBlockKind::TurnState { state: current_state, message: current_message, author: current_author, .. }
+            if *current_state == state && *current_message == message && *current_author == author)) {
+        return changed;
+    }
+    let thread_id = thread.thread_id.clone();
+    upsert_terminal_state_block(
+        thread,
+        workspace_id,
+        &thread_id,
+        &turn.id,
+        state,
+        message,
+        now_unix_ms,
+    );
+    if let Some(block) = thread.top_level.blocks_by_id.get_mut(&block_id)
+        && let TimelineBlockKind::TurnState {
+            author: current, ..
+        } = &mut block.kind
+    {
+        *current = author;
+    }
+    true
 }
 
 fn upsert_terminal_state_block(
@@ -3307,6 +3757,17 @@ fn upsert_turn_work_summary(
     completed_at_unix_ms: Option<i64>,
     now_unix_ms: i64,
 ) {
+    if thread.admission_turn_ids.contains(turn_id) {
+        remove_turn_work_state(thread, turn_id);
+        return;
+    }
+    if thread
+        .task_run_contexts
+        .get(turn_id)
+        .is_some_and(|turn| task_run_attachment_unresolved(thread, turn))
+    {
+        return;
+    }
     let existing = thread.cached_turn_work_block(turn_id).cloned();
     let preserve_terminal_state = existing.as_ref().is_some_and(|work| {
         is_terminal_turn_work_state(work.state) && !is_terminal_turn_work_state(state)
@@ -3343,6 +3804,7 @@ fn upsert_turn_work_summary(
         .unwrap_or(0);
     let (first_work_item_id, last_work_item_id) = live_first_last_work_item_ids(thread, turn_id);
     let work = TurnWorkBlock {
+        html_publications: Vec::new(),
         turn_id: turn_id.to_owned(),
         presentation,
         state,
@@ -3698,13 +4160,15 @@ fn push_turn_work_rows_and_hints(
     rows: &mut Vec<SemanticTimelineRow>,
     request_hints: &mut Vec<SemanticTimelineRequestHint>,
 ) {
+    if work_range.is_none_or(|range| !range.has_loaded_page)
+        && (work.visible_work_count > 0 || work.has_more_before || work.has_more_after)
+    {
+        request_hints.push(SemanticTimelineRequestHint::TurnWorkInitial {
+            thread_id: thread_id.to_owned(),
+            turn_id: work.turn_id.clone(),
+        });
+    }
     let Some(work_range) = work_range else {
-        if work.visible_work_count > 0 || work.has_more_before || work.has_more_after {
-            request_hints.push(SemanticTimelineRequestHint::TurnWorkInitial {
-                thread_id: thread_id.to_owned(),
-                turn_id: work.turn_id.clone(),
-            });
-        }
         return;
     };
 
@@ -3758,6 +4222,31 @@ fn work_item_is_visible_in_timeline(item: &TurnWorkItem) -> bool {
 }
 
 fn sort_top_level_blocks(cache: &mut TopLevelTimelineCache) {
+    // A partial canonical page may hydrate the card before the user row.
+    // Keep both in the known parent's sort domain, preserving row identities.
+    let user_bases = cache
+        .blocks_by_id
+        .values()
+        .filter_map(|block| {
+            if !matches!(&block.kind, TimelineBlockKind::UserMessage { .. }) {
+                return None;
+            }
+            let turn_id = block.turn_id.as_ref()?;
+            let (millis, rest) = block.sort_key.split_once(':')?;
+            let (key_turn_id, _) = rest.split_once(':')?;
+            (key_turn_id == turn_id).then(|| (turn_id.clone(), format!("{millis}:{turn_id}")))
+        })
+        .collect::<HashMap<_, _>>();
+    for block in cache.blocks_by_id.values_mut() {
+        if let TimelineBlockKind::DetachedTaskRun { task, .. } = &block.kind
+            && task.trigger_kind == TaskTriggerKind::Immediate
+            && let Some(parent_id) = task.created_by_turn_id.as_ref()
+            && block.turn_id.as_ref() != Some(parent_id)
+            && let Some(base) = user_bases.get(parent_id)
+        {
+            block.sort_key = format!("{base}:100:detached-task-run:{}", task.id);
+        }
+    }
     let mut ids = cache.blocks_by_id.keys().cloned().collect::<Vec<_>>();
     ids.sort_by(|left, right| {
         let left_block = cache
@@ -4028,9 +4517,21 @@ mod tests {
                 avatar_revision: Some(avatar.to_owned()),
                 agent: None,
             };
+            let publication: pioneer_protocol::HtmlPublication = serde_json::from_value(serde_json::json!({
+                "workspaceId":"workspace_a", "threadId":"source_child", "turnId":"source_turn", "callId":"html_call", "title":"Metadata title",
+                "artifact":{"artifact_id":"document","version_id":"exact-version","display_name":"Metadata title","kind":"file","mime_type":"text/html","size_bytes":10,"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","status":"ready"}
+            })).expect("publication fixture");
+            let mut answer = assistant_block("thread_a", "block_assistant", "003", "turn_a", None);
+            answer.block_id = assistant_block_id("turn_a", "item_block_assistant");
+            if let TimelineBlockKind::AssistantMessage {
+                html_publications, ..
+            } = &mut answer.kind
+            {
+                *html_publications = vec![publication.clone()];
+            }
             let blocks = vec![
-                turn_work_block("thread_a", "block_work", "002"),
-                assistant_block("thread_a", "block_assistant", "003", "turn_a", None),
+                turn_work_block("thread_a", &work_block_id("turn_a"), "002"),
+                answer,
             ];
             let mut state = SemanticTimelineState::default();
             apply_thread_timeline_page(
@@ -4063,6 +4564,24 @@ mod tests {
                         TopLevelPageMergeMode::Merge
                     },
                 );
+                // Native/CLI completion echo updates the same response, without
+                // dropping its source references or creating another HTML row.
+                apply_conversation_event_to_semantic_timeline(
+                    &mut state,
+                    "workspace_a",
+                    &ConversationEvent::ItemCompleted {
+                        thread_id: "thread_a".into(),
+                        turn_id: "turn_a".into(),
+                        item: TurnItem::AgentMessage {
+                            id: "item_block_assistant".into(),
+                            text: "final **markdown**".into(),
+                            phase: pioneer_protocol::AgentMessagePhase::FinalAnswer,
+                            markdown: None,
+                            markdown_version: None,
+                        },
+                    },
+                    3,
+                );
                 let rows = flatten_semantic_timeline(&state, "thread_a").unwrap().rows;
                 assert_eq!(rows.len(), 2, "CLI author must not hide work or its answer");
                 for (row, initial) in rows.iter().zip(&initial.rows) {
@@ -4076,6 +4595,16 @@ mod tests {
                 let rendered = super::super::semantic_render::render_semantic_timeline_rows(
                     &rows,
                     Default::default(),
+                );
+                assert_eq!(
+                    rendered
+                        .projection
+                        .items
+                        .iter()
+                        .find(|item| matches!(item.item, TurnItem::AgentMessage { .. }))
+                        .unwrap()
+                        .html_publications,
+                    vec![publication.clone()]
                 );
                 let render_rows = rendered
                     .rows
@@ -4886,6 +5415,295 @@ mod tests {
             vec!["item_prior", "old_live", "item_newer"],
             "canonical reconciliation must preserve the order already shown live",
         );
+    }
+
+    #[test]
+    fn live_fragment_still_requests_initial_page_and_accepts_empty_or_canonical_history() {
+        for empty in [false, true] {
+            let mut state = SemanticTimelineState::default();
+            apply_thread_timeline_page(
+                &mut state,
+                thread_page(vec![turn_work_block("thread_a", "turn:turn_a:work", "001")]),
+                TopLevelPageMergeMode::Reset,
+            );
+            apply_conversation_event_to_semantic_timeline(
+                &mut state,
+                "workspace_a",
+                &ConversationEvent::ItemDelta {
+                    thread_id: "thread_a".into(),
+                    turn_id: "turn_a".into(),
+                    item_id: "comment".into(),
+                    delta: "fragment".into(),
+                    stream: Some(ItemDeltaStream::AgentMessage),
+                    payload: None,
+                    markdown: None,
+                    markdown_version: None,
+                },
+                10_000,
+            );
+            let thread = state.thread("thread_a").unwrap();
+            let range = thread.work_range("turn_a").unwrap();
+            assert!(!range.has_loaded_page);
+            let mut canonical = range.ordered_items().next().unwrap().clone();
+            canonical.source_sequence = 2;
+            canonical.source_updated_at_unix_micros = 2;
+            canonical.metadata = None;
+            if let TurnItem::AgentMessage { text, .. } = &mut canonical.item {
+                *text = "canonical complete text".into();
+            }
+            let flattened = flatten_thread_semantic_timeline(thread);
+            assert_eq!(flattened.rows.len(), 2, "live fragment stays visible");
+            let visible = SemanticTimelineVisibleRow {
+                row_id: flattened.rows[0].id.clone(),
+                top_offset_px: 0,
+            };
+            let input = SemanticTimelineRequestPlannerInput {
+                visible_rows: vec![visible],
+                ..Default::default()
+            };
+            let plan = plan_semantic_timeline_requests(thread, &input);
+            assert!(matches!(plan.actions.as_slice(),
+                [SemanticTimelineRequestAction::TurnWorkPage { key: SemanticTimelineRequestKey::TurnWorkInitial { .. }, params }]
+                if params.anchor == TimelinePageAnchor::Newest));
+            assert!(
+                plan_semantic_timeline_requests(thread, &Default::default())
+                    .actions
+                    .is_empty()
+            );
+
+            collapse_turn_work(&mut state, "thread_a", "turn_a");
+            assert!(
+                flatten_semantic_timeline(&state, "thread_a")
+                    .unwrap()
+                    .request_hints
+                    .is_empty()
+            );
+            expand_turn_work(&mut state, "thread_a", "turn_a");
+
+            let mut page = work_page(if empty {
+                vec![]
+            } else {
+                vec![canonical.clone()]
+            });
+            page.page.has_more_before = !empty;
+            page.page.has_more_after = !empty;
+            page.source_high_watermark = 2;
+            page.projection_updated_at_unix_micros = 2;
+            let expected_range = TimelineLoadedRange::from(&page.page);
+            assert!(apply_turn_work_page(
+                &mut state,
+                page,
+                WorkPageMergeMode::MergeAfter
+            ));
+            let thread = state.thread("thread_a").unwrap();
+            let range = thread.work_range("turn_a").unwrap();
+            assert!(range.has_loaded_page);
+            assert_eq!(range.loaded_range, expected_range);
+            assert_eq!(range.ordered_item_ids.len(), 1);
+            if !empty {
+                assert_eq!(range.ordered_items().next(), Some(&canonical));
+            }
+            let flattened = flatten_thread_semantic_timeline(thread);
+            assert!(
+                flattened.request_hints.iter().all(|hint| !matches!(
+                    hint,
+                    SemanticTimelineRequestHint::TurnWorkInitial { .. }
+                ))
+            );
+            assert_eq!(flattened.request_hints.len(), if empty { 0 } else { 2 });
+            if empty {
+                assert!(
+                    plan_semantic_timeline_requests(thread, &input)
+                        .actions
+                        .is_empty()
+                );
+            } else {
+                let plan = plan_semantic_timeline_requests(thread, &input);
+                assert!(plan.actions.iter().any(|action| matches!(action,
+                    SemanticTimelineRequestAction::TurnWorkPage { params, .. }
+                    if matches!(&params.anchor, TimelinePageAnchor::Before { cursor }
+                        if cursor.value == "work-before")
+                )));
+            }
+        }
+    }
+
+    #[test]
+    fn work_state_and_targeted_items_do_not_count_as_a_loaded_page() {
+        let mut state = SemanticTimelineState::default();
+        apply_turn_work_state_changed(
+            &mut state,
+            TurnWorkStateChangedNotification {
+                workspace_id: "workspace_a".into(),
+                thread_id: "thread_a".into(),
+                turn_id: "turn_a".into(),
+                source_high_watermark: 20,
+                projection_updated_at_unix_micros: 20,
+                work: work_block("turn_a"),
+                reason: pioneer_protocol::TimelineChangeReason::LiveEvent,
+            },
+        );
+        let mut newer = work_item("shared", "002");
+        newer.source_sequence = 20;
+        newer.source_updated_at_unix_micros = 20;
+        apply_turn_work_items_get_response(
+            &mut state,
+            work_items_response("thread_a", "turn_a", 20, vec![newer.clone()]),
+        );
+        assert!(
+            !state
+                .thread("thread_a")
+                .unwrap()
+                .work_range("turn_a")
+                .unwrap()
+                .has_loaded_page
+        );
+        let mut page = work_page(vec![work_item("older", "001"), work_item("shared", "002")]);
+        page.page.has_more_after = true;
+        let expected_range = TimelineLoadedRange::from(&page.page);
+        apply_turn_work_page(&mut state, page, WorkPageMergeMode::MergeAfter);
+        let range = state
+            .thread("thread_a")
+            .unwrap()
+            .work_range("turn_a")
+            .unwrap();
+        assert!(
+            range.has_loaded_page,
+            "an older but accepted history window is still a page"
+        );
+        assert_eq!(range.loaded_range, expected_range);
+        assert_eq!(range.source_high_watermark, 20);
+        assert_eq!(range.item("shared"), Some(&newer));
+        assert_eq!(range.ordered_item_ids.len(), 2);
+    }
+
+    #[test]
+    fn initial_page_merges_live_arrivals_and_preserves_terminal_items_and_work() {
+        let mut state = SemanticTimelineState::default();
+        let item = TurnItem::AgentMessage {
+            id: "comment".into(),
+            text: "initial".into(),
+            phase: AgentMessagePhase::Commentary,
+            markdown: None,
+            markdown_version: None,
+        };
+        apply_conversation_event_to_semantic_timeline(
+            &mut state,
+            "workspace_a",
+            &ConversationEvent::ItemStarted {
+                thread_id: "thread_a".into(),
+                turn_id: "turn_a".into(),
+                item: item.clone(),
+            },
+            10,
+        );
+        let mut stale = state
+            .thread("thread_a")
+            .unwrap()
+            .work_range("turn_a")
+            .unwrap()
+            .ordered_items()
+            .next()
+            .unwrap()
+            .clone();
+        stale.source_sequence = 10;
+        let page = work_page(vec![stale]);
+        let range = state.thread_mut("thread_a").work_range_mut("turn_a");
+        range.request_status = TimelineRequestStatus::Loading {
+            request_key: "initial".into(),
+        };
+        let mut completed = item;
+        if let TurnItem::AgentMessage { text, .. } = &mut completed {
+            *text = "live complete text".into();
+        }
+        apply_conversation_event_to_semantic_timeline(
+            &mut state,
+            "workspace_a",
+            &ConversationEvent::ItemCompleted {
+                thread_id: "thread_a".into(),
+                turn_id: "turn_a".into(),
+                item: completed.clone(),
+            },
+            11,
+        );
+        apply_conversation_event_to_semantic_timeline(
+            &mut state,
+            "workspace_a",
+            &ConversationEvent::ItemStarted {
+                thread_id: "thread_a".into(),
+                turn_id: "turn_a".into(),
+                item: TurnItem::AgentMessage {
+                    id: "new-live".into(),
+                    text: "new live item".into(),
+                    phase: AgentMessagePhase::Commentary,
+                    markdown: None,
+                    markdown_version: None,
+                },
+            },
+            12,
+        );
+        let mut turn = detached_task_turn("turn_a");
+        turn.status = TurnStatus::Completed;
+        turn.turn_kind = TurnKind::Conversation;
+        turn.origin = TurnOrigin::User;
+        apply_conversation_event_to_semantic_timeline(
+            &mut state,
+            "workspace_a",
+            &ConversationEvent::TurnCompleted {
+                thread_id: "thread_a".into(),
+                turn,
+            },
+            13,
+        );
+        let before = state
+            .thread("thread_a")
+            .unwrap()
+            .work_range("turn_a")
+            .unwrap()
+            .clone();
+        assert!(!before.has_loaded_page);
+        assert!(apply_turn_work_page(
+            &mut state,
+            page,
+            WorkPageMergeMode::MergeAfter
+        ));
+        let range = state
+            .thread("thread_a")
+            .unwrap()
+            .work_range("turn_a")
+            .unwrap();
+        assert!(range.has_loaded_page);
+        assert_eq!(range.ordered_item_ids.len(), 2);
+        assert_eq!(range.items_by_id.len(), 2);
+        let item = range.item("turn:turn_a:work:comment").unwrap();
+        assert_eq!(item.status, TurnWorkItemStatus::Completed);
+        assert_eq!(item.item, completed);
+        assert_eq!(
+            range.item("turn:turn_a:work:new-live"),
+            before.item("turn:turn_a:work:new-live")
+        );
+        let work = range.work.as_ref().unwrap();
+        let terminal = before.work.as_ref().unwrap();
+        assert_eq!(work.state, TurnWorkState::Completed);
+        assert_eq!(work.presentation, terminal.presentation);
+        assert_eq!(work.completed_at_unix_ms, terminal.completed_at_unix_ms);
+        assert_eq!(work.elapsed_ms, terminal.elapsed_ms);
+    }
+
+    #[test]
+    fn work_range_loaded_flag_defaults_for_legacy_serialized_cache() {
+        let range = turn_work_range_from_page(work_page(vec![]));
+        assert!(range.has_loaded_page);
+        assert_eq!(range.initial_request_status, TimelineRequestStatus::Ready);
+        let mut legacy = serde_json::to_value(range).unwrap();
+        legacy.as_object_mut().unwrap().remove("has_loaded_page");
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("initial_request_status");
+        let decoded: TurnWorkRangeCache = serde_json::from_value(legacy).unwrap();
+        assert!(!decoded.has_loaded_page);
+        assert_eq!(decoded.initial_request_status, TimelineRequestStatus::Idle);
     }
 
     #[test]
@@ -6140,7 +6958,7 @@ mod tests {
             &mut state,
             thread_page(vec![
                 user_block("thread_a", "block_user", "001", "turn_a"),
-                turn_work_block("thread_a", "block_work", "002"),
+                turn_work_block("thread_a", "turn:turn_a:work", "002"),
             ]),
             TopLevelPageMergeMode::Reset
         ));
@@ -6174,6 +6992,15 @@ mod tests {
 
         let flattened =
             flatten_semantic_timeline(&state, "thread_a").expect("flattened rows should exist");
+        assert_eq!(
+            flattened
+                .rows
+                .iter()
+                .filter(|row| matches!(row.kind, SemanticTimelineRowKind::WorkHeader { .. }))
+                .count(),
+            1,
+            "the terminal event must update the existing work header"
+        );
         let work_row = flattened
             .rows
             .iter()
@@ -6778,6 +7605,7 @@ mod tests {
             started_at_unix_ms: Some(3),
             updated_at_unix_ms: Some(3),
             kind: TimelineBlockKind::AssistantMessage {
+                html_publications: Vec::new(),
                 item_id: format!("item_{block_id}"),
                 text: "final **markdown**".to_owned(),
                 status: TurnWorkItemStatus::Completed,
@@ -6890,6 +7718,7 @@ mod tests {
 
     fn work_block(turn_id: &str) -> TurnWorkBlock {
         TurnWorkBlock {
+            html_publications: Vec::new(),
             turn_id: turn_id.to_owned(),
             presentation: TurnWorkPresentation::ExpandedLive,
             state: TurnWorkState::Running,

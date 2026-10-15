@@ -286,6 +286,51 @@ impl ArtifactService {
         .await
     }
 
+    /// A Gateway-owned identity, never a model-controlled identifier. Retries share
+    /// one exact version and binding; different canonical calls remain independent.
+    pub async fn ingest_tool_bytes(
+        &self,
+        request: IngestArtifactBytesRequest,
+        identity: String,
+        policy_generation: u64,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> ArtifactResult<ArtifactSummary> {
+        validate_ingest_request(&request)?;
+        // Only a first-party HTML execution establishes active document semantics;
+        // generic attachments continue to use the existing MIME sniffing boundary.
+        let is_html = request.mime_type.as_deref() == Some("text/html")
+            && request.created_by_kind == pioneer_protocol::ArtifactCreatedByKind::Tool
+            && matches!(
+                request.created_by_actor_id.as_deref(),
+                Some("html_render" | "html_preview")
+            );
+        let original_name = request.display_name.clone();
+        let mut request = normalize_ingest_mime(request);
+        if is_html {
+            std::str::from_utf8(&request.bytes).map_err(|_| ArtifactError::InvalidRequest {
+                message: "HTML document must be UTF-8".into(),
+            })?;
+            request.mime_type = Some("text/html".into());
+            request.display_name =
+                display_name_with_mime_extension(original_name, Some("text/html"));
+            request
+                .metadata
+                .insert("effective_mime_type".into(), serde_json::json!("text/html"));
+        }
+        self.quota_policy
+            .check_file_size(request.bytes.len() as u64)?;
+        // Workspace headroom is checked atomically after retry recovery. A stored
+        // same-call result remains recoverable when the workspace becomes full.
+        self.ingest_blob_input_with_identity(
+            request.clone(),
+            ArtifactBlobInput::Bytes(request.bytes.clone()),
+            None,
+            Some(identity),
+            Some((policy_generation, cancel)),
+        )
+        .await
+    }
+
     pub async fn ingest_temp_file(
         &self,
         request: IngestArtifactTempFileRequest,
@@ -391,6 +436,38 @@ impl ArtifactService {
         projection_bytes: Option<Vec<u8>>,
         fence: Option<pioneer_crud::NativeArtifactRegistrationFence>,
     ) -> ArtifactResult<ArtifactSummary> {
+        self.ingest_blob_input_with_guards(request, input, projection_bytes, None, None, fence)
+            .await
+    }
+
+    async fn ingest_blob_input_with_identity(
+        &self,
+        request: IngestArtifactBytesRequest,
+        input: ArtifactBlobInput,
+        projection_bytes: Option<Vec<u8>>,
+        identity: Option<String>,
+        commit_guard: Option<(u64, tokio_util::sync::CancellationToken)>,
+    ) -> ArtifactResult<ArtifactSummary> {
+        self.ingest_blob_input_with_guards(
+            request,
+            input,
+            projection_bytes,
+            identity,
+            commit_guard,
+            None,
+        )
+        .await
+    }
+
+    async fn ingest_blob_input_with_guards(
+        &self,
+        request: IngestArtifactBytesRequest,
+        input: ArtifactBlobInput,
+        projection_bytes: Option<Vec<u8>>,
+        identity: Option<String>,
+        commit_guard: Option<(u64, tokio_util::sync::CancellationToken)>,
+        fence: Option<pioneer_crud::NativeArtifactRegistrationFence>,
+    ) -> ArtifactResult<ArtifactSummary> {
         let stored_blob = self
             .blob_store
             .put_bytes(&request.workspace_id, input)
@@ -398,7 +475,7 @@ impl ArtifactService {
 
         let ingested = match self
             .store
-            .ingest_artifact_metadata_fenced(
+            .ingest_artifact_metadata_with_guards(
                 NewArtifactBlobRecord {
                     workspace_id: request.workspace_id.clone(),
                     sha256: stored_blob.sha256.clone(),
@@ -414,6 +491,14 @@ impl ArtifactService {
                     .as_ref()
                     .map(binding_target_record_from_model),
                 request.metadata.clone(),
+                identity.clone(),
+                identity.as_ref().map(|_| {
+                    (
+                        self.quota_policy.max_workspace_bytes,
+                        self.quota_policy.max_files_per_workspace,
+                    )
+                }),
+                commit_guard,
                 fence.clone(),
             )
             .await
@@ -456,13 +541,30 @@ impl ArtifactService {
                         .await?);
                 }
                 let registration_error = ArtifactError::from(error);
-                cleanup_stored_blob_after_failed_registration(
-                    self.blob_store.as_ref(),
-                    request.workspace_id.as_str(),
-                    &stored_blob,
-                    &registration_error,
-                )
-                .await?;
+                if identity.is_some() {
+                    // Another ingestion may have deduplicated this same file while
+                    // our owner/quota transaction failed. Do not unlink its bytes.
+                    // Register the unbound blob for the existing bounded TTL GC.
+                    self.store
+                        .find_or_create_artifact_blob(NewArtifactBlobRecord {
+                            workspace_id: request.workspace_id.clone(),
+                            sha256: stored_blob.sha256.clone(),
+                            size_bytes: stored_blob.size_bytes,
+                            mime_type: request.mime_type.clone(),
+                            storage_backend: stored_blob.storage_backend.clone(),
+                            storage_key: stored_blob.storage_key.clone(),
+                            metadata: Default::default(),
+                        })
+                        .await?;
+                } else {
+                    cleanup_stored_blob_after_failed_registration(
+                        self.blob_store.as_ref(),
+                        request.workspace_id.as_str(),
+                        &stored_blob,
+                        &registration_error,
+                    )
+                    .await?;
+                }
                 return Err(registration_error);
             }
         };
@@ -1242,6 +1344,7 @@ fn list_filter_record(filter: ArtifactListFilter) -> ArtifactListFilterRecord {
         thread_id: filter.thread_id,
         thread_ids: filter.thread_ids,
         authorized_artifact_ids: filter.authorized_artifact_ids,
+        created_by_actor_id: filter.created_by_actor_id,
         turn_id: filter.turn_id,
         message_id: filter.message_id,
         task_id: filter.task_id,

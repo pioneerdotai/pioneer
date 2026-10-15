@@ -188,6 +188,8 @@
 "timeline.file_change.one_file" = "1 Datei"
 "timeline.file_change.output" = "Ausgabe"
 "timeline.file_change.running" = "Änderungen werden angewendet"
+"timeline.html.failed" = "Diese Seite konnte nicht angezeigt werden"
+"timeline.html.loading" = "Seite wird geladen…"
 "timeline.message.copy_action" = "Kopieren"
 "timeline.message.delete_action" = "Löschen"
 "timeline.message.delete_conflict" = "Diese Nachricht wurde geändert. Prüfe die aktuelle Version vor dem Löschen."

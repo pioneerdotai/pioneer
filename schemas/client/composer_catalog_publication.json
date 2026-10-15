@@ -1,0 +1,714 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ComposerCatalogPublication",
+  "type": "object",
+  "properties": {
+    "draft_id": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "mcp_request": {
+      "$ref": "#/$defs/ComposerCatalogRequest"
+    },
+    "mcp_servers": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/SelectableMcpCapability"
+      }
+    },
+    "mcp_tools": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/SelectableMcpCapability"
+      }
+    },
+    "revision": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "session": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ComposerPickerSession"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "skill_request": {
+      "$ref": "#/$defs/ComposerCatalogRequest"
+    },
+    "skills": {
+      "$ref": "#/$defs/SkillManagementProjection"
+    },
+    "thread_id": {
+      "type": "string"
+    },
+    "tool_requests": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/ComposerCatalogRequest"
+      }
+    }
+  },
+  "required": [
+    "thread_id",
+    "draft_id",
+    "revision",
+    "skills",
+    "skill_request",
+    "mcp_servers",
+    "mcp_tools",
+    "mcp_request",
+    "tool_requests"
+  ],
+  "$defs": {
+    "ComposerCatalogRequest": {
+      "type": "object",
+      "properties": {
+        "generation": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "state": {
+          "$ref": "#/$defs/ComposerCatalogRequestState"
+        }
+      },
+      "required": [
+        "generation",
+        "state"
+      ]
+    },
+    "ComposerCatalogRequestState": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "idle"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "loading"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "ready"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "failed"
+            },
+            "message": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "message"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "cancelled"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        }
+      ]
+    },
+    "ComposerOperationIdentity": {
+      "type": "object",
+      "properties": {
+        "draft_id": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "generation": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "thread_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "thread_id",
+        "draft_id",
+        "generation"
+      ]
+    },
+    "ComposerPickerKind": {
+      "type": "string",
+      "enum": [
+        "skills",
+        "mcp"
+      ]
+    },
+    "ComposerPickerSelection": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "immediate"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "skills"
+            },
+            "selections": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/ComposerSkillSelection"
+              }
+            }
+          },
+          "required": [
+            "kind",
+            "selections"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "mcp"
+            },
+            "selected": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "uniqueItems": true
+            }
+          },
+          "required": [
+            "kind",
+            "selected"
+          ]
+        }
+      ]
+    },
+    "ComposerPickerSession": {
+      "type": "object",
+      "properties": {
+        "identity": {
+          "$ref": "#/$defs/ComposerOperationIdentity"
+        },
+        "kind": {
+          "$ref": "#/$defs/ComposerPickerKind"
+        },
+        "selection": {
+          "$ref": "#/$defs/ComposerPickerSelection"
+        }
+      },
+      "required": [
+        "identity",
+        "kind",
+        "selection"
+      ]
+    },
+    "ComposerSkillSelection": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "skill"
+            },
+            "pack_id": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SkillPackId"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "skill_id": {
+              "$ref": "#/$defs/SkillId"
+            }
+          },
+          "required": [
+            "kind",
+            "skill_id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "skill_pack"
+            },
+            "pack_id": {
+              "$ref": "#/$defs/SkillPackId"
+            }
+          },
+          "required": [
+            "kind",
+            "pack_id"
+          ]
+        }
+      ]
+    },
+    "McpCapabilityUnavailableReason": {
+      "type": "string",
+      "enum": [
+        "DisabledByPolicy",
+        "RuntimeUnavailable",
+        "RuntimeNotReady",
+        "NoToolCatalog"
+      ]
+    },
+    "McpScopeKind": {
+      "type": "string",
+      "enum": [
+        "workspace",
+        "user"
+      ]
+    },
+    "SelectableMcpCapability": {
+      "type": "object",
+      "properties": {
+        "description": {
+          "type": "string"
+        },
+        "key": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        },
+        "raw_tool_name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "scope_kind": {
+          "$ref": "#/$defs/McpScopeKind"
+        },
+        "selectable": {
+          "type": "boolean"
+        },
+        "server_id": {
+          "type": "string"
+        },
+        "server_name": {
+          "type": "string"
+        },
+        "tools_count": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "minimum": 0
+        },
+        "unavailable_reason": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/McpCapabilityUnavailableReason"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "key",
+        "label",
+        "description",
+        "server_id",
+        "server_name",
+        "scope_kind",
+        "selectable"
+      ]
+    },
+    "SkillDependencyDiagnostic": {
+      "type": "object",
+      "properties": {
+        "hint": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "name",
+        "status",
+        "hint"
+      ]
+    },
+    "SkillHealthSummary": {
+      "type": "object",
+      "properties": {
+        "dependency_failures": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/SkillDependencyDiagnostic"
+          }
+        },
+        "security_blocks": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/SkillSecurityFinding"
+          }
+        },
+        "status": {
+          "type": "string"
+        },
+        "validation_issues": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/SkillValidationDiagnostic"
+          }
+        }
+      },
+      "required": [
+        "status"
+      ]
+    },
+    "SkillId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "SkillInstallState": {
+      "type": "object",
+      "properties": {
+        "install_path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "installed": {
+          "type": "boolean"
+        },
+        "lifecycle_editable": {
+          "type": "boolean",
+          "default": true
+        },
+        "managed": {
+          "type": "boolean"
+        },
+        "updated_at": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        }
+      },
+      "required": [
+        "managed",
+        "installed"
+      ]
+    },
+    "SkillListItem": {
+      "type": "object",
+      "properties": {
+        "description": {
+          "type": "string"
+        },
+        "display_name": {
+          "type": "string"
+        },
+        "fingerprint": {
+          "type": "string"
+        },
+        "health": {
+          "$ref": "#/$defs/SkillHealthSummary"
+        },
+        "install": {
+          "$ref": "#/$defs/SkillInstallState"
+        },
+        "owner": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pack": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SkillPackMembership"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "policy": {
+          "$ref": "#/$defs/SkillPolicyState"
+        },
+        "skill_id": {
+          "$ref": "#/$defs/SkillId"
+        },
+        "slug": {
+          "type": "string"
+        },
+        "source_kind": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string"
+        },
+        "status_reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "trust_level": {
+          "type": "string"
+        },
+        "version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "skill_id",
+        "slug",
+        "source_kind",
+        "display_name",
+        "description",
+        "fingerprint",
+        "trust_level",
+        "install",
+        "policy",
+        "health",
+        "status"
+      ]
+    },
+    "SkillManagementProjection": {
+      "type": "object",
+      "properties": {
+        "packs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SkillPackManagementRow"
+          }
+        },
+        "standalone": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SkillListItem"
+          }
+        }
+      },
+      "required": [
+        "standalone",
+        "packs"
+      ]
+    },
+    "SkillPackId": {
+      "type": "string",
+      "maxLength": 21,
+      "minLength": 21,
+      "pattern": "^[A-Za-z0-9]{21}$"
+    },
+    "SkillPackInstallationItem": {
+      "type": "object",
+      "properties": {
+        "created_at": {
+          "type": "integer",
+          "format": "int64"
+        },
+        "id": {
+          "$ref": "#/$defs/SkillPackId"
+        },
+        "name": {
+          "type": "string"
+        },
+        "source_kind": {
+          "type": "string"
+        },
+        "updated_at": {
+          "type": "integer",
+          "format": "int64"
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "source_kind",
+        "created_at",
+        "updated_at"
+      ]
+    },
+    "SkillPackManagementRow": {
+      "type": "object",
+      "properties": {
+        "attachable": {
+          "type": "boolean"
+        },
+        "children": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/SkillListItem"
+          }
+        },
+        "pack": {
+          "$ref": "#/$defs/SkillPackInstallationItem"
+        }
+      },
+      "required": [
+        "pack",
+        "children",
+        "attachable"
+      ]
+    },
+    "SkillPackMembership": {
+      "type": "object",
+      "properties": {
+        "member_key": {
+          "type": "string"
+        },
+        "pack_id": {
+          "$ref": "#/$defs/SkillPackId"
+        }
+      },
+      "required": [
+        "pack_id",
+        "member_key"
+      ]
+    },
+    "SkillPolicyState": {
+      "type": "object",
+      "properties": {
+        "allow_implicit_invocation": {
+          "type": "boolean"
+        },
+        "allow_implicit_invocation_editable": {
+          "type": "boolean",
+          "default": true
+        },
+        "enabled": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "enabled",
+        "allow_implicit_invocation"
+      ]
+    },
+    "SkillSecurityFinding": {
+      "type": "object",
+      "properties": {
+        "message": {
+          "type": "string"
+        },
+        "path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "rule_id": {
+          "type": "string"
+        },
+        "severity": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "rule_id",
+        "severity",
+        "message"
+      ]
+    },
+    "SkillValidationDiagnostic": {
+      "type": "object",
+      "properties": {
+        "code": {
+          "type": "string"
+        },
+        "field_path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "level": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "code",
+        "level",
+        "message"
+      ]
+    }
+  }
+}

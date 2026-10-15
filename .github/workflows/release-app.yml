@@ -131,6 +131,7 @@ jobs:
             libegl1-mesa-dev \
             libfontconfig-dev \
             libfreetype6-dev \
+            libwebkit2gtk-4.1-dev \
             libx11-dev \
             libxcb-shape0-dev \
             libxcb-xfixes0-dev \

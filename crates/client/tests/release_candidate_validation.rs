@@ -224,6 +224,7 @@ fn turn_work_block(presentation: TurnWorkPresentation, work_count: u64) -> Timel
 
 fn turn_work(presentation: TurnWorkPresentation, work_count: u64) -> TurnWorkBlock {
     TurnWorkBlock {
+        html_publications: Vec::new(),
         turn_id: TURN_ID.to_owned(),
         presentation,
         state: TurnWorkState::Completed,
@@ -256,6 +257,7 @@ fn assistant_message_block(sort_key: &str) -> TimelineBlock {
         started_at_unix_ms: Some(1_501),
         updated_at_unix_ms: Some(1_600),
         kind: TimelineBlockKind::AssistantMessage {
+            html_publications: Vec::new(),
             item_id: "agent_final".to_owned(),
             text: "Done".to_owned(),
             status: TurnWorkItemStatus::Completed,

@@ -93,6 +93,7 @@ impl TimelineView {
     pub(crate) fn retire_timeline_rows(&mut self, cx: &mut Context<Self>) {
         self.set_row_activities_visible(&std::collections::HashSet::new(), cx);
         self.set_row_terminals_visible(&std::collections::HashSet::new(), cx);
+        self.set_row_html_visible(&std::collections::HashSet::new(), cx);
         self.avatar_activities.borrow_mut().set_active(false, cx);
         crate::timeline::controller::DesktopTimelineController::exit(self);
         self.measurement_coordinator.cancel();
@@ -119,6 +120,7 @@ impl TimelineView {
         } else {
             self.set_row_activities_visible(&std::collections::HashSet::new(), cx);
             self.set_row_terminals_visible(&std::collections::HashSet::new(), cx);
+            self.set_row_html_visible(&std::collections::HashSet::new(), cx);
             crate::timeline::controller::DesktopTimelineController::exit(self);
             self.measurement_coordinator.cancel();
             self.retained_context = None;

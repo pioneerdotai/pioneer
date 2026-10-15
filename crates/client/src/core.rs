@@ -1874,13 +1874,25 @@ impl ClientCore {
                 })
                 .expect("Client presentation task could not start"),
         );
+        core.start_thread_request_controller(
+            #[cfg(test)]
+            None,
+        );
+        core.start_gateway_event_dispatcher();
+        core
+    }
+
+    pub(crate) fn start_thread_request_controller(
+        self: &Arc<Self>,
+        #[cfg(test)] waiting: Option<std::sync::mpsc::Sender<Option<std::time::Duration>>>,
+    ) {
         let (sender, receiver) = std::sync::mpsc::channel();
-        *core
+        *self
             .thread_request_sender
             .lock()
             .expect("thread request sender poisoned") = Some(sender);
-        let weak_requests = Arc::downgrade(&core);
-        *core
+        let weak_requests = Arc::downgrade(self);
+        *self
             .thread_request_task
             .lock()
             .expect("thread request task poisoned") = Some(
@@ -1896,11 +1908,16 @@ impl ClientCore {
                         }
                         let delay = [
                             core.next_thread_resume_delay(),
-                            core.next_timeline_read_delay(),
+                            core.next_timeline_request_delay(),
+                            core.next_thread_subscription_delay(),
                         ]
                         .into_iter()
                         .flatten()
                         .min();
+                        #[cfg(test)]
+                        if let Some(waiting) = &waiting {
+                            let _ = waiting.send(delay);
+                        }
                         drop(core);
                         let request = match delay {
                             Some(delay) => match receiver.recv_timeout(delay) {
@@ -1929,32 +1946,25 @@ impl ClientCore {
                                 &core.transport_runtime.ws_command_sender(),
                                 request,
                             ),
-                            Some(
-                                crate::threads::registry::ThreadControllerRequest::Subscribe {
-                                    id,
-                                    workspace,
-                                    generation,
-                                },
-                            ) => core.execute_thread_connection_request(
-                                &id, &workspace, generation, false,
-                            ),
+                            Some(crate::threads::registry::ThreadControllerRequest::Subscribe(
+                                request,
+                            )) => core.execute_thread_subscription_request(request),
                             Some(crate::threads::registry::ThreadControllerRequest::Binding {
                                 id,
                                 workspace,
                                 generation,
-                            }) => core.execute_thread_connection_request(
-                                &id, &workspace, generation, true,
-                            ),
+                            }) => {
+                                core.execute_thread_cli_binding_request(&id, &workspace, generation)
+                            }
                             _ => {}
                         }
                         core.drive_due_thread_resumes();
-                        core.drive_timeline_reads();
+                        core.drive_timeline_requests();
+                        core.drive_thread_subscriptions();
                     }
                 })
                 .expect("Client thread request task could not start"),
         );
-        core.start_gateway_event_dispatcher();
-        core
     }
 
     pub(crate) fn start_gateway_event_dispatcher(self: &Arc<Self>) {

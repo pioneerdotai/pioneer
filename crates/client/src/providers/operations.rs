@@ -213,6 +213,22 @@ impl ClientCore {
             "provider_action_forbidden"
         );
         let epoch = self.provider_runtime_epoch();
+        // A prepared command may never have been claimed by its shell after a
+        // transport change. Retire that exact owner before admitting a retry.
+        let stale = self
+            .provider_controller
+            .lock()
+            .expect("provider controller poisoned")
+            .active
+            .as_ref()
+            .filter(|active| active.epoch != epoch)
+            .cloned();
+        if let Some(identity) = stale {
+            let _ = self.finish_provider_operation(
+                &identity,
+                Err(anyhow::anyhow!("provider_action_cancelled")),
+            );
+        }
         let mut owner = self
             .provider_controller
             .lock()
@@ -257,6 +273,23 @@ impl ClientCore {
             .provider_controller
             .lock()
             .expect("provider controller poisoned");
+        if let Some(identity) = owner
+            .active
+            .as_ref()
+            .filter(|identity| {
+                identity.workspace_id == workspace
+                    && identity.generation == generation
+                    && (self.is_stopped() || identity.epoch != epoch)
+            })
+            .cloned()
+        {
+            drop(owner);
+            let _ = self.finish_provider_operation(
+                &identity,
+                Err(anyhow::anyhow!("provider_action_cancelled")),
+            );
+            anyhow::bail!("provider_action_cancelled");
+        }
         anyhow::ensure!(
             !self.is_stopped()
                 && owner
@@ -321,28 +354,31 @@ impl ClientCore {
         result: anyhow::Result<ProviderOperationCompletion>,
     ) -> anyhow::Result<ProviderOperationCompletion> {
         let epoch = self.provider_runtime_epoch();
+        let applicable = !self.is_stopped()
+            && identity.epoch == epoch
+            && self.capability_management_allowed(&identity.workspace_id);
         let mut owner = self
             .provider_controller
             .lock()
             .expect("provider controller poisoned");
         anyhow::ensure!(
-            !self.is_stopped()
-                && identity.epoch == epoch
-                && owner.active.as_ref() == Some(identity),
+            owner.active.as_ref() == Some(identity),
             "provider_action_cancelled"
         );
         owner.active = None;
         owner.prepared = None;
         self.publish_provider_operation(
             identity,
-            if result.is_ok() {
+            if !applicable {
+                ProviderLoadState::Cancelled
+            } else if result.is_ok() {
                 ProviderLoadState::Ready
             } else {
                 ProviderLoadState::Failed
             },
         );
         drop(owner);
-        if result.is_ok() {
+        if self.capability_management_allowed(&identity.workspace_id) {
             let provider = if matches!(
                 identity.kind,
                 ProviderActionKind::Configure | ProviderActionKind::Disconnect
@@ -358,14 +394,8 @@ impl ClientCore {
             self.provider_runtime_intent(ProviderRuntimeIntent::Refresh {
                 workspace_id: identity.workspace_id.clone(),
             });
-        } else if identity.kind == ProviderActionKind::Configure {
-            // The keystore has no multi-secret transaction. A later write can
-            // fail after an earlier field was saved, so reconcile the catalog.
-            self.refresh_provider_models(&identity.workspace_id, &identity.target);
-            self.provider_collection_intent(ProviderCollectionIntent::Refresh {
-                key: ProviderCollectionKey::catalog(&identity.workspace_id),
-            });
         }
+        anyhow::ensure!(applicable, "provider_action_cancelled");
         result.map_err(|_| anyhow::anyhow!("provider_action_failed"))
     }
     pub(crate) fn invalidate_provider_operations(&self) {
@@ -403,10 +433,12 @@ impl ProviderOperation {
             .upgrade()
             .ok_or_else(|| anyhow::anyhow!("provider_action_cancelled"))?;
         let identity = self.identity.clone();
-        anyhow::ensure!(
-            core.provider_operation_current(&identity),
-            "provider_action_cancelled"
-        );
+        if !core.provider_operation_current(&identity) {
+            return core.finish_provider_operation(
+                &identity,
+                Err(anyhow::anyhow!("provider_action_cancelled")),
+            );
+        }
         let (reply, receiver) = std::sync::mpsc::sync_channel(1);
         let queued = core
             .provider_controller
@@ -450,10 +482,12 @@ impl ProviderOperation {
         let core = client
             .upgrade()
             .ok_or_else(|| anyhow::anyhow!("provider_action_cancelled"))?;
-        anyhow::ensure!(
-            core.provider_operation_current(&self.identity),
-            "provider_action_cancelled"
-        );
+        if !core.provider_operation_current(&self.identity) {
+            return core.finish_provider_operation(
+                &self.identity,
+                Err(anyhow::anyhow!("provider_action_cancelled")),
+            );
+        }
         let sender = core.transport_runtime().ws_command_sender();
         let settings = match &self.command {
             ProviderCommand::SaveRuntime { draft, .. } => {
@@ -563,6 +597,41 @@ mod tests {
             clear_base_url: false,
         })
     }
+    #[test]
+    fn retired_ticket_releases_exact_active_provider_operation() {
+        for completed in [true, false] {
+            let core = fixture();
+            let first = core.prepare_provider_command(configure()).unwrap();
+            crate::catalog_test_support::replace_connection(&core, 8);
+            if completed {
+                assert!(
+                    core.finish_provider_operation(
+                        &first.identity,
+                        Ok(ProviderOperationCompletion::Completed)
+                    )
+                    .is_err()
+                );
+                assert_eq!(
+                    core.provider_operation_snapshot("workspace")
+                        .unwrap()
+                        .request(),
+                    ProviderLoadState::Cancelled
+                );
+            }
+            let next = core.prepare_provider_command(configure()).unwrap();
+            assert!(next.identity.generation > first.identity.generation);
+            let pending = core.provider_operation_snapshot("workspace").unwrap();
+            assert!(
+                core.finish_provider_operation(&first.identity, Err(anyhow::anyhow!("late")))
+                    .is_err()
+            );
+            assert!(Arc::ptr_eq(
+                &pending,
+                &core.provider_operation_snapshot("workspace").unwrap()
+            ));
+        }
+    }
+
     #[test]
     fn command_claim_and_completion_have_one_owner_and_never_publish_credential_input() {
         let core = fixture();

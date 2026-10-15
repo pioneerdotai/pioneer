@@ -56,7 +56,10 @@ impl TimelineView {
                         });
                 if !still_current {
                     if let Some(owner) = &slot.view {
-                        owner.update(cx, |owner, cx| owner.set_visible(false, cx));
+                        owner.update(cx, |owner, cx| {
+                            owner.set_visible(false, cx);
+                            owner.set_html_visible(false, cx)
+                        });
                     }
                 }
             }

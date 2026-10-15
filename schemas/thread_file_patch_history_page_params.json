@@ -36,6 +36,13 @@
     "PatchFileHistoryCursor": {
       "type": "object",
       "properties": {
+        "committedAtUnixMs": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64"
+        },
         "environmentId": {
           "type": "string"
         },
@@ -48,6 +55,12 @@
           "type": "integer",
           "format": "uint32",
           "minimum": 0
+        },
+        "sourceThreadId": {
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "turnId": {
           "type": "string"

@@ -12,7 +12,7 @@ use gpui_kit::{prelude::*, *};
 use pioneer_client::workspaces::Workspace;
 use pioneer_client::workspaces::selectors as workspace_selectors;
 
-#[derive(IntoElement)]
+#[derive(gpui_kit::IntoElement)]
 struct WorkspaceSelectorTrigger {
     id: ElementId,
     name: SharedString,

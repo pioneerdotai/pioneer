@@ -2471,3 +2471,5 @@ mod tests {
         ));
     }
 }
+
+pub mod html;

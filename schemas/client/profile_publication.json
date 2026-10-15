@@ -1,0 +1,137 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ProfilePublication",
+  "type": "object",
+  "properties": {
+    "avatar": {
+      "$ref": "#/$defs/ProfileAvatarSelection"
+    },
+    "dirty": {
+      "type": "boolean"
+    },
+    "edit_revision": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "error": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "first_name": {
+      "type": "string"
+    },
+    "has_saved_avatar": {
+      "type": "boolean"
+    },
+    "last_name": {
+      "type": "string"
+    },
+    "nickname": {
+      "type": "string"
+    },
+    "nickname_editing": {
+      "type": "boolean"
+    },
+    "nickname_valid": {
+      "type": "boolean"
+    },
+    "owner_generation": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "pending": {
+      "type": "boolean"
+    },
+    "principal_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "saved_revision": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "section": {
+      "$ref": "#/$defs/ProfileEditorSection"
+    },
+    "valid": {
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "owner_generation",
+    "first_name",
+    "last_name",
+    "nickname",
+    "avatar",
+    "has_saved_avatar",
+    "edit_revision",
+    "saved_revision",
+    "pending",
+    "dirty",
+    "valid",
+    "nickname_valid",
+    "nickname_editing",
+    "section"
+  ],
+  "$defs": {
+    "ProfileAvatarSelection": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "unchanged"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "remove"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "selected"
+            },
+            "preview": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "preview"
+          ]
+        }
+      ]
+    },
+    "ProfileEditorSection": {
+      "type": "string",
+      "enum": [
+        "account",
+        "profile",
+        "username"
+      ]
+    }
+  }
+}

@@ -289,15 +289,23 @@ impl ClientCore {
             cancellation: CancellationToken::new(),
         };
         owner.requests.insert(thread_id.clone(), request.clone());
+        let mut previews = current
+            .as_ref()
+            .map_or_else(Vec::new, |p| p.previews.clone());
+        if retry {
+            for preview in &mut previews {
+                if preview.state == super::preview_workflow::ArtifactPreviewRequestState::Failed {
+                    preview.state = super::preview_workflow::ArtifactPreviewRequestState::Cancelled;
+                }
+            }
+        }
         let next = ArtifactPublication {
             thread_id,
             workspace_id,
             revision: 0,
             generation,
             request: ArtifactReadState::Loading,
-            previews: current
-                .as_ref()
-                .map_or_else(Vec::new, |p| p.previews.clone()),
+            previews,
             actions: current
                 .as_ref()
                 .map_or_else(Vec::new, |p| p.actions.clone()),

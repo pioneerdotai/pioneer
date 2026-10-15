@@ -1,6 +1,10 @@
 use super::*;
 #[path = "checkpoint_input_alias_tests.rs"]
 mod checkpoint_input_alias_tests;
+#[path = "invalid_completion_resume_tests.rs"]
+mod invalid_completion_resume_tests;
+#[path = "invalid_completion_tests.rs"]
+mod invalid_completion_tests;
 use migration::{Migrator, MigratorTrait};
 use pioneer_agent::compaction::composition::ScopedHistorySource;
 use pioneer_compaction::summary::{HEADINGS, SummaryInput};
@@ -184,6 +188,7 @@ async fn raw_layout_publication_preserves_actual_ownership(filtered_empty: bool)
         PreparedOperation {
             owner: "raw-layout-owner".into(),
             execution_turn: "turn".into(),
+            user_initiated: true,
             source_projection: None,
             expected_checkpoint: None,
             summary_basis: None,
@@ -1980,6 +1985,7 @@ async fn turn_started_and_edited_payload_projection_matches_history_without_even
         PreparedOperation {
             owner: "input-model-projection-owner".into(),
             execution_turn: "turn".into(),
+            user_initiated: true,
             source_projection: None,
             expected_checkpoint: None,
             summary_basis: None,
@@ -2064,6 +2070,7 @@ async fn turn_started_and_edited_payload_projection_matches_history_without_even
 
 #[derive(Clone, Copy)]
 enum Reply {
+    Invalid,
     Success,
     Transient,
     Hang,
@@ -2134,13 +2141,18 @@ impl Provider for ProviderFixture {
             .unwrap()
             .pop_front()
             .unwrap_or(Reply::Success);
+        let invalid = matches!(reply, Reply::Invalid);
         match reply {
             Reply::Transient => anyhow::bail!("synthetic rate limit"),
             Reply::Hang => std::future::pending::<()>().await,
-            Reply::Success => {}
+            Reply::Success | Reply::Invalid => {}
         }
         Ok(ChatResponse {
-            text: HEADINGS.iter().map(|h| format!("{h}\nState.\n")).collect(),
+            text: if invalid {
+                "private invalid model response".into()
+            } else {
+                HEADINGS.iter().map(|h| format!("{h}\nState.\n")).collect()
+            },
             usage: None,
             termination: ProviderTermination::Complete,
             reasoning_content: None,
@@ -5432,6 +5444,7 @@ async fn admission_resumes_exact_plan_without_resetting_deadline() {
     let mut prepared = PreparedOperation {
         owner: "admission-owner".into(),
         execution_turn: "turn".into(),
+        user_initiated: true,
         source_projection: Some(projection.clone()),
         expected_checkpoint: None,
         summary_basis: None,
@@ -5616,6 +5629,7 @@ async fn admission_and_runner_remove_technical_compact_and_reference_only_payloa
     let prepared = PreparedOperation {
         owner: "typed-admission-filter-owner".into(),
         execution_turn: "turn".into(),
+        user_initiated: true,
         source_projection: Some(projection),
         expected_checkpoint: None,
         summary_basis: None,
@@ -6028,7 +6042,20 @@ async fn later_admission_resumes_deadline_progress_without_replaying_saved_porti
             );
             continue;
         }
-        // Operation and state must roll back together if the second write fails.
+        let before_resume = f
+            .store
+            .compaction_runner_state("operation")
+            .await
+            .unwrap()
+            .unwrap();
+        let operation_before_resume = f
+            .store
+            .compaction_operation("operation")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(before_resume.portion_attempts, 1);
+        // Operation, state and portion budget must roll back together if the second write fails.
         f.store.database_connection().execute_raw(Statement::from_string(DbBackend::Sqlite,
             "CREATE TRIGGER reject_resume BEFORE UPDATE ON compaction_runner_state BEGIN SELECT RAISE(ABORT,'fixture'); END"
         )).await.unwrap();
@@ -6046,6 +6073,35 @@ async fn later_admission_resumes_deadline_progress_without_replaying_saved_porti
                 .unwrap()
                 .status,
             "failed"
+        );
+        assert_eq!(
+            f.store
+                .compaction_runner_state("operation")
+                .await
+                .unwrap()
+                .unwrap(),
+            before_resume
+        );
+        let rolled_back = f
+            .store
+            .compaction_operation("operation")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(rolled_back.deadline_ms, operation_before_resume.deadline_ms);
+        assert_eq!(rolled_back.snapshot, operation_before_resume.snapshot);
+        assert_eq!(rolled_back.outcome, operation_before_resume.outcome);
+        assert_eq!(
+            (
+                rolled_back.attempts,
+                rolled_back.transient_retries,
+                rolled_back.correction
+            ),
+            (
+                operation_before_resume.attempts,
+                operation_before_resume.transient_retries,
+                operation_before_resume.correction
+            )
         );
         f.store
             .database_connection()
@@ -6079,6 +6135,12 @@ async fn later_admission_resumes_deadline_progress_without_replaying_saved_porti
             (before.attempts, before.retries, before.corrections)
         );
         assert_eq!(after.deadline_ms, resumed_deadline);
+        assert_eq!(after.portion_attempts, 0);
+        assert_eq!(after.target_tokens, before.target_tokens);
+        assert_eq!(
+            after.source_text_projection_version,
+            before.source_text_projection_version
+        );
         let snapshot = serde_json::from_str(
             &f.store
                 .compaction_operation("operation")
@@ -6478,6 +6540,7 @@ async fn expected_head_does_not_force_a_projection_basis_after_historical_edit()
     let prepared = PreparedOperation {
         owner: "owner".into(),
         execution_turn: "turn".into(),
+        user_initiated: true,
         source_projection: None,
         expected_checkpoint: Some(head.clone()),
         summary_basis: None,
@@ -16971,11 +17034,13 @@ impl Summarizer for CleanupGateSummarizer {
 
 #[tokio::test]
 async fn service_cleanup_precedes_publication_backoff_and_stop_reconciliation() {
-    for scenario in 0..3 {
+    for scenario in 0..4 {
         let mut f = fixture(
             "completed history",
             vec![if scenario == 2 {
                 Reply::Hang
+            } else if scenario == 3 {
+                Reply::Invalid
             } else {
                 Reply::Success
             }],
@@ -17020,7 +17085,7 @@ async fn service_cleanup_precedes_publication_backoff_and_stop_reconciliation() 
         assert_eq!(*f.provider.count.borrow(), 1);
         assert!(!work.is_finished());
         cleanup.release.add_permits(1);
-        if scenario == 2 {
+        if scenario == 2 || scenario == 3 {
             wait_backoff(&f.store).await;
             cancel.cancel();
         }
@@ -26761,6 +26826,7 @@ async fn new_admission_omits_service_sources_from_compact_and_reference_only() {
         PreparedOperation {
             owner: "filtered-admission".into(),
             execution_turn: "turn".into(),
+            user_initiated: true,
             source_projection: None,
             expected_checkpoint: None,
             summary_basis: None,

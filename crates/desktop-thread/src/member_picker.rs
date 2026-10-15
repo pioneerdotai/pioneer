@@ -117,7 +117,7 @@ pub(crate) fn member_picker_items(
     )
 }
 
-#[derive(IntoElement)]
+#[derive(gpui_kit::IntoElement)]
 pub(crate) struct MemberPicker {
     id: ElementId,
     trigger_id: ElementId,

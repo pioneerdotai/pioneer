@@ -278,6 +278,76 @@ fn thread_footer_shares_the_existing_bottom_bar_allocation_and_receives_pointer_
 }
 
 #[gpui_kit::test]
+fn replacing_thread_or_route_hides_the_previous_root_even_if_a_frame_retains_it(
+    cx: &mut TestAppContext,
+) {
+    use super::DesktopShellView;
+    use pioneer_client::navigation::{NavigationIntent, SemanticDestination, SettingsRoute};
+    cx.update(gpui_kit::init);
+    cx.update(crate::client_runtime::DesktopRuntimeCoordinator::install_for_test);
+    let core = cx.update(|cx| {
+        cx.global::<crate::client_runtime::DesktopRuntimeCoordinator>()
+            .core()
+    });
+    for id in ["parent", "child"] {
+        core.upsert_thread(serde_json::from_value(serde_json::json!({
+            "created_at":1,"id":id,"mode":"Chat","model":"synthetic-model","model_provider":"synthetic-provider","origin_kind":"user","preview":"","sidebar_visibility":"visible","status":"Idle","turns":[],"updated_at":2,"workspace_id":"workspace"
+        })).unwrap());
+    }
+    core.activate_thread(Some("parent"), Some("workspace"));
+    let (root, cx) = cx.add_window_view(|window, cx| {
+        let registrar = cx
+            .global::<crate::client_runtime::DesktopRuntimeCoordinator>()
+            .registrar();
+        let navigation = crate::desktop_navigation::DesktopNavigationStore::new(registrar.as_ref());
+        let layout = cx.new(|cx| crate::shell_state::ShellStateStore::new(window, cx));
+        let shell = cx.new(|cx| DesktopShellView::new(navigation, layout, window, cx));
+        Root::new(shell, window, cx)
+    });
+    cx.run_until_parked();
+    let shell = root.read_with(cx, |root, _| {
+        root.view().clone().downcast::<DesktopShellView>().unwrap()
+    });
+    let mut retained = Vec::new();
+    for id in [Some("child"), Some("parent"), None] {
+        let previous = shell.read_with(cx, |shell, _| shell.thread.as_ref().unwrap().1.clone());
+        assert!(previous.read_with(cx, |thread, _| thread.is_visible()));
+        core.activate_thread(id, Some("workspace"));
+        cx.run_until_parked();
+        assert!(
+            !previous.read_with(cx, |thread, _| thread.is_visible()),
+            "retained page must hide before selecting a child, parent or new draft"
+        );
+        retained.push(previous);
+    }
+    let previous = shell.read_with(cx, |shell, _| shell.thread.as_ref().unwrap().1.clone());
+    core.navigate(
+        NavigationIntent::Navigate {
+            destination: SemanticDestination::Settings {
+                route: SettingsRoute::Account,
+            },
+        },
+        None,
+    );
+    cx.run_until_parked();
+    assert!(!previous.read_with(cx, |thread, _| thread.is_visible()));
+    retained.push(previous);
+    assert!(
+        retained
+            .iter()
+            .all(|thread| thread.read_with(cx, |thread, _| !thread.is_visible()))
+    );
+    core.open_workspace_thread("workspace".to_owned(), Some("parent".to_owned()), None);
+    cx.run_until_parked();
+    let previous = shell.read_with(cx, |shell, _| shell.thread.as_ref().unwrap().1.clone());
+    cx.update(|window, cx| shell.update(cx, |shell, cx| shell.close(window, cx)));
+    assert!(
+        !previous.read_with(cx, |thread, _| thread.is_visible()),
+        "window close retires native pages before dropping the feature"
+    );
+}
+
+#[gpui_kit::test]
 fn every_production_route_retains_its_feature_and_window_close_releases_it(
     cx: &mut TestAppContext,
 ) {
@@ -553,7 +623,29 @@ fn late_capabilities_enable_real_mcp_and_skills_buttons_and_revocation_closes_ac
     capabilities.authorization_revision += 1;
     capabilities.global.can_manage_capabilities = false;
     let (generation, connection) = core.current_auth_ticket();
-    core.accept_authorization_projection(generation, connection, capabilities);
+    assert_eq!(
+        core.accept_authorization_projection(generation, connection, capabilities),
+        pioneer_client::authorization::AuthorizationProjectionAcceptance::Accepted
+    );
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        let shell = root
+            .read(cx)
+            .view()
+            .clone()
+            .downcast::<super::DesktopShellView>()
+            .unwrap();
+        assert!(!shell.read(cx).can_manage);
+    });
+    cx.dispatch_action(crate::desktop_navigation::OpenMcp);
+    cx.run_until_parked();
+    assert_eq!(
+        core.navigation_snapshot().destination(),
+        &SemanticDestination::Threads
+    );
+    // Fast copies previous debug selectors when any subtree is reused. An
+    // absence assertion needs a full frame, not that retained diagnostic map.
+    cx.update(|window, _| window.refresh());
     cx.run_until_parked();
     assert!(cx.debug_bounds("bottom-bar-open-mcp").is_none());
     let skills = cx.debug_bounds("bottom-bar-open-skills").unwrap();

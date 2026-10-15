@@ -115,14 +115,12 @@ async fn lifecycle_claim_and_deferral_failure_keeps_batch_progress_history_poll_
             .any(|(_, thread)| thread == "poll-thread")
     );
     // The common resilience loop's next action can proceed without the cooldown.
-    let now = now_timestamp_secs();
     processor
         .crud_store
         .with_critical_writes()
         .heartbeat_turn_executions_owned_by(
             processor.turn_execution_owner_id.as_ref(),
-            now,
-            now + 30,
+            TURN_EXECUTION_OWNER_LEASE_SECONDS,
         )
         .await
         .unwrap();

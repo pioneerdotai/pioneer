@@ -137,19 +137,19 @@ pub use audit::{
     AuditMetadataError, AuditTargetKind, BoundedServerGeneratedMetadata,
 };
 pub use auth::{
-    AuthAccessExpiringNotification, AuthCredentialPurpose, AuthDeviceActivateParams,
-    AuthDeviceActivationPresentation, AuthDeviceCreateResponse, AuthDeviceSnapshot,
-    AuthGatewaySnapshot, AuthLogoutResponse, AuthMeResponse, AuthPrincipalSnapshot,
-    AuthProfileAvatarUpdate, AuthProfileUpdateParams, AuthProfileUpdateResponse, AuthRefreshGrant,
-    AuthRefreshParams, AuthSecretString, AuthSessionGrant, AuthSessionListItem,
-    AuthSessionListResponse, AuthSessionRevokeParams, AuthSessionRevokeReason,
-    AuthSessionRevokeResponse, AuthSessionRevokedNotification, AuthSessionSnapshot,
-    AuthSessionStatus, AuthSessionTerminationReason, ClientInstallationDescriptor, ClientKind,
-    CredentialStorageOrder, DEVICE_ACTIVATION_ALPHABET, DEVICE_ACTIVATION_CODE_SYMBOLS,
-    DEVICE_ACTIVATION_LOCATOR_SYMBOLS, DEVICE_ACTIVATION_MAX_FAILED_ATTEMPTS,
-    DEVICE_SESSION_AUTH_PROTOCOL_VERSION, DeviceStatus, MAX_PROTECTED_GATEWAY_URI_BYTES,
-    REFRESH_CREDENTIAL_BODY_LEN, REFRESH_CREDENTIAL_PREFIX, device_activation_locator,
-    encode_device_activation_entropy, format_device_activation_code,
+    AuthAccessExpiringNotification, AuthAccessRenewParams, AuthAccessRenewResponse,
+    AuthCredentialPurpose, AuthDeviceActivateParams, AuthDeviceActivationPresentation,
+    AuthDeviceCreateResponse, AuthDeviceSnapshot, AuthGatewaySnapshot, AuthLogoutResponse,
+    AuthMeResponse, AuthPrincipalSnapshot, AuthProfileAvatarUpdate, AuthProfileUpdateParams,
+    AuthProfileUpdateResponse, AuthRefreshGrant, AuthRefreshParams, AuthSecretString,
+    AuthSessionGrant, AuthSessionListItem, AuthSessionListResponse, AuthSessionRevokeParams,
+    AuthSessionRevokeReason, AuthSessionRevokeResponse, AuthSessionRevokedNotification,
+    AuthSessionSnapshot, AuthSessionStatus, AuthSessionTerminationReason,
+    ClientInstallationDescriptor, ClientKind, CredentialStorageOrder, DEVICE_ACTIVATION_ALPHABET,
+    DEVICE_ACTIVATION_CODE_SYMBOLS, DEVICE_ACTIVATION_LOCATOR_SYMBOLS,
+    DEVICE_ACTIVATION_MAX_FAILED_ATTEMPTS, DEVICE_SESSION_AUTH_PROTOCOL_VERSION, DeviceStatus,
+    MAX_PROTECTED_GATEWAY_URI_BYTES, REFRESH_CREDENTIAL_BODY_LEN, REFRESH_CREDENTIAL_PREFIX,
+    device_activation_locator, encode_device_activation_entropy, format_device_activation_code,
     normalize_device_activation_code, normalize_device_activation_code_input,
 };
 pub use authorization::{
@@ -237,7 +237,7 @@ pub use jsonrpc::{
 };
 pub use markdown::{
     MARKDOWN_AST_VERSION, MarkdownBlock, MarkdownDocument, MarkdownInline, MarkdownList,
-    MarkdownListItem, MarkdownMark, MarkdownMarkKind,
+    MarkdownListItem, MarkdownMark, MarkdownMarkKind, MarkdownTable, MarkdownTableAlignment,
 };
 pub use mcp::{
     McpAuditEventSummary, McpChangedAction, McpChangedItem, McpChangedNotification,
@@ -614,3 +614,4 @@ pub fn native_semantic_checkpoint_id(turn: &str) -> String {
     ))[..21]
         .to_owned()
 }
+pub use artifact::{HtmlPublication, compact_html_timeline_item, compact_html_timeline_value};

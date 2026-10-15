@@ -101,7 +101,10 @@ impl TurnMcpPersistenceCoordinator {
             // external MCP server that must appear in the user's immutable
             // MCP server admission. External MCP names remain the only names
             // bound to role/capability grants here.
-            .filter(|binding| binding.server_installation_id != FIRST_PARTY_FILE_SERVER_ID)
+            .filter(|binding| {
+                binding.server_installation_id != FIRST_PARTY_FILE_SERVER_ID
+                    && binding.server_installation_id != pioneer_tools::html::HTML_SERVER_ID
+            })
             .map(|binding| binding.server_name.clone())
             .collect::<Vec<_>>();
         context

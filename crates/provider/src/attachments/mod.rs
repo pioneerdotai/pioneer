@@ -186,6 +186,66 @@ pub(crate) fn prepare_messages_for_request(
     )
 }
 
+// Chat adapters render HTML preview images in user messages. Derive the
+// follow-up before wire conversion so it follows the entire parallel-result
+// group. Native nested-media adapters retain their existing tool blocks.
+// Keep canonical history intact; derive a paired tool result
+// plus a labeled media follow-up after the entire parallel-result group.
+fn project_html_preview_media<'a>(
+    provider: &str,
+    messages: &'a [ChatMessage],
+) -> std::borrow::Cow<'a, [ChatMessage]> {
+    use crate::types::Role;
+    let adapter = crate::definition::provider_definition(provider)
+        .map(|definition| definition.name)
+        .unwrap_or(provider);
+    let needs_projection = !matches!(adapter, "anthropic" | "gemini" | "bedrock")
+        && messages.iter().any(|message| {
+            message.role == Role::Tool
+                && message.name.as_deref() == Some("html_preview")
+                && message
+                    .content_parts
+                    .iter()
+                    .any(|part| matches!(part, MessageContentPart::Image { .. }))
+        });
+    if !needs_projection {
+        return std::borrow::Cow::Borrowed(messages);
+    }
+    let mut projected = Vec::with_capacity(messages.len() + 1);
+    let mut media = Vec::new();
+    for message in messages {
+        if message.role != Role::Tool {
+            projected.append(&mut media);
+        }
+        let mut tool = message.clone();
+        if message.role == Role::Tool
+            && message.name.as_deref() == Some("html_preview")
+            && message
+                .content_parts
+                .iter()
+                .any(|part| matches!(part, MessageContentPart::Image { .. }))
+        {
+            let mut followup = message.clone();
+            followup.role = Role::User;
+            followup.content = format!(
+                "Images from html_preview call {} (width captions in capture order).",
+                message.tool_call_id.as_deref().unwrap_or("unknown")
+            );
+            followup.tool_call_id = None;
+            followup.name = None;
+            followup.tool_calls = None;
+            followup.provider_replay_state = None;
+            // Diagnostics and exact artifact references remain in the paired
+            // tool's JSON. Binary parts and their captions stay together here.
+            tool.content_parts.clear();
+            media.push(followup);
+        }
+        projected.push(tool);
+    }
+    projected.append(&mut media);
+    std::borrow::Cow::Owned(projected)
+}
+
 async fn prepare_messages_async(
     provider_name: &str,
     model: &str,
@@ -222,6 +282,8 @@ async fn prepare_messages_async_owned(
     capabilities: &ProviderCapabilities,
     messages: &[ChatMessage],
 ) -> Result<PreparedProviderMessages> {
+    let projected = project_html_preview_media(provider_name, messages);
+    let messages = projected.as_ref();
     // Reject mismatches before I/O and retain this snapshot through materialization.
     let state = admission::current();
     let entry = if messages.iter().any(ChatMessage::has_attachments)
@@ -535,6 +597,8 @@ fn prepare_messages_impl(
     messages: &[ChatMessage],
     config: &AttachmentPipelineConfig,
 ) -> Result<PreparedProviderMessages> {
+    let media_projection = project_html_preview_media(provider_name, messages);
+    let messages = media_projection.as_ref();
     let projected_messages = model
         .map(|model| {
             crate::history::project_messages(provider_name, model, thinking_override, messages)

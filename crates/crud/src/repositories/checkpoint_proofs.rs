@@ -1865,6 +1865,12 @@ impl GraphPreparation {
             topology: None,
         }
     }
+    /// A failed step may have consumed a frame/import before its DB operation.
+    /// Restart this job from its root; drop all old reader holds and RAM scans.
+    /// Already committed staging is idempotent and will be verified again.
+    pub(super) fn restart(&mut self) {
+        *self = Self::new(&self.root);
+    }
     pub fn finished(&self) -> bool {
         self.current.is_none() && self.topology.is_none() && self.pending.is_empty()
     }

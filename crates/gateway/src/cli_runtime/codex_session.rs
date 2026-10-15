@@ -1258,7 +1258,8 @@ impl CLIAgentRuntimeSessionFactory for CodexCLIAgentRuntimeSessionFactory {
                 let artifact = build_codex_managed_mcp_config(
                     &launch_projection.preflight,
                     bootstrap_path.as_deref(),
-                    self.mcp_limits.max_tools(),
+                    self.mcp_limits.max_tools()
+                        + launch_projection.canonical_projection.html_tool_count(),
                 )
                 .map_err(|error| anyhow!("failed to build managed Codex MCP config: {error}"))?;
                 if artifact.semantic_restart_fingerprint
@@ -1294,7 +1295,11 @@ impl CLIAgentRuntimeSessionFactory for CodexCLIAgentRuntimeSessionFactory {
                     .effective_mcp_servers_fingerprint
                     .clone(),
                 requires_staged_artifact: true,
-                max_config_origins: self.mcp_limits.max_codex_config_origins(),
+                max_config_origins: codex_config_read_max_origins(
+                    self.mcp_limits.max_tools()
+                        + launch_projection.canonical_projection.html_tool_count(),
+                )
+                .context("managed Codex HTML origin evidence limit overflow")?,
             };
         }
         process_config = process_config

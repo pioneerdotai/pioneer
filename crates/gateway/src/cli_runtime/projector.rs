@@ -944,9 +944,12 @@ fn dynamic_tool_item(
 }
 
 fn mcp_tool_item(item_id: &str, metadata: Option<&JsonValue>, status: ToolCallStatus) -> TurnItem {
-    let metadata_json = metadata.cloned().unwrap_or_else(|| json!({}));
+    let mut metadata_json = metadata.cloned().unwrap_or_else(|| json!({}));
     let tool_name = metadata_string(metadata, "canonicalCallableName")
         .unwrap_or_else(|| "mcp_tool_call".to_owned());
+    if matches!(tool_name.as_str(), "html_render" | "html_preview") {
+        pioneer_protocol::compact_html_timeline_value(&mut metadata_json);
+    }
     let server_name = metadata_string(metadata, "serverName").unwrap_or_else(|| "MCP".to_owned());
     let raw_tool_name =
         metadata_string(metadata, "rawToolName").unwrap_or_else(|| tool_name.clone());

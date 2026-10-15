@@ -109,14 +109,25 @@ impl ToolResultEnvelope {
 
     pub fn to_model_input_item(&self, call_id: &str, tool_name: &str) -> ModelInputItem {
         let payload = self.llm_payload();
-        if let Some(attachment_part) = attachment_part_from_llm_context(&payload) {
+        let parts = attachment_parts_from_llm_context(&payload);
+        if tool_name == crate::html::HTML_PREVIEW && parts.is_empty() && self.success {
+            return ModelInputItem::tool_result(
+                call_id,
+                tool_name,
+                "HTML preview delivery failed: three exact image parts are required",
+                Some(
+                    serde_json::json!({"error":"preview_image_delivery_failed","tool_outcome":{"status":"failed"}}),
+                ),
+            );
+        }
+        if !parts.is_empty() {
             let content = serde_json::to_string(&payload).unwrap_or_else(|_| payload.to_string());
             return ModelInputItem::message(ChatMessage {
                 provenance: None,
                 role: Role::Tool,
                 content,
                 reasoning_content: None,
-                content_parts: vec![attachment_part],
+                content_parts: parts,
                 tool_call_id: Some(call_id.to_owned()),
                 name: Some(tool_name.to_owned()),
                 tool_calls: None,
@@ -256,6 +267,47 @@ where
     text[..best].to_owned()
 }
 
+fn attachment_parts_from_llm_context(payload: &JsonValue) -> Vec<MessageContentPart> {
+    if let Some(images) = payload
+        .pointer("/llm_context/images")
+        .and_then(JsonValue::as_array)
+    {
+        // A preview is atomic: never turn malformed or truncated references into a
+        // successful partial image set. Other attachment tools retain their format.
+        if images.len() != 3 {
+            return Vec::new();
+        }
+        let mut parts = Vec::with_capacity(6);
+        for (entry, width) in images.iter().zip([360, 768, 1024]) {
+            if entry.get("width").and_then(JsonValue::as_u64) != Some(width) {
+                return Vec::new();
+            }
+            let Ok(attachment) =
+                serde_json::from_value::<MessageAttachment>(entry["attachment"].clone())
+            else {
+                return Vec::new();
+            };
+            if attachment.mime_type != "image/png"
+                || !attachment.artifact.as_ref().is_some_and(|a| {
+                    a.artifact_version_id
+                        .as_ref()
+                        .is_some_and(|v| !v.is_empty())
+                })
+            {
+                return Vec::new();
+            }
+            parts.push(MessageContentPart::text(format!(
+                "HTML preview: {width} CSS px"
+            )));
+            parts.push(MessageContentPart::image(attachment));
+        }
+        return parts;
+    }
+    attachment_part_from_llm_context(payload)
+        .into_iter()
+        .collect()
+}
+
 fn attachment_part_from_llm_context(payload: &JsonValue) -> Option<MessageContentPart> {
     let attachment = payload.get("llm_context")?.get("attachment")?;
     let path = attachment
@@ -359,6 +411,53 @@ pub fn builtin_output_policy(tool_name: &str) -> ToolOutputPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn preview_payload() -> JsonValue {
+        let images = [360, 768, 1024].map(|width| {
+            let mut attachment =
+                MessageAttachment::from_path(format!("/fixture/{width}.png"), "image/png");
+            attachment.artifact = Some(pioneer_provider::AttachmentArtifactContext {
+                workspace_id: "workspace".into(),
+                artifact_id: format!("image-{width}"),
+                artifact_version_id: Some(format!("version-{width}")),
+            });
+            serde_json::json!({"width":width,"attachment":attachment})
+        });
+        serde_json::json!({"llm_context":{"images":images}})
+    }
+
+    #[test]
+    fn preview_is_three_ordered_images_with_exact_replay_versions() {
+        let parts = attachment_parts_from_llm_context(&preview_payload());
+        assert_eq!(parts.len(), 6);
+        for (pair, width) in parts.chunks_exact(2).zip([360, 768, 1024]) {
+            assert!(
+                matches!(&pair[0],MessageContentPart::Text {text} if text.contains(&width.to_string()))
+            );
+            assert!(
+                matches!(&pair[1],MessageContentPart::Image {image} if image.artifact.as_ref().unwrap().artifact_version_id.as_deref() == Some(format!("version-{width}").as_str()))
+            );
+        }
+    }
+
+    #[test]
+    fn preview_never_projects_a_partial_or_reordered_set_as_media() {
+        let mut payload = preview_payload();
+        payload["llm_context"]["images"]
+            .as_array_mut()
+            .unwrap()
+            .remove(1);
+        assert!(attachment_parts_from_llm_context(&payload).is_empty());
+        let mut payload = preview_payload();
+        payload["llm_context"]["images"][0]["width"] = 1024.into();
+        assert!(attachment_parts_from_llm_context(&payload).is_empty());
+        let mut payload = preview_payload();
+        payload["llm_context"]["images"][2]["attachment"]["artifact"]
+            .as_object_mut()
+            .unwrap()
+            .remove("artifact_version_id");
+        assert!(attachment_parts_from_llm_context(&payload).is_empty());
+    }
 
     #[test]
     fn web_fetch_never_uses_full_storage_policy() {

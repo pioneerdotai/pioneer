@@ -19,5 +19,5 @@ pub mod local_presentation;
 
 pub use pioneer_protocol::{
     ArtifactBindingDirection, ArtifactBindingKind, ArtifactCreatedByKind, ArtifactKind,
-    ArtifactRef, ArtifactStatus, ArtifactSummary,
+    ArtifactRef, ArtifactStatus, ArtifactSummary, HtmlPublication,
 };

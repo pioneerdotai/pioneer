@@ -196,16 +196,15 @@ impl ClientCore {
         request: &ArtifactPreviewRequest,
         result: anyhow::Result<ArtifactPreviewImagePaths>,
     ) {
+        let applicable = !self.is_stopped()
+            && !request.cancellation.is_cancelled()
+            && self.current_auth_ticket() == request.auth_ticket
+            && self.thread_operation_token(&request.thread_id) == request.thread_incarnation;
         let mut owner = self.artifact_store.lock().expect("artifact owner poisoned");
-        if self.is_stopped()
-            || request.cancellation.is_cancelled()
-            || self.current_auth_ticket() != request.auth_ticket
-            || self.thread_operation_token(&request.thread_id) != request.thread_incarnation
-            || !owner.preview_requests.contains_key(&request.generation)
-        {
+        // Release only this request even when its result no longer has authority.
+        if owner.preview_requests.remove(&request.generation).is_none() {
             return;
         }
-        owner.preview_requests.remove(&request.generation);
         let Some(current) = owner
             .publications
             .get(&request.thread_id)
@@ -220,9 +219,13 @@ impl ClientCore {
         }) else {
             return;
         };
-        preview.state = match result {
-            Ok(paths) => ArtifactPreviewRequestState::Ready { paths },
-            Err(_) => ArtifactPreviewRequestState::Failed,
+        preview.state = if !applicable {
+            ArtifactPreviewRequestState::Cancelled
+        } else {
+            match result {
+                Ok(paths) => ArtifactPreviewRequestState::Ready { paths },
+                Err(_) => ArtifactPreviewRequestState::Failed,
+            }
         };
         self.publish_artifact(&mut owner, next);
     }
@@ -252,7 +255,10 @@ impl ClientCore {
             } else {
                 let mut changed = false;
                 for p in &mut next.previews {
-                    if p.state == ArtifactPreviewRequestState::Loading {
+                    if matches!(
+                        p.state,
+                        ArtifactPreviewRequestState::Loading | ArtifactPreviewRequestState::Failed
+                    ) {
                         p.state = ArtifactPreviewRequestState::Cancelled;
                         changed = true;
                     }
@@ -280,6 +286,10 @@ impl ClientCore {
                         return;
                     };
                     if !core.artifact_preview_matches(&request) {
+                        core.complete_artifact_preview(
+                            &request,
+                            Err(anyhow::anyhow!("artifact preview cancelled")),
+                        );
                         continue;
                     }
                     let session = super::access::artifact_http_session(
@@ -394,6 +404,43 @@ mod tests {
             Arc::new(Renderer),
             core.current_auth_ticket(),
         );
+    }
+    #[test]
+    fn retired_ticket_releases_preview_and_next_observation_can_retry() {
+        let (core, queue) = setup();
+        let reference = artifact("sha");
+        enqueue(&core, "a", &reference);
+        let old = queue.try_recv().unwrap();
+        // Simulate the ticket retained by the request before a same-session update.
+        core.artifact_store
+            .lock()
+            .unwrap()
+            .preview_requests
+            .get_mut(&old.generation)
+            .unwrap()
+            .auth_ticket
+            .0 += 1;
+        let mut stale = old.clone();
+        stale.auth_ticket.0 += 1;
+        core.complete_artifact_preview(&stale, Err(anyhow::anyhow!("lost")));
+        assert_eq!(
+            core.artifact_snapshot("a").unwrap().previews[0].state,
+            ArtifactPreviewRequestState::Cancelled
+        );
+        assert!(
+            !core
+                .artifact_store
+                .lock()
+                .unwrap()
+                .preview_requests
+                .contains_key(&old.generation)
+        );
+        enqueue(&core, "a", &reference);
+        let next = queue.try_recv().unwrap();
+        let pending = core.artifact_snapshot("a").unwrap();
+        core.complete_artifact_preview(&old, Err(anyhow::anyhow!("late")));
+        assert!(Arc::ptr_eq(&pending, &core.artifact_snapshot("a").unwrap()));
+        assert_ne!(old.generation, next.generation);
     }
     #[test]
     fn replacement_and_duplicate_completions_do_not_overwrite_the_current_projection() {

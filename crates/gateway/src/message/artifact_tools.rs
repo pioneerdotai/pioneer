@@ -143,6 +143,7 @@ impl GatewayArtifactToolProvider {
             .into_iter()
             .collect::<Vec<_>>();
         bundles.extend(agent_actions.bundles);
+        bundles.push(processor.html_tools(context_for_results.clone()));
         bundles.push(processor.thread_result_tools(context_for_results));
 
         if let Some((_, accepted)) = restore {
@@ -432,6 +433,12 @@ impl MessageProcessor {
     }
 
     pub(crate) async fn bind_artifact_tool_bridge(self: &Arc<Self>) {
+        *self
+            .mcp_service
+            .inner
+            .html_processor
+            .write()
+            .expect("HTML processor lock") = Arc::downgrade(self);
         self.agent_manager
             .set_turn_execution_providers(
                 Some(Arc::new(GatewayArtifactToolProvider::new(Arc::downgrade(

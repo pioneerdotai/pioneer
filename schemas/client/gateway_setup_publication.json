@@ -1,0 +1,176 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "GatewaySetupPublication",
+  "type": "object",
+  "properties": {
+    "action": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/GatewaySetupAction"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "activation_error": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "activation_valid": {
+      "type": "boolean"
+    },
+    "address": {
+      "type": "string"
+    },
+    "address_error": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "completed_endpoint": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "error": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "input_reset_generation": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "input_revision": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "mode": {
+      "$ref": "#/$defs/GatewaySetupMode"
+    },
+    "name": {
+      "type": "string"
+    },
+    "name_error": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "owner_generation": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "pending": {
+      "type": "boolean"
+    },
+    "revision": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    }
+  },
+  "required": [
+    "owner_generation",
+    "mode",
+    "name",
+    "address",
+    "activation_valid",
+    "pending",
+    "input_revision",
+    "input_reset_generation",
+    "revision"
+  ],
+  "$defs": {
+    "GatewaySetupAction": {
+      "type": "string",
+      "enum": [
+        "ConnectRemote",
+        "StartLocal",
+        "SaveGateway",
+        "DeleteGateway"
+      ]
+    },
+    "GatewaySetupMode": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "allow_local": {
+              "type": "boolean"
+            },
+            "kind": {
+              "type": "string",
+              "const": "initial"
+            }
+          },
+          "required": [
+            "kind",
+            "allow_local"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "allow_local": {
+              "type": "boolean"
+            },
+            "kind": {
+              "type": "string",
+              "const": "add_gateway"
+            }
+          },
+          "required": [
+            "kind",
+            "allow_local"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "endpoint_id": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "const": "edit_gateway"
+            }
+          },
+          "required": [
+            "kind",
+            "endpoint_id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "close_on_success": {
+              "type": "boolean"
+            },
+            "endpoint_id": {
+              "type": "string"
+            },
+            "kind": {
+              "type": "string",
+              "const": "reauthenticate_gateway"
+            }
+          },
+          "required": [
+            "kind",
+            "endpoint_id",
+            "close_on_success"
+          ]
+        }
+      ]
+    }
+  }
+}

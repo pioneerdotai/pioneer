@@ -75,6 +75,7 @@ pub(crate) struct McpService {
 }
 
 pub(crate) struct McpServiceInner {
+    pub(crate) html_processor: RwLock<std::sync::Weak<crate::message::MessageProcessor>>,
     pub(crate) crud_store: Arc<CrudStore>,
     authorization_invalidation_hub: Arc<AuthorizationInvalidationHub>,
     execution_leases: Arc<ExecutionLeaseRegistry>,
@@ -389,6 +390,7 @@ impl McpService {
             )
             .expect("OAuth HTTP client");
             McpServiceInner {
+                html_processor: RwLock::new(std::sync::Weak::new()),
                 oauth: oauth.clone(),
                 oauth_events: std::sync::Mutex::new(None),
                 #[cfg(test)]
@@ -2783,6 +2785,9 @@ impl TurnMcpRuntimeView for McpService {
         workspace_id: &str,
         binding: &pioneer_crud::TurnMcpBindingRecord,
     ) -> Result<CurrentMcpToolIdentity, TurnMcpInvocationError> {
+        if binding.server_installation_id == pioneer_tools::html::HTML_SERVER_ID {
+            return first_party_html_identity(workspace_id, binding);
+        }
         if binding.server_installation_id == FIRST_PARTY_FILE_SERVER_ID {
             return first_party_file_tool_identity(workspace_id, binding);
         }
@@ -2905,6 +2910,56 @@ impl TurnMcpRuntimeView for McpService {
             runtime_generation: snapshot.runtime_generation,
         })
     }
+}
+
+pub(crate) fn first_party_html_identity(
+    workspace_id: &str,
+    binding: &pioneer_crud::TurnMcpBindingRecord,
+) -> Result<CurrentMcpToolIdentity, TurnMcpInvocationError> {
+    let definition = pioneer_tools::html::definition(&binding.raw_tool_name).ok_or_else(|| {
+        TurnMcpInvocationError::new(
+            TurnMcpInvocationErrorCode::ToolUnbound,
+            "unknown HTML callable",
+        )
+    })?;
+    let (schema, fingerprint, _) =
+        crate::turn_mcp::projection::canonical_schema_identity(&definition["inputSchema"])
+            .map_err(|_| {
+                TurnMcpInvocationError::new(
+                    TurnMcpInvocationErrorCode::Internal,
+                    "HTML schema unavailable",
+                )
+            })?;
+    if workspace_id.is_empty()
+        || binding.server_name != pioneer_tools::html::HTML_SERVER_NAME
+        || binding.catalog_version != pioneer_tools::html::HTML_SERVER_ID
+        || binding.fingerprint != pioneer_tools::html::HTML_SERVER_ID
+        || binding.canonical_callable_name != binding.raw_tool_name
+        || binding.canonical_schema_fingerprint != fingerprint
+        || binding.annotations_json != "{}"
+        || binding.annotations_digest != crate::turn_mcp::projection::sha256_hex(b"{}")
+        || binding.runtime_generation != 1
+        || binding.effective_timeout_ms != 120_000
+    {
+        return Err(TurnMcpInvocationError::new(
+            TurnMcpInvocationErrorCode::ToolDrift,
+            "HTML binding differs from the canonical catalog",
+        ));
+    }
+    Ok(CurrentMcpToolIdentity {
+        server_installation_id: pioneer_tools::html::HTML_SERVER_ID.into(),
+        server_name: pioneer_tools::html::HTML_SERVER_NAME.into(),
+        raw_tool_name: binding.raw_tool_name.clone(),
+        description: definition["description"].as_str().map(str::to_owned),
+        catalog_version: pioneer_tools::html::HTML_SERVER_ID.into(),
+        installation_fingerprint: pioneer_tools::html::HTML_SERVER_ID.into(),
+        canonical_schema_fingerprint: fingerprint,
+        canonical_schema: schema,
+        annotations_json: "{}".into(),
+        annotations_digest: binding.annotations_digest.clone(),
+        effective_timeout_ms: 120_000,
+        runtime_generation: 1,
+    })
 }
 
 fn first_party_file_tool_identity(
@@ -3047,6 +3102,11 @@ impl TurnMcpValidatedExecution for McpService {
                         "turn execution security snapshot is unavailable",
                     )
                 })?;
+            if validated.binding.server_installation_id == pioneer_tools::html::HTML_SERVER_ID {
+                return self
+                    .execute_html_tool(&validated, cancellation.clone())
+                    .await;
+            }
             if validated.binding.server_installation_id == FIRST_PARTY_FILE_SERVER_ID {
                 return self
                     .execute_first_party_file_tool(&validated, &security, cancellation.clone())
@@ -3158,6 +3218,139 @@ impl TurnMcpValidatedExecution for McpService {
 }
 
 impl McpService {
+    async fn execute_html_tool(
+        &self,
+        validated: &ValidatedTurnMcpInvocation,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<CanonicalMcpToolResult, TurnMcpInvocationError> {
+        use base64::Engine;
+        let processor = self
+            .inner
+            .html_processor
+            .read()
+            .expect("HTML processor lock")
+            .upgrade()
+            .ok_or_else(|| {
+                TurnMcpInvocationError::new(
+                    TurnMcpInvocationErrorCode::ExecutionFailed,
+                    "HTML Gateway handler is unavailable",
+                )
+            })?;
+        let context = pioneer_agent::TurnToolContext {
+            workspace_id: validated.invocation.workspace_id.clone(),
+            thread_id: validated.invocation.thread_id.clone(),
+            turn_id: validated.invocation.turn_id.clone(),
+        };
+        let started = std::time::Instant::now();
+        let mut value = processor
+            .execute_html(
+                &context,
+                &validated.invocation.provider_call_id,
+                &validated.invocation.canonical_callable_name,
+                validated.invocation.arguments.clone(),
+                &cancel,
+            )
+            .await
+            .map_err(|e| {
+                TurnMcpInvocationError::new(
+                    match &e {
+                        pioneer_tools::ToolError::Cancelled(_) => {
+                            TurnMcpInvocationErrorCode::Cancelled
+                        }
+                        pioneer_tools::ToolError::InvalidArguments(_) => {
+                            TurnMcpInvocationErrorCode::InvalidRequest
+                        }
+                        pioneer_tools::ToolError::ExecutionFailed(message)
+                            if message == "HTML operation deadline exceeded" =>
+                        {
+                            TurnMcpInvocationErrorCode::TimedOut
+                        }
+                        _ => TurnMcpInvocationErrorCode::ExecutionFailed,
+                    },
+                    bounded_invocation_diagnostic(&e.to_string()),
+                )
+            })?;
+        let mut content = vec![json!({"type":"text","text":value.to_string()})];
+        if validated.invocation.canonical_callable_name == pioneer_tools::html::HTML_PREVIEW {
+            content.clear();
+            let images = value
+                .pointer("/llm_context/images")
+                .and_then(JsonValue::as_array)
+                .ok_or_else(|| {
+                    TurnMcpInvocationError::new(
+                        TurnMcpInvocationErrorCode::ResultInvalid,
+                        "three image references missing",
+                    )
+                })?;
+            if images.len() != 3
+                || images
+                    .iter()
+                    .zip(pioneer_tools::html::PREVIEW_WIDTHS)
+                    .any(|(image, width)| image["width"] != width)
+            {
+                return Err(TurnMcpInvocationError::new(
+                    TurnMcpInvocationErrorCode::ResultInvalid,
+                    "three ordered preview image references are required",
+                ));
+            }
+            let mut budget = crate::message::html_tools::screenshot_budget();
+            for image in images {
+                let artifact = &image["attachment"]["artifact"];
+                let reading = processor.artifact_service.read_bounded_artifact(
+                    pioneer_artifacts::ArtifactBoundedReadRequest {
+                        workspace_id: context.workspace_id.clone(),
+                        artifact_id: artifact["artifact_id"].as_str().unwrap_or_default().into(),
+                        version_id: artifact["artifact_version_id"].as_str().map(str::to_owned),
+                        projection_kind: None,
+                        offset: None,
+                        max_bytes: Some(budget as u64),
+                    },
+                    budget as u64,
+                );
+                let read = tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => return Err(TurnMcpInvocationError::new(
+                        TurnMcpInvocationErrorCode::Cancelled, "HTML image delivery was cancelled")),
+                    read = reading => read,
+                }.map_err(|_| {
+                        TurnMcpInvocationError::new(
+                            TurnMcpInvocationErrorCode::ResultInvalid,
+                            "exact screenshot read failed",
+                        )
+                    })?;
+                if read.truncated {
+                    return Err(TurnMcpInvocationError::new(
+                        TurnMcpInvocationErrorCode::ResourceExhausted,
+                        "preview images exceed transport budget",
+                    ));
+                }
+                budget = budget.saturating_sub(read.bytes.len());
+                content.push(
+                    json!({"type":"text","text":format!("HTML preview: {} CSS px",image["width"])}),
+                );
+                content.push(json!({"type":"image","mimeType":"image/png","data":base64::engine::general_purpose::STANDARD.encode(read.bytes)}));
+            }
+            value
+                .as_object_mut()
+                .expect("HTML result object")
+                .remove("llm_context");
+            content.push(json!({"type":"text","text":value.to_string()}));
+        }
+        if cancel.is_cancelled() {
+            return Err(TurnMcpInvocationError::new(
+                TurnMcpInvocationErrorCode::Cancelled,
+                "HTML result delivery was cancelled",
+            ));
+        }
+        Ok(CanonicalMcpToolResult {
+            content: JsonValue::Array(content),
+            structured_content: Some(value),
+            is_error: false,
+            duration_ms: started.elapsed().as_millis() as u64,
+            meta: None,
+        })
+    }
+
     async fn execute_first_party_file_tool(
         &self,
         validated: &ValidatedTurnMcpInvocation,

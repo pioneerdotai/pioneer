@@ -188,6 +188,8 @@
 "timeline.file_change.one_file" = "1 个文件"
 "timeline.file_change.output" = "输出"
 "timeline.file_change.running" = "正在应用更改"
+"timeline.html.failed" = "无法显示此页面"
+"timeline.html.loading" = "正在加载页面…"
 "timeline.message.copy_action" = "复制"
 "timeline.message.delete_action" = "删除"
 "timeline.message.delete_conflict" = "此消息已更改。请查看当前版本后再删除。"

@@ -585,6 +585,8 @@ impl Render for RunningElapsedView {
 }
 
 pub(super) struct ActivityIndicatorView {
+    #[cfg(test)]
+    pub(super) renders: usize,
     #[cfg_attr(not(feature = "qualification-diagnostics"), allow(dead_code))]
     source: ActivitySpinnerKind,
     visible: bool,
@@ -592,6 +594,8 @@ pub(super) struct ActivityIndicatorView {
 impl ActivityIndicatorView {
     pub(super) fn new(source: ActivitySpinnerKind) -> Self {
         Self {
+            #[cfg(test)]
+            renders: 0,
             source,
             visible: false,
         }
@@ -605,6 +609,10 @@ impl ActivityIndicatorView {
 }
 impl Render for ActivityIndicatorView {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        #[cfg(test)]
+        {
+            self.renders += 1;
+        }
         div().size_4().when(self.visible, |this| {
             this.child(
                 crate::qualification_diagnostics::spinner!(self.source.diagnostic_source())

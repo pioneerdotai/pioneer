@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "TaskNotificationPublication",
+  "type": "object",
+  "properties": {
+    "notification_id": {
+      "type": "string"
+    },
+    "operation_id": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "task_id": {
+      "type": "string"
+    },
+    "task_revision": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "thread_id": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "operation_id",
+    "notification_id",
+    "task_id",
+    "task_revision",
+    "thread_id"
+  ]
+}

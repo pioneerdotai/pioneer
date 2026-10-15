@@ -65,6 +65,8 @@ pub enum TurnWorkState {
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct TurnWorkBlock {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub html_publications: Vec<crate::HtmlPublication>,
     pub turn_id: String,
     pub presentation: TurnWorkPresentation,
     pub state: TurnWorkState,
@@ -137,6 +139,9 @@ pub enum TimelineBlockKind {
     },
     #[serde(rename_all = "camelCase")]
     AssistantMessage {
+        /// Exact HTML content of this canonical response; source ownership is unchanged.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        html_publications: Vec<crate::HtmlPublication>,
         item_id: String,
         text: String,
         #[serde(default = "completed_turn_work_item_status")]

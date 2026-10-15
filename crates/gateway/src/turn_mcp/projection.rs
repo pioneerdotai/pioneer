@@ -45,6 +45,55 @@ impl ResolvedMcpTurnProjection {
         }
     }
 
+    pub(crate) fn with_html_tools(
+        mut self,
+        mut limits: McpProjectionLimits,
+    ) -> Result<Self, McpProjectionBuildError> {
+        for spec in pioneer_tools::html::html_tool_specs() {
+            // First-party definitions do not consume the already bounded external
+            // catalog allowance. A full valid catalog must still expose both tools.
+            let (_, _, schema_bytes) = canonical_schema_identity(&spec.spec.parameters)
+                .map_err(McpProjectionBuildError::Serialization)?;
+            limits.max_tools += 1;
+            limits.max_total_schema_bytes += schema_bytes.len();
+            self.tools.push(ResolvedMcpTurnTool {
+                canonical_callable_name: spec.spec.name.clone(),
+                workspace_id: self.workspace_id.clone(),
+                server_installation_id: pioneer_tools::html::HTML_SERVER_ID.into(),
+                server_name: pioneer_tools::html::HTML_SERVER_NAME.into(),
+                raw_tool_name: spec.spec.name,
+                description: Some(spec.spec.description),
+                input_schema: spec.spec.parameters,
+                annotations: None,
+                timeout_ms: 120_000,
+                catalog_version: pioneer_tools::html::HTML_SERVER_ID.into(),
+                installation_fingerprint: pioneer_tools::html::HTML_SERVER_ID.into(),
+                schema_fingerprint: String::new(),
+                runtime_generation: 1,
+                selection_reason: McpSelectionReason::ImplicitPolicy,
+                capability_id: None,
+            });
+        }
+        self.finalize_identity(limits)?;
+        Ok(self)
+    }
+
+    /// Count only the exact reserved definitions in this frozen projection.
+    /// External tools cannot borrow first-party count allowance by name alone.
+    pub(crate) fn html_tool_count(&self) -> usize {
+        let definitions = pioneer_tools::html::html_tool_specs();
+        self.tools
+            .iter()
+            .filter(|tool| {
+                tool.server_installation_id == pioneer_tools::html::HTML_SERVER_ID
+                    && definitions.iter().any(|definition| {
+                        tool.raw_tool_name == definition.spec.name
+                            && tool.input_schema == definition.spec.parameters
+                    })
+            })
+            .count()
+    }
+
     pub(crate) fn finalize_identity(
         &mut self,
         limits: McpProjectionLimits,
@@ -321,6 +370,9 @@ fn normalize_name(value: &str) -> String {
 }
 
 fn base_callable_name(tool: &ResolvedMcpTurnTool) -> String {
+    if tool.server_installation_id == pioneer_tools::html::HTML_SERVER_ID {
+        return tool.raw_tool_name.clone();
+    }
     format!(
         "mcp_{}_{}",
         sanitize_callable_component(tool.server_name.as_str()),
@@ -551,6 +603,51 @@ mod tests {
             diagnostics: Vec::new(),
             manifest_hash: String::new(),
         }
+    }
+
+    #[test]
+    fn html_tools_are_present_without_external_installations_and_have_frozen_shared_schemas() {
+        let projection = ResolvedMcpTurnProjection::empty("workspace", "turn")
+            .with_html_tools(McpProjectionLimits::default())
+            .unwrap();
+        assert_eq!(projection.tools.len(), 2);
+        for tool in &projection.tools {
+            assert_eq!(tool.canonical_callable_name, tool.raw_tool_name);
+            assert_eq!(
+                tool.server_installation_id,
+                pioneer_tools::html::HTML_SERVER_ID
+            );
+            let definition = pioneer_tools::html::definition(&tool.raw_tool_name).unwrap();
+            assert_eq!(tool.input_schema, definition["inputSchema"]);
+            assert!(!tool.schema_fingerprint.is_empty());
+        }
+    }
+
+    #[test]
+    fn html_tools_remain_available_with_a_full_valid_external_catalog() {
+        let tools = (0..DEFAULT_MAX_PROJECTION_TOOLS)
+            .map(|index| tool("server", "server", &format!("tool_{index}")))
+            .collect();
+        let mut external = projection("turn", tools);
+        external
+            .finalize_identity(McpProjectionLimits::default())
+            .unwrap();
+        let combined = external
+            .with_html_tools(McpProjectionLimits::default())
+            .unwrap();
+        assert_eq!(combined.tools.len(), DEFAULT_MAX_PROJECTION_TOOLS + 2);
+        assert!(
+            combined
+                .tools
+                .iter()
+                .any(|tool| tool.canonical_callable_name == "html_preview")
+        );
+        assert!(
+            combined
+                .tools
+                .iter()
+                .any(|tool| tool.canonical_callable_name == "html_render")
+        );
     }
 
     #[test]

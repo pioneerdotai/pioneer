@@ -2,7 +2,9 @@
 use migration::{Migrator, MigratorTrait};
 use pioneer_compaction::frozen::FrozenHistoryRef;
 use pioneer_crud::{CrudStore, FrozenStorageLifetimeProgress};
-use sea_orm::{ConnectionTrait, DbBackend, Statement, TransactionTrait};
+use sea_orm::{
+    ConnectionTrait, DbBackend, EntityTrait, IntoActiveModel, Set, Statement, TransactionTrait,
+};
 
 async fn db_fixture(legacy: bool) -> sea_orm::DatabaseConnection {
     let mut options = sea_orm::ConnectOptions::new("sqlite::memory:");
@@ -159,14 +161,19 @@ fn cursor(h: &FrozenHistoryRef) -> String {
 }
 
 #[tokio::test]
-async fn task_status_not_completed_retains_every_run_even_when_runs_succeeded() {
+async fn task_status_controls_every_accepted_run_input_independently_of_run_status() {
     for status in [
         "failed",
         "cancelled",
         "blocked",
         "running",
         "waiting_review",
+        "queued",
+        "waiting",
+        "unknown_future_status",
+        "completed",
     ] {
+        let releasing = matches!(status, "completed" | "failed" | "cancelled");
         let store = fixture().await;
         task(&store, "task", status).await;
         for id in ["first", "retry"] {
@@ -174,10 +181,49 @@ async fn task_status_not_completed_retains_every_run_even_when_runs_succeeded() 
             task_input(&store, "task", id, &h).await;
         }
         let mut p = FrozenStorageLifetimeProgress::default();
+        if status == "blocked" {
+            let db = store.database_connection();
+            assert!(
+                db.execute_unprepared("UPDATE task SET workspace_id='other' WHERE id='task'")
+                    .await
+                    .is_err()
+            );
+            let mut moved = pioneer_entity::task::Entity::find_by_id("task")
+                .one(&db)
+                .await
+                .unwrap()
+                .unwrap()
+                .into_active_model();
+            moved.workspace_id = Set("other".into());
+            assert!(
+                pioneer_entity::task::Entity::insert(moved)
+                    .on_conflict(
+                        sea_orm::sea_query::OnConflict::column(pioneer_entity::task::Column::Id)
+                            .update_column(pioneer_entity::task::Column::WorkspaceId)
+                            .to_owned()
+                    )
+                    .exec(&db)
+                    .await
+                    .is_err()
+            );
+        }
+        if status == "unknown_future_status" {
+            sql(&store, "DELETE FROM task WHERE id='task'", vec![]).await;
+            drive(&store, &mut p, 2500).await;
+            for id in ["first", "retry"] {
+                assert_eq!(
+                    expired(&store, id).await,
+                    0,
+                    "missing Task retains typed inputs"
+                );
+                assert_eq!(physical(&store, id).await, 2);
+            }
+            task(&store, "task", status).await;
+        }
         drive(&store, &mut p, 2500).await;
         for id in ["first", "retry"] {
-            assert_eq!(expired(&store, id).await, 0, "{status}");
-            assert_eq!(physical(&store, id).await, 2);
+            assert_eq!(expired(&store, id).await, i64::from(releasing), "{status}");
+            assert_eq!(physical(&store, id).await, if releasing { 0 } else { 2 });
         }
         sql(
             &store,
@@ -307,7 +353,7 @@ async fn root_insert_first_protects_discovered_expiry_and_expiry_first_rejects_r
     );
 }
 #[tokio::test]
-async fn root_write_rollback_preserves_locator_and_completed_task_cannot_reopen_expired_input() {
+async fn root_write_rollback_and_terminal_tasks_cannot_reopen_expired_input() {
     let store = fixture().await;
     let h = header(&store, "input", "ws", "thread", 1, 0).await;
     store
@@ -336,20 +382,116 @@ async fn root_write_rollback_preserves_locator_and_completed_task_cannot_reopen_
     let mut p = FrozenStorageLifetimeProgress::default();
     drive(&store, &mut p, 1500).await;
     assert_eq!(expired(&store, "input").await, 1);
+    assert_eq!(physical(&store, "input").await, 0);
+    let original = pioneer_entity::task::Entity::find_by_id("task")
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap();
+    for status in ["completed", "failed", "cancelled"] {
+        // Neither terminal-to-terminal updates nor projection upserts acquire a root.
+        sql(
+            &store,
+            "UPDATE task SET status=?1 WHERE id='task'",
+            vec![status.into()],
+        )
+        .await;
+        let mut projection = original.clone().into_active_model();
+        projection.status = Set(status.into());
+        pioneer_entity::task::Entity::insert(projection.clone())
+            .on_conflict(
+                sea_orm::sea_query::OnConflict::column(pioneer_entity::task::Column::Id)
+                    .update_columns([
+                        pioneer_entity::task::Column::Status,
+                        pioneer_entity::task::Column::WorkspaceId,
+                    ])
+                    .to_owned(),
+            )
+            .exec(&db)
+            .await
+            .unwrap();
+        for retaining in ["running", "blocked"] {
+            assert!(
+                db.execute_raw(Statement::from_sql_and_values(
+                    DbBackend::Sqlite,
+                    "UPDATE task SET status=?1 WHERE id='task'",
+                    [retaining.into()]
+                ))
+                .await
+                .is_err()
+            );
+            let mut reopened = projection.clone();
+            reopened.status = Set(retaining.into());
+            assert!(
+                pioneer_entity::task::Entity::insert(reopened.clone())
+                    .on_conflict(
+                        sea_orm::sea_query::OnConflict::column(pioneer_entity::task::Column::Id)
+                            .update_columns([
+                                pioneer_entity::task::Column::Status,
+                                pioneer_entity::task::Column::WorkspaceId
+                            ])
+                            .to_owned()
+                    )
+                    .exec(&db)
+                    .await
+                    .is_err()
+            );
+            // FK OFF leaves the immutable input behind across delete/recreate.
+            sql(&store, "DELETE FROM task WHERE id='task'", vec![]).await;
+            assert!(
+                pioneer_entity::task::Entity::insert(reopened)
+                    .exec(&db)
+                    .await
+                    .is_err()
+            );
+            pioneer_entity::task::Entity::insert(projection.clone())
+                .exec(&db)
+                .await
+                .unwrap();
+        }
+        let current = pioneer_entity::task::Entity::find_by_id("task")
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.status, status);
+        assert_eq!(current.workspace_id, "ws");
+    }
+    assert_eq!(expired(&store, "input").await, 1);
     assert!(
-        db.execute_unprepared("UPDATE task SET status='failed' WHERE id='task'")
+        store
+            .compaction_acquire_frozen_history("ws", &h)
             .await
             .is_err()
     );
-    assert_eq!(
-        n(
-            &store,
-            "SELECT count(*) AS n FROM task WHERE id=?1 AND status='completed'",
-            "task"
+    // Snapshot guards remain unconditional, even for a releasing parent Task.
+    assert!(
+        db.execute_unprepared(
+            "UPDATE task_run_conversation_snapshot SET history_json=history_json WHERE run_id='run'"
         )
-        .await,
-        1
+        .await
+        .is_err()
     );
+    // This unsealed fixture may lose its header with FK OFF. Missing payload
+    // authority must also reject readmission; no guard is disabled for the fixture.
+    sql(
+        &store,
+        "DELETE FROM compaction_frozen_history WHERE id='input'",
+        vec![],
+    )
+    .await;
+    assert!(
+        db.execute_unprepared("UPDATE task SET status='blocked' WHERE id='task'")
+            .await
+            .is_err()
+    );
+    assert!(
+        store
+            .compaction_acquire_frozen_history("ws", &h)
+            .await
+            .is_err()
+    );
+    assert_eq!(n(&store, "SELECT count(*) AS n FROM task_run_conversation_snapshot WHERE run_id=?1 AND frozen_manifest_id='input'", "run").await, 1);
 }
 
 async fn operation(
@@ -367,6 +509,7 @@ async fn operation(
         deadline_ms: 1000,
         attempts: 0,
         retries: 0,
+        portion_attempts: 0,
         corrections: 0,
         target_tokens: 10,
         source_text_projection_version: 0,
@@ -510,6 +653,8 @@ async fn expired_backing_preserves_foreign_messages_and_distinct_import_interval
     let store = fixture().await;
     let p = header(&store, "p", "ws", "thread", 2, 1).await;
     let h = header(&store, "h", "ws", "thread", 5, 3).await;
+    task(&store, "task", "cancelled").await;
+    task_input(&store, "task", "run", &p).await;
     for ordinal in 2..7 {
         sql(&store,"INSERT INTO compaction_frozen_message_data(manifest_id,ordinal,reference_json,bytes) VALUES('p',?1,'{}',2)",vec![ordinal.into()]).await;
     }
@@ -625,10 +770,25 @@ async fn pending_failed_candidate_holds_known_backing_and_does_not_block_another
     header(&store, "free", "other", "other-thread", 1, 0).await;
     sql(&store,"INSERT INTO compaction_frozen_layout(manifest_id,kind,active,pending,candidate,failed) VALUES('pending',0,0,1,'base',1)",vec![]).await;
     let mut p = FrozenStorageLifetimeProgress::default();
-    assert!(drive(&store, &mut p, 2500).await > 0);
+    assert_eq!(
+        drive(&store, &mut p, 2500).await,
+        0,
+        "a retained failed dependency must not trigger worker backoff"
+    );
     assert_eq!(expired(&store, "pending").await, 0);
     assert_eq!(expired(&store, "base").await, 0);
     assert_eq!(physical(&store, "base").await, 3);
+    assert_eq!(physical(&store, "pending").await, 3);
+    assert_eq!(
+        n(
+            &store,
+            "SELECT failed AS n FROM compaction_frozen_layout WHERE manifest_id=?1 AND kind=0",
+            "pending"
+        )
+        .await,
+        1,
+        "maintenance must preserve existing failed markers"
+    );
     assert_eq!(expired(&store, "free").await, 1);
     assert_eq!(physical(&store, "free").await, 0);
 }
@@ -740,8 +900,21 @@ async fn malformed_physical_keys_are_not_delete_permission() {
     let store = fixture().await;
     header(&store, "p", "ws", "thread", 1, 0).await;
     sql(&store,"INSERT INTO compaction_frozen_import_data(manifest_id,ordinal,message_ordinal,source_scope,source_id,source_version,source_thread,proof_json,bytes) VALUES('p',0,-1,'event:turn','e','event-revision:1','thread','{}',2)",vec![]).await;
+    // A valid physical tail after the poison key must still be swept.
+    sql(&store,"INSERT INTO compaction_frozen_import_data(manifest_id,ordinal,message_ordinal,source_scope,source_id,source_version,source_thread,proof_json,bytes) VALUES('p',1,0,'event:turn','healthy','event-revision:1','thread','{}',2)",vec![]).await;
     let mut p = FrozenStorageLifetimeProgress::default();
-    assert!(drive(&store, &mut p, 2000).await > 0);
+    assert_eq!(
+        drive(&store, &mut p, 2000).await,
+        0,
+        "a poison physical key must not trigger worker backoff"
+    );
+    assert_eq!(expired(&store, "p").await, 1);
+    assert_eq!(physical(&store, "p").await, 1);
+    assert_eq!(
+        n(&store, "SELECT message_ordinal AS n FROM compaction_frozen_import_data WHERE manifest_id=?1 AND ordinal=0", "p").await,
+        -1,
+        "the malformed key must stay intact while healthy rows are deleted"
+    );
     assert_eq!(
         n(
             &store,
@@ -832,15 +1005,22 @@ async fn malformed_legacy_locator_is_scoped_and_reconciliation_continues_after_r
     header(&store, "blocked", "ws", "thread", 1, 0).await;
     header(&store, "free", "other", "other-thread", 1, 0).await;
     let mut p = FrozenStorageLifetimeProgress::default();
-    assert!(drive(&store, &mut p, 2500).await > 0);
+    assert_eq!(
+        drive(&store, &mut p, 2500).await,
+        0,
+        "an unresolved locator must hold its scope without worker backoff"
+    );
     assert_eq!(expired(&store, "blocked").await, 0);
+    assert_eq!(physical(&store, "blocked").await, 1);
     assert_eq!(expired(&store, "free").await, 1);
+    assert_eq!(physical(&store, "free").await, 0);
     store
         .upsert_cli_runtime_thread_binding(binding("{}".into()))
         .await
         .unwrap();
     drive(&store, &mut p, 2000).await;
     assert_eq!(expired(&store, "blocked").await, 1);
+    assert_eq!(physical(&store, "blocked").await, 0);
 }
 
 #[tokio::test]
@@ -854,7 +1034,11 @@ async fn oversized_legacy_locator_keeps_unknown_scope_without_starving_other_wor
     header(&store, "blocked", "ws", "thread", 1, 0).await;
     header(&store, "free", "other", "other-thread", 1, 0).await;
     let mut progress = FrozenStorageLifetimeProgress::default();
-    assert!(drive(&store, &mut progress, 2500).await > 0);
+    assert_eq!(
+        drive(&store, &mut progress, 2500).await,
+        0,
+        "an oversized locator must hold its scope without worker backoff"
+    );
     assert_eq!(n(&store, "SELECT count(*) AS n FROM thread_cli_runtime_binding WHERE thread_id=?1 AND frozen_manifest_id='';", "thread").await, 1);
     assert_eq!(expired(&store, "blocked").await, 0);
     assert_eq!(physical(&store, "blocked").await, 1);
@@ -870,30 +1054,128 @@ async fn oversized_legacy_locator_keeps_unknown_scope_without_starving_other_wor
 }
 
 #[tokio::test]
-async fn unknown_completed_task_is_not_a_workspace_root() {
-    let db = db_fixture(true).await;
-    db.execute_unprepared("INSERT INTO task(id,workspace_id,owner_kind,owner_id,created_by_thread_id,created_by_turn_id,executor_kind,status,title,goal) VALUES('task','ws','thread','thread','thread','turn','agent','completed','fixture','fixture')").await.unwrap();
-    db.execute_unprepared("INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES('run','task','run',1,1,'succeeded','agent')").await.unwrap();
-    db.execute_unprepared("INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at) VALUES('run','task','ws','thread','{bad',CURRENT_TIMESTAMP)").await.unwrap();
-    Migrator::up(&db, None).await.unwrap();
-    let store = CrudStore::new(db);
-    header(&store, "free", "ws", "thread", 1, 0).await;
-    let mut p = FrozenStorageLifetimeProgress::default();
-    drive(&store, &mut p, 2000).await;
-    assert_eq!(expired(&store, "free").await, 1);
+async fn unknown_task_input_retains_scope_unless_task_itself_releases() {
+    for status in [
+        Some("completed"),
+        Some("failed"),
+        Some("cancelled"),
+        Some("blocked"),
+        Some("unknown_future_status"),
+        None,
+    ] {
+        let db = db_fixture(true).await;
+        if let Some(status) = status {
+            db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+                "INSERT INTO task(id,workspace_id,owner_kind,owner_id,created_by_thread_id,created_by_turn_id,executor_kind,status,title,goal) VALUES('task','ws','thread','thread','thread','turn','agent',?1,'fixture','fixture')", [status.into()])).await.unwrap();
+        }
+        db.execute_unprepared("INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES('run','task','run',1,1,'succeeded','agent')").await.unwrap();
+        db.execute_unprepared("INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at) VALUES('run','task','ws','thread','{bad',CURRENT_TIMESTAMP)").await.unwrap();
+        Migrator::up(&db, None).await.unwrap();
+        let store = CrudStore::new(db);
+        header(&store, "free", "ws", "thread", 1, 0).await;
+        let mut p = FrozenStorageLifetimeProgress::default();
+        drive(&store, &mut p, 2000).await;
+        let releasing = matches!(status, Some("completed" | "failed" | "cancelled"));
+        assert_eq!(
+            expired(&store, "free").await,
+            i64::from(releasing),
+            "{status:?}"
+        );
+        assert_eq!(
+            physical(&store, "free").await,
+            if releasing { 0 } else { 1 }
+        );
+        assert_eq!(n(&store, "SELECT count(*) AS n FROM task_run_conversation_snapshot WHERE run_id=?1 AND frozen_manifest_id=''", "run").await, 1);
+        if releasing {
+            // Unverified legacy input cannot be re-admitted through a status write.
+            assert!(
+                store
+                    .database_connection()
+                    .execute_unprepared("UPDATE task SET status='blocked' WHERE id='task'")
+                    .await
+                    .is_err()
+            );
+        }
+    }
 }
 #[tokio::test]
-async fn completed_task_legacy_scope_mismatch_is_not_an_independent_input_root() {
-    let db = db_fixture(true).await;
-    db.execute_unprepared("INSERT INTO task(id,workspace_id,owner_kind,owner_id,created_by_thread_id,created_by_turn_id,executor_kind,status,title,goal) VALUES('task','other','thread','thread','thread','turn','agent','completed','fixture','fixture')").await.unwrap();
-    db.execute_unprepared("INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES('run','task','run',1,1,'succeeded','agent')").await.unwrap();
-    db.execute_unprepared("INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at) VALUES('run','task','ws','thread','{bad',CURRENT_TIMESTAMP)").await.unwrap();
+async fn terminal_task_legacy_scope_mismatch_is_not_an_independent_input_root() {
+    for status in ["completed", "failed", "cancelled", "blocked"] {
+        let db = db_fixture(true).await;
+        db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+            "INSERT INTO task(id,workspace_id,owner_kind,owner_id,created_by_thread_id,created_by_turn_id,executor_kind,status,title,goal) VALUES('task','other','thread','thread','thread','turn','agent',?1,'fixture','fixture')", [status.into()])).await.unwrap();
+        db.execute_unprepared("INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES('run','task','run',1,1,'succeeded','agent')").await.unwrap();
+        db.execute_unprepared("INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at) VALUES('run','task','ws','thread','{bad',CURRENT_TIMESTAMP)").await.unwrap();
+        Migrator::up(&db, None).await.unwrap();
+        let store = CrudStore::new(db);
+        header(&store, "free", "ws", "thread", 1, 0).await;
+        header(&store, "other-free", "other", "other-thread", 1, 0).await;
+        let mut p = FrozenStorageLifetimeProgress::default();
+        drive(&store, &mut p, 2000).await;
+        for id in ["free", "other-free"] {
+            assert_eq!(
+                expired(&store, id).await,
+                i64::from(status != "blocked"),
+                "{status}: {id}"
+            );
+        }
+    }
+}
+
+// Existing fixtures cover fresh and pre-lifetime schemas. This one also checks
+// an ordinary upgrade with already accepted failed/cancelled inputs, without backfill.
+#[tokio::test]
+async fn released_schema_upgrade_matches_fresh_triggers_and_releases_existing_inputs() {
+    let fresh = db_fixture(false).await;
+    let db = db_fixture(false).await;
+    Migrator::down(&db, Some(1)).await.unwrap();
+    let store = CrudStore::new(db.clone());
+    for status in ["completed", "failed", "cancelled"] {
+        task(&store, status, status).await;
+        let h = header(&store, status, "ws", "thread", 1, 1).await;
+        task_input(&store, status, status, &h).await;
+    }
+    drop(store);
     Migrator::up(&db, None).await.unwrap();
-    let store = CrudStore::new(db);
-    header(&store, "free", "ws", "thread", 1, 0).await;
+    let store = CrudStore::new(db.clone());
+    for name in ["task_frozen_roots_insert", "task_frozen_roots_update"] {
+        let query = Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?1",
+            [name.into()],
+        );
+        let upgraded: String = db
+            .query_one_raw(query.clone())
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get("", "sql")
+            .unwrap();
+        let installed: String = fresh
+            .query_one_raw(query)
+            .await
+            .unwrap()
+            .unwrap()
+            .try_get("", "sql")
+            .unwrap();
+        assert_eq!(upgraded, installed, "{name}");
+    }
+    // An update adds no command/gate: the existing maintenance pass revisits roots.
     let mut p = FrozenStorageLifetimeProgress::default();
-    drive(&store, &mut p, 2000).await;
-    assert_eq!(expired(&store, "free").await, 1);
+    drive(&store, &mut p, 2500).await;
+    for status in ["completed", "failed", "cancelled"] {
+        assert_eq!(expired(&store, status).await, 1);
+        assert_eq!(physical(&store, status).await, 0);
+        assert_eq!(
+            n(
+                &store,
+                "SELECT count(*) AS n FROM task_run_conversation_snapshot WHERE task_id=?1",
+                status
+            )
+            .await,
+            1
+        );
+    }
 }
 
 #[tokio::test]
@@ -986,10 +1268,10 @@ async fn dense_shared_range_and_reverse_root_query_plans_use_required_indexes() 
 }
 
 #[tokio::test]
-async fn runtime_root_and_undelivered_task_output_remain_independent_of_completed_inputs() {
+async fn runtime_root_and_undelivered_task_output_remain_independent_of_terminal_inputs() {
     let store = fixture().await;
     let h = header(&store, "output", "ws", "thread", 1, 0).await;
-    task(&store, "task", "completed").await;
+    task(&store, "task", "failed").await;
     task_input(&store, "task", "run", &h).await;
     sql(&store,"INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES('turn','thread','completed','conversation','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",vec![]).await;
     sql(&store,"INSERT INTO task_run_turn(id,task_id,run_id,thread_id,turn_id,kind,round,sequence,status,created_at) VALUES('rt','task','run','thread','turn','initial',0,1,'completed',CURRENT_TIMESTAMP)",vec![]).await;
@@ -1045,10 +1327,44 @@ async fn runtime_root_and_undelivered_task_output_remain_independent_of_complete
 #[tokio::test]
 async fn retry_conflict_winner_keeps_exact_descriptor_and_losing_capture_is_not_a_root() {
     let store = fixture().await;
-    task(&store, "task", "failed").await;
+    task(&store, "task", "running").await;
     let first = header(&store, "first", "ws", "thread", 1, 0).await;
     let losing = header(&store, "losing", "ws", "thread", 1, 0).await;
     task_input(&store, "task", "run", &first).await;
+    sql(
+        &store,
+        "UPDATE task_run SET status='failed' WHERE id='run'",
+        vec![],
+    )
+    .await;
+    let mut p = FrozenStorageLifetimeProgress::default();
+    drive(&store, &mut p, 2000).await;
+    assert_eq!(
+        expired(&store, "first").await,
+        0,
+        "failed run in an active Task is retryable"
+    );
+    sql(&store, "INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind,retry_of_run_id) VALUES('retry','task','run',2,2,'queued','agent','run')", vec![]).await;
+    let accepted = store
+        .get_task_run_conversation_snapshot("run")
+        .await
+        .unwrap()
+        .unwrap();
+    let retried = store
+        .insert_task_run_conversation_snapshot_if_absent(
+            pioneer_crud::NewTaskRunConversationSnapshot {
+                run_id: "retry".into(),
+                task_id: "task".into(),
+                workspace_id: "ws".into(),
+                conversation_thread_id: "thread".into(),
+                source_turn_id: None,
+                history_json: accepted.history_json.clone(),
+                created_at: chrono::Utc::now().fixed_offset(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(retried.history_json, accepted.history_json);
     let winner = store
         .insert_task_run_conversation_snapshot_if_absent(
             pioneer_crud::NewTaskRunConversationSnapshot {
@@ -1064,9 +1380,14 @@ async fn retry_conflict_winner_keeps_exact_descriptor_and_losing_capture_is_not_
         .await
         .unwrap();
     assert_eq!(winner.history_json, serde_json::to_string(&first).unwrap());
+    assert_eq!(
+        winner, accepted,
+        "conflict preserves the exact immutable record"
+    );
     let mut p = FrozenStorageLifetimeProgress::default();
     drive(&store, &mut p, 2000).await;
     assert_eq!(expired(&store, "first").await, 0);
+    assert_eq!(physical(&store, "first").await, 1);
     assert_eq!(expired(&store, "losing").await, 1);
 }
 #[tokio::test]
