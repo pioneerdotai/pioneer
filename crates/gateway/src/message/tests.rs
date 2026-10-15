@@ -24972,6 +24972,7 @@ fn composer_cli_skill_pack_matches_individual_members_and_preserves_presentation
                 let model = match runtime_kind {
                     CLIAgentRuntimeKind::Codex => "gpt-5",
                     CLIAgentRuntimeKind::Claude => "claude-sonnet",
+                    CLIAgentRuntimeKind::OpenCode => "openai/gpt-5",
                 };
                 let thread = harness
                     .thread_manager
@@ -30411,6 +30412,7 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_i
             Some(match runtime_kind {
                 CLIAgentRuntimeKind::Codex => pioneer_protocol::CODEX_AGENT_AVATAR_REVISION,
                 CLIAgentRuntimeKind::Claude => pioneer_protocol::CLAUDE_AGENT_AVATAR_REVISION,
+                CLIAgentRuntimeKind::OpenCode => pioneer_protocol::OPENCODE_AGENT_AVATAR_REVISION,
             }),
             "timeline projection must carry the explicit runtime-executor discriminator consumed by desktop"
         );

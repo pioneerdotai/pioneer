@@ -1203,29 +1203,7 @@ pub(crate) async fn opencode_mcp_readiness_for_instance(
             let version = version_for_attestation
                 .as_deref()
                 .ok_or_else(|| anyhow::anyhow!("OpenCode server version is unavailable"))?;
-            let base_contract =
-                crate::cli_runtime::opencode_session::opencode_provider_contract_fingerprint(Some(
-                    version,
-                ));
-            let identity =
-                codex_executable_cache_identity(&configured_binary, version, &base_contract)?;
-            let binary_sha256 = sha256_file_contents(identity.realpath.as_path())?;
-            let local_executable_fingerprint = sha256_json(&json!({
-                "provider": "opencode",
-                "realpath": identity.realpath,
-                "size": identity.size,
-                "modifiedUnixNanos": identity.modified_unix_nanos,
-                "providerVersion": identity.provider_version,
-                "binarySha256": binary_sha256,
-            }))?;
-            let adapter_contract_fingerprint = sha256_json(&json!({
-                "baseContract": base_contract,
-                "localExecutableFingerprint": local_executable_fingerprint,
-                "strictIsolation": "disconnect_unmanaged_mcp_and_exact_prompt_tool_map",
-                "dynamicMcpServer": "pioneer",
-                "projectionUpdate": "restart_server_resume_session",
-            }))?;
-            Ok((adapter_contract_fingerprint, local_executable_fingerprint))
+            opencode_executable_fingerprints(&configured_binary, version)
         })
         .await
         .ok()
@@ -1265,6 +1243,33 @@ pub(crate) async fn opencode_mcp_readiness_for_instance(
         max_schema_bytes,
         diagnostics,
     }
+}
+
+pub(crate) fn opencode_executable_fingerprints(
+    configured_binary: &str,
+    version: &str,
+) -> anyhow::Result<(String, String)> {
+    let version = version.trim_start_matches('v');
+    let base_contract =
+        crate::cli_runtime::opencode_session::opencode_provider_contract_fingerprint(Some(version));
+    let identity = codex_executable_cache_identity(&configured_binary, version, &base_contract)?;
+    let binary_sha256 = sha256_file_contents(identity.realpath.as_path())?;
+    let local_executable_fingerprint = sha256_json(&json!({
+        "provider": "opencode",
+        "realpath": identity.realpath,
+        "size": identity.size,
+        "modifiedUnixNanos": identity.modified_unix_nanos,
+        "providerVersion": identity.provider_version,
+        "binarySha256": binary_sha256,
+    }))?;
+    let adapter_contract_fingerprint = sha256_json(&json!({
+        "baseContract": base_contract,
+        "localExecutableFingerprint": local_executable_fingerprint,
+        "strictIsolation": "disconnect_unmanaged_mcp_and_exact_prompt_tool_map",
+        "dynamicMcpServer": "pioneer",
+        "projectionUpdate": "restart_server_resume_session",
+    }))?;
+    Ok((adapter_contract_fingerprint, local_executable_fingerprint))
 }
 
 fn diagnostic(level: RuntimeDiagnosticLevel, code: &str, message: &str) -> RuntimeDiagnostic {

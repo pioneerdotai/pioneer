@@ -1242,6 +1242,7 @@ struct OpenCodeRuntimeState {
     terminal_emitted: bool,
     interrupted: bool,
     last_error: Option<JsonValue>,
+    last_diff: Option<JsonValue>,
     item_order: Vec<String>,
     snapshot_items: HashSet<String>,
     assistant_message_ids: HashSet<String>,
@@ -1262,6 +1263,7 @@ impl OpenCodeRuntimeState {
         self.terminal_emitted = false;
         self.interrupted = false;
         self.last_error = None;
+        self.last_diff = None;
         self.item_order.clear();
         self.snapshot_items.clear();
         self.assistant_message_ids.clear();
@@ -1585,6 +1587,12 @@ async fn map_opencode_event(
             {
                 state.assistant_message_ids.insert(message_id.to_owned());
             }
+            if let Some(info) = properties.get("info")
+                && info["id"].as_str() == state.active_turn_id.as_deref()
+                && let Some(diff) = info.pointer("/summary/diffs")
+            {
+                return map_opencode_diff(&mut state, diff, native());
+            }
             Vec::new()
         }
         "message.part.delta" => map_opencode_part_delta(&mut state, &properties, native()),
@@ -1592,21 +1600,10 @@ async fn map_opencode_event(
         "session.status" => map_opencode_session_status(&mut state, &properties, native()),
         "session.idle" => Vec::new(),
         "session.error" => fail_opencode_turn(&mut state, &properties, native()),
-        "session.diff" => {
-            let Some(native_turn_id) = state.active_turn_id.clone() else {
-                return Vec::new();
-            };
-            vec![RuntimeEvent::DiffUpdated(RuntimeDiffUpdated {
-                native_thread_id: state.native_thread_id.clone(),
-                native_turn_id,
-                diff_redacted: properties.get("diff").map(redact_opencode_json),
-                diff_text: None,
-                revision: None,
-                event_id: None,
-                provider_exact: Some(false),
-                native: native(),
-            })]
-        }
+        "session.diff" => properties
+            .get("diff")
+            .map(|diff| map_opencode_diff(&mut state, diff, native()))
+            .unwrap_or_default(),
         "todo.updated" => {
             let Some(native_turn_id) = state.active_turn_id.clone() else {
                 return Vec::new();
@@ -1910,18 +1907,34 @@ fn map_opencode_part_updated(
             native_turn_id,
             native,
         ),
-        "patch" => vec![RuntimeEvent::DiffUpdated(RuntimeDiffUpdated {
-            native_thread_id: Some(native_thread_id),
-            native_turn_id,
-            diff_redacted: Some(redact_opencode_json(part)),
-            diff_text: None,
-            revision: None,
-            event_id: None,
-            provider_exact: Some(false),
-            native,
-        })],
+        "patch" => map_opencode_diff(state, part, native),
         _ => Vec::new(),
     }
+}
+
+fn map_opencode_diff(
+    state: &mut OpenCodeRuntimeState,
+    diff: &JsonValue,
+    native: Option<RuntimeNativeEvent>,
+) -> Vec<RuntimeEvent> {
+    let Some(native_turn_id) = state.active_turn_id.clone() else {
+        return Vec::new();
+    };
+    let diff = redact_opencode_json(diff);
+    if state.terminal_emitted || state.last_diff.as_ref() == Some(&diff) {
+        return Vec::new();
+    }
+    state.last_diff = Some(diff.clone());
+    vec![RuntimeEvent::DiffUpdated(RuntimeDiffUpdated {
+        native_thread_id: state.native_thread_id.clone(),
+        native_turn_id,
+        diff_redacted: Some(diff),
+        diff_text: None,
+        revision: None,
+        event_id: None,
+        provider_exact: Some(false),
+        native,
+    })]
 }
 
 fn map_opencode_tool_part(
@@ -2513,17 +2526,22 @@ fn changed_files_from_opencode_input(input: &JsonValue) -> Vec<String> {
         }
     }
     if let Some(files) = input.get("files").and_then(JsonValue::as_array) {
-        paths.extend(
-            files
-                .iter()
-                .filter_map(|file| {
-                    file.as_str()
-                        .or_else(|| file["movePath"].as_str())
-                        .or_else(|| file["filePath"].as_str())
-                        .or_else(|| file["relativePath"].as_str())
-                })
-                .map(str::to_owned),
-        );
+        for file in files {
+            if let Some(path) = file.as_str() {
+                paths.push(path.to_owned());
+            } else {
+                // A move changes both the source and destination paths.
+                if let Some(path) = file["filePath"]
+                    .as_str()
+                    .or_else(|| file["relativePath"].as_str())
+                {
+                    paths.push(path.to_owned());
+                }
+                if let Some(path) = file["movePath"].as_str() {
+                    paths.push(path.to_owned());
+                }
+            }
+        }
     }
     paths.sort();
     paths.dedup();
@@ -2998,6 +3016,21 @@ impl CLIAgentRuntimeSessionFactory for OpenCodeCLIAgentRuntimeSessionFactory {
         };
         let request_timeout = Duration::from_millis(instance.request_timeout_ms.max(1));
         let initialized: Result<(Option<Arc<OpenCodeRequiredMcpBridge>>, Vec<String>)> = async {
+            if let Some(projection) = launch_projection.as_ref() {
+                let binary = instance.binary_path.clone();
+                let (actual_contract, _) = tokio::task::spawn_blocking(move || {
+                    crate::cli_runtime::mcp::readiness::opencode_executable_fingerprints(
+                        &binary,
+                        OPENCODE_SUPPORTED_VERSION,
+                    )
+                })
+                .await
+                .context("OpenCode executable attestation worker failed")??;
+                anyhow::ensure!(
+                    actual_contract == projection.provider_contract_fingerprint,
+                    "OpenCode executable changed since the frozen MCP readiness contract"
+                );
+            }
             let providers = server.api.providers(request_timeout).await?;
             let connected = providers
                 .get("connected")
@@ -4217,6 +4250,17 @@ fn project_opencode_messages(
             ));
         }
     }
+    // User.summary.diffs is the persisted per-prompt diff; session.diff is an
+    // ephemeral SSE notification and cannot be replayed after a disconnect.
+    if let Some(diff) = messages
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|message| message["info"]["id"].as_str() == state.active_turn_id.as_deref())
+        .and_then(|message| message.pointer("/info/summary/diffs"))
+    {
+        events.extend(map_opencode_diff(state, diff, None));
+    }
     events
 }
 
@@ -4889,6 +4933,16 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_recovers_persisted_turn_diff_through_the_live_mapper() {
+        let mut messages = recovery_messages(true);
+        messages[0]["info"]["summary"] = json!({"diffs":[{"file":"a.rs","before":"a\nb","after":"a\nc","additions":1,"deletions":1}]});
+        let observation =
+            opencode_observation_from_messages("session", "user", &messages, false).unwrap();
+        assert!(observation.reconciliation_events.iter().any(|event|
+            matches!(event, RuntimeEvent::DiffUpdated(diff) if diff.diff_redacted.as_ref().is_some_and(|value| value[0]["before"] == "a\nb"))));
+    }
+
+    #[test]
     fn abort_and_compaction_errors_wait_for_authoritative_lifecycle() {
         let mut state = OpenCodeRuntimeState::default();
         state.begin_turn("session".into(), "user".into());
@@ -4946,7 +5000,7 @@ mod tests {
             &json!({"input":{"patchText":"patch"},"metadata":{"files":[{"filePath":"a.rs"},{"filePath":"b.rs","movePath":"c.rs"}],"diff":"--- a\n+++ b\n"}}),
             "completed",
         );
-        assert_eq!(metadata["changedFiles"], json!(["a.rs", "c.rs"]));
+        assert_eq!(metadata["changedFiles"], json!(["a.rs", "b.rs", "c.rs"]));
         assert_eq!(metadata["diffPreview"]["text"], "--- a\n+++ b\n");
         assert_eq!(metadata["diffPreview"]["truncated"], false);
     }

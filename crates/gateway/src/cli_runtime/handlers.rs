@@ -12088,9 +12088,9 @@ fn runtime_model_list_from_opencode_probe(
         OpenCodeProbeStatus::SpawnFailed => {
             Some(message.unwrap_or_else(|| "failed to spawn OpenCode server".to_owned()))
         }
-        OpenCodeProbeStatus::UnsupportedVersion => Some(
-            message.unwrap_or_else(|| "OpenCode server API v1 or newer is required".to_owned()),
-        ),
+        OpenCodeProbeStatus::UnsupportedVersion => Some(message.unwrap_or_else(|| {
+            "OpenCode server v1.4.14 is required by the audited adapter contract".to_owned()
+        })),
         OpenCodeProbeStatus::Error => {
             Some(message.unwrap_or_else(|| "OpenCode server model probe failed".to_owned()))
         }

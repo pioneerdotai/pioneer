@@ -315,7 +315,16 @@ pub(crate) async fn prepare_completed_history_owned(
                 .name()
                 .to_owned(),
         };
-        let limits = pioneer_provider::catalog::model_catalog()?.limits(&catalog, &current.model);
+        let catalog_model = if current.transport == Transport::OpenCode {
+            current
+                .model
+                .split_once('/')
+                .map(|(_, model)| model)
+                .unwrap_or(&current.model)
+        } else {
+            &current.model
+        };
+        let limits = pioneer_provider::catalog::model_catalog()?.limits(&catalog, catalog_model);
         let budget = ModelBudget::new(
             Some(limits.context_window),
             limits.max_input,

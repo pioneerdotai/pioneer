@@ -112,7 +112,15 @@ fn make_cli_summarizer(
         ),
         Transport::Api => unreachable!(),
     };
-    let limits = pioneer_provider::catalog::model_catalog()?.limits(catalog, &selection.model);
+    let (catalog, catalog_model) = if kind == Transport::OpenCode {
+        selection
+            .model
+            .split_once('/')
+            .unwrap_or((catalog, &selection.model))
+    } else {
+        (catalog, selection.model.as_str())
+    };
+    let limits = pioneer_provider::catalog::model_catalog()?.limits(catalog, catalog_model);
     Ok(Arc::new(CliSummarizer {
         usage_scope,
         selection,
