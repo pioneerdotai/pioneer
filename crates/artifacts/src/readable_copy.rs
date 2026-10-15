@@ -264,3 +264,68 @@ mod tests {
         assert!(fs::try_exists(copy_dir).await.expect("exists check"));
     }
 }
+
+/// Retire an exact legacy preview copy only after its canonical media owner was
+/// released. New local previews use the original immutable blob directly.
+/// Other paths (including originals) belong to their existing lifecycle.
+pub(crate) async fn remove_released_preview_copy(
+    root: &Path,
+    workspace: &str,
+    path: &Path,
+) -> ArtifactResult<()> {
+    let materialized = artifact_readable_copy_workspace_root(root, workspace)?;
+    let Some(directory) = path.parent() else {
+        return Ok(());
+    };
+    if directory.parent() != Some(materialized.as_path())
+        || !directory
+            .file_name()
+            .is_some_and(|s| crate::ids::is_safe_file_name(&s.to_string_lossy()))
+        || !path
+            .file_name()
+            .is_some_and(|s| crate::ids::is_safe_file_name(&s.to_string_lossy()))
+    {
+        return Ok(());
+    }
+    match fs::symlink_metadata(directory).await {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+        Ok(_) => {
+            return Err(ArtifactError::ContentInvariant {
+                reason: "released preview copy parent changed",
+            });
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => {
+            return Err(ArtifactError::Io {
+                message: "failed to inspect released preview copy".into(),
+                source,
+            });
+        }
+    }
+    match fs::remove_file(path).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(source) => {
+            return Err(ArtifactError::Io {
+                message: "failed to remove released preview copy".into(),
+                source,
+            });
+        }
+    }
+    // Only remove the now-empty directory; never recursively delete neighbours.
+    match fs::remove_dir(directory).await {
+        Ok(()) => Ok(()),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
+            ) =>
+        {
+            Ok(())
+        }
+        Err(source) => Err(ArtifactError::Io {
+            message: "failed to remove released preview copy directory".into(),
+            source,
+        }),
+    }
+}

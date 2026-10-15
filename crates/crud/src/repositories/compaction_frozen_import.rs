@@ -15,7 +15,7 @@ use pioneer_entity::{
 };
 use sea_orm::sea_query::{Alias, BinOper, Expr, ExprTrait, JoinType, OnConflict};
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect};
-use sea_orm::{ConnectionTrait, TransactionTrait};
+use sea_orm::{ConnectionTrait, DbBackend, Statement, TransactionTrait};
 use sha2::{Digest, Sha256};
 
 #[cfg(any(test, feature = "test-support"))]
@@ -105,6 +105,34 @@ pub struct FrozenImportRecord {
     pub output_manifest: String,
     pub output_ordinal: u64,
     pub acknowledgement: SourceRef,
+    /// The grant above remains the immutable output source. Only a verified
+    /// temporary preview may render a diagnostic at this distinct revision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview_archive: Option<PreviewArchiveProjection>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreviewArchiveProjection {
+    pub source: SourceRef,
+    pub wire_sha256: String,
+}
+impl FrozenImportRecord {
+    pub fn render_source(&self) -> &SourceRef {
+        self.preview_archive
+            .as_ref()
+            .map_or(&self.source, |p| &p.source)
+    }
+    pub fn matches_render_target(&self, target: &FrozenMessageRef) -> bool {
+        target.source_thread == self.source_thread
+            && target.sources.contains(self.render_source())
+            && self.preview_archive.as_ref().is_none_or(|p| {
+                target.tool_name.as_deref() == Some("html_preview")
+                    && target.sources.as_slice() == std::slice::from_ref(&p.source)
+                    && target.replay_source.as_ref().is_none_or(|s| s == &p.source)
+                    && target.wire_sha256 == p.wire_sha256
+            })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -122,6 +150,7 @@ pub struct PreparedFrozenImport {
     destination: String,
     output_digest: String,
     original_json: String,
+    archive_guards: Option<(sea_orm::Statement, sea_orm::Statement)>,
     record: FrozenImportRecord,
     accepted_basis: Option<AcceptedImportBasis>,
     /// A forwarded immutable grant may be attached to the published checkpoint
@@ -144,7 +173,7 @@ struct AcceptedImportBasis {
 }
 impl PreparedFrozenImport {
     pub fn source(&self) -> &SourceRef {
-        &self.record.source
+        self.record.render_source()
     }
     pub fn source_thread(&self) -> &str {
         &self.record.source_thread
@@ -318,8 +347,25 @@ pub(crate) async fn compaction_prepare_frozen_import(
     // An independently published summary is the imported source, not a grant
     // to extract arbitrary raw leaves from its historical coverage. Direct raw
     // references remain exact-current.
-    let mut found = false;
+    let archive = store
+        .html_preview_archived_frozen_result(workspace, &original)
+        .await?;
+    let projection = archive
+        .as_ref()
+        .filter(|(_, _, current)| current == source && source_thread == original.source_thread)
+        .map(|(_, hash, current)| PreviewArchiveProjection {
+            source: current.clone(),
+            wire_sha256: hash.clone(),
+        });
+    let mut found = None;
     for reference in &original.sources {
+        if projection.is_some()
+            && original.sources.len() == 1
+            && reference.scope.starts_with("context:")
+        {
+            found = Some(reference.clone());
+            break;
+        }
         let thread = store
             .compaction_reference_thread(workspace, reference)
             .await?
@@ -329,10 +375,23 @@ pub(crate) async fn compaction_prepare_frozen_import(
             "output source changed ownership"
         );
         if reference == source && thread == source_thread {
-            found = true;
+            found = Some(reference.clone());
         }
     }
-    ensure!(found, "source is outside the accepted own output message");
+    let grant = found
+        .ok_or_else(|| anyhow::anyhow!("source is outside the accepted own output message"))?;
+    let record = FrozenImportRecord {
+        message_ordinal: 0,
+        source_thread: source_thread.into(),
+        source: grant,
+        delivery_id: delivery.into(),
+        candidate_id: snapshot.candidate_id,
+        output_manifest: snapshot.output.history.manifest_id,
+        output_ordinal,
+        acknowledgement: acknowledgement.clone(),
+        preview_archive: projection,
+    };
+    let archive_guards = prepare_preview_archive_guards(store, workspace, &record).await?;
     Ok(PreparedFrozenImport {
         _frozen_hold: frozen_hold,
         workspace: workspace.into(),
@@ -341,17 +400,82 @@ pub(crate) async fn compaction_prepare_frozen_import(
         target_checkpoint: None,
         output_digest: snapshot.output.history.identity_sha256,
         original_json,
-        record: FrozenImportRecord {
-            message_ordinal: 0,
-            source_thread: source_thread.into(),
-            source: source.clone(),
-            delivery_id: delivery.into(),
-            candidate_id: snapshot.candidate_id,
-            output_manifest: snapshot.output.history.manifest_id,
-            output_ordinal,
-            acknowledgement: acknowledgement.clone(),
-        },
+        archive_guards,
+        record,
     })
+}
+
+/// Only the existing archive receipt can translate an immutable grant to a
+/// body revision. Prepared SQL revalidates that receipt inside publication;
+/// no parsing or hashing is done while holding writer capacity.
+async fn prepare_preview_archive_guards(
+    store: &CrudStore,
+    workspace: &str,
+    record: &FrozenImportRecord,
+) -> Result<Option<(sea_orm::Statement, sea_orm::Statement)>> {
+    let Some(projection) = &record.preview_archive else {
+        return Ok(None);
+    };
+    let row=store.connection.query_one_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+        "SELECT r.reference_json,r.archive_wire_sha256,m.reference_json AS output_json FROM html_preview_frozen_result r JOIN compaction_frozen_history h ON h.id=r.manifest_id JOIN compaction_frozen_message m ON m.manifest_id=r.manifest_id AND m.ordinal=r.ordinal WHERE r.manifest_id=?1 AND r.ordinal=?2 AND h.workspace_id=?3 AND h.owner_thread=?4 AND h.ready=1 AND h.expired=0 AND r.source_id=?5 AND r.source_version=?6 AND length(CAST(r.reference_json AS BLOB))<=262144 AND m.bytes BETWEEN 0 AND 262144 AND length(CAST(m.reference_json AS BLOB))=m.bytes",
+        vec![record.output_manifest.clone().into(),i64::try_from(record.output_ordinal)?.into(),workspace.into(),record.source_thread.clone().into(),record.source.id.clone().into(),record.source.version.clone().into()])).await?
+        .ok_or_else(||anyhow::anyhow!("archival preview grant receipt is unavailable"))?;
+    let json: String = row.try_get("", "reference_json")?;
+    let original: FrozenMessageRef = serde_json::from_str(&json)?;
+    original.validate()?;
+    let output_json: String = row.try_get("", "output_json")?;
+    let output: FrozenMessageRef = serde_json::from_str(&output_json)?;
+    ensure!(
+        original == output,
+        "archival preview receipt/output mismatch"
+    );
+    let revision = record
+        .source
+        .version
+        .strip_prefix("revision:")
+        .and_then(|s| s.parse::<u64>().ok())
+        .and_then(|n| n.checked_add(1))
+        .ok_or_else(|| anyhow::anyhow!("invalid preview grant revision"))?;
+    ensure!(
+        original.tool_name.as_deref() == Some("html_preview")
+            && original.source_thread == record.source_thread
+            && original.sources.as_slice() == std::slice::from_ref(&record.source)
+            && record.source.scope.starts_with("context:")
+            && projection.source.scope == record.source.scope
+            && projection.source.id == record.source.id
+            && projection.source.version == format!("revision:{revision}")
+            && projection.wire_sha256 == row.try_get::<String>("", "archive_wire_sha256")?,
+        "archival preview grant does not match its exact diagnostic"
+    );
+    let common = "SELECT 1 FROM html_preview_frozen_result r JOIN compaction_frozen_history h ON h.id=r.manifest_id JOIN compaction_frozen_message m ON m.manifest_id=r.manifest_id AND m.ordinal=r.ordinal WHERE r.manifest_id=?1 AND r.ordinal=?2 AND h.workspace_id=?3 AND h.owner_thread=?4 AND h.ready=1 AND h.expired=0 AND r.reference_json=?5 AND r.archive_wire_sha256=?6 AND m.reference_json=?7";
+    let values: Vec<sea_orm::Value> = vec![
+        record.output_manifest.clone().into(),
+        i64::try_from(record.output_ordinal)?.into(),
+        workspace.into(),
+        record.source_thread.clone().into(),
+        json.into(),
+        projection.wire_sha256.clone().into(),
+        output_json.into(),
+    ];
+    let historical = Statement::from_sql_and_values(DbBackend::Sqlite, common, values.clone());
+    let mut current_values = values;
+    current_values.push(projection.source.version.clone().into());
+    let current = Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        format!(
+            "{common} AND EXISTS(SELECT 1 FROM turn_llm_context c JOIN compaction_source_revision v ON v.source_id=c.id JOIN turn t ON t.id=c.turn_id JOIN thread th ON th.id=t.thread_id WHERE c.id=r.source_id AND c.turn_id=r.turn_id AND c.source='tool_result_v2' AND c.tool_name='html_preview' AND v.present=1 AND 'revision:'||v.revision=?8 AND th.workspace_id=?3 AND t.thread_id=?4 AND EXISTS(SELECT 1 FROM artifact a WHERE a.workspace_id=?3 AND a.created_by_kind='tool' AND a.created_by_actor_id='html_preview' AND CASE WHEN json_valid(a.metadata_json) THEN json_extract(a.metadata_json,'$.htmlTool.retention')='released' AND json_extract(a.metadata_json,'$.htmlTool.turnId')=c.turn_id AND json_extract(a.metadata_json,'$.htmlTool.callId')=c.item_id ELSE 0 END))"
+        ),
+        current_values,
+    );
+    Ok(Some((current, historical)))
+}
+impl FrozenImportRecord {
+    /// Historical proof validation does not grant access or accept a fresh body.
+    /// Direct import preparation/publication separately requires current guard.
+    pub async fn validate_preview_archive(&self, store: &CrudStore, workspace: &str) -> Result<()> {
+        let _ = prepare_preview_archive_guards(store, workspace, self).await?;
+        Ok(())
+    }
 }
 
 /// Attach exact immutable grants from one delivered Task output to the
@@ -412,7 +536,7 @@ pub(crate) async fn compaction_prepare_delivery_checkpoint_imports(
         .map(|import| {
             (
                 import.record.source_thread.clone(),
-                import.record.source.clone(),
+                import.record.render_source().clone(),
             )
         })
         .collect::<std::collections::BTreeSet<_>>();
@@ -517,7 +641,7 @@ pub(crate) async fn compaction_prepare_accepted_checkpoint_imports(
         .map(|import| {
             (
                 import.record.source_thread.clone(),
-                import.record.source.clone(),
+                import.record.render_source().clone(),
             )
         })
         .collect::<std::collections::BTreeSet<_>>();
@@ -579,12 +703,14 @@ async fn prepare_accepted_import(
             .await?
             .ok_or_else(|| anyhow::anyhow!("accepted import is unavailable"))?;
     let record: FrozenImportRecord = serde_json::from_str(&proof_json)?;
+    let archive_guards = prepare_preview_archive_guards(store, workspace, &record).await?;
     Ok(PreparedFrozenImport {
         _frozen_hold: frozen_hold,
         workspace: workspace.into(),
         destination: destination.into(),
         output_digest: String::new(),
         original_json: String::new(),
+        archive_guards,
         record,
         accepted_basis: Some(AcceptedImportBasis {
             turn: turn.into(),
@@ -604,6 +730,10 @@ async fn accepted_import_current<C: ConnectionTrait>(
     db: &C,
     prepared: &PreparedFrozenImport,
 ) -> Result<bool> {
+    if let Some((current, _)) = &prepared.archive_guards {
+        return Ok(accepted_import_binding_current(db, prepared).await?
+            && db.query_one_raw(current.clone()).await?.is_some());
+    }
     Ok(db
         .query_one_raw(accepted_import_current_statement(
             ACCEPTED_IMPORT_CURRENT_SQL,
@@ -969,8 +1099,7 @@ pub(crate) async fn compaction_append_frozen_imports(
                 target.source_thread == *checkpoint_thread
                     && target.sources.as_slice() == std::slice::from_ref(checkpoint)
             } else {
-                target.source_thread == prepared.record.source_thread
-                    && target.sources.contains(&prepared.record.source)
+                prepared.record.matches_render_target(&target)
             };
         ensure!(
             !target.inherited
@@ -1024,6 +1153,18 @@ pub(crate) async fn compaction_append_frozen_imports(
     );
     for (ordinal, record, prepared, target_json, json) in &batch {
         if !ready && *ordinal >= next {
+            if let Some((current, historical)) = &prepared.archive_guards {
+                let query =
+                    if prepared.accepted_basis.is_some() && prepared.target_checkpoint.is_some() {
+                        historical
+                    } else {
+                        current
+                    };
+                ensure!(
+                    tx.query_one_raw(query.clone()).await?.is_some(),
+                    "archival preview import changed before publication"
+                );
+            }
             // The existing transaction holds the validated dependency snapshot
             // through insertion; exact retries below retain their prior behavior.
             let forwarded = if prepared.accepted_basis.is_some() {
@@ -1294,21 +1435,21 @@ pub(crate) async fn compaction_append_frozen_imports(
                                 compaction_live_sources::Column::Table,
                                 compaction_live_sources::Column::SourceScope,
                             ))
-                            .eq(Expr::Value(record.source.scope.clone().into())),
+                            .eq(Expr::Value(prepared.source().scope.clone().into())),
                         )
                         .filter(
                             Expr::col((
                                 compaction_live_sources::Column::Table,
                                 compaction_live_sources::Column::SourceId,
                             ))
-                            .eq(Expr::Value(record.source.id.clone().into())),
+                            .eq(Expr::Value(prepared.source().id.clone().into())),
                         )
                         .filter(
                             Expr::col((
                                 compaction_live_sources::Column::Table,
                                 compaction_live_sources::Column::SourceVersion,
                             ))
-                            .eq(Expr::Value(record.source.version.clone().into())),
+                            .eq(Expr::Value(prepared.source().version.clone().into())),
                         )
                         .filter(
                             Expr::col((

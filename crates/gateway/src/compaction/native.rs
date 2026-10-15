@@ -310,6 +310,16 @@ async fn prepare_native_projection_with_prepared(
     let preparation_deadline = now
         .saturating_add(pioneer_compaction::OPERATION_MILLIS)
         .min(operation_deadline.unwrap_or(u64::MAX));
+    // Cover direct native media preparation through pinning, with the same
+    // absolute deadline/cancellation as the rest of this operation.
+    let _preview_activity = match processor {
+        Some(processor) => Some(tokio::select! { biased;
+            _ = context.cancellation.cancelled() => anyhow::bail!("native media preparation cancelled"),
+            _ = clock.sleep_until(preparation_deadline) => anyhow::bail!("native media preparation deadline exceeded"),
+            guard = processor.artifact_service.html_preview_activity() => guard,
+        }),
+        None => None,
+    };
     if let Some(AcceptedProjection::Prepared(projection)) = &accepted_projection {
         observe_consumed_projection(store, workspace, thread, &request, projection)?;
     }

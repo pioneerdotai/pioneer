@@ -4895,9 +4895,22 @@ impl CrudStore {
         entry: NewTurnLlmContextEntry,
         delivery_key: &str,
     ) -> Result<TurnLlmContextAppendOutcome> {
+        let preview_archive = if entry.source == "tool_result_v2"
+            && entry.tool_name.as_deref() == Some("html_preview")
+        {
+            Some(repositories::html_preview_retention::archive_result(
+                &entry.payload,
+            ))
+        } else {
+            None
+        };
+        // Prepare outside writer admission. An invalid/unknown preview remains
+        // unchanged unless the commit finds an authoritative release marker.
+        let preview_archive = preview_archive.map(|result| result.ok());
         let delivery_key = delivery_key.to_owned();
         self.run_serialized_write(|| {
-            let entry = entry.clone();
+            let mut entry = entry.clone();
+            let preview_archive = preview_archive.clone();
             let delivery_key = delivery_key.clone();
             async move {
                 let transaction = self
@@ -4905,6 +4918,19 @@ impl CrudStore {
                     .begin()
                     .await
                     .context("failed to begin turn_llm_context append transaction")?;
+                if let Some(prepared) = preview_archive {
+                    if repositories::html_preview_retention::preview_result_was_released(
+                        &transaction,
+                        &entry.turn_id,
+                        entry.item_id.as_deref().unwrap_or_default(),
+                    )
+                    .await?
+                    {
+                        entry.payload = prepared.ok_or_else(|| {
+                            anyhow::anyhow!("released HTML preview result cannot be reintroduced")
+                        })?;
+                    }
+                }
                 let outcome =
                     turn_llm_context::append_turn_llm_context(&transaction, entry, &delivery_key)
                         .await;
@@ -58517,3 +58543,9 @@ mod tests {
 
 /// Private per-worker lifetime reconciliation state; constructing it does not activate cleanup.
 pub use repositories::frozen_storage_lifetime::FrozenStorageLifetimeProgress;
+
+pub use repositories::html_preview_retention::HtmlPreviewRetentionProgress;
+
+pub use repositories::html_preview_retention::archive_result as archive_html_preview_result;
+
+pub use repositories::html_preview_retention::HtmlPreviewArchiveWitness;

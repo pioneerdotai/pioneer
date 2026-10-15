@@ -1,3 +1,4 @@
+mod m20261015_000001_html_preview_retention;
 pub use sea_orm_migration::prelude::*;
 
 pub struct Migrator;
@@ -185,6 +186,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261009_000001_projection_receipt_cleanup_discovery::Migration),
             Box::new(m20261010_000001_frozen_lifetime::Migration),
             Box::new(m20261012_000001_turn_event_delivery_unfinished_predecessor::Migration),
+            Box::new(m20261015_000001_html_preview_retention::Migration),
         ]
     }
 }

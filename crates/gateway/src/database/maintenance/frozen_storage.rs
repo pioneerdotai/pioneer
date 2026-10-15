@@ -465,4 +465,62 @@ mod tests {
         assert_eq!(pause_after_batch(true), Duration::from_millis(1));
         assert_eq!(pause_after_batch(false), Duration::from_secs(60));
     }
+    #[tokio::test]
+    async fn html_preview_index_uses_scoped_readers_and_serial_writer_and_cancels_admission() {
+        let (directory, store, observer) = fixture().await;
+        let service = Arc::new(pioneer_artifacts::ArtifactService::new(
+            Arc::new(store.clone()),
+            Arc::new(pioneer_artifacts::LocalArtifactBlobStore::new(
+                directory.path(),
+            )),
+        ));
+        let mut progress = pioneer_artifacts::HtmlPreviewMaintenanceProgress::default();
+        service
+            .html_preview_maintenance_quantum(&mut progress)
+            .await
+            .unwrap();
+        assert!(observer.reads.lock().unwrap().iter().any(|e| matches!(
+            e,
+            SqliteReadEvent::OperationFinished {
+                class: SqliteReadClass::Maintenance,
+                ..
+            }
+        )));
+        assert!(observer.writes.lock().unwrap().iter().any(|e| matches!(
+            e,
+            SqliteWriteEvent::Acquired {
+                class: SqliteWriteClass::Maintenance,
+                ..
+            }
+        )));
+        assert!(
+            store
+                .database_connection()
+                .reader_query_only_enabled()
+                .await
+                .unwrap()
+        );
+        let held = store.database_connection().begin_read().await.unwrap();
+        let cancellation = CancellationToken::new();
+        let worker = tokio::spawn(super::super::html_previews::run(
+            Arc::new(store.clone()),
+            service,
+            cancellation.clone(),
+        ));
+        observer.queued().await;
+        cancellation.cancel();
+        tokio::time::timeout(Duration::from_secs(5), worker)
+            .await
+            .unwrap()
+            .unwrap();
+        drop(held);
+        assert!(observer.reads.lock().unwrap().iter().any(|e| matches!(
+            e,
+            SqliteReadEvent::AdmissionCancelled {
+                class: SqliteReadClass::Maintenance,
+                queue_depth: 0,
+                ..
+            }
+        )));
+    }
 }

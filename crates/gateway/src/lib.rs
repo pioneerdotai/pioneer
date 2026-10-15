@@ -1083,7 +1083,11 @@ async fn run_gateway_until_shutdown_inner(
                     }
                     // Workers observe cancellation themselves. Keep polling them
                     // so shutdown joins an already-started bounded zstd CPU batch.
-                    database::maintenance::run(post_crud_store, cancellation.clone()).await;
+                    database::maintenance::run(
+                        post_crud_store,
+                        post_message_processor.artifact_service.clone(),
+                        cancellation.clone(),
+                    ).await;
                 },
             ));
             wait_for_shutdown_signal().await

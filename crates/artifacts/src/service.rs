@@ -44,6 +44,17 @@ pub struct ArtifactService {
     pub(crate) blob_store: Arc<dyn ArtifactBlobStore>,
     quota_policy: ArtifactQuotaPolicy,
     gc_policy: ArtifactGcPolicy,
+    preview_activity: Arc<tokio::sync::RwLock<()>>,
+}
+
+/// Cursors and EOF are one pass: a short traversal stays finished while the
+/// others catch up. The next quantum after idle starts a fresh bounded pass.
+#[derive(Default)]
+pub struct HtmlPreviewMaintenanceProgress {
+    previews: pioneer_crud::HtmlPreviewRetentionProgress,
+    blobs: String,
+    copies: String,
+    finished: [bool; 3],
 }
 
 /// Domain-owned bounded read used by the agent artifact tool.
@@ -194,6 +205,7 @@ impl ArtifactService {
             blob_store,
             quota_policy: ArtifactQuotaPolicy::default(),
             gc_policy: ArtifactGcPolicy::default(),
+            preview_activity: Default::default(),
         }
     }
 
@@ -207,6 +219,7 @@ impl ArtifactService {
             blob_store,
             quota_policy,
             gc_policy: ArtifactGcPolicy::default(),
+            preview_activity: Default::default(),
         }
     }
 
@@ -221,7 +234,14 @@ impl ArtifactService {
             blob_store,
             quota_policy,
             gc_policy,
+            preview_activity: Default::default(),
         }
+    }
+
+    /// In-process execution/delivery complements durable runtime/frozen owners.
+    /// Shared by this service and its maintenance owner; never a DB permit.
+    pub async fn html_preview_activity(&self) -> tokio::sync::OwnedRwLockReadGuard<()> {
+        self.preview_activity.clone().read_owned().await
     }
 
     pub async fn ingest_bytes(
@@ -402,10 +422,63 @@ impl ArtifactService {
         identity: Option<String>,
         commit_guard: Option<(u64, tokio_util::sync::CancellationToken)>,
     ) -> ArtifactResult<ArtifactSummary> {
-        let stored_blob = self
+        let html_temporary_metadata = if request.created_by_kind
+            == pioneer_protocol::ArtifactCreatedByKind::Tool
+            && matches!(
+                request.created_by_actor_id.as_deref(),
+                Some("html_preview" | "html_render")
+            )
+            && request.metadata.get("htmlTool").is_some_and(|m| {
+                m["version"] == 1
+                    && ((request.created_by_actor_id.as_deref() == Some("html_preview")
+                        && m["publication"] == false)
+                        || (request.created_by_actor_id.as_deref() == Some("html_render")
+                            && m["publication"] == true))
+                    && m["turnId"].is_string()
+                    && m["callId"].is_string()
+            }) {
+            BTreeMap::from([("htmlToolTemporary".into(), json!(1))])
+        } else {
+            BTreeMap::new()
+        };
+        let mutation_guard = self
             .blob_store
-            .put_bytes(&request.workspace_id, input)
+            .acquire_mutation_guard(&request.workspace_id)
             .await?;
+        // First-party HTML always supplies bytes. Register the content-addressed
+        // orphan before filesystem publication: cancellation can then leave only
+        // durable, idempotent existing GC work, including a late rename.
+        let staged_html = if identity.is_some() && self.blob_store.local_artifact_root().is_some() {
+            use sha2::{Digest, Sha256};
+            if let ArtifactBlobInput::Bytes(bytes) = &input {
+                let sha = hex::encode(Sha256::digest(bytes));
+                self.store
+                    .find_or_create_artifact_blob(NewArtifactBlobRecord {
+                        workspace_id: request.workspace_id.clone(),
+                        sha256: sha.clone(),
+                        size_bytes: bytes.len() as u64,
+                        mime_type: request.mime_type.clone(),
+                        storage_backend: "local".into(),
+                        storage_key: crate::ids::sha256_storage_key(&sha),
+                        metadata: html_temporary_metadata.clone(),
+                    })
+                    .await?;
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        let stored_blob = if staged_html {
+            self.blob_store
+                .put_bytes_guarded(&request.workspace_id, input, mutation_guard.clone())
+                .await?
+        } else {
+            self.blob_store
+                .put_bytes(&request.workspace_id, input)
+                .await?
+        };
 
         let ingested = match self
             .store
@@ -442,7 +515,8 @@ impl ArtifactService {
                 if identity.is_some() {
                     // Another ingestion may have deduplicated this same file while
                     // our owner/quota transaction failed. Do not unlink its bytes.
-                    // Register the unbound blob for the existing bounded TTL GC.
+                    // Register an unbound row for retry/manual GC. Only proven HTML
+                    // staging dependencies join automatic preview cleanup.
                     self.store
                         .find_or_create_artifact_blob(NewArtifactBlobRecord {
                             workspace_id: request.workspace_id.clone(),
@@ -451,15 +525,23 @@ impl ArtifactService {
                             mime_type: request.mime_type.clone(),
                             storage_backend: stored_blob.storage_backend.clone(),
                             storage_key: stored_blob.storage_key.clone(),
-                            metadata: Default::default(),
+                            metadata: html_temporary_metadata.clone(),
                         })
                         .await?;
-                } else {
+                } else if self
+                    .store
+                    .artifact_storage_key_is_unreferenced(
+                        &request.workspace_id,
+                        &stored_blob.storage_key,
+                    )
+                    .await?
+                {
                     cleanup_stored_blob_after_failed_registration(
                         self.blob_store.as_ref(),
                         request.workspace_id.as_str(),
                         &stored_blob,
                         &registration_error,
+                        mutation_guard.clone(),
                     )
                     .await?;
                 }
@@ -467,6 +549,7 @@ impl ArtifactService {
             }
         };
 
+        drop(mutation_guard);
         if projection_bytes.is_some() {
             let bytes = projection_bytes.as_deref().unwrap_or(&[]);
             let _ = create_inline_projections(
@@ -701,6 +784,108 @@ impl ArtifactService {
             self.gc_policy,
         )
         .await
+    }
+
+    /// One existing maintenance quantum: at most one frozen page/preview group
+    /// and sixteen physical blob candidates. No request runs a global GC plan.
+    pub async fn html_preview_maintenance_quantum(
+        &self,
+        progress: &mut HtmlPreviewMaintenanceProgress,
+    ) -> ArtifactResult<bool> {
+        let store = self.store.with_maintenance_access();
+        if progress.finished.iter().all(|done| *done) {
+            progress.finished = [false; 3];
+        }
+        let preview_result = if progress.finished[0] {
+            Ok(false)
+        } else {
+            match self.preview_activity.clone().try_write_owned() {
+                Ok(_activity) => progress.previews.quantum(&store).await,
+                // Defer this traversal until the next pass; no ownership is released.
+                Err(_) => Ok(false),
+            }
+        };
+        if let Ok(more) = &preview_result {
+            progress.finished[0] = !more;
+        }
+        let grace_ms =
+            i64::try_from(self.gc_policy.grace_secs.saturating_mul(1000)).unwrap_or(i64::MAX);
+        let (next, candidates) = if progress.finished[1] {
+            (String::new(), Vec::new())
+        } else {
+            store
+                .html_preview_gc_blob_page(
+                    &progress.blobs,
+                    Utc::now().timestamp_millis().saturating_sub(grace_ms),
+                )
+                .await?
+        };
+        progress.finished[1] = next.is_empty();
+        progress.blobs = next;
+        let mut deletion_error = None;
+        for (workspace, blob) in candidates {
+            // Waiting and filesystem I/O are outside database admission. Every
+            // producer of original/projection bytes holds the same local lock
+            // until its metadata reference is durable.
+            let result = async {
+                let guard = self.blob_store.acquire_mutation_guard(&workspace).await?;
+                if store
+                    .artifact_storage_key_is_unreferenced(&workspace, &blob.storage_key)
+                    .await?
+                {
+                    self.blob_store
+                        .delete_unreferenced_guarded(&workspace, &blob.storage_key, guard.clone())
+                        .await?;
+                    store
+                        .delete_artifact_blob_row(&workspace, &blob.blob_id)
+                        .await?;
+                }
+                Ok::<(), ArtifactError>(())
+            }
+            .await;
+            if let Err(error) = result {
+                deletion_error = Some(error);
+            }
+        }
+        let (id, copy) = if progress.finished[2] {
+            (String::new(), None)
+        } else {
+            store
+                .html_preview_released_copies_page(&progress.copies)
+                .await?
+        };
+        progress.finished[2] = id.is_empty();
+        progress.copies = id.clone();
+        if let Some((workspace, previous)) = copy {
+            if let Some(root) = self.blob_store.local_artifact_root() {
+                let mut metadata: serde_json::Value = serde_json::from_str(&previous)
+                    .map_err(|_| content_invariant("invalid released preview metadata"))?;
+                if let Some(paths) = metadata["htmlTool"]["releasedCopies"].as_array() {
+                    for path in paths {
+                        let path = path.as_str().ok_or_else(|| {
+                            content_invariant("invalid released preview copy path")
+                        })?;
+                        crate::readable_copy::remove_released_preview_copy(
+                            &root,
+                            &workspace,
+                            Path::new(path),
+                        )
+                        .await?;
+                    }
+                }
+                metadata["htmlTool"]["releasedCopies"] = json!([]);
+                let prepared = serde_json::to_string(&metadata)
+                    .map_err(|_| content_invariant("invalid released preview metadata"))?;
+                store
+                    .finish_html_preview_copy_cleanup(&id, &previous, &prepared)
+                    .await?;
+            }
+        }
+        if let Some(error) = deletion_error {
+            return Err(error);
+        }
+        preview_result?;
+        Ok(!progress.finished.iter().all(|done| *done))
     }
 
     pub async fn read_bounded_artifact(
@@ -1150,13 +1335,18 @@ async fn cleanup_stored_blob_after_failed_registration(
     workspace_id: &str,
     stored_blob: &crate::blob_store::StoredArtifactBlob,
     registration_error: &ArtifactError,
+    mutation_guard: crate::ArtifactBlobMutationGuard,
 ) -> ArtifactResult<()> {
     if stored_blob.deduplicated {
         return Ok(());
     }
 
     blob_store
-        .delete_unreferenced(workspace_id, stored_blob.storage_key.as_str())
+        .delete_unreferenced_guarded(
+            workspace_id,
+            stored_blob.storage_key.as_str(),
+            mutation_guard,
+        )
         .await
         .map_err(|cleanup_error| ArtifactError::BlobCleanupFailed {
             storage_key: stored_blob.storage_key.clone(),
@@ -3284,6 +3474,8 @@ mod tests {
             })
         }
     }
+
+    include!("html_preview_retention_tests.rs");
 
     async fn update_artifact_status(store: &CrudStore, artifact_id: &str, status: &str) {
         store

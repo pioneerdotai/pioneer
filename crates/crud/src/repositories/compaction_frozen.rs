@@ -134,7 +134,43 @@ pub(crate) async fn compaction_append_frozen_history(
             json,
         ));
     }
+    let mut preview_guards = Vec::new();
+    for message in messages
+        .iter()
+        .filter(|m| m.tool_name.as_deref() == Some("html_preview"))
+    {
+        let sources = message
+            .replay_source
+            .as_ref()
+            .map(std::slice::from_ref)
+            .unwrap_or(&message.sources);
+        let payload = serde_json::to_string(sources)?;
+        ensure!(
+            payload.len() <= SOURCE_PAGE_BYTES,
+            "preview capture source bound"
+        );
+        preview_guards.push((
+            super::compaction::compaction_sources_current_statement(
+                payload,
+                workspace,
+                &message.source_thread,
+            ),
+            sources.len() as i64,
+        ));
+    }
     let tx = store.connection.begin().await?;
+    // Revalidate already serialized bounded statements; source serialization
+    // happens before writer admission, alongside reference preparation above.
+    for (query, count) in &preview_guards {
+        let row = tx
+            .query_one_raw(query.clone())
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("missing preview source fence"))?;
+        ensure!(
+            row.try_get::<i64>("", "matched")? == *count,
+            "HTML preview source changed during capture; prepare history again"
+        );
+    }
     let row = compaction_frozen_history::Entity::find_by_id(manifest)
         .filter(compaction_frozen_history::Column::WorkspaceId.eq(workspace))
         .filter(compaction_frozen_history::Column::OwnerThread.eq(owner_thread))

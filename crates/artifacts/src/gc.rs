@@ -159,8 +159,19 @@ pub async fn execute_gc_with_policy(
         plan_gc_with_policy(store, Some(blob_store), workspace_id, now_unix_ms, policy).await?;
     let mut deleted_blobs = 0;
     for blob in &plan.orphan_blobs {
+        let mutation_guard = blob_store.acquire_mutation_guard(workspace_id).await?;
+        if !store
+            .artifact_storage_key_is_unreferenced(workspace_id, &blob.storage_key)
+            .await?
+        {
+            continue;
+        }
         blob_store
-            .delete_unreferenced(workspace_id, blob.storage_key.as_str())
+            .delete_unreferenced_guarded(
+                workspace_id,
+                blob.storage_key.as_str(),
+                mutation_guard.clone(),
+            )
             .await?;
         deleted_blobs += store
             .delete_artifact_blob_row(workspace_id, &blob.blob_id)

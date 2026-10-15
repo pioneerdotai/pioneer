@@ -40,10 +40,27 @@ impl ArtifactService {
             .get_artifact_version_blob(workspace_id, artifact_id, version_id)
             .await?;
         let safe_name = provider_safe_name(summary.artifact.display_name.as_str());
-        let path = self
-            .blob_store
-            .materialize_readable_copy(workspace_id, blob.storage_key.as_str(), safe_name.as_str())
-            .await?;
+        let temporary_preview = summary.created_by_kind
+            == pioneer_protocol::ArtifactCreatedByKind::Tool
+            && summary.created_by_actor_id.as_deref() == Some("html_preview")
+            && summary
+                .metadata
+                .get("htmlTool")
+                .is_some_and(|meta| meta["version"] == 1 && meta["publication"] == false);
+        let original = if temporary_preview {
+            self.blob_store
+                .local_blob_path(workspace_id, &blob.storage_key)?
+        } else {
+            None
+        };
+        let path = match original {
+            Some(path) => path,
+            None => {
+                self.blob_store
+                    .materialize_readable_copy(workspace_id, &blob.storage_key, &safe_name)
+                    .await?
+            }
+        };
         let mime_type = summary
             .artifact
             .mime_type
