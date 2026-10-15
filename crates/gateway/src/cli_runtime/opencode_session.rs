@@ -3840,17 +3840,9 @@ impl CLIAgentRuntimeSession for OpenCodeCLIAgentRuntimeSession {
         native_turn_id: &str,
     ) -> Result<Option<CLIAgentRuntimeTurnObservation>> {
         if !self.is_usable() {
-            let state = self.state.lock().await;
-            if state.active_turn_id.as_deref() == Some(native_turn_id)
-                && let Some(observation) = &state.last_turn_observation
-                // Before execution there cannot be completed native items to
-                // lose. A closed running generation requires fresh REST recovery.
-                && !state.execution_observed
-                && observation.status != CLIAgentRuntimeObservedTurnStatus::InProgress
-            {
-                return Ok(Some(observation.clone()));
-            }
-            bail!("OpenCode process generation is closed");
+            // Never substitute cached partial items for authoritative native
+            // history. The shared recovery acquisition can replace this owner.
+            bail!("OpenCode process generation is closed; reacquire it for native history");
         }
         let (messages, live, terminal_events) = read_opencode_turn_snapshot(
             &self.server,
@@ -3860,11 +3852,22 @@ impl CLIAgentRuntimeSession for OpenCodeCLIAgentRuntimeSession {
             self.request_timeout,
         )
         .await?;
-        if !terminal_events.is_empty() {
-            return Ok(self.state.lock().await.last_turn_observation.clone());
-        }
         let mut observation =
             opencode_observation_from_messages(native_thread_id, native_turn_id, &messages, live);
+        if !terminal_events.is_empty() {
+            // The messages above were read from the live server. Use their
+            // normal projection plus the explicitly proved owner cancellation;
+            // do not replace their history with last_turn_observation's items.
+            let state = self.state.lock().await;
+            if let Some(terminal) = &state.last_turn_observation {
+                if let Some(observation) = observation.as_mut() {
+                    observation.status = terminal.status;
+                    observation.message.clone_from(&terminal.message);
+                } else {
+                    observation = Some(terminal.clone());
+                }
+            }
+        }
         if let Some(observation) = observation.as_mut() {
             let state = self.state.lock().await;
             if state.active_turn_id.as_deref() == Some(native_turn_id) && state.interrupted && !live
