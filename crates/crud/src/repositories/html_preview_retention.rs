@@ -908,6 +908,7 @@ pub struct HtmlPreviewArchiveWitness {
     pub manifest: String,
     pub ordinal: i64,
     pub workspace: String,
+    pub owner_thread: String,
     pub reference: pioneer_compaction::frozen::FrozenMessageRef,
     pub payload: String,
 }
@@ -918,7 +919,7 @@ impl CrudStore {
     ) -> Result<(Option<(String, i64)>, Option<HtmlPreviewArchiveWitness>)> {
         // Page source rows, even if expired/already verified; never search the
         // whole candidate pool inside one background quantum.
-        let row=self.connection.query_one_raw(statement("SELECT r.manifest_id,r.ordinal,r.reference_json,r.source_id,r.source_version,r.turn_id,r.archive_wire_sha256,h.workspace_id,h.expired FROM html_preview_frozen_result r LEFT JOIN compaction_frozen_history h ON h.id=r.manifest_id WHERE (r.manifest_id,r.ordinal)>(?1,?2) ORDER BY r.manifest_id,r.ordinal LIMIT 1",vec![after.0.clone().into(),after.1.into()])).await?;
+        let row=self.connection.query_one_raw(statement("SELECT r.manifest_id,r.ordinal,r.reference_json,r.source_id,r.source_version,r.turn_id,r.archive_wire_sha256,h.workspace_id,h.owner_thread,h.expired FROM html_preview_frozen_result r LEFT JOIN compaction_frozen_history h ON h.id=r.manifest_id WHERE (r.manifest_id,r.ordinal)>(?1,?2) ORDER BY r.manifest_id,r.ordinal LIMIT 1",vec![after.0.clone().into(),after.1.into()])).await?;
         let Some(r) = row else {
             return Ok((None, None));
         };
@@ -949,6 +950,7 @@ impl CrudStore {
                     manifest,
                     ordinal,
                     workspace,
+                    owner_thread: r.try_get("", "owner_thread")?,
                     reference,
                     payload: body.try_get("", "payload")?,
                 })
@@ -968,7 +970,7 @@ impl CrudStore {
         );
         let reference = serde_json::to_string(&witness.reference)?;
         self.run_serialized_write(|| async {
-            self.connection.execute_raw(statement("UPDATE html_preview_frozen_result SET archive_wire_sha256=?1 WHERE manifest_id=?2 AND ordinal=?3 AND reference_json=?4 AND archive_wire_sha256 IS NULL AND EXISTS(SELECT 1 FROM compaction_frozen_history h JOIN turn_llm_context c ON c.id=html_preview_frozen_result.source_id JOIN compaction_source_revision v ON v.source_id=c.id JOIN turn t ON t.id=c.turn_id JOIN thread th ON th.id=t.thread_id WHERE h.id=html_preview_frozen_result.manifest_id AND h.workspace_id=?5 AND h.expired=0 AND th.workspace_id=h.workspace_id AND t.thread_id=?6 AND c.turn_id=html_preview_frozen_result.turn_id AND c.source='tool_result_v2' AND c.tool_name='html_preview' AND c.payload=?7 AND v.present=1 AND 'revision:'||v.revision=html_preview_frozen_result.source_version)",vec![archive_hash.into(),witness.manifest.clone().into(),witness.ordinal.into(),reference.clone().into(),witness.workspace.clone().into(),witness.reference.source_thread.clone().into(),witness.payload.clone().into()])).await?;
+            self.connection.execute_raw(statement("UPDATE html_preview_frozen_result SET archive_wire_sha256=?1 WHERE manifest_id=?2 AND ordinal=?3 AND reference_json=?4 AND archive_wire_sha256 IS NULL AND EXISTS(SELECT 1 FROM compaction_frozen_history h JOIN turn_llm_context c ON c.id=html_preview_frozen_result.source_id JOIN compaction_source_revision v ON v.source_id=c.id JOIN turn t ON t.id=c.turn_id JOIN thread th ON th.id=t.thread_id WHERE h.id=html_preview_frozen_result.manifest_id AND h.workspace_id=?5 AND h.owner_thread=?8 AND h.ready=1 AND h.expired=0 AND th.workspace_id=h.workspace_id AND t.thread_id=?6 AND c.turn_id=html_preview_frozen_result.turn_id AND c.source='tool_result_v2' AND c.tool_name='html_preview' AND c.payload=?7 AND v.present=1 AND 'revision:'||v.revision=html_preview_frozen_result.source_version)",vec![archive_hash.into(),witness.manifest.clone().into(),witness.ordinal.into(),reference.clone().into(),witness.workspace.clone().into(),witness.reference.source_thread.clone().into(),witness.payload.clone().into(),witness.owner_thread.clone().into()])).await?;
             Ok(())
         }).await
     }

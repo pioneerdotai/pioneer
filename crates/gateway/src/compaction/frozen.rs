@@ -5690,7 +5690,14 @@ pub(crate) async fn prepare_html_preview_archive_witness(
             && !reference.protected_input,
         "unsupported preview archive provenance"
     );
-    let allowed = BTreeSet::from([reference.source_thread.clone()]);
+    // An accepted import keeps its canonical source thread while its context
+    // belongs to the receiving manifest. Admit only that persisted owner, not
+    // an arbitrary context_thread from the reference. Receipt publication
+    // rechecks the same header owner together with the exact reference.
+    let allowed = BTreeSet::from([
+        reference.source_thread.clone(),
+        witness.owner_thread.clone(),
+    ]);
     authorize(
         &witness.workspace,
         &allowed,

@@ -403,7 +403,76 @@ async fn released_preview_history_keeps_pairing_for_next_native_cli_task_and_fro
             .count(),
         3
     );
+    let live_manifest = live.descriptor.manifest_id.clone();
     drop(live);
+    // Build the existing dependency index without preparing witnesses yet.
+    // This lets the same fixture exercise the owner fence at both boundaries.
+    let mut indexing = pioneer_artifacts::HtmlPreviewMaintenanceProgress::default();
+    let mut indexed = false;
+    for _ in 0..256 {
+        if !service
+            .html_preview_maintenance_quantum(&mut indexing)
+            .await
+            .unwrap()
+        {
+            indexed = true;
+            break;
+        }
+    }
+    assert!(indexed);
+    let mut cursor = (String::new(), 0);
+    let mut accepted_witness = None;
+    for _ in 0..256 {
+        let (next, witness) = f
+            .store
+            .html_preview_archive_witness_page(&cursor)
+            .await
+            .unwrap();
+        if let Some(witness) = witness.filter(|w| w.manifest == live_manifest) {
+            accepted_witness = Some(witness);
+            break;
+        }
+        let Some(next) = next else {
+            break;
+        };
+        cursor = next;
+    }
+    let witness = accepted_witness.expect("accepted child preview has a pending witness");
+    assert_eq!(witness.owner_thread, "parent");
+    assert_eq!(witness.reference.source_thread, "thread");
+    assert_eq!(witness.reference.context_thread.as_deref(), Some("parent"));
+    let mut wrong_context = witness.clone();
+    wrong_context.reference.context_thread = Some("outside-context".into());
+    assert!(
+        super::super::frozen::prepare_html_preview_archive_witness(&f.store, &wrong_context)
+            .await
+            .is_err()
+    );
+    let mut wrong_owner = witness.clone();
+    wrong_owner.owner_thread = "outside-context".into();
+    assert!(
+        super::super::frozen::prepare_html_preview_archive_witness(&f.store, &wrong_owner)
+            .await
+            .is_err()
+    );
+    // A changed owner cannot publish a receipt even if preparation was skipped.
+    f.store
+        .record_html_preview_archive_witness(&wrong_owner, &"a".repeat(64))
+        .await
+        .unwrap();
+    let stored = db.query_one_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+        "SELECT archive_wire_sha256 FROM html_preview_frozen_result WHERE manifest_id=?1 AND ordinal=?2",
+        [witness.manifest.clone().into(),witness.ordinal.into()])).await.unwrap().unwrap();
+    assert!(
+        stored
+            .try_get::<Option<String>>("", "archive_wire_sha256")
+            .unwrap()
+            .is_none()
+    );
+    super::super::frozen::prepare_html_preview_archive_witness(&f.store, &witness)
+        .await
+        .unwrap();
+    assert!(preview_paths.iter().all(|p| p.exists()));
     let mut progress = crate::database::maintenance::html_previews::Progress::default();
     // Complete several bounded passes: index, verification and blob discovery
     // may reach EOF at different points. The exact read hold still protects bytes.
