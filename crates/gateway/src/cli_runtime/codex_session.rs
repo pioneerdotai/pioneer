@@ -345,25 +345,10 @@ pub(crate) async fn run_codex_mcp_local_provider_probe(
         Ok::<_, anyhow::Error>(server)
     };
     let probe_result = async {
-        let initialize = client
+        client
             .initialize(timeout)
             .await
             .map_err(|error| anyhow!("Codex readiness initialization failed: {error}"))?;
-        if initialize
-            .version
-            .as_deref()
-            .unwrap_or_default()
-            .trim()
-            .is_empty()
-            && initialize
-                .user_agent
-                .as_deref()
-                .unwrap_or_default()
-                .trim()
-                .is_empty()
-        {
-            bail!("Codex readiness initialize identity is unavailable");
-        }
         let cwd = probe_config
             .cwd
             .as_deref()

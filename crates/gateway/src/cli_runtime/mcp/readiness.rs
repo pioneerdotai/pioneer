@@ -481,20 +481,15 @@ pub(crate) async fn codex_mcp_readiness_for_instance(
         });
     }
 
-    let local = match provider_version {
-        Some(provider_version) if !provider_version.trim().is_empty() => {
-            build_or_load_codex_local_attestation(
-                instance,
-                runtime_home,
-                provider_version,
-                proxy_url,
-                max_tools,
-                max_schema_bytes,
-            )
-            .await
-        }
-        _ => None,
-    };
+    let local = build_or_load_codex_local_attestation(
+        instance,
+        runtime_home,
+        provider_version.unwrap_or_default(),
+        proxy_url,
+        max_tools,
+        max_schema_bytes,
+    )
+    .await;
     evaluate_codex_mcp_readiness(CodexMcpReadinessInput {
         runtime_enabled: instance.enabled,
         normal_runtime_ready,
@@ -1005,12 +1000,13 @@ pub(crate) async fn claude_mcp_readiness_for_instance(
             local_attestation: None,
         });
     }
-    let local = match provider_version {
-        Some(version) if !version.trim().is_empty() => {
-            build_or_load_claude_local_attestation(instance, runtime_home, version, proxy_url).await
-        }
-        _ => None,
-    };
+    let local = build_or_load_claude_local_attestation(
+        instance,
+        runtime_home,
+        provider_version.unwrap_or_default(),
+        proxy_url,
+    )
+    .await;
     evaluate_claude_mcp_readiness(ClaudeMcpReadinessInput {
         runtime_enabled: instance.enabled,
         normal_runtime_ready,
@@ -1200,10 +1196,7 @@ pub(crate) async fn opencode_mcp_readiness_for_instance(
     let version_for_attestation = version.map(str::to_owned);
     let fingerprints = if instance.enabled && normal_runtime_ready {
         tokio::task::spawn_blocking(move || -> anyhow::Result<(String, String)> {
-            let version = version_for_attestation
-                .as_deref()
-                .ok_or_else(|| anyhow::anyhow!("OpenCode server version is unavailable"))?;
-            opencode_executable_fingerprints(&configured_binary, version)
+            opencode_executable_fingerprints(&configured_binary, version_for_attestation.as_deref())
         })
         .await
         .ok()
@@ -1221,7 +1214,6 @@ pub(crate) async fn opencode_mcp_readiness_for_instance(
     let supported = instance.enabled
         && normal_runtime_ready
         && cfg!(any(unix, windows))
-        && version.is_some()
         && fingerprints.is_some();
     if supported {
         diagnostics.push(diagnostic(
@@ -1247,12 +1239,16 @@ pub(crate) async fn opencode_mcp_readiness_for_instance(
 
 pub(crate) fn opencode_executable_fingerprints(
     configured_binary: &str,
-    version: &str,
+    version: Option<&str>,
 ) -> anyhow::Result<(String, String)> {
-    let version = version.trim_start_matches('v');
+    let version = version.map(str::trim).filter(|version| !version.is_empty());
     let base_contract =
-        crate::cli_runtime::opencode_session::opencode_provider_contract_fingerprint(Some(version));
-    let identity = codex_executable_cache_identity(&configured_binary, version, &base_contract)?;
+        crate::cli_runtime::opencode_session::opencode_provider_contract_fingerprint(version);
+    let identity = codex_executable_cache_identity(
+        configured_binary,
+        version.unwrap_or_default(),
+        &base_contract,
+    )?;
     let binary_sha256 = sha256_file_contents(identity.realpath.as_path())?;
     let local_executable_fingerprint = sha256_json(&json!({
         "provider": "opencode",

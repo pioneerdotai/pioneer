@@ -68,21 +68,6 @@ use tokio_util::sync::CancellationToken;
 const OPENCODE_SERVER_USERNAME: &str = "pioneer";
 const OPENCODE_SERVER_PREFIX: &str = "opencode server listening on ";
 const OPENCODE_API_CONTRACT_VERSION: u32 = 2;
-const OPENCODE_SUPPORTED_VERSION: &str = "1.4.14";
-
-#[derive(Debug)]
-struct UnsupportedOpenCodeVersion;
-impl std::fmt::Display for UnsupportedOpenCodeVersion {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "OpenCode {} server contract is required",
-            OPENCODE_SUPPORTED_VERSION
-        )
-    }
-}
-impl std::error::Error for UnsupportedOpenCodeVersion {}
-
 const OPENCODE_BUILTIN_TOOLS: &[&str] = &[
     "bash",
     "read",
@@ -133,7 +118,6 @@ pub(crate) enum OpenCodeProbeStatus {
     NeedsAuth,
     MissingBinary,
     SpawnFailed,
-    UnsupportedVersion,
     Error,
 }
 
@@ -560,6 +544,7 @@ impl OpenCodeApiClient {
 struct OpenCodeServerProcess {
     closed: std::sync::atomic::AtomicBool,
     api: OpenCodeApiClient,
+    version: Option<String>,
     process: Mutex<CLIAgentProcess>,
     stdin: Mutex<Option<ChildStdin>>,
     stdout_reader: JoinHandle<()>,
@@ -794,31 +779,42 @@ async fn spawn_opencode_server(
         username: OPENCODE_SERVER_USERNAME.to_owned(),
         password,
     };
-    let health = api.health(startup_timeout).await.and_then(|health| {
-        if health["healthy"] != true
-            || health["version"]
-                .as_str()
-                .map(|v| v.trim_start_matches('v'))
-                != Some(OPENCODE_SUPPORTED_VERSION)
-        {
-            return Err(UnsupportedOpenCodeVersion.into());
+    let version = match api
+        .health(startup_timeout)
+        .await
+        .and_then(|health| opencode_server_version(&health))
+    {
+        Ok(version) => version,
+        Err(error) => {
+            stdout_reader.abort();
+            let _ = process.terminate_with_grace(Duration::from_secs(2)).await;
+            return Err(error).context("OpenCode server health probe failed");
         }
-        Ok(health)
-    });
-    if let Err(error) = health {
-        stdout_reader.abort();
-        let _ = process.terminate_with_grace(Duration::from_secs(2)).await;
-        return Err(error).context("OpenCode server health probe failed");
-    }
+    };
     Ok(OpenCodeServerProcess {
         closed: std::sync::atomic::AtomicBool::new(false),
         api,
+        version,
         process: Mutex::new(process),
         stdin: Mutex::new(Some(stdin)),
         stdout_reader,
         stderr,
         shutdown_grace: Duration::from_secs(5),
     })
+}
+
+// Version is diagnostic/cache metadata, not a condition for using the API.
+fn opencode_server_version(health: &JsonValue) -> Result<Option<String>> {
+    anyhow::ensure!(
+        health["healthy"] == true,
+        "OpenCode /global/health did not report healthy=true"
+    );
+    Ok(health
+        .get("version")
+        .and_then(JsonValue::as_str)
+        .map(str::trim)
+        .filter(|version| !version.is_empty())
+        .map(str::to_owned))
 }
 
 // The shared compaction runner owns timeout/cancellation and calls cleanup,
@@ -965,9 +961,7 @@ pub(crate) async fn probe_opencode_instance(
                     .downcast_ref::<std::io::Error>()
                     .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
             });
-            let status = if error.downcast_ref::<UnsupportedOpenCodeVersion>().is_some() {
-                OpenCodeProbeStatus::UnsupportedVersion
-            } else if missing {
+            let status = if missing {
                 OpenCodeProbeStatus::MissingBinary
             } else {
                 OpenCodeProbeStatus::SpawnFailed
@@ -994,17 +988,13 @@ pub(crate) async fn probe_opencode_instance(
         }
     };
     let request_timeout = Duration::from_millis(instance.request_timeout_ms.max(1));
-    let health = server.api.health(request_timeout).await;
+    let version = server.version.clone();
     let providers = server.api.providers(request_timeout).await;
     let stderr_before_close = server.stderr.lines().await;
     let close_result = server.close().await;
-    let (health, providers) = match (health, providers) {
-        (Ok(health), Ok(providers)) => (health, providers),
-        (health, providers) => {
-            let error = health
-                .err()
-                .or_else(|| providers.err())
-                .expect("one OpenCode probe request failed");
+    let providers = match providers {
+        Ok(providers) => providers,
+        Err(error) => {
             let message = bounded_safe_detail(format!("{error:#}").as_str());
             return OpenCodeProbeSnapshot {
                 status: OpenCodeProbeStatus::Error,
@@ -1021,35 +1011,6 @@ pub(crate) async fn probe_opencode_instance(
             };
         }
     };
-    let version = health
-        .get("version")
-        .and_then(JsonValue::as_str)
-        .map(str::to_owned);
-    let healthy = health
-        .get("healthy")
-        .and_then(JsonValue::as_bool)
-        .unwrap_or(false);
-    if !healthy
-        || version.as_deref().map(|v| v.trim_start_matches('v')) != Some(OPENCODE_SUPPORTED_VERSION)
-    {
-        return OpenCodeProbeSnapshot {
-            status: if healthy {
-                OpenCodeProbeStatus::UnsupportedVersion
-            } else {
-                OpenCodeProbeStatus::Error
-            },
-            message: Some("OpenCode 1.4.14 server contract is required".to_owned()),
-            version,
-            account: None,
-            diagnostics: vec![OpenCodeProbeDiagnostic {
-                level: OpenCodeProbeDiagnosticLevel::Error,
-                code: "opencode_probe.unsupported_server".to_owned(),
-                message: "OpenCode 1.4.14 server contract is required".to_owned(),
-            }],
-            stderr: stderr_before_close,
-            models: Vec::new(),
-        };
-    }
     let connected = providers
         .get("connected")
         .and_then(JsonValue::as_array)
@@ -3130,10 +3091,11 @@ impl CLIAgentRuntimeSessionFactory for OpenCodeCLIAgentRuntimeSessionFactory {
         let initialized: Result<(Option<Arc<OpenCodeRequiredMcpBridge>>, Vec<String>)> = async {
             if let Some(projection) = launch_projection.as_ref() {
                 let binary = instance.binary_path.clone();
+                let version = server.version.clone();
                 let (actual_contract, _) = tokio::task::spawn_blocking(move || {
                     crate::cli_runtime::mcp::readiness::opencode_executable_fingerprints(
                         &binary,
-                        OPENCODE_SUPPORTED_VERSION,
+                        version.as_deref(),
                     )
                 })
                 .await
@@ -4801,6 +4763,47 @@ mod tests {
             .map(|value| (*value).to_owned())
             .chain(std::iter::once("plugin_danger".to_owned()))
             .collect()
+    }
+
+    #[test]
+    fn health_accepts_optional_release_metadata_and_preserves_health_errors() {
+        for version in ["1.4.14", "1.4.15", "1.5.0", "2.0.0", "dev-build+local"] {
+            assert_eq!(
+                opencode_server_version(&json!({"healthy": true, "version": version})).unwrap(),
+                Some(version.to_owned()),
+            );
+        }
+        for health in [
+            json!({"healthy": true}),
+            json!({"healthy": true, "version": null}),
+            json!({"healthy": true, "version": ""}),
+        ] {
+            assert_eq!(opencode_server_version(&health).unwrap(), None);
+        }
+        assert!(opencode_server_version(&json!({"healthy": false, "version": "1.4.14"})).is_err());
+        assert!(opencode_server_version(&json!({"version": "1.4.14"})).is_err());
+    }
+
+    #[test]
+    fn executable_fingerprint_accepts_unreported_and_custom_versions() {
+        use crate::cli_runtime::mcp::readiness::opencode_executable_fingerprints;
+        let executable = std::env::current_exe().unwrap();
+        let executable = executable.to_str().unwrap();
+        let unreported = opencode_executable_fingerprints(executable, None).unwrap();
+        assert_eq!(
+            unreported,
+            opencode_executable_fingerprints(executable, Some("")).unwrap()
+        );
+        let custom = opencode_executable_fingerprints(executable, Some("dev-build+local")).unwrap();
+        assert_ne!(unreported, custom);
+        assert_eq!(
+            custom,
+            opencode_executable_fingerprints(executable, Some("dev-build+local")).unwrap()
+        );
+        assert_ne!(
+            custom,
+            opencode_executable_fingerprints(executable, Some("2.0.0")).unwrap()
+        );
     }
 
     #[test]

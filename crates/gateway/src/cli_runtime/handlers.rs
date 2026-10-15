@@ -11776,7 +11776,7 @@ fn apply_claude_account_probe_to_summary(
         },
         ClaudeAccountProbeStatus::UnsupportedVersion => RuntimeStatus::UnsupportedVersion {
             version: probe.version.clone(),
-            minimum_version: Some("2.0.0".to_owned()),
+            minimum_version: None,
         },
         ClaudeAccountProbeStatus::Error => RuntimeStatus::Error {
             message: probe
@@ -11814,10 +11814,6 @@ fn apply_opencode_probe_to_summary(
                 .message
                 .clone()
                 .unwrap_or_else(|| "failed to spawn OpenCode server".to_owned()),
-        },
-        OpenCodeProbeStatus::UnsupportedVersion => RuntimeStatus::UnsupportedVersion {
-            version: probe.version.clone(),
-            minimum_version: None,
         },
         OpenCodeProbeStatus::Error => RuntimeStatus::Error {
             message: probe
@@ -12088,9 +12084,6 @@ fn runtime_model_list_from_opencode_probe(
         OpenCodeProbeStatus::SpawnFailed => {
             Some(message.unwrap_or_else(|| "failed to spawn OpenCode server".to_owned()))
         }
-        OpenCodeProbeStatus::UnsupportedVersion => Some(message.unwrap_or_else(|| {
-            "OpenCode server v1.4.14 is required by the audited adapter contract".to_owned()
-        })),
         OpenCodeProbeStatus::Error => {
             Some(message.unwrap_or_else(|| "OpenCode server model probe failed".to_owned()))
         }
