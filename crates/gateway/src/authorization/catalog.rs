@@ -51,6 +51,18 @@ const fn record(
     }
 }
 
+// Access renewal authenticates credentials and the exact connection session;
+// it does not enter domain dispatch or the restricted issuance exchange.
+const TRANSPORT_RPC_RECORDS: &[AuthorizationCatalogRecord] = &[record(
+    AuthorizationCatalogSurface::Rpc,
+    methods::AUTH_ACCESS_RENEW,
+    "session_access_renew",
+    "connection_session",
+    "authentication_terminal",
+    "authentication",
+    true,
+)];
+
 const RESTRICTED_RPC_RECORDS: &[AuthorizationCatalogRecord] = &[
     record(
         AuthorizationCatalogSurface::RestrictedRpc,
@@ -459,6 +471,7 @@ const DYNAMIC_TOOL_FAMILY_RECORDS: &[AuthorizationCatalogRecord] = &[
 pub(crate) fn authorization_catalog() -> Vec<AuthorizationCatalogRecord> {
     let mut catalog = Vec::with_capacity(
         NORMAL_METHOD_REGISTRY.len()
+            + TRANSPORT_RPC_RECORDS.len()
             + RESTRICTED_RPC_RECORDS.len()
             + BINARY_INGRESS_REGISTRY.len()
             + INTERNAL_TOOL_RECORDS.len()
@@ -480,6 +493,7 @@ pub(crate) fn authorization_catalog() -> Vec<AuthorizationCatalogRecord> {
             true,
         )
     }));
+    catalog.extend_from_slice(TRANSPORT_RPC_RECORDS);
     catalog.extend_from_slice(RESTRICTED_RPC_RECORDS);
     catalog.extend(BINARY_INGRESS_REGISTRY.iter().map(|entry| {
         record(
@@ -538,6 +552,7 @@ mod tests {
             .collect::<BTreeSet<_>>();
         let expected_rpc = methods::NORMAL_METHODS
             .iter()
+            .chain(methods::AUTHENTICATED_TRANSPORT_METHODS)
             .chain(methods::RESTRICTED_AUTH_METHODS)
             .copied()
             .collect::<BTreeSet<_>>();

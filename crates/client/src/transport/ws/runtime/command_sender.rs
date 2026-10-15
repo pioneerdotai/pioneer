@@ -193,6 +193,58 @@ impl GatewayWsCommandSender {
         attempt.complete(session_access)
     }
 
+    /// Update only an acknowledged lease on the currently owned physical transport.
+    pub(crate) fn renew_access_and_wait(
+        &self,
+        connection_id: u64,
+        spec: GatewayWsConnectSpec,
+        refresh_generation: u64,
+    ) -> Result<u64> {
+        let previous = self
+            .current_gateway_http_access()
+            .map_err(|_| anyhow!("connection renewal unavailable"))?;
+        anyhow::ensure!(
+            previous.generation == connection_id,
+            "connection renewal retired"
+        );
+        let access = http_access_from_spec(&spec, connection_id);
+        let (response_tx, response_rx) = mpsc::channel();
+        self.command_tx
+            .send(GatewayWsCommand::RenewAccess {
+                connection_id,
+                spec,
+                refresh_generation,
+                deadline: tokio::time::Instant::now() + crate::rpc::RPC_REQUEST_TIMEOUT,
+                response_tx,
+            })
+            .map_err(|_| anyhow!("websocket worker is not available"))?;
+        response_rx
+            .recv_timeout(crate::rpc::RPC_REQUEST_TIMEOUT + Duration::from_secs(1))
+            .map_err(|_| anyhow!("connection renewal unavailable"))?
+            .map_err(anyhow::Error::new)?;
+        let generations = self
+            .connection_generations
+            .lock()
+            .map_err(|_| anyhow!("Gateway connection owner poisoned"))?;
+        anyhow::ensure!(
+            generations.active == Some(connection_id) && generations.pending.is_none(),
+            "connection renewal retired"
+        );
+        let mut current = self
+            .session_access
+            .lock()
+            .map_err(|_| anyhow!("Gateway access owner poisoned"))?;
+        anyhow::ensure!(
+            current
+                .as_ref()
+                .is_some_and(|current| current.generation == connection_id
+                    && current.access_token == previous.access_token),
+            "connection renewal superseded"
+        );
+        *current = access;
+        Ok(connection_id)
+    }
+
     pub fn shutdown(&self) -> Result<()> {
         *self
             .connection_generations

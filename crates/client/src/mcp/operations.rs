@@ -284,8 +284,33 @@ impl ClientCore {
                         })
             }
     }
+    fn retire_mcp_action(&self, work: &Work) {
+        let mut owner = self.mcp_controller.lock().expect("MCP controller poisoned");
+        if !owner
+            .publications
+            .get(&(work.workspace.clone(), work.target.clone()))
+            .is_some_and(|p| p.operation_id == work.operation && p.state == McpActionState::Pending)
+        {
+            return;
+        }
+        self.publish_mcp_action(
+            &mut owner,
+            &work.workspace,
+            &work.target,
+            work.operation,
+            McpActionState::Cancelled,
+            work.intent.action_kind(),
+        );
+        drop(owner);
+        // A mutation may have committed before its response was lost. Reconcile
+        // canonical state through the existing authorized read owner, never replay it.
+        if self.capability_management_allowed(&work.workspace) {
+            self.fence_mcp_reads_after_action(&work.workspace, &work.target);
+        }
+    }
     fn complete_mcp_action(&self, work: Work, result: anyhow::Result<()>) {
         if !self.mcp_action_current(&work) {
+            self.retire_mcp_action(&work);
             return;
         }
         let mut owner = self.mcp_controller.lock().expect("MCP controller poisoned");
@@ -352,11 +377,9 @@ impl ClientCore {
                 vec![],
             );
         }
-        let refresh_cleanup =
-            matches!(work.intent, McpIntent::Disconnect { .. }) && result.is_err();
         drop(owner);
-        if refresh_cleanup {
-            self.refresh_mcp(&work.workspace);
+        if result.is_err() {
+            self.fence_mcp_reads_after_action(&work.workspace, &work.target);
         }
     }
     fn complete_mcp_configuration(
@@ -365,6 +388,7 @@ impl ClientCore {
         result: anyhow::Result<pioneer_protocol::McpInstallResponse>,
     ) {
         if !self.mcp_action_current(&work) {
+            self.retire_mcp_action(&work);
             return;
         }
         let mut owner = self.mcp_controller.lock().expect("MCP controller poisoned");
@@ -393,7 +417,7 @@ impl ClientCore {
                     reduction.queue_refresh,
                 )
             }
-            Err(_) => (McpActionState::Failed, None, false),
+            Err(_) => (McpActionState::Failed, None, true),
         };
         if refresh {
             self.fence_mcp_reads_after_action(&work.workspace, "configuration");
@@ -482,6 +506,7 @@ impl ClientCore {
                         return;
                     };
                     if !core.mcp_action_current(&work) {
+                        core.retire_mcp_action(&work);
                         continue;
                     }
                     let sender = core.transport_runtime().ws_command_sender();
@@ -621,6 +646,38 @@ mod tests {
         let (sender, receiver) = mpsc::sync_channel(2);
         core.mcp_controller.lock().unwrap().sender = Some(sender);
         (core, receiver)
+    }
+    #[test]
+    fn retired_ticket_releases_its_action_and_cannot_finish_the_replacement() {
+        let (core, queue) = fixture();
+        let intent = || McpIntent::Restart {
+            server_id: "a".into(),
+        };
+        core.mcp_intent("workspace", intent()).unwrap();
+        let work = queue.try_recv().unwrap();
+        let late = Work {
+            workspace: work.workspace.clone(),
+            target: work.target.clone(),
+            operation: work.operation,
+            epoch: work.epoch,
+            name: work.name.clone(),
+            scope_kind: work.scope_kind,
+            intent: intent(),
+            previous_policy: None,
+        };
+        crate::catalog_test_support::replace_connection(&core, 8);
+        core.complete_mcp_action(work, Ok(()));
+        assert_eq!(
+            core.mcp_action_snapshot("workspace", "a").unwrap().state,
+            McpActionState::Cancelled
+        );
+        core.mcp_intent("workspace", intent()).unwrap();
+        let pending = core.mcp_action_snapshot("workspace", "a").unwrap();
+        core.complete_mcp_action(late, Err(anyhow::anyhow!("lost response")));
+        assert!(Arc::ptr_eq(
+            &pending,
+            &core.mcp_action_snapshot("workspace", "a").unwrap()
+        ));
     }
     struct UnavailableListener;
     impl super::super::oauth::McpOAuthShell for UnavailableListener {
