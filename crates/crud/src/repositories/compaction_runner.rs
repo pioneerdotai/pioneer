@@ -1226,10 +1226,15 @@ async fn resume_failed_operation(
                 error.context("compaction resume snapshot is unavailable")
             } else { error })?;
 
+        // Patch only the new request deadline for InvalidCompletion. Keeping
+        // the saved JSON shape also preserves legacy defaults/unknown fields
+        // under the admission trigger; Deadline retains its existing rewrite.
         let changed = tx.execute_raw(Statement::from_sql_and_values(
             sea_orm::DbBackend::Sqlite,
             r#"UPDATE compaction_operation SET status='running',outcome=NULL,
-                    deadline_ms=?2,snapshot=?3,execution_turn=?6
+                    deadline_ms=?2,
+                    snapshot=CASE WHEN ?10 THEN json_set(snapshot,'$.admission.deadline_ms',?2) ELSE ?3 END,
+                    execution_turn=?6
                WHERE id=?1 AND status='failed' AND outcome IS ?9 AND snapshot=?4
                AND (NOT ?10 OR (execution_turn IS ?11 AND execution_turn<>?6
                    AND EXISTS (SELECT 1 FROM turn old WHERE old.id=compaction_operation.execution_turn AND old.status IN ('failed','completed','blocked'))

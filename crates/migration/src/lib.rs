@@ -93,6 +93,7 @@ mod m20261008_000009_retire_compaction_publication_fences;
 mod m20261009_000001_projection_receipt_cleanup_discovery;
 mod m20261010_000001_frozen_lifetime;
 mod m20261012_000001_turn_event_delivery_unfinished_predecessor;
+mod m20261015_000001_compaction_invalid_completion_resume;
 
 #[async_trait::async_trait]
 impl MigratorTrait for Migrator {
@@ -185,6 +186,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261009_000001_projection_receipt_cleanup_discovery::Migration),
             Box::new(m20261010_000001_frozen_lifetime::Migration),
             Box::new(m20261012_000001_turn_event_delivery_unfinished_predecessor::Migration),
+            Box::new(m20261015_000001_compaction_invalid_completion_resume::Migration),
         ]
     }
 }

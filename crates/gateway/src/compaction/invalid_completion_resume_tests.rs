@@ -205,6 +205,8 @@ async fn new_user_admission_resumes_only_unfinished_portion_and_preserves_chain(
             Some(before.deadline_ms - if same_deadline { 0 } else { 100 });
         let resumed = admit(&f, prepared, 20).await.unwrap();
         assert_eq!(resumed.id, snapshot.id);
+        let expected_deadline = before.deadline_ms - if same_deadline { 0 } else { 100 };
+        assert_eq!(resumed.admission.deadline_ms, expected_deadline);
         let after = f
             .store
             .compaction_runner_state(&snapshot.id)
@@ -213,6 +215,7 @@ async fn new_user_admission_resumes_only_unfinished_portion_and_preserves_chain(
             .unwrap();
         assert_eq!(after.cursor, before.cursor);
         assert_eq!(after.previous_checkpoint, before.previous_checkpoint);
+        assert_eq!(after.deadline_ms, expected_deadline);
         assert_eq!(
             (
                 after.attempts,
@@ -335,7 +338,11 @@ async fn invalid_completion_resume_refuses_incompatible_or_missing_evidence_with
                 "sources changed",
             ),
             "checkpoint" => (
-                Some("DELETE FROM compaction_checkpoint WHERE owner='resume-owner'"),
+                // Closed checkpoints are immutable. Model a missing reference
+                // in saved runner state without deleting retained evidence.
+                Some(
+                    "UPDATE compaction_runner_state SET state=json_set(state,'$.previous_checkpoint','missing-checkpoint') WHERE operation_id IN (SELECT id FROM compaction_operation WHERE owner='resume-owner')",
+                ),
                 "checkpoint is unavailable",
             ),
             "snapshot" => (
@@ -453,11 +460,18 @@ async fn invalid_completion_resume_refuses_incompatible_or_missing_evidence_with
 #[tokio::test]
 async fn invalid_completion_resume_is_atomic_and_has_only_one_winner() {
     let (f, mut prepared, snapshot, before) = failed_progress(false).await;
+    let operation_before = f
+        .store
+        .compaction_operation(&snapshot.id)
+        .await
+        .unwrap()
+        .unwrap();
     prepared.execution_turn = "new-turn".into();
     f.store.database_connection().execute_unprepared(
         "CREATE TRIGGER reject_resume BEFORE UPDATE ON compaction_runner_state BEGIN SELECT RAISE(ABORT,'fixture'); END",
     ).await.unwrap();
-    assert!(admit(&f, prepared, 20).await.is_err());
+    let error = admit(&f, prepared, 20).await.unwrap_err();
+    assert!(error.to_string().contains("fixture"), "{error:#}");
     let failed = f
         .store
         .compaction_operation(&snapshot.id)
@@ -466,6 +480,9 @@ async fn invalid_completion_resume_is_atomic_and_has_only_one_winner() {
         .unwrap();
     assert_eq!(failed.status, "failed");
     assert_eq!(failed.execution_turn.as_deref(), Some("turn"));
+    assert_eq!(failed.snapshot, operation_before.snapshot);
+    assert_eq!(failed.deadline_ms, operation_before.deadline_ms);
+    assert_eq!(failed.outcome, operation_before.outcome);
     assert_eq!(
         f.store
             .compaction_runner_state(&snapshot.id)
@@ -496,6 +513,107 @@ async fn invalid_completion_resume_is_atomic_and_has_only_one_winner() {
     assert_eq!(after.generation, before.generation + 1);
     assert_eq!(after.previous_checkpoint, before.previous_checkpoint);
     assert_eq!(after.cursor, before.cursor);
+}
+
+#[tokio::test]
+async fn invalid_completion_resume_keeps_saved_admission_immutable() {
+    let (f, mut prepared, snapshot, before) = failed_progress(false).await;
+    let record = pioneer_entity::compaction_operation::Entity::find_by_id(snapshot.id.clone())
+        .one(&f.store.database_connection())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        record.next_portion > 0,
+        "exercise the closed-admission guard"
+    );
+    let deadline = before.deadline_ms - 100;
+    for case in [
+        "plan",
+        "fingerprint",
+        "same-turn",
+        "unbound-turn",
+        "deadline",
+    ] {
+        let mut changed = snapshot.clone();
+        changed.admission.deadline_ms = if case == "deadline" {
+            deadline + 1
+        } else {
+            deadline
+        };
+        let mut fingerprint = record.fingerprint.clone();
+        let turn = match case {
+            "plan" => {
+                changed.plan.fingerprint = "different-plan".into();
+                Some("new-turn")
+            }
+            "fingerprint" => {
+                fingerprint = "different-fingerprint".into();
+                Some("new-turn")
+            }
+            "same-turn" => Some("turn"),
+            "unbound-turn" => None,
+            "deadline" => Some("new-turn"),
+            _ => unreachable!(),
+        };
+        let error = f
+            .store
+            .database_connection()
+            .execute_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "UPDATE compaction_operation SET status='running',outcome=NULL,
+                 deadline_ms=?,snapshot=?,fingerprint=?,execution_turn=? WHERE id=?",
+                [
+                    i64::try_from(deadline).unwrap().into(),
+                    serde_json::to_string(&changed).unwrap().into(),
+                    fingerprint.into(),
+                    turn.into(),
+                    snapshot.id.clone().into(),
+                ],
+            ))
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("prepared admission immutable"),
+            "{case}: {error}"
+        );
+        let unchanged =
+            pioneer_entity::compaction_operation::Entity::find_by_id(snapshot.id.clone())
+                .one(&f.store.database_connection())
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(unchanged.status, record.status);
+        assert_eq!(unchanged.outcome, record.outcome);
+        assert_eq!(unchanged.snapshot, record.snapshot);
+        assert_eq!(unchanged.fingerprint, record.fingerprint);
+        assert_eq!(unchanged.deadline_ms, record.deadline_ms);
+        assert_eq!(unchanged.execution_turn, record.execution_turn);
+        assert_eq!(
+            f.store
+                .compaction_runner_state(&snapshot.id)
+                .await
+                .unwrap()
+                .unwrap(),
+            before
+        );
+    }
+    prepared.execution_turn = "new-turn".into();
+    prepared.operation_deadline_ms = Some(deadline);
+    assert_eq!(admit(&f, prepared, 20).await.unwrap().id, snapshot.id);
+    let resumed = f
+        .store
+        .compaction_operation(&snapshot.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut expected: serde_json::Value = serde_json::from_str(&record.snapshot).unwrap();
+    expected["admission"]["deadline_ms"] = deadline.into();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&resumed.snapshot).unwrap(),
+        expected
+    );
+    assert_eq!(*f.provider.count.borrow() as u64, before.attempts);
 }
 
 #[tokio::test]
