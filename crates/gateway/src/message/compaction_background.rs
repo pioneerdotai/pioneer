@@ -732,6 +732,42 @@ fn classify_check_result(
                             "Source revisions or accepted import evidence do not match the selected history; no provider call was made",
                         ))
                     }
+                    "compaction resume plan changed" => Some((
+                        "compaction_resume_plan_changed",
+                        "Saved compaction progress belongs to a different plan; restart from zero was refused",
+                    )),
+                    "compaction resume sources changed" => Some((
+                        "compaction_resume_sources_changed",
+                        "Saved compaction sources no longer match the admitted manifest",
+                    )),
+                    "compaction resume snapshot is unavailable" => Some((
+                        "compaction_resume_snapshot_unavailable",
+                        "Saved compaction input snapshot is unavailable or expired",
+                    )),
+                    "compaction resume checkpoint is unavailable" => Some((
+                        "compaction_resume_checkpoint_unavailable",
+                        "Saved compaction checkpoint is missing or belongs to another operation",
+                    )),
+                    "compaction resume phase is unsafe" => Some((
+                        "compaction_resume_unsafe_phase",
+                        "Saved compaction state cannot safely restore the attempt purpose",
+                    )),
+                    "compaction resume plan is unavailable" => Some((
+                        "compaction_resume_plan_unavailable",
+                        "Saved compaction plan is missing or incomplete",
+                    )),
+                    "compaction resume requires a new user execution" => Some((
+                        "compaction_resume_new_execution_required",
+                        "Compaction progress may resume only on a new user execution",
+                    )),
+                    "compaction resume state or execution fence changed" => Some((
+                        "compaction_resume_fence_changed",
+                        "Compaction state, head, checkpoint or execution no longer admits resume",
+                    )),
+                    "compaction resume request deadline expired" => Some((
+                        "compaction_resume_request_deadline",
+                        "The new request deadline expired before compaction resume",
+                    )),
                     "selected CLI service instance is unavailable" => Some((
                         "summary_instance_missing",
                         "Selected CLI summary instance is not configured",
@@ -805,6 +841,31 @@ mod result_tests {
             HistoryCheckOutcome::WaitingSettings
         );
     }
+    #[test]
+    fn compaction_resume_refusals_keep_fixed_public_diagnostics() {
+        for (message, code) in [
+            ("plan changed", "plan_changed"),
+            ("sources changed", "sources_changed"),
+            ("snapshot is unavailable", "snapshot_unavailable"),
+            ("checkpoint is unavailable", "checkpoint_unavailable"),
+            ("phase is unsafe", "unsafe_phase"),
+            ("plan is unavailable", "plan_unavailable"),
+            ("requires a new user execution", "new_execution_required"),
+            ("state or execution fence changed", "fence_changed"),
+            ("request deadline expired", "request_deadline"),
+        ] {
+            let mut diagnostic = HistoryCheckDiagnostic::new("admission", "", "");
+            let error = anyhow::anyhow!("private provider payload")
+                .context(format!("compaction resume {message}"));
+            assert_eq!(
+                classify_check_result(Err(error), &mut diagnostic, false),
+                HistoryCheckOutcome::Failed
+            );
+            assert_eq!(diagnostic.code, format!("compaction_resume_{code}"));
+            assert!(!diagnostic.explanation.contains("private"));
+        }
+    }
+
     #[test]
     fn history_check_wait_cancel_and_fit_remain_distinct() {
         let mut d = HistoryCheckDiagnostic::new("history_capture", "", "");

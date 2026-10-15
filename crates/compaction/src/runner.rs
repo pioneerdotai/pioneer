@@ -108,7 +108,7 @@ pub struct RunnerState {
     pub cursor: SourceCursor,
     pub previous_checkpoint: Option<String>,
     pub phase: RunnerPhase,
-    /// Phase before a deadline fence; older records recover from their saved cursor.
+    /// Safe phase before a resumable failure; legacy portions recover from their cursor.
     #[serde(default)]
     pub resume_phase: Option<RunnerPhase>,
     #[serde(default)]
@@ -241,6 +241,14 @@ impl RunnerState {
         } else {
             next.phase = RunnerPhase::Failed { kind };
         }
+        if matches!(
+            next.phase,
+            RunnerPhase::Failed {
+                kind: FailureKind::InvalidCompletion
+            }
+        ) {
+            next.resume_phase = Some(RunnerPhase::Ready { purpose });
+        }
         Ok(next)
     }
     /// Candidate text and this state must be committed in the same transaction.
@@ -342,6 +350,44 @@ impl RunnerState {
         next.phase = RunnerPhase::Failed { kind };
         Ok(next)
     }
+    /// Invalid completions resume only through a new foreground admission.
+    /// Missing legacy phase is unambiguous only before any correction.
+    pub fn can_resume_invalid_completion(&self) -> bool {
+        matches!(
+            self.phase,
+            RunnerPhase::Failed {
+                kind: FailureKind::InvalidCompletion
+            }
+        ) && self.cursor > SourceCursor::default()
+            && self.previous_checkpoint.is_some()
+            && match self.resume_phase {
+                Some(RunnerPhase::Ready {
+                    purpose: AttemptPurpose::Portion,
+                })
+                | None => self.corrections == 0,
+                Some(RunnerPhase::Ready {
+                    purpose: AttemptPurpose::Correction,
+                }) => self.corrections == 1,
+                _ => false,
+            }
+            && self.observation.as_ref().is_none_or(|o| {
+                o.number == self.attempts && o.failure == Some(FailureKind::InvalidCompletion)
+            })
+    }
+    pub fn resume_invalid_completion(&self, deadline_ms: u64) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            self.can_resume_invalid_completion(),
+            "compaction resume phase is unsafe"
+        );
+        let mut next = self.next()?;
+        next.deadline_ms = deadline_ms;
+        next.phase = next.resume_phase.take().unwrap_or(RunnerPhase::Ready {
+            purpose: AttemptPurpose::Portion,
+        });
+        next.observation = None;
+        next.diagnostic = None;
+        Ok(next)
+    }
     pub fn can_resume_deadline(&self) -> bool {
         matches!(
             self.phase,
@@ -435,6 +481,88 @@ mod tests {
         assert_eq!(
             legacy.resume_deadline(1_800_000, true).unwrap().phase,
             candidate.phase
+        );
+    }
+
+    #[test]
+    fn invalid_completion_resume_preserves_progress_and_purpose_across_serialization() {
+        for correction in [false, true] {
+            let saved = state()
+                .claim(1)
+                .unwrap()
+                .candidate(
+                    1,
+                    "saved".into(),
+                    SourceCursor {
+                        unit: 0,
+                        source: 1,
+                        character: 123,
+                    },
+                    correction,
+                    2,
+                )
+                .unwrap();
+            let ready = saved.candidate_checked(false).unwrap();
+            let mut attempt = ready.claim(3).unwrap();
+            attempt.retries = 2; // Resume must not replenish transient retries.
+            let failed = restart(
+                &attempt
+                    .attempt_failed(FailureKind::InvalidCompletion, 4, None)
+                    .unwrap(),
+            );
+            assert_eq!(failed.action(5), RunnerAction::Terminal);
+            let resumed = restart(&failed).resume_invalid_completion(900_100).unwrap();
+            assert_eq!(resumed.phase, ready.phase);
+            assert_eq!(resumed.cursor, saved.cursor);
+            assert_eq!(resumed.previous_checkpoint, saved.previous_checkpoint);
+            assert_eq!(
+                (
+                    resumed.attempts,
+                    resumed.retries,
+                    resumed.corrections,
+                    resumed.target_tokens
+                ),
+                (
+                    failed.attempts,
+                    failed.retries,
+                    failed.corrections,
+                    failed.target_tokens
+                )
+            );
+            let next_attempt = resumed.claim(6).unwrap();
+            assert_eq!(next_attempt.attempts, failed.attempts + 1);
+            assert!(matches!(
+                next_attempt
+                    .attempt_failed(FailureKind::Transient, 7, None)
+                    .unwrap()
+                    .phase,
+                RunnerPhase::Failed {
+                    kind: FailureKind::Transient
+                }
+            ));
+            // Old JSON did not preserve purpose. Only the pre-correction case is provable.
+            let mut json = serde_json::to_value(&failed).unwrap();
+            json.as_object_mut().unwrap().remove("resume_phase");
+            let legacy: RunnerState = serde_json::from_value(json).unwrap();
+            assert_eq!(legacy.can_resume_invalid_completion(), !correction);
+            for kind in [
+                FailureKind::Cancelled,
+                FailureKind::Permanent,
+                FailureKind::Transient,
+                FailureKind::InsufficientEffect,
+                FailureKind::Deadline,
+            ] {
+                let failed = attempt.attempt_failed(kind, 4, None).unwrap();
+                assert!(!failed.can_resume_invalid_completion());
+            }
+        }
+        assert!(
+            !state()
+                .claim(1)
+                .unwrap()
+                .attempt_failed(FailureKind::InvalidCompletion, 2, None)
+                .unwrap()
+                .can_resume_invalid_completion()
         );
     }
 

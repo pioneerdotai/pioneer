@@ -1050,24 +1050,99 @@ pub(crate) async fn compaction_resume_deadline(
     execution_turn: &str,
     deadline_ms: u64,
 ) -> Result<bool> {
+    resume_failed_operation(store, operation, execution_turn, deadline_ms, false).await
+}
+
+pub(crate) async fn compaction_resume_invalid_completion(
+    store: &CrudStore,
+    operation: &str,
+    execution_turn: &str,
+    deadline_ms: u64,
+) -> Result<bool> {
+    resume_failed_operation(store, operation, execution_turn, deadline_ms, true).await
+}
+
+async fn resume_failed_operation(
+    store: &CrudStore,
+    operation: &str,
+    execution_turn: &str,
+    deadline_ms: u64,
+    invalid_completion: bool,
+) -> Result<bool> {
     let Some(record) =
         super::compaction::compaction_operation(&store.connection, operation).await?
     else {
         return Ok(false);
     };
-    if record.status != "failed" || record.outcome.as_deref() != Some("deadline") {
+    if record.status != "failed"
+        || (!invalid_completion && record.outcome.as_deref() != Some("deadline"))
+    {
         return Ok(false);
     }
     // Expiry is diagnosed before any stale-source fallback, including Ready.
-    super::compaction_source_projection::compaction_bound_source_projection(
+    let bound = super::compaction_source_projection::compaction_bound_source_projection(
         &store.connection,
         operation,
     )
-    .await?;
+    .await
+    .map_err(|error| {
+        if invalid_completion {
+            error.context("compaction resume snapshot is unavailable")
+        } else {
+            error
+        }
+    })?;
     let Some(state) = compaction_runner_state(&store.connection, operation).await? else {
+        if invalid_completion {
+            anyhow::bail!("compaction resume phase is unsafe");
+        }
         return Ok(false);
     };
-    if !state.can_resume_deadline() || deadline_ms <= state.deadline_ms {
+    if invalid_completion {
+        if !matches!(
+            state.phase,
+            RunnerPhase::Failed {
+                kind: FailureKind::InvalidCompletion
+            }
+        ) {
+            return Ok(false);
+        }
+        ensure!(
+            state.previous_checkpoint.is_some(),
+            "compaction resume checkpoint is unavailable"
+        );
+        ensure!(
+            state.can_resume_invalid_completion(),
+            "compaction resume phase is unsafe"
+        );
+        ensure!(
+            compaction_runner_plan(&store.connection, operation)
+                .await?
+                .is_some_and(|p| p.ready),
+            "compaction resume plan is unavailable"
+        );
+        ensure!(
+            record
+                .execution_turn
+                .as_deref()
+                .is_some_and(|old| old != execution_turn),
+            "compaction resume requires a new user execution"
+        );
+        let checkpoint = state.previous_checkpoint.as_deref().unwrap();
+        let saved = compaction_checkpoint::Entity::find_by_id(checkpoint)
+            .filter(compaction_checkpoint::Column::Status.is_in(["candidate", "retained"]))
+            .filter(compaction_checkpoint::Column::Summary.ne(""))
+            .select_only()
+            .column(compaction_checkpoint::Column::OperationId)
+            .column(compaction_checkpoint::Column::Owner)
+            .into_tuple::<(String, String)>()
+            .one(&store.connection)
+            .await?;
+        ensure!(
+            saved.is_some_and(|(id, owner)| id == operation && owner == record.owner),
+            "compaction resume checkpoint is unavailable"
+        );
+    } else if !state.can_resume_deadline() || deadline_ms <= state.deadline_ms {
         return Ok(false);
     }
     let legacy_final = state.resume_phase.is_none()
@@ -1080,8 +1155,34 @@ pub(crate) async fn compaction_resume_deadline(
         )
         .await?
         .is_empty();
-    let next = state.resume_deadline(deadline_ms, legacy_final)?;
-    if matches!(
+    let next = if invalid_completion {
+        ensure!(!legacy_final, "compaction resume phase is unsafe");
+        state.resume_invalid_completion(deadline_ms)?
+    } else {
+        state.resume_deadline(deadline_ms, legacy_final)?
+    };
+    if invalid_completion
+        && matches!(
+            next.phase,
+            RunnerPhase::Ready {
+                purpose: pioneer_compaction::runner::AttemptPurpose::Portion,
+            }
+        )
+    {
+        ensure!(
+            !compaction_manifest_page(
+                &store.connection,
+                operation,
+                false,
+                state.cursor.unit,
+                state.cursor.source
+            )
+            .await?
+            .is_empty(),
+            "compaction resume plan is unavailable"
+        );
+    }
+    if (matches!(
         next.phase,
         RunnerPhase::Ready {
             purpose: pioneer_compaction::runner::AttemptPurpose::Portion
@@ -1089,8 +1190,12 @@ pub(crate) async fn compaction_resume_deadline(
             purpose: pioneer_compaction::runner::AttemptPurpose::Portion,
             ..
         }
-    ) && !compaction_manifest_sources_current(&store.connection, operation).await?
+    ) || invalid_completion)
+        && !compaction_manifest_sources_current(&store.connection, operation).await?
     {
+        if invalid_completion {
+            anyhow::bail!("compaction resume sources changed");
+        }
         return Ok(false);
     }
     let mut snapshot: pioneer_compaction::OperationSnapshot =
@@ -1099,6 +1204,12 @@ pub(crate) async fn compaction_resume_deadline(
     // frozen admission deliberately stored empty compact/coverage vectors.
     // Absence of a binding alone never proves the old raw mode.
     let legacy_raw = !snapshot.plan.compact.is_empty() && !snapshot.plan.coverage.is_empty();
+    if invalid_completion {
+        ensure!(
+            legacy_raw || bound.is_some(),
+            "compaction resume snapshot is unavailable"
+        );
+    }
     snapshot.admission.deadline_ms = deadline_ms;
     let snapshot = serde_json::to_string(&snapshot)?;
     let encoded = serde_json::to_string(&next)?;
@@ -1110,13 +1221,19 @@ pub(crate) async fn compaction_resume_deadline(
         let tx = store.connection.begin().await?;
         // Decode the bound header result in this same writer transition. An
         // expired saved Commit is an explicit error, not an ordinary stale CAS.
-        super::compaction_source_projection::compaction_bound_source_projection(&tx, operation).await?;
+        super::compaction_source_projection::compaction_bound_source_projection(&tx, operation)
+            .await.map_err(|error| if invalid_completion {
+                error.context("compaction resume snapshot is unavailable")
+            } else { error })?;
 
         let changed = tx.execute_raw(Statement::from_sql_and_values(
             sea_orm::DbBackend::Sqlite,
             r#"UPDATE compaction_operation SET status='running',outcome=NULL,
                     deadline_ms=?2,snapshot=?3,execution_turn=?6
-               WHERE id=?1 AND status='failed' AND outcome='deadline' AND snapshot=?4
+               WHERE id=?1 AND status='failed' AND outcome IS ?9 AND snapshot=?4
+               AND (NOT ?10 OR (execution_turn IS ?11 AND execution_turn<>?6
+                   AND EXISTS (SELECT 1 FROM turn old WHERE old.id=compaction_operation.execution_turn AND old.status IN ('failed','completed'))
+                   AND EXISTS (SELECT 1 FROM turn new WHERE new.id=?6 AND new.status='in_progress' AND new.origin='user')))
                AND (EXISTS (SELECT 1 FROM compaction_operation_projection p
                    JOIN compaction_frozen_history h ON h.id=p.manifest_id
                    WHERE p.operation_id=?1 AND h.expired=0 AND h.ready=1
@@ -1126,8 +1243,10 @@ pub(crate) async fn compaction_resume_deadline(
                      AND h.import_count=p.import_count)
                  OR (?8 AND NOT EXISTS (SELECT 1 FROM compaction_operation_projection WHERE operation_id=?1)))
                AND EXISTS (SELECT 1 FROM compaction_runner_state s WHERE s.operation_id=?1 AND s.generation=?5)
+               AND (NOT ?10 OR EXISTS (SELECT 1 FROM compaction_runner_plan p WHERE p.operation_id=?1 AND p.ready=1))
                AND EXISTS (SELECT 1 FROM compaction_checkpoint p WHERE p.id=?7
-                   AND p.operation_id=?1 AND p.owner=compaction_operation.owner AND p.status IN ('candidate','retained'))
+                   AND p.operation_id=?1 AND p.owner=compaction_operation.owner AND p.status IN ('candidate','retained')
+                   AND (NOT ?10 OR length(p.summary)>0))
                AND EXISTS (SELECT 1 FROM compaction_context c JOIN turn t ON t.thread_id=c.thread_id
                    WHERE c.owner=compaction_operation.owner AND c.head IS compaction_operation.expected_head
                    AND t.id=?6 AND t.message_deleted_at IS NULL AND t.status NOT IN ('interrupted','cancelled'))
@@ -1137,7 +1256,8 @@ pub(crate) async fn compaction_resume_deadline(
                    AND (t.message_deleted_at IS NOT NULL OR t.status IN ('interrupted','cancelled')))"#,
             [operation.into(), i64::try_from(deadline_ms)?.into(), snapshot.clone().into(),
              record.snapshot.clone().into(), i64::try_from(state.generation)?.into(),
-             execution_turn.into(), state.previous_checkpoint.clone().into(), legacy_raw.into()],
+             execution_turn.into(), state.previous_checkpoint.clone().into(), legacy_raw.into(),
+             record.outcome.clone().into(), invalid_completion.into(), record.execution_turn.clone().into()],
         )).await?.rows_affected();
         if changed == 0 { tx.rollback().await?; return Ok(false); }
         compaction_runner_state::Entity::update_many()
@@ -1148,6 +1268,39 @@ pub(crate) async fn compaction_resume_deadline(
         tx.commit().await?;
         Ok(true)
     }).await
+}
+
+/// A late cleanup from the previous request must not terminate a resumed request.
+/// One bounded conditional write inherits the caller's serialized writer scope.
+pub(crate) async fn compaction_finish_execution<C: ConnectionTrait>(
+    db: &C,
+    operation: &str,
+    execution_turn: Option<&str>,
+    deadline_ms: u64,
+    status: &str,
+    outcome: &str,
+) -> Result<()> {
+    ensure!(
+        matches!(
+            (status, outcome),
+            ("failed", "deadline") | ("cancelled", "cancelled")
+        ),
+        "invalid reconciliation reason"
+    );
+    db.execute_raw(Statement::from_sql_and_values(
+        sea_orm::DbBackend::Sqlite,
+        "UPDATE compaction_operation SET status=?4,outcome=?5 WHERE id=?1 AND status='running'
+         AND deadline_ms=?2 AND (?3 IS NULL OR execution_turn=?3)",
+        [
+            operation.into(),
+            i64::try_from(deadline_ms)?.into(),
+            execution_turn.into(),
+            status.into(),
+            outcome.into(),
+        ],
+    ))
+    .await?;
+    Ok(())
 }
 
 /// Shared preparation for foreground reconciliation and pending repair. Decode
