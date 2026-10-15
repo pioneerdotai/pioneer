@@ -827,11 +827,16 @@ mod tests {
             .unwrap(),
         );
         let state = Arc::new(super::super::admission::AdmissionState::for_test(catalog));
+        let preparation = prepare("openai", &caps, request);
+        assert!(
+            std::mem::size_of_val(&preparation) < 64 * 1024,
+            "nested media preparation must not retain large inline operation futures"
+        );
         let prepared = super::super::admission::scope(
             state.clone(),
             super::super::runtime::with_async_authority_scope(
                 "fixture-media-authority".into(),
-                prepare("openai", &caps, request),
+                preparation,
             ),
         )
         .await

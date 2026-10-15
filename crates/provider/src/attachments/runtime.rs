@@ -54,18 +54,25 @@ pub(crate) fn with_blocking_work_context<T>(
     operation()
 }
 
-pub(crate) async fn bounded_work<T>(future: impl Future<Output = Result<T>>) -> Result<T> {
-    if let Some(context) = work_context() {
-        check_work()?;
-        let result = tokio::select! { biased;
-            _ = context.cancellation.cancelled() => Err(crate::failure::transport_timeout_error()),
-            result = tokio::time::timeout_at(context.deadline, future) => result.map_err(|_| crate::failure::transport_timeout_error())?,
-        };
-        // A ready synchronous leaf can finish after the timeout was first polled.
-        check_work()?;
-        result
-    } else {
-        future.await
+pub(crate) fn bounded_work<T>(
+    future: impl Future<Output = Result<T>>,
+) -> impl Future<Output = Result<T>> {
+    // Materialization, accounting and retries nest this boundary. Keep their
+    // operation state on the heap instead of multiplying it in each wrapper.
+    let future = Box::pin(future);
+    async move {
+        if let Some(context) = work_context() {
+            check_work()?;
+            let result = tokio::select! { biased;
+                _ = context.cancellation.cancelled() => Err(crate::failure::transport_timeout_error()),
+                result = tokio::time::timeout_at(context.deadline, future) => result.map_err(|_| crate::failure::transport_timeout_error())?,
+            };
+            // A ready synchronous leaf can finish after the timeout was first polled.
+            check_work()?;
+            result
+        } else {
+            future.await
+        }
     }
 }
 
