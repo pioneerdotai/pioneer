@@ -139,6 +139,8 @@ pub struct PermissionAuditDisplayItem {
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct ItemView {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub html_publications: Vec<pioneer_protocol::HtmlPublication>,
     pub id: String,
     pub turn_id: String,
     pub item_type: String,
@@ -1187,6 +1189,7 @@ impl ConversationProjector {
             index
         } else {
             self.view_state.items.push(ItemView {
+                html_publications: Vec::new(),
                 id: item_id.to_owned(),
                 turn_id: turn_id.to_owned(),
                 item_type: item_type.to_owned(),

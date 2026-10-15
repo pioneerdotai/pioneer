@@ -565,3 +565,5 @@ pub use schema::{protocol_schema_documents, write_protocol_schemas};
 
 mod model_selection;
 pub use model_selection::{GatewayModelSelection, ModelSelectionTransport};
+
+pub use artifact::{HtmlPublication, compact_html_timeline_item, compact_html_timeline_value};

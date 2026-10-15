@@ -8442,9 +8442,31 @@ impl CrudStore {
         binding: Option<ArtifactBindingTargetRecord>,
         version_metadata: BTreeMap<String, serde_json::Value>,
     ) -> Result<IngestedArtifactRecord> {
+        self.ingest_artifact_metadata_with_identity(
+            blob,
+            artifact,
+            binding,
+            version_metadata,
+            None,
+            None,
+            None,
+        )
+        .await
+    }
+
+    pub async fn ingest_artifact_metadata_with_identity(
+        &self,
+        blob: NewArtifactBlobRecord,
+        artifact: IngestArtifactMetadataRecord,
+        binding: Option<ArtifactBindingTargetRecord>,
+        version_metadata: BTreeMap<String, serde_json::Value>,
+        identity: Option<String>,
+        limits: Option<(u64, u64)>,
+        commit_guard: Option<(u64, tokio_util::sync::CancellationToken)>,
+    ) -> Result<IngestedArtifactRecord> {
         let prepared_at = chrono::Utc::now().fixed_offset();
         let blob_id = generate_id(DB_ID_LEN);
-        let artifact_id = generate_id(DB_ID_LEN);
+        let artifact_id = identity.clone().unwrap_or_else(|| generate_id(DB_ID_LEN));
         let version_id = generate_id(DB_ID_LEN);
         let binding_id = generate_id(DB_ID_LEN);
         let blob_size_bytes = artifact_repository::checked_size_bytes(blob.size_bytes)?;
@@ -8453,9 +8475,11 @@ impl CrudStore {
         let version_metadata_json = artifact_repository::metadata_to_db(&version_metadata)?;
         let binding_metadata_json = artifact_repository::metadata_to_db(&BTreeMap::new())?;
         self.run_serialized_write(|| {
+            let identity = identity.clone();
+            let commit_guard = commit_guard.clone();
             let blob = blob.clone();
             let artifact = artifact.clone();
-            let binding = binding.clone();
+            let mut binding = binding.clone();
             let blob_id = blob_id.clone();
             let artifact_id = artifact_id.clone();
             let version_id = version_id.clone();
@@ -8471,7 +8495,24 @@ impl CrudStore {
                     .await
                     .context("failed to begin artifact ingest transaction")?;
                 let repository = artifact_repository::ArtifactRepository::new();
+                let publication = identity.is_some() && artifact.created_by_actor_id.as_deref() == Some("html_render");
                 let result = async {
+                    if let Some((generation, cancel)) = &commit_guard {
+                        if cancel.is_cancelled() {
+                            return Err(ArtifactCrudError::InvalidRequest { message: "HTML invocation cancelled before commit".into() });
+                        }
+                        let current = current_policy_generation_on(&transaction).await.map_err(|error| ArtifactCrudError::InvalidRequest { message: format!("HTML authorization unavailable: {error}") })?;
+                        if current.get() != *generation {
+                            return Err(ArtifactCrudError::InvalidRequest { message: "HTML authorization changed before commit; retry under current policy".into() });
+                        }
+                    }
+                    if identity.is_some() {
+                        let target = binding.as_mut().ok_or_else(|| ArtifactCrudError::InvalidRequest { message:"tool artifact requires owner binding".into() })?;
+                        repository.validate_tool_ingest_owner(&transaction, &artifact.workspace_id, target).await?;
+                        if let Some(existing) = repository.find_idempotent_ingest(&transaction, &artifact_id, &blob, &artifact_metadata_json).await? { return Ok(existing); }
+                        let (bytes, files) = limits.ok_or_else(|| ArtifactCrudError::InvalidRequest { message:"tool artifact requires quotas".into() })?;
+                        target.item_index = Some(repository.reserve_tool_artifact_index(&transaction, &artifact.workspace_id, target, blob.size_bytes, bytes, files, artifact.created_by_actor_id.as_deref() == Some("html_render")).await?);
+                    }
                     let blob = repository
                         .find_or_create_blob_prepared(
                             &transaction,
@@ -8519,6 +8560,10 @@ impl CrudStore {
                             )
                             .await?;
                     }
+                    if publication {
+                        let target = binding.as_ref().expect("tool binding validated");
+                        repository.touch_html_turn_projection(&transaction, &artifact.workspace_id,target.thread_id.as_deref().unwrap_or_default(),target.turn_id.as_deref().unwrap_or_default(),prepared_at).await?;
+                    }
                     Ok::<_, ArtifactCrudError>(IngestedArtifactRecord {
                         artifact,
                         version,
@@ -8535,6 +8580,21 @@ impl CrudStore {
                     }
                 };
 
+                if publication {
+                    let target = binding.as_ref().expect("tool binding validated");
+                    let turn_id = target.turn_id.as_deref().unwrap_or_default();
+                    if find_turn_work_projection(&transaction, turn_id).await?.is_none() {
+                        crate::timeline_live_projection::project_cli_runtime_turn_binding_state(
+                            &transaction, turn_id, prepared_at,
+                        ).await?;
+                        repository.touch_html_turn_projection(&transaction, &record.artifact.workspace_id,
+                            target.thread_id.as_deref().unwrap_or_default(), turn_id, prepared_at).await?;
+                    }
+                }
+                if commit_guard.as_ref().is_some_and(|(_, cancel)| cancel.is_cancelled()) {
+                    transaction.rollback().await?;
+                    bail!("HTML invocation cancelled before commit");
+                }
                 transaction
                     .commit()
                     .await
@@ -8549,11 +8609,17 @@ impl CrudStore {
         &self,
         blob: NewArtifactBlobRecord,
     ) -> Result<ArtifactBlobRecord> {
+        let id = generate_id(DB_ID_LEN);
+        let at = chrono::Utc::now().fixed_offset();
+        let size = artifact_repository::checked_size_bytes(blob.size_bytes)?;
+        let metadata = artifact_repository::metadata_to_db(&blob.metadata)?;
         self.run_serialized_write(|| {
             let blob = blob.clone();
+            let id = id.clone();
+            let metadata = metadata.clone();
             async move {
                 artifact_repository::ArtifactRepository::new()
-                    .find_or_create_blob(&self.connection, blob)
+                    .find_or_create_blob_prepared(&self.connection, blob, id, at, size, metadata)
                     .await
                     .map_err(Into::into)
             }
@@ -8788,21 +8854,45 @@ impl CrudStore {
         status: ArtifactStatus,
         deleted_at: Option<DateTimeWithTimeZone>,
     ) -> Result<ArtifactRecord> {
+        let at = chrono::Utc::now().fixed_offset();
         self.run_serialized_write(|| {
             let workspace_id = workspace_id.to_owned();
             let artifact_id = artifact_id.to_owned();
             let deleted_at = deleted_at.clone();
             async move {
-                artifact_repository::ArtifactRepository::new()
-                    .update_artifact_status(
-                        &self.connection,
-                        &workspace_id,
-                        &artifact_id,
-                        status,
-                        deleted_at,
-                    )
-                    .await
-                    .map_err(Into::into)
+                let transaction = self.connection.begin().await?;
+                let repository = artifact_repository::ArtifactRepository::new();
+                let result = async {
+                    let artifact = repository
+                        .update_artifact_status(
+                            &transaction,
+                            &workspace_id,
+                            &artifact_id,
+                            status,
+                            deleted_at,
+                        )
+                        .await?;
+                    repository
+                        .touch_html_artifact_projection(
+                            &transaction,
+                            &workspace_id,
+                            &artifact_id,
+                            at,
+                        )
+                        .await?;
+                    Ok::<_, artifact_repository::ArtifactCrudError>(artifact)
+                }
+                .await;
+                match result {
+                    Ok(artifact) => {
+                        transaction.commit().await?;
+                        Ok(artifact)
+                    }
+                    Err(error) => {
+                        let _ = transaction.rollback().await;
+                        Err(error.into())
+                    }
+                }
             }
         })
         .await

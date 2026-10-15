@@ -322,7 +322,7 @@ impl Render for OnboardingView {
     }
 }
 
-#[derive(IntoElement)]
+#[derive(gpui_kit::IntoElement)]
 struct OnboardingSurface {
     title: String,
     description: String,

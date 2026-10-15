@@ -421,7 +421,7 @@ impl Element for MarkdownLinkText {
     }
 }
 
-#[derive(IntoElement)]
+#[derive(gpui_kit::IntoElement)]
 struct MarkdownDocumentSurface {
     content: AnyElement,
 }

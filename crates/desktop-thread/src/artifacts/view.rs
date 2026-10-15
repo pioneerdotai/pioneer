@@ -477,7 +477,7 @@ impl ThreadArtifactsView {
     }
 }
 
-#[derive(IntoElement)]
+#[derive(gpui_kit::IntoElement)]
 struct ArtifactImagePreview {
     fallback_icon: IconName,
     preview_image_path: Option<PathBuf>,

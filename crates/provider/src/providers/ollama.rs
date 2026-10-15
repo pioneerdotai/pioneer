@@ -1340,3 +1340,99 @@ mod discovery_input_tests {
 #[cfg(test)]
 #[path = "wire_tests/ollama.rs"]
 mod wire_contract_tests;
+
+#[cfg(test)]
+mod html_preview_contract_tests {
+    use super::*;
+    use crate::ChatMessage;
+    use crate::attachments::prepare_messages_for_provider_async;
+    use crate::attachments::regression::{html_preview_fixture, scoped};
+    use crate::traits::Provider;
+    #[tokio::test]
+    async fn html_preview_parallel_results_budget_wire_and_replay() {
+        let provider = OllamaProvider::new();
+        let (state, canonical) = html_preview_fixture("ollama", "ollama-chat");
+        let before = serde_json::to_value(&canonical.messages).unwrap();
+        for replay in [false, true] {
+            let mut request = canonical.clone();
+            if replay {
+                request
+                    .messages
+                    .push(ChatMessage::user("Explain the three captures"));
+            }
+            let budget = scoped(state.clone(), provider.prepare_input_budget(request))
+                .await
+                .unwrap();
+            assert_eq!(budget.media.len(), 3);
+            assert!(budget.media.iter().all(|media| media.message == 3));
+            assert_eq!(
+                budget
+                    .media
+                    .iter()
+                    .map(|media| media.part)
+                    .collect::<Vec<_>>(),
+                vec![1, 3, 5]
+            );
+            let mut prepared = scoped(
+                state.clone(),
+                prepare_messages_for_provider_async(
+                    provider.name(),
+                    &budget.request.model,
+                    &provider.capabilities(),
+                    &budget.request.messages,
+                ),
+            )
+            .await
+            .unwrap();
+            crate::tools::policy::prepare_history(provider.name(), &mut prepared.messages).unwrap();
+            assert_eq!(prepared.attachments.len(), 3);
+            for (attachment, width) in prepared.attachments.iter().zip([360, 768, 1024]) {
+                assert_eq!(attachment.message_index, 3);
+                assert_eq!(
+                    attachment
+                        .artifact
+                        .as_ref()
+                        .unwrap()
+                        .artifact_version_id
+                        .as_deref(),
+                    Some(format!("version-{width}").as_str())
+                );
+            }
+            let wire =
+                serde_json::to_value(OllamaProvider::convert_messages(&prepared).unwrap()).unwrap();
+            assert_eq!(wire[0]["role"], "assistant");
+            assert_eq!(wire[1]["role"], "tool");
+            assert_eq!(wire[2]["role"], "tool");
+            assert_eq!(wire[3]["role"], "user");
+            let paired = [
+                wire[1]["tool_call_id"].as_str().unwrap(),
+                wire[2]["tool_call_id"].as_str().unwrap(),
+            ];
+            assert!(paired.contains(&"preview-call") && paired.contains(&"echo-call"));
+            let preview = wire
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|m| m["tool_call_id"] == "preview-call")
+                .unwrap();
+            assert!(
+                preview["content"]
+                    .as_str()
+                    .unwrap()
+                    .contains("resource load error")
+            );
+            assert_eq!(wire[3]["images"].as_array().unwrap().len(), 3);
+            let caption = wire[3]["content"].as_str().unwrap();
+            for width in [360, 768, 1024] {
+                assert!(caption.contains(&format!("{width} CSS px")));
+            }
+        }
+        assert_eq!(serde_json::to_value(&canonical.messages).unwrap(), before);
+        let (unsupported, request) = html_preview_fixture("ollama", "unsupported-endpoint");
+        assert!(
+            scoped(unsupported, provider.prepare_input_budget(request))
+                .await
+                .is_err()
+        );
+    }
+}

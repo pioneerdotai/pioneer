@@ -1,6 +1,7 @@
 mod avatar_rail;
 pub(crate) mod code_highlighting;
 pub(crate) mod controller;
+mod html;
 mod items;
 mod layout;
 pub(crate) mod layout_index;

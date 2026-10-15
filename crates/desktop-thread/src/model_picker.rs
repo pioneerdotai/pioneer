@@ -873,7 +873,7 @@ impl ComposerModelPickerView {
         };
 
         div()
-            .min_h(px(visible_height))
+            .h(px(visible_height))
             .relative()
             .overflow_hidden()
             .child(
@@ -1085,7 +1085,7 @@ impl Drop for ComposerModelPickerView {
         self.retire();
     }
 }
-#[derive(IntoElement)]
+#[derive(gpui_kit::IntoElement)]
 struct SelectorPopoverTrigger {
     id: ElementId,
     label: SharedString,

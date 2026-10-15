@@ -13,7 +13,7 @@ use pioneer_protocol::{
 };
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DbErr, EntityTrait, IntoActiveModel,
-    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set,
+    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, QueryTrait, Set,
     entity::prelude::DateTimeWithTimeZone,
 };
 
@@ -531,6 +531,264 @@ impl ArtifactRepository {
         Ok(refs)
     }
 
+    pub async fn has_html_publication<C: ConnectionTrait>(
+        &self,
+        db: &C,
+        workspace: &str,
+        thread: &str,
+        turn: &str,
+    ) -> ArtifactCrudResult<bool> {
+        use sea_orm::{DbBackend, Statement};
+        // Keep the authoritative publication even if the CLI dies before its
+        // tool echo. Deleted documents also retain their unavailable row.
+        let row = db.query_one_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+            "SELECT EXISTS(SELECT 1 FROM artifact_binding b JOIN artifact a ON a.id=b.artifact_id WHERE b.workspace_id=? AND b.thread_id=? AND b.turn_id=? AND a.workspace_id=b.workspace_id AND a.primary_thread_id=b.thread_id AND a.created_by_kind='tool' AND a.created_by_actor_id='html_render' AND a.mime_type='text/html' AND b.artifact_version_id=a.current_version_id AND b.binding_kind='tool_output' AND b.direction='output' AND b.role='tool' AND json_extract(a.metadata_json,'$.htmlTool.version')=1 AND json_extract(a.metadata_json,'$.htmlTool.publication')=1 AND json_extract(a.metadata_json,'$.htmlTool.index')='document' AND json_extract(a.metadata_json,'$.htmlTool.turnId')=b.turn_id AND json_extract(a.metadata_json,'$.htmlTool.callId')=b.tool_call_id) AS present",
+            [workspace.into(),thread.into(),turn.into()])).await.map_err(|source| ArtifactCrudError::Database {message:"HTML publication presence read failed".into(),source})?;
+        row.map(|row| {
+            row.try_get::<i64>("", "present")
+                .map(|present| present != 0)
+        })
+        .transpose()
+        .map(|present| present.unwrap_or(false))
+        .map_err(|source| ArtifactCrudError::Database {
+            message: "HTML publication presence invalid".into(),
+            source,
+        })
+    }
+
+    pub async fn touch_html_artifact_projection<C: ConnectionTrait>(
+        &self,
+        db: &C,
+        workspace: &str,
+        artifact: &str,
+        at: DateTimeWithTimeZone,
+    ) -> ArtifactCrudResult<()> {
+        use sea_orm::{DbBackend, Statement};
+        let owner = db.query_one_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+            "SELECT b.thread_id AS thread, b.turn_id AS turn FROM artifact a JOIN artifact_binding b ON b.artifact_id=a.id WHERE a.id=? AND a.workspace_id=? AND a.created_by_kind='tool' AND a.created_by_actor_id='html_render' AND b.binding_kind='tool_output' AND b.thread_id=a.primary_thread_id AND b.turn_id=json_extract(a.metadata_json,'$.htmlTool.turnId') AND b.tool_call_id=json_extract(a.metadata_json,'$.htmlTool.callId') LIMIT 1",
+            [artifact.into(),workspace.into()])).await.map_err(|source| ArtifactCrudError::Database {message:"HTML artifact projection owner read failed".into(),source})?;
+        if let Some(owner) = owner {
+            let thread: String =
+                owner
+                    .try_get("", "thread")
+                    .map_err(|source| ArtifactCrudError::Database {
+                        message: "HTML artifact thread invalid".into(),
+                        source,
+                    })?;
+            let turn: String =
+                owner
+                    .try_get("", "turn")
+                    .map_err(|source| ArtifactCrudError::Database {
+                        message: "HTML artifact turn invalid".into(),
+                        source,
+                    })?;
+            self.touch_html_turn_projection(db, workspace, &thread, &turn, at)
+                .await?;
+        }
+        Ok(())
+    }
+
+    pub async fn touch_html_turn_projection<C: ConnectionTrait>(
+        &self,
+        db: &C,
+        workspace: &str,
+        thread: &str,
+        turn: &str,
+        at: DateTimeWithTimeZone,
+    ) -> ArtifactCrudResult<()> {
+        use pioneer_entity::turn_work_projection;
+        let Some(existing) = turn_work_projection::Entity::find_by_id(turn.to_owned())
+            .one(db)
+            .await
+            .map_err(|source| ArtifactCrudError::Database {
+                message: "HTML work projection read failed".into(),
+                source,
+            })?
+        else {
+            return Ok(());
+        };
+        if existing.workspace_id != workspace || existing.thread_id != thread {
+            return Err(ArtifactCrudError::InvalidRequest {
+                message: "HTML work projection ownership mismatch".into(),
+            });
+        }
+        // Reuse the existing work revision: equal event high-watermarks still
+        // order artifact-only changes, including delete/restore, across reconnect.
+        let updated = at.max(existing.updated_at + chrono::Duration::microseconds(1));
+        let mut model = existing.into_active_model();
+        model.updated_at = Set(updated);
+        model
+            .update(db)
+            .await
+            .map_err(|source| ArtifactCrudError::Database {
+                message: "HTML work projection update failed".into(),
+                source,
+            })?;
+        Ok(())
+    }
+
+    pub async fn validate_tool_ingest_owner<C: ConnectionTrait>(
+        &self,
+        db: &C,
+        workspace: &str,
+        target: &ArtifactBindingTargetRecord,
+    ) -> ArtifactCrudResult<()> {
+        use pioneer_entity::{thread, turn};
+        let thread_id = target.thread_id.as_deref().unwrap_or_default();
+        let thread = thread::Entity::find_by_id(thread_id.to_owned())
+            .one(db)
+            .await
+            .map_err(|source| ArtifactCrudError::Database {
+                message: "tool artifact owner read failed".into(),
+                source,
+            })?;
+        let turn = turn::Entity::find_by_id(target.turn_id.clone().unwrap_or_default())
+            .one(db)
+            .await
+            .map_err(|source| ArtifactCrudError::Database {
+                message: "tool artifact turn read failed".into(),
+                source,
+            })?;
+        if !thread.is_some_and(|t| t.workspace_id == workspace && t.status != "deleted")
+            || !turn.is_some_and(|t| t.thread_id == thread_id && t.status == "in_progress")
+        {
+            return Err(ArtifactCrudError::InvalidRequest {
+                message: "tool artifact owner is no longer live".into(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Constant-size aggregate rows; no full-workspace materialization under the writer.
+    pub async fn reserve_tool_artifact_index<C: ConnectionTrait>(
+        &self,
+        db: &C,
+        workspace: &str,
+        target: &ArtifactBindingTargetRecord,
+        incoming: u64,
+        max_bytes: u64,
+        max_files: u64,
+        publication: bool,
+    ) -> ArtifactCrudResult<i64> {
+        use sea_orm::{DbBackend, Statement};
+        let usage = db.query_one_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+            "SELECT (SELECT COUNT(*) FROM artifact WHERE workspace_id=? AND status!='deleted') AS files, COALESCE((SELECT SUM(size_bytes) FROM artifact_blob b WHERE b.workspace_id=? AND (EXISTS (SELECT 1 FROM artifact_version v JOIN artifact a ON a.id=v.artifact_id WHERE v.blob_id=b.id AND a.status!='deleted') OR EXISTS (SELECT 1 FROM artifact_projection p JOIN artifact a ON a.id=p.artifact_id WHERE p.blob_id=b.id AND a.status!='deleted'))),0) AS bytes",
+            [workspace.into(),workspace.into()])).await.map_err(|source| ArtifactCrudError::Database { message:"tool artifact quota read failed".into(),source })?.ok_or_else(|| ArtifactCrudError::InvalidRequest { message:"quota aggregate missing".into() })?;
+        let files: i64 =
+            usage
+                .try_get("", "files")
+                .map_err(|source| ArtifactCrudError::Database {
+                    message: "file quota aggregate invalid".into(),
+                    source,
+                })?;
+        let bytes: i64 =
+            usage
+                .try_get("", "bytes")
+                .map_err(|source| ArtifactCrudError::Database {
+                    message: "byte quota aggregate invalid".into(),
+                    source,
+                })?;
+        if (files.max(0) as u64).saturating_add(1) > max_files
+            || (bytes.max(0) as u64).saturating_add(incoming) > max_bytes
+        {
+            return Err(ArtifactCrudError::InvalidRequest {
+                message: "tool artifact workspace quota exceeded".into(),
+            });
+        }
+        if publication {
+            let count = db.query_one_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+                "SELECT COUNT(*) AS count FROM artifact a WHERE workspace_id=? AND created_by_actor_id='html_render' AND EXISTS (SELECT 1 FROM artifact_binding b WHERE b.artifact_id=a.id AND b.thread_id=? AND b.turn_id=? AND b.binding_kind='tool_output' AND a.primary_thread_id=b.thread_id AND json_extract(a.metadata_json,'$.htmlTool.turnId')=b.turn_id)",
+                [workspace.into(),target.thread_id.clone().unwrap_or_default().into(),target.turn_id.clone().unwrap_or_default().into()])).await.map_err(|source| ArtifactCrudError::Database { message:"publication capacity read failed".into(),source })?.ok_or_else(|| ArtifactCrudError::InvalidRequest { message:"publication capacity missing".into() })?;
+            let count: i64 =
+                count
+                    .try_get("", "count")
+                    .map_err(|source| ArtifactCrudError::Database {
+                        message: "publication count invalid".into(),
+                        source,
+                    })?;
+            if count >= MAX_LIST_LIMIT as i64 {
+                return Err(ArtifactCrudError::InvalidRequest {
+                    message: "HTML publications exceed the existing turn artifact page capacity"
+                        .into(),
+                });
+            }
+        }
+        let sequence = db.query_one_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+            "SELECT COALESCE(MAX(item_index),0)+1 AS sequence FROM artifact_binding WHERE workspace_id=? AND thread_id=? AND turn_id=? AND binding_kind='tool_output'",
+            [workspace.into(),target.thread_id.clone().unwrap_or_default().into(),target.turn_id.clone().unwrap_or_default().into()])).await.map_err(|source| ArtifactCrudError::Database { message:"tool artifact ordering read failed".into(),source })?.ok_or_else(|| ArtifactCrudError::InvalidRequest { message:"tool artifact sequence missing".into() })?;
+        sequence
+            .try_get("", "sequence")
+            .map_err(|source| ArtifactCrudError::Database {
+                message: "tool artifact sequence invalid".into(),
+                source,
+            })
+    }
+
+    /// Called only inside the serialized ingest transaction. The prepared identity
+    /// includes workspace, turn, canonical call and output index; metadata is compared
+    /// as pre-serialized bytes, with no filesystem or hashing under DB capacity.
+    pub async fn find_idempotent_ingest<C: ConnectionTrait>(
+        &self,
+        db: &C,
+        id: &str,
+        expected: &NewArtifactBlobRecord,
+        metadata: &str,
+    ) -> ArtifactCrudResult<Option<IngestedArtifactRecord>> {
+        let Some(artifact) = artifact::Entity::find_by_id(id.to_owned())
+            .one(db)
+            .await
+            .map_err(|source| ArtifactCrudError::Database {
+                message: "failed to query tool artifact identity".into(),
+                source,
+            })?
+        else {
+            return Ok(None);
+        };
+        if artifact.workspace_id != expected.workspace_id
+            || artifact.metadata_json != metadata
+            || artifact.status != "ready"
+        {
+            return Err(ArtifactCrudError::InvalidRequest {
+                message: "tool artifact identity conflict or deleted publication".into(),
+            });
+        }
+        let version = artifact_version::Entity::find_by_id(
+            artifact.current_version_id.clone().unwrap_or_default(),
+        )
+        .one(db)
+        .await
+        .map_err(|source| ArtifactCrudError::Database {
+            message: "failed to query tool artifact version".into(),
+            source,
+        })?
+        .ok_or_else(|| ArtifactCrudError::NotFound {
+            message: "tool artifact version missing".into(),
+        })?;
+        let blob = artifact_blob::Entity::find_by_id(version.blob_id.clone())
+            .one(db)
+            .await
+            .map_err(|source| ArtifactCrudError::Database {
+                message: "failed to query tool artifact blob".into(),
+                source,
+            })?
+            .ok_or_else(|| ArtifactCrudError::NotFound {
+                message: "tool artifact blob missing".into(),
+            })?;
+        if blob.workspace_id != expected.workspace_id
+            || blob.sha256 != expected.sha256
+            || blob.size_bytes != expected.size_bytes as i64
+        {
+            return Err(ArtifactCrudError::InvalidRequest {
+                message: "same tool call supplied different content".into(),
+            });
+        }
+        Ok(Some(IngestedArtifactRecord {
+            artifact: artifact_record_from_model(artifact),
+            version: version_record_from_model(version),
+            blob: blob_record_from_model(blob),
+        }))
+    }
+
     pub async fn get_artifact_version_blob<C: ConnectionTrait>(
         &self,
         db: &C,
@@ -716,6 +974,28 @@ impl ArtifactRepository {
                 );
             }
 
+            if let Some(actor) = &filter.created_by_actor_id {
+                let mut owned = artifact::Entity::find()
+                    .select_only()
+                    .column(artifact::Column::Id)
+                    .filter(artifact::Column::WorkspaceId.eq(workspace_id.to_owned()))
+                    .filter(artifact::Column::CreatedByActorId.eq(actor.clone()));
+                if actor == "html_render" {
+                    // A document attached elsewhere is an attachment there, not
+                    // another publication. Exclude it before identity pagination.
+                    if let Some(thread) = &filter.thread_id {
+                        owned = owned.filter(artifact::Column::PrimaryThreadId.eq(thread.clone()));
+                    }
+                    if let Some(turn) = &filter.turn_id {
+                        owned = owned.filter(sea_orm::sea_query::Expr::cust_with_values(
+                            "json_extract(metadata_json, '$.htmlTool.turnId') = ?",
+                            [turn.clone()],
+                        ));
+                    }
+                }
+                query = query
+                    .filter(artifact_binding::Column::ArtifactId.in_subquery(owned.into_query()));
+            }
             let mut thread_ids = filter.thread_ids.clone();
             if let Some(thread_id) = &filter.thread_id {
                 thread_ids.push(thread_id.clone());
@@ -740,25 +1020,44 @@ impl ArtifactRepository {
                 query = query.filter(artifact_binding::Column::TaskRunId.eq(task_run_id.clone()));
             }
 
-            let bindings = query
-                .order_by_desc(artifact_binding::Column::CreatedAt)
-                .order_by_desc(artifact_binding::Column::Id)
-                .limit(query_limit)
-                .offset(offset)
-                .all(db)
-                .await
-                .map_err(|source| ArtifactCrudError::Database {
-                    message: "failed to list artifact bindings".to_owned(),
-                    source,
-                })?;
+            if filter.created_by_actor_id.is_some() {
+                // First-party timeline consumers page identities, not bindings:
+                // attaching a document again must not hide another publication.
+                query
+                    .select_only()
+                    .column(artifact_binding::Column::ArtifactId)
+                    .distinct()
+                    .order_by_asc(artifact_binding::Column::ArtifactId)
+                    .limit(query_limit)
+                    .offset(offset)
+                    .into_tuple::<String>()
+                    .all(db)
+                    .await
+                    .map_err(|source| ArtifactCrudError::Database {
+                        message: "failed to list tool artifact identities".into(),
+                        source,
+                    })?
+            } else {
+                let bindings = query
+                    .order_by_desc(artifact_binding::Column::CreatedAt)
+                    .order_by_desc(artifact_binding::Column::Id)
+                    .limit(query_limit)
+                    .offset(offset)
+                    .all(db)
+                    .await
+                    .map_err(|source| ArtifactCrudError::Database {
+                        message: "failed to list artifact bindings".to_owned(),
+                        source,
+                    })?;
 
-            let mut artifact_ids = Vec::<String>::new();
-            for binding in bindings {
-                if !artifact_ids.iter().any(|id| id == &binding.artifact_id) {
-                    artifact_ids.push(binding.artifact_id);
+                let mut artifact_ids = Vec::<String>::new();
+                for binding in bindings {
+                    if !artifact_ids.iter().any(|id| id == &binding.artifact_id) {
+                        artifact_ids.push(binding.artifact_id);
+                    }
                 }
+                artifact_ids
             }
-            artifact_ids
         } else {
             let mut query = artifact::Entity::find()
                 .filter(artifact::Column::WorkspaceId.eq(workspace_id.to_owned()))
@@ -771,6 +1070,9 @@ impl ArtifactRepository {
                     artifact::Column::Id
                         .is_in(non_empty_authorized_artifact_ids(authorized_artifact_ids)),
                 );
+            }
+            if let Some(actor) = &filter.created_by_actor_id {
+                query = query.filter(artifact::Column::CreatedByActorId.eq(actor.clone()));
             }
             query
                 .all(db)
@@ -1157,6 +1459,7 @@ pub struct ArtifactListFilterRecord {
     pub thread_id: Option<String>,
     pub thread_ids: Vec<String>,
     pub authorized_artifact_ids: Option<Vec<String>>,
+    pub created_by_actor_id: Option<String>,
     pub turn_id: Option<String>,
     pub message_id: Option<String>,
     pub task_id: Option<String>,
@@ -1977,6 +2280,7 @@ fn binding_summary_from_model(
     binding: &artifact_binding::Model,
 ) -> ArtifactCrudResult<ArtifactBindingSummary> {
     Ok(ArtifactBindingSummary {
+        version_id: binding.artifact_version_id.clone(),
         binding_id: binding.id.clone(),
         workspace_id: binding.workspace_id.clone(),
         thread_id: binding.thread_id.clone(),

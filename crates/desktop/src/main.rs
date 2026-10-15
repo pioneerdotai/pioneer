@@ -109,6 +109,11 @@ impl HttpClient for DesktopHttpClient {
 }
 
 fn main() {
+    // Pinned Kit's Windows child-WebView bootstrap, before UI/runtime threads.
+    #[cfg(target_os = "windows")]
+    unsafe {
+        std::env::set_var("GPUI_DISABLE_DIRECT_COMPOSITION", "true");
+    }
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     if let Some(version_probe) = version_probe_from_args(args.iter().cloned()) {
         print_version_probe(version_probe);
@@ -211,7 +216,11 @@ fn main() {
     let (url_sender, mut url_receiver) = tokio::sync::mpsc::unbounded_channel::<Vec<String>>();
     let ui_runtime_stage =
         startup.stage(pioneer_observability::DesktopStartupStage::UiRuntimeInitialize);
-    let app = gpui_kit::application()
+    #[cfg(target_os = "linux")]
+    let app = gpui_kit::platform::linux(gpui_kit::WindowingModes::X11);
+    #[cfg(not(target_os = "linux"))]
+    let app = gpui_kit::application();
+    let app = app
         .with_assets(PioneerAssetsSource)
         .with_http_client(Arc::new(http_client));
     ui_runtime_stage.succeed();

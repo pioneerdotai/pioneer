@@ -51,6 +51,8 @@ pub struct TimelineToolContent {
 #[cfg_attr(any(feature = "schema", test), derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TimelineItemPresentation {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub html_publications: Vec<pioneer_protocol::HtmlPublication>,
     pub kind: TimelineItemKind,
     pub text: String,
     pub markdown: Option<MarkdownDocument>,
@@ -104,6 +106,7 @@ pub(crate) fn project_item(item: &ItemView) -> TimelineItemPresentation {
     }
     .to_owned();
     let mut result = TimelineItemPresentation {
+        html_publications: item.html_publications.clone(),
         kind,
         text,
         markdown: item

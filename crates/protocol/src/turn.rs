@@ -4448,6 +4448,7 @@ impl ToolOutputPolicySnapshot {
             "web_search" => web_search_output_policy_snapshot(),
             "download_url" | "download" => download_output_policy_snapshot(),
             "computer_use" => computer_use_output_policy_snapshot(),
+            "html_preview" | "html_render" => html_output_policy_snapshot(),
             "artifact_prepare" | "artifact_register" | "read_file" | "read_skill" | "list_dir"
             | "grep_files" | "apply_patch" | "tool_search" | "tool_suggest" => {
                 model_only_metadata_policy_snapshot()
@@ -4463,6 +4464,7 @@ impl ToolOutputPolicySnapshot {
             "web_search" => web_search_output_policy_snapshot(),
             "download_url" | "download" => download_output_policy_snapshot(),
             "computer_use" => computer_use_output_policy_snapshot(),
+            "html_preview" | "html_render" => html_output_policy_snapshot(),
             "artifact_prepare" | "artifact_register" | "read_file" | "list_dir" | "grep_files"
             | "apply_patch" | "tool_search" | "tool_suggest" => {
                 model_only_metadata_policy_snapshot()
@@ -4606,6 +4608,19 @@ fn external_runtime_tool_output_policy_snapshot() -> ToolOutputPolicySnapshot {
         recovery: RecoveryOutputPolicy::MetadataOnly,
         deltas: DeltaOutputPolicy::ProgressOnly,
     }
+}
+
+fn html_output_policy_snapshot() -> ToolOutputPolicySnapshot {
+    // Three bounded diagnostic sets plus exact screenshot references. Actual PNG
+    // bytes travel as media parts, never in timeline/storage JSON.
+    let mut policy = dynamic_unknown_output_policy_snapshot();
+    policy.llm = LlmOutputPolicy::Structured {
+        max_bytes: 96 * 1024,
+    };
+    policy.llm_retention = LlmRetentionPolicy::UntilTurnTerminal {
+        max_bytes: 96 * 1024,
+    };
+    policy
 }
 
 fn dynamic_unknown_output_policy_snapshot() -> ToolOutputPolicySnapshot {

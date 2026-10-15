@@ -586,6 +586,15 @@ impl DesktopShellView {
         view.mount_thread(window, cx);
         view
     }
+    fn retire_thread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.thread_events.take();
+        if let Some((_, thread)) = self.thread.take() {
+            // Retained frame/element references may outlive this shell owner.
+            // Hide native children while the old feature is still addressable.
+            thread.update(cx, |thread, cx| thread.set_visible(false, window, cx));
+        }
+    }
+
     fn mount_thread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let visible = self.navigation.is_visible(MainRoute::Threads);
         let (client, registrar) = {
@@ -594,13 +603,14 @@ impl DesktopShellView {
         };
         let target = thread_view_target(&self.navigation, &client, window.is_window_active());
         if self.thread.as_ref().map(|(id, _)| id) == target.as_ref() {
-            if let Some((_, thread)) = &self.thread {
+            if let Some((_, thread)) = &self.thread
+                && thread.read(cx).is_visible() != visible
+            {
                 thread.update(cx, |thread, cx| thread.set_visible(visible, window, cx));
             }
             return;
         }
-        self.thread_events.take();
-        self.thread.take();
+        self.retire_thread(window, cx);
         let Some(thread_id) = target.filter(|_| visible) else {
             return;
         };
@@ -771,8 +781,7 @@ impl DesktopShellView {
         self.layout
             .update(cx, |layout, cx| layout.persist(window, cx));
         self.route_task.take();
-        self.thread_events.take();
-        self.thread.take();
+        self.retire_thread(window, cx);
         self.identity_task.take();
         self.identity.take();
         self.gateway_switcher.take();
@@ -871,7 +880,7 @@ impl Render for DesktopShellView {
             .into_any_element()
     }
 }
-#[derive(IntoElement)]
+#[derive(gpui_kit::IntoElement)]
 struct TitleBarSurface {
     content: AnyElement,
 }
@@ -880,7 +889,7 @@ impl RenderOnce for TitleBarSurface {
         self.content
     }
 }
-#[derive(IntoElement)]
+#[derive(gpui_kit::IntoElement)]
 struct BottomBarSurface {
     content: AnyElement,
 }
@@ -889,7 +898,7 @@ impl RenderOnce for BottomBarSurface {
         self.content
     }
 }
-#[derive(IntoElement)]
+#[derive(gpui_kit::IntoElement)]
 struct ScreenHostView {
     selected: Option<AnyView>,
 }
@@ -950,7 +959,7 @@ impl Render for SidebarHostView {
             .into_any_element()
     }
 }
-#[derive(IntoElement)]
+#[derive(gpui_kit::IntoElement)]
 struct DesktopBody {
     sidebar: AnyElement,
     screen: AnyElement,

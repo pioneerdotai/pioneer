@@ -48,6 +48,7 @@ async-stream.workspace = true
 futures-util.workspace = true
 keepawake.workspace = true
 libc.workspace = true
+process-wrap.workspace = true
 log.workspace = true
 memvid-core.workspace = true
 tracing.workspace = true
@@ -79,6 +80,7 @@ transcribe-rs.workspace = true
 uuid.workspace = true
 zeroize.workspace = true
 tempfile.workspace = true
+tokio-tungstenite.workspace = true
 
 [build-dependencies]
 pioneer-protocol.workspace = true
@@ -86,7 +88,6 @@ serde.workspace = true
 toml.workspace = true
 
 [dev-dependencies]
-tokio-tungstenite.workspace = true
 sentry = { workspace = true, features = ["test"] }
 pioneer-sqlite = { workspace = true, features = ["test-support"] }
 pioneer-client.workspace = true

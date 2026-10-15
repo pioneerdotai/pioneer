@@ -179,6 +179,21 @@ impl ClientCore {
             .cloned()
     }
 
+    pub(super) fn artifact_preparation_is_current(
+        &self,
+        identity: &ArtifactActionIdentity,
+    ) -> bool {
+        !self.is_stopped()
+            && self
+                .artifact_action_snapshot(identity)
+                .is_some_and(|action| {
+                    action.state == ArtifactActionState::Resolving
+                        && action.thread_incarnation
+                            == self.thread_operation_token(&identity.thread_id)
+                        && action.auth_ticket == self.current_auth_ticket()
+                })
+    }
+
     /// Claims a prepared native effect exactly once. A late result may never
     /// open a browser or share a file after its route/operation was retired.
     pub fn claim_artifact_presentation(&self, identity: &ArtifactActionIdentity) -> bool {
@@ -481,6 +496,78 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn share_download_waits_for_capacity_and_cancelled_owner_never_continues() {
+        use super::super::operations::{ArtifactDownloadOperationError, ArtifactDownloadState};
+        let core = Arc::new(ClientCore::new());
+        let target = ArtifactDownloadTarget {
+            thread_id: Some("response".into()),
+            workspace_id: "workspace-one".into(),
+            artifact_id: "artifact-one".into(),
+            version_id: Some("version-one".into()),
+        };
+        let mut unrelated = target.clone();
+        unrelated.thread_id = None; // Release must wake even without a thread publication.
+        let busy = (0..8)
+            .map(|index| {
+                core.begin_artifact_download(format!("busy-{index}"), unrelated.clone())
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        core.begin_artifact_action_for_target(target.clone(), ArtifactActionKind::Share);
+        let cancelled = core.artifact_snapshot("response").unwrap().actions[0]
+            .identity
+            .clone();
+        assert!(core.start_artifact_preparation(&cancelled, ArtifactActionKind::Share));
+        let mut waiting =
+            Box::pin(core.admit_artifact_action_download(&cancelled, "html-cancelled".into()));
+        assert!(futures_util::poll!(waiting.as_mut()).is_pending());
+        assert_eq!(
+            core.artifact_action_snapshot(&cancelled).unwrap().state,
+            ArtifactActionState::Resolving
+        );
+        assert!(core.cancel_artifact_action(&cancelled));
+        assert_eq!(waiting.await.err().unwrap().code(), "cancelled");
+        assert!(core.artifact_download_snapshot("html-cancelled").is_none());
+        assert!(!core.prepare_artifact_presentation(&cancelled, None));
+
+        core.begin_artifact_action_for_target(target.clone(), ArtifactActionKind::Share);
+        let identity = core.artifact_snapshot("response").unwrap().actions[0]
+            .identity
+            .clone();
+        assert!(core.start_artifact_preparation(&identity, ArtifactActionKind::Share));
+        let mut waiting =
+            Box::pin(core.admit_artifact_action_download(&identity, "html-waiting".into()));
+        assert!(futures_util::poll!(waiting.as_mut()).is_pending());
+        assert!(matches!(
+            core.begin_artifact_download("overflow".into(), unrelated.clone()),
+            Err(ArtifactDownloadOperationError::Capacity)
+        ));
+        assert!(busy[0].finish(ArtifactDownloadState::Completed, None));
+        let operation = waiting.await.expect("released slot admits HTML");
+        assert_eq!(
+            core.artifact_download_snapshot("html-waiting")
+                .unwrap()
+                .target,
+            target
+        );
+        assert!(matches!(
+            core.begin_artifact_download("overflow".into(), unrelated),
+            Err(ArtifactDownloadOperationError::Capacity)
+        ));
+        let directory = tempfile::tempdir().unwrap();
+        let result =
+            super::super::http_download::tests::verified_html_fixture(&operation, directory.path())
+                .await;
+        assert_eq!(Some(&result.version_id), identity.version_id.as_ref());
+        assert!(operation.finish(ArtifactDownloadState::Completed, None));
+        assert!(core.prepare_artifact_presentation(&identity, None));
+        assert!(core.claim_artifact_presentation(&identity));
+        assert!(core.complete_artifact_presentation(&identity, None));
+        assert!(!core.claim_artifact_presentation(&cancelled));
+        assert!(core.artifact_download_snapshot("html-cancelled").is_none());
+    }
+
     #[test]
     fn authentication_retry_is_bounded_and_cancel_targets_only_the_attached_transfer() {
         use super::super::operations::ArtifactDownloadState;
@@ -496,8 +583,13 @@ mod tests {
             .identity
             .clone();
         assert!(core.start_artifact_preparation(&identity, ArtifactActionKind::Share));
+        // The HTML caller must pass this shared boundary after Share admission.
+        assert!(matches!(
+            core.begin_artifact_download("html:42".into(), target.clone()),
+            Err(super::super::operations::ArtifactDownloadOperationError::InvalidIdentity)
+        ));
         let first = core
-            .begin_artifact_download("first".into(), target.clone())
+            .begin_artifact_download("html-42".into(), target.clone())
             .unwrap();
         assert!(core.attach_artifact_download(&identity, first.identity()));
         assert!(!core.attach_artifact_download(&identity, first.identity()));

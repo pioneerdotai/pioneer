@@ -88,6 +88,11 @@ impl TimelineLayoutStore {
             .filter(|entry| entry.key == *key)
             .map(|entry| entry.height)
     }
+    pub fn invalidate_row(&mut self, id: &RowId) {
+        self.entries.remove(id);
+        // A pending draw must not commit a previous HTML intrinsic height.
+        self.context_revision += 1;
+    }
     pub fn context_changed(&mut self) {
         self.context_revision += 1;
     }

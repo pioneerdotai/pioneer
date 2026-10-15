@@ -1052,7 +1052,7 @@ pub(super) fn build_tool_turn_item(input: ProjectedToolItemInput) -> TurnItem {
     let storage_metadata = storage_metadata_from_payload(storage_projection.as_ref());
     let storage_summary = storage_summary_from_payload(storage_projection.as_ref());
 
-    match tool_item_type_from_name(tool_name.as_str()) {
+    let mut item = match tool_item_type_from_name(tool_name.as_str()) {
         TurnItemType::CommandExecution => {
             let shell = shell_from_storage(storage_projection.as_ref())
                 .or_else(|| shell_from_display(display_projection.as_ref()))
@@ -1361,7 +1361,12 @@ pub(super) fn build_tool_turn_item(input: ProjectedToolItemInput) -> TurnItem {
                 observation,
             }
         }
-    }
+    };
+    // Canonical provider-round envelopes retain the exact call arguments for
+    // execution/history pairing. Timeline lifecycle snapshots need one compact
+    // representation, rather than repeating a complete HTML source each time.
+    pioneer_protocol::compact_html_timeline_item(&mut item);
+    item
 }
 
 pub(super) fn build_tool_error_message(
@@ -1392,6 +1397,85 @@ pub(super) fn build_tool_error_message(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn html_lifecycle_items_keep_source_out_of_timeline_snapshots() {
+        for tool_name in ["html_render", "html_preview"] {
+            for (arguments, expected_arguments) in [
+                (
+                    r#"{"html":"<p>точный source</p>","title":"Page"}"#,
+                    serde_json::json!({
+                        "htmlCharacters": "<p>точный source</p>".chars().count(),
+                        "title": "Page",
+                    }),
+                ),
+                (
+                    r#"{"html":"<p>частичный"#,
+                    serde_json::json!({
+                        "argumentsCharacters": r#"{"html":"<p>частичный"#.chars().count(),
+                    }),
+                ),
+                (
+                    r#""<p>частичный""#,
+                    serde_json::json!({
+                        "argumentsCharacters": "<p>частичный".chars().count(),
+                    }),
+                ),
+            ] {
+                let items = [
+                    build_started_tool_turn_item(
+                        "call".into(),
+                        tool_name.into(),
+                        arguments.into(),
+                        None,
+                        TurnItemExecutionClass::Standard,
+                        None,
+                        None,
+                    ),
+                    build_completed_tool_turn_item(
+                        "call".into(),
+                        tool_name.into(),
+                        arguments.into(),
+                        None,
+                        TurnItemExecutionClass::Standard,
+                        None,
+                        None,
+                    ),
+                    build_failed_tool_turn_item(
+                        "call".into(),
+                        tool_name.into(),
+                        arguments.into(),
+                        "invalid arguments".into(),
+                        ToolOutcome::fatal(pioneer_tools::ToolErrorClass::InvalidArguments, None),
+                        None,
+                        TurnItemExecutionClass::Standard,
+                        None,
+                        None,
+                    ),
+                ];
+                for item in items {
+                    let json = serde_json::to_value(item).unwrap();
+                    assert!(!json.to_string().contains("<p>"));
+                    assert_eq!(json["arguments"], expected_arguments);
+                }
+            }
+        }
+
+        let partial_arguments = r#"{"html":"<p>частичный"#;
+        let ordinary = build_started_tool_turn_item(
+            "ordinary-call".into(),
+            "ordinary_tool".into(),
+            partial_arguments.into(),
+            None,
+            TurnItemExecutionClass::Standard,
+            None,
+            None,
+        );
+        assert_eq!(
+            serde_json::to_value(ordinary).unwrap()["arguments"]["raw"],
+            partial_arguments,
+        );
+    }
     use pioneer_protocol::AgentDurableEvent;
     use pioneer_tools::{
         ObservationContext, ToolCallCompletedEvent, ToolEventPayload, ToolResultView,

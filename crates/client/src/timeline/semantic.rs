@@ -3349,6 +3349,14 @@ fn upsert_assistant_message_block(
             .or(Some(now_unix_ms)),
         updated_at_unix_ms: Some(now_unix_ms),
         kind: TimelineBlockKind::AssistantMessage {
+            html_publications: existing
+                .and_then(|block| match &block.kind {
+                    TimelineBlockKind::AssistantMessage {
+                        html_publications, ..
+                    } => Some(html_publications.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default(),
             item_id: id.clone(),
             text: text.clone(),
             status,
@@ -3796,6 +3804,7 @@ fn upsert_turn_work_summary(
         .unwrap_or(0);
     let (first_work_item_id, last_work_item_id) = live_first_last_work_item_ids(thread, turn_id);
     let work = TurnWorkBlock {
+        html_publications: Vec::new(),
         turn_id: turn_id.to_owned(),
         presentation,
         state,
@@ -4508,9 +4517,21 @@ mod tests {
                 avatar_revision: Some(avatar.to_owned()),
                 agent: None,
             };
+            let publication: pioneer_protocol::HtmlPublication = serde_json::from_value(serde_json::json!({
+                "workspaceId":"workspace_a", "threadId":"source_child", "turnId":"source_turn", "callId":"html_call", "title":"Metadata title",
+                "artifact":{"artifact_id":"document","version_id":"exact-version","display_name":"Metadata title","kind":"file","mime_type":"text/html","size_bytes":10,"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","status":"ready"}
+            })).expect("publication fixture");
+            let mut answer = assistant_block("thread_a", "block_assistant", "003", "turn_a", None);
+            answer.block_id = assistant_block_id("turn_a", "item_block_assistant");
+            if let TimelineBlockKind::AssistantMessage {
+                html_publications, ..
+            } = &mut answer.kind
+            {
+                *html_publications = vec![publication.clone()];
+            }
             let blocks = vec![
-                turn_work_block("thread_a", "block_work", "002"),
-                assistant_block("thread_a", "block_assistant", "003", "turn_a", None),
+                turn_work_block("thread_a", &work_block_id("turn_a"), "002"),
+                answer,
             ];
             let mut state = SemanticTimelineState::default();
             apply_thread_timeline_page(
@@ -4543,6 +4564,24 @@ mod tests {
                         TopLevelPageMergeMode::Merge
                     },
                 );
+                // Native/CLI completion echo updates the same response, without
+                // dropping its source references or creating another HTML row.
+                apply_conversation_event_to_semantic_timeline(
+                    &mut state,
+                    "workspace_a",
+                    &ConversationEvent::ItemCompleted {
+                        thread_id: "thread_a".into(),
+                        turn_id: "turn_a".into(),
+                        item: TurnItem::AgentMessage {
+                            id: "item_block_assistant".into(),
+                            text: "final **markdown**".into(),
+                            phase: pioneer_protocol::AgentMessagePhase::FinalAnswer,
+                            markdown: None,
+                            markdown_version: None,
+                        },
+                    },
+                    3,
+                );
                 let rows = flatten_semantic_timeline(&state, "thread_a").unwrap().rows;
                 assert_eq!(rows.len(), 2, "CLI author must not hide work or its answer");
                 for (row, initial) in rows.iter().zip(&initial.rows) {
@@ -4556,6 +4595,16 @@ mod tests {
                 let rendered = super::super::semantic_render::render_semantic_timeline_rows(
                     &rows,
                     Default::default(),
+                );
+                assert_eq!(
+                    rendered
+                        .projection
+                        .items
+                        .iter()
+                        .find(|item| matches!(item.item, TurnItem::AgentMessage { .. }))
+                        .unwrap()
+                        .html_publications,
+                    vec![publication.clone()]
                 );
                 let render_rows = rendered
                     .rows
@@ -7556,6 +7605,7 @@ mod tests {
             started_at_unix_ms: Some(3),
             updated_at_unix_ms: Some(3),
             kind: TimelineBlockKind::AssistantMessage {
+                html_publications: Vec::new(),
                 item_id: format!("item_{block_id}"),
                 text: "final **markdown**".to_owned(),
                 status: TurnWorkItemStatus::Completed,
@@ -7668,6 +7718,7 @@ mod tests {
 
     fn work_block(turn_id: &str) -> TurnWorkBlock {
         TurnWorkBlock {
+            html_publications: Vec::new(),
             turn_id: turn_id.to_owned(),
             presentation: TurnWorkPresentation::ExpandedLive,
             state: TurnWorkState::Running,

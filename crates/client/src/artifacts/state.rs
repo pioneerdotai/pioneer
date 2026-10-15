@@ -625,6 +625,7 @@ mod tests {
             ArtifactKind::Json,
             ArtifactCreatedByKind::Agent,
             vec![ArtifactBindingSummary {
+                version_id: None,
                 binding_id: "bind_task".to_owned(),
                 workspace_id: "ws".to_owned(),
                 thread_id: Some("thread".to_owned()),
