@@ -324,3 +324,221 @@ async fn deadline_and_stop_during_invalid_completion_backoff_prevent_the_next_ca
         assert_eq!(saved(&f).await.previous_checkpoint, None);
     }
 }
+
+async fn attempt_history(f: &Fixture) -> Vec<String> {
+    f.store
+        .database_connection()
+        .query_all_raw(Statement::from_string(
+            DbBackend::Sqlite,
+            "SELECT observation FROM compaction_attempt_observation WHERE operation_id='operation' ORDER BY attempt",
+        ))
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| row.try_get("", "observation").unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn deadline_resume_executes_after_third_portion_or_correction_call_was_interrupted() {
+    for correction in [false, true] {
+        let text = if correction {
+            "small".into()
+        } else {
+            "漢字🌍".repeat(4000)
+        };
+        let f = fixture(
+            &text,
+            vec![
+                Reply::Success,
+                Reply::Transient,
+                Reply::Invalid,
+                Reply::Hang,
+                Reply::Success,
+            ],
+            !correction,
+            false,
+        )
+        .await;
+        f.store
+            .compaction_bind_execution_turn("operation", "turn")
+            .await
+            .unwrap();
+        let task = start(&f);
+        for calls in [2, 3] {
+            let retry_at = retry_time(&f, calls).await;
+            f.clock.advance(retry_at);
+        }
+        f.provider.wait_calls(4).await;
+        let interrupted = saved(&f).await;
+        let purpose = if correction {
+            AttemptPurpose::Correction
+        } else {
+            AttemptPurpose::Portion
+        };
+        assert!(
+            matches!(interrupted.phase, RunnerPhase::Attempt { purpose: actual, .. } if actual == purpose)
+        );
+        assert_eq!(interrupted.portion_attempts, 3);
+        assert_eq!(interrupted.attempts, 4);
+        assert_eq!(interrupted.retries, 1);
+        assert_eq!(interrupted.corrections, u8::from(correction));
+        assert!(interrupted.cursor > SourceCursor::default());
+        let checkpoint_id = interrupted.previous_checkpoint.as_ref().unwrap();
+        let checkpoint = f
+            .store
+            .compaction_checkpoint(checkpoint_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!checkpoint.summary.is_empty());
+        assert_eq!(checkpoint_id, "operation:summary:1");
+
+        f.clock.advance(f.runner.snapshot.admission.deadline_ms);
+        assert_eq!(
+            finish(task).await,
+            CompactionExit::Reconcile(FailureKind::Deadline)
+        );
+        assert_eq!(
+            f.runner.reconcile(FailureKind::Deadline).await.unwrap(),
+            CompactionExit::Failed(FailureKind::Deadline)
+        );
+        let expired = saved(&f).await;
+        assert_eq!(expired.portion_attempts, 3);
+        assert_eq!(expired.cursor, interrupted.cursor);
+        assert_eq!(expired.previous_checkpoint, interrupted.previous_checkpoint);
+        assert_eq!(expired.resume_phase, Some(RunnerPhase::Ready { purpose }));
+        assert!(expired.can_resume_deadline());
+        assert_eq!(expired.observation.as_ref().unwrap().failure, None);
+        assert_eq!(
+            serde_json::from_str::<RunnerState>(&serde_json::to_string(&expired).unwrap()).unwrap(),
+            expired
+        );
+        // Re-running the old execution does not refresh the exhausted budget.
+        assert_eq!(
+            f.runner.run(CancellationToken::new()).await.unwrap(),
+            CompactionExit::Reconcile(FailureKind::Deadline)
+        );
+        assert_eq!(saved(&f).await, expired);
+        assert_eq!(f.provider.calls.lock().unwrap().len(), 4);
+        let history = attempt_history(&f).await;
+        assert_eq!(history.len(), 4);
+
+        if correction {
+            // The saved summary is sufficient: the resumed correction must not
+            // read, validate or regenerate its already processed raw history.
+            f.store
+                .database_connection()
+                .execute_unprepared("DELETE FROM turn_event WHERE id='source'")
+                .await
+                .unwrap();
+        }
+        let deadline = expired.deadline_ms + pioneer_compaction::OPERATION_MILLIS;
+        assert!(
+            f.store
+                .compaction_resume_deadline("operation", "turn", deadline)
+                .await
+                .unwrap()
+        );
+        let resumed = saved(&f).await;
+        assert_eq!(resumed.portion_attempts, 0);
+        assert_eq!(resumed.phase, RunnerPhase::Ready { purpose });
+        assert_eq!(resumed.generation, expired.generation + 1);
+        assert_eq!(resumed.attempts, expired.attempts);
+        assert_eq!(resumed.retries, expired.retries);
+        assert_eq!(resumed.corrections, expired.corrections);
+        assert_eq!(resumed.target_tokens, expired.target_tokens);
+        assert_eq!(resumed.cursor, expired.cursor);
+        assert_eq!(resumed.previous_checkpoint, expired.previous_checkpoint);
+        assert_eq!(
+            resumed.source_text_projection_version,
+            expired.source_text_projection_version
+        );
+        assert_eq!(attempt_history(&f).await, history);
+        let operation = f
+            .store
+            .compaction_operation("operation")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(operation.status, "running");
+        assert_eq!(operation.deadline_ms as u64, deadline);
+        assert_eq!(operation.attempts as u64, expired.attempts);
+        assert_eq!(operation.transient_retries as u8, expired.retries);
+        assert_eq!(operation.correction as u8, expired.corrections);
+        let snapshot = serde_json::from_str(&operation.snapshot).unwrap();
+        let runner = Arc::new(CompactionRunner::new(
+            f.store.clone(),
+            "ws".into(),
+            "thread".into(),
+            snapshot,
+            f.runner.summarizer.clone(),
+            f.runner.target.clone(),
+            f.observer.clone(),
+            f.clock.clone(),
+        ));
+        let gate = f.provider.pause_next();
+        let task = tokio::spawn(async move { runner.run(CancellationToken::new()).await });
+        f.provider.wait_calls(5).await;
+        let claimed = saved(&f).await;
+        assert_eq!(claimed.attempts, expired.attempts + 1);
+        assert_eq!(claimed.portion_attempts, 1);
+        assert_eq!(claimed.cursor, expired.cursor);
+        assert_eq!(claimed.previous_checkpoint, expired.previous_checkpoint);
+        assert!(
+            matches!(claimed.phase, RunnerPhase::Attempt { purpose: actual, .. } if actual == purpose)
+        );
+        assert_same_request(&f, 1, 5);
+        let retried: SummaryInput = {
+            let calls = f.provider.calls.lock().unwrap();
+            serde_json::from_str(&calls[4].messages[1].content).unwrap()
+        };
+        assert_eq!(retried.previous_summary, checkpoint.summary);
+        if correction {
+            assert!(retried.compact_units.is_empty());
+            assert!(retried.reference_only.is_empty());
+        } else {
+            let first: SummaryInput =
+                serde_json::from_str(&f.provider.calls.lock().unwrap()[0].messages[1].content)
+                    .unwrap();
+            assert_ne!(
+                serde_json::to_value(&first.compact_units).unwrap(),
+                serde_json::to_value(&retried.compact_units).unwrap()
+            );
+        }
+        gate.add_permits(1);
+        let exit = finish(task).await;
+        if correction {
+            assert_eq!(
+                exit,
+                CompactionExit::Failed(FailureKind::InsufficientEffect)
+            );
+            assert_eq!(
+                f.provider.calls.lock().unwrap().len(),
+                5,
+                "a second correction must not be admitted"
+            );
+        } else {
+            assert!(matches!(exit, CompactionExit::Applied(_)));
+        }
+        let completed = saved(&f).await;
+        assert_eq!(
+            completed.attempts as usize,
+            f.provider.calls.lock().unwrap().len()
+        );
+        assert!(completed.attempts > expired.attempts);
+        assert_eq!(completed.retries, expired.retries);
+        assert_eq!(completed.corrections, expired.corrections);
+        assert_eq!(completed.target_tokens, expired.target_tokens);
+        assert_eq!(&attempt_history(&f).await[..history.len()], &history);
+        assert_eq!(
+            f.store
+                .compaction_checkpoint(checkpoint_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .summary,
+            checkpoint.summary
+        );
+    }
+}

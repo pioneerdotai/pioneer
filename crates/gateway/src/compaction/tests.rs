@@ -5930,7 +5930,20 @@ async fn later_admission_resumes_deadline_progress_without_replaying_saved_porti
             );
             continue;
         }
-        // Operation and state must roll back together if the second write fails.
+        let before_resume = f
+            .store
+            .compaction_runner_state("operation")
+            .await
+            .unwrap()
+            .unwrap();
+        let operation_before_resume = f
+            .store
+            .compaction_operation("operation")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(before_resume.portion_attempts, 1);
+        // Operation, state and portion budget must roll back together if the second write fails.
         f.store.database_connection().execute_raw(Statement::from_string(DbBackend::Sqlite,
             "CREATE TRIGGER reject_resume BEFORE UPDATE ON compaction_runner_state BEGIN SELECT RAISE(ABORT,'fixture'); END"
         )).await.unwrap();
@@ -5948,6 +5961,35 @@ async fn later_admission_resumes_deadline_progress_without_replaying_saved_porti
                 .unwrap()
                 .status,
             "failed"
+        );
+        assert_eq!(
+            f.store
+                .compaction_runner_state("operation")
+                .await
+                .unwrap()
+                .unwrap(),
+            before_resume
+        );
+        let rolled_back = f
+            .store
+            .compaction_operation("operation")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(rolled_back.deadline_ms, operation_before_resume.deadline_ms);
+        assert_eq!(rolled_back.snapshot, operation_before_resume.snapshot);
+        assert_eq!(rolled_back.outcome, operation_before_resume.outcome);
+        assert_eq!(
+            (
+                rolled_back.attempts,
+                rolled_back.transient_retries,
+                rolled_back.correction
+            ),
+            (
+                operation_before_resume.attempts,
+                operation_before_resume.transient_retries,
+                operation_before_resume.correction
+            )
         );
         f.store
             .database_connection()
@@ -5981,6 +6023,12 @@ async fn later_admission_resumes_deadline_progress_without_replaying_saved_porti
             (before.attempts, before.retries, before.corrections)
         );
         assert_eq!(after.deadline_ms, resumed_deadline);
+        assert_eq!(after.portion_attempts, 0);
+        assert_eq!(after.target_tokens, before.target_tokens);
+        assert_eq!(
+            after.source_text_projection_version,
+            before.source_text_projection_version
+        );
         let snapshot = serde_json::from_str(
             &f.store
                 .compaction_operation("operation")

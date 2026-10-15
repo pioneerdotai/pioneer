@@ -100,7 +100,8 @@ pub struct RunnerState {
     pub attempts: u64,
     pub retries: u8,
     /// Claims for the current portion (or correction), persisted before I/O.
-    /// Accepted candidates reset this independently of operation-wide retries.
+    /// Accepted candidates and an admitted Deadline-resume reset this
+    /// independently of operation-wide retries.
     #[serde(default)]
     pub portion_attempts: u8,
     pub corrections: u8,
@@ -390,7 +391,8 @@ impl RunnerState {
                 .is_none_or(|o| o.failure.is_none())
     }
     /// A later admission supplies its existing request budget. Never extend the
-    /// interrupted request or reset provider retry/correction budgets.
+    /// interrupted request or reset provider retry/correction budgets. Only
+    /// this admitted transition grants a fresh portion budget for a new execution.
     pub fn resume_deadline(&self, deadline_ms: u64, legacy_final: bool) -> anyhow::Result<Self> {
         anyhow::ensure!(
             self.can_resume_deadline() && deadline_ms > self.deadline_ms,
@@ -398,6 +400,7 @@ impl RunnerState {
         );
         let mut next = self.next()?;
         next.deadline_ms = deadline_ms;
+        next.portion_attempts = 0;
         next.phase = next.resume_phase.take().unwrap_or_else(|| {
             if legacy_final {
                 RunnerPhase::Candidate {
@@ -688,6 +691,129 @@ mod tests {
                 kind: FailureKind::InsufficientEffect
             }
         );
+    }
+
+    #[test]
+    fn only_deadline_resume_renews_exhausted_portion_and_correction_budgets() {
+        for purpose in [AttemptPurpose::Portion, AttemptPurpose::Correction] {
+            let progress = state()
+                .claim(0)
+                .unwrap()
+                .candidate(
+                    1,
+                    "accepted".into(),
+                    SourceCursor {
+                        unit: 1,
+                        ..Default::default()
+                    },
+                    purpose == AttemptPurpose::Correction,
+                    1,
+                )
+                .unwrap()
+                .candidate_checked(false)
+                .unwrap();
+            let second = fail_and_retry(progress.claim(2).unwrap(), FailureKind::Transient, 3);
+            let third = fail_and_retry(second, FailureKind::InvalidCompletion, 2_004);
+            assert_eq!(third.portion_attempts, 3);
+            assert_eq!(restart(&third), third);
+            // A process restart within the same execution cannot claim a fourth call.
+            let exhausted = restart(&third)
+                .attempt_failed(FailureKind::Transient, 10_005, None)
+                .unwrap();
+            assert_eq!(exhausted.action(10_006), RunnerAction::Terminal);
+            assert!(exhausted.claim(10_006).is_err());
+            let invalid = third
+                .attempt_failed(FailureKind::InvalidCompletion, 10_005, None)
+                .unwrap();
+            assert!(!invalid.can_resume_deadline());
+
+            let expired = restart(&third).terminate(FailureKind::Deadline).unwrap();
+            assert_eq!(expired.portion_attempts, 3);
+            assert!(expired.can_resume_deadline());
+            let resumed = restart(&expired).resume_deadline(1_800_000, false).unwrap();
+            assert_eq!(resumed.portion_attempts, 0);
+            assert_eq!(resumed.phase, RunnerPhase::Ready { purpose });
+            assert_eq!(resumed.attempts, third.attempts);
+            assert_eq!(resumed.retries, third.retries);
+            assert_eq!(resumed.corrections, third.corrections);
+            assert_eq!(resumed.target_tokens, third.target_tokens);
+            assert_eq!(resumed.cursor, third.cursor);
+            assert_eq!(resumed.previous_checkpoint, third.previous_checkpoint);
+            assert_eq!(
+                resumed.source_text_projection_version,
+                third.source_text_projection_version
+            );
+            let attempt = restart(&resumed).claim(900_001).unwrap();
+            assert_eq!(attempt.attempts, third.attempts + 1);
+            assert_eq!(attempt.portion_attempts, 1);
+            let second = fail_and_retry(attempt.clone(), FailureKind::InvalidCompletion, 900_002);
+            let third_again = fail_and_retry(second, FailureKind::InvalidCompletion, 902_003);
+            assert_eq!(third_again.portion_attempts, 3);
+            let exhausted_again = third_again
+                .attempt_failed(FailureKind::InvalidCompletion, 910_004, None)
+                .unwrap();
+            assert_eq!(exhausted_again.action(910_005), RunnerAction::Terminal);
+            assert!(exhausted_again.claim(910_005).is_err());
+            let cursor = if purpose == AttemptPurpose::Correction {
+                third.cursor
+            } else {
+                SourceCursor {
+                    unit: 2,
+                    ..Default::default()
+                }
+            };
+            let candidate = attempt
+                .candidate(attempt.attempts, "resumed".into(), cursor, true, 900_002)
+                .unwrap();
+            assert!(matches!(
+                candidate.candidate_checked(true).unwrap().phase,
+                RunnerPhase::Commit { .. }
+            ));
+            if purpose == AttemptPurpose::Correction {
+                assert_eq!(
+                    candidate.candidate_checked(false).unwrap().phase,
+                    RunnerPhase::Failed {
+                        kind: FailureKind::InsufficientEffect
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn deadline_resume_keeps_legacy_backoff_and_operation_wide_limits() {
+        let legacy = state()
+            .claim(0)
+            .unwrap()
+            .candidate(
+                1,
+                "accepted".into(),
+                SourceCursor {
+                    unit: 1,
+                    ..Default::default()
+                },
+                false,
+                1,
+            )
+            .unwrap()
+            .candidate_checked(false)
+            .unwrap()
+            .claim(2)
+            .unwrap()
+            .attempt_failed(FailureKind::Transient, 3, Some(700_000))
+            .unwrap();
+        let mut json =
+            serde_json::to_value(legacy.terminate(FailureKind::Deadline).unwrap()).unwrap();
+        json.as_object_mut().unwrap().remove("portion_attempts");
+        let expired: RunnerState = serde_json::from_value(json).unwrap();
+        let resumed = expired.resume_deadline(1_800_000, false).unwrap();
+        assert_eq!(resumed.phase, legacy.phase);
+        assert_eq!(resumed.action(300_001), RunnerAction::WaitUntil(700_003));
+        assert!(resumed.claim(700_002).is_err());
+        let attempt = restart(&resumed).claim(700_003).unwrap();
+        assert_eq!(attempt.retries, 1);
+        // Missing legacy counters still use their conservative transient accounting.
+        assert_eq!(attempt.portion_attempts, 2);
     }
 
     #[test]
