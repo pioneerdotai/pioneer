@@ -610,14 +610,15 @@ impl ExpiryPreparation {
 }
 
 // Indexed roots only: JSON is authoritative at cutover writers and sentinel CAS,
-// never parsed in expiry/sweep. A missing Task is unknown. A completed Task
-// does not retain an input even when its old snapshot scope is inconsistent;
+// never parsed in expiry/sweep. A missing Task is unknown. Only a completed,
+// failed or cancelled Task releases its inputs; blocked remains retaining.
+// Releasing inputs do not retain even an inconsistent old snapshot scope;
 // unresolved checkpoint ownership is a separate prerequisite. Retaining
 // unknown Task inputs block both known workspace interpretations.
 fn unknown_predicate(alias: &str) -> String {
     format!(
         r#"
-EXISTS(SELECT 1 FROM task_run_conversation_snapshot s LEFT JOIN task t ON t.id=s.task_id WHERE s.frozen_manifest_id='' AND (s.workspace_id={alias}.workspace_id OR t.workspace_id={alias}.workspace_id OR s.workspace_id='' OR t.workspace_id='') AND (t.id IS NULL OR t.status<>'completed'))
+EXISTS(SELECT 1 FROM task_run_conversation_snapshot s LEFT JOIN task t ON t.id=s.task_id WHERE s.frozen_manifest_id='' AND (s.workspace_id={alias}.workspace_id OR t.workspace_id={alias}.workspace_id OR s.workspace_id='' OR t.workspace_id='') AND (t.id IS NULL OR t.status NOT IN ('completed','failed','cancelled')))
 OR EXISTS(SELECT 1 FROM turn_runtime_snapshot s WHERE s.frozen_manifest_id='' AND (s.workspace_id={alias}.workspace_id OR s.workspace_id=''))
 OR EXISTS(SELECT 1 FROM thread_cli_runtime_binding s WHERE s.frozen_manifest_id='' AND (s.workspace_id={alias}.workspace_id OR s.workspace_id=''))
 OR EXISTS(SELECT 1 FROM turn_cli_runtime_binding s WHERE s.frozen_manifest_id='' AND (s.workspace_id={alias}.workspace_id OR s.workspace_id=''))
@@ -629,7 +630,7 @@ OR EXISTS(SELECT 1 FROM compaction_context x JOIN compaction_checkpoint c ON c.o
 fn root_predicate(alias: &str) -> String {
     format!(
         r#"{}
-OR EXISTS(SELECT 1 FROM task_run_conversation_snapshot s LEFT JOIN task t ON t.id=s.task_id WHERE s.frozen_manifest_id={alias}.id AND (t.id IS NULL OR t.status<>'completed'))
+OR EXISTS(SELECT 1 FROM task_run_conversation_snapshot s LEFT JOIN task t ON t.id=s.task_id WHERE s.frozen_manifest_id={alias}.id AND (t.id IS NULL OR t.status NOT IN ('completed','failed','cancelled')))
 OR EXISTS(SELECT 1 FROM turn_runtime_snapshot s WHERE s.frozen_manifest_id={alias}.id)
 OR EXISTS(SELECT 1 FROM thread_cli_runtime_binding s WHERE s.frozen_manifest_id={alias}.id)
 OR EXISTS(SELECT 1 FROM turn_cli_runtime_binding s WHERE s.frozen_manifest_id={alias}.id)
@@ -4084,9 +4085,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exact_prepared_expiry_revalidates_reader_first_and_expiry_first() {
+    async fn exact_prepared_expiry_revalidates_task_roots_readers_and_expiry_first() {
         let (store, h) = fixture(false).await;
         checkpoint_proofs::prepare_graph(&store, "cp-1")
+            .await
+            .unwrap();
+        store.connection.execute_unprepared("INSERT INTO task(id,workspace_id,owner_kind,owner_id,executor_kind,status,title,goal) VALUES('task','ws','thread','thread','agent','failed','fixture','fixture')").await.unwrap();
+        store.connection.execute_unprepared("INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES('run','task','run',1,1,'failed','agent')").await.unwrap();
+        store.connection.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+            "INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at,frozen_manifest_id) VALUES('run','task','ws','thread',?1,CURRENT_TIMESTAMP,?2)",
+            [serde_json::to_string(&h).unwrap().into(), h.manifest_id.clone().into()])).await.unwrap();
+        let mut prepared = prepared_expiry(&store).await;
+        // Discovery saw a releasing Task. The serialized expiry writer must
+        // still observe a newly retaining Task before marking/deleting payload.
+        store
+            .connection
+            .execute_unprepared("UPDATE task SET status='blocked' WHERE id='task'")
+            .await
+            .unwrap();
+        assert!(
+            prepared
+                .step(&store, &mut SweepAccounting::default())
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            history::Entity::find_by_id("origin")
+                .one(&store.connection)
+                .await
+                .unwrap()
+                .unwrap()
+                .expired,
+            0
+        );
+        store
+            .connection
+            .execute_unprepared("UPDATE task SET status='cancelled' WHERE id='task'")
             .await
             .unwrap();
         let mut prepared = prepared_expiry(&store).await;
