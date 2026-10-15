@@ -13,4 +13,6 @@ pub(crate) use restricted::{
 pub use server::spawn_server;
 
 #[cfg(test)]
-pub(crate) use server::run_normal_connection;
+pub(crate) use server::{
+    ConnectionAccessLease, process_with_access_renewals, run_normal_connection,
+};

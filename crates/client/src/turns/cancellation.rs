@@ -210,9 +210,7 @@ impl ClientCore {
         request: CancellationRequest,
         result: Result<pioneer_protocol::TurnCancelResponse, String>,
     ) {
-        if !self.turn_cancellation_matches(&request) {
-            return;
-        }
+        let applicable = self.turn_cancellation_matches(&request);
         let mut owner = self
             .turn_cancellations
             .lock()
@@ -222,6 +220,26 @@ impl ClientCore {
             .get(&request.identity.thread_id)
             .is_none_or(|r| r.identity != request.identity)
         {
+            return;
+        }
+        if !applicable {
+            // The old ticket cannot apply a response, but still owns this exact
+            // cancellation. Retire it before another Stop can be admitted.
+            self.finish_thread_turn_cancellation(
+                &request.token,
+                &request.identity.turn_id,
+                None,
+                true,
+            );
+            owner.requests.remove(&request.identity.thread_id);
+            self.publish_turn_cancellation(
+                &mut owner,
+                TurnCancellationPublication {
+                    identity: request.identity,
+                    revision: 0,
+                    state: TurnCancellationState::Cancelled,
+                },
+            );
             return;
         }
         let (event, state) = match result {
@@ -358,6 +376,10 @@ impl ClientCore {
                         return;
                     };
                     if !core.turn_cancellation_matches(&request) {
+                        core.complete_turn_cancellation(
+                            request,
+                            Err("Turn cancellation connection changed".into()),
+                        );
                         continue;
                     }
                     let sender = core.transport_runtime().ws_command_sender();
@@ -523,6 +545,32 @@ mod tests {
                 permission_profile: pioneer_protocol::default_turn_permission_profile_snapshot(),
             },
         }
+    }
+    #[test]
+    fn retired_ticket_releases_exact_stop_and_late_reply_cannot_cancel_retry() {
+        let (core, queue) = fixture();
+        request(&core);
+        let mut old = queue.try_recv().unwrap();
+        old.auth.0 += 1;
+        core.complete_turn_cancellation(old.clone(), Ok(response("turn")));
+        assert_eq!(
+            core.turn_cancellation_snapshot("a").unwrap().state,
+            TurnCancellationState::Cancelled
+        );
+        assert!(
+            !core
+                .thread_coordinator_snapshot("a")
+                .unwrap()
+                .conversation
+                .is_cancelling_turn()
+        );
+        assert_eq!(request(&core), ClientTransitionOutcome::Changed);
+        let pending = core.turn_cancellation_snapshot("a").unwrap();
+        core.complete_turn_cancellation(old, Err("late".into()));
+        assert!(Arc::ptr_eq(
+            &pending,
+            &core.turn_cancellation_snapshot("a").unwrap()
+        ));
     }
     #[test]
     fn failure_retry_and_duplicate_completion_preserve_the_draft() {

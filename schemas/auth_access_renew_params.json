@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AuthAccessRenewParams",
+  "description": "Renews admission on an already authenticated WebSocket. Refresh issuance\nremains a separate restricted exchange; only persisted access is presented here.",
+  "type": "object",
+  "properties": {
+    "access_token": {
+      "type": "string"
+    },
+    "refresh_generation": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "access_token",
+    "refresh_generation"
+  ]
+}

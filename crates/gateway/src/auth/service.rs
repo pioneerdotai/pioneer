@@ -617,6 +617,46 @@ impl GatewayAuthService {
         })
     }
 
+    /// Keep the normal socket bound to exactly the admitted durable identity.
+    /// Neither an expired old lease nor a stale access credential can renew it.
+    pub(crate) async fn renew_connection_access(
+        &self,
+        current: &AuthenticatedSessionPrincipal,
+        params: &pioneer_protocol::AuthAccessRenewParams,
+    ) -> Result<Arc<AuthenticatedSessionPrincipal>, AuthError> {
+        self.validate_session_lease(current).await?;
+        let now =
+            unix_timestamp_secs().map_err(|_| AuthError::new(AuthErrorCode::InvalidCredential))?;
+        let presented = super::PresentedCredential::classify(params.access_token.expose_secret())?;
+        if presented.kind() != super::PresentedCredentialKind::AccessV2 {
+            return Err(AuthError::new(AuthErrorCode::UnsupportedCredential));
+        }
+        let credential = self
+            .access_issuer
+            .validate(presented.expose_for_authentication(), now)?;
+        let next = self.authenticate_access(credential).await?;
+        if next.gateway_id != current.gateway_id
+            || next.principal_id != current.principal_id
+            || next.device_id != current.device_id
+            || next.session_id != current.session_id
+        {
+            return Err(AuthError::new(AuthErrorCode::InvalidCredential));
+        }
+        // A valid but non-advancing grant is not a revocation of the durable
+        // session. Keep it available for the normal reconnect path.
+        if next.access_expires_at_unix < current.access_expires_at_unix
+            || (next.access_expires_at_unix == current.access_expires_at_unix
+                && next.access_jti != current.access_jti)
+        {
+            return Err(AuthError::new(AuthErrorCode::TemporarilyUnavailable));
+        }
+        let lease = self.validate_session_lease(&next).await?;
+        if lease.me.session.refresh_generation != params.refresh_generation {
+            return Err(AuthError::new(AuthErrorCode::TemporarilyUnavailable));
+        }
+        Ok(next)
+    }
+
     pub(crate) async fn authenticate_access(
         &self,
         credential: AccessCredential,
@@ -3666,6 +3706,158 @@ mod tests {
                 "step={step}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn renewal_during_writer_rpc_keeps_connection_and_checks_durable_admission() {
+        use axum::extract::ws::Message;
+        use futures_util::StreamExt;
+        let (service, _) = fixture().await;
+        let grant = service
+            .create_initial_session_with_ids(
+                params("renewal-installation", ClientKind::Desktop),
+                ids(1),
+            )
+            .await
+            .unwrap();
+        let now = unix_timestamp_secs().unwrap();
+        let credential = service
+            .access_issuer
+            .validate(grant.access_token.expose_secret(), now)
+            .unwrap();
+        let old_token = service
+            .access_issuer
+            .issue(&credential.subject, now - 120, None)
+            .unwrap();
+        let old = authenticate_access_token(&service, &old_token).await;
+        let sessions = crate::session::SessionManager::new();
+        let (outbound, mut responses) = tokio::sync::mpsc::channel(4);
+        let id = sessions
+            .register_connection(outbound.clone(), old.clone())
+            .await
+            .unwrap();
+        let mut context = sessions.connection_context(id).await.unwrap();
+        let (renewal, receipt) =
+            tokio::sync::watch::channel(crate::transport::ConnectionAccessLease::new(
+                (*old).clone(),
+                std::time::Duration::from_secs(old.access_expires_at_unix - now),
+            ));
+        let params = pioneer_protocol::AuthAccessRenewParams {
+            access_token: grant.access_token.clone(),
+            refresh_generation: grant.refresh_generation,
+        };
+        let request = pioneer_protocol::JsonRpcRequest {
+            jsonrpc: pioneer_protocol::JSONRPC_VERSION.into(),
+            id: RequestId::new("R00000000000000000001").unwrap(),
+            method: pioneer_protocol::constants::methods::AUTH_ACCESS_RENEW.into(),
+            params: Some(serde_json::to_value(&params).unwrap()),
+        };
+        let (admitted_tx, admitted_rx) = tokio::sync::oneshot::channel();
+        let frame = Message::Text(serde_json::to_string(&request).unwrap().into());
+        let mut incoming = Box::pin(
+            futures_util::stream::once(async {
+                admitted_tx.send(()).unwrap();
+                Ok::<_, axum::Error>(frame)
+            })
+            .chain(futures_util::stream::pending()),
+        );
+        // A real transaction owns the serialized writer at frame admission.
+        // The signal controls this synthetic RPC's next poll/commit boundary;
+        // no database capacity survives into the outbound acknowledgement.
+        let transaction = service.database.begin().await.unwrap();
+        let mut deferred = std::collections::VecDeque::new();
+        let processing = crate::transport::process_with_access_renewals(
+            async {
+                admitted_rx.await.unwrap();
+                transaction.commit().await.unwrap();
+            },
+            &mut incoming,
+            &mut deferred,
+            &service,
+            &sessions,
+            &mut context,
+            &renewal,
+            &outbound,
+        );
+        let acknowledge = async {
+            let Message::Text(text) = responses.recv().await.unwrap() else {
+                panic!()
+            };
+            let response: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert!(response.get("error").is_none());
+            assert_eq!(
+                response["result"]["access_expires_at_unix"],
+                grant.access_expires_at_unix
+            );
+        };
+        let (completed, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(processing, acknowledge)
+        })
+        .await
+        .expect("the RPC must release its writer while renewal is pending");
+        assert!(completed);
+        assert_eq!(context.connection_id(), id);
+        assert_eq!(sessions.connection_ids().await, vec![id]);
+        assert_eq!(
+            context.principal().access_expires_at_unix,
+            grant.access_expires_at_unix
+        );
+        assert_eq!(receipt.borrow().principal, *context.principal());
+        assert_eq!(
+            sessions.connection_principal(id).await.unwrap().as_ref(),
+            context.principal()
+        );
+        assert_ne!(old.access_jti, context.principal().access_jti);
+        assert!(
+            responses.try_recv().is_err(),
+            "no close or lost request on renewal"
+        );
+        // Replay and a forged token cannot roll back or extend admission.
+        let stale = pioneer_protocol::AuthAccessRenewParams {
+            access_token: AuthSecretString::new(old_token),
+            ..params.clone()
+        };
+        assert_eq!(
+            service
+                .renew_connection_access(context.principal(), &stale)
+                .await
+                .unwrap_err()
+                .code(),
+            AuthErrorCode::TemporarilyUnavailable,
+        );
+        let invalid = pioneer_protocol::AuthAccessRenewParams {
+            access_token: AuthSecretString::new("invalid"),
+            ..params.clone()
+        };
+        assert!(
+            service
+                .renew_connection_access(context.principal(), &invalid)
+                .await
+                .is_err()
+        );
+        let mut expired = context.principal().clone();
+        expired.access_expires_at_unix = now;
+        assert_eq!(
+            service
+                .renew_connection_access(&expired, &params)
+                .await
+                .unwrap_err()
+                .code(),
+            AuthErrorCode::CredentialExpired
+        );
+        service
+            .database
+            .execute_unprepared("UPDATE auth_session SET status = 'revoked', revoked_at = CURRENT_TIMESTAMP, revoke_reason = 'self_revoke'")
+            .await
+            .unwrap();
+        assert_eq!(
+            service
+                .renew_connection_access(context.principal(), &params)
+                .await
+                .unwrap_err()
+                .code(),
+            AuthErrorCode::SessionRevoked
+        );
     }
 
     #[tokio::test]

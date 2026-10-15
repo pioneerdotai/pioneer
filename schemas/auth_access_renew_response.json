@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AuthAccessRenewResponse",
+  "type": "object",
+  "properties": {
+    "access_expires_at_unix": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "access_expires_at_unix"
+  ]
+}

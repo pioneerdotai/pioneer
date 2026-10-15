@@ -18,6 +18,34 @@ pub(crate) mod test_support;
 
 pub type ConnectionId = u64;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConnectionRenewalError {
+    Terminated(AuthSessionTerminationReason),
+    AccessExpired,
+    Retired,
+}
+
+impl ConnectionRenewalError {
+    pub(crate) fn auth_code(self) -> crate::auth::AuthErrorCode {
+        use crate::auth::AuthErrorCode;
+        match self {
+            Self::Terminated(reason) => match reason {
+                AuthSessionTerminationReason::SessionRevoked => AuthErrorCode::SessionRevoked,
+                AuthSessionTerminationReason::SessionExpired => AuthErrorCode::SessionExpired,
+                AuthSessionTerminationReason::SessionCompromised => {
+                    AuthErrorCode::SessionCompromised
+                }
+                AuthSessionTerminationReason::PrincipalSuspended => {
+                    AuthErrorCode::PrincipalSuspended
+                }
+                AuthSessionTerminationReason::PrincipalRemoved => AuthErrorCode::PrincipalRemoved,
+            },
+            Self::AccessExpired => AuthErrorCode::CredentialExpired,
+            Self::Retired => AuthErrorCode::TemporarilyUnavailable,
+        }
+    }
+}
+
 // Keep a terminal marker for the full maximum access-token lifetime. A
 // handshake can authenticate immediately before revocation and be descheduled
 // before registration; pruning sooner than the token validity bound could let
@@ -165,6 +193,41 @@ impl SessionManager {
             .get(&connection_id)
             .map(|connection| connection.principal.clone())
             .ok_or_else(|| anyhow!("connection `{connection_id}` is not registered"))
+    }
+
+    /// Serialized with revocation and fenced against a late renewal completion.
+    pub(crate) async fn renew_connection_principal(
+        &self,
+        connection_id: ConnectionId,
+        expected: &AuthenticatedSessionPrincipal,
+        next: Arc<AuthenticatedSessionPrincipal>,
+    ) -> std::result::Result<ConnectionContext, ConnectionRenewalError> {
+        let terminated = self.terminated_sessions.read().await;
+        if let Some(tombstone) = terminated.get(expected.session_id.as_str()) {
+            return Err(ConnectionRenewalError::Terminated(tombstone.reason));
+        }
+        let mut connections = self.connections.write().await;
+        let connection = connections
+            .get_mut(&connection_id)
+            .ok_or(ConnectionRenewalError::Retired)?;
+        if let Some(reason) = *connection.termination_tx.borrow() {
+            return Err(ConnectionRenewalError::Terminated(reason));
+        }
+        if connection.principal.as_ref() != expected
+            || next.gateway_id != expected.gateway_id
+            || next.principal_id != expected.principal_id
+            || next.device_id != expected.device_id
+            || next.session_id != expected.session_id
+        {
+            return Err(ConnectionRenewalError::Retired);
+        }
+        let now =
+            crate::helpers::unix_timestamp_secs().map_err(|_| ConnectionRenewalError::Retired)?;
+        if now >= expected.access_expires_at_unix {
+            return Err(ConnectionRenewalError::AccessExpired);
+        }
+        connection.principal = next.clone();
+        Ok(ConnectionContext::new(connection_id, next))
     }
 
     /// Returns every live auth-session identity currently associated with the
@@ -421,6 +484,68 @@ mod tests {
             pioneer_protocol::AuthSessionId::new("S00000000000000000002").unwrap();
         principal.access_jti = "J00000000000000000002".to_owned();
         Arc::new(principal)
+    }
+
+    #[tokio::test]
+    async fn renewal_failure_preserves_expiry_retirement_cas_and_termination_codes() {
+        use super::ConnectionRenewalError;
+        use crate::auth::AuthErrorCode;
+        use pioneer_protocol::AuthSessionTerminationReason;
+        for (case, expected_error) in [
+            ("expired", ConnectionRenewalError::AccessExpired),
+            ("retired", ConnectionRenewalError::Retired),
+            ("cas", ConnectionRenewalError::Retired),
+            (
+                "revoked",
+                ConnectionRenewalError::Terminated(AuthSessionTerminationReason::SessionRevoked),
+            ),
+        ] {
+            let manager = SessionManager::new();
+            let (tx, _rx) = mpsc::channel(4);
+            let mut old = (*authenticated_test_superuser()).clone();
+            if case == "expired" {
+                old.access_expires_at_unix = 0;
+            }
+            let id = manager
+                .register_connection(tx, Arc::new(old.clone()))
+                .await
+                .unwrap();
+            let mut next = (*authenticated_test_superuser()).clone();
+            next.access_jti = "renewed".into();
+            match case {
+                "retired" => manager.unregister_connection(id).await,
+                "cas" => old.access_jti = "stale".into(),
+                "revoked" => {
+                    manager
+                        .disconnect_session(
+                            &old.session_id,
+                            AuthSessionTerminationReason::SessionRevoked,
+                        )
+                        .await
+                }
+                _ => {}
+            }
+            let error = manager
+                .renew_connection_principal(id, &old, Arc::new(next))
+                .await
+                .err()
+                .unwrap();
+            assert_eq!(error, expected_error, "{case}");
+            assert_eq!(
+                error.auth_code(),
+                match case {
+                    "expired" => AuthErrorCode::CredentialExpired,
+                    "revoked" => AuthErrorCode::SessionRevoked,
+                    _ => AuthErrorCode::TemporarilyUnavailable,
+                }
+            );
+            if let Ok(principal) = manager.connection_principal(id).await {
+                assert_ne!(
+                    principal.access_jti, "renewed",
+                    "failed CAS must retain its principal"
+                );
+            }
+        }
     }
 
     #[tokio::test]
