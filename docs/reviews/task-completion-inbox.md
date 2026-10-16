@@ -1,5 +1,7 @@
 # Task completion inbox — external review handoff
 
+Current status: the previous external acceptance is withdrawn. The storage architecture revision below requires a new external review and explicit acceptance. Earlier CI results in this document describe earlier commits, not this unexecuted revision.
+
 Implementation branch: `feature/task-completion-inbox` in both repositories.
 
 - Rust worktree: `/Users/alexander/Code/pioneer/pioneer/.worktrees/task-completion-inbox`.
@@ -20,7 +22,7 @@ The desktop displays task title, user thread, terminal status, local completion 
 
 ## Authorization and navigation
 
-`authorization_scope.rs` now owns one SQL relation for exact task scope resolution and set queries. It validates the root Task, creator-turn consistency, internal-thread lineage, workspace, actor envelopes and execution admission root. It does not substitute a child's owner or creator for its root ACL.
+`authorization_scope.rs` owns one typed SeaQuery scope for exact task scope resolution and inbox set queries. It validates the root Task, creator-turn consistency, internal-thread lineage, workspace, actor envelopes and execution admission root. It does not substitute a child's owner or creator for its root ACL.
 
 Gateway admission retains own-notification permissions and additionally evaluates the canonical TaskRead action gate. Scoped users require the active workspace membership and, for private roots, exact thread membership. Absolute access comes only from the canonical TaskRead gate. Service Tasks without a user collaboration root are excluded, including for absolute principals; System executor Tasks with a valid root are included. Sidebar visibility does not restrict accessible history.
 
@@ -64,7 +66,43 @@ The existing mobile notification card required a small consumer update from outb
 - Client notification tests: pagination/total/merge identity, exact run/user context checks, read-history reopening, principal/workspace/connection/request fencing and authorization eviction. Existing inbox tests updated for run entries.
 - Desktop feature tests: workspace changes clear retained cards/count; keyboard selection reaches virtualized rows without reading them and Escape closes the popup; existing notification lifecycle test updated for the shared contract.
 
-## Corrections after external review
+## Storage architecture revision (current, awaiting external review)
+
+Pre-change audit covered `m20260804_000001_shared_messages_authorship`, `m20261008_000001_provider_usage_observation`, the `thread_read_cursor`/`user_notification_outbox` entities, the outbox and TaskRun repositories, and the installed SeaORM 2.0.4 / SeaQuery 1.0.2 sources. The fixed invariants are the original three TEXT columns, `(principal_id,run_id)` primary key, run FK with `ON DELETE CASCADE`, exact legacy recipient/run/task/workspace backfill, shared TaskRead/root ACL, workspace-first seeks, exact timestamp/ID pagination and bounded payload extraction. There is no new migration/version or data conversion.
+
+Replaced SQL:
+
+- Migration `up`/`down` use `SchemaManager` with `Table`, `Index` and `ForeignKey` builders. The acknowledgement copy uses typed entity columns, joins, `MIN`, grouping and `INSERT SELECT`. The partial legacy index keeps its original name, column order and non-null acknowledgement predicate. `use_transaction` and drop order remain unchanged. No raw SQL remains in this migration.
+- `task_completion_inbox.rs` uses entities/Column identifiers for the source tables, typed aliases/CTE fields, joins, membership `EXISTS`, terminal conditions, receipt/legacy `COALESCE`, tuple keyset ordering and limits. `FromQueryResult` projections decode the bounded entry/count results. `INSERT SELECT` plus `OnConflict` still performs access validation and receipt insertion in one serialized writer statement. Get/read retain exact run lookup sources. A materialized metadata CTE bounds JSON extraction for both list and exact get.
+- The task scope joins/validation in `authorization_scope.rs` now use entity columns and typed CASE/COALESCE/EXISTS/GLOB expressions. CROSS JOIN equalities are WHERE predicates because SeaQuery deliberately discards ON conditions for CROSS JOIN. Exact task scope uses a typed projection. Other authorization repositories/policies are unchanged; inbox rows never call the exact resolver per row.
+
+Generated entity:
+
+`pioneer-entity::task_run_read` contains String fields with `column_type = "Text"`, both primary-key annotations, and the generated `HasOne<task_run>` relationship. `read_at` deliberately stays String: the existing schema declares TEXT and preserves the exact saved timestamp representation. The module, prelude export and inverse `task_run_reads` relation were updated. CRUD uses this entity for joins, writes and receipt lookup coverage.
+
+Generation used the installed SeaORM CLI, `generate entity --entity-format dense --with-serde both --lib --tables task_run,task_run_read`, with a disposable schema-only SQLite input. That input declares the unchanged receipt DDL and a parent task_run PK for relation discovery. Only the new receipt entity and corresponding module/prelude/inverse-relation entries were applied; existing TaskRun fields and other generated entities were preserved. No migration or fixture/data statements ran during generation, and no user database was opened.
+
+Remaining narrow SQL exceptions:
+
+1. SQLite `INDEXED BY` has no node/API in the installed SeaQuery version. Its `index_hints` implementation is MySQL-only, and SQLite's table rendering does not emit it. `workspace_statement` first builds the complete typed query, then annotates only the fixed `task AS t` and `task_run AS r` sources with the existing indexes. Values remain bound. It rejects missing/ambiguous source matches instead of falling back to an unhinted scan. The task -> run CROSS JOIN and both explicit hints preserve the existing empty/small-workspace guarantee. No full query is hidden inside `Expr::cust`; neither rewritten repository path uses that API.
+2. The existing query-plan regression prefixes the final driver statement with `EXPLAIN QUERY PLAN` so it inspects the exact hinted SQL. SeaQuery's Explain AST cannot represent the missing SQLite index-hint nodes either. This is test-only and has not been executed in this revision.
+
+SQLite `strftime`, `substr`, `json_extract` and `json_object` use SeaQuery's supported `Func::cust` named-function builder with typed/bound arguments, not raw expressions or queries. Schema construction, ACL, pagination, projections and INSERT/OnConflict need no raw exception.
+
+Regression additions (written only): a typed source with missing/ambiguous index targets fails closed; the new receipt entity supports the composite PK, repeated personal read and run-FK cascade without deleting another run's receipt. Existing migrated-file ACL, legacy backfill, bounded projection, workspace-isolation and page/count plan suites remain in place. Reader handles stay physically query-only and all writes inherit their scoped serialized writer. The large-history cost within the active workspace and refresh cost described below remain unchanged.
+
+Source contract was regenerated from the mobile worktree using `PIONEER_RUST_ROOT=/Users/alexander/Code/pioneer/pioneer/.worktrees/task-completion-inbox bun run client:contract`; `check-source` returned `Client source contract: matched`. The hashes/file are unchanged because CRUD/entity/migration are outside the client-FFI source dependency closure. No RPC/UI or mobile schema/TypeScript regeneration was needed.
+
+Current verification completed without executing tests:
+
+- `CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=1 cargo check --locked -p pioneer-crud --features test-support --tests` completed successfully. It compiled the changed entity, migration, production queries and regression code. Only existing warnings in artifact helpers and compaction preparation tests remain. Gateway/full-workspace compilation was not repeated in this pass; the public CRUD result/argument shapes are unchanged.
+- `rustfmt --edition 2024 --check` on every changed Rust file and `git diff --check` in both worktrees. The new receipt entity matches the dense CLI output, and its generated registration/inverse relation entries were inspected against that output.
+- Complete final diff read against the pre-change implementation, including the new entity and regression bodies. Static review checked each root/actor/admission predicate, personal/legacy receipts, all terminal statuses, exact cursor comparison, CTE limits, CREATE/DROP and FK/PK/index semantics, serialized writer routing and read-only reader scope. No UI/RPC/contract input or unrelated repository source changed.
+- Final `check-source` with the explicit Rust worktree returned `Client source contract: matched`; the mobile worktree has no diff.
+
+No tests, query plans, fixture behavior or migration logic have been executed in this revision. The CLI only introspected a disposable schema created for entity generation. Runtime equivalence, physical plans and migration execution await external review/acceptance and subsequent authorized execution. No migration was applied to a user database. No merge or push.
+
+## Corrections after external review (earlier revision)
 
 Only the two requested review issues are changed in this pass. Public DTOs, RPC/event wire shapes, generated schemas/types, mobile, desktop UI, authorization policy, delivery routes and read semantics are unchanged.
 

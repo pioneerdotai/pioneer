@@ -3,10 +3,10 @@ use std::collections::BTreeSet;
 use anyhow::{Context, Result};
 use pioneer_entity::{
     artifact, artifact_binding, auth_session, mcp_server_installation, skill_workspace_policy,
-    task_run, thread, thread_lineage, turn, workspace,
+    task, task_execution_admission, task_run, thread, thread_lineage, turn, workspace,
 };
 use pioneer_protocol::{PersistedActorRef, PrincipalId};
-use sea_orm::{ColumnTrait, Condition, ConnectionTrait, EntityTrait, QueryFilter};
+use sea_orm::{ColumnTrait, Condition, ConnectionTrait, EntityName, EntityTrait, QueryFilter};
 
 use super::identity::actor_ref_from_db;
 use super::membership::{PersistedThreadAccessClass, persisted_thread_access_class_from_db};
@@ -540,40 +540,237 @@ pub async fn resolve_artifact_binding_authorization_root<C: ConnectionTrait>(
     Ok(roots.into_iter().next())
 }
 
-// Canonical Task scope relation, shared by exact TaskRead resolution and the
-// inbox's set queries. Provenance is rooted before lineage is followed. In
-// particular, a child's owner/creator cannot replace its root Task's ACL.
-// The unique root/workspace lookups preserve the source order for inbox seeks.
-pub(crate) const TASK_SCOPE_JOINS: &str = r#"
-CROSS JOIN task scope_root ON scope_root.id=COALESCE(t.root_task_id,t.id)
-    AND scope_root.workspace_id=t.workspace_id AND scope_root.root_task_id IS NULL
-CROSS JOIN workspace scope_workspace ON scope_workspace.id=t.workspace_id
-LEFT JOIN turn scope_turn ON scope_turn.id=scope_root.created_by_turn_id
-LEFT JOIN thread scope_origin ON scope_origin.id=COALESCE(scope_root.created_by_thread_id,
-    CASE WHEN scope_root.owner_kind='thread' THEN scope_root.owner_id END,scope_turn.thread_id)
-    AND scope_origin.workspace_id=t.workspace_id
-LEFT JOIN thread_lineage scope_lineage ON scope_lineage.child_thread_id=scope_origin.id
-LEFT JOIN thread scope_thread ON scope_thread.id=CASE WHEN scope_origin.access_class='internal'
-    THEN scope_lineage.root_thread_id ELSE scope_origin.id END
-    AND scope_thread.workspace_id=t.workspace_id
-LEFT JOIN task_execution_admission scope_admission ON scope_admission.task_id=t.id
-"#;
-pub(crate) const TASK_SCOPE_VALID: &str = r#"
-(scope_root.created_by_turn_id IS NULL OR (scope_turn.id IS NOT NULL AND EXISTS
-    (SELECT 1 FROM thread turn_thread WHERE turn_thread.id=scope_turn.thread_id
-      AND turn_thread.workspace_id=t.workspace_id)
-    AND (COALESCE(scope_root.created_by_thread_id,CASE WHEN scope_root.owner_kind='thread'
-        THEN scope_root.owner_id END) IS NULL OR scope_turn.thread_id=COALESCE(
-        scope_root.created_by_thread_id,CASE WHEN scope_root.owner_kind='thread' THEN scope_root.owner_id END))))
-AND (COALESCE(scope_root.created_by_thread_id,CASE WHEN scope_root.owner_kind='thread'
-    THEN scope_root.owner_id END,scope_turn.thread_id) IS NULL OR
-    (scope_origin.id IS NOT NULL AND scope_origin.access_class IN ('private','workspace','internal')
-    AND scope_thread.id IS NOT NULL AND scope_thread.access_class IN ('private','workspace')
-    AND ((scope_origin.created_by_actor_kind IS NULL AND scope_origin.created_by_actor_id IS NULL) OR (scope_origin.created_by_actor_kind='system' AND scope_origin.created_by_actor_id IS NULL) OR (scope_origin.created_by_actor_kind IN ('principal','agent_execution') AND length(scope_origin.created_by_actor_id)=21 AND scope_origin.created_by_actor_id NOT GLOB '*[^A-Za-z0-9]*')) AND ((scope_thread.created_by_actor_kind IS NULL AND scope_thread.created_by_actor_id IS NULL) OR (scope_thread.created_by_actor_kind='system' AND scope_thread.created_by_actor_id IS NULL) OR (scope_thread.created_by_actor_kind IN ('principal','agent_execution') AND length(scope_thread.created_by_actor_id)=21 AND scope_thread.created_by_actor_id NOT GLOB '*[^A-Za-z0-9]*'))))
-AND (scope_admission.task_id IS NULL OR scope_admission.root_thread_id=scope_thread.id)
-AND (scope_root.owner_kind<>'user' OR (length(scope_root.owner_id)=21
-    AND scope_root.owner_id NOT GLOB '*[^A-Za-z0-9]*'))
-"#;
+// Canonical Task scope shared by exact TaskRead resolution and inbox set queries.
+// Every reference uses the same typed aliases so a child's owner/provenance
+// cannot replace its root Task's ACL.
+#[derive(Clone, Copy, sea_orm::DeriveIden)]
+pub(crate) enum TaskScopeAlias {
+    #[sea_orm(iden = "t")]
+    Task,
+    #[sea_orm(iden = "scope_root")]
+    Root,
+    #[sea_orm(iden = "scope_workspace")]
+    Workspace,
+    #[sea_orm(iden = "scope_turn")]
+    Turn,
+    #[sea_orm(iden = "scope_origin")]
+    Origin,
+    #[sea_orm(iden = "scope_lineage")]
+    Lineage,
+    #[sea_orm(iden = "scope_thread")]
+    Thread,
+    #[sea_orm(iden = "scope_admission")]
+    Admission,
+    #[sea_orm(iden = "turn_thread")]
+    TurnThread,
+}
+
+fn root_owner_thread() -> sea_orm::sea_query::Expr {
+    use sea_orm::sea_query::{Expr, ExprTrait};
+    Expr::case(
+        Expr::col((TaskScopeAlias::Root, task::Column::OwnerKind)).eq("thread"),
+        Expr::col((TaskScopeAlias::Root, task::Column::OwnerId)),
+    )
+    .finally(Expr::val(None::<String>))
+    .into()
+}
+
+fn explicit_origin_thread() -> sea_orm::sea_query::Expr {
+    use sea_orm::sea_query::{Expr, Func};
+    Func::coalesce([
+        Expr::col((TaskScopeAlias::Root, task::Column::CreatedByThreadId)),
+        root_owner_thread(),
+    ])
+    .into()
+}
+
+fn origin_thread() -> sea_orm::sea_query::Expr {
+    use sea_orm::sea_query::{Expr, Func};
+    Func::coalesce([
+        Expr::col((TaskScopeAlias::Root, task::Column::CreatedByThreadId)),
+        root_owner_thread(),
+        Expr::col((TaskScopeAlias::Turn, turn::Column::ThreadId)),
+    ])
+    .into()
+}
+
+fn valid_actor_scope(alias: TaskScopeAlias) -> Condition {
+    use sea_orm::sea_query::{Expr, ExprTrait, Func, extension::sqlite::SqliteExpr};
+    let kind = Expr::col((alias, thread::Column::CreatedByActorKind));
+    let id = Expr::col((alias, thread::Column::CreatedByActorId));
+    Condition::any()
+        .add(
+            Condition::all()
+                .add(kind.clone().is_null())
+                .add(id.clone().is_null()),
+        )
+        .add(
+            Condition::all()
+                .add(kind.clone().eq("system"))
+                .add(id.clone().is_null()),
+        )
+        .add(
+            Condition::all()
+                .add(kind.is_in(["principal", "agent_execution"]))
+                .add(Func::char_length(id.clone()).eq(21))
+                .add(id.glob("*[^A-Za-z0-9]*").not()),
+        )
+}
+
+pub(crate) fn task_scope_query(
+    mut query: sea_orm::sea_query::SelectStatement,
+) -> sea_orm::sea_query::SelectStatement {
+    use TaskScopeAlias as S;
+    use sea_orm::sea_query::{
+        Expr, ExprTrait, Func, JoinType, Query, extension::sqlite::SqliteExpr,
+    };
+    // SeaQuery intentionally ignores ON for CROSS JOIN, so its typed equality
+    // predicates belong in WHERE. SQLite retains this left-to-right join order.
+    query
+        .cross_join(task::Entity.table_ref().alias(S::Root))
+        .and_where(Expr::col((S::Root, task::Column::Id)).eq(Func::coalesce([
+            Expr::col((S::Task, task::Column::RootTaskId)),
+            Expr::col((S::Task, task::Column::Id)),
+        ])))
+        .and_where(
+            Expr::col((S::Root, task::Column::WorkspaceId))
+                .equals((S::Task, task::Column::WorkspaceId)),
+        )
+        .and_where(Expr::col((S::Root, task::Column::RootTaskId)).is_null())
+        .cross_join(workspace::Entity.table_ref().alias(S::Workspace))
+        .and_where(
+            Expr::col((S::Workspace, workspace::Column::Id))
+                .equals((S::Task, task::Column::WorkspaceId)),
+        )
+        .join_as(
+            JoinType::LeftJoin,
+            turn::Entity,
+            S::Turn,
+            Expr::col((S::Turn, turn::Column::Id)).equals((S::Root, task::Column::CreatedByTurnId)),
+        )
+        .join_as(
+            JoinType::LeftJoin,
+            thread::Entity,
+            S::Origin,
+            Condition::all()
+                .add(Expr::col((S::Origin, thread::Column::Id)).eq(origin_thread()))
+                .add(
+                    Expr::col((S::Origin, thread::Column::WorkspaceId))
+                        .equals((S::Task, task::Column::WorkspaceId)),
+                ),
+        )
+        .join_as(
+            JoinType::LeftJoin,
+            thread_lineage::Entity,
+            S::Lineage,
+            Expr::col((S::Lineage, thread_lineage::Column::ChildThreadId))
+                .equals((S::Origin, thread::Column::Id)),
+        )
+        .join_as(
+            JoinType::LeftJoin,
+            thread::Entity,
+            S::Thread,
+            Condition::all()
+                .add(
+                    Expr::col((S::Thread, thread::Column::Id)).eq(Expr::case(
+                        Expr::col((S::Origin, thread::Column::AccessClass)).eq("internal"),
+                        Expr::col((S::Lineage, thread_lineage::Column::RootThreadId)),
+                    )
+                    .finally(Expr::col((S::Origin, thread::Column::Id)))),
+                )
+                .add(
+                    Expr::col((S::Thread, thread::Column::WorkspaceId))
+                        .equals((S::Task, task::Column::WorkspaceId)),
+                ),
+        )
+        .join_as(
+            JoinType::LeftJoin,
+            task_execution_admission::Entity,
+            S::Admission,
+            Expr::col((S::Admission, task_execution_admission::Column::TaskId))
+                .equals((S::Task, task::Column::Id)),
+        );
+    let creator_turn_thread = Query::select()
+        .expr(Expr::val(1))
+        .from_as(thread::Entity, S::TurnThread)
+        .and_where(
+            Expr::col((S::TurnThread, thread::Column::Id))
+                .equals((S::Turn, turn::Column::ThreadId)),
+        )
+        .and_where(
+            Expr::col((S::TurnThread, thread::Column::WorkspaceId))
+                .equals((S::Task, task::Column::WorkspaceId)),
+        )
+        .to_owned();
+    query
+        .cond_where(
+            Condition::any()
+                .add(Expr::col((S::Root, task::Column::CreatedByTurnId)).is_null())
+                .add(
+                    Condition::all()
+                        .add(Expr::col((S::Turn, turn::Column::Id)).is_not_null())
+                        .add(Expr::exists(creator_turn_thread))
+                        .add(
+                            Condition::any()
+                                .add(explicit_origin_thread().is_null())
+                                .add(
+                                    Expr::col((S::Turn, turn::Column::ThreadId))
+                                        .eq(explicit_origin_thread()),
+                                ),
+                        ),
+                ),
+        )
+        .cond_where(
+            Condition::any().add(origin_thread().is_null()).add(
+                Condition::all()
+                    .add(Expr::col((S::Origin, thread::Column::Id)).is_not_null())
+                    .add(Expr::col((S::Origin, thread::Column::AccessClass)).is_in([
+                        "private",
+                        "workspace",
+                        "internal",
+                    ]))
+                    .add(Expr::col((S::Thread, thread::Column::Id)).is_not_null())
+                    .add(
+                        Expr::col((S::Thread, thread::Column::AccessClass))
+                            .is_in(["private", "workspace"]),
+                    )
+                    .add(valid_actor_scope(S::Origin))
+                    .add(valid_actor_scope(S::Thread)),
+            ),
+        )
+        .cond_where(
+            Condition::any()
+                .add(Expr::col((S::Admission, task_execution_admission::Column::TaskId)).is_null())
+                .add(
+                    Expr::col((S::Admission, task_execution_admission::Column::RootThreadId))
+                        .equals((S::Thread, thread::Column::Id)),
+                ),
+        )
+        .cond_where(
+            Condition::any()
+                .add(Expr::col((S::Root, task::Column::OwnerKind)).ne("user"))
+                .add(
+                    Condition::all()
+                        .add(Func::char_length(Expr::col((S::Root, task::Column::OwnerId))).eq(21))
+                        .add(
+                            Expr::col((S::Root, task::Column::OwnerId))
+                                .glob("*[^A-Za-z0-9]*")
+                                .not(),
+                        ),
+                ),
+        );
+    query
+}
+
+#[derive(sea_orm::FromQueryResult)]
+struct TaskScopeRow {
+    id: String,
+    workspace_id: String,
+    is_active: bool,
+    thread_id: Option<String>,
+    owner_kind: String,
+    owner_id: Option<String>,
+}
 
 pub async fn resolve_task_authorization_scope<C: ConnectionTrait>(
     db: &C,
@@ -581,31 +778,48 @@ pub async fn resolve_task_authorization_scope<C: ConnectionTrait>(
     expected_workspace_id: Option<&str>,
     expected_root_thread_id: Option<&str>,
 ) -> Result<Option<TaskAuthorizationScope>> {
-    use sea_orm::{DbBackend, Statement};
-    let sql = format!(
-        "SELECT t.id,t.workspace_id,scope_workspace.is_active,scope_thread.id AS thread_id,scope_root.owner_kind,scope_root.owner_id FROM task t {TASK_SCOPE_JOINS} WHERE t.id=? AND {TASK_SCOPE_VALID}"
-    );
-    let Some(row) = db
-        .query_one_raw(Statement::from_sql_and_values(
-            DbBackend::Sqlite,
-            sql,
-            [task_id.into()],
-        ))
-        .await?
-    else {
+    use TaskScopeAlias as S;
+    use sea_orm::{
+        FromQueryResult,
+        sea_query::{Expr, ExprTrait, Query},
+    };
+    let mut query = task_scope_query(Query::select().from_as(task::Entity, S::Task).to_owned());
+    query
+        .expr_as(Expr::col((S::Task, task::Column::Id)), task::Column::Id)
+        .expr_as(
+            Expr::col((S::Task, task::Column::WorkspaceId)),
+            task::Column::WorkspaceId,
+        )
+        .expr_as(
+            Expr::col((S::Workspace, workspace::Column::IsActive)),
+            workspace::Column::IsActive,
+        )
+        .expr_as(
+            Expr::col((S::Thread, thread::Column::Id)),
+            turn::Column::ThreadId,
+        )
+        .expr_as(
+            Expr::col((S::Root, task::Column::OwnerKind)),
+            task::Column::OwnerKind,
+        )
+        .expr_as(
+            Expr::col((S::Root, task::Column::OwnerId)),
+            task::Column::OwnerId,
+        )
+        .and_where(Expr::col((S::Task, task::Column::Id)).eq(task_id));
+    let Some(row) = db.query_one(&query).await? else {
         return Ok(None);
     };
-    let workspace_id: String = row.try_get("", "workspace_id")?;
-    let root_thread_id: Option<String> = row.try_get("", "thread_id")?;
-    if expected_workspace_id.is_some_and(|id| id != workspace_id)
-        || expected_root_thread_id.is_some_and(|id| Some(id) != root_thread_id.as_deref())
+    let row = TaskScopeRow::from_query_result(&row, "")?;
+    if expected_workspace_id.is_some_and(|id| id != row.workspace_id)
+        || expected_root_thread_id.is_some_and(|id| Some(id) != row.thread_id.as_deref())
     {
         return Ok(None);
     }
-    let root_thread = match root_thread_id.as_deref() {
+    let root_thread = match row.thread_id.as_deref() {
         Some(id) => {
             let Some(scope) =
-                resolve_thread_authorization_scope(db, id, Some(&workspace_id)).await?
+                resolve_thread_authorization_scope(db, id, Some(&row.workspace_id)).await?
             else {
                 return Ok(None);
             };
@@ -613,16 +827,18 @@ pub async fn resolve_task_authorization_scope<C: ConnectionTrait>(
         }
         None => None,
     };
-    let initiating_principal_id = if row.try_get::<String>("", "owner_kind")? == "user" {
-        Some(PrincipalId::new(row.try_get::<String>("", "owner_id")?)?)
+    let initiating_principal_id = if row.owner_kind == "user" {
+        Some(PrincipalId::new(
+            row.owner_id.context("Task user owner is missing")?,
+        )?)
     } else {
         None
     };
     Ok(Some(TaskAuthorizationScope {
-        workspace_id,
-        root_thread_id,
-        task_id: row.try_get("", "id")?,
-        workspace_is_active: row.try_get("", "is_active")?,
+        workspace_id: row.workspace_id,
+        root_thread_id: row.thread_id,
+        task_id: row.id,
+        workspace_is_active: row.is_active,
         root_thread,
         initiating_principal_id,
     }))

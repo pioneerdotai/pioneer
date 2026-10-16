@@ -6,7 +6,10 @@ use pioneer_crud::{
     resolve_task_authorization_scope,
 };
 use pioneer_sqlite::{SqliteDatabase, SqliteWriteClass, SqliteWriteExecutor};
-use sea_orm::{ConnectOptions, ConnectionTrait, Database, DbBackend, Statement};
+use sea_orm::{
+    ColumnTrait, ConnectOptions, ConnectionTrait, Database, DbBackend, EntityTrait, QueryFilter,
+    Statement,
+};
 
 const A: &str = "P0000000000000000000A";
 const B: &str = "P0000000000000000000B";
@@ -776,5 +779,70 @@ async fn empty_and_small_workspaces_page_independently_of_large_foreign_history(
             .map(|row| row.run_id.as_str())
             .collect::<Vec<_>>(),
         ["local-0"]
+    );
+}
+
+#[tokio::test]
+async fn read_entity_preserves_composite_keys_and_cascades_only_the_deleted_run() {
+    use pioneer_entity::{task_run, task_run_read};
+    let (_dir, store, _writer) = fixture(false).await;
+    task(
+        &store,
+        "task",
+        Some("T0000000000000000000P"),
+        None,
+        "agent",
+        "none",
+        "attached",
+    )
+    .await;
+    run(&store, "first", "task", "succeeded", 1).await;
+    run(&store, "second", "task", "succeeded", 2).await;
+    read(&store, A, "first").await;
+    read(&store, B, "first").await;
+    read(&store, A, "second").await;
+    let db = store.with_maintenance_access().database_connection();
+    let receipt = task_run_read::Entity::find_by_id((A.to_owned(), "first".to_owned()))
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(receipt.read_at, "2026-10-16 11:00:00 +00:00");
+    assert_eq!(receipt.principal_id, A);
+    assert_eq!(receipt.run_id, "first");
+    read(&store, A, "first").await;
+    assert_eq!(
+        task_run_read::Entity::find()
+            .filter(task_run_read::Column::RunId.eq("first"))
+            .all(&db)
+            .await
+            .unwrap()
+            .len(),
+        2,
+        "the composite key keeps one receipt per principal and run"
+    );
+    // Enable FK enforcement on this fixture's single serialized writer after
+    // setup; the physical read-only pool remains unchanged.
+    db.execute_unprepared("PRAGMA foreign_keys=ON")
+        .await
+        .unwrap();
+    task_run::Entity::delete_by_id("first")
+        .exec(&db)
+        .await
+        .unwrap();
+    assert!(
+        task_run_read::Entity::find()
+            .filter(task_run_read::Column::RunId.eq("first"))
+            .all(&db)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        task_run_read::Entity::find_by_id((A.to_owned(), "second".to_owned()))
+            .one(&db)
+            .await
+            .unwrap()
+            .is_some()
     );
 }

@@ -144,6 +144,7 @@ pub mod task_run_conversation_snapshot;
 pub mod task_run_execution;
 pub mod task_run_occurrence_reconcile_pending;
 pub mod task_run_occurrence_reconcile_sequence;
+pub mod task_run_read;
 pub mod task_run_thread_binding;
 pub mod task_run_turn;
 pub mod task_trigger;

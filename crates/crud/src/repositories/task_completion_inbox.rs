@@ -1,21 +1,45 @@
 //! Set queries over saved runs. No delivery rows or per-recipient result copies.
-use super::authorization_scope::{TASK_SCOPE_JOINS, TASK_SCOPE_VALID};
+use super::authorization_scope::{TaskScopeAlias as S, task_scope_query};
 use anyhow::{Context, Result};
-use sea_orm::{ConnectionTrait, DbBackend, Statement, Value};
+use pioneer_entity::{
+    task, task_run, task_run_read, thread, thread_membership, user_notification_outbox, workspace,
+    workspace_membership,
+};
+use sea_orm::sea_query::{
+    Alias, Asterisk, CommonTableExpression, Condition, Expr, ExprTrait, Func, JoinType, OnConflict,
+    Order, Query, SelectStatement,
+};
+use sea_orm::{ConnectionTrait, DbBackend, DeriveIden, EntityName, FromQueryResult, Statement};
 
-const TERMINAL: &str = "r.completed_at IS NOT NULL AND r.status IN ('succeeded','failed','blocked','cancelled','timed_out')";
-// Set form of TaskRead's inherited ThreadAccessFacts policy: the role action
-// gate is evaluated by Gateway; membership is re-read in every statement.
-const ACCESS: &str = r#"(?3 OR (
-    scope_workspace.is_active=1 AND EXISTS (
-        SELECT 1 FROM workspace_membership wm
-        WHERE wm.principal_id=?2 AND wm.workspace_id=t.workspace_id
-    ) AND (scope_thread.access_class='workspace' OR EXISTS (
-        SELECT 1 FROM thread_membership tm
-        WHERE tm.principal_id=?2 AND tm.thread_id=scope_thread.id
-    ))
-))"#;
-const READ_AT: &str = "COALESCE(receipt.read_at,(SELECT MIN(n.acknowledged_at) FROM user_notification_outbox n WHERE n.recipient_principal_id=?2 AND n.run_id=r.id AND n.task_id=t.id AND n.workspace_id=t.workspace_id AND n.acknowledged_at IS NOT NULL))";
+#[derive(Clone, Copy, DeriveIden)]
+enum InboxAlias {
+    #[sea_orm(iden = "r")]
+    Run,
+    Receipt,
+    Legacy,
+    WorkspaceMember,
+    ThreadMember,
+    InboxPage,
+    #[sea_orm(iden = "p")]
+    Page,
+    ResultRun,
+}
+#[derive(Clone, Copy, DeriveIden)]
+enum InboxField {
+    TaskId,
+    RunId,
+    Title,
+    ThreadId,
+    ThreadTitle,
+    Status,
+    CompletedKey,
+    ReadKey,
+    CompletedAt,
+    Summary,
+    ErrorJson,
+    ReadAt,
+    Count,
+}
 
 #[derive(Clone, Debug)]
 pub struct TaskCompletionInboxAccess<'a> {
@@ -23,15 +47,6 @@ pub struct TaskCompletionInboxAccess<'a> {
     pub principal_id: &'a str,
     /// Only the canonical TaskRead action gate's AllowAbsolute permits this.
     pub absolute: bool,
-}
-impl TaskCompletionInboxAccess<'_> {
-    fn values(&self) -> Vec<Value> {
-        vec![
-            self.workspace_id.into(),
-            self.principal_id.into(),
-            self.absolute.into(),
-        ]
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -50,78 +65,308 @@ pub struct TaskCompletionInboxRow {
     pub read_at: Option<i64>,
 }
 
-fn relation(workspace_scan: bool) -> String {
-    // Pages/count start with this workspace's tasks, then seek runs by task.
-    // CROSS JOIN prevents the planner from starting at a global run index;
-    // empty/small workspaces never walk other workspaces' completion history.
-    // Exact get/read retain their run-PK lookup path.
-    let source = if workspace_scan {
-        "FROM task t INDEXED BY idx_task_workspace_status CROSS JOIN task_run r INDEXED BY idx_task_run_task_id ON r.task_id=t.id"
+#[derive(FromQueryResult)]
+struct InboxRow {
+    task_id: String,
+    run_id: String,
+    title: String,
+    thread_id: String,
+    thread_title: String,
+    status: String,
+    completed_at: i64,
+    completed_key: String,
+    summary: Option<String>,
+    error_json: Option<String>,
+    read_at: Option<i64>,
+}
+impl TryFrom<InboxRow> for TaskCompletionInboxRow {
+    type Error = anyhow::Error;
+    fn try_from(row: InboxRow) -> Result<Self> {
+        Ok(Self {
+            task_id: row.task_id,
+            run_id: row.run_id,
+            title: row.title,
+            thread_id: row.thread_id,
+            thread_title: row.thread_title,
+            status: crate::convention::task_run_status_from_db(&row.status)
+                .context("invalid inbox run status")?,
+            completed_at: row.completed_at,
+            completed_key: row.completed_key,
+            summary: row.summary,
+            error_json: row.error_json,
+            read_at: row.read_at,
+        })
+    }
+}
+
+fn access_condition(access: &TaskCompletionInboxAccess<'_>) -> Condition {
+    use InboxAlias as A;
+    let workspace_member = Query::select()
+        .expr(Expr::val(1))
+        .from_as(workspace_membership::Entity, A::WorkspaceMember)
+        .and_where(
+            Expr::col((
+                A::WorkspaceMember,
+                workspace_membership::Column::PrincipalId,
+            ))
+            .eq(access.principal_id),
+        )
+        .and_where(
+            Expr::col((
+                A::WorkspaceMember,
+                workspace_membership::Column::WorkspaceId,
+            ))
+            .equals((S::Task, task::Column::WorkspaceId)),
+        )
+        .to_owned();
+    let thread_member = Query::select()
+        .expr(Expr::val(1))
+        .from_as(thread_membership::Entity, A::ThreadMember)
+        .and_where(
+            Expr::col((A::ThreadMember, thread_membership::Column::PrincipalId))
+                .eq(access.principal_id),
+        )
+        .and_where(
+            Expr::col((A::ThreadMember, thread_membership::Column::ThreadId))
+                .equals((S::Thread, thread::Column::Id)),
+        )
+        .to_owned();
+    Condition::any().add(Expr::val(access.absolute)).add(
+        Condition::all()
+            .add(Expr::col((S::Workspace, workspace::Column::IsActive)).eq(true))
+            .add(Expr::exists(workspace_member))
+            .add(
+                Condition::any()
+                    .add(Expr::col((S::Thread, thread::Column::AccessClass)).eq("workspace"))
+                    .add(Expr::exists(thread_member)),
+            ),
+    )
+}
+
+fn read_at(access: &TaskCompletionInboxAccess<'_>) -> Expr {
+    use InboxAlias as A;
+    use user_notification_outbox::Column as N;
+    let legacy = Query::select()
+        .expr(Expr::col((A::Legacy, N::AcknowledgedAt)).min())
+        .from_as(user_notification_outbox::Entity, A::Legacy)
+        .and_where(Expr::col((A::Legacy, N::RecipientPrincipalId)).eq(access.principal_id))
+        .and_where(Expr::col((A::Legacy, N::RunId)).equals((A::Run, task_run::Column::Id)))
+        .and_where(Expr::col((A::Legacy, N::TaskId)).equals((S::Task, task::Column::Id)))
+        .and_where(
+            Expr::col((A::Legacy, N::WorkspaceId)).equals((S::Task, task::Column::WorkspaceId)),
+        )
+        .and_where(Expr::col((A::Legacy, N::AcknowledgedAt)).is_not_null())
+        .to_owned();
+    Func::coalesce([
+        Expr::col((A::Receipt, task_run_read::Column::ReadAt)),
+        Expr::from(legacy),
+    ])
+    .into()
+}
+
+fn relation(access: &TaskCompletionInboxAccess<'_>, workspace_scan: bool) -> SelectStatement {
+    use InboxAlias as A;
+    let mut query = Query::select();
+    if workspace_scan {
+        // CROSS JOIN fences task -> run order before root/ACL joins. The hints
+        // below require workspace and task-local index seeks even on empty sets.
+        query
+            .from_as(task::Entity, S::Task)
+            .cross_join(task_run::Entity.table_ref().alias(A::Run))
+            .and_where(
+                Expr::col((A::Run, task_run::Column::TaskId)).equals((S::Task, task::Column::Id)),
+            );
     } else {
-        "FROM task_run r JOIN task t ON t.id=r.task_id"
-    };
-    format!(
-        "{source} {TASK_SCOPE_JOINS} LEFT JOIN task_run_read receipt ON receipt.principal_id=?2 AND receipt.run_id=r.id WHERE t.workspace_id=?1 AND {TERMINAL} AND {TASK_SCOPE_VALID} AND scope_thread.id IS NOT NULL AND {ACCESS}"
-    )
+        query.from_as(task_run::Entity, A::Run).join_as(
+            JoinType::InnerJoin,
+            task::Entity,
+            S::Task,
+            Expr::col((S::Task, task::Column::Id)).equals((A::Run, task_run::Column::TaskId)),
+        );
+    }
+    let mut query = task_scope_query(query);
+    query
+        .join_as(
+            JoinType::LeftJoin,
+            task_run_read::Entity,
+            A::Receipt,
+            Condition::all()
+                .add(
+                    Expr::col((A::Receipt, task_run_read::Column::PrincipalId))
+                        .eq(access.principal_id),
+                )
+                .add(
+                    Expr::col((A::Receipt, task_run_read::Column::RunId))
+                        .equals((A::Run, task_run::Column::Id)),
+                ),
+        )
+        .and_where(Expr::col((S::Task, task::Column::WorkspaceId)).eq(access.workspace_id))
+        .and_where(Expr::col((A::Run, task_run::Column::CompletedAt)).is_not_null())
+        .and_where(
+            Expr::col((A::Run, task_run::Column::Status)).is_in(
+                [
+                    pioneer_protocol::TaskRunStatus::Succeeded,
+                    pioneer_protocol::TaskRunStatus::Failed,
+                    pioneer_protocol::TaskRunStatus::Blocked,
+                    pioneer_protocol::TaskRunStatus::Cancelled,
+                    pioneer_protocol::TaskRunStatus::TimedOut,
+                ]
+                .map(crate::convention::task_run_status_to_db),
+            ),
+        )
+        .and_where(Expr::col((S::Thread, thread::Column::Id)).is_not_null())
+        .cond_where(access_condition(access));
+    query
 }
-fn projection() -> String {
-    // Only fields needed by the existing public failure projection. In
-    // particular, diagnostic/provider details and full HTML are never loaded.
-    format!(
-        "SELECT t.id task_id,r.id run_id,t.title,scope_thread.id thread_id,COALESCE(scope_thread.name,scope_thread.id) thread_title,r.status,CAST(r.completed_at AS TEXT) completed_key,CAST(strftime('%s',r.completed_at) AS INTEGER) completed_at,substr(json_extract(r.result_json,'$.summary'),1,1024) summary,CASE WHEN r.error_json IS NOT NULL THEN json_object('code',substr(json_extract(r.error_json,'$.code'),1,128),'message',substr(json_extract(r.error_json,'$.message'),1,1024),'class',json_extract(r.error_json,'$.class')) END error_json,CAST(strftime('%s',{READ_AT}) AS INTEGER) read_at"
-    )
+
+fn select_metadata(query: &mut SelectStatement, access: &TaskCompletionInboxAccess<'_>) {
+    use InboxAlias as A;
+    use InboxField as F;
+    query
+        .expr_as(Expr::col((S::Task, task::Column::Id)), F::TaskId)
+        .expr_as(Expr::col((A::Run, task_run::Column::Id)), F::RunId)
+        .expr_as(Expr::col((S::Task, task::Column::Title)), F::Title)
+        .expr_as(Expr::col((S::Thread, thread::Column::Id)), F::ThreadId)
+        .expr_as(
+            Func::coalesce([
+                Expr::col((S::Thread, thread::Column::Name)),
+                Expr::col((S::Thread, thread::Column::Id)),
+            ]),
+            F::ThreadTitle,
+        )
+        .expr_as(Expr::col((A::Run, task_run::Column::Status)), F::Status)
+        .expr_as(
+            Expr::col((A::Run, task_run::Column::CompletedAt)),
+            F::CompletedKey,
+        )
+        .expr_as(read_at(access), F::ReadKey);
 }
-fn from_row(row: sea_orm::QueryResult) -> Result<TaskCompletionInboxRow> {
-    Ok(TaskCompletionInboxRow {
-        task_id: row.try_get("", "task_id")?,
-        run_id: row.try_get("", "run_id")?,
-        title: row.try_get("", "title")?,
-        thread_id: row.try_get("", "thread_id")?,
-        thread_title: row.try_get("", "thread_title")?,
-        status: crate::convention::task_run_status_from_db(&row.try_get::<String>("", "status")?)
-            .context("invalid inbox run status")?,
-        completed_at: row.try_get("", "completed_at")?,
-        completed_key: row.try_get("", "completed_key")?,
-        summary: row.try_get("", "summary")?,
-        error_json: row.try_get("", "error_json")?,
-        read_at: row.try_get("", "read_at")?,
-    })
+
+fn unix_seconds(value: Expr) -> Expr {
+    // Func::cust is SeaQuery's supported named-function API: all arguments stay
+    // typed/bound. SQLite strftime returns text; retain the original integer cast.
+    Func::cust(Alias::new("strftime"))
+        .args([Expr::val("%s"), value])
+        .cast_as(Alias::new("INTEGER"))
+}
+fn result_field(column: task_run::Column, path: &str) -> Expr {
+    Func::cust(Alias::new("json_extract"))
+        .args([Expr::col((InboxAlias::ResultRun, column)), Expr::val(path)])
+        .into()
+}
+fn bounded_text(value: Expr, limit: i32) -> Expr {
+    Func::cust(Alias::new("substr"))
+        .args([value, Expr::val(1), Expr::val(limit)])
+        .into()
+}
+
+fn project_page(page: SelectStatement) -> SelectStatement {
+    use InboxAlias as A;
+    use InboxField as F;
+    let cte = CommonTableExpression::new()
+        .table_name(A::InboxPage)
+        .materialized(true)
+        .query(page)
+        .to_owned();
+    let mut query = Query::select();
+    // The materialized CTE contains bounded metadata only. JSON extraction is
+    // outside it, so sorting/filtering cannot parse historical result payloads.
+    query
+        .with_cte(cte)
+        .from_as(A::InboxPage, A::Page)
+        .cross_join(task_run::Entity.table_ref().alias(A::ResultRun))
+        .and_where(Expr::col((A::ResultRun, task_run::Column::Id)).equals((A::Page, F::RunId)));
+    for field in [
+        F::TaskId,
+        F::RunId,
+        F::Title,
+        F::ThreadId,
+        F::ThreadTitle,
+        F::Status,
+    ] {
+        query.expr_as(Expr::col((A::Page, field)), field);
+    }
+    let public_error = Func::cust(Alias::new("json_object")).args([
+        Expr::val("code"),
+        bounded_text(result_field(task_run::Column::ErrorJson, "$.code"), 128),
+        Expr::val("message"),
+        bounded_text(result_field(task_run::Column::ErrorJson, "$.message"), 1024),
+        Expr::val("class"),
+        result_field(task_run::Column::ErrorJson, "$.class"),
+    ]);
+    query
+        .expr_as(
+            Expr::col((A::Page, F::CompletedKey)).cast_as(Alias::new("TEXT")),
+            F::CompletedKey,
+        )
+        .expr_as(
+            unix_seconds(Expr::col((A::Page, F::CompletedKey))),
+            F::CompletedAt,
+        )
+        .expr_as(
+            bounded_text(
+                result_field(task_run::Column::ResultJson, "$.summary"),
+                1024,
+            ),
+            F::Summary,
+        )
+        .expr_as(
+            Expr::case(
+                Expr::col((A::ResultRun, task_run::Column::ErrorJson)).is_not_null(),
+                public_error,
+            )
+            .finally(Expr::val(None::<String>)),
+            F::ErrorJson,
+        )
+        .expr_as(unix_seconds(Expr::col((A::Page, F::ReadKey))), F::ReadAt)
+        .order_by((A::Page, F::CompletedKey), Order::Desc)
+        .order_by((A::Page, F::RunId), Order::Desc);
+    query
+}
+
+/// SeaQuery 1.0.2 has MySQL index hints but no SQLite INDEXED BY node/API.
+/// Render the typed query first, then add ONLY the two fixed table hints. Values
+/// remain bound. Fail closed if rendering changes; never execute an unhinted
+/// workspace scan. Exact get/read statements do not use this adapter.
+fn workspace_statement(query: &SelectStatement) -> Result<Statement> {
+    let mut statement = DbBackend::Sqlite.build(query);
+    for (table, index) in [
+        ("\"task\" AS \"t\"", "idx_task_workspace_status"),
+        ("\"task_run\" AS \"r\"", "idx_task_run_task_id"),
+    ] {
+        anyhow::ensure!(
+            statement.sql.matches(table).count() == 1,
+            "inbox workspace index target changed"
+        );
+        statement.sql =
+            statement
+                .sql
+                .replacen(table, &format!("{table} INDEXED BY \"{index}\""), 1);
+    }
+    Ok(statement)
 }
 
 fn page_statement(
     access: &TaskCompletionInboxAccess<'_>,
     before: Option<(&str, &str)>,
     limit: usize,
-) -> Statement {
-    let mut values = access.values();
-    let mut page = format!(
-        "SELECT t.id task_id,r.id run_id,t.title,scope_thread.id thread_id,COALESCE(scope_thread.name,scope_thread.id) thread_title,r.status,r.completed_at,{READ_AT} read_at {}",
-        relation(true)
-    );
+) -> Result<Statement> {
+    use InboxAlias as A;
+    let mut page = relation(access, true);
+    select_metadata(&mut page, access);
     if let Some((at, id)) = before {
-        page.push_str(" AND (r.completed_at,r.id)<(?4,?5)");
-        values.extend([at.into(), id.into()]);
+        page.and_where(
+            Expr::tuple([
+                Expr::col((A::Run, task_run::Column::CompletedAt)),
+                Expr::col((A::Run, task_run::Column::Id)),
+            ])
+            .lt(Expr::tuple([Expr::val(at), Expr::val(id)])),
+        );
     }
-    page.push_str(&format!(
-        " ORDER BY r.completed_at DESC,r.id DESC LIMIT {}",
-        limit.clamp(1, 101)
-    ));
-    // Materialize only the bounded metadata page before extracting summaries.
-    // A planner choosing a sort must never parse every historical result/HTML.
-    let sql = format!(
-        r#"WITH inbox_page AS MATERIALIZED ({page})
-        SELECT p.task_id,p.run_id,p.title,p.thread_id,p.thread_title,p.status,
-            CAST(p.completed_at AS TEXT) completed_key,CAST(strftime('%s',p.completed_at) AS INTEGER) completed_at,
-            substr(json_extract(r.result_json,'$.summary'),1,1024) summary,
-            CASE WHEN r.error_json IS NOT NULL THEN json_object(
-                'code',substr(json_extract(r.error_json,'$.code'),1,128),
-                'message',substr(json_extract(r.error_json,'$.message'),1,1024),
-                'class',json_extract(r.error_json,'$.class')) END error_json,
-            CAST(strftime('%s',p.read_at) AS INTEGER) read_at
-        FROM inbox_page p CROSS JOIN task_run r ON r.id=p.run_id
-        ORDER BY p.completed_at DESC,p.run_id DESC"#
-    );
-    Statement::from_sql_and_values(DbBackend::Sqlite, sql, values)
+    page.order_by((A::Run, task_run::Column::CompletedAt), Order::Desc)
+        .order_by((A::Run, task_run::Column::Id), Order::Desc)
+        .limit(limit.clamp(1, 101) as u64);
+    workspace_statement(&project_page(page))
 }
 
 pub async fn list_task_completion_inbox<C: ConnectionTrait>(
@@ -130,30 +375,32 @@ pub async fn list_task_completion_inbox<C: ConnectionTrait>(
     before: Option<(&str, &str)>,
     limit: usize,
 ) -> Result<Vec<TaskCompletionInboxRow>> {
-    db.query_all_raw(page_statement(access, before, limit))
+    db.query_all_raw(page_statement(access, before, limit)?)
         .await?
-        .into_iter()
-        .map(from_row)
+        .iter()
+        .map(|row| InboxRow::from_query_result(row, "")?.try_into())
         .collect()
 }
-
-fn unread_count_statement(access: &TaskCompletionInboxAccess<'_>) -> Statement {
-    let sql = format!(
-        "SELECT COUNT(*) count {} AND {READ_AT} IS NULL",
-        relation(true)
-    );
-    Statement::from_sql_and_values(DbBackend::Sqlite, sql, access.values())
+fn unread_count_statement(access: &TaskCompletionInboxAccess<'_>) -> Result<Statement> {
+    let mut query = relation(access, true);
+    query
+        .expr_as(Func::count(Expr::col(Asterisk)), InboxField::Count)
+        .and_where(read_at(access).is_null());
+    workspace_statement(&query)
 }
-
+#[derive(FromQueryResult)]
+struct UnreadCount {
+    count: i64,
+}
 pub async fn count_unread_task_completion_inbox<C: ConnectionTrait>(
     db: &C,
     access: &TaskCompletionInboxAccess<'_>,
 ) -> Result<u64> {
     let row = db
-        .query_one_raw(unread_count_statement(access))
+        .query_one_raw(unread_count_statement(access)?)
         .await?
         .context("inbox count missing")?;
-    Ok(row.try_get::<i64>("", "count")? as u64)
+    Ok(UnreadCount::from_query_result(&row, "")?.count as u64)
 }
 
 pub async fn find_task_completion_inbox_entry<C: ConnectionTrait>(
@@ -161,45 +408,65 @@ pub async fn find_task_completion_inbox_entry<C: ConnectionTrait>(
     access: &TaskCompletionInboxAccess<'_>,
     run_id: &str,
 ) -> Result<Option<TaskCompletionInboxRow>> {
-    let sql = format!("{} {} AND r.id=?4", projection(), relation(false));
-    let mut values = access.values();
-    values.push(run_id.into());
-    db.query_one_raw(Statement::from_sql_and_values(
-        DbBackend::Sqlite,
-        sql,
-        values,
-    ))
-    .await?
-    .map(from_row)
-    .transpose()
+    let mut page = relation(access, false);
+    select_metadata(&mut page, access);
+    page.and_where(Expr::col((InboxAlias::Run, task_run::Column::Id)).eq(run_id))
+        .limit(1);
+    db.query_one(&project_page(page))
+        .await?
+        .map(|row| InboxRow::from_query_result(&row, "")?.try_into())
+        .transpose()
 }
 
-/// ACL, terminal state and receipt commit are a single writer statement. No
-/// preparation reads can become stale before this write is admitted.
+/// ACL, terminal state and receipt commit remain a single writer statement.
 pub async fn mark_task_completion_inbox_read<C: ConnectionTrait>(
     db: &C,
     access: &TaskCompletionInboxAccess<'_>,
     run_id: &str,
     read_at: &str,
 ) -> Result<()> {
-    let sql = format!(
-        "INSERT INTO task_run_read(principal_id,run_id,read_at) SELECT ?2,r.id,?5 {} AND r.id=?4 ON CONFLICT(principal_id,run_id) DO NOTHING",
-        relation(false)
-    );
-    let mut values = access.values();
-    values.extend([run_id.into(), read_at.into()]);
-    db.execute_raw(Statement::from_sql_and_values(
-        DbBackend::Sqlite,
-        sql,
-        values,
-    ))
-    .await?;
+    let mut source = relation(access, false);
+    source
+        .expr(Expr::val(access.principal_id))
+        .column((InboxAlias::Run, task_run::Column::Id))
+        .expr(Expr::val(read_at))
+        .and_where(Expr::col((InboxAlias::Run, task_run::Column::Id)).eq(run_id));
+    let insert = Query::insert()
+        .into_table(task_run_read::Entity)
+        .columns([
+            task_run_read::Column::PrincipalId,
+            task_run_read::Column::RunId,
+            task_run_read::Column::ReadAt,
+        ])
+        .select_from(source)?
+        .on_conflict(
+            OnConflict::columns([
+                task_run_read::Column::PrincipalId,
+                task_run_read::Column::RunId,
+            ])
+            .do_nothing()
+            .to_owned(),
+        )
+        .to_owned();
+    db.execute(&insert).await?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workspace_hints_fail_closed_when_a_typed_source_is_missing_or_ambiguous() {
+        let missing_run = Query::select()
+            .expr(Expr::val(1))
+            .from_as(task::Entity, S::Task)
+            .to_owned();
+        assert!(workspace_statement(&missing_run).is_err());
+        let mut ambiguous = missing_run;
+        ambiguous.from_as(task::Entity, S::Task);
+        assert!(workspace_statement(&ambiguous).is_err());
+    }
 
     // Production statements on the migrated schema, prepared for post-review
     // execution only. Keep the physical reader and serialized writer separate.
@@ -236,10 +503,12 @@ mod tests {
             absolute: false,
         };
         for mut statement in [
-            page_statement(&access, None, 31),
-            page_statement(&access, Some(("2026-10-16 10:00:00 +00:00", "run")), 31),
-            unread_count_statement(&access),
+            page_statement(&access, None, 31).unwrap(),
+            page_statement(&access, Some(("2026-10-16 10:00:00 +00:00", "run")), 31).unwrap(),
+            unread_count_statement(&access).unwrap(),
         ] {
+            // Inspect the exact final statement, including INDEXED BY, which
+            // SeaQuery cannot represent in its ExplainStatement AST either.
             statement.sql = format!("EXPLAIN QUERY PLAN {}", statement.sql);
             let plan = db
                 .query_all_raw(statement)
