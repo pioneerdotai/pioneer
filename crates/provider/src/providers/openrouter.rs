@@ -455,8 +455,8 @@ impl OpenRouterFailure {
         }
     }
 
-    fn stream(error: StreamError, id: Option<String>) -> Self {
-        Self::generation(error, id, ProviderFailureStage::MidStream, None)
+    fn stream(error: StreamError, id: Option<String>, retry_after_ms: Option<u64>) -> Self {
+        Self::generation(error, id, ProviderFailureStage::MidStream, retry_after_ms)
     }
 
     fn generation(
@@ -1094,7 +1094,13 @@ impl OpenRouterProvider {
         request_id: Option<String>,
         diagnostics: crate::ProviderStreamDiagnostics,
     ) -> crate::ProviderStream {
-        Self::decode_stream_with_usage(byte_stream, request_id, diagnostics, TokenUsage::default())
+        Self::decode_stream_with_usage(
+            byte_stream,
+            request_id,
+            diagnostics,
+            TokenUsage::default(),
+            None,
+        )
     }
 
     fn decode_stream_with_usage(
@@ -1102,6 +1108,7 @@ impl OpenRouterProvider {
         request_id: Option<String>,
         diagnostics: crate::ProviderStreamDiagnostics,
         header_usage: TokenUsage,
+        retry_after_ms: Option<u64>,
     ) -> crate::ProviderStream {
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<StreamChunk>>(64);
 
@@ -1229,6 +1236,7 @@ impl OpenRouterProvider {
                                     .send(Err(OpenRouterFailure::stream(
                                         error,
                                         generation_id.clone(),
+                                        retry_after_ms,
                                     )
                                     .into()))
                                     .await
@@ -1647,6 +1655,7 @@ impl crate::traits::Provider for OpenRouterProvider {
         {
             diagnostics.set_request_id(id);
         }
+        let retry_after_ms = ResponseFailureFacts::capture(&response).retry_after_ms;
         let byte_stream = crate::http::bounded_response_stream(
             response,
             crate::types::ProviderResponseLimits::default().max_transport_bytes,
@@ -1658,6 +1667,7 @@ impl crate::traits::Provider for OpenRouterProvider {
             request_id,
             diagnostics,
             header_usage,
+            retry_after_ms,
         ))
     }
 

@@ -585,6 +585,9 @@ impl TurnPreflightProviderRequestFailure {
         } else {
             description.failure_class = Some(pioneer_protocol::ProviderFailureClass::Unknown);
         }
+        if source.is::<super::provider::ProviderDispatchDeadlineExceeded>() {
+            description.cause_code = "provider_timeout";
+        }
         Self {
             description,
             collected_response_chars: 0,
@@ -687,9 +690,20 @@ fn turn_preflight_request_attempt_failure(
         failure.map_or(0, |failure| failure.collected_response_bytes),
         failure.and_then(|failure| failure.collected_response_sha256.as_deref()),
     );
+    let (reason, code) = if description.cause_code == "provider_timeout" {
+        (
+            TurnPreflightFallbackReason::Timeout,
+            "preflight.provider.timeout",
+        )
+    } else {
+        (
+            TurnPreflightFallbackReason::ProviderError,
+            "preflight.provider.error",
+        )
+    };
     turn_preflight_attempt_failure(
-        TurnPreflightFallbackReason::ProviderError,
-        "preflight.provider.error",
+        reason,
+        code,
         description.to_string(),
         endpoint,
         attempt,
@@ -3814,7 +3828,11 @@ mod tests {
             provider.as_ref(),
             "provider_stream_start",
             ProviderFailureStage::Connect,
-            anyhow::anyhow!("tunnel error: unexpected end of file"),
+            pioneer_provider::failure::ProviderTransportFailure {
+                classification: pioneer_provider::ProviderFailureClassification::new(
+                    ProviderFailureClass::NetworkTransient,
+                ),
+            },
         );
         assert!(classified.is_transient_network());
         let endpoint = provider_endpoint(provider.clone(), "preflight-provider", "preflight-model");

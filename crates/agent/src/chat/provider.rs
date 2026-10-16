@@ -68,6 +68,10 @@ fn total_token_usage(usage: Option<&TokenUsage>) -> Option<u64> {
     usage.input_tokens?.checked_add(usage.output_tokens?)
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("provider dispatch deadline exceeded")]
+pub(super) struct ProviderDispatchDeadlineExceeded;
+
 pub(super) async fn await_provider_dispatch<T>(
     stream: bool,
     future: impl std::future::Future<Output = anyhow::Result<T>>,
@@ -96,13 +100,16 @@ pub(super) async fn await_provider_dispatch<T>(
         );
         anyhow::Error::new(pioneer_provider::failure::ProviderTransportFailure { classification })
     };
-    if context.cancellation.is_cancelled() || tokio::time::Instant::now() >= deadline {
+    if context.cancellation.is_cancelled() {
         return Err(timeout_error());
+    }
+    if tokio::time::Instant::now() >= deadline {
+        return Err(timeout_error().context(ProviderDispatchDeadlineExceeded));
     }
     tokio::select! {
         biased;
         _ = context.cancellation.cancelled() => Err(timeout_error()),
-        result = tokio::time::timeout_at(deadline, future) => result.map_err(|_| timeout_error())?,
+        result = tokio::time::timeout_at(deadline, future) => result.map_err(|_| timeout_error().context(ProviderDispatchDeadlineExceeded))?,
     }
 }
 
@@ -1849,7 +1856,7 @@ mod tests {
                     }
 
                     let body = r#"{"error":{"code":"native_rejection","message":"SECRET_BODY retry-after: 2"}}"#;
-                    socket.write_all(format!("HTTP/1.1 {status} Error\r\nContent-Type: application/json\r\nX-Generation-Id: gen-native-header\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+                    socket.write_all(format!("HTTP/1.1 {status} Error\r\nContent-Type: application/json\r\nX-Generation-Id: gen-native-header\r\nRetry-After: 2\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
                 });
                 // Native adapter + normal registry wrapper; no endpoint override
                 // resolver, so the default non-redacting error path is exercised.
@@ -2653,7 +2660,7 @@ mod tests {
                 truncated_transport,
             )
             .await;
-            assert_eq!(failure.class, ProviderFailureClass::StreamStall);
+            assert_eq!(failure.class, ProviderFailureClass::StreamTruncated);
             assert_eq!(failure.http_status, None);
             let diagnostic = RecoveryDiagnostic::provider(&failure);
             assert_eq!(
@@ -4847,7 +4854,7 @@ mod native_decoder_gate_tests {
             });
             let request = ChatRequest {
                 model: "fixture".into(), messages: vec![pioneer_provider::ChatMessage::user("fixture")],
-                temperature: None, max_tokens: None, tools: None, tool_choice: None,
+                temperature: None, max_tokens: None, tools: Some(vec![pioneer_provider::ToolDefinition { name: "write_file".into(), description: "Write fixture output".into(), parameters: serde_json::json!({"type":"object","properties":{}}) }]), tool_choice: None,
                 parallel_tool_calls: None, reasoning: None, compiled_prompt: None,
             };
             let result = request_agent_round(&provider, request, "ws", "thread", "turn", "item", ollama, ProviderTimeoutPolicy::default(), &hub).await;
