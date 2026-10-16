@@ -146,7 +146,15 @@ async fn drain_preview_worker(store: &CrudStore, service: &ArtifactService) {
 
 #[tokio::test]
 async fn released_preview_history_keeps_pairing_for_next_native_cli_task_and_frozen_replay() {
-    let f = fixture("answer", vec![], true, false).await;
+    let f = fixture("answer", vec![Reply::Success], true, false).await;
+    // The shared fixture starts a raw compaction operation. Publish its exact
+    // checkpoint before adding preview history, so it does not remain an
+    // unresolved legacy owner that correctly blocks frozen input retirement.
+    assert!(matches!(
+        f.runner.run(CancellationToken::new()).await.unwrap(),
+        CompactionExit::Applied(_)
+    ));
+    assert_eq!(f.provider.calls.lock().unwrap().len(), 1);
     let root = tempfile::tempdir().unwrap();
     let service = ArtifactService::new_with_policies(
         Arc::new(f.store.clone()),
@@ -516,6 +524,25 @@ async fn released_preview_history_keeps_pairing_for_next_native_cli_task_and_fro
         }
     }
     assert!(idle);
+    for (manifest, expired) in [
+        (&live_manifest, 1_i64),
+        (&output.history.manifest_id, 0_i64),
+    ] {
+        let header = db
+            .query_one_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "SELECT expired FROM compaction_frozen_history WHERE id=?",
+                [manifest.clone().into()],
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            header.try_get::<i64>("", "expired").unwrap(),
+            expired,
+            "completed accepted input expires while permanent Task output stays rooted"
+        );
+    }
     // The same output can also be accepted input of a continuing Task. A
     // permanent output root and this live accepted input have distinct policy.
     db.execute_unprepared("INSERT INTO task(id,workspace_id,owner_kind,owner_id,executor_kind,status,title,goal) VALUES ('preview-consumer','ws','thread','thread','agent','running','Consumer','fixture')").await.unwrap();
@@ -1105,7 +1132,11 @@ async fn released_preview_history_keeps_pairing_for_next_native_cli_task_and_fro
         .await
         .is_err()
     );
-    assert!(f.provider.calls.lock().unwrap().is_empty());
+    assert_eq!(
+        f.provider.calls.lock().unwrap().len(),
+        1,
+        "authorized preparation and replay never invoke the provider"
+    );
 }
 
 #[tokio::test]
