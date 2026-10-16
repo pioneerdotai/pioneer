@@ -412,6 +412,41 @@ impl MessageProcessor {
         let notification_task_id = context.task_id.clone();
         let is_progress_event = matches!(event.payload, TaskEventPayload::Progress { .. });
         let is_terminal_event = event.payload.is_terminal();
+        // Saved runs are already committed. Invalidate independently of timeline
+        // projection and delivery so offline history and deliveryPolicy=none use
+        // the same source. This small hint also avoids coupling inbox refresh to
+        // the richer Task/TaskRun presentation notification payloads.
+        if matches!(
+            &event.payload,
+            TaskEventPayload::RunCompleted { .. }
+                | TaskEventPayload::RunFailed { .. }
+                | TaskEventPayload::RunBlocked { .. }
+                | TaskEventPayload::RunCancelled { .. }
+                | TaskEventPayload::RunCreated { .. }
+                | TaskEventPayload::RunStarted { .. }
+                | TaskEventPayload::TaskCompleted { .. }
+                | TaskEventPayload::TaskFailed { .. }
+                | TaskEventPayload::TaskBlocked { .. }
+                | TaskEventPayload::TaskCancelled { .. }
+                | TaskEventPayload::TaskResumed { .. }
+                | TaskEventPayload::TaskUpdated { .. }
+                | TaskEventPayload::TaskRecovered { .. }
+                | TaskEventPayload::TaskRevisionRequested { .. }
+                | TaskEventPayload::TaskRunEnteredReview { .. }
+                | TaskEventPayload::DepthLimitExceeded { .. }
+                | TaskEventPayload::TaskThreadLineageCreated { .. }
+                | TaskEventPayload::ChildThreadLinked { .. }
+        ) {
+            self.send_notification_to_task_workspace_connections(
+                &notification_task_id,
+                &workspace_id,
+                events::TASK_COMPLETION_INBOX_CHANGED,
+                &pioneer_protocol::TaskCompletionInboxChangedNotification {
+                    workspace_id: workspace_id.clone(),
+                },
+            )
+            .await;
+        }
         let awaits_occurrence_thread_delivery = match event.payload.run_id() {
             Some(run_id) => {
                 self.task_run_awaits_occurrence_thread_delivery(&task_response, run_id)

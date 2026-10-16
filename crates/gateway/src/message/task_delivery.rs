@@ -243,6 +243,8 @@ impl MessageProcessor {
                 return;
             }
         };
+        self.notify_task_completion_inbox_read(request_context, workspace.workspace_id())
+            .await;
         let response = pioneer_protocol::TaskUserNotificationAcknowledgeResponse { notification };
         match JsonRpcResponse::from_result(request_id.clone(), &response) {
             Ok(response) => {

@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 use anyhow::{Context, Result};
 use pioneer_entity::{
     artifact, artifact_binding, auth_session, mcp_server_installation, skill_workspace_policy,
-    task, task_execution_admission, task_run, thread, thread_lineage, turn, workspace,
+    task_run, thread, thread_lineage, turn, workspace,
 };
 use pioneer_protocol::{PersistedActorRef, PrincipalId};
 use sea_orm::{ColumnTrait, Condition, ConnectionTrait, EntityTrait, QueryFilter};
@@ -540,121 +540,89 @@ pub async fn resolve_artifact_binding_authorization_root<C: ConnectionTrait>(
     Ok(roots.into_iter().next())
 }
 
+// Canonical Task scope relation, shared by exact TaskRead resolution and the
+// inbox's set queries. Provenance is rooted before lineage is followed. In
+// particular, a child's owner/creator cannot replace its root Task's ACL.
+// The unique root/workspace lookups preserve the source order for inbox seeks.
+pub(crate) const TASK_SCOPE_JOINS: &str = r#"
+CROSS JOIN task scope_root ON scope_root.id=COALESCE(t.root_task_id,t.id)
+    AND scope_root.workspace_id=t.workspace_id AND scope_root.root_task_id IS NULL
+CROSS JOIN workspace scope_workspace ON scope_workspace.id=t.workspace_id
+LEFT JOIN turn scope_turn ON scope_turn.id=scope_root.created_by_turn_id
+LEFT JOIN thread scope_origin ON scope_origin.id=COALESCE(scope_root.created_by_thread_id,
+    CASE WHEN scope_root.owner_kind='thread' THEN scope_root.owner_id END,scope_turn.thread_id)
+    AND scope_origin.workspace_id=t.workspace_id
+LEFT JOIN thread_lineage scope_lineage ON scope_lineage.child_thread_id=scope_origin.id
+LEFT JOIN thread scope_thread ON scope_thread.id=CASE WHEN scope_origin.access_class='internal'
+    THEN scope_lineage.root_thread_id ELSE scope_origin.id END
+    AND scope_thread.workspace_id=t.workspace_id
+LEFT JOIN task_execution_admission scope_admission ON scope_admission.task_id=t.id
+"#;
+pub(crate) const TASK_SCOPE_VALID: &str = r#"
+(scope_root.created_by_turn_id IS NULL OR (scope_turn.id IS NOT NULL AND EXISTS
+    (SELECT 1 FROM thread turn_thread WHERE turn_thread.id=scope_turn.thread_id
+      AND turn_thread.workspace_id=t.workspace_id)
+    AND (COALESCE(scope_root.created_by_thread_id,CASE WHEN scope_root.owner_kind='thread'
+        THEN scope_root.owner_id END) IS NULL OR scope_turn.thread_id=COALESCE(
+        scope_root.created_by_thread_id,CASE WHEN scope_root.owner_kind='thread' THEN scope_root.owner_id END))))
+AND (COALESCE(scope_root.created_by_thread_id,CASE WHEN scope_root.owner_kind='thread'
+    THEN scope_root.owner_id END,scope_turn.thread_id) IS NULL OR
+    (scope_origin.id IS NOT NULL AND scope_origin.access_class IN ('private','workspace','internal')
+    AND scope_thread.id IS NOT NULL AND scope_thread.access_class IN ('private','workspace')
+    AND ((scope_origin.created_by_actor_kind IS NULL AND scope_origin.created_by_actor_id IS NULL) OR (scope_origin.created_by_actor_kind='system' AND scope_origin.created_by_actor_id IS NULL) OR (scope_origin.created_by_actor_kind IN ('principal','agent_execution') AND length(scope_origin.created_by_actor_id)=21 AND scope_origin.created_by_actor_id NOT GLOB '*[^A-Za-z0-9]*')) AND ((scope_thread.created_by_actor_kind IS NULL AND scope_thread.created_by_actor_id IS NULL) OR (scope_thread.created_by_actor_kind='system' AND scope_thread.created_by_actor_id IS NULL) OR (scope_thread.created_by_actor_kind IN ('principal','agent_execution') AND length(scope_thread.created_by_actor_id)=21 AND scope_thread.created_by_actor_id NOT GLOB '*[^A-Za-z0-9]*'))))
+AND (scope_admission.task_id IS NULL OR scope_admission.root_thread_id=scope_thread.id)
+AND (scope_root.owner_kind<>'user' OR (length(scope_root.owner_id)=21
+    AND scope_root.owner_id NOT GLOB '*[^A-Za-z0-9]*'))
+"#;
+
 pub async fn resolve_task_authorization_scope<C: ConnectionTrait>(
     db: &C,
     task_id: &str,
     expected_workspace_id: Option<&str>,
     expected_root_thread_id: Option<&str>,
 ) -> Result<Option<TaskAuthorizationScope>> {
-    let Some(model) = task::Entity::find_by_id(task_id.to_owned())
-        .one(db)
-        .await
-        .context("failed to resolve task authorization scope")?
-    else {
-        return Ok(None);
-    };
-    if expected_workspace_id.is_some_and(|expected| expected != model.workspace_id.as_str()) {
-        return Ok(None);
-    }
-    let Some(workspace) =
-        resolve_workspace_authorization_scope(db, model.workspace_id.as_str()).await?
-    else {
-        return Ok(None);
-    };
-
-    let root = if let Some(root_task_id) = model.root_task_id.as_ref() {
-        let Some(root) = task::Entity::find_by_id(root_task_id.clone())
-            .one(db)
-            .await
-            .context("failed to resolve task root authorization scope")?
-        else {
-            return Ok(None);
-        };
-        if root.workspace_id != model.workspace_id || root.root_task_id.is_some() {
-            return Ok(None);
-        }
-        root
-    } else {
-        model.clone()
-    };
-
-    let mut creating_thread_id = root.created_by_thread_id.clone().or_else(|| {
-        (root.owner_kind == "thread")
-            .then(|| root.owner_id.clone())
-            .flatten()
-    });
-    if let Some(turn_id) = root.created_by_turn_id.as_ref() {
-        let Some(turn_scope) = resolve_turn_authorization_scope(
-            db,
-            turn_id.as_str(),
-            Some(model.workspace_id.as_str()),
-            creating_thread_id.as_deref(),
-        )
+    use sea_orm::{DbBackend, Statement};
+    let sql = format!(
+        "SELECT t.id,t.workspace_id,scope_workspace.is_active,scope_thread.id AS thread_id,scope_root.owner_kind,scope_root.owner_id FROM task t {TASK_SCOPE_JOINS} WHERE t.id=? AND {TASK_SCOPE_VALID}"
+    );
+    let Some(row) = db
+        .query_one_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            sql,
+            [task_id.into()],
+        ))
         .await?
-        else {
-            return Ok(None);
-        };
-        creating_thread_id.get_or_insert(turn_scope.thread_id);
-    }
-
-    // `created_by_thread_id` is exact causal provenance and may identify an
-    // internal child. Authorization belongs to that child's durable
-    // collaboration root, never to the initiating principal and never to the
-    // internal row itself.
-    let root_thread_id = match creating_thread_id.as_deref() {
-        Some(thread_id) => {
-            artifact_authorization_root_thread_id(db, model.workspace_id.as_str(), thread_id)
-                .await?
-        }
-        None => None,
-    };
-    if expected_root_thread_id.is_some_and(|expected| root_thread_id.as_deref() != Some(expected)) {
+    else {
         return Ok(None);
-    }
-
-    if let Some(admission) = task_execution_admission::Entity::find_by_id(model.id.clone())
-        .one(db)
-        .await
-        .context("failed to resolve Task execution admission authority")?
-        && root_thread_id.as_deref() != Some(admission.root_thread_id.as_str())
+    };
+    let workspace_id: String = row.try_get("", "workspace_id")?;
+    let root_thread_id: Option<String> = row.try_get("", "thread_id")?;
+    if expected_workspace_id.is_some_and(|id| id != workspace_id)
+        || expected_root_thread_id.is_some_and(|id| Some(id) != root_thread_id.as_deref())
     {
         return Ok(None);
     }
     let root_thread = match root_thread_id.as_deref() {
-        Some(thread_id) => {
-            let Some(scope) = resolve_thread_authorization_scope(
-                db,
-                thread_id,
-                Some(model.workspace_id.as_str()),
-            )
-            .await?
+        Some(id) => {
+            let Some(scope) =
+                resolve_thread_authorization_scope(db, id, Some(&workspace_id)).await?
             else {
                 return Ok(None);
             };
-            if scope.access_class == PersistedThreadAccessClass::Internal {
-                return Ok(None);
-            }
             Some(scope)
         }
         None => None,
     };
-    let initiating_principal_id = if root.owner_kind == "user" {
-        let Some(owner_id) = root.owner_id.as_deref() else {
-            return Ok(None);
-        };
-        match PrincipalId::new(owner_id) {
-            Ok(principal_id) => Some(principal_id),
-            Err(_) => return Ok(None),
-        }
+    let initiating_principal_id = if row.try_get::<String>("", "owner_kind")? == "user" {
+        Some(PrincipalId::new(row.try_get::<String>("", "owner_id")?)?)
     } else {
         None
     };
-
     Ok(Some(TaskAuthorizationScope {
-        workspace_id: model.workspace_id,
+        workspace_id,
         root_thread_id,
-        task_id: model.id,
-        workspace_is_active: workspace.is_active,
+        task_id: row.try_get("", "id")?,
+        workspace_is_active: row.try_get("", "is_active")?,
         root_thread,
         initiating_principal_id,
     }))

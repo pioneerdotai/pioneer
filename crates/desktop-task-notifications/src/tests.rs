@@ -41,8 +41,8 @@ impl DesktopNotificationPort for FakePort {
 }
 fn input(revision: u64, actionable: bool) -> Arc<TaskInboxPublication> {
     Arc::new(serde_json::from_value(serde_json::json!({
-        "workspace_id":"a", "revision":revision, "next_cursor":null, "loading":false, "error":null, "opened":null, "native_notifications":[],
-        "items":[{"revision":revision,"dismissing":false,"notification":{"notificationId":"n","workspaceId":"a","taskId":"t","runId":"r","deliveryId":"d","createdAt":1,"acknowledgedAt":if actionable { None } else { Some(2) }}}]
+        "workspace_id":"a", "revision":revision, "next_cursor":null,"unread_count":if actionable {1}else{0}, "loading":false, "error":null, "opened":null, "native_notifications":[],
+        "items":[{"revision":revision,"dismissing":false,"notification":{"workspaceId":"a","taskId":"t","runId":"r","title":"Task","threadId":"root","threadTitle":"Root","status":"succeeded","completedAt":1,"readAt":if actionable { None } else { Some(2) }}}]
     })).unwrap())
 }
 #[gpui_kit::test]
@@ -84,4 +84,112 @@ fn fake_native_resources_dedupe_replace_clear_and_teardown(cx: &mut TestAppConte
         assert_eq!(port.removed.borrow().len(), 3);
         assert!(view.delivered.is_empty());
     });
+}
+
+#[gpui_kit::test]
+fn workspace_change_discards_old_result_cards_and_read_count(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let client = Arc::new(ClientCore::new());
+    let view = cx.new(|cx| {
+        TaskNotificationView::new(
+            TaskNotificationConfig::new(
+                client.clone(),
+                Arc::new(Registrar),
+                TaskNotificationLabels::new(
+                    "title".into(),
+                    "task".into(),
+                    "loading".into(),
+                    "empty".into(),
+                    "completed".into(),
+                    "read".into(),
+                ),
+            ),
+            cx,
+        )
+    });
+    view.update(cx, |view, _| {
+        view.workspace = Some("a".into());
+        view.input = Some(input(1, true));
+    });
+    client.open_workspace_thread("b".into(), None, None);
+    view.update(cx, |view, cx| {
+        view.sync(cx);
+        assert_eq!(view.workspace.as_deref(), Some("b"));
+        assert!(view.input.is_none());
+    });
+}
+
+#[gpui_kit::test]
+fn keyboard_navigation_reaches_virtualized_history_without_reading_it(cx: &mut TestAppContext) {
+    use gpui_kit::component::Root;
+    cx.update(gpui_kit::init);
+    cx.update(super::init);
+    let (root, cx) = cx.add_window_view(|window, cx| {
+        let view = cx.new(|cx| {
+            TaskNotificationView::new(
+                TaskNotificationConfig::new(
+                    Arc::new(ClientCore::new()),
+                    Arc::new(Registrar),
+                    TaskNotificationLabels::new(
+                        "title".into(),
+                        "task".into(),
+                        "loading".into(),
+                        "empty".into(),
+                        "completed".into(),
+                        "read".into(),
+                    ),
+                ),
+                cx,
+            )
+        });
+        Root::new(view, window, cx)
+    });
+    let view = root.read_with(cx, |root, _| {
+        root.view()
+            .clone()
+            .downcast::<TaskNotificationView>()
+            .unwrap()
+    });
+    view.update(cx, |view, cx| {
+        let mut publication = serde_json::to_value(input(1, true).as_ref()).unwrap();
+        let template = publication["items"][0].clone();
+        publication["items"] = (0..32)
+            .map(|ix| {
+                let mut row = template.clone();
+                row["notification"]["runId"] = format!("run-{ix:03}").into();
+                row
+            })
+            .collect::<Vec<_>>()
+            .into();
+        publication["unread_count"] = 120.into();
+        view.workspace = Some("a".into());
+        view.input = Some(Arc::new(serde_json::from_value(publication).unwrap()));
+        view.inbox_open = true;
+        cx.notify();
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        let focus = view.read(cx).inbox_focus.clone();
+        focus.focus(window, cx);
+    });
+    for _ in 0..32 {
+        cx.simulate_keystrokes("down");
+        cx.run_until_parked();
+    }
+    view.read_with(cx, |view, _| {
+        assert_eq!(view.selected_run.as_deref(), Some("run-031"));
+        assert!(view.scroll.base_handle().offset().y < gpui_kit::Pixels::ZERO);
+        assert_eq!(view.input.as_ref().unwrap().unread_count(), 120);
+        assert!(
+            view.input
+                .as_ref()
+                .unwrap()
+                .items()
+                .iter()
+                .all(|item| item.is_actionable())
+        );
+    });
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    view.read_with(cx, |view, _| assert!(!view.inbox_open));
 }

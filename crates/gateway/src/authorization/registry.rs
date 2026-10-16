@@ -783,6 +783,27 @@ pub(crate) static NORMAL_METHOD_REGISTRY: &[MethodAuthorizationEntry] = &[
     method_entry(TASK_AGENDA, TaskRead, Task, NotFound, Read),
     method_entry(TASK_DELIVERIES, TaskRead, Task, NotFound, Read),
     method_entry(
+        TASK_COMPLETION_INBOX_LIST,
+        NotificationReadOwn,
+        Workspace,
+        NotFound,
+        Read,
+    ),
+    method_entry(
+        TASK_COMPLETION_INBOX_GET,
+        NotificationReadOwn,
+        Workspace,
+        NotFound,
+        Read,
+    ),
+    method_entry(
+        TASK_COMPLETION_INBOX_READ,
+        NotificationAcknowledgeOwn,
+        Workspace,
+        NotFound,
+        Mutation,
+    ),
+    method_entry(
         TASK_USER_NOTIFICATION_LIST,
         NotificationReadOwn,
         Workspace,

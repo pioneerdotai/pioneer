@@ -247,7 +247,7 @@ impl ThreadArtifactsView {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let artifact = &summary.artifact;
-        let created_at = format_timestamp(summary.created_at);
+        let created_at = format_local_timestamp(summary.created_at);
         let action_status = self.thread_artifact_action_status(artifact);
         let action_in_progress = action_status.as_ref().is_some_and(|s| s.is_in_progress());
         let download_can_cancel = matches!(
@@ -796,7 +796,8 @@ fn artifact_binding_target_kind_label(
     }
 }
 
-fn format_timestamp(timestamp_ms: i64) -> String {
+/// Existing desktop date presentation for a Unix timestamp in milliseconds.
+pub fn format_local_timestamp(timestamp_ms: i64) -> String {
     Local
         .timestamp_millis_opt(timestamp_ms)
         .single()

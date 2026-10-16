@@ -211,6 +211,10 @@ pub use repositories::task_actor_contract::{
     upgrade_task_actor_contract_model_to_current, upsert_task_actor_contract,
     upsert_task_occurrence_contract,
 };
+pub use repositories::task_completion_inbox::{
+    TaskCompletionInboxAccess, TaskCompletionInboxRow, count_unread_task_completion_inbox,
+    find_task_completion_inbox_entry, list_task_completion_inbox, mark_task_completion_inbox_read,
+};
 pub use repositories::thread::{
     ThreadManagementChange, advance_thread_read_cursor, find_thread_read_cursor,
     thread_read_cursor_from_model,

@@ -8436,6 +8436,22 @@
           "properties": {
             "kind": {
               "type": "string",
+              "const": "load_more"
+            },
+            "workspace_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "workspace_id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
               "const": "dismiss"
             },
             "notification_id": {

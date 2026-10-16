@@ -1703,6 +1703,14 @@ task = "任务"
 mark_read = "标记为已读"
 completed = "任务已完成"
 
+open = "打开会话"
+more = "加载更多"
+read = "已读"
+unread = "未读"
+retry = "重试"
+loading_failed = "无法加载任务结果"
+timed_out = "已超时"
+
 [settings.self_improvement.status]
 title = "活动"
 refresh = "刷新"

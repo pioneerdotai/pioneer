@@ -147,6 +147,7 @@ pub enum GatewayNotification {
     TaskDeliveryFailed(TaskDeliveryFailedNotification),
     TaskDeliveryCancelled(TaskDeliveryCancelledNotification),
     TaskUserNotificationDelivered(TaskUserNotificationDeliveredNotification),
+    TaskCompletionInboxChanged(crate::TaskCompletionInboxChangedNotification),
     TaskTreeChanged(TaskTreeChangedTaskNotification),
     TaskRecovered(TaskRecoveredNotification),
     MemoryChanged(MemoryChangedNotification),
@@ -657,6 +658,11 @@ impl GatewayNotification {
                 serde_json::from_value::<TaskDeliveryCancelledNotification>(params)
                     .ok()
                     .map(Self::TaskDeliveryCancelled)
+            }
+            events::TASK_COMPLETION_INBOX_CHANGED => {
+                serde_json::from_value::<crate::TaskCompletionInboxChangedNotification>(params)
+                    .ok()
+                    .map(Self::TaskCompletionInboxChanged)
             }
             events::TASK_USER_NOTIFICATION_DELIVERED => {
                 serde_json::from_value::<TaskUserNotificationDeliveredNotification>(params)
