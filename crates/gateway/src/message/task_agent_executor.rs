@@ -2693,6 +2693,7 @@ impl TaskAgentExecutor {
                 &runtime_environment,
                 history.as_slice(),
                 &mut agent_skill_overlay,
+                None,
             )
             .await
         {
@@ -3708,6 +3709,7 @@ impl TaskAgentExecutor {
                 &runtime_environment,
                 history.as_slice(),
                 &mut agent_skill_overlay,
+                None,
             )
             .await
         {
@@ -5906,6 +5908,7 @@ impl TaskAgentExecutor {
                 &runtime_environment,
                 history.as_slice(),
                 &mut agent_skill_overlay,
+                None,
             )
             .await
         {
@@ -7888,6 +7891,7 @@ mod prepared_snapshot_tests {
                 &std::collections::HashMap::new(),
                 &history,
                 &[],
+                None,
             )
             .await
             .unwrap();

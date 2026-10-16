@@ -4203,6 +4203,7 @@ impl MessageProcessor {
         runtime_environment: &HashMap<String, String>,
         history: &[ChatMessage],
         agent_skill_overlay: &[pioneer_skills::AgentSkillRuntimeEntry],
+        accepted_history: Option<&crate::compaction::frozen::PreparedHistory>,
     ) -> anyhow::Result<()> {
         let canonical = history.iter().all(|message| message.provenance.is_some());
         let mut snapshot = crate::turn_runtime_snapshot::new_turn_runtime_snapshot(
@@ -4223,15 +4224,38 @@ impl MessageProcessor {
             agent_skill_overlay,
         )?;
         let mut frozen_prepared = None;
-        if canonical {
-            let allowed = crate::compaction::frozen::execution_history_scopes(
-                self.crud_store.as_ref(),
-                workspace_id,
-                thread_id,
-                turn_id,
-                hook_runtime_context.conversation_thread_id.as_deref(),
-            )
-            .await?;
+        if let Some(prepared) = accepted_history {
+            anyhow::ensure!(
+                canonical && history == prepared.messages.as_slice(),
+                "runtime history does not match its accepted preparation"
+            );
+            anyhow::ensure!(
+                prepared.accepted_scopes.contains(thread_id),
+                "runtime preparation does not include its destination"
+            );
+            snapshot.history_json = serde_json::to_string(&prepared.descriptor)?;
+        } else if canonical {
+            let allowed =
+                if let Some(accepted) = self.crud_store.get_turn_runtime_snapshot(turn_id).await? {
+                    anyhow::ensure!(
+                        accepted.workspace_id == workspace_id && accepted.thread_id == thread_id,
+                        "runtime history scope identity mismatch"
+                    );
+                    crate::turn_runtime_snapshot::accepted_history_scopes_from_snapshot(
+                        self.crud_store.as_ref(),
+                        &accepted,
+                    )
+                    .await?
+                } else {
+                    crate::compaction::frozen::execution_history_scopes(
+                        self.crud_store.as_ref(),
+                        workspace_id,
+                        thread_id,
+                        turn_id,
+                        hook_runtime_context.conversation_thread_id.as_deref(),
+                    )
+                    .await?
+                };
             let prepared = crate::compaction::frozen::capture_prepared(
                 self.crud_store.as_ref(),
                 workspace_id,
@@ -4244,10 +4268,15 @@ impl MessageProcessor {
             snapshot.history_json = serde_json::to_string(&prepared.descriptor)?;
             frozen_prepared = Some(prepared);
         }
-        // Temporary compatibility for the ordinary legacy loader is removed
-        // when that loader is replaced. Canonical Task histories never enter it.
+        // The borrowed preparation retains its hold through this atomic root
+        // handoff; the writer rechecks the epochs read during preparation.
         self.crud_store
-            .upsert_turn_runtime_snapshot(snapshot)
+            .upsert_turn_runtime_snapshot_with_source_epochs(
+                snapshot,
+                accepted_history
+                    .map(|prepared| &prepared.source_epochs)
+                    .unwrap_or(&Default::default()),
+            )
             .await
             .with_context(|| format!("failed to persist runtime snapshot for turn `{turn_id}`"))?;
         drop(frozen_prepared);
@@ -4275,6 +4304,7 @@ impl MessageProcessor {
         runtime_environment: &HashMap<String, String>,
         history: &[ChatMessage],
         agent_skill_overlay: &mut Vec<pioneer_skills::AgentSkillRuntimeEntry>,
+        accepted_history: Option<&crate::compaction::frozen::PreparedHistory>,
     ) -> anyhow::Result<()> {
         match self
             .persist_turn_runtime_snapshot(
@@ -4293,6 +4323,7 @@ impl MessageProcessor {
                 runtime_environment,
                 history,
                 agent_skill_overlay.as_slice(),
+                accepted_history,
             )
             .await
         {
@@ -4321,6 +4352,7 @@ impl MessageProcessor {
                     runtime_environment,
                     history,
                     &[],
+                    accepted_history,
                 )
                 .await
             }

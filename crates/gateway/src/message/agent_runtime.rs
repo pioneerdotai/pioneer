@@ -1319,6 +1319,31 @@ impl MessageProcessor {
         turn: &str,
         excluded_turn: Option<&str>,
     ) -> Result<crate::compaction::frozen::PreparedHistory> {
+        self.capture_context_basis_prepared(store, workspace, thread, turn, excluded_turn, false)
+            .await
+    }
+
+    pub(crate) async fn capture_running_context_basis_prepared(
+        &self,
+        store: &pioneer_crud::CrudStore,
+        workspace: &str,
+        thread: &str,
+        turn: &str,
+        excluded_turn: Option<&str>,
+    ) -> Result<crate::compaction::frozen::PreparedHistory> {
+        self.capture_context_basis_prepared(store, workspace, thread, turn, excluded_turn, true)
+            .await
+    }
+
+    async fn capture_context_basis_prepared(
+        &self,
+        store: &pioneer_crud::CrudStore,
+        workspace: &str,
+        thread: &str,
+        turn: &str,
+        excluded_turn: Option<&str>,
+        reuse_runtime: bool,
+    ) -> Result<crate::compaction::frozen::PreparedHistory> {
         let authority =
             crate::authorization::ExecutionAuthorizationContext::load_for_turn(store, turn).await?;
         anyhow::ensure!(
@@ -1334,6 +1359,24 @@ impl MessageProcessor {
                 self.current_authorization_revision().await?,
             )
             .await?;
+        if reuse_runtime && let Some(snapshot) = store.get_turn_runtime_snapshot(turn).await? {
+            anyhow::ensure!(
+                snapshot.workspace_id == workspace && snapshot.thread_id == thread,
+                "accepted runtime destination changed"
+            );
+            return crate::compaction::frozen::prepare_runtime_history_for_execution(
+                store, &snapshot,
+            )
+            .await;
+        }
+        if reuse_runtime
+            && let Some(prepared) = crate::compaction::frozen::prepare_task_history_for_execution(
+                store, workspace, thread, turn,
+            )
+            .await?
+        {
+            return Ok(prepared);
+        }
         self.capture_authorized_task_basis_prepared(
             store,
             current.principal(),

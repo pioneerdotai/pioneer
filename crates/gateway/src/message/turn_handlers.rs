@@ -2987,19 +2987,19 @@ impl MessageProcessor {
             .await;
             return Err(TurnStartFailure::unavailable(message));
         }
-        let history = {
+        let prepared_history = {
             let _startup_part = pioneer_observability::turn_startup::stage(
                 &outcome.started_notification.turn.id,
                 pioneer_observability::turn_startup::Stage::History,
             );
-            self.load_conversation_history_for_workspace(
+            self.load_prepared_conversation_history_for_workspace(
                 outcome.started_notification.workspace_id.as_str(),
                 outcome.started_notification.thread_id.as_str(),
                 outcome.started_notification.turn.id.as_str(),
             )
             .await
         };
-        let history = match history {
+        let prepared_history = match prepared_history {
             Ok(history) => history,
             Err(_) => {
                 let message =
@@ -3013,6 +3013,7 @@ impl MessageProcessor {
                 return Err(TurnStartFailure::unavailable(message));
             }
         };
+        let history = prepared_history.messages.clone();
         let workspace_skill_policies = match self
             .crud_store
             .list_workspace_skill_policies(outcome.started_notification.workspace_id.as_str())
@@ -3130,6 +3131,7 @@ impl MessageProcessor {
                 &runtime_environment,
                 history.as_slice(),
                 &mut agent_skill_overlay,
+                Some(&prepared_history),
             )
             .await;
         if let Err(error) = snapshot_result {
@@ -3367,8 +3369,8 @@ impl MessageProcessor {
         self.ensure_agent_listener_task(outcome.started_notification.thread_id.as_str())
             .await
             .map_err(|error| format!("failed to activate durable listener: {error:#}"))?;
-        let history = self
-            .load_conversation_history_for_workspace(
+        let prepared_history = self
+            .load_prepared_conversation_history_for_workspace(
                 outcome.started_notification.workspace_id.as_str(),
                 outcome.started_notification.thread_id.as_str(),
                 outcome.started_notification.turn.id.as_str(),
@@ -3377,6 +3379,7 @@ impl MessageProcessor {
             .map_err(|_| {
                 "Conversation history is unavailable; turn preparation paused".to_owned()
             })?;
+        let history = prepared_history.messages.clone();
         let workspace_skill_policies = self
             .crud_store
             .list_workspace_skill_policies(outcome.started_notification.workspace_id.as_str())
@@ -3427,6 +3430,7 @@ impl MessageProcessor {
             &runtime_environment,
             history.as_slice(),
             &mut agent_skill_overlay,
+            Some(&prepared_history),
         )
         .await
         .map_err(|error| format!("failed to persist child runtime snapshot: {error:#}"))?;
@@ -4979,7 +4983,11 @@ impl MessageProcessor {
                             .is_some_and(|source| source.cwd.is_some())));
             if persisted_context_binding.is_none()
                 && bounded_fork_available
-                && matches!(success_response, TurnStartSuccessResponse::TurnStart)
+                && matches!(
+                    success_response,
+                    TurnStartSuccessResponse::TurnStart
+                        | TurnStartSuccessResponse::VoiceSessionFinalizeAccepted { .. }
+                )
                 && let Some(source) = previous_cli_turn_binding.as_ref()
                 && source.thread_id == continuation_thread_id
                 && source.continuation_thread_id != continuation_thread_id
@@ -8828,7 +8836,7 @@ impl MessageProcessor {
                 result = &mut cancelled => Err(result.err().unwrap_or_else(|| anyhow::anyhow!("CLI history monitor ended unexpectedly"))),
                 _ = &mut deadline => anyhow::bail!("CLI history preparation exceeded the turn deadline"),
                 prepared = async {
-                    let mut prepared = self.capture_current_context_basis_prepared(
+                    let mut prepared = self.capture_running_context_basis_prepared(
                         &history_store, workspace_id, thread_id, active_turn_id, Some(active_turn_id),
                     ).await?;
                     // Use the shared projector before sizing or sending CLI history.

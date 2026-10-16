@@ -11741,9 +11741,8 @@ async fn assert_concurrent_collaborative_tasks_receive_independent_frozen_comman
         .unwrap()
         .unwrap();
     assert!(import_count > 0);
-    // Re-capture a real admitted child basis, as native/background compaction
-    // does after execution. The source bodies and their own-import grants must
-    // survive together, including repeated captures and the latest-basis path.
+    // Exact execution projections must forward the accepted own-import grants.
+    // New conversations have separate bounded inheritance and no such grants.
     let db = crud_store.database_connection();
     for (sql, values) in [
         (
@@ -11791,19 +11790,17 @@ async fn assert_concurrent_collaborative_tasks_receive_independent_frozen_comman
         .await
         .unwrap();
     }
-    for basis_turn in [Some("recapture-turn"), None] {
-        let recaptured = crate::compaction::frozen::capture_execution_basis_json(
+    for pass in 0..2 {
+        let recaptured = crate::compaction::frozen::prepare_exact_task_fixture(
             crud_store.as_ref(),
             &workspace_id,
             "new-child-context",
-            basis_turn,
-            None,
+            "recapture-turn",
             None,
         )
         .await
         .unwrap();
-        let descriptor: pioneer_compaction::frozen::FrozenHistoryRef =
-            serde_json::from_str(&recaptured).unwrap();
+        let descriptor = recaptured.descriptor;
         let (forwarded, _) = crud_store
             .compaction_frozen_import_state(
                 &workspace_id,
@@ -11815,7 +11812,7 @@ async fn assert_concurrent_collaborative_tasks_receive_independent_frozen_comman
             .unwrap();
         assert_eq!(
             forwarded, import_count,
-            "recapture must preserve every accepted own source grant (basis turn: {basis_turn:?})"
+            "recapture must preserve every accepted own source grant (pass {pass})"
         );
     }
 
@@ -15141,6 +15138,41 @@ async fn task_run_voice_composer_stays_foreground() {
         )
         .await
         .expect("persist task-run voice lineage");
+
+    // A Task child has a durable initial execution as well as lineage. The
+    // voice turn below is a later conversation, not the creating Task attempt.
+    for (sql, values) in [
+        (
+            "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES('turn_voice_task_initial','thr_voice_task_run','completed','conversation','system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+            vec![],
+        ),
+        (
+            "INSERT INTO task(id,workspace_id,owner_kind,owner_id,created_by_thread_id,created_by_turn_id,executor_kind,status,title,goal) VALUES('task_voice_task_run',?,'thread','thr_voice_task_root','thr_voice_task_root','turn_voice_task_root','agent','completed','Voice child','fixture')",
+            vec![workspace_id.clone().into()],
+        ),
+        (
+            "INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES('run_voice_task_run','task_voice_task_run','run_voice_task_run',1,1,'succeeded','agent')",
+            vec![],
+        ),
+        (
+            "INSERT INTO task_run_turn(id,task_id,run_id,thread_id,turn_id,kind,round,sequence,status,created_at) VALUES('rt_voice_task_run','task_voice_task_run','run_voice_task_run','thr_voice_task_run','turn_voice_task_initial','initial',0,1,'review_recorded',CURRENT_TIMESTAMP)",
+            vec![],
+        ),
+        (
+            "INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,history_json,created_at,frozen_manifest_id) VALUES('run_voice_task_run','task_voice_task_run',?,'thr_voice_task_root','turn_voice_task_root','[]',CURRENT_TIMESTAMP,NULL)",
+            vec![workspace_id.clone().into()],
+        ),
+    ] {
+        crud_store
+            .database_connection()
+            .execute_raw(sea_orm::Statement::from_sql_and_values(
+                sea_orm::DbBackend::Sqlite,
+                sql,
+                values,
+            ))
+            .await
+            .unwrap();
+    }
 
     let turn_id = "turn_voice_task_run";
     let result = submit_test_voice_turn(
@@ -25847,12 +25879,25 @@ async fn a_child_first_continued_by_another_provider_or_after_source_edit_transf
             TaskStatus::Completed
         );
         if edit_source || edit_after_ready {
-            seed_completed_task_parent_with_history(
+            let cutoff = store
+                .compaction_child_history_parent(&workspace, &lineage.child_thread_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .started_at
+                .timestamp()
+                + 1;
+            seed_completed_task_parent_with_inputs_at(
                 &processor,
                 &workspace,
                 &parent,
                 &format!("switch-late-parent-{source_id}"),
                 "LATE PARENT AFTER CHILD ANSWER",
+                vec![UserInput::Text {
+                    text: "LATE PARENT AFTER CHILD ANSWER".into(),
+                    text_elements: vec![],
+                }],
+                cutoff,
             )
             .await;
         }
@@ -26604,8 +26649,14 @@ async fn accepted_task_cli_transfer_compacts_without_later_parent_history_impl(
         .await
         .unwrap();
     sync_test_cli_runtime_identities(&processor).await.unwrap();
+    let max_input_tokens = 50_000;
     processor
-        .mark_cli_reasoning_model_ready_for_tests(&workspace, "codex", "gpt-5")
+        .mark_cli_reasoning_model_with_limit_ready_for_tests(
+            &workspace,
+            "codex",
+            "gpt-5",
+            Some(max_input_tokens),
+        )
         .await
         .unwrap();
     processor
@@ -26617,15 +26668,18 @@ async fn accepted_task_cli_transfer_compacts_without_later_parent_history_impl(
     processor.bind_task_bridge().await;
     processor.start_task_event_listener().await;
     let parent = "accepted-large-task-parent";
-    let mut raw_bytes = 0usize;
+    // Force real transfer compaction through the discovered input limit.
+    // The separate CLI frame fixture covers the 8 MiB limit; these cases need
+    // accepted revisions, checkpoint reuse and cancellation, not that volume.
+    let mut history_tokens = 0;
+    let mut history_chars = 0;
     for index in 0..12 {
-        // Keep the provider frame above the 8 MiB cap without making a
-        // single giant BPE word dominate history-transfer timing.
         let text = format!(
             "ACCEPTED TASK CHUNK {index:02} {}",
-            "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx ".repeat(22_200)
+            "accepted history ".repeat(6_500)
         );
-        raw_bytes += text.len();
+        history_tokens += pioneer_compaction::text_tokens(&text);
+        history_chars += text.chars().count();
         seed_completed_task_parent_with_inputs(
             &processor,
             &workspace,
@@ -26639,7 +26693,8 @@ async fn accepted_task_cli_transfer_compacts_without_later_parent_history_impl(
         )
         .await;
     }
-    assert!(raw_bytes > crate::cli_runtime::context::MAX_CLI_TURN_INPUT_FRAME_BYTES);
+    assert!(history_tokens > max_input_tokens);
+    assert!(history_chars > crate::cli_runtime::context::MAX_CODEX_INPUT_TEXT_CHARS);
     let launch = "accepted-large-task-launch";
     let params = detached_cli_task_create_params(
         &workspace,
@@ -26660,9 +26715,8 @@ async fn accepted_task_cli_transfer_compacts_without_later_parent_history_impl(
     });
     let result = create_task_for_test(&processor, params).await.unwrap();
     let run = result.run.unwrap();
-    // This barrier follows projection of more than 8 MiB of accepted history.
-    // A concurrent workspace test run can spend well over ten seconds there;
-    // keep the test wait bounded without imposing an unrelated product deadline.
+    // Keep the observation bounded while the accepted projection is prepared.
+    // Editing below must happen at the selected capture/compaction boundary.
     timeout(
         Duration::from_secs(180),
         processor.wait_for_completed_history_preparation_barrier(),
@@ -26679,16 +26733,33 @@ async fn accepted_task_cli_transfer_compacts_without_later_parent_history_impl(
     let child = wait_for_child_lineage_for_run(store.clone(), run.id.as_str()).await;
     let late_parent_body = format!(
         "LATER PARENT MUST NOT ENTER TASK CHECKPOINT {}",
-        "q".repeat(3_000_000)
+        "later context ".repeat(50_000)
     );
-    seed_completed_task_parent_with_history(
+    let cutoff = store
+        .compaction_child_history_parent(&workspace, &child.child_thread_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .started_at
+        .timestamp()
+        + 1;
+    seed_completed_task_parent_with_inputs_at(
         &processor,
         &workspace,
         parent,
         "parent-later-than-task-snapshot",
         late_parent_body.as_str(),
+        vec![UserInput::Text {
+            text: late_parent_body.clone(),
+            text_elements: vec![],
+        }],
+        cutoff,
     )
     .await;
+    // Make the edited unit exceed the transfer token target so it must enter
+    // the summary, even if its replacement row sorts into the retained tail.
+    let edited_body = format!("EDITED ACCEPTED SOURCE 00 {}", "b ".repeat(70_000));
+    assert!(pioneer_compaction::text_tokens(&edited_body) > max_input_tokens);
     store
         .edit_turn_message(pioneer_crud::EditTurnMessageRequest {
             workspace_id: workspace.clone(),
@@ -26696,10 +26767,7 @@ async fn accepted_task_cli_transfer_compacts_without_later_parent_history_impl(
             turn_id: "accepted-source-00".to_owned(),
             expected_revision: 0,
             input: vec![UserInput::Text {
-                text: format!(
-                    "EDITED ACCEPTED SOURCE 00 {}",
-                    "yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy ".repeat(22_200)
-                ),
+                text: edited_body,
                 text_elements: Vec::new(),
             }],
             mentions: Vec::new(),
@@ -27089,6 +27157,16 @@ async fn accepted_task_cli_transfer_compacts_without_later_parent_history_impl(
         )
         .await
         .unwrap();
+    assert_eq!(prepared.checkpoint.as_deref(), Some(checkpoint_id.as_str()));
+    assert_eq!(
+        prepared
+            .messages
+            .iter()
+            .filter(|message| { message.content.contains("ACCEPTED TASK HISTORY SUMMARY") })
+            .count(),
+        1,
+        "recapture must reuse the published checkpoint over the accepted edited sources"
+    );
     processor
         .compact_cli_transfer_history(
             &workspace,
@@ -30813,12 +30891,25 @@ async fn nested_cli_children_bootstrap_their_accepted_lineage_only_impl() {
     }
 
     let late_parent_marker = "LATE ROOT APPEND AFTER CHILD BASIS";
-    seed_completed_task_parent_with_history(
+    let root_cutoff = crud_store
+        .compaction_child_history_parent(&workspace_id, &lineages[0].child_thread_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .started_at
+        .timestamp()
+        + 1;
+    seed_completed_task_parent_with_inputs_at(
         &processor,
         workspace_id.as_str(),
         root_thread_id,
         "turn_nested_cli_late_root",
         late_parent_marker,
+        vec![UserInput::Text {
+            text: late_parent_marker.into(),
+            text_elements: vec![],
+        }],
+        root_cutoff,
     )
     .await;
     cli_session
@@ -55350,6 +55441,7 @@ async fn agent_skill_snapshot_failure_retries_the_gateway_path_without_overlay()
             &runtime_environment,
             &[],
             &mut overlay,
+            None,
         )
         .await
         .expect("optional Agent pin failure must preserve the base Gateway turn path");
@@ -55425,6 +55517,7 @@ async fn persist_agent_skill_snapshot_for_resolution_tests(
             &runtime_environment,
             &[],
             &mut overlay,
+            None,
         )
         .await
         .expect("Agent skill snapshot fixture must persist");
@@ -75205,6 +75298,7 @@ async fn compaction_failed_partial_writer_preserves_event_but_excludes_observati
             &std::collections::HashMap::new(),
             &history,
             &[],
+            None,
         )
         .await
         .unwrap();
