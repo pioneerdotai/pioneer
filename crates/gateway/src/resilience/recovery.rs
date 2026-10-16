@@ -3755,6 +3755,22 @@ impl RecoveryCoordinator {
         Ok(())
     }
 
+    // Chat has no Agent initial phase, mutable tool obligations or retry guard.
+    // Require both durable producers to agree before selecting its stateless path.
+    async fn is_stateless_chat_turn(&self, thread_id: &str, turn_id: &str) -> Result<bool> {
+        let Some((workspace, turn)) = self.crud_store.get_turn(thread_id, turn_id).await? else {
+            return Ok(false);
+        };
+        let Some(snapshot) = self.crud_store.get_turn_runtime_snapshot(turn_id).await? else {
+            return Ok(false);
+        };
+        Ok(snapshot.workspace_id == workspace
+            && snapshot.thread_id == thread_id
+            && turn.mode == pioneer_protocol::ThreadMode::Chat
+            && serde_json::from_str::<pioneer_protocol::ThreadMode>(&snapshot.mode_json)?
+                == pioneer_protocol::ThreadMode::Chat)
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn checkpoint_running_execution_window(
         &self,
@@ -3778,7 +3794,7 @@ impl RecoveryCoordinator {
             Some(
                 pioneer_crud::TurnExecutorKind::NativeAgent
                 | pioneer_crud::TurnExecutorKind::ApiProvider,
-            ) => true,
+            ) => !self.is_stateless_chat_turn(thread_id, turn_id).await?,
             Some(
                 pioneer_crud::TurnExecutorKind::CliRuntime
                 | pioneer_crud::TurnExecutorKind::AcpRuntime,
@@ -4060,6 +4076,15 @@ impl RecoveryCoordinator {
                 || snapshot.thread_id != execution.thread_id
             {
                 return Err(NativeSemanticCheckpointUnavailable.into());
+            }
+            if self
+                .is_stateless_chat_turn(&execution.thread_id, turn_id)
+                .await?
+            {
+                return Ok((
+                    self.tool_loop_config.execution_windows.normalized(),
+                    self.tool_loop_config.no_progress_mode,
+                ));
             }
             let phase = snapshot
                 .initial_phase_json
