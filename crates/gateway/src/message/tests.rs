@@ -14024,7 +14024,7 @@ async fn turn_start_with_artifact_input_materializes_user_message_attachment_and
             workspace_id.as_str(),
             &thread.thread.id,
             turn_id,
-            &user_message_item_id(turn_id),
+            &super::user_message_item_id(turn_id),
             &serde_json::from_value::<Vec<UserInput>>(request["params"]["input"].clone()).unwrap(),
         )
         .await
