@@ -3032,12 +3032,15 @@ async fn native_recovery_refusal_commits_progress_atomically_and_rejects_stale_p
                         repositories::recovery_job::set_diagnostic(
                             &store.connection,
                             &job.id,
-                            "{}".into(),
+                            r#"{"stopReason":"policy_rejected"}"#.into(),
                         )
                         .await
                     })
                     .await
                     .unwrap();
+                // Rewriting an empty diagnostic preserves the same stored
+                // progress and is not drift. Prove this newer diagnostic is.
+                assert!(!progress.current(&store.connection).await.unwrap());
             }
             let before = store.get_recovery_job(&job.id).await.unwrap().unwrap();
             let applied = store
