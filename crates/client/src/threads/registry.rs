@@ -6157,10 +6157,9 @@ mod tests {
             let (core, receiver) = reconciliation_core();
             if !cached {
                 core.remove_thread_store("a");
-                core.apply_thread_timeline_page(
-                    presentation_page(&[]),
-                    crate::timeline::semantic::TopLevelPageMergeMode::Reset,
-                );
+                // No history page has loaded yet. An empty page would mark the
+                // cache loaded, leaving the later local send without range cursors.
+                drop(core.thread_mutation("a", "ws").unwrap());
             }
             struct AckTransport<'a> {
                 core: &'a ClientCore,
