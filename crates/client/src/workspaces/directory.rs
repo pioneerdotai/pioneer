@@ -1244,6 +1244,9 @@ mod tests {
         );
         directory.threads.get_mut("t").unwrap().sidebar_visibility =
             pioneer_protocol::ThreadSidebarVisibility::Visible;
+        let visible = directory.project("a", None, false, None).unwrap();
+        assert!(visible.snapshot.running_task_thread_ids.contains("t"));
+        assert!(visible.snapshot.running_task_folder_ids.contains("root"));
         assert!(
             directory
                 .project("a", Some("t"), false, None)

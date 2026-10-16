@@ -862,10 +862,13 @@ mod tests {
                     .contains("existing")
             );
             assert!(loaded.snapshot().running_task_folder_ids.contains("parent"));
+            let coordinator = core.thread_snapshot("existing").unwrap().coordinator();
             assert!(
-                core.thread_snapshot("existing").is_none(),
+                !coordinator.history_loaded,
                 "directory recovery needs no timeline"
             );
+            assert!(!coordinator.history_loading);
+            assert!(coordinator.thread().unwrap().turns.is_empty());
             assert_eq!(core.navigation_snapshot().workspace_id(), Some("ws"));
             accept();
             assert!(
