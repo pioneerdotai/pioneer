@@ -457,6 +457,19 @@ fn test_skill_tool_name(slug: &str, tool_slug: &str) -> String {
     )
 }
 
+// These doubles sit below the registry's native wire boundary. Responses and
+// captured wire requests use provider-safe names; timeline assertions keep the
+// canonical domain names. The codec has separate rejection/roundtrip tests.
+fn test_skill_tool_wire_name(slug: &str, tool_slug: &str) -> String {
+    use sha2::Digest;
+    format!(
+        "p1v1{}",
+        &hex::encode(sha2::Sha256::digest(
+            test_skill_tool_name(slug, tool_slug).as_bytes()
+        ))[..60]
+    )
+}
+
 fn mcp_tool_capability(server_name: &str, raw_tool_name: &str) -> TurnCapability {
     TurnCapability {
         id: format!("mcp-tool:workspace:{server_name}:{raw_tool_name}"),
@@ -3247,7 +3260,21 @@ impl Provider for SequencedToolProvider {
                 text: String::new(),
                 usage: None,
                 reasoning_content: None,
-                tool_calls: self.first_tool_calls.clone(),
+                tool_calls: self
+                    .first_tool_calls
+                    .iter()
+                    .cloned()
+                    .map(|mut call| {
+                        if call.name.starts_with("skill.") {
+                            use sha2::Digest;
+                            call.name = format!(
+                                "p1v1{}",
+                                &hex::encode(sha2::Sha256::digest(call.name.as_bytes()))[..60]
+                            );
+                        }
+                        call
+                    })
+                    .collect(),
                 provider_replay_state: self.first_provider_replay_state.clone(),
                 termination: pioneer_provider::ProviderTermination::ToolCalls,
             });
@@ -11993,12 +12020,33 @@ async fn remembered_memory_is_recalled_in_new_thread_and_forget_suppresses_it() 
     );
 }
 
-fn loop_budget_manager(
+struct MissingBudgetToolHandler;
+#[async_trait::async_trait]
+impl ToolHandler for MissingBudgetToolHandler {
+    async fn handle(
+        &self,
+        invocation: ToolInvocation,
+        _: ToolEventTrace,
+    ) -> Result<Box<dyn pioneer_tools::ToolOutput>, ToolError> {
+        Err(ToolError::NotFound(invocation.tool_name))
+    }
+}
+
+async fn loop_budget_manager(
     provider: Arc<LoopBudgetProvider>,
     tool_loop_config: ToolLoopConfig,
 ) -> AgentManager {
     let registry = Arc::new(ProviderRegistry::with_provider("loop-budget", provider));
-    AgentManager::new(registry, tool_loop_config)
+    let manager = AgentManager::new(registry, tool_loop_config);
+    manager
+        .set_turn_tool_provider(Some(Arc::new(StaticTurnToolProvider {
+            bundle: fake_task_tool_bundle_for_names(
+                &["missing_loop_budget_tool"],
+                Arc::new(MissingBudgetToolHandler),
+            ),
+        })))
+        .await;
+    manager
 }
 
 fn tool_result_message_count(request: &ChatRequest) -> usize {
@@ -12049,7 +12097,7 @@ async fn tool_loop_provider_round_budget_requests_continuation_without_final_no_
     set_execution_window_budget(&mut config, 2, 16);
     config.retry.max_recoverable_retry_rounds_per_episode = 16;
     config.retry.max_same_tool_error_retries_per_episode = 16;
-    let manager = loop_budget_manager(provider.clone(), config);
+    let manager = loop_budget_manager(provider.clone(), config).await;
     let mut events = start_loop_budget_turn(
         &manager,
         "thr_loop_budget_rounds",
@@ -12566,7 +12614,7 @@ async fn production_regression_repeated_failed_tools_continue_without_final_no_t
     set_execution_window_budget(&mut config, 2, 16);
     config.retry.max_recoverable_retry_rounds_per_episode = 16;
     config.retry.max_same_tool_error_retries_per_episode = 16;
-    let manager = loop_budget_manager(provider.clone(), config);
+    let manager = loop_budget_manager(provider.clone(), config).await;
     let mut events = start_loop_budget_turn(
         &manager,
         "thr_production_failed_tools_window_regression",
@@ -12648,7 +12696,7 @@ async fn execution_window_continuation_restarts_same_turn_and_completes_next_win
     set_execution_window_budget(&mut config, 2, 16);
     config.retry.max_recoverable_retry_rounds_per_episode = 16;
     config.retry.max_same_tool_error_retries_per_episode = 16;
-    let manager = loop_budget_manager(provider.clone(), config);
+    let manager = loop_budget_manager(provider.clone(), config).await;
     let initial_hook_calls = Arc::new(std::sync::Mutex::new(Vec::new()));
     manager
         .set_hook_runtime(Some(recording_hook_runtime(
@@ -12852,7 +12900,7 @@ async fn provider_recovery_success_boundary_survives_execution_window_continuati
     set_execution_window_budget(&mut config, 2, 16);
     config.retry.max_recoverable_retry_rounds_per_episode = 16;
     config.retry.max_same_tool_error_retries_per_episode = 16;
-    let manager = loop_budget_manager(provider.clone(), config);
+    let manager = loop_budget_manager(provider.clone(), config).await;
     let thread_id = "thr_loop_budget_recovery_window";
     let turn_id = "turn_loop_budget_recovery_window";
     let recovery_job_id = "recovery_job_window_continuation";
@@ -12974,7 +13022,7 @@ async fn max_windows_cap_blocks_continuation_without_turn_failed() {
     config.execution_windows.total.max_windows_per_turn = Some(1);
     config.retry.max_recoverable_retry_rounds_per_episode = 16;
     config.retry.max_same_tool_error_retries_per_episode = 16;
-    let manager = loop_budget_manager(provider.clone(), config);
+    let manager = loop_budget_manager(provider.clone(), config).await;
     let thread_id = "thr_loop_budget_max_windows";
     let turn_id = "turn_loop_budget_max_windows";
     manager
@@ -13091,7 +13139,7 @@ async fn total_tool_call_cap_blocks_continuation_without_turn_failed() {
     config.execution_windows.total.max_tool_calls_per_turn = Some(1);
     config.retry.max_recoverable_retry_rounds_per_episode = 16;
     config.retry.max_same_tool_error_retries_per_episode = 16;
-    let manager = loop_budget_manager(provider.clone(), config);
+    let manager = loop_budget_manager(provider.clone(), config).await;
     let thread_id = "thr_loop_budget_total_tools";
     let turn_id = "turn_loop_budget_total_tools";
     manager
@@ -13177,7 +13225,7 @@ async fn unknown_tool_results_preserve_general_window_cap_without_fabricating_pr
     config.execution_windows.total.max_windows_per_turn = Some(3);
     config.retry.max_recoverable_retry_rounds_per_episode = 16;
     config.retry.max_same_tool_error_retries_per_episode = 16;
-    let manager = loop_budget_manager(provider.clone(), config);
+    let manager = loop_budget_manager(provider.clone(), config).await;
     let thread_id = "thr_loop_budget_failed_windows";
     let turn_id = "turn_loop_budget_failed_windows";
     let mut events = start_loop_budget_turn(&manager, thread_id, turn_id).await;
@@ -13209,7 +13257,7 @@ async fn memory_recall_tools_remain_available_for_budget_continuation() {
     set_execution_window_budget(&mut config, 2, 16);
     config.retry.max_recoverable_retry_rounds_per_episode = 16;
     config.retry.max_same_tool_error_retries_per_episode = 16;
-    let manager = loop_budget_manager(provider.clone(), config);
+    let manager = loop_budget_manager(provider.clone(), config).await;
     let memory_provider = Arc::new(RecordingMemoryProvider::new(
         Ok(MemoryRecallSnapshot {
             items: vec![memory_recall_item(
@@ -13283,7 +13331,7 @@ async fn provider_tools_after_tools_disabled_requests_continuation_without_turn_
     set_execution_window_budget(&mut config, 8, 16);
     config.retry.max_recoverable_retry_rounds_per_episode = 1;
     config.retry.max_same_tool_error_retries_per_episode = 16;
-    let manager = loop_budget_manager(provider.clone(), config);
+    let manager = loop_budget_manager(provider.clone(), config).await;
     let mut events = start_loop_budget_turn(
         &manager,
         "thr_loop_budget_disabled_tools",
@@ -13524,7 +13572,7 @@ async fn tool_loop_total_tool_call_budget_prevents_execution() {
     set_execution_window_budget(&mut config, 8, 2);
     config.retry.max_recoverable_retry_rounds_per_episode = 8;
     config.retry.max_same_tool_error_retries_per_episode = 8;
-    let manager = loop_budget_manager(provider.clone(), config);
+    let manager = loop_budget_manager(provider.clone(), config).await;
     let mut events = start_loop_budget_turn(
         &manager,
         "thr_loop_budget_tool_calls",
@@ -13575,7 +13623,7 @@ async fn tool_loop_recoverable_retry_rounds_are_bounded() {
     set_execution_window_budget(&mut config, 8, 8);
     config.retry.max_recoverable_retry_rounds_per_episode = 1;
     config.retry.max_same_tool_error_retries_per_episode = 8;
-    let manager = loop_budget_manager(provider.clone(), config);
+    let manager = loop_budget_manager(provider.clone(), config).await;
     let mut events = start_loop_budget_turn(
         &manager,
         "thr_loop_budget_retries",
@@ -13644,7 +13692,7 @@ async fn empty_response_after_retry_exhaustion_retries_in_no_tools_mode() {
     set_execution_window_budget(&mut config, 8, 8);
     config.retry.max_recoverable_retry_rounds_per_episode = 1;
     config.retry.max_same_tool_error_retries_per_episode = 8;
-    let manager = loop_budget_manager(provider.clone(), config);
+    let manager = loop_budget_manager(provider.clone(), config).await;
     let mut events = start_loop_budget_turn(
         &manager,
         "thr_empty_after_retry_exhaustion",
@@ -13695,7 +13743,7 @@ async fn tool_loop_same_failure_signature_is_bounded() {
     set_execution_window_budget(&mut config, 8, 8);
     config.retry.max_recoverable_retry_rounds_per_episode = 8;
     config.retry.max_same_tool_error_retries_per_episode = 1;
-    let manager = loop_budget_manager(provider.clone(), config);
+    let manager = loop_budget_manager(provider.clone(), config).await;
     let mut events = start_loop_budget_turn(
         &manager,
         "thr_loop_budget_same_failure",
@@ -13736,7 +13784,7 @@ async fn tool_loop_distinct_failure_signatures_keep_tools_available() {
     config.retry.max_recoverable_retry_rounds_per_episode = 8;
     config.retry.max_same_tool_error_retries_per_episode = 3;
     config.retry.max_retries_per_tool_name_per_episode = 8;
-    let manager = loop_budget_manager(provider.clone(), config);
+    let manager = loop_budget_manager(provider.clone(), config).await;
     let mut events = start_loop_budget_turn(
         &manager,
         "thr_distinct_tool_failures",
@@ -13778,7 +13826,7 @@ async fn tool_retry_budget_resets_after_successful_episode() {
     config.retry.max_recoverable_retry_rounds_per_episode = 1;
     config.retry.max_same_tool_error_retries_per_episode = 1;
     config.retry.max_retries_per_tool_name_per_episode = 1;
-    let manager = loop_budget_manager(provider.clone(), config);
+    let manager = loop_budget_manager(provider.clone(), config).await;
     let mut events = start_loop_budget_turn(
         &manager,
         "thr_loop_budget_retry_episode_reset",
@@ -13977,7 +14025,7 @@ async fn start_turn_initializes_first_execution_window_index() {
     ));
     let mut config = test_tool_loop_config();
     set_execution_window_budget(&mut config, 2, 16);
-    let manager = loop_budget_manager(provider, config);
+    let manager = loop_budget_manager(provider, config).await;
     let thread_id = "thr_initial_window_index";
     let workspace_id = "ws_initial_window_index";
     let turn_id = "turn_initial_window_index";
@@ -14964,7 +15012,7 @@ async fn active_skill_contributes_dynamic_tool_definition_to_model_request() {
         .iter()
         .map(|tool| tool.name.as_str())
         .collect::<Vec<_>>();
-    assert!(tool_names.contains(&test_skill_tool_name("my-skill", "fetch-data").as_str()));
+    assert!(tool_names.contains(&test_skill_tool_wire_name("my-skill", "fetch-data").as_str()));
     assert!(tool_names.contains(&"read_skill"));
 
     let _ = fs::remove_dir_all(skill_root);
@@ -15539,7 +15587,7 @@ async fn dynamic_skill_tool_executes_and_emits_dynamic_tool_call() {
         .expect("second round must include dynamic tool result");
     assert_eq!(
         dynamic_result.name.as_deref(),
-        Some(test_skill_tool_name("my-skill", "echo-shell").as_str())
+        Some(test_skill_tool_wire_name("my-skill", "echo-shell").as_str())
     );
     assert!(
         dynamic_result.content.contains("shell-ok"),
@@ -15819,7 +15867,7 @@ runtime:
         .expect("second round must include dynamic tool result");
     assert_eq!(
         dynamic_result.name.as_deref(),
-        Some(test_skill_tool_name("my-skill", "echo-shell").as_str())
+        Some(test_skill_tool_wire_name("my-skill", "echo-shell").as_str())
     );
     assert!(
         dynamic_result
@@ -16251,7 +16299,7 @@ async fn invalid_skill_runtime_config_fails_open_to_builtin_tools() {
         .map(|tool| tool.name.as_str())
         .collect::<Vec<_>>();
     assert!(tool_names.contains(&"read_file"));
-    assert!(!tool_names.contains(&test_skill_tool_name("my-skill", "bad-proxy").as_str()));
+    assert!(!tool_names.contains(&test_skill_tool_wire_name("my-skill", "bad-proxy").as_str()));
 
     let _ = fs::remove_dir_all(skill_root);
 }
@@ -16341,8 +16389,8 @@ async fn invalid_skill_runtime_tool_is_excluded_per_tool() {
         .iter()
         .map(|tool| tool.name.as_str())
         .collect::<Vec<_>>();
-    assert!(tool_names.contains(&test_skill_tool_name("my-skill", "fetch-data").as_str()));
-    assert!(!tool_names.contains(&test_skill_tool_name("my-skill", "bad-proxy").as_str()));
+    assert!(tool_names.contains(&test_skill_tool_wire_name("my-skill", "fetch-data").as_str()));
+    assert!(!tool_names.contains(&test_skill_tool_wire_name("my-skill", "bad-proxy").as_str()));
 
     let _ = fs::remove_dir_all(skill_root);
 }
