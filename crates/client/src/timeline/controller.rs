@@ -91,11 +91,18 @@ pub struct TimelinePageRequest {
 }
 
 #[derive(Default)]
+struct PageFailure {
+    attempts: u8,
+    retry_at_ms: u64,
+    retryable: bool,
+}
+
+#[derive(Default)]
 pub struct ThreadTimelineController {
     pub(crate) in_flight: HashSet<PageKey>,
     pub(crate) pending: HashMap<PageKey, PageAction>,
     requests: HashMap<PageKey, (u64, PageAction)>,
-    failures: HashMap<PageKey, (u8, u64)>,
+    failures: HashMap<PageKey, PageFailure>,
     failed_refreshes: HashMap<String, PageAction>,
     demands: HashMap<(String, String), TimelineDemand>,
     retired: HashMap<(String, String), u64>,
@@ -193,7 +200,7 @@ impl ThreadTimelineController {
     pub(crate) fn page_retry_allowed(&self, key: &PageKey, now_ms: u64) -> bool {
         self.failures
             .get(key)
-            .is_none_or(|(attempt, deadline)| *attempt < MAX_ATTEMPTS && now_ms >= *deadline)
+            .is_none_or(|failure| failure.attempts < MAX_ATTEMPTS && now_ms >= failure.retry_at_ms)
     }
 
     pub(crate) fn finish(
@@ -226,12 +233,13 @@ impl ThreadTimelineController {
                 }
             } else {
                 let failure = self.failures.entry(key.clone()).or_default();
-                failure.0 = if retryable {
-                    failure.0.saturating_add(1)
+                failure.attempts = if retryable {
+                    failure.attempts.saturating_add(1)
                 } else {
                     MAX_ATTEMPTS
                 };
-                failure.1 = now_ms.saturating_add(backoff(failure.0));
+                failure.retry_at_ms = now_ms.saturating_add(backoff(failure.attempts));
+                failure.retryable = retryable;
                 if is_refresh {
                     // The retry obligation owns its exact action, independently
                     // of another anchor waiting in the ordinary pending slot.
@@ -254,7 +262,11 @@ impl ThreadTimelineController {
             // not turn a failure into an immediate request or reset the budget.
             next = None;
         }
-        if next.is_none() && self.refresh_deadline(key).is_none() {
+        // Exhaustion stops the clock, not a domain-owned reconciliation. Keep
+        // that ownership across viewport Exit until success or store retirement.
+        let failed_newest = matches!(key, PageKey::ThreadNewest { .. })
+            && self.has_failed_refresh(request_thread_id(key));
+        if next.is_none() && !failed_newest {
             self.durable_pages.remove(key);
         }
         next
@@ -268,8 +280,29 @@ impl ThreadTimelineController {
         }
         self.failures
             .get(key)
-            .filter(|(attempts, _)| *attempts < MAX_ATTEMPTS)
-            .map(|(_, deadline)| *deadline)
+            .filter(|failure| failure.attempts < MAX_ATTEMPTS)
+            .map(|failure| failure.retry_at_ms)
+    }
+
+    /// A new event can reopen an exhausted transient recovery once. Keep the
+    /// last failure's deadline as a cooldown; further events during Backoff or
+    /// Loading neither replenish the budget nor move that deadline.
+    pub(crate) fn rearm_exhausted_refresh(&mut self, thread: &str) -> bool {
+        if !self.has_failed_refresh(thread) || self.has_active_refresh(thread) {
+            return false;
+        }
+        let key = PageKey::ThreadNewest {
+            thread_id: thread.to_owned(),
+        };
+        let Some(failure) = self.failures.get_mut(&key) else {
+            return false;
+        };
+        if !failure.retryable || failure.attempts < MAX_ATTEMPTS {
+            return false;
+        }
+        failure.attempts = 0;
+        self.durable_pages.insert(key);
+        true
     }
 
     pub(crate) fn reset_page_retry(&mut self, key: &PageKey) {
@@ -277,21 +310,33 @@ impl ThreadTimelineController {
     }
 
     pub(crate) fn next_refresh_deadline(&self) -> Option<u64> {
+        self.next_refresh_deadline_where(|_| true)
+    }
+
+    pub(crate) fn next_refresh_deadline_where(
+        &self,
+        eligible: impl Fn(&str) -> bool,
+    ) -> Option<u64> {
         self.failed_refreshes
             .values()
             .map(semantic::semantic_timeline_request_key)
-            .filter(|key| !self.in_flight.contains(*key))
+            .filter(|key| eligible(request_thread_id(key)) && !self.in_flight.contains(*key))
             .filter_map(|key| self.refresh_deadline(key))
             .min()
     }
 
-    pub(crate) fn due_refreshes(&mut self, now_ms: u64) -> Vec<TimelinePageRequest> {
+    pub(crate) fn due_refreshes(
+        &mut self,
+        now_ms: u64,
+        eligible: impl Fn(&str) -> bool,
+    ) -> Vec<TimelinePageRequest> {
         let mut actions = self
             .failed_refreshes
             .values()
             .filter(|action| {
                 let key = semantic::semantic_timeline_request_key(action);
-                !self.in_flight.contains(key)
+                eligible(request_thread_id(key))
+                    && !self.in_flight.contains(key)
                     && self
                         .refresh_deadline(key)
                         .is_some_and(|deadline| deadline <= now_ms)
@@ -546,13 +591,6 @@ impl ThreadTimelineController {
         requests
     }
 
-    fn next_request_deadline(&self) -> Option<u64> {
-        [self.next_read_deadline(), self.next_refresh_deadline()]
-            .into_iter()
-            .flatten()
-            .min()
-    }
-
     pub(crate) fn next_read_deadline(&self) -> Option<u64> {
         self.reads
             .values()
@@ -777,6 +815,97 @@ mod tests {
     }
 
     #[test]
+    fn exhausted_refresh_rearms_once_after_cooldown_and_keeps_a_bounded_budget() {
+        for retryable in [false, true] {
+            let mut policy = ThreadTimelineController::default();
+            let action = page();
+            let key = semantic::semantic_timeline_request_key(&action).clone();
+            assert_eq!(
+                policy
+                    .update(demand("desktop"), vec![action.clone()], 0)
+                    .pages
+                    .len(),
+                1
+            );
+            // A notification makes the scoped request a domain obligation.
+            policy.retain_domain_request(&key);
+            let old_generation = policy.request_generation(&key);
+            for now in [0, 1_000, 3_000] {
+                assert!(!policy.rearm_exhausted_refresh("a"));
+                for _ in 0..10 {
+                    assert!(policy.begin(action.clone()).is_none());
+                }
+                assert_eq!(policy.pending.len(), 1);
+                assert!(
+                    policy
+                        .finish_with_retry(&key, false, now < 3_000 || retryable, now)
+                        .is_none()
+                );
+                if now < 3_000 {
+                    assert!(!policy.rearm_exhausted_refresh("a"));
+                    assert!(policy.due_refreshes(now, |_| true).is_empty());
+                    let deadline = policy.next_refresh_deadline().unwrap();
+                    assert_eq!(policy.due_refreshes(deadline, |_| true).len(), 1);
+                }
+            }
+            assert_eq!(policy.next_refresh_deadline(), None);
+            assert!(policy.due_refreshes(u64::MAX, |_| true).is_empty());
+            assert!(policy.exit("a", "desktop", 1).cancelled.is_empty());
+            assert!(
+                policy.has_failed_refresh("a"),
+                "viewport Exit retains domain recovery"
+            );
+            assert_eq!(policy.rearm_exhausted_refresh("a"), retryable);
+            if !retryable {
+                // Protocol/auth/dispatch failures remain terminal for automatic triggers.
+                assert_eq!(policy.next_refresh_deadline(), None);
+                continue;
+            }
+            assert_eq!(policy.next_refresh_deadline(), Some(7_000));
+            assert!(!policy.rearm_exhausted_refresh("a"));
+            assert!(policy.due_refreshes(6_999, |_| true).is_empty());
+            assert!(policy.due_refreshes(u64::MAX, |_| false).is_empty());
+            assert_eq!(policy.next_refresh_deadline_where(|_| false), None);
+            // Other anchors share the key, but cannot consume/reset Newest recovery.
+            for anchor in [
+                pioneer_protocol::TimelinePageAnchor::Oldest,
+                pioneer_protocol::TimelinePageAnchor::Around {
+                    cursor: pioneer_protocol::TimelineCursor {
+                        value: "opaque".into(),
+                    },
+                },
+            ] {
+                let mut other = action.clone();
+                let PageAction::ThreadTimelinePage { params, .. } = &mut other else {
+                    unreachable!()
+                };
+                params.anchor = anchor;
+                policy.begin(other).unwrap();
+                assert_eq!(policy.next_refresh_deadline(), None);
+                assert!(policy.finish(&key, true, 6_000).is_none());
+                assert_eq!(policy.next_refresh_deadline(), Some(7_000));
+            }
+            let next = policy.due_refreshes(7_000, |_| true).remove(0);
+            assert_eq!(next.action, action);
+            assert!(next.generation > old_generation);
+            assert!(!policy.accepts(&key, old_generation));
+            for now in [7_000, 8_000, 10_000] {
+                assert!(!policy.rearm_exhausted_refresh("a"));
+                assert!(policy.due_refreshes(u64::MAX, |_| true).is_empty());
+                assert!(policy.finish(&key, false, now).is_none());
+                if now < 10_000 {
+                    assert!(!policy.rearm_exhausted_refresh("a"));
+                    let deadline = policy.next_refresh_deadline().unwrap();
+                    assert_eq!(policy.due_refreshes(deadline, |_| true).len(), 1);
+                }
+            }
+            assert_eq!(policy.next_refresh_deadline(), None);
+            assert!(policy.due_refreshes(u64::MAX, |_| true).is_empty());
+            assert!(policy.has_failed_refresh("a"));
+        }
+    }
+
+    #[test]
     fn persistent_read_failure_stops_at_three_attempts_until_explicit_retry() {
         let mut policy = ThreadTimelineController::default();
         let first = policy.update(demand("desktop"), vec![], 0).reads.remove(0);
@@ -864,7 +993,7 @@ mod tests {
         policy.finish(key, false, 0);
         assert_eq!(policy.next_refresh_deadline(), Some(1_000));
         policy.invalidate(Some("a"));
-        assert!(policy.due_refreshes(u64::MAX).is_empty());
+        assert!(policy.due_refreshes(u64::MAX, |_| true).is_empty());
         assert_eq!(policy.next_refresh_deadline(), None);
         assert!(!policy.accepts_read(&a.reads[0]));
         assert!(policy.accepts_read(&b.reads[0]));
@@ -1059,8 +1188,7 @@ impl crate::core::ClientCore {
         self.thread_registry
             .lock()
             .expect("thread registry poisoned")
-            .timeline
-            .next_request_deadline()
+            .next_timeline_request_deadline()
             .map(|deadline| {
                 std::time::Duration::from_millis(deadline.saturating_sub(self.timeline_now_ms()))
             })
@@ -1078,8 +1206,7 @@ impl crate::core::ClientCore {
             .thread_registry
             .lock()
             .expect("thread registry poisoned")
-            .timeline
-            .due_refreshes(now_ms);
+            .due_timeline_refreshes(now_ms);
         for page in pages {
             self.schedule_planned_timeline_request(page);
         }

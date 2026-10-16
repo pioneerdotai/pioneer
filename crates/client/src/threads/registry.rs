@@ -268,6 +268,31 @@ pub struct ThreadRegistry {
 }
 
 impl ThreadRegistry {
+    pub(crate) fn next_timeline_request_deadline(&self) -> Option<u64> {
+        [
+            self.timeline.next_read_deadline(),
+            self.timeline.next_refresh_deadline_where(|id| {
+                self.stores.get(id).is_some_and(|store| {
+                    !store.presentation_blocked && store.demand != ClientDemand::Suspended
+                })
+            }),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+    }
+
+    pub(crate) fn due_timeline_refreshes(
+        &mut self,
+        now_ms: u64,
+    ) -> Vec<crate::timeline::controller::TimelinePageRequest> {
+        self.timeline.due_refreshes(now_ms, |id| {
+            self.stores.get(id).is_some_and(|store| {
+                !store.presentation_blocked && store.demand != ClientDemand::Suspended
+            })
+        })
+    }
+
     pub(crate) fn timeline_has_unread(&self, thread: &str) -> bool {
         self.directory.has_unread(thread)
     }
@@ -1276,6 +1301,17 @@ impl ClientCore {
         // Read intent survives a duplicate invalidation, but only for IDs accepted
         // into the stale sets by the semantic reducer (including tombstone fences).
         let requests = thread_reconcile_actions(&state, &update);
+        let store = &state.registry.stores[id];
+        // Any accepted change for this timeline can signal recovery, including
+        // duplicates and removal-only updates that produce no ordinary request.
+        let rearmed = !store.presentation_blocked
+            && store.demand == ClientDemand::Visible
+            && state.registry.timeline.rearm_exhausted_refresh(id);
+        drop(state);
+        if rearmed {
+            // Preserve the wake even when admission below returns no request.
+            self.wake_thread_timeline_requests();
+        }
         Some((changed, generation, requests))
     }
     pub fn thread_semantic_in_flight(&self, id: &str) -> HashSet<SemanticTimelineRequestKey> {
@@ -2324,6 +2360,7 @@ impl ClientCore {
             self.request_thread_presentation(id);
             if let Some(workspace) = restored_workspace {
                 self.schedule_thread_subscription(id, &workspace);
+                self.recover_visible_thread_timeline(id);
             }
         }
     }
@@ -2350,6 +2387,14 @@ impl ClientCore {
         let became_visible = registry.stores.get(id).is_some_and(|store| {
             store.demand != ClientDemand::Visible && combined == ClientDemand::Visible
         });
+        let resumed_prefetch = registry.stores.get(id).is_some_and(|store| {
+            store.demand == ClientDemand::Suspended
+                && combined == ClientDemand::Prefetch
+                && !store.presentation_blocked
+        }) && registry
+            .timeline
+            .next_refresh_deadline_where(|thread| thread == id)
+            .is_some();
         if let Some(store) = registry.stores.get_mut(id) {
             store.demand = combined;
         }
@@ -2370,6 +2415,46 @@ impl ClientCore {
         }
         if became_visible && let Some(workspace) = workspace {
             self.schedule_thread_subscription(id, &workspace);
+            self.recover_visible_thread_timeline(id);
+        }
+        if resumed_prefetch {
+            // Prefetch resumes an existing budget; only Visible may rearm it.
+            self.wake_thread_timeline_requests();
+        }
+    }
+
+    fn recover_visible_thread_timeline(&self, id: &str) {
+        let mut registry = self
+            .thread_registry
+            .lock()
+            .expect("thread registry poisoned");
+        if self.is_stopped()
+            || !registry.stores.get(id).is_some_and(|store| {
+                !store.presentation_blocked && store.demand == ClientDemand::Visible
+            })
+        {
+            return;
+        }
+        registry.timeline.rearm_exhausted_refresh(id);
+        // Also wake an unexhausted Backoff that was paused while Suspended.
+        let wake = registry
+            .timeline
+            .next_refresh_deadline_where(|thread| thread == id)
+            .is_some();
+        drop(registry);
+        if wake {
+            self.wake_thread_timeline_requests();
+        }
+    }
+
+    fn wake_thread_timeline_requests(&self) {
+        if let Some(sender) = self
+            .thread_request_sender
+            .lock()
+            .expect("thread request sender poisoned")
+            .as_ref()
+        {
+            let _ = sender.send(ThreadControllerRequest::Resume);
         }
     }
 }
@@ -5328,7 +5413,15 @@ mod tests {
         Arc<ClientCore>,
         std::sync::mpsc::Receiver<ThreadControllerRequest>,
     ) {
-        let core = core();
+        reconciliation_core_with(core())
+    }
+
+    fn reconciliation_core_with(
+        core: Arc<ClientCore>,
+    ) -> (
+        Arc<ClientCore>,
+        std::sync::mpsc::Receiver<ThreadControllerRequest>,
+    ) {
         core.upsert_thread(thread("a", "ws"));
         core.apply_thread_timeline_page(
             reconciliation_page(reconciliation_history()[80..=210].to_vec(), true, true),
@@ -5506,16 +5599,54 @@ mod tests {
     }
 
     #[test]
-    fn refresh_worker_recovers_without_notifications_and_stops_at_the_budget() {
+    fn refresh_worker_is_bounded_and_recovers_on_later_timeline_triggers() {
         use crate::timeline::semantic::TimelineRequestStatus;
-        for exhaust in [false, true] {
-            let (core, receiver) = reconciliation_core();
+        for trigger in [
+            "automatic",
+            "notification",
+            "removal",
+            "visible",
+            "reacquire",
+        ] {
+            let exhaust = trigger != "automatic";
+            let (core, receiver) =
+                reconciliation_core_with(crate::catalog_test_support::settings_client());
+            {
+                let mut session = core.gateway_session.lock().unwrap();
+                session.observe_transport(&crate::transport::ws::GatewayWsEvent::Connected {
+                    connection_id: 7,
+                    endpoint_id: "endpoint".into(),
+                    endpoint_name: "Synthetic".into(),
+                    gateway_base_url: pioneer_protocol::GatewayBaseUrl::parse_presentation(
+                        "https://synthetic.invalid",
+                    )
+                    .unwrap(),
+                });
+                core.publish_gateway_session(&session);
+            }
+            let revision = core.gateway_session().startup.transport_revision;
+            core.thread_registry
+                .lock()
+                .unwrap()
+                .stores
+                .get_mut("a")
+                .unwrap()
+                .subscription_revision = Some(revision);
+            let auth = core.current_auth_ticket();
             let scope = ClientScope::Timeline {
                 thread_id: "a".into(),
             };
-            let _lease = core.subscribe(scope.clone(), NonZeroUsize::new(16).unwrap());
+            let mut lease = Some(core.subscribe(scope.clone(), NonZeroUsize::new(16).unwrap()));
             core.apply_thread_notification(reconciliation_notification(&["result-140"]));
             let mut request = reconciliation_request(&receiver);
+            let request_store_generation = request.generation;
+            let retired = ThreadSemanticRequest {
+                id: request.id.clone(),
+                generation: request.generation,
+                request_generation: request.request_generation,
+                action: request.action.clone(),
+                reconciliation: None,
+            };
             let mut history = reconciliation_history();
             history.push(reconciliation_result(140));
             history.sort_by(|a, b| a.sort_key.cmp(&b.sort_key));
@@ -5625,8 +5756,134 @@ mod tests {
                         .get("Failed")
                         .is_some()
                 );
-                core.apply_thread_notification(reconciliation_notification(&["result-140"]));
+                // Without a later event, exhaustion has no deadline and does not poll.
+                if trigger == "reacquire" {
+                    drop(lease.take());
+                } else if trigger == "visible" {
+                    core.thread_demand_changed(&scope, ClientDemand::Suspended);
+                }
+                for _ in 0..10 {
+                    let notification = if trigger == "removal" {
+                        history
+                            .borrow_mut()
+                            .retain(|block| block.block_id != "block-100");
+                        let GatewayNotification::ThreadTimelineBlocksChanged(mut update) =
+                            reconciliation_notification(&[])
+                        else {
+                            unreachable!()
+                        };
+                        update.removed_block_ids = vec!["block-100".into()];
+                        GatewayNotification::ThreadTimelineBlocksChanged(update)
+                    } else {
+                        reconciliation_notification(&["result-140"])
+                    };
+                    core.apply_thread_notification(notification);
+                }
+                if trigger == "visible" || trigger == "reacquire" {
+                    assert_eq!(core.next_timeline_request_delay(), None);
+                    core.drive_timeline_requests_at(u64::MAX);
+                    assert_eq!(
+                        receiver.try_iter().count(),
+                        0,
+                        "hidden parent does not poll"
+                    );
+                    if trigger == "reacquire" {
+                        lease = Some(core.subscribe(scope.clone(), NonZeroUsize::new(16).unwrap()));
+                    } else {
+                        core.thread_demand_changed(&scope, ClientDemand::Visible);
+                        core.thread_demand_changed(&scope, ClientDemand::Visible);
+                    }
+                }
+                assert!(matches!(
+                    receiver.try_recv().unwrap(),
+                    ThreadControllerRequest::Resume
+                ));
+                assert_eq!(
+                    receiver.try_iter().count(),
+                    0,
+                    "one wake for the saved obligation"
+                );
+                let deadline = core
+                    .thread_registry
+                    .lock()
+                    .unwrap()
+                    .timeline
+                    .next_refresh_deadline()
+                    .unwrap();
+                core.drive_timeline_requests_at(deadline - 1);
+                assert_eq!(
+                    receiver.try_iter().count(),
+                    0,
+                    "cooldown survives the trigger"
+                );
+                assert_eq!(
+                    core.thread_semantic_snapshot("a")
+                        .thread("a")
+                        .unwrap()
+                        .top_level
+                        .request_status,
+                    cached.request_status,
+                    "rearming cannot acknowledge stale data"
+                );
+                // Hiding after the trigger preserves the deferred obligation too.
+                core.thread_demand_changed(&scope, ClientDemand::Suspended);
+                assert_eq!(core.next_timeline_request_delay(), None);
+                core.drive_timeline_requests_at(u64::MAX);
                 assert_eq!(receiver.try_iter().count(), 0);
+                core.thread_demand_changed(&scope, ClientDemand::Visible);
+                assert!(matches!(
+                    receiver.try_recv().unwrap(),
+                    ThreadControllerRequest::Resume
+                ));
+                assert_eq!(
+                    core.thread_registry
+                        .lock()
+                        .unwrap()
+                        .timeline
+                        .next_refresh_deadline(),
+                    Some(deadline)
+                );
+                core.drive_timeline_requests_at(deadline);
+                let request = reconciliation_request(&receiver);
+                assert!(request.request_generation > retired.request_generation);
+                let transport = ReconciliationTransport {
+                    calls: Default::default(),
+                    reply: |_: usize, params: &ThreadTimelinePageParams| {
+                        Ok(reconciliation_server_page(&history.borrow(), params))
+                    },
+                };
+                core.fail_timeline_dispatch(&retired);
+                core.execute_thread_semantic_request(&transport, retired);
+                assert!(
+                    transport.calls.borrow().is_empty(),
+                    "retired request cannot read or finish"
+                );
+                assert_eq!(core.thread_semantic_in_flight("a").len(), 1);
+                core.execute_thread_semantic_request(&transport, request);
+                assert_eq!(receiver.try_iter().count(), 0);
+                core.materialize_demanded_timelines();
+                assert_eq!(
+                    core.thread_semantic_snapshot("a")
+                        .thread("a")
+                        .unwrap()
+                        .top_level
+                        .request_status,
+                    TimelineRequestStatus::Ready
+                );
+                assert!(
+                    core.snapshot(&scope)
+                        .unwrap()
+                        .snapshot()
+                        .serialized_payload()
+                        .to_string()
+                        .contains("child result")
+                );
+                let registry = core.thread_registry.lock().unwrap();
+                assert_eq!(registry.stores["a"].subscription_revision, Some(revision));
+                assert_eq!(registry.stores["a"].generation, request_store_generation);
+                drop(registry);
+                assert_eq!(core.gateway_session().startup.transport_revision, revision);
+                assert_eq!(core.current_auth_ticket(), auth);
             } else {
                 assert_eq!(cached.request_status, TimelineRequestStatus::Ready);
                 assert!(cached.block("result-140").is_some());
@@ -5637,7 +5894,88 @@ mod tests {
                         .contains("recovered latest child result")
                 );
             }
+            drop(lease);
         }
+    }
+
+    #[test]
+    fn prefetch_wakes_suspended_refresh_without_replenishing_its_budget() {
+        let (core, receiver) = reconciliation_core();
+        let scope = ClientScope::Timeline {
+            thread_id: "a".into(),
+        };
+        let _lease = core.subscribe(scope.clone(), NonZeroUsize::new(16).unwrap());
+        core.apply_thread_notification(reconciliation_notification(&["result-140"]));
+        let mut request = reconciliation_request(&receiver);
+        let action = request.action.clone();
+        let transport = ReconciliationTransport {
+            calls: Default::default(),
+            reply: |_: usize, _: &ThreadTimelinePageParams| Err("temporary read failure".into()),
+        };
+        for attempt in 1..=3 {
+            core.execute_thread_semantic_request(&transport, request);
+            if attempt == 3 {
+                break;
+            }
+            let deadline = core
+                .thread_registry
+                .lock()
+                .unwrap()
+                .timeline
+                .next_refresh_deadline()
+                .unwrap();
+            if attempt == 1 {
+                core.thread_demand_changed(&scope, ClientDemand::Suspended);
+                assert_eq!(core.next_timeline_request_delay(), None);
+                core.drive_timeline_requests_at(u64::MAX);
+                assert!(receiver.try_recv().is_err());
+                core.thread_demand_changed(&scope, ClientDemand::Prefetch);
+                assert!(matches!(
+                    receiver.try_recv().unwrap(),
+                    ThreadControllerRequest::Resume
+                ));
+                core.thread_demand_changed(&scope, ClientDemand::Prefetch);
+                assert!(
+                    receiver.try_recv().is_err(),
+                    "duplicate demand does not wake"
+                );
+                assert_eq!(
+                    core.thread_registry
+                        .lock()
+                        .unwrap()
+                        .next_timeline_request_deadline(),
+                    Some(deadline)
+                );
+            }
+            core.drive_timeline_requests_at(deadline - 1);
+            assert!(receiver.try_recv().is_err());
+            core.drive_timeline_requests_at(deadline);
+            request = reconciliation_request(&receiver);
+            assert_eq!(
+                request.action, action,
+                "retry preserves the exact Newest action"
+            );
+            core.drive_timeline_requests_at(u64::MAX);
+            assert!(receiver.try_recv().is_err(), "one active request per key");
+        }
+        assert_eq!(transport.calls.borrow().len(), 3, "original attempt budget");
+        assert_eq!(core.next_timeline_request_delay(), None);
+        core.thread_demand_changed(&scope, ClientDemand::Suspended);
+        core.thread_demand_changed(&scope, ClientDemand::Prefetch);
+        core.thread_demand_changed(&scope, ClientDemand::Prefetch);
+        core.drive_timeline_requests_at(u64::MAX);
+        assert!(
+            receiver.try_recv().is_err(),
+            "Prefetch cannot rearm exhaustion"
+        );
+        assert!(core.thread_semantic_in_flight("a").is_empty());
+        assert!(
+            core.thread_registry
+                .lock()
+                .unwrap()
+                .timeline
+                .has_failed_refresh("a")
+        );
     }
 
     #[test]
@@ -5727,6 +6065,12 @@ mod tests {
                 },
             ] {
                 let (core, receiver) = reconciliation_core();
+                let _lease = core.subscribe(
+                    ClientScope::Timeline {
+                        thread_id: "a".into(),
+                    },
+                    NonZeroUsize::new(16).unwrap(),
+                );
                 let mut history = reconciliation_history();
                 history.push(reconciliation_result(140));
                 history.sort_by(|a, b| a.sort_key.cmp(&b.sort_key));
@@ -9333,9 +9677,9 @@ impl ClientCore {
                 return None;
             }
         }
-        // Notifications retain invalidation without bypassing an owned recovery's
-        // backoff or exhausted budget. The request worker drives retries;
-        // explicit Retry and confirmed subscriptions can start fresh recovery.
+        // Live reduction may have rearmed an exhausted cycle. The worker owns
+        // its exact Newest action and deadline; notification admission must not
+        // bypass that cooldown or an existing recovery's backoff/budget.
         if notification
             && matches!(
                 crate::timeline::semantic::semantic_timeline_request_key(&action),
