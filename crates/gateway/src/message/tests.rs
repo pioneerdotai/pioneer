@@ -43160,6 +43160,110 @@ async fn thread_read_rpc_is_monotonic_and_converges_all_principal_sessions() {
         assert_eq!(secondary_notification.cursor, response.cursor);
         assert_eq!(secondary_notification.unread_count, response.unread_count);
     }
+    // A workspace-only observer must learn about a final answer without a
+    // timeline subscription, then receive the same principal's read cursor.
+    processor
+        .session_manager
+        .set_connection_workspace(_secondary_connection_id, Some(workspace_id.clone()))
+        .await;
+    let answer = pioneer_protocol::TurnItem::AgentMessage {
+        id: pioneer_protocol::task_delivery_result_item_id("read-rpc-delivery"),
+        text: "Finished answer".into(),
+        phase: pioneer_protocol::AgentMessagePhase::FinalAnswer,
+        markdown: None,
+        markdown_version: None,
+    };
+    processor
+        .crud_store
+        .materialize_item_started(
+            pioneer_protocol::ItemStartedNotification {
+                workspace_id: workspace_id.clone(),
+                thread_id: THREAD_ID.into(),
+                turn_id: FIRST_TURN_ID.into(),
+                item: answer.clone(),
+            },
+            now_timestamp_secs(),
+        )
+        .await
+        .unwrap();
+    let streaming = request_thread_timeline_page_for_test(
+        &processor,
+        primary_connection_id,
+        &mut primary_rx,
+        THREAD_ID,
+        "readreplystream00001",
+    )
+    .await;
+    assert!(streaming.blocks.iter().any(|block| matches!(&block.kind, pioneer_protocol::TimelineBlockKind::AssistantMessage { status: pioneer_protocol::TurnWorkItemStatus::Running, item_id, .. } if item_id == answer.item_id())), "canonical lifecycle status must survive Gateway batching");
+    processor
+        .crud_store
+        .materialize_item_completed(
+            pioneer_protocol::ItemCompletedNotification {
+                workspace_id: workspace_id.clone(),
+                thread_id: THREAD_ID.into(),
+                turn_id: FIRST_TURN_ID.into(),
+                item: answer.clone(),
+            },
+            now_timestamp_secs(),
+        )
+        .await
+        .unwrap();
+    processor
+        .notify_semantic_timeline_item_changed(
+            &workspace_id,
+            THREAD_ID,
+            FIRST_TURN_ID,
+            &answer,
+            Some("completed"),
+        )
+        .await;
+    let tree = recv_notification_by_method(&mut secondary_rx, events::THREAD_TREE_CHANGED).await;
+    assert_eq!(tree.params.unwrap()["workspace_id"], workspace_id);
+    let principal = authenticated_test_superuser().principal_id.clone();
+    assert_eq!(
+        processor
+            .crud_store
+            .unread_counts_for_threads(&principal, &[THREAD_ID.into()])
+            .await
+            .unwrap()
+            .get(THREAD_ID),
+        Some(&1)
+    );
+    let block_id = pioneer_crud::assistant_block_id(FIRST_TURN_ID, answer.item_id());
+    let canonical = request_thread_timeline_page_for_test(
+        &processor,
+        primary_connection_id,
+        &mut primary_rx,
+        THREAD_ID,
+        "readreplyfinal000001",
+    )
+    .await;
+    let sort_key = &canonical
+        .blocks
+        .iter()
+        .find(|block| block.block_id == block_id)
+        .unwrap()
+        .sort_key;
+    processor.process_request_for_connection(primary_connection_id, &json!({
+        "jsonrpc": "2.0", "id": "readreplyexact000001", "method": "thread/read",
+        "params": { "thread_id": THREAD_ID, "through_turn_id": FIRST_TURN_ID, "through_block": { "block_id": block_id, "sort_key": sort_key } }
+    }).to_string()).await;
+    let (response, _) = recv_response_and_notification_by_id_method(
+        &mut primary_rx,
+        "readreplyexact000001",
+        events::THREAD_READ_CURSOR_CHANGED,
+    )
+    .await;
+    let response: pioneer_protocol::ThreadReadResponse =
+        serde_json::from_value(response.result).unwrap();
+    assert_eq!(response.cursor.through_turn_id, FIRST_TURN_ID);
+    assert_eq!(response.unread_count, 0);
+    let peer =
+        recv_notification_by_method(&mut secondary_rx, events::THREAD_READ_CURSOR_CHANGED).await;
+    let peer: pioneer_protocol::ThreadReadCursorChangedNotification =
+        serde_json::from_value(peer.params.unwrap()).unwrap();
+    assert_eq!(peer.cursor, response.cursor);
+    assert_eq!(peer.unread_count, 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

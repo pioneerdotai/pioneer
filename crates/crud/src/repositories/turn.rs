@@ -1502,6 +1502,24 @@ pub async fn find_turn_item<C: ConnectionTrait>(
         .context("failed to query turn item row")
 }
 
+pub(crate) async fn is_completed_agent_message<C: ConnectionTrait>(
+    db: &C,
+    turn_id: &str,
+    item_id: &str,
+) -> Result<bool> {
+    // The canonical assistant block supplies final-answer placement. Check
+    // lifecycle state without fetching/parsing its potentially large payload.
+    Ok(turn_item::Entity::find()
+        .filter(turn_item::Column::TurnId.eq(turn_id.to_owned()))
+        .filter(turn_item::Column::ItemId.eq(item_id.to_owned()))
+        .filter(turn_item::Column::ItemType.eq("agent_message"))
+        .filter(turn_item::Column::Status.eq("completed"))
+        .count(db)
+        .await
+        .context("failed to validate completed response position")?
+        > 0)
+}
+
 pub async fn list_turn_items_by_ids<C: ConnectionTrait>(
     db: &C,
     turn_id: &str,

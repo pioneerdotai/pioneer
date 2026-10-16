@@ -256,6 +256,12 @@ pub struct ThreadDirectoryStore {
     projections: SidebarProjectionStore,
 }
 impl ThreadDirectoryStore {
+    pub(crate) fn read_position_is_confirmed(&self, thread: &str, sort_key: &str) -> bool {
+        self.cursors
+            .get(thread)
+            .is_some_and(|cursor| cursor.sort_key.as_str() >= sort_key)
+    }
+
     pub(crate) fn has_unread(&self, thread: &str) -> bool {
         self.unread.get(thread).copied().unwrap_or(0) > 0
     }

@@ -1870,9 +1870,19 @@ pub struct TurnMessageRevisionsPageResponse {
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+pub struct ThreadReadPosition {
+    pub block_id: String,
+    pub sort_key: String,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
 pub struct ThreadReadParams {
     pub thread_id: String,
     pub through_turn_id: String,
+    /// Exact canonical message viewed by the client. Omission retains the
+    /// legacy user-message-only Turn anchor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub through_block: Option<ThreadReadPosition>,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]

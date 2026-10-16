@@ -1042,7 +1042,7 @@ impl MessageProcessor {
             notification.thread_id.as_str(),
             notification.turn_id.as_str(),
             &notification.item,
-            None,
+            Some("completed"),
         )
         .await;
         Ok(true)

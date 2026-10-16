@@ -388,6 +388,55 @@ pub async fn find_thread_timeline_block_by_sort_key<C: ConnectionTrait>(
     })
 }
 
+pub async fn find_thread_timeline_block_by_id<C: ConnectionTrait>(
+    db: &C,
+    thread_id: &str,
+    block_id: &str,
+) -> Result<Option<thread_timeline_block::Model>> {
+    thread_timeline_block::Entity::find_by_id(block_id.to_owned())
+        .filter(thread_timeline_block::Column::ThreadId.eq(thread_id.to_owned()))
+        .one(db)
+        .await
+        .context("failed to find message read position")
+}
+
+/// Called inside the canonical projection transaction, only when a message
+/// first becomes readable. In particular, a late final answer must sort after
+/// cursors that could already have passed the beginning of its Turn.
+/// Existing rows retain their position on edits, snapshots and redelivery.
+pub(crate) async fn new_message_sort_key<C: ConnectionTrait>(
+    db: &C,
+    thread_id: &str,
+    candidate: String,
+) -> Result<String> {
+    let latest = thread_timeline_block::Entity::find()
+        .filter(thread_timeline_block::Column::ThreadId.eq(thread_id.to_owned()))
+        .order_by_desc(thread_timeline_block::Column::SortKey)
+        .one(db)
+        .await
+        .context("failed to find latest timeline position")?;
+    if let Some(latest) = latest
+        && latest.sort_key >= candidate
+    {
+        // Preserve the existing key shape/Turn identity. Only new readable
+        // messages need a logical tick when their original Turn position is
+        // already behind published rows (including completions in one clock tick).
+        let (millis, _) = latest
+            .sort_key
+            .split_once(':')
+            .context("invalid latest message position")?;
+        let (_, suffix) = candidate
+            .split_once(':')
+            .context("invalid new message position")?;
+        let millis = millis
+            .parse::<u64>()?
+            .checked_add(1)
+            .context("message position overflow")?;
+        return Ok(format!("{millis:020}:{suffix}"));
+    }
+    Ok(candidate)
+}
+
 pub async fn find_user_message_block_by_turn_id<C: ConnectionTrait>(
     db: &C,
     thread_id: &str,
@@ -406,7 +455,27 @@ pub async fn find_user_message_block_by_turn_id<C: ConnectionTrait>(
         })
 }
 
-pub async fn count_unread_user_message_blocks<C: ConnectionTrait>(
+// Assistant blocks already identify canonical final responses. EXISTS checks
+// completion without loading payloads or multiplying a response by its HTML publications.
+const UNREAD_MESSAGE_PREDICATE: &str = r#"AND (
+                        (block.block_kind = 'user_message'
+                            AND turn.turn_kind = 'conversation'
+                            AND turn.origin = 'user'
+                            AND turn.message_deleted_at IS NULL
+                            AND turn.initiated_by_actor_kind = 'principal'
+                            AND turn.initiated_by_actor_id <> ?)
+                        OR (block.block_kind = 'assistant_message'
+                            AND block.source_kind = 'turn_item'
+                            AND EXISTS (
+                                SELECT 1 FROM turn_item AS item
+                                WHERE item.turn_id = block.turn_id
+                                    AND item.item_id = block.source_key
+                                    AND item.item_type = 'agent_message'
+                                    AND item.status = 'completed'
+                            ))
+                    )"#;
+
+pub async fn count_unread_message_blocks<C: ConnectionTrait>(
     db: &C,
     thread_id: &str,
     principal_id: &str,
@@ -415,21 +484,18 @@ pub async fn count_unread_user_message_blocks<C: ConnectionTrait>(
     let row = db
         .query_one_raw(Statement::from_sql_and_values(
             db.get_database_backend(),
-            r#"
+            format!(
+                r#"
                 SELECT COUNT(*) AS unread_count
                 FROM thread_timeline_block AS block
                 INNER JOIN turn
                     ON turn.id = block.turn_id
                     AND turn.thread_id = block.thread_id
                 WHERE block.thread_id = ?
-                    AND block.block_kind = 'user_message'
                     AND block.sort_key > ?
-                    AND turn.turn_kind = 'conversation'
-                    AND turn.origin = 'user'
-                    AND turn.message_deleted_at IS NULL
-                    AND turn.initiated_by_actor_kind = 'principal'
-                    AND turn.initiated_by_actor_id <> ?
-            "#,
+                    {UNREAD_MESSAGE_PREDICATE}
+            "#
+            ),
             vec![
                 thread_id.to_owned().into(),
                 after_sort_key.to_owned().into(),
@@ -437,15 +503,15 @@ pub async fn count_unread_user_message_blocks<C: ConnectionTrait>(
             ],
         ))
         .await
-        .context("failed to count unread user-message timeline blocks")?
+        .context("failed to count unread message timeline blocks")?
         .context("unread count query returned no row")?;
     let count = row
         .try_get::<i64>("", "unread_count")
-        .context("failed to decode unread user-message count")?;
-    u64::try_from(count).context("unread user-message count is negative")
+        .context("failed to decode unread message count")?;
+    u64::try_from(count).context("unread message count is negative")
 }
 
-pub async fn count_unread_user_message_blocks_for_threads<C: ConnectionTrait>(
+pub async fn count_unread_message_blocks_for_threads<C: ConnectionTrait>(
     db: &C,
     thread_ids: &[String],
     principal_id: &str,
@@ -468,13 +534,8 @@ pub async fn count_unread_user_message_blocks_for_threads<C: ConnectionTrait>(
                 ON cursor.thread_id = block.thread_id
                 AND cursor.principal_id = ?
             WHERE block.thread_id IN ({placeholders})
-                AND block.block_kind = 'user_message'
                 AND block.sort_key > COALESCE(cursor.last_read_sort_key, '')
-                AND turn.turn_kind = 'conversation'
-                AND turn.origin = 'user'
-                AND turn.message_deleted_at IS NULL
-                AND turn.initiated_by_actor_kind = 'principal'
-                AND turn.initiated_by_actor_id <> ?
+                {UNREAD_MESSAGE_PREDICATE}
             GROUP BY block.thread_id
         "#
     );
@@ -489,7 +550,7 @@ pub async fn count_unread_user_message_blocks_for_threads<C: ConnectionTrait>(
             values,
         ))
         .await
-        .context("failed to count unread user-message blocks for thread batch")?;
+        .context("failed to count unread message blocks for thread batch")?;
     rows.into_iter()
         .map(|row| {
             let thread_id = row
