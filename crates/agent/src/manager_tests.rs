@@ -3497,7 +3497,10 @@ impl Provider for AlwaysTaskCreateProvider {
             .expect("always task_create provider lock poisoned")
             .push(request);
         if preflight {
-            return Ok(test_preflight_response());
+            return Ok(ChatResponse {
+                text: preflight_response_with_visible_tools(&["task_create"]),
+                ..test_preflight_response()
+            });
         }
 
         let round_index = self.next_index.fetch_add(1, Ordering::SeqCst);
@@ -4513,6 +4516,62 @@ async fn subscribe_agent_events_with_checkpoints(
         }
     });
     (rx, checkpoints)
+}
+
+async fn start_failed_native_fixture(
+    manager: &AgentManager,
+    thread: &str,
+    workspace: &str,
+    turn: &str,
+    provider: &str,
+    input: &str,
+) -> (Vec<AgentEvent>, ExecutionCheckpointContext) {
+    manager.ensure_thread(thread, workspace).await.unwrap();
+    let (mut events, checkpoints) = subscribe_agent_events_with_checkpoints(manager, thread).await;
+    manager
+        .start_test_turn_with_default_profile(
+            thread,
+            turn,
+            ThreadMode::Agent,
+            "test-model",
+            provider,
+            HashMap::new(),
+            vec![UserInput::Text {
+                text: input.into(),
+                text_elements: Vec::new(),
+            }],
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    let mut observed = Vec::new();
+    for _ in 0..160 {
+        let event = timeout(Duration::from_secs(2), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let failed = matches!(event, AgentEvent::ProviderFailureDetected { .. });
+        assert!(
+            !matches!(
+                event,
+                AgentEvent::TurnCompleted { .. }
+                    | AgentEvent::TurnFailed { .. }
+                    | AgentEvent::TurnBlocked { .. }
+            ),
+            "unexpected terminal before decoder failure: {event:?}"
+        );
+        observed.push(event);
+        if failed {
+            let checkpoint = checkpoints
+                .lock()
+                .unwrap()
+                .get(turn)
+                .cloned()
+                .expect("failed native attempt closes its actual window");
+            return (observed, checkpoint);
+        }
+    }
+    panic!("native failure fixture did not observe a provider failure")
 }
 
 async fn recv_events_until_terminal(
@@ -12316,13 +12375,19 @@ async fn loop_budget_manager(
 ) -> AgentManager {
     let registry = Arc::new(ProviderRegistry::with_provider("loop-budget", provider));
     let manager = AgentManager::new(registry, tool_loop_config);
+    let mut bundle = fake_task_tool_bundle_for_names(
+        &["missing_loop_budget_tool"],
+        Arc::new(MissingBudgetToolHandler),
+    );
+    bundle.specs[0].spec.recovery = ToolRecoveryMetadata {
+        retry_class: ToolRetryClass::Never,
+        idempotency_mode: ToolIdempotencyMode::None,
+        max_attempts: 1,
+        can_resume: false,
+        max_wall_clock_secs: None,
+    };
     manager
-        .set_turn_tool_provider(Some(Arc::new(StaticTurnToolProvider {
-            bundle: fake_task_tool_bundle_for_names(
-                &["missing_loop_budget_tool"],
-                Arc::new(MissingBudgetToolHandler),
-            ),
-        })))
+        .set_turn_tool_provider(Some(Arc::new(StaticTurnToolProvider { bundle })))
         .await;
     manager
 }
@@ -12434,8 +12499,8 @@ async fn wall_clock_window_checkpoints_before_executing_the_next_tool_batch() {
         SequencedToolProvider::new(
             vec![ProviderToolCall {
                 id: "call_after_elapsed_window".to_owned(),
-                name: "must_not_execute_after_elapsed_window".to_owned(),
-                arguments: serde_json::json!({}).to_string(),
+                name: "list_dir".to_owned(),
+                arguments: serde_json::json!({"path":".","depth":0,"limit":1}).to_string(),
             }],
             "final after time checkpoint",
         )
@@ -13536,6 +13601,14 @@ async fn unknown_tool_results_preserve_general_window_cap_without_fabricating_pr
     config.retry.max_recoverable_retry_rounds_per_episode = 16;
     config.retry.max_same_tool_error_retries_per_episode = 16;
     let manager = loop_budget_manager(provider.clone(), config).await;
+    manager
+        .set_turn_tool_provider(Some(Arc::new(StaticTurnToolProvider {
+            bundle: fake_task_tool_bundle_for_names(
+                &["missing_loop_budget_tool"],
+                Arc::new(MemoryFakeHandler),
+            ),
+        })))
+        .await;
     let thread_id = "thr_loop_budget_failed_windows";
     let turn_id = "turn_loop_budget_failed_windows";
     let mut events = start_loop_budget_turn(&manager, thread_id, turn_id).await;
@@ -13632,7 +13705,7 @@ async fn memory_recall_tools_remain_available_for_budget_continuation() {
 }
 
 #[tokio::test]
-async fn provider_tools_after_tools_disabled_requests_continuation_without_turn_failed() {
+async fn provider_tools_after_tools_disabled_are_rejected_before_dispatch_and_checkpointed() {
     let provider = Arc::new(LoopBudgetProvider::new(
         LoopBudgetProviderMode::AlwaysTools,
         1,
@@ -13642,72 +13715,44 @@ async fn provider_tools_after_tools_disabled_requests_continuation_without_turn_
     config.retry.max_recoverable_retry_rounds_per_episode = 1;
     config.retry.max_same_tool_error_retries_per_episode = 16;
     let manager = loop_budget_manager(provider.clone(), config).await;
-    let mut events = start_loop_budget_turn(
+    let (observed, checkpoint) = start_failed_native_fixture(
         &manager,
         "thr_loop_budget_disabled_tools",
+        "ws_loop_budget",
         "turn_loop_budget_disabled_tools",
+        "loop-budget",
+        "exercise no-tools native response",
     )
     .await;
-
-    let observed_events = recv_events_until_loop_budget_action(
-        &mut events,
-        ToolLoopBudgetLimitKind::ProviderReturnedToolsAfterToolsDisabled,
-        ToolLoopBudgetAction::ContinueInNextWindow,
-    )
-    .await;
-    let budget_index = observed_events
-        .iter()
-        .position(|event| {
-            matches!(
-                event,
-                AgentEvent::TurnToolLoopBudgetExceeded(notification)
-                    if notification.limit_kind
-                        == ToolLoopBudgetLimitKind::ProviderReturnedToolsAfterToolsDisabled
-                        && notification.action == ToolLoopBudgetAction::ContinueInNextWindow
-            )
-        })
-        .expect("provider tool-call leak should request continuation");
     assert!(
-        !observed_events[..=budget_index]
-            .iter()
-            .any(|event| matches!(event, AgentEvent::TurnFailed { .. })),
-        "provider tools after tools-disabled must not fail the turn"
+        matches!(observed.last(), Some(AgentEvent::ProviderFailureDetected { failure, .. }) if failure.class == ProviderFailureClass::ProviderRejected)
     );
-
-    timeout(Duration::from_secs(2), async {
-        while provider.snapshot_requests().len() < 4 {
-            yield_now().await;
-        }
-    })
-    .await
-    .expect("continuation should causally schedule the next provider round");
+    assert_eq!(
+        checkpoint.payload.window.exhaustion_reason,
+        Some(ExecutionWindowExhaustionReason::ProviderFailureContinuation)
+    );
     let requests = provider.snapshot_requests();
-    assert!(
-        requests.len() >= 4,
-        "continuation should schedule another provider request after the no-tools violation"
-    );
     let no_tools_index = requests
         .iter()
         .position(|request| request.tools.is_none())
-        .expect("fixture should enter one no-tools finalization round before continuation");
+        .expect("fixture reaches a no-tools request");
+    assert_eq!(no_tools_index, 2);
     assert_eq!(
-        tool_result_message_count(&requests[no_tools_index]),
-        2,
-        "only tool-capable retry rounds should execute tools before no-tools violation"
+        requests.len(),
+        3,
+        "an undeclared response does not cause an automatic provider retry"
     );
-    assert!(
-        requests
-            .iter()
-            .skip(no_tools_index + 1)
-            .any(|request| request.tools.is_some()),
-        "next execution window should restore tools after provider tools-disabled violation"
+    assert_eq!(tool_result_message_count(&requests[no_tools_index]), 2);
+    assert_eq!(
+        checkpoint.payload.tools.executed_count, 2,
+        "rejected no-tools calls never execute"
     );
 }
 
 #[tokio::test]
 async fn failed_task_create_cannot_finalize_as_success_claim() {
     let task_tools = Arc::new(FailingTaskMutationToolProvider::default());
-    let provider = Arc::new(SequencedToolProvider::new(
+    let provider = Arc::new(SequencedToolProvider::with_preflight_response(
         vec![ProviderToolCall {
             id: "call_task_create_failed_then_claim_success".to_owned(),
             name: "task_create".to_owned(),
@@ -13719,6 +13764,7 @@ async fn failed_task_create_cannot_finalize_as_success_claim() {
             .to_string(),
         }],
         "задача настроена",
+        preflight_response_with_visible_tools(&["task_create"]),
     ));
     let registry = Arc::new(ProviderRegistry::with_provider(
         "sequenced-tools",
@@ -13775,48 +13821,49 @@ async fn task_mutation_failure_preserves_root_cause_when_provider_returns_tools_
         .set_task_tool_provider(Some(task_tools.clone()))
         .await;
 
-    let observed = start_simple_turn(
+    let (observed, checkpoint) = start_failed_native_fixture(
         &manager,
         "thr_task_mutation_provider_tools_disabled",
         "ws_task_mutation_provider_tools_disabled",
         "turn_task_mutation_provider_tools_disabled",
-        ThreadMode::Agent,
         "always-task-create",
         "create a scheduled task",
     )
     .await;
-
-    assert_turn_completed(&observed);
     assert!(
-        !observed.iter().any(|event| match event {
-            AgentEvent::TurnFailed { .. } => true,
-            _ => false,
-        }),
-        "deterministic task mutation finalization must not surface a turn failure"
-    );
-    let final_text =
-        completed_agent_message_text(&observed).expect("final assistant text should be emitted");
-    assert!(
-        final_text.contains("unresolved postcondition"),
-        "{final_text}"
-    );
-    assert!(final_text.contains("task_create"), "{final_text}");
-    assert!(
-        !final_text.contains("provider_returned_tools_after_tools_disabled"),
-        "root cause must stay the task mutation failure, got: {final_text}"
+        matches!(observed.last(), Some(AgentEvent::ProviderFailureDetected { failure, .. }) if failure.class == ProviderFailureClass::ProviderRejected)
     );
     assert_eq!(
         task_tools.handler.calls(),
         0,
-        "invalid task_create arguments and final no-tools tool calls must not execute mutations"
+        "invalid arguments and undeclared no-tools replies never mutate a task"
     );
-    let requests = provider.snapshot_requests();
+    let state = checkpoint.payload.native_semantic_state.as_ref().unwrap();
+    let failures = state["task_mutation_guard"]["failures_since_last_success"]
+        .as_array()
+        .unwrap();
     assert!(
-        requests
+        !failures.is_empty(),
+        "decoder failure cannot erase an unresolved task postcondition"
+    );
+    assert!(failures.iter().all(|failure| {
+        failure["tool_name"] == "task_create"
+            && failure["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("trigger"))
+    }));
+    assert!(
+        !observed
+            .iter()
+            .any(|event| matches!(event, AgentEvent::TurnCompleted { .. })),
+        "no false final success is published"
+    );
+    assert!(
+        provider
+            .snapshot_requests()
             .iter()
             .skip(1)
-            .any(|request| request.tools.is_none()),
-        "task mutation finalization should still include a no-tools provider request"
+            .any(|request| request.tools.is_none())
     );
 }
 
@@ -13840,18 +13887,21 @@ async fn partial_task_tool_name_does_not_emit_visible_truncated_tool_row() {
         .set_task_tool_provider(Some(task_tools.clone()))
         .await;
 
-    let observed = start_simple_turn(
+    let (observed, checkpoint) = start_failed_native_fixture(
         &manager,
         "thr_partial_task_tool_name",
         "ws_partial_task_tool_name",
         "turn_partial_task_tool_name",
-        ThreadMode::Agent,
         "sequenced-tools",
         "create a scheduled task",
     )
     .await;
 
-    assert_turn_completed(&observed);
+    assert!(
+        matches!(observed.last(), Some(AgentEvent::ProviderFailureDetected { failure, .. }) if failure.class == ProviderFailureClass::ProviderRejected)
+    );
+    assert_eq!(checkpoint.payload.tools.executed_count, 0);
+    assert_eq!(provider.snapshot_requests().len(), 1);
     assert_eq!(
         task_tools.handler.calls(),
         0,
@@ -14580,7 +14630,7 @@ async fn non_tool_recovery_request_restarts_turn_without_failing() {
 }
 
 #[tokio::test]
-async fn continue_generation_recovery_is_compiled_into_system_prompt() {
+async fn recovery_checkpoint_is_compiled_into_the_same_turn_system_prompt() {
     let provider = Arc::new(CaptureStandardProvider::default());
     provider.fail_first_main.store(true, Ordering::SeqCst);
     let registry = Arc::new(ProviderRegistry::with_provider(
@@ -14696,12 +14746,12 @@ async fn continue_generation_recovery_is_compiled_into_system_prompt() {
     assert!(
         continuation_prompt
             .full_system_text
-            .contains("Continue from where it stopped without repeating prior text.")
+            .contains("Original request preview: hello")
     );
     assert!(
         continuation_prompt
             .full_system_text
-            .contains("Recovery Continuation")
+            .contains("Execution Continuation")
     );
     assert!(
         continuation_prompt
@@ -17696,7 +17746,7 @@ async fn applied_tool_retry_accepts_first_ordinary_final_with_optional_tools() {
     let provider = Arc::new(SequencedToolProvider::new(
         vec![ProviderToolCall {
             id: "retry_invalid_read".into(),
-            name: "read_file".into(),
+            name: "list_dir".into(),
             arguments: r#"{"path":42}"#.into(),
         }],
         TOOL_SCHEMA_DUMP_RESPONSE,
