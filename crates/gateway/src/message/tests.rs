@@ -3523,10 +3523,40 @@ impl pioneer_tasks::TaskExecutor for FailingSystemExecutor {
     }
 }
 
+// These admission fixtures select OpenAI while using deterministic Echo work.
+// Keep the adapter identity aligned with the selected registry authority.
+struct OpenAiEchoProvider;
+
+#[async_trait]
+impl Provider for OpenAiEchoProvider {
+    fn name(&self) -> &str {
+        "openai"
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        EchoProvider::new().capabilities()
+    }
+
+    fn model_tool_support(&self, model: &str) -> pioneer_provider::ModelToolSupport {
+        EchoProvider::new().model_tool_support(model)
+    }
+
+    async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
+        EchoProvider::new().chat(request).await
+    }
+
+    async fn stream_chat(
+        &self,
+        request: ChatRequest,
+    ) -> anyhow::Result<futures_util::stream::BoxStream<'static, anyhow::Result<StreamChunk>>> {
+        EchoProvider::new().stream_chat(request).await
+    }
+}
+
 fn test_provider() -> Arc<pioneer_provider::ProviderRegistry> {
     Arc::new(pioneer_provider::ProviderRegistry::with_provider(
         "openai",
-        Arc::new(EchoProvider::new()),
+        Arc::new(OpenAiEchoProvider),
     ))
 }
 
@@ -34149,7 +34179,7 @@ async fn task_agent_without_explicit_model_or_provider_is_rejected() {
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
     let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
         "openai",
-        Arc::new(EchoProvider::new()),
+        Arc::new(OpenAiEchoProvider),
     ));
     let processor = Arc::new(MessageProcessor::new(
         thread_manager,
@@ -76597,7 +76627,7 @@ async fn check_native_overflow_twice(with_tool: bool, cli_summary: bool) {
         }
 
         fn name(&self) -> &str {
-            "overflow-fixture"
+            "openai"
         }
         fn capabilities(&self) -> ProviderCapabilities {
             let mut capabilities = CaptureSummaryProvider::new("").capabilities();
@@ -76625,7 +76655,12 @@ async fn check_native_overflow_twice(with_tool: bool, cli_summary: bool) {
                     tool_calls: self.1.clone(),
                 });
             }
-            anyhow::bail!("provider error: maximum context length exceeded")
+            Err(pioneer_provider::failure::ProviderTransportFailure {
+                classification: pioneer_provider::ProviderFailureClassification::new(
+                    ProviderFailureClass::ContextTooLarge,
+                ),
+            }
+            .into())
         }
         async fn stream_chat(
             &self,
