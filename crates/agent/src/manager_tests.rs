@@ -2661,6 +2661,23 @@ impl RecordingMemoryProvider {
 
 #[async_trait::async_trait]
 impl AgentMemoryProvider for RecordingMemoryProvider {
+    async fn restore_memory_tools(
+        &self,
+        _: MemoryTurnContext,
+        accepted_specs: &[Vec<ConfiguredToolSpec>],
+    ) -> Result<MemoryToolMaterialization, String> {
+        let materialized = self.tool_result.clone()?;
+        let actual = materialized
+            .bundles
+            .iter()
+            .map(|bundle| bundle.specs.clone())
+            .collect::<Vec<_>>();
+        if actual != accepted_specs {
+            return Err("fixture memory tool contract changed".into());
+        }
+        Ok(materialized)
+    }
+
     async fn recall_memory(
         &self,
         context: MemoryTurnContext,
@@ -4334,9 +4351,11 @@ impl crate::compaction::controller::NativeContextController for FixtureControlCo
                 .prepare(context, request, measurement, recovery)
                 .await;
         }
-        let prepared = context.provider.prepare_input_budget(request).await?;
+        // This fixture supplies only the durable control source absent from a
+        // standalone Agent. It preserves the original no-controller request;
+        // media/context admission has separate concrete provider fixtures.
         let receipt = crate::compaction::controller::NativeInputReceipt::for_request(
-            &prepared.request,
+            &request,
             &context.provider_instance,
             context.provider.usage_api(),
             0,
@@ -4344,10 +4363,10 @@ impl crate::compaction::controller::NativeContextController for FixtureControlCo
         )?;
         Ok(crate::compaction::controller::NativePreparedRequest {
             history_check: crate::compaction::controller::NativeHistoryCheckMetadata {
-                target_output_cap: prepared.request.max_tokens.unwrap_or(4096),
+                target_output_cap: request.max_tokens.unwrap_or(4096),
                 fixed_input_tokens: 0,
             },
-            request: prepared.request,
+            request,
             receipt,
             covered_native_control_ids: Vec::new(),
         })
@@ -4377,6 +4396,25 @@ async fn subscribe_agent_events(
     let (tx, rx) = tokio::sync::mpsc::channel(256);
     tokio::spawn(async move {
         while let Some(event) = durable_rx.recv().await {
+            if let AgentDurableEvent::NativeSemanticCheckpoint {
+                checkpoint,
+                control: Some(record),
+                ..
+            } = &event
+            {
+                record.validate().unwrap();
+                let mut records = controller.records.lock().unwrap();
+                assert!(records.len() < 4096);
+                records.insert(
+                    (
+                        checkpoint.workspace_id.clone(),
+                        checkpoint.thread_id.clone(),
+                        checkpoint.turn_id.clone(),
+                        record.id.clone(),
+                    ),
+                    record.clone(),
+                );
+            }
             if let AgentDurableEvent::ItemCompleted { notification } = &event {
                 if let TurnItem::SystemEvent {
                     code,
