@@ -465,15 +465,16 @@ pub fn run_install(options: InstallOptions) -> Result<InstallReport> {
                 }));
             }
             Err(error) => {
-                rollback_and_restore(
+                let rollback = rollback_and_restore(
                     &target_binary,
                     &rollback_binary,
                     runtime_home.as_deref(),
                     config_backup_dir.as_deref(),
                     was_active,
                     &options.managed_by,
+                    RollbackSafety::SchemaMayHaveAdvanced,
                 );
-                bail!("failed to start gateway after update: {error:#}; update rolled back");
+                bail!("failed to start gateway after update: {error:#}; {rollback}");
             }
         };
 
@@ -486,15 +487,16 @@ pub fn run_install(options: InstallOptions) -> Result<InstallReport> {
                 true,
                 "stop during rollback",
             );
-            rollback_and_restore(
+            let rollback = rollback_and_restore(
                 &target_binary,
                 &rollback_binary,
                 runtime_home.as_deref(),
                 config_backup_dir.as_deref(),
                 was_active,
                 &options.managed_by,
+                RollbackSafety::SchemaMayHaveAdvanced,
             );
-            bail!("gateway failed health check after update; update rolled back");
+            bail!("gateway failed health check after update; {rollback}");
         }
         stage_timings.push(successful_stage_timing(
             "health.wait",
@@ -516,15 +518,20 @@ pub fn run_install(options: InstallOptions) -> Result<InstallReport> {
             )
         },
     ) {
-        rollback_and_restore(
+        let rollback = rollback_and_restore(
             &target_binary,
             &rollback_binary,
             runtime_home.as_deref(),
             config_backup_dir.as_deref(),
             was_active,
             &options.managed_by,
+            if should_start {
+                RollbackSafety::SchemaMayHaveAdvanced
+            } else {
+                RollbackSafety::BeforeGatewayStart
+            },
         );
-        bail!("failed to persist install-state: {error:#}; update rolled back");
+        bail!("failed to persist install-state: {error:#}; {rollback}");
     }
 
     observe_install_stage(
@@ -999,6 +1006,25 @@ fn persist_install_state(
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RollbackSafety {
+    BeforeGatewayStart,
+    SchemaMayHaveAdvanced,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RollbackDisposition {
+    Attempted,
+    BlockedCompatibilityUnknown,
+}
+impl std::fmt::Display for RollbackDisposition {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Attempted => "binary/config rollback attempted",
+            Self::BlockedCompatibilityUnknown => "rollback blocked: binary/schema compatibility is unknown after startup; candidate binary and backups retained",
+        })
+    }
+}
+
 fn rollback_and_restore(
     target_binary: &Path,
     rollback_binary: &Path,
@@ -1006,7 +1032,14 @@ fn rollback_and_restore(
     config_backup_dir: Option<&Path>,
     was_active: bool,
     managed_by: &InstallManagedBy,
-) {
+    safety: RollbackSafety,
+) -> RollbackDisposition {
+    // Starting a candidate can durably apply migrations before health fails.
+    // Restoring only the old binary cannot undo them. Without a read-only
+    // applied-history compatibility proof, preserve both binaries and data.
+    if safety == RollbackSafety::SchemaMayHaveAdvanced {
+        return RollbackDisposition::BlockedCompatibilityUnknown;
+    }
     restore_binary_and_config(
         target_binary,
         rollback_binary,
@@ -1014,6 +1047,7 @@ fn rollback_and_restore(
         config_backup_dir,
     );
     maybe_restore_service_after_rollback(target_binary, rollback_binary, was_active, managed_by);
+    RollbackDisposition::Attempted
 }
 
 fn restore_binary_and_config(
@@ -1985,6 +2019,33 @@ mod tests {
     use std::sync::{Mutex, OnceLock};
     use std::thread::{self, JoinHandle};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn schema_uncertainty_blocks_binary_only_rollback_before_any_restore() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("candidate");
+        let rollback = dir.path().join("old");
+        fs::write(&target, "candidate-with-new-schema").unwrap();
+        fs::write(&rollback, "older-binary").unwrap();
+        let outcome = super::rollback_and_restore(
+            &target,
+            &rollback,
+            None,
+            None,
+            true,
+            &pioneer_config::InstallManagedBy::Manual,
+            super::RollbackSafety::SchemaMayHaveAdvanced,
+        );
+        assert_eq!(
+            outcome,
+            super::RollbackDisposition::BlockedCompatibilityUnknown
+        );
+        assert_eq!(
+            fs::read_to_string(target).unwrap(),
+            "candidate-with-new-schema"
+        );
+        assert_eq!(fs::read_to_string(rollback).unwrap(), "older-binary");
+    }
 
     #[test]
     fn install_reports_preserve_transient_download_classification_after_output_failure() {
