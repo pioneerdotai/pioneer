@@ -522,7 +522,7 @@ mod tests {
         insta::assert_snapshot!(rendered, @r###"
 Initiating thread: initiating_thread_snapshot
 Execution thread: thr_snapshot (internal child)
-Checkpoint: schema_version=2, workspace_id=ws_snapshot, turn_id=turn_snapshot
+Checkpoint: schema_version=3, workspace_id=ws_snapshot, turn_id=turn_snapshot
 Original request preview: Create the proposal
 Original attachment kinds: local_file
 Completed window: index=2, agent_rounds=5, tool_calls=6, provider_tokens=unknown
