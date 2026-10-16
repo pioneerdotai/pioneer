@@ -217,8 +217,9 @@ async fn released_preview_history_keeps_pairing_for_next_native_cli_task_and_fro
         };
         permanent.push((service.ingest_bytes(request).await.unwrap(), bytes));
     }
-    // The upload is an actual input in the completed output history, not just
-    // an unrelated file that happens to survive storage cleanup.
+    // The upload is an initial input in the completed output history, not just
+    // an unrelated file that happens to survive storage cleanup. Revision zero
+    // keeps it current; a positive Message revision represents an input edit.
     f.store
         .replace_turn_input_projection_for_test(
             "turn",
@@ -226,7 +227,7 @@ async fn released_preview_history_keeps_pairing_for_next_native_cli_task_and_fro
                 artifact_id: permanent[0].0.artifact.artifact_id.clone(),
                 version_id: permanent[0].0.artifact.version_id.clone(),
             }],
-            1,
+            0,
             chrono::Utc::now().timestamp(),
         )
         .await
@@ -695,6 +696,17 @@ async fn released_preview_history_keeps_pairing_for_next_native_cli_task_and_fro
             )
             .await
             .is_err()
+    );
+    assert!(
+        super::super::frozen::validate_frozen_history_current(
+            &f.store,
+            "ws",
+            "parent",
+            &serde_json::to_string(&accepted.descriptor).unwrap(),
+        )
+        .await
+        .unwrap(),
+        "the diagnostic and ordinary attachment are exact-current before forwarding"
     );
     retain_as_task_basis(&f, "forward-archive", &accepted.descriptor).await;
     let forwarded = processor
