@@ -46088,10 +46088,12 @@ async fn codex_thread_ops_name_sync_failure_does_not_break_pioneer_rename() {
             .notified()
             .await;
         let request = json!({
-            "jsonrpc":"2.0", "id":"rename-publication-race", "method":"thread/update",
+            "jsonrpc":"2.0", "id":generate_test_request_id("rename", "publicationrace"), "method":"thread/update",
             "params":{"workspace_id":workspace_id, "thread_id":thread_id, "name":"Manual winner"}
         })
         .to_string();
+        serde_json::from_str::<pioneer_protocol::JsonRpcRequest>(&request)
+            .expect("publication race request must match the protocol");
         let mut rename =
             Box::pin(processor.process_request_for_connection(connection_id, &request));
         tokio::select! {
