@@ -751,6 +751,7 @@ mod tests {
 
         struct DirectoryTransport<'a> {
             before_response: &'a dyn Fn(),
+            running: bool,
         }
         impl crate::rpc::JsonRpcRequestTransport for DirectoryTransport<'_> {
             fn send_json_rpc_request(
@@ -768,7 +769,11 @@ mod tests {
                         "threads": [{"id":"existing","workspace_id":"ws","preview":"history",
                             "mode":"Chat","model":"model","model_provider":"provider",
                             "created_at":1,"updated_at":1,"status":"Idle","turns":[]}],
-                        "unread":[],"folders":[],"placements":[],"agents_docs":[]
+                        "running_task_thread_ids": if self.running { vec!["existing"] } else { vec![] },
+                        "unread":[],"folders":[
+                            {"id":"parent","workspace_id":"ws","name":"Parent","created_at":1,"updated_at":1},
+                            {"id":"child","workspace_id":"ws","parent_folder_id":"parent","name":"Child","created_at":1,"updated_at":1}
+                        ],"placements":[{"thread_id":"existing","workspace_id":"ws","folder_id":"child"}],"agents_docs":[]
                     })))
                     .unwrap();
                 Ok(())
@@ -779,12 +784,10 @@ mod tests {
             let core = Arc::new(ClientCore::new());
             let (sender, _receiver) = mpsc::sync_channel(1);
             core.workspace_controller.lock().unwrap().sender = Some(sender);
-            let _subscription = core.subscribe(
-                ClientScope::WorkspaceTree {
-                    workspace_id: Some("ws".into()),
-                },
-                NonZeroUsize::new(8).unwrap(),
-            );
+            let scope = ClientScope::WorkspaceTree {
+                workspace_id: Some("ws".into()),
+            };
+            let subscription = core.subscribe(scope.clone(), NonZeroUsize::new(8).unwrap());
             core.activate_thread(None, Some("ws"));
             let capabilities = crate::catalog_test_support::client()
                 .authorization_snapshot(None, None)
@@ -809,6 +812,7 @@ mod tests {
                 "ws",
                 &DirectoryTransport {
                     before_response: &before_response,
+                    running: true,
                 },
             );
             if during_request {
@@ -846,16 +850,64 @@ mod tests {
                     "ws",
                     &DirectoryTransport {
                         before_response: &|| {},
+                        running: true,
                     },
                 )
                 .unwrap();
             assert_eq!(loaded.snapshot().threads_by_id.len(), 1);
+            assert!(
+                loaded
+                    .snapshot()
+                    .running_task_thread_ids
+                    .contains("existing")
+            );
+            assert!(loaded.snapshot().running_task_folder_ids.contains("parent"));
+            assert!(
+                core.thread_snapshot("existing").is_none(),
+                "directory recovery needs no timeline"
+            );
             assert_eq!(core.navigation_snapshot().workspace_id(), Some("ws"));
             accept();
             assert!(
                 core.workspace_controller.lock().unwrap().refresh.is_empty(),
                 "equal capabilities must not cause a reload loop"
             );
+            assert!(core.observe_workspace_notification(
+                &pioneer_protocol::GatewayNotification::ThreadTreeChanged(
+                    pioneer_protocol::ThreadTreeChangedNotification {
+                        workspace_id: "ws".into()
+                    }
+                )
+            ));
+            assert_eq!(core.workspace_controller.lock().unwrap().refresh.len(), 1);
+            core.workspace_controller.lock().unwrap().refresh.clear();
+            core.workspace_demand_changed(&scope, crate::core::ClientDemand::Suspended);
+            let changed = pioneer_protocol::GatewayNotification::ThreadTreeChanged(
+                pioneer_protocol::ThreadTreeChangedNotification {
+                    workspace_id: "ws".into(),
+                },
+            );
+            core.observe_workspace_notification(&changed);
+            assert!(core.workspace_controller.lock().unwrap().refresh.is_empty());
+            core.workspace_demand_changed(&scope, crate::core::ClientDemand::Visible);
+            assert_eq!(core.workspace_controller.lock().unwrap().refresh.len(), 1);
+            let resumed = core
+                .refresh_workspace_tree_with_transport(
+                    "ws",
+                    &DirectoryTransport {
+                        before_response: &|| {},
+                        running: false,
+                    },
+                )
+                .unwrap();
+            assert!(resumed.snapshot().running_task_thread_ids.is_empty());
+            assert!(resumed.snapshot().running_task_folder_ids.is_empty());
+            core.workspace_controller.lock().unwrap().refresh.clear();
+            drop(subscription);
+            core.observe_workspace_notification(&changed);
+            assert!(core.workspace_controller.lock().unwrap().refresh.is_empty());
+            let _resubscribed = core.subscribe(scope, NonZeroUsize::new(8).unwrap());
+            assert_eq!(core.workspace_controller.lock().unwrap().refresh.len(), 1);
         }
     }
 

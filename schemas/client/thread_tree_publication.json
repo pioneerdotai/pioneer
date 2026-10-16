@@ -784,6 +784,23 @@
             "$ref": "#/$defs/ThreadPlacement"
           }
         },
+        "running_task_folder_ids": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "uniqueItems": true
+        },
+        "running_task_thread_ids": {
+          "description": "Authorized task activity, independent of conversation/selection state.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "uniqueItems": true
+        },
         "thread_ids_by_folder_id": {
           "type": "object",
           "additionalProperties": {

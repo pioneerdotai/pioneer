@@ -57511,6 +57511,7 @@ async fn turn_cancel_completed_turn_returns_completed_snapshot() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn thread_tree_returns_folders_and_placements_after_moves() {
+    use sea_orm::Statement;
     let (tx, mut rx) = mpsc::channel(32);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
@@ -57619,6 +57620,81 @@ async fn thread_tree_returns_folders_and_placements_after_moves() {
         }),
         "thread/tree should include placement into folder"
     );
+    assert!(tree.running_task_thread_ids.is_empty());
+    // The connection now stays only in the list: activity must arrive without
+    // any thread/timeline subscription, and a fresh tree must restore it.
+    processor
+        .thread_manager
+        .thread_unsubscribe(connection_id, thread_id)
+        .await;
+    let db = processor.crud_store.database_connection();
+    db.execute_raw(Statement::from_sql_and_values(
+        db.get_database_backend(),
+        "INSERT INTO task(id,workspace_id,owner_kind,owner_id,executor_kind,status,title,goal)
+         VALUES('tree-activity-task',?,'thread',?,'tool','waiting','Activity','fixture')",
+        vec![workspace_id.clone().into(), thread_id.into()],
+    ))
+    .await
+    .unwrap();
+    db.execute_unprepared("INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind)
+        VALUES('tree-activity-run','tree-activity-task','tree-activity-run',1,1,'queued','tool')").await.unwrap();
+    let (_, event) = processor
+        .crud_store
+        .claim_task_run_for_dispatch_with_event("tree-activity-run", now_timestamp_secs())
+        .await
+        .unwrap()
+        .unwrap();
+    processor.emit_task_event(event).await.unwrap();
+    let notification = recv_notification_by_method(&mut rx, events::THREAD_TREE_CHANGED).await;
+    assert_eq!(notification.params.unwrap()["workspace_id"], workspace_id);
+    processor
+        .process_request_for_connection(connection_id, &tree_request.to_string())
+        .await;
+    let response = recv_response_by_id(&mut rx, "ddddddddddddddddddddd").await;
+    let tree: ThreadTreeResponse = serde_json::from_value(response.result).unwrap();
+    assert_eq!(tree.running_task_thread_ids, vec![thread_id]);
+    let event = processor
+        .crud_store
+        .append_task_event(
+            TaskEventPayload::RunCancelled {
+                task_id: "tree-activity-task".into(),
+                run_id: "tree-activity-run".into(),
+                reason: None,
+                cancelled_at: now_timestamp_secs(),
+            },
+            now_timestamp_secs(),
+        )
+        .await
+        .unwrap();
+    processor.emit_task_event(event).await.unwrap();
+    recv_notification_by_method(&mut rx, events::THREAD_TREE_CHANGED).await;
+    processor
+        .process_request_for_connection(connection_id, &tree_request.to_string())
+        .await;
+    let response = recv_response_by_id(&mut rx, "ddddddddddddddddddddd").await;
+    let tree: ThreadTreeResponse = serde_json::from_value(response.result).unwrap();
+    assert!(tree.running_task_thread_ids.is_empty());
+    // A service run with no user-tree authorization root creates neither a
+    // row indicator nor an unrelated tree refresh/loading spinner.
+    while rx.try_recv().is_ok() {}
+    db.execute_raw(Statement::from_sql_and_values(
+        db.get_database_backend(),
+        "INSERT INTO task(id,workspace_id,owner_kind,executor_kind,status,title,goal)
+         VALUES('tree-service-task',?,'system','system','waiting','Service','fixture')",
+        [workspace_id.clone().into()],
+    ))
+    .await
+    .unwrap();
+    db.execute_unprepared("INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind)
+        VALUES('tree-service-run','tree-service-task','tree-service-run',1,1,'queued','system')").await.unwrap();
+    let (_, event) = processor
+        .crud_store
+        .claim_task_run_for_dispatch_with_event("tree-service-run", now_timestamp_secs())
+        .await
+        .unwrap()
+        .unwrap();
+    processor.emit_task_event(event).await.unwrap();
+    assert!(rx.try_recv().is_err());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

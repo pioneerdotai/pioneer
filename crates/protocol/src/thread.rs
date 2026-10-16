@@ -220,6 +220,9 @@ pub struct ThreadParticipantsChangedNotification {
 
 #[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
 pub struct ThreadTreeResponse {
+    /// Authorized visible threads with at least one Starting or Running TaskRun.
+    #[serde(default)]
+    pub running_task_thread_ids: Vec<String>,
     pub workspace_id: String,
     #[serde(default)]
     pub threads: Vec<Thread>,
@@ -719,8 +722,10 @@ mod tests {
         }))
         .expect("thread tree response should decode without agents_docs");
         assert!(decoded.agents_docs.is_empty());
+        assert!(decoded.running_task_thread_ids.is_empty());
 
         let encoded = serde_json::to_value(ThreadTreeResponse {
+            running_task_thread_ids: Vec::new(),
             workspace_id: "ws_123".to_owned(),
             threads: Vec::new(),
             unread: Vec::new(),

@@ -829,8 +829,8 @@ impl TaskScheduler {
             return Ok(false);
         };
         let claimed_at = now_timestamp_secs();
-        let Some(run) = store
-            .claim_task_run_for_dispatch(run.id.as_str(), claimed_at)
+        let Some((run, claimed_event)) = store
+            .claim_task_run_for_dispatch_with_event(run.id.as_str(), claimed_at)
             .await?
         else {
             debug!(
@@ -841,6 +841,7 @@ impl TaskScheduler {
             );
             return Ok(false);
         };
+        self.event_bus.publish(claimed_event).await;
         let worker_id = format!("task-worker-{}", generate_id(ID_LEN));
         let lease_until = claimed_at.saturating_add(TASK_EXECUTION_LEASE_SECONDS);
         let Some(execution) = store
