@@ -82751,6 +82751,7 @@ async fn opencode_v2_summary_totals_and_native_categories_reach_completion_and_j
             .await
             .unwrap();
         assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, "completed");
         let retained: pioneer_provider::TokenUsage =
             serde_json::from_str(&rows[0].usage_json).unwrap();
         assert_eq!(retained.input_tokens, completion.input_tokens);
@@ -82772,18 +82773,40 @@ async fn opencode_v2_summary_totals_and_native_categories_reach_completion_and_j
         crate::compaction::apply_cli_usage(&mut observed, &raw);
         assert_eq!(observed.input_tokens, input);
         assert_eq!(observed.output_tokens, output);
-        // A failed native terminal retains its observed categories too.
+        // A failed attempt owns a separate journal entry. Terminal outcomes
+        // cannot change from completed to failed on the same call.
+        let failed_owner = format!("opencode-summary-usage-failed-{index}");
+        let mut failed_observed = pioneer_provider::TokenUsage {
+            provider: Some("opencode-cli".into()),
+            ..Default::default()
+        };
+        let failed_call = crate::usage_journal::Call::start(
+            store.as_ref(),
+            &workspace,
+            "summary",
+            &failed_owner,
+            &failed_observed,
+        )
+        .await
+        .unwrap();
         let mut failed = history.clone();
         failed[messages.as_array().unwrap().len() + 1]["outcome"] = serde_json::json!("failed");
         let error = opencode_summary_result(&selected, &failed, "msg_summary").unwrap_err();
         if let Some(usage) =
             error.downcast_ref::<pioneer_cli_agent_runtime::service::ObservedServiceUsage>()
         {
-            crate::compaction::apply_cli_usage(&mut observed, &usage.0);
+            crate::compaction::apply_cli_usage(&mut failed_observed, &usage.0);
         }
-        call.record("failed", &observed).await.unwrap();
+        failed_call
+            .record("failed", &failed_observed)
+            .await
+            .unwrap();
+        failed_call
+            .record("failed", &failed_observed)
+            .await
+            .unwrap();
         let rows = store
-            .provider_usage_page(&workspace, &owner, "", 100)
+            .provider_usage_page(&workspace, &failed_owner, "", 100)
             .await
             .unwrap();
         assert_eq!(rows.len(), 1);
@@ -82792,5 +82815,15 @@ async fn opencode_v2_summary_totals_and_native_categories_reach_completion_and_j
             serde_json::from_str(&rows[0].usage_json).unwrap();
         assert_eq!(failed.input_tokens, input);
         assert_eq!(failed.output_tokens, output);
+        assert_eq!(failed.uncached_input_tokens, uncached);
+        assert_eq!(failed.reasoning_tokens, reasoning);
+        assert_eq!(
+            failed.cache_read_input_tokens,
+            retained.cache_read_input_tokens
+        );
+        assert_eq!(
+            failed.cache_write_input_tokens,
+            retained.cache_write_input_tokens
+        );
     }
 }
