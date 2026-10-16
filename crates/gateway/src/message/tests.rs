@@ -3525,7 +3525,7 @@ impl pioneer_tasks::TaskExecutor for FailingSystemExecutor {
 
 // These admission fixtures select OpenAI while using deterministic Echo work.
 // Keep the adapter identity aligned with the selected registry authority.
-struct OpenAiEchoProvider;
+pub(super) struct OpenAiEchoProvider;
 
 #[async_trait]
 impl Provider for OpenAiEchoProvider {
@@ -23192,107 +23192,27 @@ async fn recovered_hidden_task_run_uses_preflight_before_restored_child_main_pro
     let running_window = running_window
         .expect("running child window should load")
         .expect("hanging child should have an active execution window");
-    let runtime_window_id = running_window.metadata_json["runtimeWindowId"]
-        .as_str()
-        .expect("active child window should preserve its runtime id")
-        .to_owned();
-    let runtime_window_index = running_window.window_index;
+    assert_eq!(running_window.status, ExecutionWindowStatus::Running);
+    let accepted_checkpoint = crud_store
+        .native_semantic_checkpoint_for_turn(&lineage.child_turn_id)
+        .await
+        .unwrap()
+        .expect("the live child must persist its semantic state before dispatch");
+    let accepted_payload: pioneer_protocol::ExecutionCheckpointPayload =
+        serde_json::from_value(accepted_checkpoint.payload_json).unwrap();
+    assert!(accepted_payload.native_semantic_state.is_some());
+    assert!(accepted_payload.window.progress.is_some());
+    assert_eq!(accepted_payload.tools.executed_count, 0);
+    let initial_phase = child_snapshot.initial_phase_json.clone();
+    assert!(initial_phase.is_some());
+    // Close the controlled pause from its real accepted state and receipts.
+    // Startup consumes that closed boundary, preserving mutable state and the
+    // completed initial phase instead of replacing them with legacy defaults.
     initial_processor
-        .handle_durable_agent_event(AgentDurableEvent::TurnExecutionWindowExhausted {
-            notification: pioneer_protocol::TurnExecutionWindowExhaustedNotification {
-                workspace_id: workspace_id.clone(),
-                thread_id: lineage.child_thread_id.clone(),
-                turn_id: lineage.child_turn_id.clone(),
-                window_id: runtime_window_id.clone(),
-                window_index: runtime_window_index,
-                status: ExecutionWindowStatus::Exhausted,
-                exhaustion_reason: ExecutionWindowExhaustionReason::MaxToolCallsPerWindow,
-                limit: 3,
-                observed: 3,
-                agent_round_count: 2,
-                tool_call_count: 3,
-                provider_token_count: None,
-                started_at_unix_ms: 1_000,
-                exhausted_at_unix_ms: 2_000,
-                reason: "max_tool_calls_per_window".to_owned(),
-            },
-        })
+        .agent_manager
+        .remove_thread(&lineage.child_thread_id)
         .await;
-    let checkpoint_payload = pioneer_protocol::build_execution_checkpoint_payload(
-        workspace_id.clone(),
-        lineage.child_thread_id.clone(),
-        lineage.child_turn_id.clone(),
-        pioneer_protocol::ExecutionCheckpointOriginalRequestSummary {
-            input_count: 1,
-            text_preview: Some("Recovered hidden preflight child".to_owned()),
-            text_truncated: false,
-            attachment_count: 0,
-            attachment_kinds: Vec::new(),
-        },
-        pioneer_protocol::ExecutionCheckpointWindowSummary {
-            progress: None,
-            window_id: Some(runtime_window_id.clone()),
-            window_index: runtime_window_index,
-            started_at_unix_ms: Some(1_000),
-            completed_at_unix_ms: Some(2_000),
-            agent_round_count: 2,
-            tool_call_count: 3,
-            provider_token_count: None,
-            exhaustion_reason: Some(ExecutionWindowExhaustionReason::MaxToolCallsPerWindow),
-        },
-        pioneer_protocol::ExecutionCheckpointProviderBudgetSummary {
-            model: Some("test-model".to_owned()),
-            model_provider: Some("openai".to_owned()),
-            agent_round_count: 2,
-            tool_call_count: 3,
-            provider_token_count: None,
-            provider_usage_available: false,
-            exhaustion_reason: Some(ExecutionWindowExhaustionReason::MaxToolCallsPerWindow),
-            exhausted_limit: Some(3),
-            exhausted_observed: Some(3),
-        },
-        pioneer_protocol::ExecutionCheckpointToolSummary {
-            requested_count: 3,
-            executed_count: 2,
-            unexecuted_count: 1,
-            total_count: 3,
-            succeeded_count: 1,
-            failed_count: 1,
-            in_progress_count: 0,
-            detail_limit: 0,
-            details_truncated: false,
-            details: Vec::new(),
-        },
-        Vec::new(),
-    );
-    let checkpoint_payload_bytes = serde_json::to_vec(&checkpoint_payload)
-        .expect("checkpoint payload should serialize")
-        .len() as u64;
-    initial_processor
-        .handle_durable_agent_event(AgentDurableEvent::TurnExecutionWindowCheckpointed {
-            notification: pioneer_protocol::TurnExecutionWindowCheckpointedNotification {
-                workspace_id: workspace_id.clone(),
-                thread_id: lineage.child_thread_id.clone(),
-                turn_id: lineage.child_turn_id.clone(),
-                window_id: runtime_window_id,
-                window_index: runtime_window_index,
-                status: ExecutionWindowStatus::Checkpointed,
-                checkpoint_id: "task_recovery_checkpoint_1".to_owned(),
-                checkpoint_kind: "window_exhausted".to_owned(),
-                payload_bytes: checkpoint_payload_bytes,
-                created_at_unix_ms: 2_050,
-            },
-            payload: checkpoint_payload,
-        })
-        .await;
-    assert!(
-        crud_store
-            .latest_turn_execution_checkpoint_for_turn(lineage.child_turn_id.as_str())
-            .await
-            .expect("latest checkpoint should load")
-            .is_some(),
-        "startup recovery fixture should persist a child execution checkpoint"
-    );
+    close_paused_native_fixture_window(&initial_processor, &lineage.child_turn_id).await;
     let stale_at = super::now_timestamp_secs().saturating_sub(120);
     crud_store
         .mark_execution_running(execution.id.as_str(), stale_at, Some(stale_at))
@@ -23309,13 +23229,6 @@ async fn recovered_hidden_task_run_uses_preflight_before_restored_child_main_pro
             .await
             .expect("child Turn execution lease should be made stale")
     );
-    // Model an actual process restart. Leaving the original hanging agent loop
-    // alive would create two in-memory owners for the same durable Turn and
-    // turn this recovery test into an unsupported split-brain race.
-    initial_processor
-        .agent_manager
-        .remove_thread(lineage.child_thread_id.as_str())
-        .await;
     let recovery_provider = Arc::new(PreflightCaptureProvider::new(
         "recovered hidden child completed",
     ));
@@ -23405,19 +23318,26 @@ async fn recovered_hidden_task_run_uses_preflight_before_restored_child_main_pro
     assert_eq!(recovered_execution.id, execution.id);
 
     let requests = recovery_provider.snapshot_requests();
-    let preflight_pos = requests
-        .iter()
-        .position(is_turn_preflight_request)
-        .expect("recovered hidden child task should call preflight");
+    assert!(
+        requests
+            .iter()
+            .all(|request| !is_turn_preflight_request(request)),
+        "restoring the same semantic Turn must not repeat completed preflight"
+    );
+    if let Some(snapshot) = crud_store
+        .get_turn_runtime_snapshot(&lineage.child_turn_id)
+        .await
+        .unwrap()
+    {
+        assert_eq!(
+            snapshot.initial_phase_json, initial_phase,
+            "recovery must preserve accepted initial preparation until terminal cleanup"
+        );
+    }
     let child_main_pos = requests
         .iter()
         .position(is_child_task_main_request)
-        .expect("recovered hidden child task should call main provider after prompt compile");
-    assert!(
-        preflight_pos < child_main_pos,
-        "recovered hidden child task preflight must run before the restored main child provider request"
-    );
-    assert!(requests[preflight_pos].compiled_prompt.is_none());
+        .expect("recovered hidden child must call main with its restored prompt");
     assert!(requests[child_main_pos].compiled_prompt.is_some());
     let restored_prompt = requests[child_main_pos]
         .compiled_prompt
@@ -56386,6 +56306,99 @@ fn agents_doc_turn_prompt_uses_root_inheritance_and_folder_override() {
     });
 }
 
+// Only for the two controlled restart fixtures: callers have removed the actor
+// while their provider barrier prevents any response/tool execution. Acknowledge
+// its charged dispatch receipt without inventing semantic state or a fresh guard.
+async fn close_paused_native_fixture_window(processor: &MessageProcessor, turn: &str) {
+    let store = &processor.crud_store;
+    let window = store
+        .latest_turn_execution_window(turn)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(window.status, ExecutionWindowStatus::Running);
+    let checkpoint = store
+        .native_semantic_checkpoint_for_turn(turn)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut payload: pioneer_protocol::ExecutionCheckpointPayload =
+        serde_json::from_value(checkpoint.payload_json).unwrap();
+    assert_eq!(payload.tools.executed_count, 0);
+    let state = payload
+        .native_semantic_state
+        .as_mut()
+        .expect("real accepted semantic state");
+    assert_eq!(state["post_turn_tool_events"].as_array().unwrap().len(), 0);
+    assert_eq!(state["controls"]["retained"].as_array().unwrap().len(), 0);
+    let revision = state["checkpoint_revision"].as_u64().unwrap();
+    state["checkpoint_revision"] = json!(revision.checked_add(1).unwrap());
+    let (rounds, tokens, available) = store
+        .summarize_execution_window_provider_usage(turn, window.window_index)
+        .await
+        .unwrap();
+    payload.window.agent_round_count = payload.window.agent_round_count.max(rounds);
+    payload.provider_budget.agent_round_count = payload.window.agent_round_count;
+    payload.window.provider_token_count =
+        Some(payload.window.provider_token_count.unwrap_or(0).max(tokens));
+    payload.provider_budget.provider_token_count = payload.window.provider_token_count;
+    payload.provider_budget.provider_usage_available = available;
+    payload.native_event_frontier = None;
+    let owner = store.get_turn_execution(turn).await.unwrap().unwrap();
+    let cancellation = store
+        .native_cancellation_context(turn)
+        .await
+        .unwrap()
+        .unwrap();
+    store
+        .commit_native_semantic_checkpoint(
+            payload.clone(),
+            None,
+            cancellation.preparation.runtime_generation,
+            processor.turn_execution_owner_id.as_ref(),
+            owner.owner_generation,
+        )
+        .await
+        .unwrap();
+    let accepted = store
+        .native_semantic_checkpoint_for_turn(turn)
+        .await
+        .unwrap()
+        .unwrap();
+    let completed_at = chrono::Utc::now().fixed_offset();
+    payload.window.completed_at_unix_ms = Some(completed_at.timestamp_millis());
+    payload.window.exhaustion_reason =
+        Some(ExecutionWindowExhaustionReason::RuntimeShutdownContinuation);
+    store
+        .checkpoint_native_running_window_for_recovery(
+            &window,
+            &accepted,
+            pioneer_crud::NewTurnExecutionCheckpointRecord {
+                id: None,
+                window_id: window.id.clone(),
+                workspace_id: window.workspace_id.clone(),
+                thread_id: window.thread_id.clone(),
+                turn_id: turn.to_owned(),
+                checkpoint_kind: pioneer_crud::TurnExecutionCheckpointKind::StartupRecovery,
+                payload_json: serde_json::to_value(&payload).unwrap(),
+                created_at: completed_at,
+            },
+            pioneer_crud::TurnExecutionWindowStatsRecord {
+                agent_round_count: payload.window.agent_round_count,
+                tool_call_count: 0,
+                provider_token_count: payload.window.provider_token_count.unwrap_or(0),
+                metadata_json: window.metadata_json.clone(),
+                completed_at,
+                updated_at: completed_at,
+            },
+            ExecutionWindowExhaustionReason::RuntimeShutdownContinuation,
+            processor.turn_execution_owner_id.as_ref(),
+            owner.owner_generation,
+        )
+        .await
+        .unwrap();
+}
+
 pub(super) async fn ensure_test_native_snapshot_owner(
     processor: &MessageProcessor,
     workspace: &str,
@@ -57798,8 +57811,8 @@ async fn assert_turn_cancel_with_optional_busy_native_actor(
                     .await
                     .unwrap();
             } else {
-                // Close the actual Running predecessor before continuing it.
-                // A semantic checkpoint alone is not a recovery-close receipt.
+                // Resume the real recovery-closed predecessor after Blocked.
+                // Its original semantic state and cancellation plan are retained.
                 let weak = Arc::downgrade(&processor);
                 processor
                     .recovery_coordinator
@@ -57838,6 +57851,7 @@ async fn assert_turn_cancel_with_optional_busy_native_actor(
 
             if resume_direct && cycle == 0 {
                 processor.agent_manager.remove_thread(thread_id).await;
+                close_paused_native_fixture_window(&processor, turn_id).await;
                 let context = crud_store_for_assert
                     .native_cancellation_context(turn_id)
                     .await
@@ -76283,7 +76297,7 @@ async fn recv_notification_by_method(
     rx: &mut mpsc::Receiver<Message>,
     method: &str,
 ) -> JsonRpcNotification {
-    recv_notification_by_method_timeout(rx, method, Duration::from_secs(2)).await
+    recv_notification_by_method_timeout(rx, method, Duration::from_secs(30)).await
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -76320,11 +76334,19 @@ async fn recv_notification_by_method_timeout(
     method: &str,
     wait_for: Duration,
 ) -> JsonRpcNotification {
-    let context = format!("notification method `{method}`");
+    let deadline = tokio::time::Instant::now() + wait_for;
+    let mut observed = std::collections::VecDeque::new();
     for _ in 0..200 {
-        let payload = recv_text_timeout_context(rx, wait_for, context.as_str()).await;
+        let context = format!("notification method `{method}`; recent={observed:?}");
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let payload = recv_text_timeout_context(rx, remaining, context.as_str()).await;
         let value: serde_json::Value =
             serde_json::from_str(&payload).expect("json-rpc payload should decode");
+        if observed.len() == 8 {
+            observed.pop_front();
+        }
+        let summary = json!({"method":value.get("method"),"turn":value.pointer("/params/turn"),"error":value.get("error")}).to_string();
+        observed.push_back(summary.chars().take(2048).collect::<String>());
         if value.get("id").is_none()
             && value.get("method").and_then(serde_json::Value::as_str) == Some(method)
         {

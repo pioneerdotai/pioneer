@@ -4727,7 +4727,7 @@ impl MessageProcessor {
         ));
         let provider_registry = Arc::new(ProviderRegistry::with_provider(
             "openai",
-            Arc::new(pioneer_provider::providers::EchoProvider::new()),
+            Arc::new(tests::OpenAiEchoProvider),
         ));
         let now_snapshot = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
         {
