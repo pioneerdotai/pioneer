@@ -5836,15 +5836,7 @@ mod tests {
             route: None,
         };
         if let TimelineBlockKind::UserMessage { author, .. } = &mut page.blocks[1].kind {
-            *author = Some(TurnAuthorSnapshot {
-                actor: PersistedActorRef::AgentExecution(
-                    AgentExecutionId::new("E".repeat(21)).unwrap(),
-                ),
-                display_name: "Agent".into(),
-                nickname: "agent".into(),
-                avatar_revision: None,
-                agent: None,
-            });
+            *author = composer_occurrence().author;
         }
         core.apply_thread_timeline_page(
             page,
