@@ -3616,6 +3616,7 @@ struct MemoryAgentE2eProvider {
 }
 
 struct DelayedProvider {
+    name: &'static str,
     delay: Duration,
     text: String,
 }
@@ -3727,6 +3728,7 @@ impl pioneer_sqlite::SqliteWriteObserver for NativeSchedulingObserver {
 }
 
 struct PreflightCaptureProvider {
+    name: &'static str,
     text: String,
     requests: std::sync::Mutex<Vec<ChatRequest>>,
 }
@@ -3784,7 +3786,7 @@ impl Provider for DelayedProvider {
     }
 
     fn name(&self) -> &str {
-        "delayed"
+        self.name
     }
 
     fn capabilities(&self) -> ProviderCapabilities {
@@ -3837,7 +3839,7 @@ impl Provider for RevisionProvider {
     }
 
     fn name(&self) -> &str {
-        "revision"
+        "openai"
     }
 
     fn capabilities(&self) -> ProviderCapabilities {
@@ -3921,7 +3923,7 @@ impl Provider for RevisionHangingProvider {
     }
 
     fn name(&self) -> &str {
-        "revision-hanging"
+        "openai"
     }
 
     fn capabilities(&self) -> ProviderCapabilities {
@@ -4022,7 +4024,7 @@ impl Provider for CountingDelayedProvider {
     }
 
     fn name(&self) -> &str {
-        "counting-delayed"
+        "openai"
     }
 
     fn capabilities(&self) -> ProviderCapabilities {
@@ -4081,7 +4083,7 @@ impl CountingDelayedProvider {
 impl CaptureSummaryProvider {
     fn new(text: impl Into<String>) -> Self {
         Self {
-            name: "capture-summary".into(),
+            name: "openai".into(),
             pause_first: std::sync::atomic::AtomicBool::new(false),
             first_delay_ms: std::sync::atomic::AtomicUsize::new(0),
             release_first: Notify::new(),
@@ -4141,9 +4143,15 @@ impl CaptureSummaryProvider {
 impl PreflightCaptureProvider {
     fn new(text: impl Into<String>) -> Self {
         Self {
+            name: "openai",
             text: text.into(),
             requests: std::sync::Mutex::new(Vec::new()),
         }
+    }
+
+    fn named(mut self, name: &'static str) -> Self {
+        self.name = name;
+        self
     }
 
     fn snapshot_requests(&self) -> Vec<ChatRequest> {
@@ -4373,7 +4381,7 @@ impl Provider for PreflightCaptureProvider {
     }
 
     fn name(&self) -> &str {
-        "preflight-capture"
+        self.name
     }
 
     fn capabilities(&self) -> ProviderCapabilities {
@@ -4525,7 +4533,7 @@ impl Provider for HangingChildProvider {
     }
 
     fn name(&self) -> &str {
-        "hanging-child"
+        "openai"
     }
 
     fn capabilities(&self) -> ProviderCapabilities {
@@ -4579,7 +4587,7 @@ impl Provider for ConcurrentComposerHistoryProvider {
     }
 
     fn name(&self) -> &str {
-        "concurrent-composer-history"
+        "openai"
     }
 
     fn capabilities(&self) -> ProviderCapabilities {
@@ -4655,7 +4663,7 @@ impl Provider for FlakyTitleProvider {
     }
 
     fn name(&self) -> &str {
-        "flaky-title"
+        "openai"
     }
 
     fn capabilities(&self) -> ProviderCapabilities {
@@ -4726,7 +4734,7 @@ impl Provider for GuardAwareProvider {
     }
 
     fn name(&self) -> &str {
-        "guard-aware"
+        "parent"
     }
 
     fn capabilities(&self) -> ProviderCapabilities {
@@ -4873,7 +4881,7 @@ impl Provider for CreateThenHangProvider {
     }
 
     fn name(&self) -> &str {
-        "create-then-hang"
+        "parent"
     }
 
     fn capabilities(&self) -> ProviderCapabilities {
@@ -20781,6 +20789,7 @@ fn review_enabled_child_completion_creates_pending_candidate_without_finalizing_
 
 async fn review_enabled_child_completion_creates_pending_candidate_without_finalizing_run_impl() {
     let provider = Arc::new(DelayedProvider {
+        name: "openai",
         delay: Duration::from_millis(0),
         text: r#"<task_result>{"summary":"ready for parent review","data":{"answer":"ok"}}</task_result>"#
             .to_owned(),
@@ -21173,6 +21182,7 @@ async fn task_accept_rpc_finalizes_review_candidate_and_queues_delivery_impl(
     inject_queue_failure: bool,
 ) {
     let provider = Arc::new(DelayedProvider {
+        name: "openai",
         delay: Duration::from_millis(0),
         text: r#"<task_result>{"summary":"ready for user approval","data":{"answer":"ok"}}</task_result>"#
             .to_owned(),
@@ -21923,6 +21933,7 @@ async fn task_revise_dispatch_failure_blocks_revision_turn_and_run_impl() {
     let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
         "openai",
         Arc::new(DelayedProvider {
+            name: "openai",
             delay: Duration::from_millis(0),
             text: r#"<task_result>{"summary":"needs revision","data":{"ok":false}}</task_result>"#
                 .to_owned(),
@@ -22201,6 +22212,7 @@ fn review_enabled_invalid_result_creates_extraction_failed_candidate() {
 
 async fn review_enabled_invalid_result_creates_extraction_failed_candidate_impl() {
     let provider = Arc::new(DelayedProvider {
+        name: "openai",
         delay: Duration::from_millis(0),
         text: "plain text that does not satisfy required json".to_owned(),
     });
@@ -22307,6 +22319,7 @@ fn waiting_review_cancel_cancels_candidate_locks_and_no_delivery() {
 
 async fn waiting_review_cancel_cancels_candidate_locks_and_no_delivery_impl() {
     let provider = Arc::new(DelayedProvider {
+        name: "openai",
         delay: Duration::from_millis(0),
         text: r#"<task_result>{"summary":"cancel me","data":{"answer":"ok"}}</task_result>"#
             .to_owned(),
@@ -22472,6 +22485,7 @@ fn parent_cancel_attached_subtree_cancels_waiting_review_candidate() {
 
 async fn parent_cancel_attached_subtree_cancels_waiting_review_candidate_body() {
     let provider = Arc::new(DelayedProvider {
+        name: "openai",
         delay: Duration::from_millis(0),
         text: r#"<task_result>{"summary":"child waits for review"}</task_result>"#.to_owned(),
     });
@@ -22581,6 +22595,7 @@ fn waiting_review_detach_is_blocked_and_candidate_stays_active() {
 
 async fn waiting_review_detach_is_blocked_and_candidate_stays_active_impl() {
     let provider = Arc::new(DelayedProvider {
+        name: "openai",
         delay: Duration::from_millis(0),
         text: r#"<task_result>{"summary":"do not detach yet"}</task_result>"#.to_owned(),
     });
@@ -35422,6 +35437,7 @@ async fn task_detach_updates_lifecycle_policy_impl() {
     let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
         "openai",
         Arc::new(DelayedProvider {
+            name: "openai",
             delay: Duration::from_secs(10),
             text: "delayed result".to_owned(),
         }),
@@ -37193,6 +37209,7 @@ fn task_parent_turn_guard_forces_wait_cancel_or_detach_before_completion() {
             .insert(
                 "delayed",
                 Arc::new(DelayedProvider {
+                    name: "delayed",
                     delay: Duration::from_secs(10),
                     text: "slow child".to_owned(),
                 }),
@@ -37551,6 +37568,7 @@ async fn parent_turn_cancel_cancels_attached_child_tasks_through_service_impl() 
         .insert(
             "delayed",
             Arc::new(DelayedProvider {
+                name: "delayed",
                 delay: Duration::from_secs(10),
                 text: "slow child".to_owned(),
             }),
@@ -47330,6 +47348,7 @@ async fn cli_runtime_turn_start_blocker_rejects_active_cli_binding() {
     let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
         "openai",
         Arc::new(DelayedProvider {
+            name: "openai",
             delay: Duration::from_secs(30),
             text: "late".to_owned(),
         }),
@@ -47658,6 +47677,7 @@ async fn cli_runtime_stale_silent_running_binding_schedules_recovery_impl() {
     let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
         "openai",
         Arc::new(DelayedProvider {
+            name: "openai",
             delay: Duration::from_secs(30),
             text: "late".to_owned(),
         }),
@@ -47974,6 +47994,7 @@ fn cli_runtime_reconciliation_preserves_active_turn_and_repairs_missed_terminal_
         let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
             "openai",
             Arc::new(DelayedProvider {
+                name: "openai",
                 delay: Duration::from_secs(30),
                 text: "late".to_owned(),
             }),
@@ -48827,6 +48848,7 @@ async fn codex_goal_segments_share_one_pioneer_turn_and_fence_subagents_impl() {
     let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
         "openai",
         Arc::new(DelayedProvider {
+            name: "openai",
             delay: Duration::from_secs(30),
             text: "late".to_owned(),
         }),
@@ -49200,6 +49222,7 @@ async fn turn_cancel_clears_codex_goal_and_interrupts_latest_execution_segment()
     let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
         "delayed",
         Arc::new(DelayedProvider {
+            name: "delayed",
             delay: Duration::from_secs(30),
             text: "late".to_owned(),
         }),
@@ -55965,7 +55988,7 @@ fn agents_doc_turn_without_doc_omits_agents_md_prompt_section() {
             register_authenticated_test_connection(session_manager.as_ref(), tx).await;
         let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
         let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
-        let capture_provider = Arc::new(CaptureSummaryProvider::new("ok"));
+        let capture_provider = Arc::new(CaptureSummaryProvider::new("ok").named("capture-summary"));
         let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
             "capture-summary",
             capture_provider.clone(),
@@ -56055,7 +56078,7 @@ fn agents_doc_turn_prompt_uses_root_inheritance_and_folder_override() {
             register_authenticated_test_connection(session_manager.as_ref(), tx).await;
         let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
         let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
-        let capture_provider = Arc::new(CaptureSummaryProvider::new("ok"));
+        let capture_provider = Arc::new(CaptureSummaryProvider::new("ok").named("capture-summary"));
         let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
             "capture-summary",
             capture_provider.clone(),
@@ -56949,7 +56972,9 @@ fn phase_11_prompt_manifest_hook_sources_roundtrip_existing_event() {
         // Preflight runs before manifest compilation and window registration.
         // Let it finish through its own provider so the barrier gates only the
         // main response, after the actor's durable startup events have ACKed.
-        let preflight_provider = Arc::new(PreflightCaptureProvider::new("unexpected main request"));
+        let preflight_provider = Arc::new(
+            PreflightCaptureProvider::new("unexpected main request").named("preflight-capture"),
+        );
         provider_registry
             .insert("preflight-capture", preflight_provider.clone())
             .expect("preflight provider should fit the bounded test registry");
@@ -57456,6 +57481,7 @@ async fn assert_turn_cancel_with_optional_busy_native_actor(
         })
     } else {
         Arc::new(DelayedProvider {
+            name: "delayed",
             delay: Duration::from_secs(30),
             text: "too late".to_owned(),
         })
@@ -58139,6 +58165,7 @@ async fn turn_cancel_cli_runtime_without_active_session_does_not_start_runtime()
     let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
         "delayed",
         Arc::new(DelayedProvider {
+            name: "delayed",
             delay: Duration::from_secs(30),
             text: "too late".to_owned(),
         }),
@@ -63727,6 +63754,7 @@ async fn cli_runtime_request_respond_rejects_pending_for_blocked_turn_without_na
     let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
         "openai",
         Arc::new(DelayedProvider {
+            name: "openai",
             delay: Duration::from_secs(30),
             text: "late".to_owned(),
         }),
@@ -83495,6 +83523,7 @@ fn native_cancellation_race_fallback_preserves_materialization_error_and_require
                 })
             } else {
                 Arc::new(DelayedProvider {
+                    name: "delayed",
                     delay: Duration::from_secs(30),
                     text: "too late".to_owned(),
                 })
