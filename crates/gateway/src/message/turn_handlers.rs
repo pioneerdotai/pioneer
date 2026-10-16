@@ -72,6 +72,17 @@ impl TurnStartFailure {
         self
     }
 
+    fn with_task_reason(mut self, reason: pioneer_tasks::TaskStartReason) -> Self {
+        let failure = self.task_failure.take().unwrap_or_else(|| {
+            pioneer_tasks::TaskStartFailure::new(
+                pioneer_tasks::TaskStartStage::CliAdmission,
+                pioneer_tasks::TaskStartCause::Unclassified,
+            )
+        });
+        self.task_failure = Some(failure.with_reason(reason));
+        self
+    }
+
     pub(super) fn internal_typed(
         stage: pioneer_tasks::TaskStartStage,
         error: anyhow::Error,
@@ -3779,6 +3790,7 @@ impl MessageProcessor {
                         TurnStartFailure::internal(format!(
                             "CLI runtime `{runtime_id}` is absent from the readiness snapshot"
                         ))
+                        .with_task_reason(pioneer_tasks::TaskStartReason::ReadinessSnapshotMissing)
                     })?
             };
             let readiness_summary = readiness_snapshot.summary;
@@ -3796,7 +3808,8 @@ impl MessageProcessor {
                 return Err(TurnStartFailure::invalid_input(format!(
                     "CLI runtime `{runtime_id}` is not ready: {}",
                     cli_runtime_unavailable_reason(&readiness_summary.status)
-                )));
+                ))
+                .with_task_reason(pioneer_tasks::TaskStartReason::RuntimeNotReady));
             }
 
             let (max_tools, max_total_schema_bytes) = self.mcp_service.projection_limit_values();
@@ -3822,11 +3835,17 @@ impl MessageProcessor {
             )
             .await
             {
-                Ok(projection) => Some(
-                    projection
-                        .with_html_tools(projection_limits)
-                        .map_err(|error| TurnStartFailure::internal(error.to_string()))?,
-                ),
+                Ok(projection) => Some(projection.with_html_tools(projection_limits).map_err(
+                    |error| {
+                        TurnStartFailure::internal_typed(
+                            pioneer_tasks::TaskStartStage::CliAdmission,
+                            error.into(),
+                        )
+                        .with_task_reason(
+                            pioneer_tasks::TaskStartReason::CapabilityProjectionInvalid,
+                        )
+                    },
+                )?),
                 Err(error) => {
                     let code = match error.reason {
                         pioneer_agent::AgentMcpMaterializationFailureReason::ExplicitCapabilityRejected => {
@@ -11739,6 +11758,27 @@ fn cli_runtime_unavailable_reason(status: &RuntimeStatus) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn task_admission_reason_survives_public_projection_without_raw_diagnostic() {
+        let failure = TurnStartFailure::invalid_input("PRIVATE runtime routing payload")
+            .with_task_reason(pioneer_tasks::TaskStartReason::RuntimeNotReady);
+        let ((public, failure), events) =
+            crate::public_error::test_support::capture_events(|| failure.into_task_failure());
+        assert_eq!(
+            failure.descriptor().reason,
+            Some(pioneer_tasks::TaskStartReason::RuntimeNotReady)
+        );
+        assert_eq!(
+            failure.descriptor().cause,
+            pioneer_tasks::TaskStartCause::Unclassified
+        );
+        let encoded = serde_json::to_string(&failure.descriptor().task_error(None)).unwrap();
+        assert!(encoded.contains("runtime_not_ready"));
+        assert!(encoded.contains(&public.correlation_id));
+        assert!(!encoded.contains("PRIVATE"));
+        assert!(!serde_json::to_string(&events).unwrap().contains("PRIVATE"));
+    }
 
     #[test]
     fn task_expected_causes_are_explicit_and_public_admission_does_not_imply_policy() {
