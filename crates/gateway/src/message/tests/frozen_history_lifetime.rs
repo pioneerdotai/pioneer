@@ -1198,6 +1198,11 @@ async fn child_continuation_uses_saved_branch_second_after_expiry_and_runtime_re
             &HashMap::new(),
             &[],
             &[],
+            &pioneer_skills::SkillCatalogSnapshot {
+                version: 0,
+                generated_at_unix: 0,
+                skills: Vec::new(),
+            },
         )
         .unwrap();
         candidate.history_json = serde_json::to_string(&prepared.descriptor).unwrap();
