@@ -43186,12 +43186,13 @@ async fn thread_read_rpc_is_monotonic_and_converges_all_principal_sessions() {
         )
         .await
         .unwrap();
+    let streaming_request_id = generate_test_request_id("readreply", "stream");
     let streaming = request_thread_timeline_page_for_test(
         &processor,
         primary_connection_id,
         &mut primary_rx,
         THREAD_ID,
-        "readreplystream00001",
+        &streaming_request_id,
     )
     .await;
     assert!(streaming.blocks.iter().any(|block| matches!(&block.kind, pioneer_protocol::TimelineBlockKind::AssistantMessage { status: pioneer_protocol::TurnWorkItemStatus::Running, item_id, .. } if item_id == answer.item_id())), "canonical lifecycle status must survive Gateway batching");
@@ -43230,12 +43231,13 @@ async fn thread_read_rpc_is_monotonic_and_converges_all_principal_sessions() {
         Some(&1)
     );
     let block_id = pioneer_crud::assistant_block_id(FIRST_TURN_ID, answer.item_id());
+    let canonical_request_id = generate_test_request_id("readreply", "final");
     let canonical = request_thread_timeline_page_for_test(
         &processor,
         primary_connection_id,
         &mut primary_rx,
         THREAD_ID,
-        "readreplyfinal000001",
+        &canonical_request_id,
     )
     .await;
     let sort_key = &canonical
@@ -43244,13 +43246,14 @@ async fn thread_read_rpc_is_monotonic_and_converges_all_principal_sessions() {
         .find(|block| block.block_id == block_id)
         .unwrap()
         .sort_key;
+    let read_request_id = generate_test_request_id("readreply", "exact");
     processor.process_request_for_connection(primary_connection_id, &json!({
-        "jsonrpc": "2.0", "id": "readreplyexact000001", "method": "thread/read",
+        "jsonrpc": "2.0", "id": read_request_id, "method": "thread/read",
         "params": { "thread_id": THREAD_ID, "through_turn_id": FIRST_TURN_ID, "through_block": { "block_id": block_id, "sort_key": sort_key } }
     }).to_string()).await;
     let (response, _) = recv_response_and_notification_by_id_method(
         &mut primary_rx,
-        "readreplyexact000001",
+        &read_request_id,
         events::THREAD_READ_CURSOR_CHANGED,
     )
     .await;
