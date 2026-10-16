@@ -1407,6 +1407,130 @@ async fn setup_cli_runtime_security_harness_for_principal(
 }
 
 #[test]
+#[cfg(unix)]
+fn codex_readiness_shares_one_account_read_and_process_and_preserves_auth_failures() {
+    use std::os::unix::fs::PermissionsExt;
+    run_gateway_message_test("codex-readiness-single-probe", || async {
+        for (name, response, expected) in [
+            (
+                "ready",
+                r#"{"id":1,"result":{"account":{"type":"chatgpt","email":"test@example.com"},"requiresOpenaiAuth":false}}"#,
+                pioneer_protocol::RuntimeStatus::Ready,
+            ),
+            (
+                "needs-auth",
+                r#"{"id":1,"result":{"requiresOpenaiAuth":true}}"#,
+                pioneer_protocol::RuntimeStatus::NeedsAuth,
+            ),
+            (
+                "account-error",
+                r#"{"id":1,"error":{"code":-32603,"message":"account unavailable"}}"#,
+                pioneer_protocol::RuntimeStatus::Error {
+                    message: "unused".into(),
+                },
+            ),
+        ] {
+            let harness =
+                setup_cli_runtime_security_harness(Some(CLIAgentRuntimeKind::Codex)).await;
+            let processor = &harness.processor;
+            let temp = tempfile::tempdir().unwrap();
+            let script = temp.path().join("fake-codex");
+            std::fs::write(&script, format!(r#"#!/bin/sh
+cd "$(dirname "$0")" || exit 1
+printf '%s\n' started >> probe-starts
+printf '%s\n' 'synthetic probe stderr' >&2
+read initialize
+printf '%s\n' "$initialize" >> probe-requests
+printf '%s\n' '{{"id":0,"result":{{"userAgent":"codex/1.2.3 test"}}}}'
+read initialized
+read account
+printf '%s\n' "$account" >> probe-requests
+printf '%s\n' '{response}'
+while read line; do
+  printf '%s\n' "$line" >> probe-requests
+  case "$line" in
+    *model/list*) printf '%s\n' '{{"id":2,"result":{{"data":[{{"id":"test-model"}}]}}}}' ;;
+    *account/read*) printf '%s\n' '{{"id":2,"error":{{"code":-32603,"message":"duplicate account/read"}}}}' ;;
+  esac
+done
+"#)).unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let config = crate::isolated_test_app_config().unwrap();
+            let settings_name = config.gateway.settings_file_name.as_str();
+            let settings_path = processor.artifact_runtime_home.join(settings_name);
+            let mut settings = crate::settings::load_or_create_gateway_settings(
+                &settings_path,
+                config.gateway.settings_version,
+                settings_name,
+            )
+            .unwrap();
+            let mut instance = pioneer_protocol::GatewayCliRuntimeInstanceSettings::default_codex();
+            instance.enabled = true;
+            instance.binary_path = script.to_string_lossy().into_owned();
+            instance.home_path = temp
+                .path()
+                .join("codex-home")
+                .to_string_lossy()
+                .into_owned();
+            settings
+                .set_cli_runtime_settings_for_tests(pioneer_protocol::GatewayCliRuntimeSettings {
+                    instances: vec![instance],
+                })
+                .unwrap();
+            crate::settings::save_gateway_settings(&settings_path, &settings).unwrap();
+            processor
+                .refresh_cli_readiness_for_tests(&harness.workspace_id)
+                .await
+                .unwrap();
+            let probe = processor
+                .cli_runtime_probe_snapshot(&harness.workspace_id, "codex")
+                .await
+                .unwrap()
+                .expect("published readiness probe");
+            assert_eq!(
+                std::mem::discriminant(&probe.summary.status),
+                std::mem::discriminant(&expected),
+                "{name}: {:?}",
+                probe.summary
+            );
+            assert_eq!(probe.summary.version.as_deref(), Some("1.2.3"));
+            assert!(
+                probe
+                    .summary
+                    .recent_stderr
+                    .iter()
+                    .any(|line| line.contains("synthetic probe stderr"))
+            );
+            let requests = std::fs::read_to_string(temp.path().join("probe-requests")).unwrap();
+            assert_eq!(requests.matches("account/read").count(), 1, "{name}");
+            assert_eq!(
+                std::fs::read_to_string(temp.path().join("probe-starts"))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                1,
+                "{name}"
+            );
+            if expected == pioneer_protocol::RuntimeStatus::Ready {
+                assert_eq!(requests.matches("model/list").count(), 1);
+                assert_eq!(probe.models.unwrap().result.models[0].id, "test-model");
+                assert_eq!(
+                    probe.summary.account.unwrap().email.as_deref(),
+                    Some("test@example.com")
+                );
+                assert!(probe.summary.capabilities.supports_mcp_tools);
+                assert!(probe.mcp_readiness.is_some());
+            } else {
+                assert!(!requests.contains("model/list"));
+                assert!(probe.models.is_none());
+                assert!(!probe.summary.capabilities.supports_mcp_tools);
+                assert!(!probe.summary.diagnostics.is_empty());
+            }
+        }
+    });
+}
+
+#[test]
 fn skill_pack_turn_normalization_is_authoritative_ordered_and_fail_closed() {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()

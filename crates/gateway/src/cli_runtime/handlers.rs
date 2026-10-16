@@ -10954,9 +10954,11 @@ impl MessageProcessor {
             return Ok(CliRuntimeLiveReadiness {
                 summary,
                 mcp_readiness: None,
+                models: None,
             });
         }
 
+        let mut models = None;
         let (summary, mcp_readiness) = match instance.kind {
             GatewayCliAgentRuntimeKindConfig::Codex => {
                 let account_stage = refresh_trace.map(|trace| {
@@ -10965,8 +10967,11 @@ impl MessageProcessor {
                         runtime_kind,
                     )
                 });
+                let model_stage = refresh_trace.map(|trace| {
+                    trace.runtime_stage(GatewayProviderWarmupStage::RuntimeModelsLoad, runtime_kind)
+                });
                 let probe =
-                    CodexProbe::account_read(codex_account_probe_config_from_instance_with_proxy(
+                    CodexProbe::model_list(codex_account_probe_config_from_instance_with_proxy(
                         &instance,
                         proxy_url.as_deref(),
                     ))
@@ -10974,9 +10979,18 @@ impl MessageProcessor {
                 if let Some(stage) = account_stage {
                     stage.succeed();
                 }
-                let normal_runtime_ready = probe.status == CodexAccountProbeStatus::Ready;
-                let provider_version = probe.version.clone();
-                let mut summary = apply_codex_account_probe_to_summary(summary, probe);
+                // Account identity and models belong to this same probe session.
+                let account = probe.account_probe_snapshot();
+                let normal_runtime_ready = account.status == CodexAccountProbeStatus::Ready;
+                let provider_version = account.version.clone();
+                let mut summary = apply_codex_account_probe_to_summary(summary, account);
+                let result = runtime_model_list_from_codex_probe(probe, &instance.custom_models);
+                if let Some(stage) = model_stage
+                    && result.error_message.is_none()
+                {
+                    stage.succeed();
+                }
+                models = Some(result);
                 let (max_tools, max_schema_bytes) = self.mcp_service.projection_limit_values();
                 #[cfg(test)]
                 let readiness_override = self.cli_mcp_readiness_override_for_tests(
@@ -11091,6 +11105,7 @@ impl MessageProcessor {
         Ok(CliRuntimeLiveReadiness {
             summary,
             mcp_readiness: Some(mcp_readiness),
+            models,
         })
     }
 
@@ -11792,6 +11807,7 @@ fn runtime_models_from_codex_probe(
 pub(super) struct CliRuntimeLiveReadiness {
     pub(super) summary: RuntimeSummary,
     pub(super) mcp_readiness: Option<pioneer_protocol::CliMcpAdapterReadiness>,
+    pub(super) models: Option<RuntimeModelListResult>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -13903,6 +13919,7 @@ mod tests {
     fn cli_runtime_list_models_needs_auth_returns_custom_models() {
         let models = runtime_models_from_codex_probe(
             CodexModelListProbeSnapshot {
+                account_probe: None,
                 status: CodexModelListProbeStatus::NeedsAuth,
                 message: Some("Codex CLI is not authenticated".to_owned()),
                 user_agent: Some("codex/1.2.3".to_owned()),
