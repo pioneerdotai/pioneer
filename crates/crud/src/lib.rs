@@ -40,6 +40,7 @@ pub use repositories::task_run_occurrence_reconcile::{
 #[cfg(any(test, feature = "test-support"))]
 pub use task_delivery_lifecycle::TaskDeliveryCommitTestKind;
 pub use task_delivery_lifecycle::{TaskDeliveryTransition, TaskDeliveryTransitionOutcome};
+pub use task_run_occurrence::{TaskRunOccurrenceRepairPhase, TaskRunOccurrenceRepairReason};
 pub use task_terminal::{
     PreparedTaskTerminalTransition, TaskTerminalCommitOutcome, TaskTerminalCommitStatus,
     TaskTerminalConflict,

@@ -2079,12 +2079,15 @@ async fn background_repair_waits_for_predecessor_then_retries_without_source_pai
         .await
         .unwrap();
     assert_eq!(events_before.len(), 1);
-    assert!(
-        store
-            .reconcile_claimed_task_run_occurrence(&claim, NOW)
-            .await
-            .is_err()
-    );
+    let error = store
+        .reconcile_claimed_task_run_occurrence(&claim, NOW)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<crate::TaskRunOccurrenceRepairPhase>(),
+        Some(crate::TaskRunOccurrenceRepairPhase::Commit)
+    ));
+
     assert_eq!(
         row(&store, &run.id).await.unwrap().next_attempt_at,
         claim.next_attempt_at
