@@ -159,6 +159,7 @@ pub(crate) async fn prepare_completed_history(
         None,
         std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         None,
+        None,
         &mut diagnostic,
     )
     .await?;
@@ -188,6 +189,7 @@ pub(crate) async fn prepare_completed_history_owned(
     codex_history_budget: Option<crate::cli_runtime::context::CodexTransferHistoryBudget>,
     suspending: Arc<std::sync::atomic::AtomicBool>,
     accepted_projection: Option<super::frozen::PreparedHistory>,
+    cli_cwd: Option<&str>,
     diagnostic: &mut HistoryCheckDiagnostic,
 ) -> Result<HistoryCheckOutcome> {
     // The owner chooses the database class: foreground transfer is part of
@@ -387,7 +389,9 @@ pub(crate) async fn prepare_completed_history_owned(
             Transport::Claude => Some(pioneer_protocol::CLIAgentRuntimeKind::Claude),
             Transport::OpenCode => Some(pioneer_protocol::CLIAgentRuntimeKind::OpenCode),
         };
-        let cwd = if cli.is_some() {
+        let cwd = if let Some(cwd) = cli_cwd {
+            Some(cwd.to_owned())
+        } else if cli.is_some() {
             store
                 .get_cli_runtime_thread_binding(thread)
                 .await?

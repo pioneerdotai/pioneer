@@ -9035,6 +9035,7 @@ impl MessageProcessor {
         deadline_ms: u64,
         codex_history_budget: Option<crate::cli_runtime::context::CodexTransferHistoryBudget>,
         accepted: crate::compaction::frozen::PreparedHistory,
+        cli_cwd: Option<&str>,
     ) -> anyhow::Result<()> {
         scope_current_stage(Stage::CliCompaction, async {
             let cancellation = tokio_util::sync::CancellationToken::new();
@@ -9145,6 +9146,7 @@ impl MessageProcessor {
                     codex_history_budget,
                     std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                     Some(accepted),
+                    cli_cwd,
                     &mut diagnostic,
                 );
                 tokio::pin!(work);
@@ -9549,6 +9551,7 @@ impl MessageProcessor {
                         accepted_projection
                             .take()
                             .context("CLI transfer projection was lost")?,
+                        native_cwd.as_deref(),
                     )
                     .await?;
                     // Fits can reuse an existing summary without publishing a new one.

@@ -27338,6 +27338,7 @@ async fn accepted_task_cli_transfer_compacts_without_later_parent_history_impl(
             deadline_ms,
             None,
             prepared,
+            None,
         )
         .await
         .expect("Fits must not require a newly published checkpoint");
@@ -71521,6 +71522,7 @@ async fn completed_command_history_fits_real_background_preflight_after_projecti
         None,
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
         None,
+        None,
         &mut diagnostic,
     )
     .await
@@ -71629,6 +71631,7 @@ async fn genuinely_large_command_history_compacts_through_real_background_prefli
         0,
         None,
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        None,
         None,
         &mut diagnostic,
     )
@@ -77744,6 +77747,7 @@ async fn production_background_preflight_ignores_technical_noise_but_budgets_rea
                 None,
                 Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 None,
+                None,
                 &mut diagnostic,
             )
             .await
@@ -78297,6 +78301,7 @@ async fn background_history_preflight_budgets_task_input_copy_once_near_threshol
         None,
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
         None,
+        None,
         &mut baseline,
     )
     .await
@@ -78421,6 +78426,7 @@ async fn background_history_preflight_budgets_task_input_copy_once_near_threshol
         None,
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
         None,
+        None,
         &mut fitting,
     )
     .await
@@ -78451,6 +78457,7 @@ async fn background_history_preflight_budgets_task_input_copy_once_near_threshol
         fixed,
         None,
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        None,
         None,
         &mut overflowing,
     )
@@ -79785,6 +79792,7 @@ async fn background_completed_history_projects_reasoning_before_fit_and_compacti
         None,
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
         None,
+        None,
         &mut fitting,
     )
     .await
@@ -79814,6 +79822,7 @@ async fn background_completed_history_projects_reasoning_before_fit_and_compacti
         fixed,
         None,
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        None,
         None,
         &mut compacted,
     )
@@ -80110,6 +80119,7 @@ async fn background_deepseek_effort_matches_provider_preflight_and_token_boundar
             None,
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
             None,
+            None,
             &mut diagnostic,
         )
         .await
@@ -80168,6 +80178,7 @@ async fn background_deepseek_effort_matches_provider_preflight_and_token_boundar
         compaction_fixed,
         None,
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        None,
         None,
         &mut diagnostic,
     )

@@ -568,6 +568,7 @@ impl MessageProcessor {
                 None,
                 suspending,
                 None,
+                None,
                 diagnostic,
             );
             tokio::pin!(work);

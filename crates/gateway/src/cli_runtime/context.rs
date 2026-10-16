@@ -323,9 +323,9 @@ pub(crate) fn completed_cli_history_budget(
     Vec<pioneer_provider::attachments::MediaInputEstimate>,
 )> {
     let label = match runtime_kind {
-        pioneer_protocol::CLIAgentRuntimeKind::Codex => "Codex",
-        pioneer_protocol::CLIAgentRuntimeKind::Claude => "Claude",
-        pioneer_protocol::CLIAgentRuntimeKind::OpenCode => "OpenCode",
+        pioneer_protocol::CLIAgentRuntimeKind::Codex => "Codex CLI",
+        pioneer_protocol::CLIAgentRuntimeKind::Claude => "Claude CLI",
+        pioneer_protocol::CLIAgentRuntimeKind::OpenCode => "OpenCode CLI",
     };
     let mapping = historical_attachment_inputs(history, workspace, cwd, label)?;
     let mut input = vec![CLIRuntimeTurnInputItem::Text {
@@ -1261,7 +1261,8 @@ mod tests {
             ),
         ));
         let history = vec![message];
-        let mapping = historical_attachment_inputs(&history, "workspace", None, "Codex").unwrap();
+        let mapping =
+            historical_attachment_inputs(&history, "workspace", None, "Codex CLI").unwrap();
         let mut input = vec![CLIRuntimeTurnInputItem::Text {
             text: thread_context_from_history(&history).unwrap().text,
         }];
