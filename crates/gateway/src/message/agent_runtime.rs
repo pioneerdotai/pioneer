@@ -8611,9 +8611,21 @@ impl MessageProcessor {
             }
         }
 
-        if self
-            .artifact_finalization_blocks_completion(thread_id.as_str(), turn_id.as_str())
-            .await
+        // A Composer source Turn owns its accepted message; its detached Task
+        // owns provider work and artifact obligations. UI mode is not ownership.
+        let owns_work = match self.crud_store.turn_work_owner(&thread_id, &turn_id).await {
+            Ok(Some(pioneer_crud::TurnWorkOwner::Turn)) => true,
+            Ok(Some(pioneer_crud::TurnWorkOwner::DetachedTask)) => false,
+            Ok(None) => return false,
+            Err(error) => {
+                warn!(thread_id, turn_id, error = %error, "Turn completion work owner unavailable");
+                return false;
+            }
+        };
+        if owns_work
+            && self
+                .artifact_finalization_blocks_completion(&thread_id, &turn_id)
+                .await
         {
             return false;
         }

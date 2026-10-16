@@ -15646,6 +15646,22 @@ impl CrudStore {
         .await
     }
 
+    /// The immutable owner accepted with the Turn, separate from its UI mode.
+    pub async fn turn_work_owner(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+    ) -> Result<Option<TurnWorkOwner>> {
+        turn::find_turn_by_thread_and_id(&self.connection, thread_id, turn_id)
+            .await?
+            .map(|turn| match turn.work_owner.as_str() {
+                "turn" => Ok(TurnWorkOwner::Turn),
+                "detached_task" => Ok(TurnWorkOwner::DetachedTask),
+                _ => anyhow::bail!("Turn work owner is unavailable"),
+            })
+            .transpose()
+    }
+
     /// Exact immutable candidate already accepted by the finalization owner.
     /// Decode only after the bounded repository read releases DB capacity.
     pub async fn turn_finalization_notification(

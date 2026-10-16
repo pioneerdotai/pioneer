@@ -11651,6 +11651,27 @@ async fn assert_concurrent_collaborative_tasks_receive_independent_frozen_comman
             timeout(Duration::from_secs(5), provider.first_started.notified())
                 .await
                 .expect("Task A provider request should start");
+            assert_eq!(
+                wait_for_turn_status(
+                    crud_store.clone(),
+                    parent_thread_id,
+                    turn_id,
+                    TurnStatus::Completed
+                )
+                .await,
+                TurnStatus::Completed,
+                "the Composer message must complete while its child owns the pending work"
+            );
+            assert!(
+                crud_store
+                    .get_turn(parent_thread_id, turn_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .1
+                    .error
+                    .is_none()
+            );
         } else {
             timeout(Duration::from_secs(5), provider.second_started.notified())
                 .await
