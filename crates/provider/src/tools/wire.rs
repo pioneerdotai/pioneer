@@ -150,7 +150,7 @@ impl ToolWireManifest {
         };
         let canonical = self.wire_to_canonical.get(name).ok_or_else(rejected)?;
         if advertised && !self.advertised.contains(canonical) {
-            return Err(rejected());
+            return Err(rejected().into());
         }
         *name = canonical.clone();
         Ok(())

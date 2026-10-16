@@ -383,7 +383,7 @@ struct OpenAiFileUploadResponse {
 /// redact an endpoint override. Keep only classified, safe data here.
 #[derive(Debug)]
 struct OpenAiFileUploadError {
-    classification: ProviderFailureClassification,
+    transport: crate::failure::ProviderTransportFailure,
 }
 
 impl OpenAiFileUploadError {
@@ -391,7 +391,9 @@ impl OpenAiFileUploadError {
         let mut classification = ProviderFailureClassification::new(class);
         classification.http_status = status;
         classification.retry_after_ms = retry_after_ms;
-        Self { classification }
+        Self {
+            transport: crate::failure::ProviderTransportFailure { classification },
+        }
     }
 
     fn http(status: reqwest::StatusCode, body: &str, retry_after_ms: Option<u64>) -> Self {
@@ -404,7 +406,9 @@ impl OpenAiFileUploadError {
         let mut classification =
             crate::failure::classify_transport_status(Some(status.as_u16()), code);
         classification.retry_after_ms = retry_after_ms;
-        Self { classification }
+        Self {
+            transport: crate::failure::ProviderTransportFailure { classification },
+        }
     }
 
     fn transport(error: &reqwest::Error) -> Self {
@@ -415,7 +419,9 @@ impl OpenAiFileUploadError {
         if status.is_none() && classification.is_network_error {
             classification.class = ProviderFailureClass::NetworkTransient;
         }
-        Self { classification }
+        Self {
+            transport: crate::failure::ProviderTransportFailure { classification },
+        }
     }
 
     fn response() -> Self {
@@ -428,16 +434,20 @@ impl std::fmt::Display for OpenAiFileUploadError {
         write!(
             f,
             "OpenAI file upload failed ({:?}",
-            self.classification.class
+            self.transport.classification.class
         )?;
-        if let Some(status) = self.classification.http_status {
+        if let Some(status) = self.transport.classification.http_status {
             write!(f, ", HTTP {status}")?;
         }
         f.write_str(")")
     }
 }
 
-impl std::error::Error for OpenAiFileUploadError {}
+impl std::error::Error for OpenAiFileUploadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.transport)
+    }
+}
 
 // ── Implementation ──────────────────────────────────────────────────────────
 
@@ -1295,7 +1305,7 @@ impl crate::traits::Provider for OpenAiProvider {
     fn classify_failure(&self, error: &anyhow::Error) -> Option<ProviderFailureClassification> {
         error
             .downcast_ref::<OpenAiFileUploadError>()
-            .map(|upload| upload.classification.clone())
+            .map(|upload| upload.transport.classification.clone())
             .or_else(|| crate::failure::classify_transport_error(error))
             .or_else(|| crate::failure::classify_stream_error(error))
     }
