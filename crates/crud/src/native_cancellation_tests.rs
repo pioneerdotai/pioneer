@@ -2964,7 +2964,7 @@ async fn native_recovery_refusal_commits_progress_atomically_and_rejects_stale_p
                     workspace_id: plan.workspace_id.clone(),
                     executor_kind: TurnExecutorKind::NativeAgent,
                     executor_key: Some("fixture".into()),
-                    status: TurnExecutionStatus::Recovering,
+                    status: TurnExecutionStatus::Starting,
                     owner_id: OWNER.into(),
                     lease_until: unix_to_datetime(NOW + 100),
                     created_at: unix_to_datetime(NOW),
@@ -2972,6 +2972,16 @@ async fn native_recovery_refusal_commits_progress_atomically_and_rejects_stale_p
             )
             .await
             .unwrap();
+            assert!(
+                repositories::turn_execution::mark_recovering_owned(
+                    &store.connection,
+                    &turn.id,
+                    OWNER,
+                    unix_to_datetime(NOW)
+                )
+                .await
+                .unwrap()
+            );
             let execution = store.get_turn_execution(&turn.id).await.unwrap().unwrap();
             let job = store
                 .enqueue_recovery_job(
