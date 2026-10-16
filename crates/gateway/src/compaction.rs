@@ -24,7 +24,7 @@ pub(crate) use origins::resolve_message_origins;
 mod result_budget;
 mod service;
 #[cfg(test)]
-pub(crate) use service::apply_cli_usage;
+pub(crate) use service::{apply_cli_usage, finish_cli_summary};
 #[cfg(test)]
 pub(crate) mod test_support;
 mod tool_outcomes;

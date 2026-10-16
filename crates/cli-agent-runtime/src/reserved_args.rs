@@ -193,9 +193,10 @@ pub fn validate_opencode_custom_args(args: &[String]) -> Result<(), ReservedLaun
             "--port" => Some("--port"),
             "--hostname" => Some("--hostname"),
             "--cors" => Some("--cors"),
-            "--mdns" => Some("--mdns"),
-            "--no-mdns" => Some("--no-mdns"),
-            "--mdns-domain" => Some("--mdns-domain"),
+            "--stdio" | "--no-stdio" => Some("--stdio"),
+            "--no-service" | "--service" | "service" => Some("--service"),
+            "--standalone" => Some("--standalone"),
+            "--server" => Some("--server"),
             _ => None,
         };
         if let Some(reserved) = reserved {
@@ -390,9 +391,9 @@ mod tests {
             args(&["--port=4096"]),
             args(&["--hostname", "0.0.0.0"]),
             args(&["--cors=https://example.com"]),
-            args(&["--mdns"]),
-            args(&["--no-mdns"]),
-            args(&["--mdns-domain", "example.local"]),
+            args(&["--stdio=false"]),
+            args(&["--service"]),
+            args(&["--server", "http://localhost:4096"]),
         ] {
             assert!(
                 validate_opencode_custom_args(&values).is_err(),
@@ -400,7 +401,7 @@ mod tests {
             );
         }
 
-        for values in [args(&["--log-level", "INFO"]), args(&["--print-logs"])] {
+        for values in [args(&["--print-logs"]), args(&["--print-logs=true"])] {
             validate_opencode_custom_args(&values)
                 .unwrap_or_else(|error| panic!("{values:?}: {error}"));
         }
