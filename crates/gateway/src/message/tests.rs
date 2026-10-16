@@ -5915,7 +5915,7 @@ impl Provider for VerticalUnfinishedSiblingProvider {
     }
 
     fn name(&self) -> &str {
-        "vertical-unfinished-sibling"
+        "vertical-sibling"
     }
 
     fn capabilities(&self) -> ProviderCapabilities {
