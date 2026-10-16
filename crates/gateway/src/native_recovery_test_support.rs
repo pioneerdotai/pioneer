@@ -98,11 +98,14 @@ pub(crate) async fn charged_native_window(
     )
     .unwrap();
     snapshot.initial_phase_json = Some(phase);
-    let contract = pioneer_provider::Provider::capture_model_contract(
-        &pioneer_provider::providers::EchoProvider::new(),
-        "test-model",
-    )
-    .unwrap();
+    let providers = pioneer_provider::ProviderRegistry::with_provider(
+        "echo",
+        std::sync::Arc::new(pioneer_provider::providers::EchoProvider::new()),
+    );
+    let provider = providers
+        .get_or_create_for_workspace(workspace, "echo")
+        .unwrap();
+    let contract = provider.capture_model_contract("test-model").unwrap();
     snapshot.provider_model_contract_json = Some(serde_json::to_string(&contract).unwrap());
     store.upsert_turn_runtime_snapshot(snapshot).await.unwrap();
     for (ordinal, (input, output)) in receipts.into_iter().enumerate() {
