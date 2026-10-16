@@ -542,6 +542,7 @@ impl fmt::Display for TurnPreflightSafeFailure {
 
 #[derive(Debug)]
 struct TurnPreflightProviderRequestFailure {
+    dispatch_deadline_exceeded: bool,
     description: TurnPreflightSafeFailure,
     collected_response_chars: usize,
     collected_response_bytes: usize,
@@ -551,6 +552,7 @@ struct TurnPreflightProviderRequestFailure {
 impl TurnPreflightProviderRequestFailure {
     fn local(stage: &'static str, cause_code: &'static str) -> Self {
         Self {
+            dispatch_deadline_exceeded: false,
             description: TurnPreflightSafeFailure::local(stage, cause_code),
             collected_response_chars: 0,
             collected_response_bytes: 0,
@@ -589,6 +591,8 @@ impl TurnPreflightProviderRequestFailure {
             description.cause_code = "provider_timeout";
         }
         Self {
+            dispatch_deadline_exceeded: source
+                .is::<super::provider::ProviderDispatchDeadlineExceeded>(),
             description,
             collected_response_chars: 0,
             collected_response_bytes: 0,
@@ -602,6 +606,7 @@ impl TurnPreflightProviderRequestFailure {
         response: &str,
     ) -> Self {
         Self {
+            dispatch_deadline_exceeded: false,
             description: TurnPreflightSafeFailure::local(stage, "response_validation_failed"),
             collected_response_chars: response.chars().count(),
             collected_response_bytes: response.len(),
@@ -690,7 +695,7 @@ fn turn_preflight_request_attempt_failure(
         failure.map_or(0, |failure| failure.collected_response_bytes),
         failure.and_then(|failure| failure.collected_response_sha256.as_deref()),
     );
-    let (reason, code) = if description.cause_code == "provider_timeout" {
+    let (reason, code) = if failure.is_some_and(|failure| failure.dispatch_deadline_exceeded) {
         (
             TurnPreflightFallbackReason::Timeout,
             "preflight.provider.timeout",
