@@ -216,7 +216,7 @@ async fn stream_errors_require_typed_proof_for_completion_retry_policy() {
     }
     let failure = pioneer_provider::failure::ProviderTransportFailure {
         classification: pioneer_provider::ProviderFailureClassification::new(
-            pioneer_provider::ProviderFailureClass::StreamStall,
+            pioneer_protocol::ProviderFailureClass::StreamStall,
         ),
     };
     let stream = Box::pin(stream::iter(vec![Err(anyhow::Error::from(failure))]));
