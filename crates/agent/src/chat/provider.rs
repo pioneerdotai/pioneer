@@ -68,9 +68,14 @@ fn total_token_usage(usage: Option<&TokenUsage>) -> Option<u64> {
     usage.input_tokens?.checked_add(usage.output_tokens?)
 }
 
-#[derive(Debug, thiserror::Error)]
-#[error("provider dispatch deadline exceeded")]
+#[derive(Debug)]
 pub(super) struct ProviderDispatchDeadlineExceeded;
+impl std::fmt::Display for ProviderDispatchDeadlineExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("provider dispatch deadline exceeded")
+    }
+}
+impl std::error::Error for ProviderDispatchDeadlineExceeded {}
 
 pub(super) async fn await_provider_dispatch<T>(
     stream: bool,

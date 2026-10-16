@@ -17650,7 +17650,10 @@ async fn native_toolless_failure_closes_charged_semantic_window_before_failure_o
                     failed_observation = true;
                 }
                 AgentDurableEvent::TurnExecutionWindowCheckpointed { payload, .. } => {
-                    assert_eq!(payload.window.agent_round_count, 1);
+                    assert_eq!(
+                        payload.window.agent_round_count, 2,
+                        "preflight and main are distinct charged attempts"
+                    );
                     assert_eq!(
                         payload.window.exhaustion_reason,
                         Some(ExecutionWindowExhaustionReason::ProviderFailureContinuation)
