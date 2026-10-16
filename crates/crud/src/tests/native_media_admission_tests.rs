@@ -1,5 +1,6 @@
 use super::*;
 use pioneer_protocol::ArtifactStatus;
+use sea_orm::ActiveModelTrait;
 
 #[tokio::test]
 async fn exact_native_input_binding_is_atomic_idempotent_and_revalidates_scope() {
