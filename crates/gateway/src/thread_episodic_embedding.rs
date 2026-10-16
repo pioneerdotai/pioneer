@@ -1719,7 +1719,7 @@ impl RemoteEmbeddingProvider {
             runtime.block_on(provider.embed(request))
         };
 
-        result.map_err(|error| Self::map_provider_error(provider_id, model, error))
+        result.map_err(|error| Self::map_provider_error(provider_id, model, provider, error))
     }
 
     fn probe_embedding_dimension(
@@ -1757,10 +1757,30 @@ impl RemoteEmbeddingProvider {
     fn map_provider_error(
         provider_id: &str,
         model: &str,
+        provider: &dyn Provider,
         error: anyhow::Error,
     ) -> ThreadEpisodicEmbeddingError {
-        let message = format!("{error:#}");
-        if provider_embedding_error_is_retryable(&error) {
+        // Adapter facts must be consumed before the intentionally opaque error is dropped.
+        let classification = provider.classify_failure(&error);
+        let retryable = classification.as_ref().map_or_else(
+            || provider_embedding_error_is_retryable(&error),
+            |failure| {
+                matches!(
+                    failure.class,
+                    pioneer_protocol::ProviderFailureClass::NetworkTransient
+                        | pioneer_protocol::ProviderFailureClass::RateLimit
+                        | pioneer_protocol::ProviderFailureClass::Provider5xx
+                )
+            },
+        );
+        let message = classification.map_or_else(
+            || "embedding provider request failed (unclassified transport)".to_owned(),
+            |failure| format!(
+                "embedding provider request failed (class={:?}, stage=embedding_request, http_status={:?}, retry_after_ms={:?})",
+                failure.class, failure.http_status, failure.retry_after_ms
+            ),
+        );
+        if retryable {
             ThreadEpisodicEmbeddingError::retryable_provider_failure(provider_id, model, message)
         } else {
             ThreadEpisodicEmbeddingError::non_retryable_provider_failure(
@@ -1773,7 +1793,7 @@ impl RemoteEmbeddingProvider {
 }
 
 fn provider_embedding_error_is_retryable(error: &anyhow::Error) -> bool {
-    if error.chain().any(|cause| {
+    error.chain().any(|cause| {
         cause.downcast_ref::<reqwest::Error>().is_some_and(|error| {
             error.is_timeout()
                 || error.is_connect()
@@ -1788,11 +1808,7 @@ fn provider_embedding_error_is_retryable(error: &anyhow::Error) -> bool {
                     ) || status.is_server_error()
                 })
         })
-    }) {
-        return true;
-    }
-
-    provider_embedding_error_message_is_retryable(format!("{error:#}").as_str())
+    })
 }
 
 pub(crate) fn provider_embedding_error_message_is_retryable(message: &str) -> bool {
@@ -2242,6 +2258,17 @@ mod tests {
         ));
     }
 
+    #[derive(Debug)]
+    struct OpaqueEmbeddingFailure(pioneer_provider::ProviderFailureClassification);
+
+    impl std::fmt::Display for OpaqueEmbeddingFailure {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("provider request failed: timeout rate limit")
+        }
+    }
+
+    impl std::error::Error for OpaqueEmbeddingFailure {}
+
     struct FakeRemoteProvider {
         name: &'static str,
         embeddings: bool,
@@ -2278,6 +2305,15 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Provider for FakeRemoteProvider {
+        fn classify_failure(
+            &self,
+            error: &anyhow::Error,
+        ) -> Option<pioneer_provider::ProviderFailureClassification> {
+            error
+                .downcast_ref::<OpaqueEmbeddingFailure>()
+                .map(|error| error.0.clone())
+        }
+
         fn name(&self) -> &str {
             self.name
         }
@@ -2570,7 +2606,12 @@ mod tests {
             false,
             Arc::new(FakeRemoteProvider::with_responses(
                 "openai",
-                vec![Err(anyhow::anyhow!("OpenAI API error (429): rate limit"))],
+                vec![Err(OpaqueEmbeddingFailure(
+                    pioneer_provider::ProviderFailureClassification::new(
+                        pioneer_protocol::ProviderFailureClass::RateLimit,
+                    ),
+                )
+                .into())],
             )),
         )
         .expect("provider")
@@ -2584,13 +2625,52 @@ mod tests {
             false,
             Arc::new(FakeRemoteProvider::with_responses(
                 "openai",
-                vec![Err(anyhow::anyhow!("OpenAI API error (401): invalid key"))],
+                vec![Err(OpaqueEmbeddingFailure(
+                    pioneer_provider::ProviderFailureClassification::new(
+                        pioneer_protocol::ProviderFailureClass::AuthOrPermission,
+                    ),
+                )
+                .into())],
             )),
         )
         .expect("provider")
         .embed_text("hello")
         .expect_err("invalid key should fail");
         assert!(!invalid_key.is_retryable());
+    }
+
+    #[test]
+    fn embedding_adapter_classification_overrides_opaque_or_misleading_display() {
+        use pioneer_protocol::ProviderFailureClass as Class;
+        let provider = FakeRemoteProvider::with_responses("openrouter", vec![]);
+        for (class, status, retryable) in [
+            (Class::AuthOrPermission, 403, false),
+            (Class::RateLimit, 429, true),
+            (Class::Provider5xx, 503, true),
+            (Class::Unknown, 400, false),
+        ] {
+            let mut facts = pioneer_provider::ProviderFailureClassification::new(class);
+            facts.http_status = Some(status);
+            facts.retry_after_ms = Some(1200);
+            let error = RemoteEmbeddingProvider::map_provider_error(
+                "openrouter",
+                "fixture",
+                &provider,
+                OpaqueEmbeddingFailure(facts).into(),
+            );
+            assert_eq!(error.is_retryable(), retryable);
+            assert!(error.message.contains(&status.to_string()));
+            assert!(error.message.contains("1200"));
+            assert_eq!(error.provider_id, "openrouter");
+            assert_eq!(error.model, "fixture");
+        }
+        let unknown = RemoteEmbeddingProvider::map_provider_error(
+            "openrouter",
+            "fixture",
+            &provider,
+            anyhow::anyhow!("timeout rate limit 503"),
+        );
+        assert!(!unknown.is_retryable());
     }
 
     #[test]
