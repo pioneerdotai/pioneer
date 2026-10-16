@@ -8572,7 +8572,16 @@ impl MessageProcessor {
                     self.finalize_agent_execution_for_turn(&current_turn, "completed")
                         .await;
                 }
-                return committed;
+                return committed
+                    && self
+                        .reconcile_completed_turn(
+                            thread_id,
+                            turn_id,
+                            recovery,
+                            now_timestamp_secs(),
+                            terminal_actor_generation,
+                        )
+                        .await;
             }
             if current_turn.status != TurnStatus::InProgress {
                 self.retire_execution_progress_state(turn_id.as_str()).await;
@@ -8668,6 +8677,26 @@ impl MessageProcessor {
         self.finalize_agent_execution_for_turn(&turn_completed.turn, "completed")
             .await;
 
+        self.reconcile_completed_turn(
+            thread_id,
+            turn_id,
+            recovery,
+            event_timestamp,
+            terminal_actor_generation,
+        )
+        .await
+    }
+
+    // Both a newly committed terminal event and its exact replay must finish
+    // the existing Task aggregate and resource cleanup after the durable commit.
+    async fn reconcile_completed_turn(
+        &self,
+        thread_id: String,
+        turn_id: String,
+        recovery: Option<pioneer_protocol::RecoveryAttemptContext>,
+        event_timestamp: i64,
+        terminal_actor_generation: Option<u64>,
+    ) -> bool {
         if let Err(error) = self
             .close_latest_active_execution_window_for_terminal_turn(
                 turn_id.as_str(),

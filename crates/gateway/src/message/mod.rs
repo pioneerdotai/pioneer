@@ -3517,7 +3517,7 @@ impl MessageProcessor {
 
             if let Err(error) = self
                 .timeout_supervisor
-                .heartbeat_item_attempt(
+                .heartbeat_item_attempt_from_confirmed_external_activity(
                     key.turn_id.as_str(),
                     key.item_id.as_str(),
                     TurnItemType::CommandExecution,
