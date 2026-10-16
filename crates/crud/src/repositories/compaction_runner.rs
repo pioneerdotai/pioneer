@@ -2740,6 +2740,7 @@ accepted_imports AS MATERIALIZED (
       AND output.next_ordinal=output.message_count AND output.import_count>=0
       AND output.next_import=output.import_count
       AND receipt.archive_wire_sha256=json_extract(i.proof_json,'$.preview_archive.wire_sha256')
+      AND receipt.archive_wire_sha256<>json_extract(CASE WHEN json_valid(receipt.reference_json) THEN receipt.reference_json ELSE '{}' END,'$.wire_sha256')
       AND revision.present=1 AND revision.turn_id=receipt.turn_id
       AND i.source_version='revision:'||(revision.revision-1)
       AND json_extract(i.proof_json,'$.preview_archive.source.version')='revision:'||revision.revision

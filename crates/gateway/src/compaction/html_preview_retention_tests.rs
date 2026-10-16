@@ -1083,6 +1083,28 @@ async fn released_preview_history_keeps_pairing_for_next_native_cli_task_and_fro
             "checkpoint reads require the exact preview archive receipt"
         );
     }
+    // Maintenance has indexed both the original media and the subsequently
+    // frozen diagnostic. Keep that existing diagnostic witness in place: it
+    // proves no wire transformation and must not authorize another revision.
+    for (manifest, ordinal, unchanged) in [
+        (&archived.output_manifest, archived.output_ordinal, 0_i64),
+        (
+            &accepted.descriptor.manifest_id,
+            archived.message_ordinal,
+            1_i64,
+        ),
+    ] {
+        let witness = db
+            .query_one_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "SELECT archive_wire_sha256=json_extract(reference_json,'$.wire_sha256') AS unchanged FROM html_preview_frozen_result WHERE manifest_id=?1 AND ordinal=?2",
+                [manifest.clone().into(), i64::try_from(ordinal).unwrap().into()],
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(witness.try_get::<i64>("", "unchanged").unwrap(), unchanged);
+    }
     // A later edit cannot be accepted using the release receipt as a general
     // revision exemption. Both fresh preparation and accepted replay reject it.
     let row = f
@@ -1124,6 +1146,18 @@ async fn released_preview_history_keeps_pairing_for_next_native_cli_task_and_fro
             .await
             .unwrap(),
         "an archive grant cannot authorize a later diagnostic revision"
+    );
+    assert_eq!(
+        crate::turn_runtime_snapshot::restore_history_json(
+            &f.store,
+            "ws",
+            &checkpoint_basis.accepted_scopes,
+            &serde_json::to_string(&checkpoint_basis.descriptor).unwrap(),
+        )
+        .await
+        .unwrap(),
+        checkpoint_replay,
+        "the published summary keeps its independently verified historical inputs"
     );
     // Current Message inputs are a supported adoption even without a
     // UserMessage item or the old async attachment-binding step.

@@ -436,6 +436,8 @@ async fn prepare_preview_archive_guards(
         .and_then(|s| s.parse::<u64>().ok())
         .and_then(|n| n.checked_add(1))
         .ok_or_else(|| anyhow::anyhow!("invalid preview grant revision"))?;
+    // Indexing an already archived diagnostic also yields a receipt. Its
+    // unchanged wire body proves no retirement and cannot grant a new revision.
     ensure!(
         original.tool_name.as_deref() == Some("html_preview")
             && original.source_thread == record.source_thread
@@ -444,6 +446,7 @@ async fn prepare_preview_archive_guards(
             && projection.source.scope == record.source.scope
             && projection.source.id == record.source.id
             && projection.source.version == format!("revision:{revision}")
+            && projection.wire_sha256 != original.wire_sha256
             && projection.wire_sha256 == row.try_get::<String>("", "archive_wire_sha256")?,
         "archival preview grant does not match its exact diagnostic"
     );

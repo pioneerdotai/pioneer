@@ -979,6 +979,8 @@ impl CrudStore {
     /// projection. Retirement's single UPDATE advances the existing source
     /// trigger exactly once. Require that adjacent revision, a release marker
     /// and the verified diagnostic hash; a later edit invalidates the receipt.
+    /// An already archived diagnostic can also have an indexing receipt, but
+    /// its unchanged wire hash cannot authorize another revision transition.
     pub async fn html_preview_archived_frozen_result(
         &self,
         workspace: &str,
@@ -995,7 +997,7 @@ impl CrudStore {
         else {
             return Ok(None);
         };
-        let row=self.connection.query_one_raw(statement("SELECT c.payload,r.archive_wire_sha256,'revision:'||v.revision AS retired_version FROM html_preview_frozen_result r JOIN compaction_frozen_history h ON h.id=r.manifest_id JOIN turn_llm_context c ON c.id=r.source_id AND c.turn_id=r.turn_id JOIN compaction_source_revision v ON v.source_id=c.id JOIN turn t ON t.id=c.turn_id JOIN thread th ON th.id=t.thread_id WHERE r.source_id=?1 AND r.source_version=?2 AND r.reference_json=?3 AND h.workspace_id=?4 AND th.workspace_id=?4 AND t.thread_id=?5 AND c.source='tool_result_v2' AND c.tool_name='html_preview' AND v.present=1 AND r.source_version='revision:'||(v.revision-1) AND r.archive_wire_sha256 IS NOT NULL AND EXISTS(SELECT 1 FROM artifact a WHERE a.workspace_id=?4 AND a.created_by_kind='tool' AND a.created_by_actor_id='html_preview' AND CASE WHEN json_valid(a.metadata_json) THEN json_extract(a.metadata_json,'$.htmlTool.retention')='released' AND json_extract(a.metadata_json,'$.htmlTool.turnId')=c.turn_id AND json_extract(a.metadata_json,'$.htmlTool.callId')=c.item_id ELSE 0 END) AND length(CAST(c.payload AS BLOB))<=524288 LIMIT 1",vec![source.id.clone().into(),source.version.clone().into(),serialized.into(),workspace.into(),reference.source_thread.clone().into()])).await?;
+        let row=self.connection.query_one_raw(statement("SELECT c.payload,r.archive_wire_sha256,'revision:'||v.revision AS retired_version FROM html_preview_frozen_result r JOIN compaction_frozen_history h ON h.id=r.manifest_id JOIN turn_llm_context c ON c.id=r.source_id AND c.turn_id=r.turn_id JOIN compaction_source_revision v ON v.source_id=c.id JOIN turn t ON t.id=c.turn_id JOIN thread th ON th.id=t.thread_id WHERE r.source_id=?1 AND r.source_version=?2 AND r.reference_json=?3 AND h.workspace_id=?4 AND th.workspace_id=?4 AND t.thread_id=?5 AND c.source='tool_result_v2' AND c.tool_name='html_preview' AND v.present=1 AND r.source_version='revision:'||(v.revision-1) AND r.archive_wire_sha256<>json_extract(CASE WHEN json_valid(r.reference_json) THEN r.reference_json ELSE '{}' END,'$.wire_sha256') AND EXISTS(SELECT 1 FROM artifact a WHERE a.workspace_id=?4 AND a.created_by_kind='tool' AND a.created_by_actor_id='html_preview' AND CASE WHEN json_valid(a.metadata_json) THEN json_extract(a.metadata_json,'$.htmlTool.retention')='released' AND json_extract(a.metadata_json,'$.htmlTool.turnId')=c.turn_id AND json_extract(a.metadata_json,'$.htmlTool.callId')=c.item_id ELSE 0 END) AND length(CAST(c.payload AS BLOB))<=524288 LIMIT 1",vec![source.id.clone().into(),source.version.clone().into(),serialized.into(),workspace.into(),reference.source_thread.clone().into()])).await?;
         row.map(|r| {
             Ok((
                 r.try_get("", "payload")?,
