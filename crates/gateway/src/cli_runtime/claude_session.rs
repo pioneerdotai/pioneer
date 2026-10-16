@@ -1792,7 +1792,6 @@ impl CLIAgentRuntimeSession for ClaudeCLIAgentRuntimeSession {
             .set_native_thread_id(native_thread_id.clone())
             .await;
         Ok(CLIAgentRuntimeThreadOpenSnapshot {
-            name: None,
             native_thread_id,
             cwd: Some(params.cwd),
             model: params.model,
@@ -1817,7 +1816,6 @@ impl CLIAgentRuntimeSession for ClaudeCLIAgentRuntimeSession {
             .set_native_thread_id(native_thread_id.clone())
             .await;
         Ok(CLIAgentRuntimeThreadOpenSnapshot {
-            name: None,
             native_thread_id,
             cwd: Some(params.cwd),
             model: params.model,

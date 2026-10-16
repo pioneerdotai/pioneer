@@ -2078,7 +2078,6 @@ impl CLIAgentRuntimeSession for CodexCLIAgentRuntimeSession {
         .context("Codex isolated thread/start failed")?;
         continuation.bound_native_thread_id = Some(opened.native_thread_id.clone());
         Ok(CLIAgentRuntimeThreadOpenSnapshot {
-            name: opened.name,
             native_thread_id: opened.native_thread_id,
             cwd: opened.cwd,
             model: opened.model,
@@ -2126,7 +2125,6 @@ impl CLIAgentRuntimeSession for CodexCLIAgentRuntimeSession {
         .context("Codex isolated thread/resume failed")?;
         continuation.bound_native_thread_id = Some(opened.native_thread_id.clone());
         Ok(CLIAgentRuntimeThreadOpenSnapshot {
-            name: opened.name,
             native_thread_id: opened.native_thread_id,
             cwd: opened.cwd,
             model: opened.model,

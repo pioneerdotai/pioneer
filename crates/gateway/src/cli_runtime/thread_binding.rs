@@ -2009,7 +2009,16 @@ where
     Ok(CLIAgentRuntimeThreadBindingOpenResult {
         binding,
         mode,
-        name: opened.name,
+        // Keep Codex metadata out of the shared snapshot required by other
+        // runtime adapters. The decoder also checks the exact native identity.
+        name: (request.runtime_kind == "codex")
+            .then(|| {
+                pioneer_cli_agent_runtime::codex::thread_open_name(
+                    &opened.raw,
+                    &opened.native_thread_id,
+                )
+            })
+            .flatten(),
     })
 }
 
@@ -2239,7 +2248,6 @@ mod tests {
 
     fn open_snapshot(native_thread_id: &str) -> CLIAgentRuntimeThreadOpenSnapshot {
         CLIAgentRuntimeThreadOpenSnapshot {
-            name: None,
             native_thread_id: native_thread_id.to_owned(),
             cwd: Some("/tmp/project".to_owned()),
             model: Some("gpt-5".to_owned()),
@@ -2681,7 +2689,8 @@ mod tests {
     async fn cli_runtime_binding_first_start_persists_thread_binding() {
         let (_connection, store) = setup_store().await;
         let client = FakeCliRuntimeThreadClient::new();
-        client.start_result.lock().unwrap().as_mut().unwrap().name = Some("Opened title".into());
+        client.start_result.lock().unwrap().as_mut().unwrap().raw["thread"]["name"] =
+            json!("Opened title");
 
         let result =
             open_cli_runtime_thread_binding(&store, &client, open_request("thread_cli_a", 100))

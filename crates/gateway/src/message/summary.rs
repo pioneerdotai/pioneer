@@ -98,6 +98,13 @@ fn title_cli_instance(
         .find(|instance| instance.id == id)
         .context("selected CLI title instance is unavailable")?;
     ensure!(instance.enabled, "selected CLI title instance is disabled");
+    ensure!(
+        matches!(
+            instance.kind,
+            GatewayCliAgentRuntimeKindConfig::Codex | GatewayCliAgentRuntimeKindConfig::Claude
+        ),
+        "selected CLI runtime does not support isolated title generation"
+    );
     Ok(Some(instance))
 }
 
@@ -137,46 +144,43 @@ async fn generate_cli_title(
     let timeout = std::time::Duration::from_millis(instance.request_timeout_ms);
     // These are fresh nonpersistent service contexts, never the user's session.
     // No compaction prompt, runner, lifecycle, or visible Pioneer turn is used.
-    let result = match instance.kind {
-        GatewayCliAgentRuntimeKindConfig::Codex => {
-            let service = CodexService::new(CodexServiceConfig {
-                executable: instance.binary_path,
-                home_path: instance.home_path,
-                environment,
-            });
-            service
-                .summarize(
-                    CodexServiceRequest {
-                        model: model.into(),
-                        effort: None,
-                        instructions: title_instructions().into(),
-                        input: prompt,
-                    },
-                    timeout,
-                )
-                .await
-                .map(|result| (result.text, result.observed_usage))
-        }
-        GatewayCliAgentRuntimeKindConfig::Claude => {
-            let service = ClaudeService::new(ClaudeServiceConfig {
-                executable: instance.binary_path,
-                config_dir: instance.home_path,
-                environment,
-            });
-            service
-                .summarize(
-                    ClaudeServiceRequest {
-                        model: model.into(),
-                        effort: None,
-                        instructions: title_instructions().into(),
-                        input: prompt,
-                        output_cap: claude_output_cap,
-                    },
-                    timeout,
-                )
-                .await
-                .map(|result| (result.text, result.observed_usage))
-        }
+    let result = if codex {
+        let service = CodexService::new(CodexServiceConfig {
+            executable: instance.binary_path,
+            home_path: instance.home_path,
+            environment,
+        });
+        service
+            .summarize(
+                CodexServiceRequest {
+                    model: model.into(),
+                    effort: None,
+                    instructions: title_instructions().into(),
+                    input: prompt,
+                },
+                timeout,
+            )
+            .await
+            .map(|result| (result.text, result.observed_usage))
+    } else {
+        let service = ClaudeService::new(ClaudeServiceConfig {
+            executable: instance.binary_path,
+            config_dir: instance.home_path,
+            environment,
+        });
+        service
+            .summarize(
+                ClaudeServiceRequest {
+                    model: model.into(),
+                    effort: None,
+                    instructions: title_instructions().into(),
+                    input: prompt,
+                    output_cap: claude_output_cap,
+                },
+                timeout,
+            )
+            .await
+            .map(|result| (result.text, result.observed_usage))
     };
     let raw = match &result {
         Ok((_, raw)) => Some(raw),

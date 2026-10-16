@@ -137,7 +137,6 @@ pub(crate) struct CLIAgentRuntimeThreadOpenParams {
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct CLIAgentRuntimeThreadOpenSnapshot {
-    pub name: Option<String>,
     pub native_thread_id: String,
     pub cwd: Option<String>,
     pub model: Option<String>,

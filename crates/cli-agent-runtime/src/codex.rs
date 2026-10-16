@@ -4328,6 +4328,19 @@ struct CodexThreadGoalClearResponse {
     cleared: bool,
 }
 
+/// Read the optional Codex Thread.name only for the exact opened thread.
+pub fn thread_open_name(raw: &JsonValue, native_thread_id: &str) -> Option<String> {
+    // Codex 0.144.1 / 0.159.2 Thread.name is nullable. Invalid metadata
+    // must not break opening the working session.
+    (raw.pointer("/thread/id").and_then(JsonValue::as_str) == Some(native_thread_id))
+        .then(|| {
+            raw.pointer("/thread/name")
+                .and_then(JsonValue::as_str)
+                .map(str::to_owned)
+        })
+        .flatten()
+}
+
 fn decode_codex_thread_open_response(
     method: &str,
     raw: JsonValue,
@@ -4360,16 +4373,7 @@ fn decode_codex_thread_open_response(
         })?;
 
     Ok(CodexThreadOpenSnapshot {
-        // Codex 0.144.1 / 0.159.2 Thread.name is nullable. Invalid metadata
-        // must not break opening the working session.
-        name: (raw.pointer("/thread/id").and_then(JsonValue::as_str)
-            == Some(native_thread_id.as_str()))
-        .then(|| {
-            raw.pointer("/thread/name")
-                .and_then(JsonValue::as_str)
-                .map(str::to_owned)
-        })
-        .flatten(),
+        name: thread_open_name(&raw, &native_thread_id),
         native_thread_id,
         cwd: cwd_from_thread.or(cwd),
         model: model_from_thread.or(model),
@@ -10161,6 +10165,7 @@ while read line; do :; done
             .expect("thread start task should join")
             .expect("thread start should succeed");
         assert_eq!(snapshot.name.as_deref(), Some("Название Codex"));
+        assert!(thread_open_name(&snapshot.raw, "another-native-thread").is_none());
         for name in [JsonValue::Null, json!(17), json!({"invalid":true})] {
             let opened = decode_codex_thread_open_response(
                 "thread/start",

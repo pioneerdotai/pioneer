@@ -858,7 +858,6 @@ impl CLIAgentRuntimeSession for RecordingCliRuntimeSession {
                 }
             });
         Ok(CLIAgentRuntimeThreadOpenSnapshot {
-            name: None,
             native_thread_id: native_thread_id.clone(),
             cwd: Some(params.cwd.clone()),
             model: params.model.clone(),
@@ -883,7 +882,6 @@ impl CLIAgentRuntimeSession for RecordingCliRuntimeSession {
             .await
             .push((native_thread_id.to_owned(), params.clone()));
         Ok(CLIAgentRuntimeThreadOpenSnapshot {
-            name: None,
             native_thread_id: native_thread_id.to_owned(),
             cwd: Some(params.cwd.clone()),
             model: params.model.clone(),
