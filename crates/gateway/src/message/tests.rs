@@ -3648,7 +3648,10 @@ impl Provider for CancellationBarrierProvider {
             input_types: ProviderInputCapabilities::fallback_for_all_file_types(),
         }
     }
-    async fn chat(&self, _request: ChatRequest) -> anyhow::Result<ChatResponse> {
+    async fn chat(&self, request: ChatRequest) -> anyhow::Result<ChatResponse> {
+        if is_turn_preflight_request(&request) {
+            return Ok(test_turn_preflight_response_with_visible_tools(&[]));
+        }
         self.entered.notify_one();
         self.release.notified().await;
         Ok(ChatResponse {
@@ -57581,6 +57584,44 @@ async fn assert_turn_cancel_with_optional_busy_native_actor(
                 .await
                 .unwrap()
         );
+        ensure_test_native_snapshot_owner(&processor, &workspace_id, thread_id, turn_id).await;
+        let security = test_full_access_execution_security_snapshot().unwrap();
+        assert!(
+            crud_store_for_assert
+                .set_turn_execution_security_snapshot(turn_id, &security)
+                .await
+                .unwrap()
+        );
+        processor
+            .persist_turn_runtime_snapshot(
+                thread_id,
+                &workspace_id,
+                turn_id,
+                if with_effects {
+                    ThreadMode::Agent
+                } else {
+                    ThreadMode::Chat
+                },
+                &pioneer_agent::AgentTurnHookRuntimeContext::default(),
+                "test-model",
+                "delayed",
+                None,
+                &HashMap::new(),
+                &turn_outcome.materialization.input,
+                &[],
+                &[],
+                &HashMap::new(),
+                &[],
+                &[],
+                &pioneer_skills::SkillCatalogSnapshot {
+                    version: 1,
+                    generated_at_unix: 0,
+                    skills: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .unwrap();
         for cycle in 0..if resume_direct { 2 } else { 1 } {
             processor
                 .agent_manager
@@ -57592,35 +57633,37 @@ async fn assert_turn_cancel_with_optional_busy_native_actor(
                 .ensure_agent_listener_task(thread_id)
                 .await
                 .unwrap();
+            let checkpoint = if cycle == 0 {
+                None
+            } else {
+                let stored = crud_store_for_assert
+                    .native_semantic_checkpoint_for_turn(turn_id)
+                    .await
+                    .unwrap()
+                    .expect("resumed cancellation keeps its actual semantic state");
+                let payload: pioneer_protocol::ExecutionCheckpointPayload =
+                    serde_json::from_value(stored.payload_json).unwrap();
+                Some(pioneer_agent::ExecutionCheckpointContext {
+                    window_id: payload.window.window_id.clone().unwrap(),
+                    window_index: payload.window.window_index,
+                    checkpoint_id: stored.id,
+                    checkpoint_kind: "semantic_state".into(),
+                    payload,
+                    usage: crate::turn_runtime_snapshot::execution_window_usage_snapshot(
+                        crud_store_for_assert.as_ref(),
+                        turn_id,
+                    )
+                    .await
+                    .unwrap(),
+                })
+            };
             processor
-                .agent_manager
-                .start_turn_with_hook_context_permission_profile_and_security_snapshot(
+                .start_admitted_native_snapshot_turn(
                     thread_id,
                     turn_id,
-                    if with_effects {
-                        ThreadMode::Agent
-                    } else {
-                        ThreadMode::Chat
-                    },
-                    pioneer_agent::AgentTurnHookRuntimeContext::default(),
-                    "test-model",
-                    "delayed",
-                    HashMap::new(),
-                    pioneer_skills::SkillCatalogSnapshot {
-                        version: 1,
-                        generated_at_unix: 0,
-                        skills: Vec::new(),
-                    },
-                    vec![UserInput::Text {
-                        text: "hello".to_owned(),
-                        text_elements: Vec::new(),
-                    }],
-                    Vec::new(),
-                    Vec::new(),
-                    HashMap::new(),
-                    Vec::new(),
                     default_test_permission_profile(),
-                    test_full_access_execution_security_snapshot(),
+                    security.clone(),
+                    checkpoint,
                 )
                 .await
                 .unwrap();
