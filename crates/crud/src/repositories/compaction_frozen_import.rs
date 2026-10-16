@@ -417,16 +417,16 @@ async fn prepare_preview_archive_guards(
         return Ok(None);
     };
     let row=store.connection.query_one_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-        "SELECT r.reference_json,r.archive_wire_sha256,m.reference_json AS output_json FROM html_preview_frozen_result r JOIN compaction_frozen_history h ON h.id=r.manifest_id JOIN compaction_frozen_message m ON m.manifest_id=r.manifest_id AND m.ordinal=r.ordinal WHERE r.manifest_id=?1 AND r.ordinal=?2 AND h.workspace_id=?3 AND h.owner_thread=?4 AND h.ready=1 AND h.expired=0 AND r.source_id=?5 AND r.source_version=?6 AND length(CAST(r.reference_json AS BLOB))<=262144 AND m.bytes BETWEEN 0 AND 262144 AND length(CAST(m.reference_json AS BLOB))=m.bytes",
+        "SELECT r.reference_json,r.archive_wire_sha256,m.reference_json AS output_reference_json FROM html_preview_frozen_result r JOIN compaction_frozen_history h ON h.id=r.manifest_id JOIN compaction_frozen_message m ON m.manifest_id=r.manifest_id AND m.ordinal=r.ordinal WHERE r.manifest_id=?1 AND r.ordinal=?2 AND h.workspace_id=?3 AND h.owner_thread=?4 AND h.ready=1 AND h.expired=0 AND r.source_id=?5 AND r.source_version=?6 AND length(CAST(r.reference_json AS BLOB))<=262144 AND m.bytes BETWEEN 0 AND 262144 AND length(CAST(m.reference_json AS BLOB))=m.bytes",
         vec![record.output_manifest.clone().into(),i64::try_from(record.output_ordinal)?.into(),workspace.into(),record.source_thread.clone().into(),record.source.id.clone().into(),record.source.version.clone().into()])).await?
         .ok_or_else(||anyhow::anyhow!("archival preview grant receipt is unavailable"))?;
     let json: String = row.try_get("", "reference_json")?;
     let original: FrozenMessageRef = serde_json::from_str(&json)?;
     original.validate()?;
-    let output_json: String = row.try_get("", "output_json")?;
-    let output: FrozenMessageRef = serde_json::from_str(&output_json)?;
+    let output_reference_json: String = row.try_get("", "output_reference_json")?;
+    let output_reference: FrozenMessageRef = serde_json::from_str(&output_reference_json)?;
     ensure!(
-        original == output,
+        original == output_reference,
         "archival preview receipt/output mismatch"
     );
     let revision = record
@@ -458,7 +458,7 @@ async fn prepare_preview_archive_guards(
         record.source_thread.clone().into(),
         json.into(),
         projection.wire_sha256.clone().into(),
-        output_json.into(),
+        output_reference_json.into(),
     ];
     let historical = Statement::from_sql_and_values(DbBackend::Sqlite, common, values.clone());
     let mut current_values = values;
