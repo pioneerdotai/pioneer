@@ -115,6 +115,14 @@ The generated contract matches this exact worktree pair: `rust_source_sha256` is
 
 Post-generation static review includes both complete repository diffs and comparison against snapshots taken before this correction, plus `git diff --check` in both worktrees. The final `check-source` was repeated after all edits and returned `Client source contract: matched`. No generator input files were edited. No tests, typecheck, heavy compilation or migrations were run in this pass; previous compilation feature requirements, baseline TypeScript diagnostics and performance/runtime verification limitations documented elsewhere in this report still apply. Source-contract matching does not constitute runtime testing or external acceptance.
 
+## CI fixture follow-up
+
+The Linux [CI run for PR #107](https://github.com/pioneerdotai/pioneer/actions/runs/38905121168/job/116986642517) stopped in all nine CRUD inbox integration cases at the common fixture setup: its short workspace ID violated `ck_workspace_membership_ids`. No inbox assertions ran in those cases. The same remote run completed the client refresh regressions and the CRUD page/count query-plan regression successfully.
+
+The CRUD fixture now uses 21-character alphanumeric workspace/thread IDs throughout its related rows, scope lookups and assertions. Static schema review also found a nonexistent `workspace_id` column in the `thread_membership` inserts in both the CRUD fixture and the Gateway inbox fixture; those inserts now use the actual membership columns. Production queries, authorization, migrations and delivery behavior are unchanged. The existing migrated CHECK constraints remain intact.
+
+Local follow-up checks are limited to Rust formatting, diff review/`git diff --check` and source-contract matching. Neither local `cargo check` nor local tests or SQL fixture execution were run for this fix, as requested. The updated cases still need the next remote CI run.
+
 ## Reviewer-only test commands
 
 Run only after full external review and explicit acceptance by the originating-thread reviewer:

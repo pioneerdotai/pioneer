@@ -49,11 +49,13 @@ async fn fixture(before: bool) -> (tempfile::TempDir, CrudStore, SqliteWriteExec
         .await
         .unwrap();
     let db = store.with_maintenance_access().database_connection();
+    // ACL membership tables enforce 21-character alphanumeric IDs. Keep the
+    // fixture relationships valid without relaxing the migrated schema.
     for sql in [
-        "INSERT INTO workspace(id,name,is_active,is_current) VALUES('ws','Inbox',1,1),('other','Other',1,0)",
-        "INSERT INTO thread(id,workspace_id,name,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES('public','ws','Public thread','','agent','m','p','active','user','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP),('private','ws','Private thread','','agent','m','p','active','user','private',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP),('internal','ws',NULL,'','agent','m','p','active','task_run','internal',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
-        "INSERT INTO workspace_membership(principal_id,workspace_id,granted_by_actor_kind,created_at,updated_at) VALUES('P0000000000000000000A','ws','system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP),('P0000000000000000000B','ws','system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
-        "INSERT INTO thread_membership(principal_id,thread_id,workspace_id,added_by_actor_kind,created_at,updated_at) VALUES('P0000000000000000000A','private','ws','system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP),('P0000000000000000000B','private','ws','system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        "INSERT INTO workspace(id,name,is_active,is_current) VALUES('W0000000000000000000I','Inbox',1,1),('W0000000000000000000O','Other',1,0)",
+        "INSERT INTO thread(id,workspace_id,name,preview,mode,model,model_provider,status,origin_kind,access_class,created_at,updated_at) VALUES('T0000000000000000000P','W0000000000000000000I','Public thread','','agent','m','p','active','user','workspace',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP),('T0000000000000000000V','W0000000000000000000I','Private thread','','agent','m','p','active','user','private',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP),('T0000000000000000000I','W0000000000000000000I',NULL,'','agent','m','p','active','task_run','internal',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        "INSERT INTO workspace_membership(principal_id,workspace_id,granted_by_actor_kind,created_at,updated_at) VALUES('P0000000000000000000A','W0000000000000000000I','system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP),('P0000000000000000000B','W0000000000000000000I','system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        "INSERT INTO thread_membership(principal_id,thread_id,added_by_actor_kind,created_at,updated_at) VALUES('P0000000000000000000A','T0000000000000000000V','system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP),('P0000000000000000000B','T0000000000000000000V','system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
     ] {
         db.execute_unprepared(sql).await.unwrap();
     }
@@ -61,7 +63,7 @@ async fn fixture(before: bool) -> (tempfile::TempDir, CrudStore, SqliteWriteExec
 }
 fn access(principal: &str) -> TaskCompletionInboxAccess<'_> {
     TaskCompletionInboxAccess {
-        workspace_id: "ws",
+        workspace_id: "W0000000000000000000I",
         principal_id: principal,
         absolute: false,
     }
@@ -77,7 +79,7 @@ async fn task(
 ) {
     let db = store.with_maintenance_access().database_connection();
     db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-        "INSERT INTO task(id,workspace_id,owner_kind,owner_id,created_by_thread_id,root_task_id,executor_kind,status,title,goal,priority,delivery_policy_json,lifecycle_policy_json,revision,created_at,updated_at) VALUES(?,'ws','workspace','ws',?,?,?,'completed','Task title','Goal',0,?,?,1,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+        "INSERT INTO task(id,workspace_id,owner_kind,owner_id,created_by_thread_id,root_task_id,executor_kind,status,title,goal,priority,delivery_policy_json,lifecycle_policy_json,revision,created_at,updated_at) VALUES(?,'W0000000000000000000I','workspace','W0000000000000000000I',?,?,?,'completed','Task title','Goal',0,?,?,1,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
         [id.into(),thread.into(),root.into(),executor.into(),serde_json::json!({"mode":mode,"includeResult":true,"format":"summary"}).to_string().into(),serde_json::json!({"attachment":attachment,"onParentCancel":"cancel","onParentFailure":"cancel","completion":"complete_on_terminal_run"}).to_string().into()])).await.unwrap();
 }
 async fn run(store: &CrudStore, id: &str, task: &str, status: &str, number: i64) {
@@ -128,7 +130,7 @@ async fn terminal_statuses_policies_executors_attachment_and_recurring_runs_shar
             task(
                 &store,
                 &id,
-                Some("public"),
+                Some("T0000000000000000000P"),
                 None,
                 ["agent", "tool", "workflow", "webhook", "system"][ix % 5],
                 mode,
@@ -152,7 +154,7 @@ async fn terminal_statuses_policies_executors_attachment_and_recurring_runs_shar
         .await
         .unwrap();
     assert_eq!(page.len() as u64, expected);
-    assert!(page.iter().all(|e| e.thread_id == "public"
+    assert!(page.iter().all(|e| e.thread_id == "T0000000000000000000P"
         && e.summary.as_deref() == Some("summary")
         && e.completed_at == 1792144800));
     assert_eq!(page.iter().filter(|e| e.task_id == "task-0-0").count(), 2);
@@ -183,7 +185,7 @@ async fn personal_reads_survive_reopen_and_acl_revocation_removes_list_count_get
     task(
         &store,
         "root",
-        Some("private"),
+        Some("T0000000000000000000V"),
         None,
         "agent",
         "none",
@@ -193,7 +195,7 @@ async fn personal_reads_survive_reopen_and_acl_revocation_removes_list_count_get
     task(
         &store,
         "child",
-        Some("public"),
+        Some("T0000000000000000000P"),
         Some("root"),
         "system",
         "webhook",
@@ -210,12 +212,19 @@ async fn personal_reads_survive_reopen_and_acl_revocation_removes_list_count_get
     run(&store, "run", "child", "blocked", 1).await;
     assert_eq!(unread(&store, A).await, 1);
     assert_eq!(unread(&store, B).await, 1);
-    let scope =
-        resolve_task_authorization_scope(&store.database_connection(), "child", Some("ws"), None)
-            .await
-            .unwrap()
-            .unwrap();
-    assert_eq!(scope.root_thread_id.as_deref(), Some("private"));
+    let scope = resolve_task_authorization_scope(
+        &store.database_connection(),
+        "child",
+        Some("W0000000000000000000I"),
+        None,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        scope.root_thread_id.as_deref(),
+        Some("T0000000000000000000V")
+    );
     read(&store, A, "run").await;
     read(&store, A, "run").await;
     assert_eq!(unread(&store, A).await, 0);
@@ -242,7 +251,7 @@ async fn personal_reads_survive_reopen_and_acl_revocation_removes_list_count_get
             .read_at
             .is_some()
     );
-    store.database_connection().execute_unprepared("DELETE FROM thread_membership WHERE principal_id='P0000000000000000000B' AND thread_id='private'").await.unwrap();
+    store.database_connection().execute_unprepared("DELETE FROM thread_membership WHERE principal_id='P0000000000000000000B' AND thread_id='T0000000000000000000V'").await.unwrap();
     assert_eq!(unread(&store, B).await, 0);
     assert!(
         list_task_completion_inbox(&store.database_connection(), &access(B), None, 30)
@@ -288,7 +297,7 @@ async fn time_and_id_seek_pages_are_stable_and_total_unread_is_not_page_size() {
     task(
         &store,
         "recurring",
-        Some("public"),
+        Some("T0000000000000000000P"),
         None,
         "tool",
         "none",
@@ -341,7 +350,7 @@ async fn time_and_id_seek_pages_are_stable_and_total_unread_is_not_page_size() {
     assert_eq!(third.len(), 5);
     assert_eq!(unread(&store, A).await, 65);
     let foreign = TaskCompletionInboxAccess {
-        workspace_id: "other",
+        workspace_id: "W0000000000000000000O",
         principal_id: A,
         absolute: true,
     };
@@ -359,7 +368,7 @@ async fn migration_preserves_legacy_acknowledgement_only_for_its_exact_recipient
     task(
         &store,
         "task",
-        Some("public"),
+        Some("T0000000000000000000P"),
         None,
         "agent",
         "user_notification",
@@ -368,12 +377,12 @@ async fn migration_preserves_legacy_acknowledgement_only_for_its_exact_recipient
     .await;
     run(&store, "run", "task", "succeeded", 1).await;
     let db = store.with_maintenance_access().database_connection();
-    db.execute_unprepared("INSERT INTO task_delivery(id,workspace_id,task_id,run_id,delivery_key,mode,target_user_id,status,attempt_count,max_attempts,created_at,updated_at) VALUES('delivery','ws','task','run','delivery-key','user_notification','P0000000000000000000A','delivered',1,1,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)").await.unwrap();
-    db.execute_unprepared("INSERT INTO user_notification_outbox(id,task_delivery_id,workspace_id,recipient_principal_id,task_id,run_id,payload_json,status,created_at,delivered_at,acknowledged_at) VALUES('legacy','delivery','ws','P0000000000000000000A','task','run','{}','acknowledged',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)").await.unwrap();
+    db.execute_unprepared("INSERT INTO task_delivery(id,workspace_id,task_id,run_id,delivery_key,mode,target_user_id,status,attempt_count,max_attempts,created_at,updated_at) VALUES('delivery','W0000000000000000000I','task','run','delivery-key','user_notification','P0000000000000000000A','delivered',1,1,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)").await.unwrap();
+    db.execute_unprepared("INSERT INTO user_notification_outbox(id,task_delivery_id,workspace_id,recipient_principal_id,task_id,run_id,payload_json,status,created_at,delivered_at,acknowledged_at) VALUES('legacy','delivery','W0000000000000000000I','P0000000000000000000A','task','run','{}','acknowledged',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)").await.unwrap();
     // A second delivery/outbox record for the same run is not a second card,
     // and its missing acknowledgement cannot undo an exact saved receipt.
-    db.execute_unprepared("INSERT INTO task_delivery(id,workspace_id,task_id,run_id,delivery_key,mode,target_user_id,status,attempt_count,max_attempts,created_at,updated_at) VALUES('delivery-duplicate','ws','task','run','duplicate-key','user_notification','P0000000000000000000A','delivered',1,1,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)").await.unwrap();
-    db.execute_unprepared("INSERT INTO user_notification_outbox(id,task_delivery_id,workspace_id,recipient_principal_id,task_id,run_id,payload_json,status,created_at,delivered_at) VALUES('unread-duplicate','delivery-duplicate','ws','P0000000000000000000A','task','run','{}','delivered',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)").await.unwrap();
+    db.execute_unprepared("INSERT INTO task_delivery(id,workspace_id,task_id,run_id,delivery_key,mode,target_user_id,status,attempt_count,max_attempts,created_at,updated_at) VALUES('delivery-duplicate','W0000000000000000000I','task','run','duplicate-key','user_notification','P0000000000000000000A','delivered',1,1,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)").await.unwrap();
+    db.execute_unprepared("INSERT INTO user_notification_outbox(id,task_delivery_id,workspace_id,recipient_principal_id,task_id,run_id,payload_json,status,created_at,delivered_at) VALUES('unread-duplicate','delivery-duplicate','W0000000000000000000I','P0000000000000000000A','task','run','{}','delivered',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)").await.unwrap();
     writer
         .run_migrations::<Migrator>(SqliteWriteClass::Maintenance, None)
         .await
@@ -401,8 +410,8 @@ async fn migration_preserves_legacy_acknowledgement_only_for_its_exact_recipient
         .unwrap();
     assert_eq!(unread(&store, A).await, 0);
     // Older devices acknowledging after migration are accounted for too.
-    db.execute_unprepared("INSERT INTO task_delivery(id,workspace_id,task_id,run_id,delivery_key,mode,target_user_id,status,attempt_count,max_attempts,created_at,updated_at) VALUES('delivery-b','ws','task','run','delivery-key-b','user_notification','P0000000000000000000B','delivered',1,1,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)").await.unwrap();
-    db.execute_unprepared("INSERT INTO user_notification_outbox(id,task_delivery_id,workspace_id,recipient_principal_id,task_id,run_id,payload_json,status,created_at,delivered_at,acknowledged_at) VALUES('late','delivery-b','ws','P0000000000000000000B','task','run','{}','acknowledged',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)").await.unwrap();
+    db.execute_unprepared("INSERT INTO task_delivery(id,workspace_id,task_id,run_id,delivery_key,mode,target_user_id,status,attempt_count,max_attempts,created_at,updated_at) VALUES('delivery-b','W0000000000000000000I','task','run','delivery-key-b','user_notification','P0000000000000000000B','delivered',1,1,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)").await.unwrap();
+    db.execute_unprepared("INSERT INTO user_notification_outbox(id,task_delivery_id,workspace_id,recipient_principal_id,task_id,run_id,payload_json,status,created_at,delivered_at,acknowledged_at) VALUES('late','delivery-b','W0000000000000000000I','P0000000000000000000B','task','run','{}','acknowledged',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)").await.unwrap();
     assert_eq!(unread(&store, B).await, 0);
 }
 
@@ -410,11 +419,11 @@ async fn migration_preserves_legacy_acknowledgement_only_for_its_exact_recipient
 async fn internal_origin_turn_provenance_and_admission_use_the_same_task_scope() {
     let (_dir, store, _writer) = fixture(false).await;
     let db = store.database_connection();
-    db.execute_unprepared("INSERT INTO thread_lineage(child_thread_id,parent_thread_id,root_thread_id,depth,created_at) VALUES('internal','private','private',1,CURRENT_TIMESTAMP)").await.unwrap();
+    db.execute_unprepared("INSERT INTO thread_lineage(child_thread_id,parent_thread_id,root_thread_id,depth,created_at) VALUES('T0000000000000000000I','T0000000000000000000V','T0000000000000000000V',1,CURRENT_TIMESTAMP)").await.unwrap();
     task(
         &store,
         "causal",
-        Some("internal"),
+        Some("T0000000000000000000I"),
         None,
         "system",
         "none",
@@ -422,20 +431,24 @@ async fn internal_origin_turn_provenance_and_admission_use_the_same_task_scope()
     )
     .await;
     run(&store, "causal-run", "causal", "cancelled", 1).await;
-    let scope = resolve_task_authorization_scope(&db, "causal", Some("ws"), None)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(scope.root_thread_id.as_deref(), Some("private"));
+    let scope =
+        resolve_task_authorization_scope(&db, "causal", Some("W0000000000000000000I"), None)
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(
+        scope.root_thread_id.as_deref(),
+        Some("T0000000000000000000V")
+    );
     assert_eq!(
         find_task_completion_inbox_entry(&db, &access(A), "causal-run")
             .await
             .unwrap()
             .unwrap()
             .thread_id,
-        "private"
+        "T0000000000000000000V"
     );
-    db.execute_unprepared("INSERT INTO task_execution_admission(task_id,workspace_id,root_thread_id,initiating_principal_id,authorization_context_json,created_at) VALUES('causal','ws','public','P0000000000000000000A','{}',CURRENT_TIMESTAMP)").await.unwrap();
+    db.execute_unprepared("INSERT INTO task_execution_admission(task_id,workspace_id,root_thread_id,initiating_principal_id,authorization_context_json,created_at) VALUES('causal','W0000000000000000000I','T0000000000000000000P','P0000000000000000000A','{}',CURRENT_TIMESTAMP)").await.unwrap();
     assert!(
         resolve_task_authorization_scope(&db, "causal", None, None)
             .await
@@ -454,7 +467,7 @@ async fn internal_origin_turn_provenance_and_admission_use_the_same_task_scope()
         .unwrap();
     // A creator turn is authoritative even without created_by_thread_id, and
     // contradicting that turn cannot redirect the inbox to a public thread.
-    db.execute_unprepared("INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES('creator','private','completed','conversation','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)").await.unwrap();
+    db.execute_unprepared("INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES('creator','T0000000000000000000V','completed','conversation','user',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)").await.unwrap();
     task(&store, "turn-only", None, None, "tool", "none", "attached").await;
     db.execute_unprepared("UPDATE task SET created_by_turn_id='creator' WHERE id='turn-only'")
         .await
@@ -466,11 +479,13 @@ async fn internal_origin_turn_provenance_and_admission_use_the_same_task_scope()
             .unwrap()
             .unwrap()
             .thread_id,
-        "private"
+        "T0000000000000000000V"
     );
-    db.execute_unprepared("UPDATE task SET created_by_thread_id='public' WHERE id='turn-only'")
-        .await
-        .unwrap();
+    db.execute_unprepared(
+        "UPDATE task SET created_by_thread_id='T0000000000000000000P' WHERE id='turn-only'",
+    )
+    .await
+    .unwrap();
     assert!(
         resolve_task_authorization_scope(&db, "turn-only", None, None)
             .await
@@ -491,7 +506,7 @@ async fn scheduled_and_recurring_trigger_history_does_not_depend_on_current_task
     task(
         &store,
         "recurring",
-        Some("public"),
+        Some("T0000000000000000000P"),
         None,
         "agent",
         "none",
@@ -546,7 +561,7 @@ async fn same_run_updates_preserve_personal_read_and_list_projection_is_bounded(
     task(
         &store,
         "task",
-        Some("public"),
+        Some("T0000000000000000000P"),
         None,
         "agent",
         "none",
@@ -617,7 +632,7 @@ async fn an_unloaded_old_payload_is_not_parsed_to_return_a_metadata_page_or_tota
     task(
         &store,
         "task",
-        Some("public"),
+        Some("T0000000000000000000P"),
         None,
         "agent",
         "none",
@@ -648,7 +663,7 @@ async fn an_unloaded_old_payload_is_not_parsed_to_return_a_metadata_page_or_tota
 async fn empty_and_small_workspaces_page_independently_of_large_foreign_history() {
     let (_dir, store, _writer) = fixture(false).await;
     let db = store.with_maintenance_access().database_connection();
-    db.execute_unprepared("INSERT INTO task(id,workspace_id,owner_kind,owner_id,executor_kind,status,title,goal,priority,revision,created_at,updated_at) VALUES('foreign-task','other','workspace','other','system','completed','Foreign','Goal',0,1,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)").await.unwrap();
+    db.execute_unprepared("INSERT INTO task(id,workspace_id,owner_kind,owner_id,executor_kind,status,title,goal,priority,revision,created_at,updated_at) VALUES('foreign-task','W0000000000000000000O','workspace','W0000000000000000000O','system','completed','Foreign','Goal',0,1,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)").await.unwrap();
     db.execute_unprepared("WITH RECURSIVE numbers(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM numbers WHERE n<4096) INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind,completed_at,result_json,created_at,updated_at) SELECT printf('foreign-%05d',n),'foreign-task',printf('foreign-%05d',n),1,n,'succeeded','system','2099-01-01 00:00:00 +00:00','foreign payload must not be decoded',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP FROM numbers").await.unwrap();
     // No tasks in the requested workspace: the outer workspace index seek
     // yields no run lookups, regardless of newer completions elsewhere.
@@ -667,7 +682,7 @@ async fn empty_and_small_workspaces_page_independently_of_large_foreign_history(
     task(
         &store,
         "local",
-        Some("public"),
+        Some("T0000000000000000000P"),
         None,
         "tool",
         "none",
@@ -718,7 +733,7 @@ async fn empty_and_small_workspaces_page_independently_of_large_foreign_history(
     task(
         &store,
         "hidden",
-        Some("private"),
+        Some("T0000000000000000000V"),
         None,
         "agent",
         "thread",
@@ -727,7 +742,7 @@ async fn empty_and_small_workspaces_page_independently_of_large_foreign_history(
     .await;
     run(&store, "private-run", "hidden", "succeeded", 1).await;
     read(&store, A, "local-2").await;
-    db.execute_unprepared("DELETE FROM thread_membership WHERE principal_id='P0000000000000000000A' AND thread_id='private'").await.unwrap();
+    db.execute_unprepared("DELETE FROM thread_membership WHERE principal_id='P0000000000000000000A' AND thread_id='T0000000000000000000V'").await.unwrap();
     db.execute_unprepared("UPDATE task_run SET status='running' WHERE id='local-3'")
         .await
         .unwrap();
