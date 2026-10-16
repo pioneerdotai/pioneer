@@ -140,22 +140,25 @@ pub async fn registration_receipt<C: ConnectionTrait>(
         rows.len() <= 1,
         "native artifact registration receipt is ambiguous"
     );
+    #[derive(serde::Deserialize)]
+    struct RegistrationMetadata {
+        native_registration_request_sha256: String,
+    }
     rows.into_iter()
         .next()
         .map(|row| {
             let metadata: Option<String> = row.try_get("", "metadata")?;
-            let metadata: serde_json::Value = serde_json::from_str(
+            let receipt: RegistrationMetadata = serde_json::from_str(
                 &metadata.context("artifact receipt metadata exceeds bound")?,
             )?;
-            let identity = metadata
-                .get("native_registration_request_sha256")
-                .and_then(serde_json::Value::as_str)
-                .filter(|s| {
-                    s.len() == 64
-                        && s.bytes()
-                            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-                })
-                .context("native artifact receipt request identity unavailable")?;
+            let identity = receipt.native_registration_request_sha256;
+            ensure!(
+                identity.len() == 64
+                    && identity
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+                "native artifact receipt request identity unavailable"
+            );
             Ok(NativeArtifactRegistrationReceipt {
                 artifact_id: row.try_get("", "artifact_id")?,
                 version_id: row.try_get("", "version_id")?,

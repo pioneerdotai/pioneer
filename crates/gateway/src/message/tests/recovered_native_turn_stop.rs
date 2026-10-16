@@ -350,6 +350,7 @@ async fn exercise(kind: TurnExecutorKind, scenario: Scenario, delivery_before_ro
     let calls = Arc::new(AtomicU64::new(0));
     let provider = Arc::new(RecoveryProvider {
         barrier: CancellationBarrierProvider {
+            name: "delayed",
             entered: entered.clone(),
             release: Arc::new(Notify::new()),
         },
