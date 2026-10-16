@@ -137,6 +137,7 @@ pub(crate) struct CLIAgentRuntimeThreadOpenParams {
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct CLIAgentRuntimeThreadOpenSnapshot {
+    pub name: Option<String>,
     pub native_thread_id: String,
     pub cwd: Option<String>,
     pub model: Option<String>,
@@ -522,6 +523,8 @@ impl CLIAgentRuntimeMachineRequestResponder {
 
 #[derive(Clone)]
 struct CLIAgentRuntimeCachedSession {
+    // Only this generation's metadata commits and retirement share this gate.
+    metadata_commit: Arc<Mutex<()>>,
     instance: CliSessionInstanceId,
     session: Arc<dyn CLIAgentRuntimeSession>,
     launch_spec: CliSessionLaunchSpec,
@@ -752,6 +755,7 @@ impl CLIAgentRuntimeManager {
             match sessions.entry(key.clone()) {
                 Entry::Vacant(entry) => {
                     entry.insert(CLIAgentRuntimeCachedSession {
+                        metadata_commit: Arc::new(Mutex::new(())),
                         instance: instance.clone(),
                         session: session.clone(),
                         launch_spec,
@@ -789,12 +793,16 @@ impl CLIAgentRuntimeManager {
     ) -> Result<bool> {
         let start_lock = self.start_lock_for_key(key).await;
         let _start_guard = start_lock.lock().await;
-        let stale = {
-            let mut sessions = self.sessions.lock().await;
-            let should_close = sessions
-                .get(key)
-                .is_some_and(|cached| cached.started_at_ms <= cutoff_ms);
-            should_close.then(|| sessions.remove(key)).flatten()
+        let candidate = self
+            .sessions
+            .lock()
+            .await
+            .get(key)
+            .filter(|cached| cached.started_at_ms <= cutoff_ms)
+            .map(|cached| cached.instance.clone());
+        let stale = match candidate {
+            Some(instance) => self.remove_session_instance(&instance).await,
+            None => None,
         };
         let Some(stale) = stale else {
             return Ok(false);
@@ -854,6 +862,24 @@ impl CLIAgentRuntimeManager {
             .map(CLIAgentRuntimeCachedSession::handle)
     }
 
+    /// Keep this instance current through a metadata commit, without retaining
+    /// the registry lock while waiting for the database or another commit.
+    pub(crate) async fn current_instance_guard(
+        &self,
+        instance: &CliSessionInstanceId,
+    ) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        let gate = {
+            let sessions = self.sessions.lock().await;
+            let cached = sessions.get(instance.key())?;
+            if cached.instance != *instance {
+                return None;
+            }
+            cached.metadata_commit.clone()
+        };
+        let guard = gate.lock_owned().await;
+        self.is_current_instance(instance).await.then_some(guard)
+    }
+
     pub(crate) async fn is_current_instance(&self, instance: &CliSessionInstanceId) -> bool {
         self.sessions
             .lock()
@@ -863,15 +889,7 @@ impl CLIAgentRuntimeManager {
     }
 
     pub(crate) async fn remove_if_generation(&self, instance: &CliSessionInstanceId) -> bool {
-        let removed = {
-            let mut sessions = self.sessions.lock().await;
-            let is_current = sessions
-                .get(instance.key())
-                .is_some_and(|cached| cached.instance == *instance);
-            is_current
-                .then(|| sessions.remove(instance.key()))
-                .flatten()
-        };
+        let removed = self.remove_session_instance(instance).await;
         if removed.is_some() {
             // Event-pump EOF means the provider side has already terminated.
             self.lifecycle.after_session_close(instance).await;
@@ -898,6 +916,7 @@ impl CLIAgentRuntimeManager {
         &self,
         instance: &CliSessionInstanceId,
     ) -> Option<CLIAgentRuntimeCachedSession> {
+        let _commit = self.current_instance_guard(instance).await?;
         let mut sessions = self.sessions.lock().await;
         let current = sessions.get(instance.key())?;
         if current.instance != *instance {
@@ -920,19 +939,29 @@ impl CLIAgentRuntimeManager {
 
     async fn close_idle_sessions_at(&self, now_ms: u64) -> Result<usize> {
         let ttl_ms = self.idle_session_ttl.as_millis() as u64;
-        let idle_sessions = {
+        let candidates = self
+            .sessions
+            .lock()
+            .await
+            .values()
+            .filter(|cached| now_ms.saturating_sub(cached.last_used_at_ms) >= ttl_ms)
+            .map(|cached| cached.instance.clone())
+            .collect::<Vec<_>>();
+        let mut idle_sessions = Vec::new();
+        for instance in candidates {
+            let Some(_commit) = self.current_instance_guard(&instance).await else {
+                continue;
+            };
             let mut sessions = self.sessions.lock().await;
-            let keys = sessions
-                .iter()
-                .filter_map(|(key, cached)| {
-                    let idle_for_ms = now_ms.saturating_sub(cached.last_used_at_ms);
-                    (idle_for_ms >= ttl_ms).then_some(key.clone())
-                })
-                .collect::<Vec<_>>();
-            keys.into_iter()
-                .filter_map(|key| sessions.remove(&key).map(|cached| (key, cached)))
-                .collect::<Vec<_>>()
-        };
+            // Touches may have happened while this generation's commit finished.
+            if sessions.get(instance.key()).is_some_and(|cached| {
+                cached.instance == instance
+                    && now_ms.saturating_sub(cached.last_used_at_ms) >= ttl_ms
+            }) && let Some(cached) = sessions.remove(instance.key())
+            {
+                idle_sessions.push((instance.key().clone(), cached));
+            }
+        }
 
         let closed_count = idle_sessions.len();
         let mut first_error = None;
@@ -958,7 +987,16 @@ impl CLIAgentRuntimeManager {
     pub(crate) async fn close_session(&self, key: &CLIAgentRuntimeSessionKey) -> Result<bool> {
         let start_lock = self.start_lock_for_key(key).await;
         let _start_guard = start_lock.lock().await;
-        let session = self.sessions.lock().await.remove(key);
+        let instance = self
+            .sessions
+            .lock()
+            .await
+            .get(key)
+            .map(|cached| cached.instance.clone());
+        let session = match instance {
+            Some(instance) => self.remove_session_instance(&instance).await,
+            None => None,
+        };
         let Some(cached) = session else {
             return Ok(false);
         };
@@ -983,15 +1021,7 @@ impl CLIAgentRuntimeManager {
     ) -> Result<bool> {
         let start_lock = self.start_lock_for_key(instance.key()).await;
         let _start_guard = start_lock.lock().await;
-        let cached = {
-            let mut sessions = self.sessions.lock().await;
-            let is_current = sessions
-                .get(instance.key())
-                .is_some_and(|cached| cached.instance == *instance);
-            is_current
-                .then(|| sessions.remove(instance.key()))
-                .flatten()
-        };
+        let cached = self.remove_session_instance(instance).await;
         let Some(cached) = cached else {
             return Ok(false);
         };
@@ -1013,10 +1043,19 @@ impl CLIAgentRuntimeManager {
 
     pub(crate) async fn close_all(&self) -> Result<usize> {
         self.lifecycle.shutdown_started().await;
-        let sessions = {
-            let mut sessions = self.sessions.lock().await;
-            sessions.drain().collect::<Vec<_>>()
-        };
+        let instances = self
+            .sessions
+            .lock()
+            .await
+            .values()
+            .map(|cached| cached.instance.clone())
+            .collect::<Vec<_>>();
+        let mut sessions = Vec::new();
+        for instance in instances {
+            if let Some(cached) = self.remove_session_instance(&instance).await {
+                sessions.push((instance.key().clone(), cached));
+            }
+        }
         self.start_locks.lock().await.clear();
 
         let closed_count = sessions.len();
@@ -1847,17 +1886,43 @@ mod tests {
             .get_or_start_with_options(key.clone(), CLIAgentRuntimeSessionStartOptions::default())
             .await
             .unwrap();
-        let replacement = manager
-            .get_or_start_with_options(
-                key.clone(),
-                CLIAgentRuntimeSessionStartOptions {
-                    approval_policy: Some("never".to_owned()),
-                    ..Default::default()
-                },
-            )
+        // Model a metadata write waiting for its SQL writer: retirement of A
+        // must wait, while unrelated session B remains fully accessible.
+        let commit = manager
+            .current_instance_guard(first.instance())
             .await
             .unwrap();
-
+        let mut replacement = Box::pin(manager.get_or_start_with_options(
+            key.clone(),
+            CLIAgentRuntimeSessionStartOptions {
+                approval_policy: Some("never".to_owned()),
+                ..Default::default()
+            },
+        ));
+        assert!(futures_util::poll!(&mut replacement).is_pending());
+        let other_key =
+            super::CLIAgentRuntimeSessionKey::new("workspace", "codex", "other").unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let other = manager.get_or_start(other_key.clone()).await.unwrap();
+            assert!(manager.existing_session(&other_key).await.is_some());
+            assert!(
+                manager
+                    .close_session_instance(other.instance())
+                    .await
+                    .unwrap()
+            );
+        })
+        .await
+        .unwrap();
+        assert!(manager.is_current_instance(first.instance()).await);
+        drop(commit);
+        let replacement = replacement.await.unwrap();
+        assert!(
+            manager
+                .current_instance_guard(first.instance())
+                .await
+                .is_none()
+        );
         assert!(!manager.remove_if_generation(first.instance()).await);
         let current = manager.existing_session(&key).await.unwrap();
         assert_eq!(current.instance(), replacement.instance());

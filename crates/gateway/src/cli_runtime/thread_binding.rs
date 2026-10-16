@@ -1880,6 +1880,7 @@ pub(crate) enum CLIAgentRuntimeThreadBindingOpenMode {
 
 #[derive(Debug, Clone)]
 pub(crate) struct CLIAgentRuntimeThreadBindingOpenResult {
+    pub name: Option<String>,
     pub binding: CliRuntimeThreadBindingRecord,
     pub mode: CLIAgentRuntimeThreadBindingOpenMode,
 }
@@ -2005,7 +2006,11 @@ where
             )
         })?;
 
-    Ok(CLIAgentRuntimeThreadBindingOpenResult { binding, mode })
+    Ok(CLIAgentRuntimeThreadBindingOpenResult {
+        binding,
+        mode,
+        name: opened.name,
+    })
 }
 
 fn generic_thread_binding_from_opened(
@@ -2234,6 +2239,7 @@ mod tests {
 
     fn open_snapshot(native_thread_id: &str) -> CLIAgentRuntimeThreadOpenSnapshot {
         CLIAgentRuntimeThreadOpenSnapshot {
+            name: None,
             native_thread_id: native_thread_id.to_owned(),
             cwd: Some("/tmp/project".to_owned()),
             model: Some("gpt-5".to_owned()),
@@ -2675,12 +2681,14 @@ mod tests {
     async fn cli_runtime_binding_first_start_persists_thread_binding() {
         let (_connection, store) = setup_store().await;
         let client = FakeCliRuntimeThreadClient::new();
+        client.start_result.lock().unwrap().as_mut().unwrap().name = Some("Opened title".into());
 
         let result =
             open_cli_runtime_thread_binding(&store, &client, open_request("thread_cli_a", 100))
                 .await
                 .expect("first open should succeed");
 
+        assert_eq!(result.name.as_deref(), Some("Opened title"));
         assert_eq!(result.mode, CLIAgentRuntimeThreadBindingOpenMode::Started);
         assert_eq!(result.binding.native_thread_id, "cli-thread-started");
         assert_eq!(result.binding.native_cwd.as_deref(), Some("/tmp/project"));

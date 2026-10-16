@@ -697,6 +697,51 @@ pub async fn update_thread_name_if_changed<C: ConnectionTrait>(
     Ok(true)
 }
 
+/// A single writer statement revalidates the title and, for native names, its
+/// exact durable owner at commit. No provider work happens under DB capacity.
+pub async fn update_automatic_thread_name<C: ConnectionTrait>(
+    db: &C,
+    thread_id: &str,
+    name: &str,
+    fallback: Option<&str>,
+    binding: Option<&crate::CliRuntimeThreadBindingRecord>,
+    updated_at: DateTimeWithTimeZone,
+) -> Result<bool> {
+    let mut sql = String::from(
+        "UPDATE thread SET name = ?, updated_at = ? WHERE id = ? \
+         AND (name IS NULL OR name = '' OR name = ?) AND (name IS NULL OR name != ?)",
+    );
+    let mut values: Vec<sea_orm::Value> = vec![
+        name.into(),
+        updated_at.into(),
+        thread_id.into(),
+        fallback.map(str::to_owned).into(),
+        name.into(),
+    ];
+    if let Some(binding) = binding {
+        sql.push_str(
+            " AND workspace_id = ? AND EXISTS (SELECT 1 FROM thread_cli_runtime_binding b \
+            WHERE b.thread_id = thread.id AND b.workspace_id = ? AND b.runtime_id = ? \
+            AND b.runtime_kind = 'codex' AND b.native_thread_id = ? AND b.status = 'active')",
+        );
+        values.extend([
+            binding.workspace_id.clone().into(),
+            binding.workspace_id.clone().into(),
+            binding.runtime_id.clone().into(),
+            binding.native_thread_id.clone().into(),
+        ]);
+    }
+    let result = db
+        .execute_raw(Statement::from_sql_and_values(
+            DatabaseBackend::Sqlite,
+            sql,
+            values,
+        ))
+        .await
+        .context("failed to accept automatic thread name")?;
+    Ok(result.rows_affected() > 0)
+}
+
 pub async fn update_thread_summary<C: ConnectionTrait>(
     db: &C,
     thread_id: &str,

@@ -3809,6 +3809,7 @@ impl fmt::Debug for CodexThreadResumeParams {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct CodexThreadOpenSnapshot {
+    pub name: Option<String>,
     pub native_thread_id: String,
     pub cwd: Option<String>,
     pub model: Option<String>,
@@ -4359,6 +4360,16 @@ fn decode_codex_thread_open_response(
         })?;
 
     Ok(CodexThreadOpenSnapshot {
+        // Codex 0.144.1 / 0.159.2 Thread.name is nullable. Invalid metadata
+        // must not break opening the working session.
+        name: (raw.pointer("/thread/id").and_then(JsonValue::as_str)
+            == Some(native_thread_id.as_str()))
+        .then(|| {
+            raw.pointer("/thread/name")
+                .and_then(JsonValue::as_str)
+                .map(str::to_owned)
+        })
+        .flatten(),
         native_thread_id,
         cwd: cwd_from_thread.or(cwd),
         model: model_from_thread.or(model),
@@ -10137,6 +10148,7 @@ while read line; do :; done
             json!({
                 "thread": {
                     "id": "codex-thread-started",
+                    "name": "Название Codex",
                     "cwd": "/tmp/project",
                     "model": "gpt-5"
                 }
@@ -10148,6 +10160,18 @@ while read line; do :; done
             .await
             .expect("thread start task should join")
             .expect("thread start should succeed");
+        assert_eq!(snapshot.name.as_deref(), Some("Название Codex"));
+        for name in [JsonValue::Null, json!(17), json!({"invalid":true})] {
+            let opened = decode_codex_thread_open_response(
+                "thread/start",
+                json!({
+                    "thread": {"id":"native", "name":name}
+                }),
+            )
+            .unwrap();
+            assert!(opened.name.is_none());
+        }
+
         assert_eq!(snapshot.native_thread_id, "codex-thread-started");
         assert_eq!(snapshot.cwd.as_deref(), Some("/tmp/project"));
         assert_eq!(snapshot.model.as_deref(), Some("gpt-5"));
@@ -11019,7 +11043,7 @@ while read line; do :; done
         fake.write_result_response(
             request["id"].clone(),
             json!({
-                "threadId": "codex-thread-existing",
+                "thread": { "id": "codex-thread-existing", "name": "Resumed title" },
                 "cwd": "/tmp/project",
                 "model": "gpt-5.1"
             }),
@@ -11030,6 +11054,7 @@ while read line; do :; done
             .await
             .expect("thread resume task should join")
             .expect("thread resume should succeed");
+        assert_eq!(snapshot.name.as_deref(), Some("Resumed title"));
         assert_eq!(snapshot.native_thread_id, "codex-thread-existing");
         assert_eq!(snapshot.cwd.as_deref(), Some("/tmp/project"));
         assert_eq!(snapshot.model.as_deref(), Some("gpt-5.1"));
