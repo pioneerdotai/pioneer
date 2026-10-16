@@ -4441,7 +4441,7 @@ async fn subscribe_agent_events_with_checkpoints(
                 assert!(checkpoints.len() < 128);
                 let usage = crate::ExecutionWindowUsageSnapshot {
                     total_windows: notification.window_index,
-                    total_tool_calls: payload.window.tool_call_count,
+                    total_tool_calls: u64::from(payload.window.tool_call_count),
                     total_provider_tokens: payload.window.provider_token_count.unwrap_or(0),
                     provider_token_usage_unknown: !payload.provider_budget.provider_usage_available,
                     ..Default::default()
