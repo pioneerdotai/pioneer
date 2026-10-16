@@ -676,7 +676,7 @@ pub struct MessageProcessor {
     #[cfg(test)]
     cli_runtime_skill_preflight_test_events: Arc<Mutex<Vec<String>>>,
     #[cfg(test)]
-    cli_mcp_readiness_overrides: [Option<pioneer_protocol::CliMcpAdapterReadiness>; 2],
+    cli_mcp_readiness_overrides: [Option<pioneer_protocol::CliMcpAdapterReadiness>; 3],
     skill_upload_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     skill_upload_owners: Arc<Mutex<HashMap<String, AuthenticatedTransferOwner>>>,
     pub(crate) task_agent_executor: Arc<task_agent_executor::TaskAgentExecutor>,
@@ -1327,7 +1327,7 @@ impl MessageProcessor {
             #[cfg(test)]
             cli_runtime_skill_preflight_test_events: Arc::new(Mutex::new(Vec::new())),
             #[cfg(test)]
-            cli_mcp_readiness_overrides: [None, None],
+            cli_mcp_readiness_overrides: [None, None, None],
             skill_upload_locks: Arc::new(Mutex::new(HashMap::new())),
             skill_upload_owners: Arc::new(Mutex::new(HashMap::new())),
             task_agent_executor,
@@ -1746,6 +1746,7 @@ impl MessageProcessor {
         let slot = match readiness.injection {
             pioneer_protocol::CliMcpInjectionKind::CodexManagedStdioMcp => 0,
             pioneer_protocol::CliMcpInjectionKind::ClaudeStrictStdioMcp => 1,
+            pioneer_protocol::CliMcpInjectionKind::OpenCodeDynamicStdioMcp => 2,
         };
         self.cli_mcp_readiness_overrides[slot] = Some(readiness);
         self
@@ -1759,6 +1760,7 @@ impl MessageProcessor {
         let slot = match runtime_kind {
             pioneer_protocol::CLIAgentRuntimeKind::Codex => 0,
             pioneer_protocol::CLIAgentRuntimeKind::Claude => 1,
+            pioneer_protocol::CLIAgentRuntimeKind::OpenCode => 2,
         };
         self.cli_mcp_readiness_overrides[slot].clone()
     }
@@ -4946,7 +4948,7 @@ impl MessageProcessor {
             #[cfg(test)]
             cli_runtime_skill_preflight_test_events: Arc::new(Mutex::new(Vec::new())),
             #[cfg(test)]
-            cli_mcp_readiness_overrides: [None, None],
+            cli_mcp_readiness_overrides: [None, None, None],
             skill_upload_locks: Arc::new(Mutex::new(HashMap::new())),
             skill_upload_owners: Arc::new(Mutex::new(HashMap::new())),
             task_agent_executor,

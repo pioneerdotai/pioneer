@@ -22,6 +22,13 @@ pub(crate) fn map_claude_turn_input_from_pioneer(
     map_cli_runtime_turn_input_from_pioneer_for_runtime(input, resolved_artifacts, "Claude")
 }
 
+pub(crate) fn map_opencode_turn_input_from_pioneer(
+    input: &[UserInput],
+    resolved_artifacts: &[ResolvedArtifactInput],
+) -> CLIRuntimeInputMappingResult {
+    map_cli_runtime_turn_input_from_pioneer_for_runtime(input, resolved_artifacts, "OpenCode")
+}
+
 fn map_cli_runtime_turn_input_from_pioneer_for_runtime(
     input: &[UserInput],
     resolved_artifacts: &[ResolvedArtifactInput],

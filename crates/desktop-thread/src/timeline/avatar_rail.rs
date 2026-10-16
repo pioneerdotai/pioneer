@@ -7,8 +7,11 @@ use super::running_indicator::RunningDinoView;
 use crate::screen::TimelineView;
 use gpui_kit::component::Sizable as _;
 use gpui_kit::component::avatar::Avatar;
+use gpui_kit::component::theme::ActiveTheme;
 use gpui_kit::prelude::*;
 use gpui_kit::*;
+use pioneer_client::avatars::cli_runtime_avatar_revision;
+use pioneer_desktop_foundation::AvatarSurface;
 use std::path::Path;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -51,6 +54,7 @@ impl TimelineView {
             .map(|group| group.activity_id.clone())
             .collect();
         self.avatar_activities.borrow_mut().retain(&live);
+        let dark = cx.theme().mode.is_dark();
         let avatar_demands = layout
             .grouping()
             .avatar_groups()
@@ -62,8 +66,8 @@ impl TimelineView {
                     if let Some(execution_author) =
                         super::timeline_agent_execution_author(Some(author))
                     {
-                        let revision = super::timeline_agent_presentation(Some(execution_author))
-                            .and_then(timeline_agent_default_avatar_revision);
+                        let revision =
+                            timeline_agent_default_avatar_revision(execution_author, dark);
                         (None, revision.map(str::to_owned))
                     } else {
                         let author = self.current_timeline_author_presentation(Some(author));
@@ -76,12 +80,12 @@ impl TimelineView {
                 } => {
                     let runtime_revision =
                         super::timeline_cli_runtime_execution_author(author.as_ref())
-                            .and_then(|author| author.avatar_revision.as_deref());
+                            .and_then(|author| author.cli_runtime_kind)
+                            .map(|kind| cli_runtime_avatar_revision(kind, dark));
                     let agent_revision = super::timeline_agent_execution_author(author.as_ref())
-                        .and_then(|author| super::timeline_agent_presentation(Some(author)))
                         .map_or(
                             Some(pioneer_client::timeline::types::PIONEER_AGENT_AVATAR_REVISION),
-                            timeline_agent_default_avatar_revision,
+                            |author| timeline_agent_default_avatar_revision(author, dark),
                         );
                     let revision = runtime_revision.or(agent_revision);
                     (None, revision.map(str::to_owned))
@@ -141,6 +145,7 @@ impl TimelineView {
         _rendered_list_width: Pixels,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let dark = cx.theme().mode.is_dark();
         let visuals = Rc::new(
             layout
                 .grouping()
@@ -151,7 +156,7 @@ impl TimelineView {
                         if let Some(author) =
                             super::timeline_agent_execution_author(author.as_ref())
                         {
-                            return self.timeline_agent_avatar_visual(author);
+                            return self.timeline_agent_avatar_visual(author, dark);
                         }
                         let (display_name, cached_path) =
                             self.timeline_author_avatar_parts(author.as_ref());
@@ -182,7 +187,7 @@ impl TimelineView {
                                     )
                                     .map(Path::to_path_buf),
                             },
-                            |author| self.timeline_agent_avatar_visual(author),
+                            |author| self.timeline_agent_avatar_visual(author, dark),
                         )
                     }
                 })
@@ -271,18 +276,19 @@ impl TimelineView {
     fn timeline_agent_avatar_visual(
         &self,
         author: &pioneer_client::timeline::types::TurnAuthorSnapshot,
+        dark: bool,
     ) -> TimelineAvatarVisual {
         if let Some(runtime_author) = super::timeline_cli_runtime_execution_author(Some(author)) {
             return TimelineAvatarVisual::Agent {
                 display_name: runtime_author.display_name.trim().to_owned(),
                 cached_path: runtime_author
-                    .avatar_revision
-                    .as_deref()
+                    .cli_runtime_kind
+                    .map(|kind| cli_runtime_avatar_revision(kind, dark))
                     .and_then(|revision| self.member_avatar_state.agent_cached_image_path(revision))
                     .map(Path::to_path_buf),
             };
         }
-        let Some(agent) = super::timeline_agent_presentation(Some(author)) else {
+        let Some(_) = super::timeline_agent_presentation(Some(author)) else {
             return TimelineAvatarVisual::Agent {
                 display_name: t!("chat.composer.mode.agent_label").to_string(),
                 cached_path: self
@@ -297,11 +303,12 @@ impl TimelineView {
         if display_name.is_empty() {
             return TimelineAvatarVisual::Absent;
         }
-        let cached_path = timeline_agent_default_avatar_revision(agent).and_then(|revision| {
-            self.member_avatar_state
-                .agent_cached_image_path(revision)
-                .map(Path::to_path_buf)
-        });
+        let cached_path =
+            timeline_agent_default_avatar_revision(author, dark).and_then(|revision| {
+                self.member_avatar_state
+                    .agent_cached_image_path(revision)
+                    .map(Path::to_path_buf)
+            });
         TimelineAvatarVisual::Agent {
             display_name,
             cached_path,
@@ -310,28 +317,18 @@ impl TimelineView {
 }
 
 fn timeline_agent_default_avatar_revision(
-    agent: &pioneer_client::timeline::types::AgentPresentationSnapshot,
+    author: &pioneer_client::timeline::types::TurnAuthorSnapshot,
+    dark: bool,
 ) -> Option<&'static str> {
-    let runtime_kind = agent
-        .role_label
-        .as_deref()
-        .unwrap_or(agent.nickname.as_str());
+    let agent = super::timeline_agent_presentation(Some(author))?;
     match agent.identity_source_kind {
         pioneer_client::timeline::types::AgentIdentitySourceKind::NativeAgent => {
             Some(pioneer_client::timeline::types::PIONEER_AGENT_AVATAR_REVISION)
         }
-        pioneer_client::timeline::types::AgentIdentitySourceKind::CliRuntimeInstance
-            if runtime_kind.eq_ignore_ascii_case("codex") =>
-        {
-            Some(pioneer_client::timeline::types::CODEX_AGENT_AVATAR_REVISION)
-        }
-        pioneer_client::timeline::types::AgentIdentitySourceKind::CliRuntimeInstance
-            if runtime_kind.eq_ignore_ascii_case("claude") =>
-        {
-            Some(pioneer_client::timeline::types::CLAUDE_AGENT_AVATAR_REVISION)
-        }
-        pioneer_client::timeline::types::AgentIdentitySourceKind::CliRuntimeInstance
-        | pioneer_client::timeline::types::AgentIdentitySourceKind::Ephemeral => None,
+        pioneer_client::timeline::types::AgentIdentitySourceKind::CliRuntimeInstance => author
+            .cli_runtime_kind
+            .map(|kind| cli_runtime_avatar_revision(kind, dark)),
+        pioneer_client::timeline::types::AgentIdentitySourceKind::Ephemeral => None,
     }
 }
 
@@ -344,11 +341,13 @@ fn render_timeline_avatar(visual: &TimelineAvatarVisual) -> AnyElement {
         TimelineAvatarVisual::HistoricalUser {
             display_name,
             cached_path: Some(path),
-        } => Avatar::new()
-            .name(display_name.clone())
-            .src(path.clone())
-            .with_size(TIMELINE_AVATAR_SIZE)
-            .into_any_element(),
+        } => AvatarSurface::new(
+            Avatar::new()
+                .name(display_name.clone())
+                .with_size(TIMELINE_AVATAR_SIZE),
+        )
+        .source(path.clone())
+        .into_any_element(),
         // GPUI Component gives custom-size initials a half-size layout box. Use the
         // unconstrained Medium initials layout, then override only the outer box back
         // to the established 32 px timeline size.
@@ -360,10 +359,8 @@ fn render_timeline_avatar(visual: &TimelineAvatarVisual) -> AnyElement {
         TimelineAvatarVisual::Agent {
             display_name: _,
             cached_path: Some(path),
-        } => Avatar::new()
-            .src(path.clone())
-            .with_size(TIMELINE_AVATAR_SIZE)
-            .border_0()
+        } => AvatarSurface::new(Avatar::new().with_size(TIMELINE_AVATAR_SIZE).border_0())
+            .source(path.clone())
             .into_any_element(),
         TimelineAvatarVisual::Agent { display_name, .. } => Avatar::new()
             .name(display_name.clone())

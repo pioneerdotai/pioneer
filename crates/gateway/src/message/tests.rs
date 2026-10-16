@@ -528,6 +528,7 @@ async fn persist_test_cli_execution_authorization_context_with_profile(
     let runtime_kind = match runtime_kind {
         "codex" => CLIAgentRuntimeKind::Codex,
         "claude" => CLIAgentRuntimeKind::Claude,
+        "opencode" => CLIAgentRuntimeKind::OpenCode,
         other => panic!("unsupported test CLI runtime kind `{other}`"),
     };
     let execution_backend = AgentExecutionBackend::CLIAgentRuntime {
@@ -591,6 +592,10 @@ async fn persist_test_cli_instruction_projection(
         CLIAgentRuntimeKind::Claude => (
             "claude",
             CLIRuntimeElevatedInstructionTransport::ClaudeAppendSystemPromptFile,
+        ),
+        CLIAgentRuntimeKind::OpenCode => (
+            "opencode",
+            CLIRuntimeElevatedInstructionTransport::OpenCodeSystemPrompt,
         ),
     };
     let now = chrono::Utc::now().fixed_offset();
@@ -1286,6 +1291,10 @@ fn supported_test_cli_mcp_readiness(
             pioneer_protocol::CliMcpInjectionKind::ClaudeStrictStdioMcp,
             pioneer_protocol::CliMcpProjectionUpdateKind::ClaudeRestartProcessResumeSession,
         ),
+        CLIAgentRuntimeKind::OpenCode => (
+            pioneer_protocol::CliMcpInjectionKind::OpenCodeDynamicStdioMcp,
+            pioneer_protocol::CliMcpProjectionUpdateKind::OpenCodeRestartServerResumeSession,
+        ),
     };
     pioneer_protocol::CliMcpAdapterReadiness {
         supported: true,
@@ -1775,6 +1784,7 @@ async fn setup_cli_runtime_skill_preflight_harness(
     let runtime_id = match runtime_kind {
         CLIAgentRuntimeKind::Codex => "codex_proposal_51",
         CLIAgentRuntimeKind::Claude => "claude_proposal_51",
+        CLIAgentRuntimeKind::OpenCode => "opencode_proposal_51",
     }
     .to_owned();
     settings
@@ -1977,6 +1987,7 @@ async fn seed_cli_runtime_skill_preflight_thread(
                     match harness.runtime_kind {
                         CLIAgentRuntimeKind::Codex => "o4-mini",
                         CLIAgentRuntimeKind::Claude => "claude-sonnet",
+                        CLIAgentRuntimeKind::OpenCode => "openai/gpt-5",
                     }
                     .to_owned(),
                 ),
@@ -2053,7 +2064,11 @@ where
 }
 
 async fn capability_persistence_order_impl() {
-    for runtime_kind in [CLIAgentRuntimeKind::Codex, CLIAgentRuntimeKind::Claude] {
+    for runtime_kind in [
+        CLIAgentRuntimeKind::Codex,
+        CLIAgentRuntimeKind::Claude,
+        CLIAgentRuntimeKind::OpenCode,
+    ] {
         let harness = setup_cli_runtime_skill_preflight_harness(runtime_kind, false).await;
         let alpha_path = write_test_skill(&harness.user_root, "alpha", "", "# alpha\n");
         let beta_path = write_test_skill(&harness.registry_root, "beta", "", "# beta\n");
@@ -2091,6 +2106,7 @@ async fn capability_persistence_order_impl() {
             match runtime_kind {
                 CLIAgentRuntimeKind::Codex => "codex",
                 CLIAgentRuntimeKind::Claude => "claude",
+                CLIAgentRuntimeKind::OpenCode => "opencode",
             },
         );
         let request = cli_runtime_turn_start_request_with_capabilities(
@@ -2201,7 +2217,10 @@ async fn capability_persistence_order_impl() {
                 ..
             } if committed_turn_id == turn_id && bindings.len() == 2
         ));
-        if matches!(runtime_kind, CLIAgentRuntimeKind::Codex) {
+        if matches!(
+            runtime_kind,
+            CLIAgentRuntimeKind::Codex | CLIAgentRuntimeKind::OpenCode
+        ) {
             let input = native_turn.input.as_array().unwrap();
             let skill_items = input
                 .iter()
@@ -2224,19 +2243,29 @@ async fn capability_persistence_order_impl() {
                 ]
             );
             let instructions = native_turn.elevated_instructions.text();
-            assert!(instructions.contains("selected Skill input"));
+            let (directive, beta_label, alpha_label, runtime_label) = match runtime_kind {
+                CLIAgentRuntimeKind::Codex => {
+                    ("selected Skill input", "- $beta", "- $alpha", "Codex")
+                }
+                CLIAgentRuntimeKind::OpenCode => ("OpenCode turn", "- beta", "- alpha", "OpenCode"),
+                CLIAgentRuntimeKind::Claude => unreachable!(),
+            };
+            assert!(instructions.contains(directive));
             let beta = instructions
-                .find("- $beta")
-                .expect("Codex elevated instructions should include beta");
+                .find(beta_label)
+                .unwrap_or_else(|| panic!("{runtime_label} instructions should include beta"));
             let alpha = instructions
-                .find("- $alpha")
-                .expect("Codex elevated instructions should include alpha");
-            assert!(beta < alpha, "selected Codex skill order must be preserved");
+                .find(alpha_label)
+                .unwrap_or_else(|| panic!("{runtime_label} instructions should include alpha"));
+            assert!(
+                beta < alpha,
+                "selected {runtime_label} skill order must be preserved"
+            );
             assert!(input.iter().all(|item| {
                 item["type"] != "text"
                     || item["text"]
                         .as_str()
-                        .is_none_or(|text| !text.contains("selected Skill input"))
+                        .is_none_or(|text| !text.contains(directive))
             }));
         } else {
             let input = native_turn.input.as_array().unwrap();
@@ -2272,7 +2301,11 @@ fn gateway_cli_skill_full_turn_first_noop_update_and_zero_skill_matrix() {
 }
 
 async fn gateway_cli_skill_full_turn_first_noop_update_and_zero_skill_matrix_impl() {
-    for runtime_kind in [CLIAgentRuntimeKind::Codex, CLIAgentRuntimeKind::Claude] {
+    for runtime_kind in [
+        CLIAgentRuntimeKind::Codex,
+        CLIAgentRuntimeKind::Claude,
+        CLIAgentRuntimeKind::OpenCode,
+    ] {
         let harness = setup_cli_runtime_skill_preflight_harness(runtime_kind, false).await;
         let source = write_test_skill(&harness.user_root, "lifecycle", "", "# first\n");
         let lifecycle_id = seed_cli_runtime_skill_installation(
@@ -24971,6 +25004,7 @@ fn composer_cli_skill_pack_matches_individual_members_and_preserves_presentation
                 let model = match runtime_kind {
                     CLIAgentRuntimeKind::Codex => "gpt-5",
                     CLIAgentRuntimeKind::Claude => "claude-sonnet",
+                    CLIAgentRuntimeKind::OpenCode => "openai/gpt-5",
                 };
                 let thread = harness
                     .thread_manager
@@ -28854,6 +28888,9 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_i
                 CLIAgentRuntimeKind::Claude => {
                     pioneer_protocol::TurnSecurityExecutionBackendKind::ClaudeCli
                 }
+                CLIAgentRuntimeKind::OpenCode => {
+                    pioneer_protocol::TurnSecurityExecutionBackendKind::OpenCodeCli
+                }
             }
         );
 
@@ -30466,12 +30503,9 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_i
             "foreground CLI presentation must identify the actual runtime executor, not generic Agent"
         );
         assert_eq!(
-            manual_author.and_then(|author| author.avatar_revision.as_deref()),
-            Some(match runtime_kind {
-                CLIAgentRuntimeKind::Codex => pioneer_protocol::CODEX_AGENT_AVATAR_REVISION,
-                CLIAgentRuntimeKind::Claude => pioneer_protocol::CLAUDE_AGENT_AVATAR_REVISION,
-            }),
-            "timeline projection must carry the explicit runtime-executor discriminator consumed by desktop"
+            manual_author.and_then(|author| author.cli_runtime_kind),
+            Some(runtime_kind),
+            "timeline projection must carry provider identity independently of artwork"
         );
         let before_delivery = processor
             .task_runtime
@@ -54654,6 +54688,7 @@ async fn materialize_cli_runtime_turn_with_execution(
             execution_principal.principal_id.clone(),
         );
         turn.author = Some(pioneer_protocol::TurnAuthorSnapshot {
+            cli_runtime_kind: None,
             actor: actor.clone(),
             display_name: "Superuser".into(),
             nickname: "superuser".into(),

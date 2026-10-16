@@ -740,6 +740,7 @@ pub fn collaboration_from_model(model: &turn::Model) -> Result<PersistedTurnColl
                 })
                 .transpose()?;
             let snapshot = TurnAuthorSnapshot {
+                cli_runtime_kind: None,
                 actor,
                 display_name: display_name.clone(),
                 nickname: nickname.clone(),
@@ -761,6 +762,7 @@ pub fn collaboration_from_model(model: &turn::Model) -> Result<PersistedTurnColl
                 PersistedActorRef::System => ("System".to_owned(), "system".to_owned()),
             };
             Some(TurnAuthorSnapshot {
+                cli_runtime_kind: None,
                 actor,
                 display_name,
                 nickname,
@@ -2328,6 +2330,7 @@ mod tests {
             origin: pioneer_protocol::TurnOrigin::User,
             mode: ThreadMode::Message,
             author: Some(TurnAuthorSnapshot {
+                cli_runtime_kind: None,
                 actor: actor.clone(),
                 display_name: "System".to_owned(),
                 nickname: "system".to_owned(),

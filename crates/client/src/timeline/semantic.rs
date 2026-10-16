@@ -832,11 +832,7 @@ pub fn timeline_cli_runtime_execution_author(
 ) -> Option<&pioneer_protocol::TurnAuthorSnapshot> {
     author.filter(|author| {
         matches!(&author.actor, pioneer_protocol::PersistedActorRef::System)
-            && matches!(
-                author.avatar_revision.as_deref(),
-                Some(pioneer_protocol::CODEX_AGENT_AVATAR_REVISION)
-                    | Some(pioneer_protocol::CLAUDE_AGENT_AVATAR_REVISION)
-            )
+            && author.cli_runtime_kind.is_some()
             && author.agent.is_none()
     })
 }
@@ -3213,6 +3209,9 @@ fn preserve_turn_author(
         return;
     };
     if incoming_author.actor == existing.actor {
+        if incoming_author.cli_runtime_kind.is_none() {
+            incoming_author.cli_runtime_kind = existing.cli_runtime_kind;
+        }
         if incoming_author.avatar_revision.is_none() {
             incoming_author.avatar_revision = existing.avatar_revision.clone();
         }
@@ -4444,6 +4443,7 @@ mod tests {
         assert_eq!(ready_agent_timeline_author(None), Some(None));
 
         let principal_author = TurnAuthorSnapshot {
+            cli_runtime_kind: None,
             actor: PersistedActorRef::Principal(
                 PrincipalId::new("P0000000000000000000A").expect("principal id"),
             ),
@@ -4454,8 +4454,9 @@ mod tests {
         };
         assert!(ready_agent_timeline_author(Some(&principal_author)).is_none());
         let mut runtime_author = TurnAuthorSnapshot {
+            cli_runtime_kind: Some(pioneer_protocol::CLIAgentRuntimeKind::Codex),
             actor: PersistedActorRef::System,
-            avatar_revision: Some(pioneer_protocol::CODEX_AGENT_AVATAR_REVISION.to_owned()),
+            avatar_revision: Some("arbitrary-old-avatar".to_owned()),
             ..principal_author.clone()
         };
         assert_eq!(
@@ -4466,11 +4467,18 @@ mod tests {
         assert!(ready_agent_timeline_author(Some(&runtime_author)).is_none());
         runtime_author.actor = PersistedActorRef::System;
         runtime_author.avatar_revision = Some("unrelated-system-avatar".to_owned());
+        assert_eq!(
+            ready_agent_timeline_author(Some(&runtime_author)),
+            Some(Some(&runtime_author))
+        );
+        runtime_author.cli_runtime_kind = None;
         assert!(ready_agent_timeline_author(Some(&runtime_author)).is_none());
+        runtime_author.cli_runtime_kind = Some(pioneer_protocol::CLIAgentRuntimeKind::Codex);
 
         let execution_id =
             AgentExecutionId::new("E0000000000000000000A").expect("agent execution id");
         let legacy_agent_author = TurnAuthorSnapshot {
+            cli_runtime_kind: None,
             actor: PersistedActorRef::AgentExecution(execution_id.clone()),
             display_name: "Legacy agent".to_owned(),
             nickname: "legacy-agent".to_owned(),
@@ -4483,6 +4491,7 @@ mod tests {
         );
 
         let mismatched_agent_author = TurnAuthorSnapshot {
+            cli_runtime_kind: None,
             agent: Some(AgentPresentationSnapshot {
                 agent_identity_id: AgentIdentityId::new("A0000000000000000000A")
                     .expect("agent identity id"),
@@ -4498,23 +4507,24 @@ mod tests {
             ..legacy_agent_author
         };
         assert!(ready_agent_timeline_author(Some(&mismatched_agent_author)).is_none());
-        runtime_author.avatar_revision =
-            Some(pioneer_protocol::CODEX_AGENT_AVATAR_REVISION.to_owned());
+        runtime_author.avatar_revision = None;
         runtime_author.agent = mismatched_agent_author.agent;
         assert!(ready_agent_timeline_author(Some(&runtime_author)).is_none());
     }
 
     #[test]
     fn direct_cli_answer_and_work_survive_author_hydration_and_reload() {
-        for avatar in [
-            pioneer_protocol::CODEX_AGENT_AVATAR_REVISION,
-            pioneer_protocol::CLAUDE_AGENT_AVATAR_REVISION,
+        for runtime_kind in [
+            pioneer_protocol::CLIAgentRuntimeKind::Codex,
+            pioneer_protocol::CLIAgentRuntimeKind::Claude,
+            pioneer_protocol::CLIAgentRuntimeKind::OpenCode,
         ] {
             let author = TurnAuthorSnapshot {
+                cli_runtime_kind: Some(runtime_kind),
                 actor: PersistedActorRef::System,
                 display_name: "CLI runtime".to_owned(),
                 nickname: "cli".to_owned(),
-                avatar_revision: Some(avatar.to_owned()),
+                avatar_revision: None,
                 agent: None,
             };
             let publication: pioneer_protocol::HtmlPublication = serde_json::from_value(serde_json::json!({
@@ -4712,6 +4722,7 @@ mod tests {
     fn authoritative_user_message_snapshot_replaces_optimism_and_preserves_exact_refs() {
         let principal_id = PrincipalId::new("PAAAAAAAAAAAAAAAAAAAA").expect("valid principal id");
         let author = TurnAuthorSnapshot {
+            cli_runtime_kind: None,
             actor: PersistedActorRef::Principal(principal_id.clone()),
             display_name: "Alice".to_owned(),
             nickname: "alice".to_owned(),

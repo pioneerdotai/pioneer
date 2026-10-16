@@ -338,6 +338,7 @@ mod tests {
         let (projection, row) = projection_with_target_item(false);
         let mut authored = row.clone();
         authored.author = Some(TurnAuthorSnapshot {
+            cli_runtime_kind: None,
             actor: PersistedActorRef::System,
             display_name: "System".to_owned(),
             nickname: "system".to_owned(),
@@ -372,6 +373,7 @@ mod tests {
         };
         let mut authored = row.clone();
         authored.author = Some(TurnAuthorSnapshot {
+            cli_runtime_kind: None,
             actor: PersistedActorRef::System,
             display_name: "System".to_owned(),
             nickname: "system".to_owned(),

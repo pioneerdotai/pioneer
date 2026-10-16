@@ -23,6 +23,7 @@ pub fn from_selector(
                 match runtime.kind {
                     CLIAgentRuntimeKind::Codex => ModelSelectionTransport::Codex,
                     CLIAgentRuntimeKind::Claude => ModelSelectionTransport::Claude,
+                    CLIAgentRuntimeKind::OpenCode => ModelSelectionTransport::OpenCode,
                 },
                 id.to_owned(),
             )

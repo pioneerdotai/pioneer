@@ -2758,6 +2758,9 @@ impl AgentActionToolHandler {
                     pioneer_config::GatewayCliAgentRuntimeKindConfig::Claude => {
                         pioneer_protocol::CLIAgentRuntimeKind::Claude
                     }
+                    pioneer_config::GatewayCliAgentRuntimeKindConfig::OpenCode => {
+                        pioneer_protocol::CLIAgentRuntimeKind::OpenCode
+                    }
                 };
                 Some(pioneer_protocol::AgentExecutionBackend::CLIAgentRuntime {
                     runtime_id: runtime_instance_id.clone(),
@@ -2818,6 +2821,12 @@ impl AgentActionToolHandler {
                 runtime_id,
                 runtime_kind: pioneer_protocol::CLIAgentRuntimeKind::Claude,
             }) => crate::turn_security::TurnSecurityResolverExecutionBackend::ClaudeCli {
+                runtime_id: runtime_id.clone(),
+            },
+            Some(pioneer_protocol::AgentExecutionBackend::CLIAgentRuntime {
+                runtime_id,
+                runtime_kind: pioneer_protocol::CLIAgentRuntimeKind::OpenCode,
+            }) => crate::turn_security::TurnSecurityResolverExecutionBackend::OpenCodeCli {
                 runtime_id: runtime_id.clone(),
             },
             Some(pioneer_protocol::AgentExecutionBackend::ACPAgentRuntime { .. }) | None => {

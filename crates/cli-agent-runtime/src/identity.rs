@@ -127,6 +127,7 @@ impl CliRuntimeAgentBinding {
             role_label: Some(match self.kind {
                 CLIAgentRuntimeKind::Codex => "Codex CLI".to_owned(),
                 CLIAgentRuntimeKind::Claude => "Claude CLI".to_owned(),
+                CLIAgentRuntimeKind::OpenCode => "OpenCode CLI".to_owned(),
             }),
             source_revision: self.source_revision,
             source_fingerprint: self.source_fingerprint.clone(),
@@ -225,6 +226,7 @@ const fn runtime_kind_name(kind: CLIAgentRuntimeKind) -> &'static str {
     match kind {
         CLIAgentRuntimeKind::Codex => "codex",
         CLIAgentRuntimeKind::Claude => "claude",
+        CLIAgentRuntimeKind::OpenCode => "opencode",
     }
 }
 

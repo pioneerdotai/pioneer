@@ -2622,6 +2622,7 @@ mod tests {
     fn composer_admission() -> Turn {
         let mut turn = running_turn("admission");
         turn.author = Some(TurnAuthorSnapshot {
+            cli_runtime_kind: None,
             actor: PersistedActorRef::Principal(PrincipalId::new("P".repeat(21)).unwrap()),
             display_name: "User".into(),
             nickname: "user".into(),
@@ -2636,6 +2637,7 @@ mod tests {
         turn.turn_kind = TurnKind::TaskRun;
         turn.origin = TurnOrigin::DetachedTask;
         turn.author = Some(TurnAuthorSnapshot {
+            cli_runtime_kind: None,
             actor: PersistedActorRef::AgentExecution(
                 AgentExecutionId::new("E".repeat(21)).unwrap(),
             ),
@@ -8277,6 +8279,7 @@ mod tests {
         let mut child = running_turn("child");
         child.mode = ThreadMode::Agent;
         child.author = Some(TurnAuthorSnapshot {
+            cli_runtime_kind: None,
             actor: PersistedActorRef::System,
             display_name: "Child Agent".into(),
             nickname: "child-agent".into(),
@@ -9567,6 +9570,7 @@ mod tests {
         assert_eq!(last.rows()[0].item().unwrap().partial_text, "latest");
         if let TimelineBlockKind::UserMessage { author, .. } = &mut page.blocks[0].kind {
             *author = Some(pioneer_protocol::TurnAuthorSnapshot {
+                cli_runtime_kind: None,
                 actor: pioneer_protocol::PersistedActorRef::Principal(
                     pioneer_protocol::PrincipalId::new("PAAAAAAAAAAAAAAAAAAAA").unwrap(),
                 ),
@@ -9682,6 +9686,7 @@ mod tests {
         }
         if let TimelineBlockKind::UserMessage { author, .. } = &mut page.blocks[1].kind {
             *author = Some(pioneer_protocol::TurnAuthorSnapshot {
+                cli_runtime_kind: None,
                 actor: pioneer_protocol::PersistedActorRef::Principal(
                     pioneer_protocol::PrincipalId::new(principal).unwrap(),
                 ),

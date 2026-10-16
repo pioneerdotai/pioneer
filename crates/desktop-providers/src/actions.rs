@@ -366,6 +366,12 @@ fn default_cli_runtime_display_name(
             return cli_provider_settings::cli_runtime_provider_default_display_name(instance.kind)
                 .to_owned();
         }
+        pioneer_client::providers::types::CLIAgentRuntimeKind::OpenCode
+            if instance.id == "opencode" =>
+        {
+            return cli_provider_settings::cli_runtime_provider_default_display_name(instance.kind)
+                .to_owned();
+        }
         _ => {}
     }
     instance

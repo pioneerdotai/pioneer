@@ -1823,6 +1823,8 @@ impl MessageProcessor {
             .into_iter()
             .map(|execution| (execution.turn_id.clone(), execution))
             .collect::<HashMap<_, _>>();
+        let runtime_kinds_by_turn =
+            pioneer_crud::load_cli_runtime_kinds_for_turns(&database, turn_ids).await?;
         let direct_authors_by_turn = turn_ids
             .iter()
             .filter_map(|turn_id| {
@@ -1903,18 +1905,6 @@ impl MessageProcessor {
                         )
                         .await?
                         .map(|presentation| {
-                            let runtime_marker = presentation
-                                .role_label
-                                .as_deref()
-                                .unwrap_or(presentation.nickname.as_str());
-                            let runtime_avatar_revision =
-                                if runtime_marker.eq_ignore_ascii_case("codex") {
-                                    Some(pioneer_protocol::CODEX_AGENT_AVATAR_REVISION.to_owned())
-                                } else if runtime_marker.eq_ignore_ascii_case("claude") {
-                                    Some(pioneer_protocol::CLAUDE_AGENT_AVATAR_REVISION.to_owned())
-                                } else {
-                                    presentation.avatar_revision.clone()
-                                };
                             pioneer_protocol::TurnAuthorSnapshot {
                                 // Foreground CLI turns have a real runtime executor but no
                                 // AgentExecution. Keep that distinction explicit instead of
@@ -1922,10 +1912,8 @@ impl MessageProcessor {
                                 actor: pioneer_protocol::PersistedActorRef::System,
                                 display_name: presentation.display_name,
                                 nickname: presentation.nickname,
-                                // Reserved runtime avatar revisions are the existing
-                                // cross-client presentation discriminator for a real
-                                // CLI executor without an AgentExecution association.
-                                avatar_revision: runtime_avatar_revision,
+                                avatar_revision: presentation.avatar_revision,
+                                cli_runtime_kind: None,
                                 agent: None,
                             }
                         })
@@ -1938,7 +1926,10 @@ impl MessageProcessor {
             } else {
                 None
             };
-            if let Some(author) = author {
+            if let Some(mut author) = author {
+                author.cli_runtime_kind = author
+                    .cli_runtime_kind
+                    .or_else(|| runtime_kinds_by_turn.get(turn_id).copied());
                 authors.insert(turn_id.clone(), author);
             }
         }

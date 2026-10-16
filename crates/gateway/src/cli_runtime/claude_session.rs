@@ -661,8 +661,8 @@ impl CLIAgentRuntimeSessionFactory for ClaudeCLIAgentRuntimeSessionFactory {
         let launch_projection = match &launch_spec.mcp {
             CliMcpSessionLaunch::Disabled | CliMcpSessionLaunch::ManagementOnly => None,
             CliMcpSessionLaunch::Claude(projection) => Some(projection),
-            CliMcpSessionLaunch::Codex(_) => {
-                bail!("Claude CLI runtime cannot consume a Codex MCP launch projection")
+            CliMcpSessionLaunch::Codex(_) | CliMcpSessionLaunch::OpenCode(_) => {
+                bail!("Claude CLI runtime cannot consume another provider's MCP launch projection")
             }
         };
         let provider_session_id = launch_spec
@@ -1220,7 +1220,8 @@ fn claude_process_config_from_instance_with_managed_mcp(
             .context("invalid Claude bounded fork continuation")?
             .append_process_args(&mut args);
         }
-        CliProviderContinuation::CodexRpcThread { .. } => {
+        CliProviderContinuation::CodexRpcThread { .. }
+        | CliProviderContinuation::OpenCodeServerSession { .. } => {
             bail!("Claude process launch requires a typed Claude continuation");
         }
     }

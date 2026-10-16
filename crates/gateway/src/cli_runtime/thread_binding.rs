@@ -666,7 +666,7 @@ pub(crate) fn binding_has_prepared_child_fork(
     binding: &CliRuntimeThreadBindingRecord,
     source: &pioneer_crud::CliRuntimeTurnBindingRecord,
 ) -> Result<bool> {
-    if binding.runtime_kind != "codex"
+    if !matches!(binding.runtime_kind.as_str(), "codex" | "opencode")
         || binding.status != "active"
         || binding.thread_id != source.thread_id
         || binding.workspace_id != source.workspace_id
@@ -728,8 +728,8 @@ pub(crate) fn pending_codex_fork_intent(
         return Ok(None);
     }
     anyhow::ensure!(
-        binding.runtime_kind == "codex",
-        "non-Codex fork intent is unsupported"
+        matches!(binding.runtime_kind.as_str(), "codex" | "opencode"),
+        "provider fork intent is unsupported"
     );
     let cursor = deserialize_cli_runtime_json::<CliRuntimeResumeCursor>(
         binding.resume_cursor_json.as_str(),

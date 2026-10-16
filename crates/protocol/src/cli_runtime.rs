@@ -94,6 +94,7 @@ pub struct RuntimeCapabilities {
 pub enum CliMcpInjectionKind {
     CodexManagedStdioMcp,
     ClaudeStrictStdioMcp,
+    OpenCodeDynamicStdioMcp,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -101,6 +102,7 @@ pub enum CliMcpInjectionKind {
 pub enum CliMcpProjectionUpdateKind {
     CodexRestartAppServerResumeThread,
     ClaudeRestartProcessResumeSession,
+    OpenCodeRestartServerResumeSession,
 }
 
 /// Provider-specific MCP readiness evidence retained inside the Gateway.
