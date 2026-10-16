@@ -1026,6 +1026,68 @@ async fn released_preview_history_keeps_pairing_for_next_native_cli_task_and_fro
             .is_err(),
         "stale image history must not be accepted after release"
     );
+    // The read-time grant must use the same exact archive receipt as import
+    // publication. A mismatched diagnostic hash cannot authorize this input.
+    let archive_hash = &archived.preview_archive.as_ref().unwrap().wire_sha256;
+    for (hash, expected) in [("0".repeat(64), false), (archive_hash.clone(), true)] {
+        db.execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE html_preview_frozen_result SET archive_wire_sha256=?1 WHERE manifest_id=?2 AND ordinal=?3",
+            [hash.into(), archived.output_manifest.clone().into(), i64::try_from(archived.output_ordinal).unwrap().into()],
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            f.store
+                .compaction_manifest_sources_current(&operation.id)
+                .await
+                .unwrap(),
+            expected,
+            "checkpoint reads require the exact preview archive receipt"
+        );
+    }
+    // A later edit cannot be accepted using the release receipt as a general
+    // revision exemption. Both fresh preparation and accepted replay reject it.
+    let row = f
+        .store
+        .list_turn_llm_context("turn")
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|c| c.tool_name.as_deref() == Some("html_preview"))
+        .unwrap();
+    db.execute_raw(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "UPDATE turn_llm_context SET payload=payload||' ' WHERE id=?1",
+        [row.id.into()],
+    ))
+    .await
+    .unwrap();
+    assert!(
+        processor
+            .capture_authorized_task_basis_prepared(
+                &f.store, &principal, "ws", "parent", None, None, None
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        crate::turn_runtime_snapshot::restore_history_json(
+            &f.store,
+            "ws",
+            &accepted.accepted_scopes,
+            &serde_json::to_string(&accepted.descriptor).unwrap()
+        )
+        .await
+        .is_err()
+    );
+    assert!(
+        !f.store
+            .compaction_manifest_sources_current(&operation.id)
+            .await
+            .unwrap(),
+        "an archive grant cannot authorize a later diagnostic revision"
+    );
     // Current Message inputs are a supported adoption even without a
     // UserMessage item or the old async attachment-binding step.
     let mut request = adoption_request.unwrap();
@@ -1108,41 +1170,6 @@ async fn released_preview_history_keeps_pairing_for_next_native_cli_task_and_fro
             .bindings
             .iter()
             .any(|b| b.binding_kind == pioneer_protocol::ArtifactBindingKind::UserInput)
-    );
-    // A later edit cannot be accepted using the release receipt as a general
-    // revision exemption. Both fresh preparation and accepted replay reject it.
-    let row = f
-        .store
-        .list_turn_llm_context("turn")
-        .await
-        .unwrap()
-        .into_iter()
-        .find(|c| c.tool_name.as_deref() == Some("html_preview"))
-        .unwrap();
-    db.execute_raw(Statement::from_sql_and_values(
-        DbBackend::Sqlite,
-        "UPDATE turn_llm_context SET payload=payload||' ' WHERE id=?1",
-        [row.id.into()],
-    ))
-    .await
-    .unwrap();
-    assert!(
-        processor
-            .capture_authorized_task_basis_prepared(
-                &f.store, &principal, "ws", "parent", None, None, None
-            )
-            .await
-            .is_err()
-    );
-    assert!(
-        crate::turn_runtime_snapshot::restore_history_json(
-            &f.store,
-            "ws",
-            &accepted.accepted_scopes,
-            &serde_json::to_string(&accepted.descriptor).unwrap()
-        )
-        .await
-        .is_err()
     );
     assert_eq!(
         f.provider.calls.lock().unwrap().len(),

@@ -2716,7 +2716,37 @@ current_sources(source_scope,source_id,source_version,thread_id,workspace_id) AS
   AND basis_source.workspace_id=o.workspace_id
 ),
 accepted_imports AS MATERIALIZED (
- SELECT i.source_scope, i.source_id, i.source_version, i.source_thread
+ SELECT i.source_scope, i.source_id,
+  CASE WHEN i.bytes BETWEEN 0 AND 262144
+    AND length(CAST(i.proof_json AS BLOB))=i.bytes AND json_valid(i.proof_json)
+   THEN CASE WHEN
+    json_extract(i.proof_json,'$.source.scope')=i.source_scope
+    AND json_extract(i.proof_json,'$.source.id')=i.source_id
+    AND json_extract(i.proof_json,'$.source.version')=i.source_version
+    AND json_extract(i.proof_json,'$.source_thread')=i.source_thread
+    AND json_extract(i.proof_json,'$.preview_archive.source.scope')=i.source_scope
+    AND json_extract(i.proof_json,'$.preview_archive.source.id')=i.source_id
+    AND EXISTS (
+     SELECT 1 FROM html_preview_frozen_result receipt
+     JOIN compaction_frozen_history output ON output.id=receipt.manifest_id
+     JOIN compaction_source_revision revision ON revision.source_id=receipt.source_id
+     WHERE receipt.manifest_id=json_extract(i.proof_json,'$.output_manifest')
+      AND receipt.ordinal=json_extract(i.proof_json,'$.output_ordinal')
+      AND receipt.source_id=i.source_id AND receipt.source_version=i.source_version
+      AND i.source_scope='context:'||receipt.turn_id
+      AND output.workspace_id=o.workspace_id AND output.owner_thread=i.source_thread
+      AND output.ready=1 AND output.expired=0
+      AND receipt.ordinal>=0 AND receipt.ordinal<output.message_count
+      AND output.next_ordinal=output.message_count AND output.import_count>=0
+      AND output.next_import=output.import_count
+      AND receipt.archive_wire_sha256=json_extract(i.proof_json,'$.preview_archive.wire_sha256')
+      AND revision.present=1 AND revision.turn_id=receipt.turn_id
+      AND i.source_version='revision:'||(revision.revision-1)
+      AND json_extract(i.proof_json,'$.preview_archive.source.version')='revision:'||revision.revision
+    ) THEN json_extract(i.proof_json,'$.preview_archive.source.version')
+    ELSE i.source_version END
+   ELSE i.source_version END AS source_version,
+  i.source_thread
  FROM current_operation o
  JOIN compaction_operation_projection p ON p.operation_id=o.id
  JOIN compaction_frozen_history h ON h.id=p.manifest_id
@@ -3098,7 +3128,9 @@ pub(crate) async fn compaction_manifest_sources_current<C: ConnectionTrait>(
     // including its unambiguous exact input aliases. Those aliases never
     // authorize direct raw reads or OWN imports. Historical coverage never
     // joins canonical payload/revision rows. OWN imports still require
-    // their immutable delivery proofs. This check is used before reading raw
+    // their immutable delivery proofs. A preview proof keeps its original
+    // grant, but its adjacent diagnostic revision is read only when the exact
+    // persisted archive receipt agrees. This check is used before reading raw
     // portions; finished summaries no longer revalidate live sources.
     let stale = db
         .query_one_raw(compaction_manifest_sources_current_statement(operation))
