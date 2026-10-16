@@ -438,6 +438,7 @@ impl TimelineView {
 #[cfg(test)]
 mod author_presentation_tests {
     use super::*;
+    use pioneer_client::providers::types::CLIAgentRuntimeKind;
     use pioneer_client::timeline::types::AgentExecutionId;
     use pioneer_client::timeline::types::AgentIdentityId;
     use pioneer_client::timeline::types::AgentIdentitySourceKind;
@@ -530,7 +531,7 @@ mod author_presentation_tests {
         assert_eq!(timeline_agent_label(Some(&author)), None);
 
         let runtime_author = TurnAuthorSnapshot {
-            cli_runtime_kind: Some(pioneer_protocol::CLIAgentRuntimeKind::Codex),
+            cli_runtime_kind: Some(CLIAgentRuntimeKind::Codex),
             actor: PersistedActorRef::System,
             display_name: "Codex CLI".to_owned(),
             nickname: "codex".to_owned(),
