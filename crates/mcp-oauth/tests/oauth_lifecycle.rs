@@ -109,6 +109,7 @@ struct Fake {
     deny_mcp: AtomicUsize,
     resources: AtomicBool,
     stateful: AtomicBool,
+    authorized_deletes: AtomicUsize,
     expected_refresh: Mutex<String>,
     requests: Mutex<Vec<(HeaderMap, HashMap<String, String>)>>,
     dcr: Mutex<Vec<Value>>,
@@ -144,6 +145,7 @@ impl Server {
             deny_mcp: AtomicUsize::new(0),
             resources: AtomicBool::new(false),
             stateful: AtomicBool::new(false),
+            authorized_deletes: AtomicUsize::new(0),
             expected_refresh: Mutex::new("refresh-0".into()),
             requests: Mutex::new(vec![]),
             dcr: Mutex::new(vec![]),
@@ -160,7 +162,7 @@ impl Server {
             .route("/.well-known/oauth-authorization-server", get(as_metadata))
             .route("/register", post(register))
             .route("/token", post(token))
-            .route("/mcp", post(mcp).get(mcp_stream))
+            .route("/mcp", post(mcp).get(mcp_stream).delete(delete_mcp_session))
             .route(
                 "/alias",
                 post(|| async { axum::response::Redirect::temporary("/mcp") }),
@@ -307,6 +309,14 @@ async fn token(
     }
     Json(result).into_response()
 }
+async fn delete_mcp_session(State(s): State<Arc<Fake>>, headers: HeaderMap) -> StatusCode {
+    if headers.get("authorization").is_none() {
+        return StatusCode::UNAUTHORIZED;
+    }
+    s.authorized_deletes.fetch_add(1, Ordering::SeqCst);
+    StatusCode::NO_CONTENT
+}
+
 async fn mcp(State(s): State<Arc<Fake>>, headers: HeaderMap, Json(body): Json<Value>) -> Response {
     let deny = s.deny_mcp.load(Ordering::SeqCst);
     if deny == 6 && body["method"] == "resources/list" {
@@ -4127,5 +4137,21 @@ async fn cleanup_synchronization_and_suspend_preserve_management_without_restori
     );
     assert_eq!(h.server.data.exchanges.load(Ordering::SeqCst), exchanges);
     assert_eq!(h.sink.browsers(), 0);
+    h.service.shutdown().await;
+}
+
+#[tokio::test]
+async fn quiesced_oauth_retains_authorized_delete_but_rejects_new_connects() {
+    let h = Harness::new(true).await;
+    h.server.data.stateful.store(true, Ordering::SeqCst);
+    h.login().await;
+    let mut session = h.connect().await.unwrap();
+    h.service.quiesce().await;
+    assert!(h.connect().await.is_err());
+    tokio::time::timeout(Duration::from_secs(3), session.shutdown())
+        .await
+        .unwrap();
+    assert_eq!(h.server.data.authorized_deletes.load(Ordering::SeqCst), 1);
+    h.service.shutdown().await;
     h.service.shutdown().await;
 }

@@ -706,6 +706,9 @@ impl PersistentCredentials {
 #[async_trait]
 impl CredentialStore for PersistentCredentials {
     async fn load(&self) -> Result<Option<StoredCredentials>, AuthError> {
+        if self.cancellation.is_cancelled() {
+            return Err(AuthError::AuthorizationRequired);
+        }
         let baseline = self
             .consent_baseline
             .lock()
@@ -726,6 +729,9 @@ impl CredentialStore for PersistentCredentials {
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .clone();
+                    if self.cancellation.is_cancelled() {
+                        return Err(AuthError::AuthorizationRequired);
+                    }
                     return baseline.map(Ok).unwrap_or(Err(error));
                 }
             }
@@ -741,6 +747,9 @@ impl CredentialStore for PersistentCredentials {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
+        if self.cancellation.is_cancelled() {
+            return Err(AuthError::AuthorizationRequired);
+        }
         Ok(baseline.unwrap_or_else(|| record.and_then(|r| r.credentials)))
     }
     async fn save(&self, credentials: StoredCredentials) -> Result<(), AuthError> {
@@ -803,11 +812,14 @@ impl CredentialStore for PersistentCredentials {
     }
 
     async fn acquire_refresh_guard(&self) -> Result<Option<CredentialRefreshGuard>, AuthError> {
-        let local = tokio::select! {_=self.cancellation.cancelled()=>return Err(storage_error()),guard=self.gate.clone().lock_owned()=>guard};
+        let local = tokio::select! {biased; _=self.cancellation.cancelled()=>return Err(AuthError::AuthorizationRequired),guard=self.gate.clone().lock_owned()=>guard};
         let file = self
             .persistence
             .file_guard(&self.id, &self.cancellation)
             .await?;
+        if self.cancellation.is_cancelled() {
+            return Err(AuthError::AuthorizationRequired);
+        }
         let lease = Arc::new(RefreshLease {
             _local: Some(local),
             _file: file,
