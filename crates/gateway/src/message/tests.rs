@@ -13927,11 +13927,13 @@ async fn turn_start_with_artifact_input_materializes_user_message_attachment_and
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("o4-mini", "openai"));
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
-    let capture_provider = Arc::new(CaptureSummaryProvider::new("artifact answer"));
+    let capture_provider =
+        Arc::new(CaptureSummaryProvider::new("artifact answer").with_native_attachments());
     let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
         "openai",
         capture_provider.clone(),
     ));
+    discover_native_capture_models(&provider_registry, workspace_id.as_str()).await;
     let processor = MessageProcessor::new(
         thread_manager,
         provider_registry,
@@ -14011,6 +14013,25 @@ async fn turn_start_with_artifact_input_materializes_user_message_attachment_and
                 && resolved.display_name == "report.txt"
     ));
 
+    let original_bindings = crud_store
+        .get_artifact_summary(&workspace_id, &artifact.artifact_id, None)
+        .await
+        .unwrap()
+        .bindings;
+    assert_eq!(original_bindings.len(), 1);
+    let repeated = processor
+        .user_message_payload_from_input_resolved(
+            workspace_id.as_str(),
+            &thread.thread.id,
+            turn_id,
+            &user_message_item_id(turn_id),
+            &serde_json::from_value::<Vec<UserInput>>(request["params"]["input"].clone()).unwrap(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(repeated.0, text);
+    assert_eq!(repeated.1, attachments);
     let summary = crud_store
         .get_artifact_summary(&workspace_id, &artifact.artifact_id, None)
         .await
@@ -14021,6 +14042,7 @@ async fn turn_start_with_artifact_input_materializes_user_message_attachment_and
         .filter(|binding| binding.binding_kind == pioneer_protocol::ArtifactBindingKind::UserInput)
         .collect::<Vec<_>>();
     assert_eq!(bindings.len(), 1);
+    assert_eq!(bindings[0].binding_id, original_bindings[0].binding_id);
     assert_eq!(
         bindings[0].thread_id.as_deref(),
         Some(thread.thread.id.as_str())
@@ -14045,7 +14067,12 @@ async fn turn_start_with_artifact_input_materializes_user_message_attachment_and
             if file.name.as_deref() == Some("report.txt")
                 && file.mime_type == "text/plain"
                 && file.size_bytes == Some(14)
-                && matches!(file.source, pioneer_provider::AttachmentDataSource::Path { .. })
+                && matches!(&file.source, pioneer_provider::AttachmentDataSource::Bytes { base64_data }
+                    if base64_data == "aGVsbG8gYXJ0aWZhY3Q=")
+                && file.artifact.as_ref().is_some_and(|accepted| {
+                    accepted.artifact_id == artifact.artifact_id
+                        && accepted.artifact_version_id == artifact.version_id
+                })
     ));
 }
 
@@ -76605,10 +76632,13 @@ async fn compaction_failed_partial_writer_preserves_event_but_excludes_observati
         .await
         .unwrap();
     assert_eq!(restored, history);
-    let mut authority =
-        crate::authorization::ExecutionAuthorizationContext::load_for_turn(store.as_ref(), turn)
-            .await
-            .unwrap();
+    let mut authority = crate::authorization::ExecutionAuthorizationContext::for_test(
+        authenticated_test_superuser().as_ref(),
+        &workspace,
+        thread,
+        &default_test_permission_profile(),
+        None,
+    );
     authority.bind_test_provider_authority(
         "openai",
         "o4-mini",

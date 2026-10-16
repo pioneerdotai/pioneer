@@ -202,6 +202,82 @@ async fn exact_native_input_binding_is_atomic_idempotent_and_revalidates_scope()
                 pins[0].artifact_version_id.as_deref(),
                 Some(ingested.version.id.as_str())
             );
+            let original_binding_id = pins[0].id.clone();
+            let canonical_item = format!("user_{}", turn.id);
+            let target = ArtifactBindingTargetRecord {
+                thread_id: Some(thread.id.clone()),
+                turn_id: Some(turn.id.clone()),
+                message_id: Some(canonical_item.clone()),
+                turn_item_id: Some(canonical_item.clone()),
+                tool_call_id: None,
+                task_id: None,
+                task_run_id: None,
+                binding_kind: ArtifactBindingKind::UserInput,
+                direction: ArtifactBindingDirection::Input,
+                role: Some(ArtifactRole::User),
+                item_index: Some(0),
+            };
+            for replay in 0..2 {
+                let access = if replay == 0 {
+                    store.clone()
+                } else {
+                    store.with_maintenance_access()
+                };
+                let published = access
+                    .bind_artifact(
+                        &thread.workspace_id,
+                        &ingested.artifact.id,
+                        Some(&ingested.version.id),
+                        target.clone(),
+                        BTreeMap::new(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(published.binding_id, original_binding_id);
+                assert_eq!(
+                    published.message_id.as_deref(),
+                    Some(canonical_item.as_str())
+                );
+                assert_eq!(
+                    published.turn_item_id.as_deref(),
+                    Some(canonical_item.as_str())
+                );
+            }
+            assert_eq!(
+                pioneer_entity::artifact_binding::Entity::find()
+                    .filter(pioneer_entity::artifact_binding::Column::TurnId.eq(&turn.id))
+                    .count(&store.connection)
+                    .await
+                    .unwrap(),
+                1
+            );
+            // Older publication produced this exact canonical-plus-placeholder
+            // ambiguity. Refuse it atomically rather than delete an ownership pin.
+            let mut duplicate = sea_orm::IntoActiveModel::into_active_model(pins[0].clone());
+            duplicate.id = Set(pioneer_protocol::generate_id(21));
+            duplicate.insert(&store.connection).await.unwrap();
+            assert!(
+                store
+                    .bind_artifact(
+                        &thread.workspace_id,
+                        &ingested.artifact.id,
+                        Some(&ingested.version.id),
+                        target,
+                        BTreeMap::new()
+                    )
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("accepted input binding is ambiguous")
+            );
+            assert_eq!(
+                pioneer_entity::artifact_binding::Entity::find()
+                    .filter(pioneer_entity::artifact_binding::Column::TurnId.eq(&turn.id))
+                    .count(&store.connection)
+                    .await
+                    .unwrap(),
+                2
+            );
         }
     }
     store

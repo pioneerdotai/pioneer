@@ -335,6 +335,83 @@ impl ArtifactRepository {
         created_at: DateTimeWithTimeZone,
         metadata_json: String,
     ) -> ArtifactCrudResult<ArtifactBindingSummary> {
+        // Admission pins an exact input before the user item is published.
+        // Publication fills in that same owner's canonical message identity.
+        if target.binding_kind == ArtifactBindingKind::UserInput
+            && target.direction == ArtifactBindingDirection::Input
+            && target.role == Some(ArtifactRole::User)
+            && target.tool_call_id.is_none()
+            && target.task_id.is_none()
+            && target.task_run_id.is_none()
+            && metadata_json == "{}"
+            && let (Some(thread), Some(turn), Some(index), Some(version)) = (
+                target.thread_id.as_deref(),
+                target.turn_id.as_deref(),
+                target.item_index,
+                version_id,
+            )
+        {
+            let message = format!("user_{turn}");
+            if target.message_id.as_deref() == Some(message.as_str())
+                && target.turn_item_id.as_deref() == Some(message.as_str())
+            {
+                let mut pins = artifact_binding::Entity::find()
+                    .filter(artifact_binding::Column::WorkspaceId.eq(workspace_id))
+                    .filter(artifact_binding::Column::ArtifactId.eq(artifact_id))
+                    .filter(artifact_binding::Column::ArtifactVersionId.eq(version))
+                    .filter(artifact_binding::Column::ThreadId.eq(thread))
+                    .filter(artifact_binding::Column::TurnId.eq(turn))
+                    .filter(artifact_binding::Column::ItemIndex.eq(index))
+                    .filter(artifact_binding::Column::BindingKind.eq("user_input"))
+                    .filter(artifact_binding::Column::Direction.eq("input"))
+                    .filter(artifact_binding::Column::Role.eq("user"))
+                    .filter(artifact_binding::Column::ToolCallId.is_null())
+                    .filter(artifact_binding::Column::TaskId.is_null())
+                    .filter(artifact_binding::Column::TaskRunId.is_null())
+                    .filter(artifact_binding::Column::MetadataJson.eq("{}"))
+                    .filter(
+                        sea_orm::Condition::any()
+                            .add(
+                                sea_orm::Condition::all()
+                                    .add(artifact_binding::Column::MessageId.is_null())
+                                    .add(artifact_binding::Column::TurnItemId.is_null()),
+                            )
+                            .add(
+                                sea_orm::Condition::all()
+                                    .add(artifact_binding::Column::MessageId.eq(&message))
+                                    .add(artifact_binding::Column::TurnItemId.eq(&message)),
+                            ),
+                    )
+                    .limit(2)
+                    .all(db)
+                    .await
+                    .map_err(|source| ArtifactCrudError::Database {
+                        message: "failed to resolve accepted input binding".into(),
+                        source,
+                    })?;
+                if pins.len() > 1 {
+                    return Err(ArtifactCrudError::InvalidRequest {
+                        message: "accepted input binding is ambiguous".into(),
+                    });
+                }
+                if let Some(pin) = pins.pop() {
+                    if pin.message_id.is_some() {
+                        return binding_summary_from_model(&pin);
+                    }
+                    let mut pin = pin.into_active_model();
+                    pin.message_id = Set(Some(message.clone()));
+                    pin.turn_item_id = Set(Some(message));
+                    let pin =
+                        pin.update(db)
+                            .await
+                            .map_err(|source| ArtifactCrudError::Database {
+                                message: "failed to publish accepted input binding".into(),
+                                source,
+                            })?;
+                    return binding_summary_from_model(&pin);
+                }
+            }
+        }
         let model = artifact_binding::ActiveModel {
             id: Set(id),
             artifact_id: Set(artifact_id.to_owned()),
