@@ -1705,7 +1705,10 @@ async fn commit_current(
                 provider_name: "fixture".into(),
                 reasoning_effort: None,
                 agent_skill_versions_json: None,
-                hook_runtime_context_json: "{}".into(),
+                hook_runtime_context_json: serde_json::to_string(
+                    &pioneer_agent::AgentTurnHookRuntimeContext::default(),
+                )
+                .unwrap(),
                 workspace_skill_policies_json: "[]".into(),
                 input_json: "[]".into(),
                 capabilities_json: "[]".into(),

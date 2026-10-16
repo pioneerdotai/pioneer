@@ -594,6 +594,16 @@ async fn read_source_page<C: ConnectionTrait, E: EntityTrait>(
         .filter(projection.paging.sequence.clone().gt(after))
         .filter(projection.paging.capture_order.lte(capture_order))
         .filter(match before {
+            Some(before) if matches!(kind, CanonicalSource::Input) => {
+                history::history_input_before(projection.paging.created_at, before)
+            }
+            Some(before) if matches!(kind, CanonicalSource::Event) => {
+                history::history_event_before(
+                    projection.paging.created_at,
+                    Expr::col((turn_event::Entity, turn_event::Column::EventType)),
+                    before,
+                )
+            }
             Some(before) => history::history_before(projection.paging.created_at, before),
             None => Expr::val(true).into(),
         })

@@ -11741,9 +11741,8 @@ async fn assert_concurrent_collaborative_tasks_receive_independent_frozen_comman
         .unwrap()
         .unwrap();
     assert!(import_count > 0);
-    // Re-capture a real admitted child basis, as native/background compaction
-    // does after execution. The source bodies and their own-import grants must
-    // survive together, including repeated captures and the latest-basis path.
+    // Exact execution projections must forward the accepted own-import grants.
+    // New conversations have separate bounded inheritance and no such grants.
     let db = crud_store.database_connection();
     for (sql, values) in [
         (
@@ -11791,19 +11790,17 @@ async fn assert_concurrent_collaborative_tasks_receive_independent_frozen_comman
         .await
         .unwrap();
     }
-    for basis_turn in [Some("recapture-turn"), None] {
-        let recaptured = crate::compaction::frozen::capture_execution_basis_json(
+    for pass in 0..2 {
+        let recaptured = crate::compaction::frozen::prepare_exact_task_fixture(
             crud_store.as_ref(),
             &workspace_id,
             "new-child-context",
-            basis_turn,
-            None,
+            "recapture-turn",
             None,
         )
         .await
         .unwrap();
-        let descriptor: pioneer_compaction::frozen::FrozenHistoryRef =
-            serde_json::from_str(&recaptured).unwrap();
+        let descriptor = recaptured.descriptor;
         let (forwarded, _) = crud_store
             .compaction_frozen_import_state(
                 &workspace_id,
@@ -11815,7 +11812,7 @@ async fn assert_concurrent_collaborative_tasks_receive_independent_frozen_comman
             .unwrap();
         assert_eq!(
             forwarded, import_count,
-            "recapture must preserve every accepted own source grant (basis turn: {basis_turn:?})"
+            "recapture must preserve every accepted own source grant (pass {pass})"
         );
     }
 
@@ -15141,6 +15138,41 @@ async fn task_run_voice_composer_stays_foreground() {
         )
         .await
         .expect("persist task-run voice lineage");
+
+    // A Task child has a durable initial execution as well as lineage. The
+    // voice turn below is a later conversation, not the creating Task attempt.
+    for (sql, values) in [
+        (
+            "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES('turn_voice_task_initial','thr_voice_task_run','completed','conversation','system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+            vec![],
+        ),
+        (
+            "INSERT INTO task(id,workspace_id,owner_kind,owner_id,created_by_thread_id,created_by_turn_id,executor_kind,status,title,goal) VALUES('task_voice_task_run',?,'thread','thr_voice_task_root','thr_voice_task_root','turn_voice_task_root','agent','completed','Voice child','fixture')",
+            vec![workspace_id.clone().into()],
+        ),
+        (
+            "INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES('run_voice_task_run','task_voice_task_run','run_voice_task_run',1,1,'succeeded','agent')",
+            vec![],
+        ),
+        (
+            "INSERT INTO task_run_turn(id,task_id,run_id,thread_id,turn_id,kind,round,sequence,status,created_at) VALUES('rt_voice_task_run','task_voice_task_run','run_voice_task_run','thr_voice_task_run','turn_voice_task_initial','initial',0,1,'review_recorded',CURRENT_TIMESTAMP)",
+            vec![],
+        ),
+        (
+            "INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,history_json,created_at) VALUES('run_voice_task_run','task_voice_task_run',?,'thr_voice_task_root','turn_voice_task_root','[]',CURRENT_TIMESTAMP)",
+            vec![workspace_id.clone().into()],
+        ),
+    ] {
+        crud_store
+            .database_connection()
+            .execute_raw(sea_orm::Statement::from_sql_and_values(
+                sea_orm::DbBackend::Sqlite,
+                sql,
+                values,
+            ))
+            .await
+            .unwrap();
+    }
 
     let turn_id = "turn_voice_task_run";
     let result = submit_test_voice_turn(
@@ -25847,12 +25879,25 @@ async fn a_child_first_continued_by_another_provider_or_after_source_edit_transf
             TaskStatus::Completed
         );
         if edit_source || edit_after_ready {
-            seed_completed_task_parent_with_history(
+            let cutoff = store
+                .compaction_child_history_parent(&workspace, &lineage.child_thread_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .started_at
+                .timestamp()
+                + 1;
+            seed_completed_task_parent_with_inputs_at(
                 &processor,
                 &workspace,
                 &parent,
                 &format!("switch-late-parent-{source_id}"),
                 "LATE PARENT AFTER CHILD ANSWER",
+                vec![UserInput::Text {
+                    text: "LATE PARENT AFTER CHILD ANSWER".into(),
+                    text_elements: vec![],
+                }],
+                cutoff,
             )
             .await;
         }
@@ -26681,12 +26726,25 @@ async fn accepted_task_cli_transfer_compacts_without_later_parent_history_impl(
         "LATER PARENT MUST NOT ENTER TASK CHECKPOINT {}",
         "q".repeat(3_000_000)
     );
-    seed_completed_task_parent_with_history(
+    let cutoff = store
+        .compaction_child_history_parent(&workspace, &child.child_thread_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .started_at
+        .timestamp()
+        + 1;
+    seed_completed_task_parent_with_inputs_at(
         &processor,
         &workspace,
         parent,
         "parent-later-than-task-snapshot",
         late_parent_body.as_str(),
+        vec![UserInput::Text {
+            text: late_parent_body.clone(),
+            text_elements: vec![],
+        }],
+        cutoff,
     )
     .await;
     store
@@ -30796,12 +30854,25 @@ async fn nested_cli_children_bootstrap_their_accepted_lineage_only_impl() {
     }
 
     let late_parent_marker = "LATE ROOT APPEND AFTER CHILD BASIS";
-    seed_completed_task_parent_with_history(
+    let root_cutoff = crud_store
+        .compaction_child_history_parent(&workspace_id, &lineages[0].child_thread_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .started_at
+        .timestamp()
+        + 1;
+    seed_completed_task_parent_with_inputs_at(
         &processor,
         workspace_id.as_str(),
         root_thread_id,
         "turn_nested_cli_late_root",
         late_parent_marker,
+        vec![UserInput::Text {
+            text: late_parent_marker.into(),
+            text_elements: vec![],
+        }],
+        root_cutoff,
     )
     .await;
     cli_session

@@ -1369,6 +1369,14 @@ impl MessageProcessor {
             )
             .await;
         }
+        if reuse_runtime
+            && let Some(prepared) = crate::compaction::frozen::prepare_task_history_for_execution(
+                store, workspace, thread, turn,
+            )
+            .await?
+        {
+            return Ok(prepared);
+        }
         self.capture_authorized_task_basis_prepared(
             store,
             current.principal(),

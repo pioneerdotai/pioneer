@@ -77,6 +77,39 @@ pub(super) fn history_before(
         .lt(before.timestamp())
 }
 
+/// Editing replaces a turn's current input rows. Their new insertion date is
+/// not a new parent contribution; the original turn still fixes membership.
+/// Ordinary event/provider appends continue to use their own recorded dates.
+pub(super) fn history_input_before(
+    created_at: Expr,
+    before: sea_orm::prelude::DateTimeWithTimeZone,
+) -> Expr {
+    history_before(created_at, before).or(Expr::col((turn::Entity, turn::Column::MessageRevision))
+        .gt(0_i64)
+        .and(history_before(
+            Expr::col((turn::Entity, turn::Column::CreatedAt)),
+            before,
+        )))
+}
+
+/// Only structural edit/delete events update an already admitted message;
+/// their later dates must not resurrect an earlier input or hide its revision.
+pub(super) fn history_event_before(
+    created_at: Expr,
+    event_type: Expr,
+    before: sea_orm::prelude::DateTimeWithTimeZone,
+) -> Expr {
+    history_before(created_at, before).or(event_type
+        .is_in([
+            pioneer_protocol::constants::events::TURN_MESSAGE_EDITED,
+            pioneer_protocol::constants::events::TURN_MESSAGE_DELETED,
+        ])
+        .and(history_before(
+            Expr::col((turn::Entity, turn::Column::CreatedAt)),
+            before,
+        )))
+}
+
 /// Existing durable branch relationship; no Task input payload is read.
 #[derive(Clone, Debug)]
 pub struct ChildHistoryParent {
@@ -271,7 +304,7 @@ pub(crate) async fn compaction_history_source_created_at<C: ConnectionTrait>(
                 .await?,
         );
     }
-    if turn::Entity::find_by_id(turn_id)
+    let Some((turn_created_at, message_revision)) = turn::Entity::find_by_id(turn_id)
         .filter(turn::Column::ThreadId.eq(thread_id))
         .join(
             JoinType::InnerJoin,
@@ -282,14 +315,13 @@ pub(crate) async fn compaction_history_source_created_at<C: ConnectionTrait>(
         )
         .filter(thread::Column::WorkspaceId.eq(workspace))
         .select_only()
-        .column(turn::Column::Id)
-        .into_tuple::<String>()
+        .columns([turn::Column::CreatedAt, turn::Column::MessageRevision])
+        .into_tuple::<(sea_orm::prelude::DateTimeWithTimeZone, i64)>()
         .one(db)
         .await?
-        .is_none()
-    {
+    else {
         return Ok(None);
-    }
+    };
     macro_rules! timestamp {
         ($entity:ident) => {
             $entity::Entity::find_by_id(&source.id)
@@ -302,8 +334,33 @@ pub(crate) async fn compaction_history_source_created_at<C: ConnectionTrait>(
         };
     }
     Ok(match kind {
-        "input" => timestamp!(turn_input),
-        "event" => timestamp!(turn_event),
+        "input" => timestamp!(turn_input).map(|at| {
+            if message_revision > 0 {
+                turn_created_at
+            } else {
+                at
+            }
+        }),
+        "event" => {
+            let mutation = message_revision > 0
+                && turn_event::Entity::find_by_id(&source.id)
+                    .filter(turn_event::Column::TurnId.eq(turn_id))
+                    .filter(turn_event::Column::EventType.is_in([
+                        pioneer_protocol::constants::events::TURN_MESSAGE_EDITED,
+                        pioneer_protocol::constants::events::TURN_MESSAGE_DELETED,
+                    ]))
+                    .select_only()
+                    .column(turn_event::Column::Id)
+                    .into_tuple::<String>()
+                    .one(db)
+                    .await?
+                    .is_some();
+            if mutation {
+                Some(turn_created_at)
+            } else {
+                timestamp!(turn_event)
+            }
+        }
         "context" => timestamp!(turn_llm_context),
         "item" => {
             use pioneer_entity::{compaction_item_revision, turn_item};
@@ -2578,7 +2635,7 @@ async fn compaction_history_turn_page_inner<C: ConnectionTrait>(
                                     .lte(Expr::Value(fence.input_order.into())),
                                 )
                                 .and(match fence.before {
-                                    Some(before) => history_before(
+                                    Some(before) => history_input_before(
                                         Expr::col(("s", turn_input::Column::CreatedAt)),
                                         before,
                                     ),
@@ -2632,8 +2689,9 @@ async fn compaction_history_turn_page_inner<C: ConnectionTrait>(
                                     .lte(Expr::Value(fence.event_order.into())),
                                 )
                                 .and(match fence.before {
-                                    Some(before) => history_before(
+                                    Some(before) => history_event_before(
                                         Expr::col(("s", turn_event::Column::CreatedAt)),
+                                        Expr::col(("s", turn_event::Column::EventType)),
                                         before,
                                     ),
                                     None => Expr::val(true).into(),

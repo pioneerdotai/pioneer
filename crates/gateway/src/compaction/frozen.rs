@@ -912,7 +912,19 @@ pub(crate) async fn capture_execution_basis_prepared(
 /// independently of the ordinary conversation reader. Re-freeze that verified
 /// execution projection only to exercise existing import/publication APIs.
 #[cfg(test)]
-pub(super) async fn prepare_exact_task_fixture(
+pub(crate) async fn prepare_exact_task_fixture(
+    store: &CrudStore,
+    workspace: &str,
+    thread: &str,
+    turn: &str,
+    policy: Option<&pioneer_protocol::TaskAgentContextPolicy>,
+) -> Result<PreparedHistory> {
+    prepare_accepted_task_basis_prepared(store, workspace, thread, turn, policy).await
+}
+
+/// Project only the exact accepted Task basis and forward its verified OWN
+/// grants. The immutable Task/run snapshot is never replaced by this projection.
+async fn prepare_accepted_task_basis_prepared(
     store: &CrudStore,
     workspace: &str,
     thread: &str,
@@ -922,13 +934,72 @@ pub(super) async fn prepare_exact_task_fixture(
     let basis = store
         .compaction_task_basis_snapshot(workspace, thread, turn)
         .await?
-        .ok_or_else(|| anyhow::anyhow!("fixture has no exact Task basis"))?;
+        .ok_or_else(|| anyhow::anyhow!("execution has no exact Task basis"))?;
     let _hold = acquire_history_json(store, workspace, &basis.history_json).await?;
-    let descriptor: FrozenHistoryRef = serde_json::from_str(&basis.history_json)?;
     let mut allowed =
         accepted_history_scopes(store, workspace, &basis.parent_thread, &basis.history_json)
             .await?;
     allowed.insert(thread.to_owned());
+    let mut epochs = BTreeMap::new();
+    for scope in &allowed {
+        epochs.insert(
+            scope.clone(),
+            store
+                .compaction_projection_version(workspace, scope)
+                .await?,
+        );
+    }
+    let head = store
+        .compaction_head(&super::native::native_owner(workspace, thread))
+        .await?;
+    if basis.history_json.trim_start().starts_with('[') {
+        let reference = store
+            .compaction_legacy_task_basis_source(workspace, &basis.parent_thread, &basis.run_id)
+            .await?
+            .context("accepted legacy Task basis disappeared")?;
+        let body =
+            super::history::reference_payload(store, workspace, &basis.parent_thread, &reference)
+                .await?;
+        ensure!(
+            body == basis.history_json,
+            "accepted legacy Task basis changed during capture"
+        );
+        let mut messages: Vec<ChatMessage> = serde_json::from_str(&body)?;
+        // Preserve the existing opaque legacy unit. Its array does not grant
+        // permission to discover any additional parent turns.
+        for message in &mut messages {
+            message.provenance = Some(MessageProvenance {
+                logical_turn_id: None,
+                workspace_id: workspace.into(),
+                thread_id: basis.parent_thread.clone(),
+                context_thread: None,
+                unit_id: format!("legacy-task-basis:{}", basis.run_id),
+                sources: vec![runtime_source(&reference)],
+                source_aliases: vec![],
+                ambiguous_input_aliases: vec![],
+                complete: true,
+                protected_input: false,
+                inherited: true,
+            });
+        }
+        if let Some(policy) = policy {
+            select_task_history(&mut messages, policy)?;
+        }
+        let mut prepared = capture_prepared(store, workspace, thread, &allowed, &messages).await?;
+        for (scope, expected) in &epochs {
+            ensure!(
+                store
+                    .compaction_projection_version(workspace, scope)
+                    .await?
+                    == *expected,
+                "accepted Task history changed during preparation"
+            );
+        }
+        prepared.source_epochs = prepared_source_epochs(&prepared.accepted_scopes, &epochs)?;
+        prepared.expected_checkpoint = head;
+        return Ok(prepared);
+    }
+    let descriptor: FrozenHistoryRef = serde_json::from_str(&basis.history_json)?;
     let mut graphs = super::coverage::CheckpointGraphResolver::default();
     let mut restored = restore_accepted_execution_basis_prepared(
         store,
@@ -973,7 +1044,7 @@ pub(super) async fn prepare_exact_task_fixture(
         let origin = message
             .provenance
             .as_ref()
-            .context("fixture lost provenance")?;
+            .context("accepted Task projection lost provenance")?;
         if origin.inherited {
             continue;
         }
@@ -986,20 +1057,29 @@ pub(super) async fn prepare_exact_task_fixture(
                 let graph = graphs
                     .resolve(store, workspace, Some(&allowed), &key.source)
                     .await?
-                    .context("fixture checkpoint disappeared")?;
-                let ordinals = records
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(ordinal, record)| {
-                        graph
-                            .leaves
-                            .contains(&ScopedHistorySource {
-                                thread: record.source_thread.clone(),
-                                source: record.source.clone(),
-                            })
-                            .then_some(ordinal as u64)
-                    })
-                    .collect::<Vec<_>>();
+                    .context("accepted Task checkpoint disappeared")?;
+                let mut ordinals = Vec::new();
+                for (ordinal, record) in records.iter().enumerate() {
+                    let leaf = ScopedHistorySource {
+                        thread: record.source_thread.clone(),
+                        source: record.source.clone(),
+                    };
+                    // An immutable grant can name an atomic checkpoint, not
+                    // just a raw leaf. Keep that identity and its import ordinal.
+                    let checkpoint_member = graph.checkpoints.contains(&record.source)
+                        && store
+                            .compaction_checkpoint_source(
+                                workspace,
+                                &record.source_thread,
+                                &record.source.id,
+                            )
+                            .await?
+                            .as_ref()
+                            == Some(&record.source);
+                    if graph.leaves.contains(&leaf) || checkpoint_member {
+                        ordinals.push(ordinal as u64);
+                    }
+                }
                 if !ordinals.is_empty() {
                     imports.insert(
                         key.clone(),
@@ -1037,17 +1117,17 @@ pub(super) async fn prepare_exact_task_fixture(
         store, workspace, thread, &allowed, &restored, &imports, graphs,
     )
     .await?;
-    for scope in &prepared.accepted_scopes {
-        prepared.source_epochs.insert(
-            scope.clone(),
+    for (scope, expected) in &epochs {
+        ensure!(
             store
                 .compaction_projection_version(workspace, scope)
-                .await?,
+                .await?
+                == *expected,
+            "accepted Task history changed during preparation"
         );
     }
-    prepared.expected_checkpoint = store
-        .compaction_head(&super::native::native_owner(workspace, thread))
-        .await?;
+    prepared.source_epochs = prepared_source_epochs(&prepared.accepted_scopes, &epochs)?;
+    prepared.expected_checkpoint = head;
     Ok(prepared)
 }
 
@@ -1283,6 +1363,26 @@ pub(crate) async fn prepare_runtime_history_for_execution(
     }
     prepared.source_epochs = prepared_source_epochs(&prepared.accepted_scopes, &epochs)?;
     Ok(prepared)
+}
+
+/// A CLI Task may bootstrap before publishing its runtime snapshot. Its exact
+/// accepted run input remains the authority; a new conversation is separate.
+pub(crate) async fn prepare_task_history_for_execution(
+    store: &CrudStore,
+    workspace: &str,
+    thread: &str,
+    turn: &str,
+) -> Result<Option<PreparedHistory>> {
+    if store
+        .get_task_run_turn_by_turn(thread, turn)
+        .await?
+        .is_none()
+    {
+        return Ok(None);
+    }
+    Ok(Some(
+        prepare_accepted_task_basis_prepared(store, workspace, thread, turn, None).await?,
+    ))
 }
 
 pub(crate) async fn capture_execution_basis_prepared_with_outputs(
@@ -1529,6 +1629,54 @@ async fn capture_history_line_prepared(
                     origin.inherited = true;
                     origin.context_thread = Some(thread.to_owned());
                 }
+                // A same-second parent acknowledgement may already expose a
+                // fragment of this child's own round. Prefer the complete
+                // canonical child unit before composing the two lines; a raw
+                // output fragment cannot be split out of that round safely.
+                let own_layout =
+                    pioneer_agent::compaction::history::NativeHistoryLayout::from_messages(
+                        workspace,
+                        thread,
+                        &messages,
+                        &vec![0; messages.len()],
+                    )?;
+                let own_sources = own_layout
+                    .units
+                    .iter()
+                    .filter(|unit| unit.complete)
+                    .flat_map(|unit| &unit.sources)
+                    .filter(|source| own_layout.source_threads[*source] == thread)
+                    .cloned()
+                    .collect::<BTreeSet<_>>();
+                let inherited_layout =
+                    pioneer_agent::compaction::history::NativeHistoryLayout::from_messages(
+                        workspace,
+                        thread,
+                        &inherited_messages,
+                        &vec![0; inherited_messages.len()],
+                    )?;
+                let duplicate_indexes = inherited_layout
+                    .units
+                    .iter()
+                    .zip(&inherited_layout.message_indexes)
+                    .filter(|(unit, _)| {
+                        unit.complete
+                            && !unit.sources.is_empty()
+                            && unit.sources.iter().all(|source| {
+                                !source.scope.starts_with("checkpoint:")
+                                    && inherited_layout.source_threads[source] == thread
+                                    && own_sources.contains(source)
+                            })
+                    })
+                    .flat_map(|(_, indexes)| indexes.iter().copied())
+                    .collect::<BTreeSet<_>>();
+                inherited_messages = inherited_messages
+                    .into_iter()
+                    .enumerate()
+                    .filter_map(|(index, message)| {
+                        (!duplicate_indexes.contains(&index)).then_some(message)
+                    })
+                    .collect();
                 messages = compose_frozen_basis_with_resolver(
                     store,
                     workspace,

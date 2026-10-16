@@ -8414,22 +8414,23 @@ async fn native_discovers_working_context_head_published_after_inherited_snapsho
     ))
     .await
     .unwrap();
-    let e_projection_json = serde_json::to_string(
-        &super::frozen::prepare_exact_task_fixture(&f.store, "ws", "context-e", "turn-e", None)
+    let e_projection =
+        super::frozen::prepare_task_history_for_execution(&f.store, "ws", "context-e", "turn-e")
             .await
             .unwrap()
-            .descriptor,
-    )
-    .unwrap();
-    let e_projection: pioneer_compaction::frozen::FrozenHistoryRef =
-        serde_json::from_str(&e_projection_json).unwrap();
-    let e_allowed =
-        super::frozen::accepted_history_scopes(&f.store, "ws", "context-e", &e_projection_json)
-            .await
             .unwrap();
-    let e_history = super::frozen::restore(&f.store, "ws", &e_allowed, &e_projection)
+    let e_history = e_projection.messages.clone();
+    let e_imports = f
+        .store
+        .compaction_frozen_import_page("ws", "context-e", &e_projection.descriptor.manifest_id, 0)
         .await
         .unwrap();
+    assert!(
+        e_imports
+            .iter()
+            .any(|grant| grant.source.id == output_summary.id),
+        "an accepted atomic checkpoint needs its own forwarded grant, not only its raw leaves"
+    );
     assert_eq!(
         e_history
             .iter()
@@ -8469,7 +8470,7 @@ async fn native_discovers_working_context_head_published_after_inherited_snapsho
         events: Arc::new(ExecutionEventHub::new()),
         cancellation: CancellationToken::new(),
     };
-    let e_prepared = super::native::prepare_native_projection(
+    let e_prepared = super::native::prepare_native_projection_from_history(
         &f.store,
         &providers,
         &settings,
@@ -8488,12 +8489,9 @@ async fn native_discovers_working_context_head_published_after_inherited_snapsho
             reasoning: None,
             compiled_prompt: None,
         },
-        None,
-        false,
+        e_projection,
         f.observer.clone(),
         f.clock.clone(),
-        Some(e_projection),
-        None,
     )
     .await
     .unwrap();
@@ -20424,7 +20422,9 @@ async fn conversation_policy_keeps_own_child_turn_after_bounded_ancestors() {
                 "INSERT OR IGNORE INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES ('{run}','{task}','{run}',1,1,'running','agent')"
             ),
             format!(
-                "INSERT INTO task_run_turn(id,task_id,run_id,thread_id,turn_id,kind,round,sequence,status,created_at) VALUES ('{run}-{suffix}-turn','{task}','{run}','policy-child','{turn}','initial',0,{sequence},'completed',CURRENT_TIMESTAMP)"
+                "INSERT INTO task_run_turn(id,task_id,run_id,thread_id,turn_id,kind,round,sequence,status,created_at) VALUES ('{run}-{suffix}-turn','{task}','{run}','policy-child','{turn}','{kind}',{round},{sequence},'completed',CURRENT_TIMESTAMP)",
+                round = sequence - 1,
+                kind = if sequence == 1 { "initial" } else { "revision" },
             ),
         ] {
             f.store
@@ -22410,13 +22410,34 @@ async fn task_input_copy_normalization_survives_capture_restore_and_keeps_distin
     );
     assert!(both_selected.contains(&child_answer));
 
-    let prepared = super::frozen::capture_execution_basis_prepared(
+    let accepted = super::frozen::prepare_exact_task_fixture(
         &f.store,
         "ws",
         "child-thread",
-        Some("child-turn"),
+        "child-turn",
         None,
-        None,
+    )
+    .await
+    .unwrap();
+    let own = super::history::load_task_line_history(&f.store, "ws", "child-thread", None, &fence)
+        .await
+        .unwrap();
+    let messages = super::frozen::compose_frozen_basis(
+        &f.store,
+        "ws",
+        "child-thread",
+        &accepted.accepted_scopes,
+        &accepted.messages,
+        &own,
+    )
+    .await
+    .unwrap();
+    let prepared = super::frozen::capture_prepared(
+        &f.store,
+        "ws",
+        "child-thread",
+        &accepted.accepted_scopes,
+        &messages,
     )
     .await
     .unwrap();
