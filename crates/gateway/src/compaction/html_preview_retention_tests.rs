@@ -106,7 +106,7 @@ async fn retain_as_task_basis(
             "INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES ('run-{id}','task-{id}','run-{id}',1,1,'running','agent')"
         ),
         format!(
-            "INSERT INTO task_run_turn(id,task_id,run_id,thread_id,turn_id,kind,round,sequence,status,created_at) VALUES ('rt-{id}','task-{id}','run-{id}','{id}','turn-{id}','initial',0,1,'completed',CURRENT_TIMESTAMP)"
+            "INSERT INTO task_run_turn(id,task_id,run_id,thread_id,turn_id,kind,round,sequence,status,created_at) VALUES ('rt-{id}','task-{id}','run-{id}','{id}','turn-{id}','initial',0,1,'in_progress',CURRENT_TIMESTAMP)"
         ),
     ] {
         db.execute_unprepared(&sql).await.unwrap();
