@@ -21702,7 +21702,8 @@ async fn prepare_task_input_checkpoint_runner(
             .compaction_manifest_sources_current(&operation.id)
             .await
             .unwrap(),
-        "Task-input checkpoint manifest must be current before activation"
+        "Task-input checkpoint manifest for {} must be current before activation",
+        operation.id
     );
     let initial =
         RunnerState::new(operation.admission.deadline_ms, budget, runner_tokens, None).unwrap();
@@ -23179,19 +23180,9 @@ async fn task_input_copy_normalization_survives_capture_restore_and_keeps_distin
         "ambiguous source input identity must preserve the copy"
     );
 
-    // The independent ambiguity run remains intact. The following checkpoint
-    // scenario still uses the original unambiguous launch-copy run.
-    let prepared = super::frozen::capture_execution_basis_prepared(
-        &f.store,
-        "ws",
-        "child-thread",
-        Some("child-turn"),
-        None,
-        None,
-    )
-    .await
-    .unwrap();
-
+    // Use the normalized accepted Task projection prepared above. This
+    // checkpoint proves its original input and launch-copy alias; a new
+    // conversation intentionally excludes the Composer launch from its parent.
     let represented_source = original.provenance.as_ref().unwrap().sources[0].clone();
     let represented_source = SourceRef {
         scope: represented_source.scope,

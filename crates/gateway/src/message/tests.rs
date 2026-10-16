@@ -26649,8 +26649,14 @@ async fn accepted_task_cli_transfer_compacts_without_later_parent_history_impl(
         .await
         .unwrap();
     sync_test_cli_runtime_identities(&processor).await.unwrap();
+    let max_input_tokens = 50_000;
     processor
-        .mark_cli_reasoning_model_ready_for_tests(&workspace, "codex", "gpt-5")
+        .mark_cli_reasoning_model_with_limit_ready_for_tests(
+            &workspace,
+            "codex",
+            "gpt-5",
+            Some(max_input_tokens),
+        )
         .await
         .unwrap();
     processor
@@ -26662,15 +26668,18 @@ async fn accepted_task_cli_transfer_compacts_without_later_parent_history_impl(
     processor.bind_task_bridge().await;
     processor.start_task_event_listener().await;
     let parent = "accepted-large-task-parent";
-    let mut raw_bytes = 0usize;
+    // Force real transfer compaction through the discovered input limit.
+    // The separate CLI frame fixture covers the 8 MiB limit; these cases need
+    // accepted revisions, checkpoint reuse and cancellation, not that volume.
+    let mut history_tokens = 0;
+    let mut history_chars = 0;
     for index in 0..12 {
-        // Keep the provider frame above the 8 MiB cap without making a
-        // single giant BPE word dominate history-transfer timing.
         let text = format!(
             "ACCEPTED TASK CHUNK {index:02} {}",
-            "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx ".repeat(22_200)
+            "accepted history ".repeat(6_500)
         );
-        raw_bytes += text.len();
+        history_tokens += pioneer_compaction::text_tokens(&text);
+        history_chars += text.chars().count();
         seed_completed_task_parent_with_inputs(
             &processor,
             &workspace,
@@ -26684,7 +26693,8 @@ async fn accepted_task_cli_transfer_compacts_without_later_parent_history_impl(
         )
         .await;
     }
-    assert!(raw_bytes > crate::cli_runtime::context::MAX_CLI_TURN_INPUT_FRAME_BYTES);
+    assert!(history_tokens > max_input_tokens);
+    assert!(history_chars > crate::cli_runtime::context::MAX_CODEX_INPUT_TEXT_CHARS);
     let launch = "accepted-large-task-launch";
     let params = detached_cli_task_create_params(
         &workspace,
@@ -26705,9 +26715,8 @@ async fn accepted_task_cli_transfer_compacts_without_later_parent_history_impl(
     });
     let result = create_task_for_test(&processor, params).await.unwrap();
     let run = result.run.unwrap();
-    // This barrier follows projection of more than 8 MiB of accepted history.
-    // A concurrent workspace test run can spend well over ten seconds there;
-    // keep the test wait bounded without imposing an unrelated product deadline.
+    // Keep the observation bounded while the accepted projection is prepared.
+    // Editing below must happen at the selected capture/compaction boundary.
     timeout(
         Duration::from_secs(180),
         processor.wait_for_completed_history_preparation_barrier(),
@@ -26724,7 +26733,7 @@ async fn accepted_task_cli_transfer_compacts_without_later_parent_history_impl(
     let child = wait_for_child_lineage_for_run(store.clone(), run.id.as_str()).await;
     let late_parent_body = format!(
         "LATER PARENT MUST NOT ENTER TASK CHECKPOINT {}",
-        "q".repeat(3_000_000)
+        "later context ".repeat(50_000)
     );
     let cutoff = store
         .compaction_child_history_parent(&workspace, &child.child_thread_id)
@@ -26747,6 +26756,10 @@ async fn accepted_task_cli_transfer_compacts_without_later_parent_history_impl(
         cutoff,
     )
     .await;
+    // Make the edited unit exceed the transfer token target so it must enter
+    // the summary, even if its replacement row sorts into the retained tail.
+    let edited_body = format!("EDITED ACCEPTED SOURCE 00 {}", "b ".repeat(70_000));
+    assert!(pioneer_compaction::text_tokens(&edited_body) > max_input_tokens);
     store
         .edit_turn_message(pioneer_crud::EditTurnMessageRequest {
             workspace_id: workspace.clone(),
@@ -26754,10 +26767,7 @@ async fn accepted_task_cli_transfer_compacts_without_later_parent_history_impl(
             turn_id: "accepted-source-00".to_owned(),
             expected_revision: 0,
             input: vec![UserInput::Text {
-                text: format!(
-                    "EDITED ACCEPTED SOURCE 00 {}",
-                    "yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy ".repeat(22_200)
-                ),
+                text: edited_body,
                 text_elements: Vec::new(),
             }],
             mentions: Vec::new(),
