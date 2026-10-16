@@ -16,6 +16,7 @@ use std::{
     cmp::Ordering,
     collections::{HashMap, hash_map::DefaultHasher},
     hash::{Hash, Hasher},
+    sync::Arc,
 };
 
 macro_rules! client_system_label {
@@ -313,6 +314,9 @@ pub struct ConversationProjector {
     item_index: HashMap<String, usize>,
     item_timeline_index: HashMap<String, usize>,
     turn_index: HashMap<String, usize>,
+    // Identity changes only on an accepted phase change, including snapshot sync.
+    // A request can retain it to distinguish a repeat from departure and return.
+    turn_phase_markers: HashMap<String, Arc<TurnPhase>>,
     timeline_counter: u64,
     synthetic_item_counter: u64,
 }
@@ -323,12 +327,17 @@ impl ConversationProjector {
         self.item_index.clear();
         self.item_timeline_index.clear();
         self.turn_index.clear();
+        self.turn_phase_markers.clear();
         self.timeline_counter = 0;
         self.synthetic_item_counter = 0;
     }
 
     pub fn view_state(&self) -> &ConversationViewState {
         &self.view_state
+    }
+
+    pub(super) fn turn_phase_marker(&self, turn_id: &str) -> Option<&Arc<TurnPhase>> {
+        self.turn_phase_markers.get(turn_id)
     }
 
     pub fn bump_revision(&mut self) {
@@ -373,6 +382,15 @@ impl ConversationProjector {
     }
 
     pub fn upsert_turn_snapshot_metadata(&mut self, turn: &Turn) {
+        // Use the same phase mutation and index as live events. The DTO metadata
+        // helper alone would bypass lifecycle evidence and leave new views unindexed.
+        self.upsert_turn(
+            &turn.id,
+            turn_phase_for_status(turn.status),
+            None,
+            None,
+            turn.error.clone(),
+        );
         self.view_state.upsert_turn_snapshot_metadata(turn);
     }
 
@@ -1292,6 +1310,13 @@ impl ConversationProjector {
         completed_at_unix_ms: Option<i64>,
         error: Option<String>,
     ) {
+        let marker = self
+            .turn_phase_markers
+            .entry(turn_id.to_owned())
+            .or_insert_with(|| Arc::new(phase));
+        if **marker != phase {
+            *marker = Arc::new(phase);
+        }
         if let Some(index) = self.turn_index.get(turn_id).copied()
             && let Some(turn) = self.view_state.turns.get_mut(index)
         {
