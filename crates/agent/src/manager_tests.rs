@@ -5394,7 +5394,7 @@ async fn provider_failure_checkpoints_window_and_recovery_continues_in_next_wind
         "empty-no-tool-round",
         provider.clone(),
     ));
-    let manager = Arc::new(AgentManager::new(registry, test_tool_loop_config()));
+    let manager = Arc::new(AgentManager::new(registry.clone(), test_tool_loop_config()));
     manager
         .set_memory_provider(Some(Arc::new(RecordingMemoryProvider::new(
             Ok(MemoryRecallSnapshot::empty()),
@@ -5435,6 +5435,14 @@ async fn provider_failure_checkpoints_window_and_recovery_continues_in_next_wind
         .await
         .expect("turn should start");
 
+    let accepted_contract = registry
+        .get_or_create_for_workspace(workspace_id, "empty-no-tool-round")
+        .unwrap()
+        .capture_model_contract("test-model")
+        .unwrap();
+    let accepted_contract =
+        serde_json::from_slice(&serde_json::to_vec(&accepted_contract).unwrap()).unwrap();
+    let mut initial_phase_json = None;
     let mut exhausted_window_id = None;
     let mut checkpoint_context = None;
     let mut saw_provider_failure = false;
@@ -5443,6 +5451,9 @@ async fn provider_failure_checkpoints_window_and_recovery_continues_in_next_wind
             .await
             .expect("provider failure lifecycle event should arrive")
             .expect("durable receiver should stay open");
+        if let AgentDurableEvent::NativeInitialPhaseAdvanced { preparation } = &event {
+            initial_phase_json = Some(preparation.initial_phase_json.clone());
+        }
         durable_events.acknowledge_last(Ok(()));
         match event {
             AgentDurableEvent::TurnExecutionWindowExhausted { notification } => {
@@ -5565,14 +5576,10 @@ async fn provider_failure_checkpoints_window_and_recovery_continues_in_next_wind
                         .iter()
                         .any(|tool| tool.name == "memory_remember")
                 );
-                let restarted_provider = Arc::new(CaptureAgentProvider::default());
-                let restarted = AgentManager::new(
-                    Arc::new(ProviderRegistry::with_provider(
-                        "capture",
-                        restarted_provider.clone(),
-                    )),
-                    test_tool_loop_config(),
-                );
+                // Rebuild the Agent facade from accepted bytes while keeping the
+                // same provider authority, model and original semantic input.
+                let restarted_provider = provider.clone();
+                let restarted = AgentManager::new(registry.clone(), test_tool_loop_config());
                 restarted
                     .set_memory_provider(Some(Arc::new(RecordingMemoryProvider::new(
                         Ok(MemoryRecallSnapshot::empty()),
@@ -5588,13 +5595,48 @@ async fn provider_failure_checkpoints_window_and_recovery_continues_in_next_wind
                     .await
                     .unwrap();
                 let mut restarted_events = subscribe_agent_events(&restarted, thread_id).await;
-                restarted.start_turn_with_hook_context_and_execution_checkpoint_permission_profile_and_security_snapshot(
-                    thread_id, turn_id, ThreadMode::Agent, AgentTurnHookRuntimeContext::default(),
-                    "test-model", "capture", HashMap::new(), SkillCatalogSnapshot { version: 1, generated_at_unix: 0, skills: Vec::new() },
-                    vec![UserInput::Text { text: "ordinary question".to_owned(), text_elements: Vec::new() }],
-                    Vec::new(), Vec::new(), HashMap::new(), Vec::new(), restart_checkpoint,
-                    pioneer_protocol::default_turn_permission_profile_snapshot(), test_full_access_security_snapshot(),
-                ).await.unwrap();
+                restarted
+                    .start_turn_with_hook_context_and_execution_checkpoint_and_reasoning(
+                        thread_id,
+                        turn_id,
+                        ThreadMode::Agent,
+                        AgentTurnHookRuntimeContext::default(),
+                        "test-model",
+                        "empty-no-tool-round",
+                        None,
+                        Some(accepted_contract),
+                        Some(
+                            NativeInitialPreparation::restore(
+                                initial_phase_json.as_deref().unwrap(),
+                                workspace_id,
+                                thread_id,
+                                turn_id,
+                                pioneer_protocol::TURN_EXECUTION_REQUEST_MAX_BYTES,
+                            )
+                            .unwrap(),
+                        ),
+                        HashMap::new(),
+                        SkillCatalogSnapshot {
+                            version: 1,
+                            generated_at_unix: 0,
+                            skills: Vec::new(),
+                        },
+                        Vec::new(),
+                        vec![UserInput::Text {
+                            text: "return a final answer".to_owned(),
+                            text_elements: Vec::new(),
+                        }],
+                        Vec::new(),
+                        Vec::new(),
+                        HashMap::new(),
+                        Vec::new(),
+                        restart_checkpoint,
+                        None,
+                        pioneer_protocol::default_turn_permission_profile_snapshot(),
+                        test_full_access_security_snapshot(),
+                    )
+                    .await
+                    .unwrap();
                 assert_turn_completed(&recv_events_until_terminal(&mut restarted_events).await);
                 assert!(
                     restarted_provider
@@ -5617,7 +5659,7 @@ async fn provider_failure_checkpoints_window_and_recovery_continues_in_next_wind
 }
 
 #[tokio::test]
-async fn terminal_runtime_failure_checkpoints_window_before_turn_failure() {
+async fn permanent_finalization_rejection_is_not_a_recoverable_runtime_failure() {
     let provider = Arc::new(CaptureAgentProvider::default());
     let registry = Arc::new(ProviderRegistry::with_provider("capture", provider));
     let manager = AgentManager::new(registry, test_tool_loop_config());
@@ -5679,11 +5721,17 @@ async fn terminal_runtime_failure_checkpoints_window_before_turn_failure() {
                 );
                 saw_checkpoint = true;
             }
-            AgentDurableEvent::TurnFailed { error, .. } => {
+            AgentDurableEvent::TurnFailed { error, failure, .. } => {
                 assert_eq!(error, "finalization rejected the turn");
                 assert!(
-                    saw_checkpoint,
-                    "runtime failure must be published only after its checkpoint"
+                    !saw_checkpoint && !saw_exhausted,
+                    "an explicit permanent rejection must not create a resumable runtime checkpoint"
+                );
+                assert_eq!(
+                    failure,
+                    Some(pioneer_protocol::NativeFailureMetadata::execution(
+                        pioneer_protocol::TurnFailureDisposition::Permanent
+                    ))
                 );
                 return;
             }
