@@ -3558,7 +3558,9 @@ impl Provider for CaptureAgentProvider {
         // The capture double models a JSON-function provider. Keep its
         // externally visible name stable while opting into the native
         // filesystem capability contract used by apply-patch flows.
-        pioneer_provider::select_native_file_tool_capability("openai", model)
+        let mut capability = pioneer_provider::select_native_file_tool_capability("openai", model);
+        capability.provider = self.name().to_owned();
+        capability
     }
 
     fn capabilities(&self) -> ProviderCapabilities {
@@ -17276,7 +17278,10 @@ async fn native_required_tools_unknown_stops_before_initial_hooks_or_dispatch() 
         "requires native tools",
     )
     .await;
-    assert_turn_blocked(&events, "native Agent requires verified model tool support");
+    assert_turn_blocked(
+        &events,
+        "native Agent requires verified model tool support; capability evidence is unknown",
+    );
     assert!(capture.snapshot_requests().is_empty());
     assert!(snapshot_hook_calls(&calls).is_empty());
     assert!(
