@@ -647,6 +647,16 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::time::{Duration, sleep};
 
+    fn assert_attempt_work_progress(payload: &crate::events::ToolEventPayload) {
+        let crate::events::ToolEventPayload::OutputDelta(delta) = payload else {
+            panic!("expected typed attempt progress");
+        };
+        let crate::events::ToolDeltaPayload::Progress { stage, .. } = &delta.delta else {
+            panic!("non-shell fixtures must not emit raw output chunks");
+        };
+        assert_eq!(stage, "attempt_work_started");
+    }
+
     struct SleepHandler {
         sleep_ms: u64,
         active: Arc<AtomicUsize>,
@@ -1219,7 +1229,7 @@ mod tests {
         assert!(result.is_ok());
 
         let mut seen_started = false;
-        let mut seen_delta = false;
+        let mut seen_work_progress = false;
         let mut seen_completed = false;
         let mut completed_meta = None;
         let mut last_seq = 0u64;
@@ -1236,7 +1246,10 @@ mod tests {
                 ToolEventKind::CallStarted => seen_started = true,
                 ToolEventKind::Heartbeat => {}
                 ToolEventKind::PermissionAudit => {}
-                ToolEventKind::OutputDelta => seen_delta = true,
+                ToolEventKind::OutputDelta => {
+                    assert_attempt_work_progress(&event.payload);
+                    seen_work_progress = true;
+                }
                 ToolEventKind::CallCompleted => {
                     seen_completed = true;
                     completed_meta = Some(event.payload);
@@ -1248,8 +1261,8 @@ mod tests {
 
         assert!(seen_started, "expected call started lifecycle event");
         assert!(
-            !seen_delta,
-            "non-shell tools must not emit raw output delta events"
+            seen_work_progress,
+            "the concrete attempt must persist its work-start receipt"
         );
         assert!(seen_completed, "expected call completed lifecycle event");
         let completed_payload = completed_meta.expect("completion payload should be present");
@@ -1297,6 +1310,9 @@ mod tests {
             );
             last_seq = event.observation.event_seq;
 
+            if event.kind() == ToolEventKind::OutputDelta {
+                assert_attempt_work_progress(&event.payload);
+            }
             application_stages.push(event.observation.pipeline_stage.clone());
             if matches!(
                 event.kind(),
@@ -1311,6 +1327,7 @@ mod tests {
             vec![
                 "runtime.call.started",
                 "permission.audit",
+                "runtime.call.delta",
                 "runtime.call.completed"
             ],
             "ToolEventBus must carry product lifecycle and permission audit events only"
@@ -1341,6 +1358,9 @@ mod tests {
             if event.call_id != "call_failed" {
                 continue;
             }
+            if event.kind() == ToolEventKind::OutputDelta {
+                assert_attempt_work_progress(&event.payload);
+            }
             application_stages.push(event.observation.pipeline_stage.clone());
             if matches!(event.kind(), ToolEventKind::CallFailed) {
                 break;
@@ -1352,6 +1372,7 @@ mod tests {
             vec![
                 "runtime.call.started",
                 "permission.audit",
+                "runtime.call.delta",
                 "runtime.call.failed"
             ],
             "failed calls must terminalize through product lifecycle and permission audit events only"
