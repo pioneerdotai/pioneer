@@ -3561,6 +3561,7 @@ fn test_provider() -> Arc<pioneer_provider::ProviderRegistry> {
 }
 
 struct SequencedToolProvider {
+    name: &'static str,
     requests: std::sync::Mutex<Vec<ChatRequest>>,
     first_tool_calls: Vec<ProviderToolCall>,
     tool_call_rounds: Option<Vec<Vec<ProviderToolCall>>>,
@@ -5678,6 +5679,7 @@ async fn assert_memory_hook_subscription(
 impl SequencedToolProvider {
     fn new(first_tool_calls: Vec<ProviderToolCall>, second_text: impl Into<String>) -> Self {
         Self {
+            name: "openai",
             requests: std::sync::Mutex::new(Vec::new()),
             first_tool_calls,
             tool_call_rounds: None,
@@ -5685,6 +5687,16 @@ impl SequencedToolProvider {
             next_index: AtomicUsize::new(0),
             native_file_provider: None,
         }
+    }
+
+    fn new_named(
+        name: &'static str,
+        first_tool_calls: Vec<ProviderToolCall>,
+        second_text: impl Into<String>,
+    ) -> Self {
+        let mut provider = Self::new(first_tool_calls, second_text);
+        provider.name = name;
+        provider
     }
 
     fn with_tool_call_rounds(mut self, rounds: Vec<Vec<ProviderToolCall>>) -> Self {
@@ -6766,7 +6778,7 @@ impl Provider for SequencedToolProvider {
     }
 
     fn name(&self) -> &str {
-        "sequenced-tools"
+        self.name
     }
 
     fn native_file_tool_capability(
@@ -34292,7 +34304,8 @@ fn nested_task_create_tool_preserves_root_lineage_for_grandchild_permissions() {
 }
 
 async fn nested_task_create_tool_preserves_root_lineage_for_grandchild_permissions_body() {
-    let provider = Arc::new(SequencedToolProvider::new(
+    let provider = Arc::new(SequencedToolProvider::new_named(
+        "nested",
         vec![
             ProviderToolCall {
                 id: "call_create_nested_subagent".to_owned(),
@@ -34525,7 +34538,8 @@ async fn supervised_native_task_grant_reaches_the_real_child_sandbox_side_effect
     std::fs::write(source.as_path(), "approved Task child\n")
         .expect("Task source fixture should write");
 
-    let provider = Arc::new(SequencedToolProvider::new(
+    let provider = Arc::new(SequencedToolProvider::new_named(
+        "supervised-task-native",
         vec![ProviderToolCall {
             id: "call_supervised_task_shell".to_owned(),
             name: "exec_command".to_owned(),
@@ -35322,7 +35336,8 @@ fn task_list_inside_child_turn_hides_its_execution_wrapper() {
 }
 
 async fn task_list_inside_child_turn_hides_its_execution_wrapper_impl() {
-    let provider = Arc::new(SequencedToolProvider::new(
+    let provider = Arc::new(SequencedToolProvider::new_named(
+        "task-list-child",
         vec![ProviderToolCall {
             id: "call_list_from_task_execution".to_owned(),
             name: "task_list".to_owned(),
@@ -35489,7 +35504,11 @@ async fn agent_mode_materializes_task_tools_and_chat_mode_does_not_impl() {
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
     let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
-    let provider = Arc::new(SequencedToolProvider::new(Vec::new(), "done"));
+    let provider = Arc::new(SequencedToolProvider::new_named(
+        "parent",
+        Vec::new(),
+        "done",
+    ));
     let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
         "parent",
         provider.clone(),
@@ -35585,7 +35604,11 @@ async fn agent_mode_materializes_task_tools_and_chat_mode_does_not_impl() {
         "review-disabled Phase 3 must not expose review/approval tools"
     );
 
-    let chat_provider = Arc::new(SequencedToolProvider::new(Vec::new(), "done"));
+    let chat_provider = Arc::new(SequencedToolProvider::new_named(
+        "parent",
+        Vec::new(),
+        "done",
+    ));
     let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
         "parent",
         chat_provider.clone(),
@@ -35965,7 +35988,8 @@ async fn task_create_tool_idempotency_key_deduplicates_parallel_mutations_impl()
         "idempotencyKey": "same-task-create-key"
     })
     .to_string();
-    let provider = Arc::new(SequencedToolProvider::new(
+    let provider = Arc::new(SequencedToolProvider::new_named(
+        "parent",
         vec![
             ProviderToolCall {
                 id: "call_task_create_idem_1".to_owned(),
