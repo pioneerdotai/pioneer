@@ -21,6 +21,11 @@ pub struct HistoryReadFence {
     pub input_order: i64,
     pub event_order: i64,
     pub context_order: i64,
+    /// Request-local historical cutoff, independent of today's append fence.
+    #[sea_orm(skip)]
+    pub before: Option<sea_orm::prelude::DateTimeWithTimeZone>,
+    #[sea_orm(skip)]
+    pub source_turn: Option<String>,
 }
 /// Tool items are resolved by exact source references, not enumerated by the
 /// history assembler. A physical turn_item rowid boundary is neither used nor
@@ -53,6 +58,347 @@ pub struct AcceptedTaskBasis {
     pub parent_thread: String,
     pub run_id: String,
     pub history_json: String,
+}
+
+/// All branch cutoffs are whole Unix seconds. Strip only the fractional
+/// seconds before SQLite parses the timezone: its date functions otherwise
+/// round .999999999 into the next second. CURRENT_TIMESTAMP, RFC3339 (T/Z)
+/// and offset timestamps then compare as instants, never as TEXT.
+/// The template accepts only an expression, not interpolated source data.
+pub(super) const HISTORY_WHOLE_SECOND_SQL: &str =
+    "unixepoch(substr(?,1,19) || ltrim(substr(?,20), '.0123456789'))";
+
+pub(super) fn history_before(
+    created_at: Expr,
+    before: sea_orm::prelude::DateTimeWithTimeZone,
+) -> Expr {
+    debug_assert_eq!(before.timestamp_subsec_nanos(), 0);
+    Expr::cust_with_exprs(HISTORY_WHOLE_SECOND_SQL, [created_at.clone(), created_at])
+        .lt(before.timestamp())
+}
+
+/// Editing replaces a turn's current input rows. Their new insertion date is
+/// not a new parent contribution; the original turn still fixes membership.
+/// Ordinary event/provider appends continue to use their own recorded dates.
+pub(super) fn history_input_before(
+    created_at: Expr,
+    before: sea_orm::prelude::DateTimeWithTimeZone,
+) -> Expr {
+    history_before(created_at, before).or(Expr::col((turn::Entity, turn::Column::MessageRevision))
+        .gt(0_i64)
+        .and(history_before(
+            Expr::col((turn::Entity, turn::Column::CreatedAt)),
+            before,
+        )))
+}
+
+/// Only structural edit/delete events update an already admitted message;
+/// their later dates must not resurrect an earlier input or hide its revision.
+pub(super) fn history_event_before(
+    created_at: Expr,
+    event_type: Expr,
+    before: sea_orm::prelude::DateTimeWithTimeZone,
+) -> Expr {
+    history_before(created_at, before).or(event_type
+        .is_in([
+            pioneer_protocol::constants::events::TURN_MESSAGE_EDITED,
+            pioneer_protocol::constants::events::TURN_MESSAGE_DELETED,
+        ])
+        .and(history_before(
+            Expr::col((turn::Entity, turn::Column::CreatedAt)),
+            before,
+        )))
+}
+
+/// Existing durable branch relationship; no Task input payload is read.
+#[derive(Clone, Debug)]
+pub struct ChildHistoryParent {
+    pub parent_thread: String,
+    pub root_thread: String,
+    pub started_at: sea_orm::prelude::DateTimeWithTimeZone,
+    pub source_turn: Option<String>,
+    pub task_source_turn: Option<String>,
+    pub task_metadata_json: Option<String>,
+    pub context_policy_json: Option<String>,
+}
+
+pub(crate) async fn compaction_child_history_parent<C: ConnectionTrait>(
+    db: &C,
+    workspace: &str,
+    child: &str,
+) -> Result<Option<ChildHistoryParent>> {
+    use pioneer_entity::{task_agent_spec, task_run_thread_binding};
+    use sea_orm::{QueryOrder, QuerySelect};
+    let Some(lineage) = thread_lineage::Entity::find_by_id(child).one(db).await? else {
+        return Ok(None);
+    };
+    ensure!(
+        lineage.parent_thread_id != child && lineage.root_thread_id != child && lineage.depth >= 0,
+        "invalid child history lineage"
+    );
+    for id in [child, lineage.parent_thread_id.as_str()] {
+        ensure!(
+            thread::Entity::find_by_id(id)
+                .filter(thread::Column::WorkspaceId.eq(workspace))
+                .select_only()
+                .column(thread::Column::Id)
+                .into_tuple::<String>()
+                .one(db)
+                .await?
+                .is_some(),
+            "child history left its workspace"
+        );
+    }
+    let binding = task_run_thread_binding::Entity::find()
+        .filter(task_run_thread_binding::Column::ThreadId.eq(child))
+        .one(db)
+        .await?;
+    // agent_action is capsule lineage, not an accepted Task conversation.
+    // Do not silently ignore conflicting Task evidence or corrupt Task children.
+    if lineage.origin_kind.as_deref() == Some("agent_action") {
+        ensure!(
+            binding.is_none()
+                && thread::Entity::find_by_id(child)
+                    .filter(thread::Column::OriginKind.eq("system"))
+                    .select_only()
+                    .column(thread::Column::Id)
+                    .into_tuple::<String>()
+                    .one(db)
+                    .await?
+                    .is_some()
+                && task_run_turn::Entity::find()
+                    .filter(task_run_turn::Column::ThreadId.eq(child))
+                    .select_only()
+                    .column(task_run_turn::Column::Id)
+                    .into_tuple::<String>()
+                    .one(db)
+                    .await?
+                    .is_none(),
+            "internal lineage conflicts with Task child identity"
+        );
+        return Ok(None);
+    }
+    let mut query = task_run_turn::Entity::find().filter(task_run_turn::Column::ThreadId.eq(child));
+    if let Some(binding) = &binding {
+        query = query
+            .filter(task_run_turn::Column::RunId.eq(&binding.run_id))
+            .filter(task_run_turn::Column::TaskId.eq(&binding.task_id));
+    }
+    let first = query
+        .order_by_asc(task_run_turn::Column::Sequence)
+        .one(db)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("child history has no initial Task turn"))?;
+    // Sequence orders turns within one run. It cannot order different runs;
+    // reject a conflicting owner anywhere in this child's relationship rows.
+    ensure!(
+        task_run_turn::Entity::find()
+            .filter(task_run_turn::Column::ThreadId.eq(child))
+            .filter(
+                sea_orm::Condition::any()
+                    .add(task_run_turn::Column::RunId.ne(&first.run_id))
+                    .add(task_run_turn::Column::TaskId.ne(&first.task_id))
+            )
+            .select_only()
+            .column(task_run_turn::Column::Id)
+            .into_tuple::<String>()
+            .one(db)
+            .await?
+            .is_none(),
+        "child history has ambiguous Task runs"
+    );
+    let started_at = turn::Entity::find_by_id(&first.turn_id)
+        .filter(turn::Column::ThreadId.eq(child))
+        .select_only()
+        .column(turn::Column::CreatedAt)
+        .into_tuple::<sea_orm::prelude::DateTimeWithTimeZone>()
+        .one(db)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("initial child turn is unavailable"))?;
+    let run_task = task_run::Entity::find_by_id(&first.run_id)
+        .select_only()
+        .column(task_run::Column::TaskId)
+        .into_tuple::<String>()
+        .one(db)
+        .await?;
+    ensure!(
+        run_task.as_deref() == Some(first.task_id.as_str()),
+        "child history run changed"
+    );
+    let (task_source_turn, task_metadata_json) = task::Entity::find_by_id(&first.task_id)
+        .filter(task::Column::WorkspaceId.eq(workspace))
+        .select_only()
+        .columns([task::Column::CreatedByTurnId, task::Column::MetadataJson])
+        .into_tuple::<(Option<String>, Option<String>)>()
+        .one(db)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("child history Task is unavailable"))?;
+    // Old rows may predate thread bindings. The exact run-turn + snapshot +
+    // lineage still have to agree; a binding, when present, narrows this lookup.
+    let snapshot = task_run_conversation_snapshot::Entity::find_by_id(&first.run_id)
+        .filter(task_run_conversation_snapshot::Column::TaskId.eq(&first.task_id))
+        .filter(task_run_conversation_snapshot::Column::WorkspaceId.eq(workspace))
+        .filter(
+            task_run_conversation_snapshot::Column::ConversationThreadId
+                .eq(&lineage.parent_thread_id),
+        )
+        .select_only()
+        .column(task_run_conversation_snapshot::Column::SourceTurnId)
+        .into_tuple::<Option<String>>()
+        .one(db)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("child history snapshot relationship is unavailable"))?;
+    let context_policy_json = task_agent_spec::Entity::find()
+        .filter(task_agent_spec::Column::TaskId.eq(&first.task_id))
+        .filter(task_agent_spec::Column::RunId.eq(&first.run_id))
+        .select_only()
+        .column(task_agent_spec::Column::ContextPolicyJson)
+        .into_tuple::<Option<String>>()
+        .one(db)
+        .await?;
+    let context_policy_json = match context_policy_json {
+        Some(policy) => policy,
+        None => task_agent_spec::Entity::find()
+            .filter(task_agent_spec::Column::TaskId.eq(&first.task_id))
+            .filter(task_agent_spec::Column::RunId.is_null())
+            .select_only()
+            .column(task_agent_spec::Column::ContextPolicyJson)
+            .into_tuple::<Option<String>>()
+            .one(db)
+            .await?
+            .flatten(),
+    };
+    Ok(Some(ChildHistoryParent {
+        parent_thread: lineage.parent_thread_id,
+        root_thread: lineage.root_thread_id,
+        started_at,
+        source_turn: snapshot,
+        task_source_turn,
+        task_metadata_json,
+        context_policy_json,
+    }))
+}
+
+/// Timestamp metadata only, including a source whose body was edited. Missing
+/// historical leaves are handled by checkpoint admission evidence by the caller.
+pub(crate) async fn compaction_history_source_created_at<C: ConnectionTrait>(
+    db: &C,
+    workspace: &str,
+    thread_id: &str,
+    source: &SourceRef,
+) -> Result<Option<sea_orm::prelude::DateTimeWithTimeZone>> {
+    use sea_orm::QuerySelect;
+    let Some((kind, turn_id)) = source.scope.split_once(':') else {
+        return Ok(None);
+    };
+    if kind == "task-basis" {
+        return Ok(
+            task_run_conversation_snapshot::Entity::find_by_id(&source.id)
+                .filter(task_run_conversation_snapshot::Column::RunId.eq(turn_id))
+                .filter(task_run_conversation_snapshot::Column::WorkspaceId.eq(workspace))
+                .filter(task_run_conversation_snapshot::Column::ConversationThreadId.eq(thread_id))
+                .select_only()
+                .column(task_run_conversation_snapshot::Column::CreatedAt)
+                .into_tuple::<sea_orm::prelude::DateTimeWithTimeZone>()
+                .one(db)
+                .await?,
+        );
+    }
+    let Some((turn_created_at, message_revision)) = turn::Entity::find_by_id(turn_id)
+        .filter(turn::Column::ThreadId.eq(thread_id))
+        .join(
+            JoinType::InnerJoin,
+            turn::Entity::belongs_to(thread::Entity)
+                .from(turn::Column::ThreadId)
+                .to(thread::Column::Id)
+                .into(),
+        )
+        .filter(thread::Column::WorkspaceId.eq(workspace))
+        .select_only()
+        .columns([turn::Column::CreatedAt, turn::Column::MessageRevision])
+        .into_tuple::<(sea_orm::prelude::DateTimeWithTimeZone, i64)>()
+        .one(db)
+        .await?
+    else {
+        return Ok(None);
+    };
+    macro_rules! timestamp {
+        ($entity:ident) => {
+            $entity::Entity::find_by_id(&source.id)
+                .filter($entity::Column::TurnId.eq(turn_id))
+                .select_only()
+                .column($entity::Column::CreatedAt)
+                .into_tuple::<sea_orm::prelude::DateTimeWithTimeZone>()
+                .one(db)
+                .await?
+        };
+    }
+    Ok(match kind {
+        "input" => timestamp!(turn_input).map(|at| {
+            if message_revision > 0 {
+                turn_created_at
+            } else {
+                at
+            }
+        }),
+        "event" => {
+            let mutation = message_revision > 0
+                && turn_event::Entity::find_by_id(&source.id)
+                    .filter(turn_event::Column::TurnId.eq(turn_id))
+                    .filter(turn_event::Column::EventType.is_in([
+                        pioneer_protocol::constants::events::TURN_MESSAGE_EDITED,
+                        pioneer_protocol::constants::events::TURN_MESSAGE_DELETED,
+                    ]))
+                    .select_only()
+                    .column(turn_event::Column::Id)
+                    .into_tuple::<String>()
+                    .one(db)
+                    .await?
+                    .is_some();
+            if mutation {
+                Some(turn_created_at)
+            } else {
+                timestamp!(turn_event)
+            }
+        }
+        "context" => timestamp!(turn_llm_context),
+        "item" => {
+            use pioneer_entity::{compaction_item_revision, turn_item};
+            let revision = compaction_item_revision::Entity::find_by_id(&source.id)
+                .filter(compaction_item_revision::Column::TurnId.eq(turn_id))
+                .select_only()
+                .column(compaction_item_revision::Column::Revision)
+                .into_tuple::<i64>()
+                .one(db)
+                .await?;
+            if revision.is_none_or(|revision| source.version != format!("item-revision:{revision}"))
+            {
+                return Ok(None);
+            }
+            let item = turn_item::Entity::find_by_id(&source.id)
+                .filter(turn_item::Column::TurnId.eq(turn_id))
+                .select_only()
+                .columns([turn_item::Column::ItemId, turn_item::Column::UpdatedAt])
+                .into_tuple::<(String, sea_orm::prelude::DateTimeWithTimeZone)>()
+                .one(db)
+                .await?;
+            if let Some((item_id, updated_at)) = item {
+                turn_llm_context::Entity::find()
+                    .filter(turn_llm_context::Column::TurnId.eq(turn_id))
+                    .filter(turn_llm_context::Column::ItemId.eq(item_id))
+                    .filter(turn_llm_context::Column::Source.eq("tool_result_v2"))
+                    .select_only()
+                    .column(turn_llm_context::Column::CreatedAt)
+                    .into_tuple::<sea_orm::prelude::DateTimeWithTimeZone>()
+                    .one(db)
+                    .await?
+                    .or(Some(updated_at))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    })
 }
 
 #[derive(Clone, Debug, FromQueryResult)]
@@ -1482,7 +1828,7 @@ pub(crate) async fn compaction_task_delivery_command(
         return Ok(Some(row));
     }
     store
-        .compaction_failed_delivery_command(workspace, thread, None, Some(source), i64::MAX)
+        .compaction_failed_delivery_command(workspace, thread, None, Some(source), i64::MAX, None)
         .await
 }
 
@@ -1496,6 +1842,7 @@ pub(crate) async fn compaction_failed_delivery_command<C: ConnectionTrait>(
     command: Option<&str>,
     source: Option<&SourceRef>,
     event_fence: i64,
+    before: Option<sea_orm::prelude::DateTimeWithTimeZone>,
 ) -> Result<Option<String>> {
     let mut after = String::new();
     loop {
@@ -1665,6 +2012,12 @@ pub(crate) async fn compaction_failed_delivery_command<C: ConnectionTrait>(
                             // state. Emit its exact key directly: a nullable-parameter OR
                             // hides the primary-key lookup from SQLite and makes every
                             // historical message scan unrelated event revisions.
+                            .and_where_option(before.map(|before| {
+                                history_before(
+                                    Expr::col(("e", turn_event::Column::CreatedAt)),
+                                    before,
+                                )
+                            }))
                             .and_where_option(source.map(|source| {
                                 Expr::col(("e", turn_event::Column::Id))
                                     .eq(source.id.clone())
@@ -1735,6 +2088,9 @@ pub(crate) async fn compaction_history_causal_boundary(
                 Query::select()
                     .expr(Expr::val(1_i64))
                     .from_as(task::Entity, "task")
+                    .and_where_option(fence.before.map(|before| {
+                        history_before(Expr::col(("task", task::Column::CreatedAt)), before)
+                    }))
                     .and_where(
                         Expr::col(("task", task::Column::WorkspaceId))
                             .eq(Expr::col((thread::Entity, thread::Column::WorkspaceId)))
@@ -1777,6 +2133,9 @@ pub(crate) async fn compaction_history_causal_boundary(
                 Query::select()
                     .expr(Expr::val(1_i64))
                     .from_as(task_delivery::Entity, "d")
+                    .and_where_option(fence.before.map(|before| {
+                        history_before(Expr::col(("d", task_delivery::Column::CreatedAt)), before)
+                    }))
                     .and_where(
                         Expr::col(("d", task_delivery::Column::WorkspaceId))
                             .eq(Expr::col((thread::Entity, thread::Column::WorkspaceId)))
@@ -1798,6 +2157,9 @@ pub(crate) async fn compaction_history_causal_boundary(
                 Query::select()
                     .expr(Expr::val(1_i64))
                     .from_as(task::Entity, "task")
+                    .and_where_option(fence.before.map(|before| {
+                        history_before(Expr::col(("task", task::Column::CreatedAt)), before)
+                    }))
                     .join_as(
                         JoinType::InnerJoin,
                         task_delivery::Entity,
@@ -1879,6 +2241,13 @@ pub(crate) async fn compaction_history_causal_boundary(
                                 Expr::col(("v", compaction_event_revision::Column::CaptureOrder))
                                     .lte(Expr::Value(fence.event_order.into())),
                             )
+                            .and(match fence.before {
+                                Some(before) => history_before(
+                                    Expr::col(("e", turn_event::Column::CreatedAt)),
+                                    before,
+                                ),
+                                None => Expr::val(true).into(),
+                            })
                             .and(
                                 Expr::col(("v", compaction_event_revision::Column::ItemId)).eq(
                                     Expr::Value(
@@ -1902,6 +2271,9 @@ pub(crate) async fn compaction_history_causal_boundary(
                 Query::select()
                     .expr(Expr::val(1_i64))
                     .from_as(task::Entity, "task")
+                    .and_where_option(fence.before.map(|before| {
+                        history_before(Expr::col(("task", task::Column::CreatedAt)), before)
+                    }))
                     .join_as(
                         JoinType::InnerJoin,
                         task_run::Entity,
@@ -1965,6 +2337,13 @@ pub(crate) async fn compaction_history_causal_boundary(
                                 Expr::col(("v", compaction_event_revision::Column::CaptureOrder))
                                     .lte(Expr::Value(fence.event_order.into())),
                             )
+                            .and(match fence.before {
+                                Some(before) => history_before(
+                                    Expr::col(("e", turn_event::Column::CreatedAt)),
+                                    before,
+                                ),
+                                None => Expr::val(true).into(),
+                            })
                             .and(Expr::col(("e", turn_event::Column::EventType)).is_in([
                                 Expr::Value(
                                     pioneer_protocol::constants::events::TURN_FAILED.into(),
@@ -1999,6 +2378,7 @@ pub(crate) async fn compaction_history_causal_boundary(
                 Some(turn),
                 None,
                 fence.event_order,
+                fence.before,
             )
             .await?
             .is_some();
@@ -2253,7 +2633,14 @@ async fn compaction_history_turn_page_inner<C: ConnectionTrait>(
                                         compaction_input_revision::Column::CaptureOrder,
                                     ))
                                     .lte(Expr::Value(fence.input_order.into())),
-                                ),
+                                )
+                                .and(match fence.before {
+                                    Some(before) => history_input_before(
+                                        Expr::col(("s", turn_input::Column::CreatedAt)),
+                                        before,
+                                    ),
+                                    None => Expr::val(true).into(),
+                                }),
                         )
                         .to_owned()
                         .into(),
@@ -2300,7 +2687,15 @@ async fn compaction_history_turn_page_inner<C: ConnectionTrait>(
                                         compaction_event_revision::Column::CaptureOrder,
                                     ))
                                     .lte(Expr::Value(fence.event_order.into())),
-                                ),
+                                )
+                                .and(match fence.before {
+                                    Some(before) => history_event_before(
+                                        Expr::col(("s", turn_event::Column::CreatedAt)),
+                                        Expr::col(("s", turn_event::Column::EventType)),
+                                        before,
+                                    ),
+                                    None => Expr::val(true).into(),
+                                }),
                         )
                         .to_owned()
                         .into(),
@@ -2349,7 +2744,14 @@ async fn compaction_history_turn_page_inner<C: ConnectionTrait>(
                                         compaction_source_revision::Column::CaptureOrder,
                                     ))
                                     .lte(Expr::Value(fence.context_order.into())),
-                                ),
+                                )
+                                .and(match fence.before {
+                                    Some(before) => history_before(
+                                        Expr::col(("s", turn_llm_context::Column::CreatedAt)),
+                                        before,
+                                    ),
+                                    None => Expr::val(true).into(),
+                                }),
                         )
                         .to_owned()
                         .into(),
@@ -2367,6 +2769,28 @@ async fn compaction_history_turn_page_inner<C: ConnectionTrait>(
                         .lte(Expr::Value(fence.turn_id.clone().into())),
                 ),
         );
+    query = query.filter(
+        Expr::exists(
+            Query::select()
+                .expr(Expr::val(1_i64))
+                .from(compaction_turn_creation::Entity)
+                .and_where(
+                    Expr::col(compaction_turn_creation::Column::TurnId)
+                        .eq(Expr::col((turn::Entity, turn::Column::Id))),
+                )
+                .and_where(
+                    Expr::col(compaction_turn_creation::Column::Sequence).gt(fence.turn_order),
+                )
+                .to_owned(),
+        )
+        .not(),
+    );
+    if let Some(before) = fence.before {
+        query = query.filter(history_before(
+            Expr::col((turn::Entity, turn::Column::CreatedAt)),
+            before,
+        ));
+    }
     if let Some(selected) = selected {
         query = query.filter(turn::Column::Id.is_in(selected.iter().cloned()));
     }

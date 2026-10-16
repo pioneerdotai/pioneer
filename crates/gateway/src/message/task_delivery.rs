@@ -1133,7 +1133,7 @@ impl MessageProcessor {
                     item_completed.thread_id.as_str(),
                     item_completed.turn_id.as_str(),
                     &item_completed.item,
-                    None,
+                    Some("completed"),
                 )
                 .await;
                 self.send_notification_to_thread_subscribers(
@@ -1281,7 +1281,7 @@ impl MessageProcessor {
             completed.thread_id.as_str(),
             completed.turn_id.as_str(),
             &completed.item,
-            None,
+            Some("completed"),
         )
         .await;
         Ok(())

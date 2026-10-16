@@ -3,6 +3,7 @@ pub(crate) mod coordinator;
 pub(crate) mod facade;
 pub(crate) mod grants;
 pub(crate) mod limits;
+pub(crate) mod native_correlation;
 pub(crate) mod readiness;
 pub(crate) mod recovery;
 pub(crate) mod server;

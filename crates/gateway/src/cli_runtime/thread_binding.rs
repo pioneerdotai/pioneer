@@ -666,7 +666,7 @@ pub(crate) fn binding_has_prepared_child_fork(
     binding: &CliRuntimeThreadBindingRecord,
     source: &pioneer_crud::CliRuntimeTurnBindingRecord,
 ) -> Result<bool> {
-    if binding.runtime_kind != "codex"
+    if !matches!(binding.runtime_kind.as_str(), "codex" | "opencode")
         || binding.status != "active"
         || binding.thread_id != source.thread_id
         || binding.workspace_id != source.workspace_id
@@ -728,8 +728,8 @@ pub(crate) fn pending_codex_fork_intent(
         return Ok(None);
     }
     anyhow::ensure!(
-        binding.runtime_kind == "codex",
-        "non-Codex fork intent is unsupported"
+        matches!(binding.runtime_kind.as_str(), "codex" | "opencode"),
+        "provider fork intent is unsupported"
     );
     let cursor = deserialize_cli_runtime_json::<CliRuntimeResumeCursor>(
         binding.resume_cursor_json.as_str(),
@@ -957,12 +957,17 @@ async fn context_basis_from_acknowledged_turn(
         }
         let descriptor: pioneer_compaction::frozen::FrozenHistoryRef =
             serde_json::from_str(history_json.as_str())?;
-        let direct_sources = crate::compaction::frozen::frozen_history_direct_sources(
+        let direct_sources = match crate::compaction::frozen::frozen_history_direct_sources(
             store,
             source.workspace_id.as_str(),
             &descriptor,
         )
-        .await?;
+        .await
+        {
+            Ok(sources) => sources,
+            Err(error) if expired_context_authority(&error) => return Ok(None),
+            Err(error) => return Err(error),
+        };
         let Some((_, turn)) = store
             .get_turn(source.thread_id.as_str(), source.turn_id.as_str())
             .await?
@@ -1074,20 +1079,32 @@ async fn context_basis_from_acknowledged_turn(
     Ok(Some(basis))
 }
 
+/// Expiry retires a continuity proof; it cannot authorize a provider fork.
+/// The ordinary new-session bridge can prepare a fresh conversation context.
+/// Corruption, ownership changes and database failures remain errors.
+fn expired_context_authority(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.to_string().starts_with("frozen_input_expired:"))
+}
+
 pub(crate) async fn completed_context_basis_is_current(
     store: &CrudStore,
     workspace_id: &str,
     basis: &CliRuntimeContextBasis,
 ) -> Result<bool> {
-    if !crate::compaction::frozen::validate_frozen_history_authority(
+    match crate::compaction::frozen::validate_frozen_history_authority(
         store,
         workspace_id,
         basis.manifest_owner_thread_id.as_str(),
         basis.history_json.as_str(),
     )
-    .await?
+    .await
     {
-        return Ok(false);
+        Ok(true) => {}
+        Ok(false) => return Ok(false),
+        Err(error) if expired_context_authority(&error) => return Ok(false),
+        Err(error) => return Err(error),
     }
     let authority: pioneer_compaction::frozen::FrozenHistoryRef =
         serde_json::from_str(basis.history_json.as_str())?;
@@ -1880,6 +1897,7 @@ pub(crate) enum CLIAgentRuntimeThreadBindingOpenMode {
 
 #[derive(Debug, Clone)]
 pub(crate) struct CLIAgentRuntimeThreadBindingOpenResult {
+    pub name: Option<String>,
     pub binding: CliRuntimeThreadBindingRecord,
     pub mode: CLIAgentRuntimeThreadBindingOpenMode,
 }
@@ -2005,7 +2023,20 @@ where
             )
         })?;
 
-    Ok(CLIAgentRuntimeThreadBindingOpenResult { binding, mode })
+    Ok(CLIAgentRuntimeThreadBindingOpenResult {
+        binding,
+        mode,
+        // Keep Codex metadata out of the shared snapshot required by other
+        // runtime adapters. The decoder also checks the exact native identity.
+        name: (request.runtime_kind == "codex")
+            .then(|| {
+                pioneer_cli_agent_runtime::codex::thread_open_name(
+                    &opened.raw,
+                    &opened.native_thread_id,
+                )
+            })
+            .flatten(),
+    })
 }
 
 fn generic_thread_binding_from_opened(
@@ -2675,12 +2706,15 @@ mod tests {
     async fn cli_runtime_binding_first_start_persists_thread_binding() {
         let (_connection, store) = setup_store().await;
         let client = FakeCliRuntimeThreadClient::new();
+        client.start_result.lock().unwrap().as_mut().unwrap().raw["thread"]["name"] =
+            json!("Opened title");
 
         let result =
             open_cli_runtime_thread_binding(&store, &client, open_request("thread_cli_a", 100))
                 .await
                 .expect("first open should succeed");
 
+        assert_eq!(result.name.as_deref(), Some("Opened title"));
         assert_eq!(result.mode, CLIAgentRuntimeThreadBindingOpenMode::Started);
         assert_eq!(result.binding.native_thread_id, "cli-thread-started");
         assert_eq!(result.binding.native_cwd.as_deref(), Some("/tmp/project"));

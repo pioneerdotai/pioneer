@@ -78,6 +78,7 @@ fn make_cli_summarizer(
     let kind = match instance.kind {
         GatewayCliAgentRuntimeKindConfig::Codex => Transport::Codex,
         GatewayCliAgentRuntimeKindConfig::Claude => Transport::Claude,
+        GatewayCliAgentRuntimeKindConfig::OpenCode => Transport::OpenCode,
     };
     ensure!(
         kind == selection.transport,
@@ -100,9 +101,26 @@ fn make_cli_summarizer(
             })),
             "anthropic",
         ),
+        Transport::OpenCode => (
+            CliService::OpenCode(
+                crate::cli_runtime::opencode_session::OpenCodeSummaryService::new(
+                    instance,
+                    environment,
+                ),
+            ),
+            "opencode",
+        ),
         Transport::Api => unreachable!(),
     };
-    let limits = pioneer_provider::catalog::model_catalog()?.limits(catalog, &selection.model);
+    let (catalog, catalog_model) = if kind == Transport::OpenCode {
+        selection
+            .model
+            .split_once('/')
+            .unwrap_or((catalog, &selection.model))
+    } else {
+        (catalog, selection.model.as_str())
+    };
+    let limits = pioneer_provider::catalog::model_catalog()?.limits(catalog, catalog_model);
     Ok(Arc::new(CliSummarizer {
         usage_scope,
         selection,
@@ -118,6 +136,7 @@ fn make_cli_summarizer(
 enum CliService {
     Codex(CodexService),
     Claude(ClaudeService),
+    OpenCode(crate::cli_runtime::opencode_session::OpenCodeSummaryService),
 }
 struct CliSummarizer {
     usage_scope: Option<(pioneer_crud::CrudStore, String)>,
@@ -308,6 +327,7 @@ impl Summarizer for CliSummarizer {
             provider: Some(
                 match self.selection.transport {
                     Transport::Codex => "codex-cli",
+                    Transport::OpenCode => "opencode-cli",
                     _ => "claude-cli",
                 }
                 .into(),
@@ -316,6 +336,7 @@ impl Summarizer for CliSummarizer {
             api: Some(
                 match self.selection.transport {
                     Transport::Codex => "codex_exec_json",
+                    Transport::OpenCode => "opencode_http",
                     _ => "claude_print_json",
                 }
                 .into(),
@@ -335,6 +356,7 @@ impl Summarizer for CliSummarizer {
         };
         let completion = async {
         let (text, input_tokens, output_tokens, raw) = match &self.service {
+            CliService::OpenCode(service) => service.summarize(request.selection.model, request.selection.effort, INSTRUCTIONS, input, timeout).await.map_err(failure)?,
             CliService::Codex(service) => {
                 let result = service
                     .summarize(
@@ -396,6 +418,7 @@ impl Summarizer for CliSummarizer {
         match &self.service {
             CliService::Codex(service) => service.cleanup().await,
             CliService::Claude(service) => service.cleanup().await,
+            CliService::OpenCode(service) => service.cleanup().await,
         }
         .map_err(failure)
     }

@@ -349,6 +349,7 @@ mod tests {
         avatar_revision: Option<&str>,
     ) -> TimelineRenderRow {
         let author = TurnAuthorSnapshot {
+            cli_runtime_kind: None,
             actor: PersistedActorRef::Principal(principal(author_id)),
             display_name: display_name.to_owned(),
             nickname: nickname.to_owned(),
@@ -383,6 +384,7 @@ mod tests {
 
     fn system_message(key: &str) -> TimelineRenderRow {
         let author = TurnAuthorSnapshot {
+            cli_runtime_kind: None,
             actor: PersistedActorRef::System,
             display_name: "System".to_owned(),
             nickname: "system".to_owned(),
@@ -417,6 +419,7 @@ mod tests {
 
     fn agent_author() -> TurnAuthorSnapshot {
         TurnAuthorSnapshot {
+            cli_runtime_kind: None,
             actor: PersistedActorRef::AgentExecution(
                 AgentExecutionId::new("EAAAAAAAAAAAAAAAAAAAA").unwrap(),
             ),

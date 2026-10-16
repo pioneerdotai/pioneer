@@ -8,7 +8,13 @@ Implementation branch: `feature/task-completion-inbox` in both repositories.
 - Rust base: local `main`, `7f76de76292e2f5180ffb8307ec7ca8f8e6e29ea`.
 - Mobile contract worktree: `/Users/alexander/Code/pioneer/pioneer/.worktrees/task-completion-inbox-app`.
 - Mobile base: local `main`, `b8c3e8bd1e06b9804d8c4849bb8a12aa3f0608ab`.
-- Main checkouts, other worktrees and the pre-existing mobile `bun.lock` change were not edited. No merge, push, publication or worktree removal.
+- Main checkouts, other worktrees and the pre-existing mobile `bun.lock` change were not edited. Publication and later main synchronization are recorded below; no worktree was removed.
+
+## Main synchronization after the storage revision
+
+At the user's request, the storage revision was committed as `3debeeea` and the latest fetched `origin/main` was merged into both feature branches: Rust `0160b2aedbd0929641993350b7598d7a48e96979`, mobile `04d479c`. Rust merged without conflicts. The mobile conflict was confined to `boundary-source.json`; the standard `client:contract` generator rebuilt it with the explicit Rust worktree path. Contract versions, package selection and verification logic remain unchanged.
+
+Static review checked the overlapping authorization, Gateway task event, protocol export and generated schema changes. Main's running-task scope/activity changes and the inbox's typed scope, workspace-first selection, personal receipts and loaded-history refresh remain present. `check-source` matched after generation, and `git diff --check` passed in both worktrees. No local compilation, tests or migrations were run during this synchronization. Earlier compilation/typecheck limitations below remain applicable; the merged revision still requires external review.
 
 ## Data path and invariants
 
@@ -100,7 +106,7 @@ Current verification completed without executing tests:
 - Complete final diff read against the pre-change implementation, including the new entity and regression bodies. Static review checked each root/actor/admission predicate, personal/legacy receipts, all terminal statuses, exact cursor comparison, CTE limits, CREATE/DROP and FK/PK/index semantics, serialized writer routing and read-only reader scope. No UI/RPC/contract input or unrelated repository source changed.
 - Final `check-source` with the explicit Rust worktree returned `Client source contract: matched`; the mobile worktree has no diff.
 
-No tests, query plans, fixture behavior or migration logic have been executed in this revision. The CLI only introspected a disposable schema created for entity generation. Runtime equivalence, physical plans and migration execution await external review/acceptance and subsequent authorized execution. No migration was applied to a user database. No merge or push.
+No tests, query plans, fixture behavior or migration logic have been executed in this revision. The CLI only introspected a disposable schema created for entity generation. Runtime equivalence, physical plans and migration execution await external review/acceptance and subsequent authorized execution. No migration was applied to a user database. This storage pass did not merge or push; the subsequent user-authorized main synchronization is recorded above.
 
 ## Corrections after external review (earlier revision)
 

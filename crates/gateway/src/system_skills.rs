@@ -335,7 +335,11 @@ mod tests {
             crate::cli_runtime::skills::ensure_cli_runtime_skills_exportable(active.as_slice())
                 .is_ok()
         );
-        for runtime_kind in [CLIAgentRuntimeKind::Codex, CLIAgentRuntimeKind::Claude] {
+        for runtime_kind in [
+            CLIAgentRuntimeKind::Codex,
+            CLIAgentRuntimeKind::Claude,
+            CLIAgentRuntimeKind::OpenCode,
+        ] {
             assert!(
                 crate::cli_runtime::skills::ensure_cli_runtime_skill_invocation_eligible(
                     runtime_kind,

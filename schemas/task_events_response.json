@@ -400,7 +400,8 @@
       "type": "string",
       "enum": [
         "codex",
-        "claude"
+        "claude",
+        "opencode"
       ]
     },
     "McpScopeKind": {
@@ -2130,6 +2131,40 @@
               },
               "required": [
                 "run"
+              ]
+            }
+          },
+          "required": [
+            "kind",
+            "payload"
+          ]
+        },
+        {
+          "description": "Dispatch claim committed; execution may still be preparing.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "run_starting"
+            },
+            "payload": {
+              "type": "object",
+              "properties": {
+                "claimed_at": {
+                  "type": "integer",
+                  "format": "int64"
+                },
+                "run_id": {
+                  "type": "string"
+                },
+                "task_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "task_id",
+                "run_id",
+                "claimed_at"
               ]
             }
           },

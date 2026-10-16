@@ -112,6 +112,7 @@ pub(crate) fn project_cli_runtime_event(
         RuntimeEvent::ThreadStateChanged(thread) => project_thread_state_changed(context, thread),
         RuntimeEvent::Raw(raw) => project_raw_event(context, raw),
         RuntimeEvent::SessionStateChanged(_)
+        | RuntimeEvent::ThreadNameUpdated(_)
         | RuntimeEvent::ThreadGoalUpdated(_)
         | RuntimeEvent::ThreadGoalCleared(_)
         | RuntimeEvent::TurnStarted(_)
@@ -781,7 +782,9 @@ fn command_execution_item(
         ),
         status,
         recovery_policy: None,
-        output_policy: ToolOutputPolicySnapshot::for_tool_name(tool_name.as_str()),
+        // The canonical item kind determines the shell payload policy. Native
+        // names such as OpenCode's `bash` and Claude's `Bash` are not core tools.
+        output_policy: ToolOutputPolicySnapshot::for_tool_name("exec_command"),
         display,
         storage,
         recovery: metadata
@@ -1446,6 +1449,7 @@ fn event_kind_name(event: &RuntimeEvent) -> &'static str {
     match event {
         RuntimeEvent::SessionStateChanged(_) => "session_state_changed",
         RuntimeEvent::ThreadStateChanged(_) => "thread_state_changed",
+        RuntimeEvent::ThreadNameUpdated(_) => "thread_name_updated",
         RuntimeEvent::ThreadGoalUpdated(_) => "thread_goal_updated",
         RuntimeEvent::ThreadGoalCleared(_) => "thread_goal_cleared",
         RuntimeEvent::TurnStarted(_) => "turn_started",

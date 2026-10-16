@@ -33,6 +33,8 @@ proxy_hint = "Optional workspace-scoped proxy for this provider."
 replace_hint = "%{provider} 已配置密钥。保存后将替换现有密钥。"
 
 [providers.error]
+configure_failed = "无法保存 %{provider} 的设置"
+disconnect_failed = "无法移除 %{provider} 的 API 密钥"
 gateway_not_connected = "网关未连接。"
 workspace_not_selected = "未选择工作区。"
 load_failed = "加载供应商配置失败"
@@ -127,6 +129,12 @@ unsupported = "Unsupported"
 error = "Error"
 
 [providers.cli.error]
+settings_load_failed = "无法加载 CLI 供应商设置"
+settings_forbidden = "此账户无权管理 Gateway 设置"
+login_failed = "无法启动 %{runtime} 登录"
+proxy_failed = "无法更新 %{runtime} 的代理"
+save_failed = "无法保存 %{runtime} 的设置"
+enabled_failed = "无法启用或禁用 %{runtime}"
 open_path_failed = "Open path failed"
 
 [providers.catalog.anthropic]

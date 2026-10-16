@@ -348,6 +348,7 @@ pub(crate) struct SettingsRuntime {
     desktop_demands: BTreeMap<SettingsPage, usize>,
     sessions_leases: usize,
     refreshing: Option<SettingsEpoch>,
+    refresh_after_save: Option<(u64, SettingsEpoch)>,
     demand_authorization: Option<u64>,
     sessions_pending: Option<SettingsEpoch>,
     sessions_demand_authorization: Option<u64>,
@@ -374,6 +375,7 @@ impl SettingsRuntime {
             .checked_add(1)
             .expect("remote key reset generation exhausted");
         self.refreshing = None;
+        self.refresh_after_save = None;
         self.demand_authorization = None;
         self.sessions_pending = None;
         self.sessions_demand_authorization = None;
@@ -407,6 +409,62 @@ impl Drop for SettingsRuntime {
     }
 }
 impl ClientCore {
+    // Called with the identity owner held, which also serializes read/write admission.
+    pub(crate) fn defer_settings_refresh_until_save(
+        &self,
+        owner: &crate::gateway::identity_authorization::IdentityAuthorizationStore,
+        workspace: Option<String>,
+    ) {
+        let epoch = SettingsEpoch {
+            authorization: owner.authorization_epoch().0,
+            permissions_generation: owner.permissions_generation(),
+            workspace,
+        };
+        let mut runtime = self
+            .settings_runtime
+            .lock()
+            .expect("settings owner poisoned");
+        runtime.refreshing = Some(epoch.clone());
+        runtime.refresh_after_save = Some((owner.settings_request, epoch));
+    }
+    pub(crate) fn resume_settings_refresh_after_save(
+        &self,
+        owner: &crate::gateway::identity_authorization::IdentityAuthorizationStore,
+    ) {
+        let workspace = self.settings_workspace();
+        let connection = self.gateway_http_generation();
+        let mut runtime = self
+            .settings_runtime
+            .lock()
+            .expect("settings owner poisoned");
+        let Some((generation, _)) = runtime.refresh_after_save.as_ref() else {
+            return;
+        };
+        if *generation != owner.settings_request {
+            return;
+        }
+        let (_, epoch) = runtime.refresh_after_save.take().expect("matching save");
+        if self.is_stopped()
+            || !epoch.matches_owner(owner, workspace)
+            || owner.settings_request_connection != connection
+        {
+            // Retire only this save's demand; queued or newer work keeps its owner.
+            if runtime.refreshing.as_ref() == Some(&epoch)
+                && !runtime.queue.iter().any(|work| matches!(work, SettingsWork::Intent { intent: SettingsIntent::Refresh, epoch: queued } if queued == &epoch))
+            {
+                runtime.refreshing = None;
+            }
+            return;
+        }
+        if !runtime.queue.iter().any(|work| matches!(work, SettingsWork::Intent { intent: SettingsIntent::Refresh, epoch: queued } if queued == &epoch)) {
+            runtime.queue.push_back(SettingsWork::Intent {
+                intent: SettingsIntent::Refresh,
+                epoch: epoch.clone(),
+            });
+        }
+        runtime.refreshing = Some(epoch);
+        runtime.wake();
+    }
     pub(crate) fn settings_epoch(&self) -> SettingsEpoch {
         let identity = self
             .identity_authorization
@@ -605,7 +663,7 @@ impl ClientCore {
             action.needs_selection = false;
             action.epoch = Some(epoch.clone());
         } else if matches!(intent, SettingsIntent::Refresh) {
-            if runtime.refreshing.is_some() {
+            if runtime.refreshing.as_ref() == Some(&epoch) {
                 return self.navigation_outcome(ClientTransitionOutcome::Noop);
             }
             runtime.refreshing = Some(epoch.clone());
@@ -778,7 +836,10 @@ impl ClientCore {
                 }
             }
         } else if matches!(intent, SettingsIntent::Refresh) {
-            if runtime.refreshing.as_ref() == Some(epoch) {
+            if runtime.refreshing.as_ref() == Some(epoch)
+                && !runtime.refresh_after_save.as_ref().is_some_and(|(_, deferred)| deferred == epoch)
+                && !runtime.queue.iter().any(|work| matches!(work, SettingsWork::Intent { intent: SettingsIntent::Refresh, epoch: queued } if queued == epoch))
+            {
                 runtime.refreshing = None;
             }
         }
@@ -861,10 +922,12 @@ impl ClientCore {
         }
         let mut needs_selection = false;
         let result = match &intent {
-            SettingsIntent::Refresh => self
-                .request_gateway_settings_for_epoch(&epoch)
-                .and_then(|generation| self.load_gateway_settings(generation))
-                .map(|_| ()),
+            SettingsIntent::Refresh => match self.request_gateway_settings_for_epoch(&epoch) {
+                Ok(Some(generation)) => self.load_gateway_settings(generation).map(|_| ()),
+                // The save completion owns the coalesced follow-up, including its demand.
+                Ok(None) => return,
+                Err(error) => Err(error),
+            },
             SettingsIntent::RefreshSessions => refresh_sessions(&epoch),
             SettingsIntent::RevokeSession {
                 session_id,
@@ -962,7 +1025,10 @@ impl ClientCore {
                     Some((Instant::now() + Duration::from_secs(1), 12, epoch.clone()));
             }
         } else if matches!(intent, SettingsIntent::Refresh) {
-            if runtime.refreshing.as_ref() != Some(epoch) {
+            if runtime.refreshing.as_ref() != Some(epoch)
+                || runtime.refresh_after_save.as_ref().is_some_and(|(_, deferred)| deferred == epoch)
+                || runtime.queue.iter().any(|work| matches!(work, SettingsWork::Intent { intent: SettingsIntent::Refresh, epoch: queued } if queued == epoch))
+            {
                 return;
             }
             runtime.refreshing = None;
@@ -1426,22 +1492,40 @@ mod tests {
         );
     }
     #[test]
-    fn old_refresh_cannot_release_a_new_policy_refresh_demand() {
-        let core = crate::catalog_test_support::settings_model_picker_client();
-        core.settings_intent(SettingsIntent::Refresh);
-        let old = core.settings_epoch();
-        let mut capabilities = core.authorization_snapshot(None, None).unwrap();
-        capabilities.authorization_revision += 1;
-        core.invalidate_authorization_revision(capabilities.authorization_revision);
-        let (generation, connection) = core.current_auth_ticket();
-        core.accept_authorization_projection(generation, connection, capabilities);
-        core.settings_intent(SettingsIntent::Refresh);
-        let current = core.settings_epoch();
-        core.complete_settings_action(&SettingsIntent::Refresh, &old, false, false);
-        assert_eq!(
-            core.settings_runtime.lock().unwrap().refreshing,
-            Some(current)
-        );
+    fn old_refresh_cannot_release_a_new_scope_refresh_demand() {
+        for workspace_change in [false, true] {
+            let core = crate::catalog_test_support::settings_model_picker_client();
+            core.settings_intent(SettingsIntent::Refresh);
+            let old = core.settings_epoch();
+            assert_eq!(
+                core.settings_intent(SettingsIntent::Refresh).outcome(),
+                ClientTransitionOutcome::Noop
+            );
+            if workspace_change {
+                core.navigate(
+                    crate::navigation::NavigationIntent::SelectWorkspace {
+                        workspace_id: Some("other-workspace".into()),
+                    },
+                    None,
+                );
+            } else {
+                let mut capabilities = core.authorization_snapshot(None, None).unwrap();
+                capabilities.authorization_revision += 1;
+                core.invalidate_authorization_revision(capabilities.authorization_revision);
+                let (generation, connection) = core.current_auth_ticket();
+                core.accept_authorization_projection(generation, connection, capabilities);
+            }
+            assert_eq!(
+                core.settings_intent(SettingsIntent::Refresh).outcome(),
+                ClientTransitionOutcome::Changed
+            );
+            let current = core.settings_epoch();
+            core.complete_settings_action(&SettingsIntent::Refresh, &old, false, false);
+            assert_eq!(
+                core.settings_runtime.lock().unwrap().refreshing,
+                Some(current)
+            );
+        }
     }
     #[test]
     fn settings_and_sessions_fail_closed_without_authorization() {
@@ -1458,6 +1542,19 @@ mod tests {
             );
         }
         assert!(core.settings_runtime.lock().unwrap().queue.is_empty());
+        let core = crate::catalog_test_support::client();
+        assert!(
+            core.authorization_snapshot(None, None)
+                .unwrap()
+                .global
+                .can_manage_capabilities
+        );
+        assert_eq!(
+            core.settings_intent(SettingsIntent::Refresh).outcome(),
+            ClientTransitionOutcome::Rejected
+        );
+        assert!(core.settings_runtime.lock().unwrap().queue.is_empty());
+        assert!(!core.gateway_settings().loading);
     }
     #[test]
     fn desktop_demand_is_reference_counted_and_last_release_cancels_poll() {
@@ -1691,5 +1788,29 @@ impl ClientCore {
             }
         }
         (sessions, profiles)
+    }
+}
+
+#[cfg(test)]
+impl ClientCore {
+    pub(crate) fn take_settings_refresh_for_test(&self) -> Option<SettingsEpoch> {
+        self.settings_runtime
+            .lock()
+            .unwrap()
+            .queue
+            .pop_front()
+            .map(|work| {
+                let SettingsWork::Intent {
+                    intent: SettingsIntent::Refresh,
+                    epoch,
+                } = work
+                else {
+                    panic!("unexpected Settings work")
+                };
+                epoch
+            })
+    }
+    pub(crate) fn complete_settings_refresh_for_test(&self, epoch: &SettingsEpoch, success: bool) {
+        self.complete_settings_action(&SettingsIntent::Refresh, epoch, success, false);
     }
 }

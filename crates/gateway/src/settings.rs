@@ -91,6 +91,7 @@ impl<'de> Deserialize<'de> for GatewaySettings {
         };
         settings.migrate_legacy_active_recall_model();
         settings.migrate_default_claude_cli_runtime_instance();
+        settings.migrate_default_opencode_cli_runtime_instance();
         Ok(settings)
     }
 }
@@ -829,6 +830,9 @@ impl GatewaySettings {
                             pioneer_protocol::CLIAgentRuntimeKind::Claude => {
                                 pioneer_protocol::ModelSelectionTransport::Claude
                             }
+                            pioneer_protocol::CLIAgentRuntimeKind::OpenCode => {
+                                pioneer_protocol::ModelSelectionTransport::OpenCode
+                            }
                         };
                         anyhow::ensure!(
                             selected_instance == &instance.id && transport == &expected,
@@ -1062,6 +1066,56 @@ impl GatewaySettings {
         }
         self.migrated |= migrated;
         migrated
+    }
+
+    fn migrate_default_opencode_cli_runtime_instance(&mut self) -> bool {
+        let Some(runtimes) = &mut self.cli_runtimes else {
+            return false;
+        };
+        if runtimes.instances.len() != 2 {
+            return false;
+        }
+        for (instance, (id, kind, home, display)) in runtimes.instances.iter().zip([
+            (
+                "codex",
+                GatewayCliAgentRuntimeKindConfig::Codex,
+                "~/.codex",
+                "Codex",
+            ),
+            (
+                "claude",
+                GatewayCliAgentRuntimeKindConfig::Claude,
+                "~/.claude",
+                "Claude",
+            ),
+        ]) {
+            if instance.id != id
+                || instance.kind != kind
+                || !instance.enabled
+                || instance.binary_path != id
+                || instance.home_path != home
+                || instance.shadow_home_path.is_some()
+                || (!instance.nickname.is_empty() && instance.nickname != id)
+                || (instance.display_name != display
+                    && instance.display_name != format!("{display} CLI"))
+            {
+                return false;
+            }
+        }
+        runtimes
+            .instances
+            .push(GatewayCliRuntimeInstanceSettingsOverride {
+                id: "opencode".into(),
+                kind: GatewayCliAgentRuntimeKindConfig::OpenCode,
+                display_name: "OpenCode".into(),
+                nickname: "opencode".into(),
+                enabled: true,
+                binary_path: "opencode".into(),
+                home_path: "~/.config/opencode".into(),
+                shadow_home_path: None,
+            });
+        self.migrated = true;
+        true
     }
 
     fn migrate_default_claude_cli_runtime_instance(&mut self) -> bool {
@@ -2085,6 +2139,9 @@ fn cli_runtime_kind_to_protocol(
     match kind {
         GatewayCliAgentRuntimeKindConfig::Codex => pioneer_protocol::CLIAgentRuntimeKind::Codex,
         GatewayCliAgentRuntimeKindConfig::Claude => pioneer_protocol::CLIAgentRuntimeKind::Claude,
+        GatewayCliAgentRuntimeKindConfig::OpenCode => {
+            pioneer_protocol::CLIAgentRuntimeKind::OpenCode
+        }
     }
 }
 
@@ -2095,6 +2152,9 @@ fn cli_runtime_kind_from_protocol(
         pioneer_protocol::CLIAgentRuntimeKind::Codex => Ok(GatewayCliAgentRuntimeKindConfig::Codex),
         pioneer_protocol::CLIAgentRuntimeKind::Claude => {
             Ok(GatewayCliAgentRuntimeKindConfig::Claude)
+        }
+        pioneer_protocol::CLIAgentRuntimeKind::OpenCode => {
+            Ok(GatewayCliAgentRuntimeKindConfig::OpenCode)
         }
     }
 }
@@ -4269,7 +4329,7 @@ backend = "keystore"
         .expect("gateway settings should parse");
         let mut config = gateway_config_with_keepawake(false);
         config.cli_agent_runtime.enabled = true;
-        assert_eq!(config.effective_cli_agent_runtime_instances().len(), 2);
+        assert_eq!(config.effective_cli_agent_runtime_instances().len(), 3);
 
         let snapshot = settings.snapshot(&config);
         assert!(snapshot.cli_runtimes.instances.is_empty());
@@ -4303,7 +4363,7 @@ backend = "keystore"
         assert!(config.effective_cli_agent_runtime_instances().is_empty());
 
         let snapshot = settings.snapshot(&config);
-        assert_eq!(snapshot.cli_runtimes.instances.len(), 2);
+        assert_eq!(snapshot.cli_runtimes.instances.len(), 3);
         assert_eq!(snapshot.cli_runtimes.instances[0].id, "codex");
         assert!(snapshot.cli_runtimes.instances[0].enabled);
         assert_eq!(snapshot.cli_runtimes.instances[1].id, "claude");
@@ -4311,11 +4371,13 @@ backend = "keystore"
 
         let applied = settings.apply_to_gateway_config(config);
         let instances = applied.effective_cli_agent_runtime_instances();
-        assert_eq!(instances.len(), 2);
+        assert_eq!(instances.len(), 3);
         assert_eq!(instances[0].id, "codex");
         assert!(instances[0].enabled);
         assert_eq!(instances[1].id, "claude");
         assert!(instances[1].enabled);
+        assert_eq!(instances[2].id, "opencode");
+        assert!(instances[2].enabled);
     }
 
     #[test]
@@ -4406,7 +4468,7 @@ home_path = "~/.codex"
             .expect("settings should load and migrate");
         let snapshot = settings.snapshot(&gateway_config_with_keepawake(false));
 
-        assert_eq!(snapshot.cli_runtimes.instances.len(), 2);
+        assert_eq!(snapshot.cli_runtimes.instances.len(), 3);
         let codex = snapshot
             .cli_runtimes
             .instances
@@ -4420,6 +4482,13 @@ home_path = "~/.codex"
             .iter()
             .find(|instance| instance.id == "claude")
             .expect("default Claude CLI runtime should be migrated");
+        assert!(
+            snapshot
+                .cli_runtimes
+                .instances
+                .iter()
+                .any(|i| i.id == "opencode")
+        );
         assert_eq!(claude.display_name, "Claude CLI");
         assert!(claude.enabled);
 
@@ -5086,6 +5155,9 @@ fn compaction_selection(
             pioneer_protocol::ModelSelectionTransport::Claude => {
                 pioneer_compaction::Transport::Claude
             }
+            pioneer_protocol::ModelSelectionTransport::OpenCode => {
+                pioneer_compaction::Transport::OpenCode
+            }
         },
         instance: instance.clone(),
         model: model.clone(),
@@ -5124,5 +5196,40 @@ fn legacy_model_selection(
         instance: provider.unwrap_or_default().to_owned(),
         model: model.unwrap_or_default().to_owned(),
         reasoning_effort: None,
+    }
+}
+
+#[cfg(test)]
+mod opencode_migration_tests {
+    #[test]
+    fn default_opencode_migration_is_narrow_and_idempotent() {
+        let mut defaults = super::GatewayCliRuntimeSettingsOverride::default_supported().unwrap();
+        defaults
+            .instances
+            .retain(|instance| instance.id != "opencode");
+        let make = || {
+            toml::from_str::<super::GatewaySettings>(
+                "version = 1\n[secrets]\nbackend = \"keystore\"\n",
+            )
+            .unwrap()
+        };
+        let mut settings = make();
+        settings.cli_runtimes = Some(defaults.clone());
+        assert!(settings.migrate_default_opencode_cli_runtime_instance());
+        assert!(!settings.migrate_default_opencode_cli_runtime_instance());
+        assert_eq!(settings.cli_runtimes.as_ref().unwrap().instances.len(), 3);
+        for case in 0..4 {
+            let mut custom = defaults.clone();
+            match case {
+                0 => custom.instances.clear(),
+                1 => custom.instances[0].enabled = false,
+                2 => custom.instances[0].nickname = "work".into(),
+                _ => custom.instances[1].home_path = "~/custom-claude".into(),
+            }
+            let mut settings = make();
+            settings.cli_runtimes = Some(custom.clone());
+            assert!(!settings.migrate_default_opencode_cli_runtime_instance());
+            assert_eq!(settings.cli_runtimes.unwrap(), custom);
+        }
     }
 }

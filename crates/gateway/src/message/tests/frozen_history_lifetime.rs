@@ -942,63 +942,378 @@ async fn retained_output_checkpoint_replacement_uses_fresh_ordinals_through_proc
 }
 
 #[tokio::test]
-async fn required_expired_task_parent_basis_is_rejected_before_summary_fallback() {
-    let f = fixture().await;
-    materialize(&f.h, "frozen-child", "frozen-child-turn", "child", true).await;
-    let db = f.h.crud_store.database_connection();
-    for (sql, values) in [
-        (
-            "INSERT INTO thread_lineage(child_thread_id,parent_thread_id,root_thread_id,depth,created_at,origin_kind) VALUES('frozen-child','frozen-source','frozen-source',1,CURRENT_TIMESTAMP,'task_run')",
-            vec![],
-        ),
-        (
-            "INSERT INTO task(id,workspace_id,owner_kind,owner_id,created_by_thread_id,created_by_turn_id,executor_kind,status,title,goal) VALUES('frozen-child-task',?1,'thread','frozen-source','frozen-source','frozen-source-turn','agent','completed','child','child')",
-            vec![f.h.workspace_id.clone().into()],
-        ),
-        (
-            "INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES('frozen-child-run','frozen-child-task','frozen-child-run',1,1,'succeeded','agent')",
-            vec![],
-        ),
-        (
-            "INSERT INTO task_run_turn(id,task_id,run_id,thread_id,turn_id,kind,round,sequence,status,created_at) VALUES('frozen-child-rt','frozen-child-task','frozen-child-run','frozen-child','frozen-child-turn','initial',0,1,'review_recorded',CURRENT_TIMESTAMP)",
-            vec![],
-        ),
-        (
-            "INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at,frozen_manifest_id) VALUES('frozen-child-run','frozen-child-task',?1,'frozen-source',?2,CURRENT_TIMESTAMP,?3)",
-            vec![
-                f.h.workspace_id.clone().into(),
-                serde_json::to_string(&f.origin).unwrap().into(),
-                f.origin.manifest_id.clone().into(),
-            ],
-        ),
-    ] {
+async fn child_continuation_uses_saved_branch_second_after_expiry_and_runtime_restore() {
+    for use_summary in [false, true] {
+        let f = fixture().await;
+        materialize(&f.h, "frozen-child", "frozen-child-turn", "child", true).await;
+        let db = f.h.crud_store.database_connection();
+        for (sql, values) in [
+            (
+                "INSERT INTO thread_lineage(child_thread_id,parent_thread_id,root_thread_id,depth,created_at,origin_kind) VALUES('frozen-child','frozen-source','frozen-source',1,CURRENT_TIMESTAMP,'task_run')",
+                vec![],
+            ),
+            (
+                "INSERT INTO task(id,workspace_id,owner_kind,owner_id,created_by_thread_id,created_by_turn_id,executor_kind,status,title,goal) VALUES('frozen-child-task',?1,'thread','frozen-source','frozen-source','frozen-source-turn','agent','completed','child','child')",
+                vec![f.h.workspace_id.clone().into()],
+            ),
+            (
+                "INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES('frozen-child-run','frozen-child-task','frozen-child-run',1,1,'succeeded','agent')",
+                vec![],
+            ),
+            (
+                "INSERT INTO task_run_turn(id,task_id,run_id,thread_id,turn_id,kind,round,sequence,status,created_at) VALUES('frozen-child-rt','frozen-child-task','frozen-child-run','frozen-child','frozen-child-turn','initial',0,1,'review_recorded',CURRENT_TIMESTAMP)",
+                vec![],
+            ),
+            (
+                "INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,history_json,created_at,frozen_manifest_id) VALUES('frozen-child-run','frozen-child-task',?1,'frozen-source',?2,CURRENT_TIMESTAMP,?3)",
+                vec![
+                    f.h.workspace_id.clone().into(),
+                    serde_json::to_string(&f.origin).unwrap().into(),
+                    f.origin.manifest_id.clone().into(),
+                ],
+            ),
+        ] {
+            db.execute_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                sql,
+                values,
+            ))
+            .await
+            .unwrap();
+        }
+        db.execute_unprepared(
+            "UPDATE thread SET origin_kind='task_run',access_class='internal' WHERE id='frozen-child'",
+        )
+        .await
+        .unwrap();
+        let branch_second = phase_13_now_secs() + 10;
+        let branch_time = chrono::DateTime::from_timestamp(branch_second, 0)
+            .unwrap()
+            .fixed_offset();
         db.execute_raw(Statement::from_sql_and_values(
             DbBackend::Sqlite,
-            sql,
-            values,
+            "UPDATE turn SET created_at=? WHERE id='frozen-child-turn'",
+            [branch_time.into()],
         ))
         .await
         .unwrap();
+        if !use_summary {
+            db.execute_raw(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                "UPDATE compaction_context SET head=NULL WHERE owner=?",
+                [crate::compaction::native_owner(&f.h.workspace_id, "frozen-source").into()],
+            ))
+            .await
+            .unwrap();
+        }
+        materialize(
+            &f.h,
+            "frozen-source",
+            "running-parent",
+            "parent request",
+            false,
+        )
+        .await;
+        // The native/UI copies of a single response must not be duplicated. The
+        // accepted last second includes fractional provider dates as well as events.
+        for (offset, marker) in [(0, "IN_BRANCH_SECOND"), (1, "AFTER_BRANCH_SECOND")] {
+            let at = branch_time + chrono::Duration::seconds(offset);
+            for (id, text) in [
+                (format!("{marker}-event"), marker.to_owned()),
+                (format!("{marker}-round"), format!("NATIVE_{marker}")),
+            ] {
+                f.h.crud_store
+                    .materialize_item_completed(
+                        ItemCompletedNotification {
+                            workspace_id: f.h.workspace_id.clone(),
+                            thread_id: "frozen-source".into(),
+                            turn_id: "running-parent".into(),
+                            item: TurnItem::AgentMessage {
+                                id,
+                                text,
+                                phase: Default::default(),
+                                markdown: None,
+                                markdown_version: None,
+                            },
+                        },
+                        at.timestamp(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            // CURRENT_TIMESTAMP-style dates must compare as instants against
+            // the RFC3339 child cutoff, including rows past the boundary.
+            db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+                "UPDATE turn_event SET created_at=? WHERE turn_id='running-parent' AND json_extract(payload,'$.payload.item.id') IN (?,?)",
+                [at.format("%Y-%m-%d %H:%M:%S").to_string().into(), format!("{marker}-event").into(), format!("{marker}-round").into()],
+            )).await.unwrap();
+            let envelope = pioneer_provider::CanonicalProviderRoundEnvelope {
+                version: 1,
+                round_id: format!("{marker}-round"),
+                termination: pioneer_provider::ProviderTermination::Complete,
+                message: ChatMessage::assistant(format!("NATIVE_{marker}")),
+                calls: vec![],
+            };
+            f.h.crud_store
+                .insert_turn_llm_context(pioneer_crud::NewTurnLlmContextEntry {
+                    turn_id: "running-parent".into(),
+                    item_id: None,
+                    attempt_id: None,
+                    sequence: offset + 1,
+                    source: "assistant_round".into(),
+                    tool_name: None,
+                    payload: serde_json::to_string(&envelope).unwrap(),
+                    output_policy_snapshot: "{}".into(),
+                    created_at: at + chrono::Duration::milliseconds(500),
+                    expires_at: None,
+                })
+                .await
+                .unwrap();
+            let provider_date = if offset == 0 {
+                format!(
+                    "{}.999999999+03:00",
+                    (at + chrono::Duration::hours(3)).format("%Y-%m-%dT%H:%M:%S")
+                )
+            } else {
+                format!(
+                    "{}-04:00",
+                    (at - chrono::Duration::hours(4)).format("%Y-%m-%d %H:%M:%S")
+                )
+            };
+            db.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
+                "UPDATE turn_llm_context SET created_at=? WHERE turn_id='running-parent' AND sequence=?",
+                [provider_date.into(), (offset + 1).into()],
+            )).await.unwrap();
+        }
+        expire_and_sweep(&f).await;
+        // This is a NEW conversation context; no accepted runtime exists yet.
+
+        materialize(
+            &f.h,
+            "frozen-child",
+            "frozen-continuation",
+            "next input",
+            false,
+        )
+        .await;
+        persist_test_execution_authorization_context_for_principal(
+            &f.h.processor,
+            &authenticated_test_superuser(),
+            &f.h.workspace_id,
+            "frozen-source",
+            "frozen-continuation",
+        )
+        .await;
+        let prepared =
+            f.h.processor
+                .capture_running_context_basis_prepared(
+                    &f.h.crud_store,
+                    &f.h.workspace_id,
+                    "frozen-child",
+                    "frozen-continuation",
+                    Some("frozen-continuation"),
+                )
+                .await
+                .unwrap();
+        let wire = prepared
+            .messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(wire.contains("IN_BRANCH_SECOND"));
+        assert!(!wire.contains("AFTER_BRANCH_SECOND"));
+        assert!(
+            !wire.contains("input next input"),
+            "the new input is not historical context"
+        );
+        assert_eq!(
+            prepared
+                .messages
+                .iter()
+                .filter(|message| message.content == "NATIVE_IN_BRANCH_SECOND")
+                .count(),
+            1
+        );
+        assert_eq!(
+            prepared
+                .messages
+                .iter()
+                .any(|message| message.content.contains("FROZEN PERMANENT SUMMARY")),
+            use_summary
+        );
+        assert!(
+            wire.find("IN_BRANCH_SECOND").unwrap() < wire.find("input child").unwrap(),
+            "the admitted parent section must precede the child's own line"
+        );
+        let cli =
+            f.h.processor
+                .capture_cli_transfer_projection(
+                    &f.h.workspace_id,
+                    "frozen-child",
+                    "frozen-continuation",
+                    u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap() + 60_000,
+                )
+                .await
+                .unwrap();
+        assert!(
+            cli.messages
+                .iter()
+                .any(|message| message.content == "NATIVE_IN_BRANCH_SECOND")
+        );
+        assert!(
+            !cli.messages
+                .iter()
+                .any(|message| message.content.contains("AFTER_BRANCH_SECOND"))
+        );
+        let expired_basis = crate::cli_runtime::thread_binding::cli_runtime_context_basis(
+            "frozen-child",
+            "frozen-source",
+            serde_json::to_string(&f.origin).unwrap(),
+            &[],
+        );
+        assert!(
+            !crate::cli_runtime::thread_binding::completed_context_basis_is_current(
+                &f.h.crud_store,
+                &f.h.workspace_id,
+                &expired_basis,
+            )
+            .await
+            .unwrap(),
+            "an expired continuity proof requests a fresh bootstrap instead of blocking the message"
+        );
+        let mut candidate = crate::turn_runtime_snapshot::new_turn_runtime_snapshot(
+            "frozen-child",
+            &f.h.workspace_id,
+            "frozen-continuation",
+            ThreadMode::Agent,
+            &pioneer_agent::AgentTurnHookRuntimeContext::default(),
+            "fixture",
+            "fixture",
+            None,
+            &HashMap::new(),
+            &[],
+            &[],
+            &[],
+            &HashMap::new(),
+            &[],
+            &[],
+        )
+        .unwrap();
+        candidate.history_json = serde_json::to_string(&prepared.descriptor).unwrap();
+        let mut stale_epochs = prepared.source_epochs.clone();
+        *stale_epochs.get_mut("frozen-child").unwrap() += 1;
+        assert!(
+            f.h.crud_store
+                .upsert_turn_runtime_snapshot_with_source_epochs(candidate, &stale_epochs)
+                .await
+                .is_err()
+        );
+        assert!(
+            f.h.crud_store
+                .get_turn_runtime_snapshot("frozen-continuation")
+                .await
+                .unwrap()
+                .is_none(),
+            "a rejected handoff must not publish a runtime root"
+        );
+        commit_current(&f, "frozen-child", "frozen-continuation", &prepared).await;
+        drop(prepared);
+        expire_and_sweep(&f).await;
+
+        let snapshot =
+            f.h.crud_store
+                .get_turn_runtime_snapshot("frozen-continuation")
+                .await
+                .unwrap()
+                .unwrap();
+        let allowed = crate::turn_runtime_snapshot::accepted_history_scopes_from_snapshot(
+            &f.h.crud_store,
+            &snapshot,
+        )
+        .await
+        .unwrap();
+        assert!(allowed.contains("frozen-child"));
+        assert!(allowed.contains("frozen-source"));
+        assert!(!allowed.contains("unrelated-sibling"));
+        let (_, restored) =
+            crate::turn_runtime_snapshot::restored_conversation_scope_from_snapshot(
+                &f.h.crud_store,
+                &snapshot,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            restored
+                .iter()
+                .any(|message| message.content.contains("FROZEN PERMANENT SUMMARY")),
+            use_summary
+        );
+        assert!(
+            restored
+                .iter()
+                .any(|message| message.content.contains("IN_BRANCH_SECOND"))
+        );
+        assert!(
+            !restored
+                .iter()
+                .any(|message| message.content.contains("AFTER_BRANCH_SECOND"))
+        );
+        let refreshed =
+            f.h.processor
+                .capture_running_context_basis_prepared(
+                    &f.h.crud_store,
+                    &f.h.workspace_id,
+                    "frozen-child",
+                    "frozen-continuation",
+                    Some("frozen-continuation"),
+                )
+                .await
+                .unwrap();
+        assert!(
+            refreshed
+                .messages
+                .iter()
+                .any(|message| message.content.contains("IN_BRANCH_SECOND"))
+        );
+        assert!(
+            !refreshed
+                .messages
+                .iter()
+                .any(|message| message.content.contains("AFTER_BRANCH_SECOND"))
+        );
+        assert!(
+            restored
+                .iter()
+                .any(|message| message.content.contains("child"))
+        );
+
+        // A retry of the original execution still requires its literal input.
+        let error = crate::compaction::frozen::restore_accepted_history_for_execution(
+            &f.h.crud_store,
+            &f.h.workspace_id,
+            Some("frozen-source"),
+            "frozen-child",
+            &allowed,
+            &serde_json::to_string(&f.origin).unwrap(),
+        )
+        .await
+        .err()
+        .expect("exact expired Task replay must fail");
+        assert!(format!("{error:#}").contains("expired"));
+
+        // A runtime record pointing at an unrelated owner cannot grant its scopes.
+        let mut foreign = snapshot.clone();
+        foreign.thread_id = "unrelated-sibling".into();
+        assert!(
+            crate::turn_runtime_snapshot::accepted_history_scopes_from_snapshot(
+                &f.h.crud_store,
+                &foreign,
+            )
+            .await
+            .is_err()
+        );
     }
-    db.execute_unprepared(
-        "UPDATE thread SET origin_kind='task_run',access_class='internal' WHERE id='frozen-child'",
-    )
-    .await
-    .unwrap();
-    expire_and_sweep(&f).await;
-    let error = capture_current(
-        &f,
-        "frozen-child",
-        "frozen-child-turn",
-        &authenticated_test_superuser(),
-    )
-    .await
-    .err()
-    .expect("required exact expired basis must fail");
-    assert!(
-        format!("{error:#}").contains("expired"),
-        "expiry must not become missing/current-history fallback: {error:#}"
-    );
 }
 #[tokio::test]
 async fn checkpoint_proofs_do_not_restore_revoked_consumer_read_authority() {
@@ -1380,25 +1695,31 @@ async fn commit_current(
 ) {
     let now = chrono::Utc::now().fixed_offset();
     f.h.crud_store
-        .upsert_turn_runtime_snapshot(pioneer_crud::NewTurnRuntimeSnapshot {
-            turn_id: turn.into(),
-            thread_id: thread.into(),
-            workspace_id: f.h.workspace_id.clone(),
-            mode_json: "\"Agent\"".into(),
-            model: "fixture".into(),
-            provider_name: "fixture".into(),
-            reasoning_effort: None,
-            agent_skill_versions_json: None,
-            hook_runtime_context_json: "{}".into(),
-            workspace_skill_policies_json: "[]".into(),
-            input_json: "[]".into(),
-            capabilities_json: "[]".into(),
-            resolved_artifacts_json: "[]".into(),
-            runtime_environment_json: "{}".into(),
-            history_json: serde_json::to_string(&prepared.descriptor).unwrap(),
-            created_at: now,
-            updated_at: now,
-        })
+        .upsert_turn_runtime_snapshot_with_source_epochs(
+            pioneer_crud::NewTurnRuntimeSnapshot {
+                turn_id: turn.into(),
+                thread_id: thread.into(),
+                workspace_id: f.h.workspace_id.clone(),
+                mode_json: "\"Agent\"".into(),
+                model: "fixture".into(),
+                provider_name: "fixture".into(),
+                reasoning_effort: None,
+                agent_skill_versions_json: None,
+                hook_runtime_context_json: serde_json::to_string(
+                    &pioneer_agent::AgentTurnHookRuntimeContext::default(),
+                )
+                .unwrap(),
+                workspace_skill_policies_json: "[]".into(),
+                input_json: "[]".into(),
+                capabilities_json: "[]".into(),
+                resolved_artifacts_json: "[]".into(),
+                runtime_environment_json: "{}".into(),
+                history_json: serde_json::to_string(&prepared.descriptor).unwrap(),
+                created_at: now,
+                updated_at: now,
+            },
+            &prepared.source_epochs,
+        )
         .await
         .unwrap();
     let row =

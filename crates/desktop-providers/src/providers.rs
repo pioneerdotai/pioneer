@@ -4,7 +4,8 @@ use pioneer_client::{
     authorization::{PrincipalPresentationCapabilities, principal_presentation_capabilities},
     core::{ClientCore, ClientScope},
     navigation::{ClientNavigationState, NavigationIntent, SemanticDestination},
-    providers::{runtime::*, store::*},
+    providers::{operations::*, runtime::*, store::*},
+    settings::runtime::SettingsIntent,
 };
 pub(crate) use pioneer_client::{
     providers::selectors::ProviderFilter, state::client_state::GatewayConnectionState,
@@ -45,6 +46,8 @@ pub(crate) struct GatewayInput {
     pub(crate) connection_state: GatewayConnectionState,
     pub(crate) ws_connection_id: Option<u64>,
     pub(crate) settings: Option<pioneer_client::providers::types::GatewaySettingsSnapshot>,
+    pub(crate) settings_loading: bool,
+    pub(crate) settings_error: Option<String>,
 }
 pub struct ProviderCatalogView {
     pub(crate) client: Arc<ClientCore>,
@@ -111,6 +114,8 @@ impl ProviderCatalogView {
                     connection_state: GatewayConnectionState::Disconnected,
                     ws_connection_id: None,
                     settings: None,
+                    settings_loading: false,
+                    settings_error: None,
                 },
                 inline_inputs: std::collections::BTreeMap::new(),
                 binding,
@@ -181,7 +186,17 @@ impl ProviderCatalogView {
         }
     }
     pub(crate) fn refresh_gateway_settings(&mut self, _: &mut Context<Self>) {
-        let _ = self.client.request_gateway_settings();
+        self.client.settings_intent(SettingsIntent::Refresh);
+    }
+    pub(crate) fn settings_controls_available(&self) -> bool {
+        self.active_workspace_id().is_some()
+            && self.gateway.connection_state == GatewayConnectionState::Connected
+            && self.gateway.capabilities.can_manage_capabilities
+            && self.gateway.capabilities.can_manage_gateway_settings
+            && self.gateway.settings.is_some()
+            && !self.gateway.settings_loading
+            && self.gateway.settings_error.as_deref() != Some("settings_load_failed")
+            && !self.providers.loading()
     }
     pub(crate) fn ui_id(&self, domain: &str, role: &str) -> SharedString {
         format!(
@@ -210,7 +225,9 @@ impl ProviderCatalogView {
         let connected = self.gateway.connection_state == GatewayConnectionState::Connected;
         let loading = self.visible()
             && self.window_active
-            && (self.providers.loading() || self.providers.cli_loading());
+            && (self.providers.loading()
+                || self.providers.cli_loading()
+                || self.gateway.settings_loading);
         self.refresh_button
             .update(cx, |button, cx| button.sync(connected, loading, cx));
     }
@@ -225,6 +242,9 @@ impl ProviderCatalogView {
                 .as_ref()
                 .map(|p| p.cli_runtimes.clone()),
             can_manage: self.gateway.capabilities.can_manage_capabilities,
+            can_manage_settings: self.gateway.capabilities.can_manage_gateway_settings,
+            settings_loading: self.gateway.settings_loading,
+            settings_error: self.gateway.settings_error.clone(),
             catalog: self.providers.catalog.as_ref().map(|p| p.revision()),
             runtimes: self.providers.runtimes.as_ref().map(|p| p.revision()),
             operation: self.providers.operation.as_ref().map(|p| p.revision()),
@@ -242,7 +262,9 @@ impl ProviderCatalogView {
             self.active_workspace_id().map(str::to_owned),
             self.gateway.endpoint_id.clone(),
             self.gateway.ws_connection_id,
+            self.gateway.connection_state,
             self.gateway.capabilities.can_manage_capabilities,
+            self.gateway.capabilities.can_manage_gateway_settings,
         );
         self.navigation_input = self.client.navigation_snapshot();
         self.gateway.capabilities = self
@@ -268,16 +290,23 @@ impl ProviderCatalogView {
             self.providers.clear_scope();
             self.inline_inputs.clear();
         }
-        self.gateway.settings = self.client.gateway_settings().settings;
-        if previous_scope
+        let settings = self.client.gateway_settings();
+        self.gateway.settings = settings
+            .settings
+            .filter(|_| settings.workspace_id.as_deref() == self.active_workspace_id());
+        self.gateway.settings_loading = settings.loading || settings.saving;
+        self.gateway.settings_error = settings.error;
+        let scope_changed = previous_scope
             != (
                 self.visible(),
                 self.active_workspace_id().map(str::to_owned),
                 self.gateway.endpoint_id.clone(),
                 self.gateway.ws_connection_id,
+                self.gateway.connection_state,
                 self.gateway.capabilities.can_manage_capabilities,
-            )
-        {
+                self.gateway.capabilities.can_manage_gateway_settings,
+            );
+        if scope_changed {
             self.operation = None;
             self.providers.login_message = None;
             self.providers.clear_cli_runtime_draft();
@@ -326,11 +355,20 @@ impl ProviderCatalogView {
                     .provider_runtime_intent(ProviderRuntimeIntent::Observe {
                         workspace_id: workspace_id.clone(),
                     });
-                if self.gateway.settings.is_none() {
-                    let _ = self.client.request_gateway_settings();
-                }
             }
             self.runtime_demanded = runtime_wanted;
+        }
+        if self.visible()
+            && self.demanded.is_some()
+            && self.gateway.capabilities.can_manage_capabilities
+            && self.gateway.capabilities.can_manage_gateway_settings
+            && self.gateway.connection_state == GatewayConnectionState::Connected
+            && (scope_changed
+                || (self.gateway.settings.is_none()
+                    && self.gateway.settings_error.is_none()
+                    && !self.gateway.settings_loading))
+        {
+            self.refresh_gateway_settings(cx);
         }
         let mut scopes = vec![
             ClientScope::Navigation,
@@ -363,30 +401,43 @@ impl ProviderCatalogView {
                 self.operation = None;
             }
             self.providers.operation = operation;
-            self.providers.error = self
+            let (api_error, cli_error) = self
                 .providers
-                .catalog
-                .as_ref()
-                .filter(|p| {
-                    matches!(
-                        p.request(),
-                        ProviderLoadState::Failed | ProviderLoadState::Forbidden
-                    )
+                .operation
+                .as_deref()
+                .map(provider_operation_errors)
+                .unwrap_or_default();
+            self.providers.error = api_error.or_else(|| {
+                self.providers
+                    .catalog
+                    .as_ref()
+                    .filter(|p| {
+                        matches!(
+                            p.request(),
+                            ProviderLoadState::Failed | ProviderLoadState::Forbidden
+                        )
+                    })
+                    .map(|_| t!("providers.error.load_failed").to_string())
+            });
+            self.providers.cli_error = cli_error
+                .or_else(|| {
+                    self.gateway
+                        .settings_error
+                        .as_ref()
+                        .filter(|error| error.as_str() == "settings_load_failed")
+                        .map(|_| t!("providers.cli.error.settings_load_failed").to_string())
                 })
-                .map(|_| t!("providers.error.load_failed").to_string())
+                .or_else(|| {
+                    (!self.gateway.capabilities.can_manage_gateway_settings)
+                        .then(|| t!("providers.cli.error.settings_forbidden").to_string())
+                })
                 .or_else(|| {
                     self.providers
-                        .operation
+                        .runtimes
                         .as_ref()
-                        .filter(|p| p.request() == ProviderLoadState::Failed)
-                        .map(|_| t!("providers.error.save_failed").to_string())
+                        .filter(|p| *p.request() == ProviderRuntimeRequestState::Failed)
+                        .map(|_| t!("providers.error.load_failed").to_string())
                 });
-            self.providers.cli_error = self
-                .providers
-                .runtimes
-                .as_ref()
-                .filter(|p| *p.request() == ProviderRuntimeRequestState::Failed)
-                .map(|_| t!("providers.error.load_failed").to_string());
         } else {
             self.providers.catalog = None;
             self.providers.runtimes = None;
@@ -442,10 +493,44 @@ struct ProviderPresentation {
     connected: GatewayConnectionState,
     settings: Option<pioneer_client::providers::types::GatewayCliRuntimeSettings>,
     can_manage: bool,
+    can_manage_settings: bool,
+    settings_loading: bool,
+    settings_error: Option<String>,
     catalog: Option<u64>,
     runtimes: Option<u64>,
     operation: Option<u64>,
     connection: Option<u64>,
+}
+
+fn provider_operation_errors(
+    operation: &ProviderOperationPublication,
+) -> (Option<String>, Option<String>) {
+    if operation.request() != ProviderLoadState::Failed {
+        return (None, None);
+    }
+    let (cli, key) = match operation.action() {
+        ProviderActionKind::Configure => (false, "providers.error.configure_failed"),
+        ProviderActionKind::Disconnect => (false, "providers.error.disconnect_failed"),
+        ProviderActionKind::Connect => (true, "providers.cli.error.login_failed"),
+        ProviderActionKind::SetRuntimeProxy | ProviderActionKind::RemoveRuntimeProxy => {
+            (true, "providers.cli.error.proxy_failed")
+        }
+        ProviderActionKind::SaveRuntime => (true, "providers.cli.error.save_failed"),
+        ProviderActionKind::SetRuntimeEnabled => (true, "providers.cli.error.enabled_failed"),
+    };
+    let message = Some(
+        t!(
+            key,
+            provider = operation.target(),
+            runtime = operation.target()
+        )
+        .to_string(),
+    );
+    if cli {
+        (None, message)
+    } else {
+        (message, None)
+    }
 }
 
 #[cfg(test)]
@@ -508,6 +593,160 @@ mod tests {
             panic!("unexpected platform effect")
         }
     }
+    #[gpui_kit::test]
+    fn initial_and_explicit_settings_refresh_queue_the_existing_worker(cx: &mut TestAppContext) {
+        use pioneer_client::{
+            core::ClientTransitionOutcome,
+            settings::runtime::SettingsIntent,
+            state::{
+                client_state::{GatewayConnectionState, GatewayStatusLevel},
+                reducers::{GatewayStatusProjection, GatewayStatusTextUpdate},
+            },
+        };
+        cx.update(gpui_kit::init);
+        for initial in [true, false] {
+            let core = pioneer_client::catalog_test_support::settings_model_picker_client();
+            core.navigate(
+                NavigationIntent::Navigate {
+                    destination: SemanticDestination::Providers {
+                        filter: ProviderFilter::Cli,
+                    },
+                },
+                None,
+            );
+            if initial {
+                let mut session = GatewaySessionPublication::default();
+                session.status = Some(GatewayStatusProjection {
+                    status: GatewayStatusTextUpdate::KeepExisting,
+                    status_level: GatewayStatusLevel::Connected,
+                    connection_state: GatewayConnectionState::Connected,
+                    clear_gateway_error: false,
+                });
+                let revision = core
+                    .snapshot(&ClientScope::Session)
+                    .map_or(1, |p| p.revisions().scoped().get() + 1);
+                core.publish(
+                    &ClientMutationAuthority::for_test(),
+                    ClientScope::Session,
+                    ClientRevisions::new(
+                        DomainRevision::new(revision),
+                        PresentationRevision::new(revision),
+                        ContentRevision::new(revision),
+                        ScopedRevision::new(revision),
+                    ),
+                    Arc::new(session),
+                    vec![],
+                );
+            }
+            let scopes = Rc::new(RefCell::new(HashSet::new()));
+            let (view, cx) = cx.add_window_view(|window, cx| {
+                Root::new(
+                    ProviderCatalogView::new(
+                        ProviderCatalogConfig::new(
+                            core.clone(),
+                            Arc::new(Registrar(scopes)),
+                            Arc::new(Ports),
+                            Arc::new(Ports),
+                            Arc::new(Ports),
+                        ),
+                        window,
+                        cx,
+                    ),
+                    window,
+                    cx,
+                )
+            });
+            let view = view.read_with(cx, |root, _| {
+                root.view()
+                    .clone()
+                    .downcast::<ProviderCatalogView>()
+                    .unwrap()
+            });
+            assert!(!view.read_with(cx, |view, _| view.settings_controls_available()));
+            if !initial {
+                view.update(cx, |view, cx| view.refresh_gateway_settings(cx));
+            }
+            // No worker is started in this fixture. Noop proves that the view
+            // queued Refresh, rather than only marking a request as loading.
+            assert_eq!(
+                core.settings_intent(SettingsIntent::Refresh).outcome(),
+                ClientTransitionOutcome::Noop
+            );
+            assert!(!core.gateway_settings().loading);
+        }
+    }
+
+    #[test]
+    fn failed_provider_operations_use_their_action_and_target() {
+        use pioneer_client::providers::{operations::*, types::*};
+        for command in [
+            ProviderCommand::SetRuntimeEnabled {
+                workspace_id: "workspace".into(),
+                runtime_id: "codex-test".into(),
+                enabled: false,
+            },
+            ProviderCommand::Configure(ProviderConfigureParams {
+                workspace_id: "workspace".into(),
+                provider: "openai".into(),
+                api_key: Some("synthetic".into()),
+                proxy_url: None,
+                clear_proxy: false,
+                base_url: None,
+                clear_base_url: false,
+            }),
+            ProviderCommand::Disconnect(ProviderDeleteApiKeyParams {
+                workspace_id: "workspace".into(),
+                provider: "openai".into(),
+            }),
+        ] {
+            let core = pioneer_client::catalog_test_support::client();
+            let operation = core.prepare_provider_command(command).unwrap();
+            // The fixture has no worker, so the command publishes a real failure.
+            assert!(operation.execute(Arc::downgrade(&core)).is_err());
+            let publication = core.provider_operation_snapshot("workspace").unwrap();
+            let (api, cli) = super::provider_operation_errors(&publication);
+            match publication.action() {
+                ProviderActionKind::SetRuntimeEnabled => {
+                    assert!(api.is_none());
+                    assert_eq!(
+                        cli,
+                        Some(
+                            t!("providers.cli.error.enabled_failed", runtime = "codex-test")
+                                .to_string()
+                        )
+                    );
+                }
+                ProviderActionKind::Configure => {
+                    assert!(cli.is_none());
+                    assert_eq!(
+                        api,
+                        Some(
+                            t!("providers.error.configure_failed", provider = "openai").to_string()
+                        )
+                    );
+                }
+                ProviderActionKind::Disconnect => {
+                    assert!(cli.is_none());
+                    assert_eq!(
+                        api,
+                        Some(
+                            t!("providers.error.disconnect_failed", provider = "openai")
+                                .to_string()
+                        )
+                    );
+                }
+                _ => unreachable!(),
+            }
+            core.cancel_provider_operations("workspace");
+            assert_eq!(
+                super::provider_operation_errors(
+                    &core.provider_operation_snapshot("workspace").unwrap()
+                ),
+                (None, None)
+            );
+        }
+    }
+
     #[gpui_kit::test]
     fn retained_root_observes_only_its_scopes_and_identity_tracks_parent_not_position(
         cx: &mut TestAppContext,

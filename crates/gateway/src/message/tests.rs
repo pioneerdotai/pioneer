@@ -528,6 +528,7 @@ async fn persist_test_cli_execution_authorization_context_with_profile(
     let runtime_kind = match runtime_kind {
         "codex" => CLIAgentRuntimeKind::Codex,
         "claude" => CLIAgentRuntimeKind::Claude,
+        "opencode" => CLIAgentRuntimeKind::OpenCode,
         other => panic!("unsupported test CLI runtime kind `{other}`"),
     };
     let execution_backend = AgentExecutionBackend::CLIAgentRuntime {
@@ -591,6 +592,10 @@ async fn persist_test_cli_instruction_projection(
         CLIAgentRuntimeKind::Claude => (
             "claude",
             CLIRuntimeElevatedInstructionTransport::ClaudeAppendSystemPromptFile,
+        ),
+        CLIAgentRuntimeKind::OpenCode => (
+            "opencode",
+            CLIRuntimeElevatedInstructionTransport::OpenCodeSystemPrompt,
         ),
     };
     let now = chrono::Utc::now().fixed_offset();
@@ -1286,6 +1291,10 @@ fn supported_test_cli_mcp_readiness(
             pioneer_protocol::CliMcpInjectionKind::ClaudeStrictStdioMcp,
             pioneer_protocol::CliMcpProjectionUpdateKind::ClaudeRestartProcessResumeSession,
         ),
+        CLIAgentRuntimeKind::OpenCode => (
+            pioneer_protocol::CliMcpInjectionKind::OpenCodeDynamicStdioMcp,
+            pioneer_protocol::CliMcpProjectionUpdateKind::OpenCodeRestartServerResumeSession,
+        ),
     };
     pioneer_protocol::CliMcpAdapterReadiness {
         supported: true,
@@ -1404,6 +1413,130 @@ async fn setup_cli_runtime_security_harness_for_principal(
         self_improvement_supervisor,
         processor: Arc::new(processor),
     }
+}
+
+#[test]
+#[cfg(unix)]
+fn codex_readiness_shares_one_account_read_and_process_and_preserves_auth_failures() {
+    use std::os::unix::fs::PermissionsExt;
+    run_gateway_message_test("codex-readiness-single-probe", || async {
+        for (name, response, expected) in [
+            (
+                "ready",
+                r#"{"id":1,"result":{"account":{"type":"chatgpt","email":"test@example.com"},"requiresOpenaiAuth":false}}"#,
+                pioneer_protocol::RuntimeStatus::Ready,
+            ),
+            (
+                "needs-auth",
+                r#"{"id":1,"result":{"requiresOpenaiAuth":true}}"#,
+                pioneer_protocol::RuntimeStatus::NeedsAuth,
+            ),
+            (
+                "account-error",
+                r#"{"id":1,"error":{"code":-32603,"message":"account unavailable"}}"#,
+                pioneer_protocol::RuntimeStatus::Error {
+                    message: "unused".into(),
+                },
+            ),
+        ] {
+            let harness =
+                setup_cli_runtime_security_harness(Some(CLIAgentRuntimeKind::Codex)).await;
+            let processor = &harness.processor;
+            let temp = tempfile::tempdir().unwrap();
+            let script = temp.path().join("fake-codex");
+            std::fs::write(&script, format!(r#"#!/bin/sh
+cd "$(dirname "$0")" || exit 1
+printf '%s\n' started >> probe-starts
+printf '%s\n' 'synthetic probe stderr' >&2
+read initialize
+printf '%s\n' "$initialize" >> probe-requests
+printf '%s\n' '{{"id":0,"result":{{"userAgent":"codex/1.2.3 test"}}}}'
+read initialized
+read account
+printf '%s\n' "$account" >> probe-requests
+printf '%s\n' '{response}'
+while read line; do
+  printf '%s\n' "$line" >> probe-requests
+  case "$line" in
+    *model/list*) printf '%s\n' '{{"id":2,"result":{{"data":[{{"id":"test-model"}}]}}}}' ;;
+    *account/read*) printf '%s\n' '{{"id":2,"error":{{"code":-32603,"message":"duplicate account/read"}}}}' ;;
+  esac
+done
+"#)).unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let config = crate::isolated_test_app_config().unwrap();
+            let settings_name = config.gateway.settings_file_name.as_str();
+            let settings_path = processor.artifact_runtime_home.join(settings_name);
+            let mut settings = crate::settings::load_or_create_gateway_settings(
+                &settings_path,
+                config.gateway.settings_version,
+                settings_name,
+            )
+            .unwrap();
+            let mut instance = pioneer_protocol::GatewayCliRuntimeInstanceSettings::default_codex();
+            instance.enabled = true;
+            instance.binary_path = script.to_string_lossy().into_owned();
+            instance.home_path = temp
+                .path()
+                .join("codex-home")
+                .to_string_lossy()
+                .into_owned();
+            settings
+                .set_cli_runtime_settings_for_tests(pioneer_protocol::GatewayCliRuntimeSettings {
+                    instances: vec![instance],
+                })
+                .unwrap();
+            crate::settings::save_gateway_settings(&settings_path, &settings).unwrap();
+            processor
+                .refresh_cli_readiness_for_tests(&harness.workspace_id)
+                .await
+                .unwrap();
+            let probe = processor
+                .cli_runtime_probe_snapshot(&harness.workspace_id, "codex")
+                .await
+                .unwrap()
+                .expect("published readiness probe");
+            assert_eq!(
+                std::mem::discriminant(&probe.summary.status),
+                std::mem::discriminant(&expected),
+                "{name}: {:?}",
+                probe.summary
+            );
+            assert_eq!(probe.summary.version.as_deref(), Some("1.2.3"));
+            assert!(
+                probe
+                    .summary
+                    .recent_stderr
+                    .iter()
+                    .any(|line| line.contains("synthetic probe stderr"))
+            );
+            let requests = std::fs::read_to_string(temp.path().join("probe-requests")).unwrap();
+            assert_eq!(requests.matches("account/read").count(), 1, "{name}");
+            assert_eq!(
+                std::fs::read_to_string(temp.path().join("probe-starts"))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                1,
+                "{name}"
+            );
+            if expected == pioneer_protocol::RuntimeStatus::Ready {
+                assert_eq!(requests.matches("model/list").count(), 1);
+                assert_eq!(probe.models.unwrap().result.models[0].id, "test-model");
+                assert_eq!(
+                    probe.summary.account.unwrap().email.as_deref(),
+                    Some("test@example.com")
+                );
+                assert!(probe.summary.capabilities.supports_mcp_tools);
+                assert!(probe.mcp_readiness.is_some());
+            } else {
+                assert!(!requests.contains("model/list"));
+                assert!(probe.models.is_none());
+                assert!(!probe.summary.capabilities.supports_mcp_tools);
+                assert!(!probe.summary.diagnostics.is_empty());
+            }
+        }
+    });
 }
 
 #[test]
@@ -1775,6 +1908,7 @@ async fn setup_cli_runtime_skill_preflight_harness(
     let runtime_id = match runtime_kind {
         CLIAgentRuntimeKind::Codex => "codex_proposal_51",
         CLIAgentRuntimeKind::Claude => "claude_proposal_51",
+        CLIAgentRuntimeKind::OpenCode => "opencode_proposal_51",
     }
     .to_owned();
     settings
@@ -1977,6 +2111,7 @@ async fn seed_cli_runtime_skill_preflight_thread(
                     match harness.runtime_kind {
                         CLIAgentRuntimeKind::Codex => "o4-mini",
                         CLIAgentRuntimeKind::Claude => "claude-sonnet",
+                        CLIAgentRuntimeKind::OpenCode => "openai/gpt-5",
                     }
                     .to_owned(),
                 ),
@@ -2053,7 +2188,11 @@ where
 }
 
 async fn capability_persistence_order_impl() {
-    for runtime_kind in [CLIAgentRuntimeKind::Codex, CLIAgentRuntimeKind::Claude] {
+    for runtime_kind in [
+        CLIAgentRuntimeKind::Codex,
+        CLIAgentRuntimeKind::Claude,
+        CLIAgentRuntimeKind::OpenCode,
+    ] {
         let harness = setup_cli_runtime_skill_preflight_harness(runtime_kind, false).await;
         let alpha_path = write_test_skill(&harness.user_root, "alpha", "", "# alpha\n");
         let beta_path = write_test_skill(&harness.registry_root, "beta", "", "# beta\n");
@@ -2091,6 +2230,7 @@ async fn capability_persistence_order_impl() {
             match runtime_kind {
                 CLIAgentRuntimeKind::Codex => "codex",
                 CLIAgentRuntimeKind::Claude => "claude",
+                CLIAgentRuntimeKind::OpenCode => "opencode",
             },
         );
         let request = cli_runtime_turn_start_request_with_capabilities(
@@ -2201,7 +2341,10 @@ async fn capability_persistence_order_impl() {
                 ..
             } if committed_turn_id == turn_id && bindings.len() == 2
         ));
-        if matches!(runtime_kind, CLIAgentRuntimeKind::Codex) {
+        if matches!(
+            runtime_kind,
+            CLIAgentRuntimeKind::Codex | CLIAgentRuntimeKind::OpenCode
+        ) {
             let input = native_turn.input.as_array().unwrap();
             let skill_items = input
                 .iter()
@@ -2224,19 +2367,29 @@ async fn capability_persistence_order_impl() {
                 ]
             );
             let instructions = native_turn.elevated_instructions.text();
-            assert!(instructions.contains("selected Skill input"));
+            let (directive, beta_label, alpha_label, runtime_label) = match runtime_kind {
+                CLIAgentRuntimeKind::Codex => {
+                    ("selected Skill input", "- $beta", "- $alpha", "Codex")
+                }
+                CLIAgentRuntimeKind::OpenCode => ("OpenCode turn", "- beta", "- alpha", "OpenCode"),
+                CLIAgentRuntimeKind::Claude => unreachable!(),
+            };
+            assert!(instructions.contains(directive));
             let beta = instructions
-                .find("- $beta")
-                .expect("Codex elevated instructions should include beta");
+                .find(beta_label)
+                .unwrap_or_else(|| panic!("{runtime_label} instructions should include beta"));
             let alpha = instructions
-                .find("- $alpha")
-                .expect("Codex elevated instructions should include alpha");
-            assert!(beta < alpha, "selected Codex skill order must be preserved");
+                .find(alpha_label)
+                .unwrap_or_else(|| panic!("{runtime_label} instructions should include alpha"));
+            assert!(
+                beta < alpha,
+                "selected {runtime_label} skill order must be preserved"
+            );
             assert!(input.iter().all(|item| {
                 item["type"] != "text"
                     || item["text"]
                         .as_str()
-                        .is_none_or(|text| !text.contains("selected Skill input"))
+                        .is_none_or(|text| !text.contains(directive))
             }));
         } else {
             let input = native_turn.input.as_array().unwrap();
@@ -2272,7 +2425,11 @@ fn gateway_cli_skill_full_turn_first_noop_update_and_zero_skill_matrix() {
 }
 
 async fn gateway_cli_skill_full_turn_first_noop_update_and_zero_skill_matrix_impl() {
-    for runtime_kind in [CLIAgentRuntimeKind::Codex, CLIAgentRuntimeKind::Claude] {
+    for runtime_kind in [
+        CLIAgentRuntimeKind::Codex,
+        CLIAgentRuntimeKind::Claude,
+        CLIAgentRuntimeKind::OpenCode,
+    ] {
         let harness = setup_cli_runtime_skill_preflight_harness(runtime_kind, false).await;
         let source = write_test_skill(&harness.user_root, "lifecycle", "", "# first\n");
         let lifecycle_id = seed_cli_runtime_skill_installation(
@@ -10163,26 +10320,31 @@ async fn repeated_title_triggers_are_singleflight_per_thread() {
     let session_manager = Arc::new(SessionManager::new());
     let thread_manager = Arc::new(ThreadManager::new("test-model", "openai"));
     let (workspace_manager, crud_store, workspace_id) = setup_workspace_manager().await;
-    let counting_provider = Arc::new(CountingDelayedProvider::new(
-        Duration::from_millis(200),
-        "Единый заголовок",
-    ));
+    let counting_provider = Arc::new(
+        CaptureSummaryProvider::new("Единый заголовок")
+            .with_first_delay(Duration::from_millis(200)),
+    );
     let mut summary_config = test_summary_config();
     summary_config.title_model_provider = Some("openai".to_owned());
     let provider_registry = Arc::new(pioneer_provider::ProviderRegistry::with_provider(
         "openai",
         counting_provider.clone(),
     ));
-    let processor = Arc::new(MessageProcessor::new(
-        thread_manager,
-        provider_registry,
-        session_manager,
-        workspace_manager,
-        crud_store.clone(),
-        test_gateway_secrets(),
-        summary_config,
-        test_tool_loop_config(),
-    ));
+    let cli_session = Arc::new(RecordingCliRuntimeSession::default());
+    let cli_manager = test_cli_runtime_manager(cli_session.clone());
+    let processor = Arc::new(
+        MessageProcessor::new(
+            thread_manager,
+            provider_registry,
+            session_manager,
+            workspace_manager,
+            crud_store.clone(),
+            test_gateway_secrets(),
+            summary_config,
+            test_tool_loop_config(),
+        )
+        .with_cli_runtime_manager_for_tests(cli_manager.clone()),
+    );
 
     let thread_id = "thr_title_singleflight_0001";
     let thread = pioneer_protocol::Thread {
@@ -10251,6 +10413,185 @@ async fn repeated_title_triggers_are_singleflight_per_thread() {
         "singleflight should keep one active title generation job"
     );
     assert_eq!(thread.name.as_deref(), Some("Единый заголовок"));
+
+    let key = CLIAgentRuntimeSessionKey::new(&workspace_id, "codex", thread_id).unwrap();
+    let handle = cli_manager.get_or_start(key.clone()).await.unwrap();
+    let binding = crud_store
+        .upsert_cli_runtime_thread_binding(pioneer_crud::NewCliRuntimeThreadBinding {
+            thread_id: thread_id.into(),
+            workspace_id: workspace_id.clone(),
+            runtime_id: "codex".into(),
+            runtime_kind: "codex".into(),
+            native_thread_id: "native-title".into(),
+            native_session_id: None,
+            native_root_thread_id: None,
+            native_cwd: None,
+            native_model: None,
+            resume_cursor_json: "{}".into(),
+            status: "active".into(),
+            created_at: chrono::Utc::now().fixed_offset(),
+            updated_at: chrono::Utc::now().fixed_offset(),
+        })
+        .await
+        .unwrap();
+    let fallback = "первый текст для заголовка";
+    let persisted_name = || async {
+        crud_store
+            .get_thread_by_id(thread_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .name
+    };
+    // Exercise the same job and writer boundary with a rename arriving while
+    // the provider is in flight. Both a person and a native name must win.
+    for (index, winner) in ["Ручное название", "Имя Codex"].into_iter().enumerate()
+    {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while processor
+                .title_job_runtime
+                .lock()
+                .await
+                .contains_key(thread_id)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        crud_store.update_thread_name(thread_id, "").await.unwrap();
+        counting_provider.pause_first.store(true, Ordering::SeqCst);
+        processor.spawn_initial_thread_title_task(thread_id.into(), Some(fallback.into()));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while counting_provider.call_count() < index + 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        if index == 0 {
+            crud_store
+                .update_thread_name(thread_id, winner)
+                .await
+                .unwrap();
+        } else {
+            use pioneer_cli_agent_runtime::event::RuntimeThreadNameUpdated;
+            for (workspace, runtime, pioneer, native, name) in [
+                (
+                    "other-workspace",
+                    "codex",
+                    thread_id,
+                    "native-title",
+                    winner,
+                ),
+                (
+                    workspace_id.as_str(),
+                    "other-runtime",
+                    thread_id,
+                    "native-title",
+                    winner,
+                ),
+                (
+                    workspace_id.as_str(),
+                    "codex",
+                    "other-thread",
+                    "native-title",
+                    winner,
+                ),
+                (
+                    workspace_id.as_str(),
+                    "codex",
+                    thread_id,
+                    "detached-child-native",
+                    winner,
+                ),
+                (
+                    workspace_id.as_str(),
+                    "codex",
+                    thread_id,
+                    "native-title",
+                    " ",
+                ),
+                (
+                    workspace_id.as_str(),
+                    "codex",
+                    thread_id,
+                    "native-title",
+                    "bad\0name",
+                ),
+            ] {
+                let wrong_key =
+                    CLIAgentRuntimeSessionKey::new(workspace, runtime, pioneer).unwrap();
+                let origin = cli_manager.get_or_start(wrong_key).await.unwrap();
+                processor
+                    .handle_cli_runtime_event(
+                        origin.instance(),
+                        RuntimeEvent::ThreadNameUpdated(RuntimeThreadNameUpdated {
+                            native_thread_id: native.into(),
+                            name: name.into(),
+                        }),
+                    )
+                    .await;
+                assert_eq!(persisted_name().await.as_deref(), Some(fallback));
+            }
+            // Even a matching old native binding snapshot cannot pass the
+            // writer predicate after the durable runtime owner has changed.
+            let mut stale = binding.clone();
+            stale.native_thread_id = "stale-native".into();
+            assert!(
+                !crud_store
+                    .with_maintenance_access()
+                    .update_automatic_thread_name(thread_id, winner, Some(fallback), Some(&stale))
+                    .await
+                    .unwrap()
+            );
+            cli_manager.remove_if_generation(handle.instance()).await;
+            processor
+                .handle_cli_runtime_event(
+                    handle.instance(),
+                    RuntimeEvent::ThreadNameUpdated(RuntimeThreadNameUpdated {
+                        native_thread_id: "native-title".into(),
+                        name: winner.into(),
+                    }),
+                )
+                .await;
+            assert_eq!(persisted_name().await.as_deref(), Some(fallback));
+            let current = cli_manager.get_or_start(key.clone()).await.unwrap();
+            processor
+                .handle_cli_runtime_event(
+                    current.instance(),
+                    RuntimeEvent::ThreadNameUpdated(RuntimeThreadNameUpdated {
+                        native_thread_id: "native-title".into(),
+                        name: winner.into(),
+                    }),
+                )
+                .await;
+        }
+        counting_provider.release_paused_call();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while processor
+                .title_job_runtime
+                .lock()
+                .await
+                .contains_key(thread_id)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(persisted_name().await.as_deref(), Some(winner));
+        assert!(
+            !processor
+                .accept_automatic_thread_title(thread_id, "Поздний fallback", None)
+                .await
+                .unwrap()
+        );
+    }
+    assert!(
+        cli_session.thread_name_sets.lock().await.is_empty(),
+        "incoming native names must not echo back to Codex"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -11741,9 +12082,8 @@ async fn assert_concurrent_collaborative_tasks_receive_independent_frozen_comman
         .unwrap()
         .unwrap();
     assert!(import_count > 0);
-    // Re-capture a real admitted child basis, as native/background compaction
-    // does after execution. The source bodies and their own-import grants must
-    // survive together, including repeated captures and the latest-basis path.
+    // Exact execution projections must forward the accepted own-import grants.
+    // New conversations have separate bounded inheritance and no such grants.
     let db = crud_store.database_connection();
     for (sql, values) in [
         (
@@ -11791,19 +12131,17 @@ async fn assert_concurrent_collaborative_tasks_receive_independent_frozen_comman
         .await
         .unwrap();
     }
-    for basis_turn in [Some("recapture-turn"), None] {
-        let recaptured = crate::compaction::frozen::capture_execution_basis_json(
+    for pass in 0..2 {
+        let recaptured = crate::compaction::frozen::prepare_exact_task_fixture(
             crud_store.as_ref(),
             &workspace_id,
             "new-child-context",
-            basis_turn,
-            None,
+            "recapture-turn",
             None,
         )
         .await
         .unwrap();
-        let descriptor: pioneer_compaction::frozen::FrozenHistoryRef =
-            serde_json::from_str(&recaptured).unwrap();
+        let descriptor = recaptured.descriptor;
         let (forwarded, _) = crud_store
             .compaction_frozen_import_state(
                 &workspace_id,
@@ -11815,7 +12153,7 @@ async fn assert_concurrent_collaborative_tasks_receive_independent_frozen_comman
             .unwrap();
         assert_eq!(
             forwarded, import_count,
-            "recapture must preserve every accepted own source grant (basis turn: {basis_turn:?})"
+            "recapture must preserve every accepted own source grant (pass {pass})"
         );
     }
 
@@ -15141,6 +15479,41 @@ async fn task_run_voice_composer_stays_foreground() {
         )
         .await
         .expect("persist task-run voice lineage");
+
+    // A Task child has a durable initial execution as well as lineage. The
+    // voice turn below is a later conversation, not the creating Task attempt.
+    for (sql, values) in [
+        (
+            "INSERT INTO turn(id,thread_id,status,turn_kind,origin,created_at,updated_at) VALUES('turn_voice_task_initial','thr_voice_task_run','completed','conversation','system',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)",
+            vec![],
+        ),
+        (
+            "INSERT INTO task(id,workspace_id,owner_kind,owner_id,created_by_thread_id,created_by_turn_id,executor_kind,status,title,goal) VALUES('task_voice_task_run',?,'thread','thr_voice_task_root','thr_voice_task_root','turn_voice_task_root','agent','completed','Voice child','fixture')",
+            vec![workspace_id.clone().into()],
+        ),
+        (
+            "INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind) VALUES('run_voice_task_run','task_voice_task_run','run_voice_task_run',1,1,'succeeded','agent')",
+            vec![],
+        ),
+        (
+            "INSERT INTO task_run_turn(id,task_id,run_id,thread_id,turn_id,kind,round,sequence,status,created_at) VALUES('rt_voice_task_run','task_voice_task_run','run_voice_task_run','thr_voice_task_run','turn_voice_task_initial','initial',0,1,'review_recorded',CURRENT_TIMESTAMP)",
+            vec![],
+        ),
+        (
+            "INSERT INTO task_run_conversation_snapshot(run_id,task_id,workspace_id,conversation_thread_id,source_turn_id,history_json,created_at,frozen_manifest_id) VALUES('run_voice_task_run','task_voice_task_run',?,'thr_voice_task_root','turn_voice_task_root','[]',CURRENT_TIMESTAMP,NULL)",
+            vec![workspace_id.clone().into()],
+        ),
+    ] {
+        crud_store
+            .database_connection()
+            .execute_raw(sea_orm::Statement::from_sql_and_values(
+                sea_orm::DbBackend::Sqlite,
+                sql,
+                values,
+            ))
+            .await
+            .unwrap();
+    }
 
     let turn_id = "turn_voice_task_run";
     let result = submit_test_voice_turn(
@@ -24939,6 +25312,7 @@ fn composer_cli_skill_pack_matches_individual_members_and_preserves_presentation
                 let model = match runtime_kind {
                     CLIAgentRuntimeKind::Codex => "gpt-5",
                     CLIAgentRuntimeKind::Claude => "claude-sonnet",
+                    CLIAgentRuntimeKind::OpenCode => "openai/gpt-5",
                 };
                 let thread = harness
                     .thread_manager
@@ -25847,12 +26221,25 @@ async fn a_child_first_continued_by_another_provider_or_after_source_edit_transf
             TaskStatus::Completed
         );
         if edit_source || edit_after_ready {
-            seed_completed_task_parent_with_history(
+            let cutoff = store
+                .compaction_child_history_parent(&workspace, &lineage.child_thread_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .started_at
+                .timestamp()
+                + 1;
+            seed_completed_task_parent_with_inputs_at(
                 &processor,
                 &workspace,
                 &parent,
                 &format!("switch-late-parent-{source_id}"),
                 "LATE PARENT AFTER CHILD ANSWER",
+                vec![UserInput::Text {
+                    text: "LATE PARENT AFTER CHILD ANSWER".into(),
+                    text_elements: vec![],
+                }],
+                cutoff,
             )
             .await;
         }
@@ -26604,8 +26991,14 @@ async fn accepted_task_cli_transfer_compacts_without_later_parent_history_impl(
         .await
         .unwrap();
     sync_test_cli_runtime_identities(&processor).await.unwrap();
+    let max_input_tokens = 50_000;
     processor
-        .mark_cli_reasoning_model_ready_for_tests(&workspace, "codex", "gpt-5")
+        .mark_cli_reasoning_model_with_limit_ready_for_tests(
+            &workspace,
+            "codex",
+            "gpt-5",
+            Some(max_input_tokens),
+        )
         .await
         .unwrap();
     processor
@@ -26617,15 +27010,18 @@ async fn accepted_task_cli_transfer_compacts_without_later_parent_history_impl(
     processor.bind_task_bridge().await;
     processor.start_task_event_listener().await;
     let parent = "accepted-large-task-parent";
-    let mut raw_bytes = 0usize;
+    // Force real transfer compaction through the discovered input limit.
+    // The separate CLI frame fixture covers the 8 MiB limit; these cases need
+    // accepted revisions, checkpoint reuse and cancellation, not that volume.
+    let mut history_tokens = 0;
+    let mut history_chars = 0;
     for index in 0..12 {
-        // Keep the provider frame above the 8 MiB cap without making a
-        // single giant BPE word dominate history-transfer timing.
         let text = format!(
             "ACCEPTED TASK CHUNK {index:02} {}",
-            "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx ".repeat(22_200)
+            "accepted history ".repeat(6_500)
         );
-        raw_bytes += text.len();
+        history_tokens += pioneer_compaction::text_tokens(&text);
+        history_chars += text.chars().count();
         seed_completed_task_parent_with_inputs(
             &processor,
             &workspace,
@@ -26639,7 +27035,8 @@ async fn accepted_task_cli_transfer_compacts_without_later_parent_history_impl(
         )
         .await;
     }
-    assert!(raw_bytes > crate::cli_runtime::context::MAX_CLI_TURN_INPUT_FRAME_BYTES);
+    assert!(history_tokens > max_input_tokens);
+    assert!(history_chars > crate::cli_runtime::context::MAX_CODEX_INPUT_TEXT_CHARS);
     let launch = "accepted-large-task-launch";
     let params = detached_cli_task_create_params(
         &workspace,
@@ -26660,9 +27057,8 @@ async fn accepted_task_cli_transfer_compacts_without_later_parent_history_impl(
     });
     let result = create_task_for_test(&processor, params).await.unwrap();
     let run = result.run.unwrap();
-    // This barrier follows projection of more than 8 MiB of accepted history.
-    // A concurrent workspace test run can spend well over ten seconds there;
-    // keep the test wait bounded without imposing an unrelated product deadline.
+    // Keep the observation bounded while the accepted projection is prepared.
+    // Editing below must happen at the selected capture/compaction boundary.
     timeout(
         Duration::from_secs(180),
         processor.wait_for_completed_history_preparation_barrier(),
@@ -26679,16 +27075,33 @@ async fn accepted_task_cli_transfer_compacts_without_later_parent_history_impl(
     let child = wait_for_child_lineage_for_run(store.clone(), run.id.as_str()).await;
     let late_parent_body = format!(
         "LATER PARENT MUST NOT ENTER TASK CHECKPOINT {}",
-        "q".repeat(3_000_000)
+        "later context ".repeat(50_000)
     );
-    seed_completed_task_parent_with_history(
+    let cutoff = store
+        .compaction_child_history_parent(&workspace, &child.child_thread_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .started_at
+        .timestamp()
+        + 1;
+    seed_completed_task_parent_with_inputs_at(
         &processor,
         &workspace,
         parent,
         "parent-later-than-task-snapshot",
         late_parent_body.as_str(),
+        vec![UserInput::Text {
+            text: late_parent_body.clone(),
+            text_elements: vec![],
+        }],
+        cutoff,
     )
     .await;
+    // Make the edited unit exceed the transfer token target so it must enter
+    // the summary, even if its replacement row sorts into the retained tail.
+    let edited_body = format!("EDITED ACCEPTED SOURCE 00 {}", "b ".repeat(70_000));
+    assert!(pioneer_compaction::text_tokens(&edited_body) > max_input_tokens);
     store
         .edit_turn_message(pioneer_crud::EditTurnMessageRequest {
             workspace_id: workspace.clone(),
@@ -26696,10 +27109,7 @@ async fn accepted_task_cli_transfer_compacts_without_later_parent_history_impl(
             turn_id: "accepted-source-00".to_owned(),
             expected_revision: 0,
             input: vec![UserInput::Text {
-                text: format!(
-                    "EDITED ACCEPTED SOURCE 00 {}",
-                    "yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy ".repeat(22_200)
-                ),
+                text: edited_body,
                 text_elements: Vec::new(),
             }],
             mentions: Vec::new(),
@@ -27089,6 +27499,16 @@ async fn accepted_task_cli_transfer_compacts_without_later_parent_history_impl(
         )
         .await
         .unwrap();
+    assert_eq!(prepared.checkpoint.as_deref(), Some(checkpoint_id.as_str()));
+    assert_eq!(
+        prepared
+            .messages
+            .iter()
+            .filter(|message| { message.content.contains("ACCEPTED TASK HISTORY SUMMARY") })
+            .count(),
+        1,
+        "recapture must reuse the published checkpoint over the accepted edited sources"
+    );
     processor
         .compact_cli_transfer_history(
             &workspace,
@@ -28776,6 +29196,9 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_i
                 CLIAgentRuntimeKind::Claude => {
                     pioneer_protocol::TurnSecurityExecutionBackendKind::ClaudeCli
                 }
+                CLIAgentRuntimeKind::OpenCode => {
+                    pioneer_protocol::TurnSecurityExecutionBackendKind::OpenCodeCli
+                }
             }
         );
 
@@ -30388,12 +30811,9 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_i
             "foreground CLI presentation must identify the actual runtime executor, not generic Agent"
         );
         assert_eq!(
-            manual_author.and_then(|author| author.avatar_revision.as_deref()),
-            Some(match runtime_kind {
-                CLIAgentRuntimeKind::Codex => pioneer_protocol::CODEX_AGENT_AVATAR_REVISION,
-                CLIAgentRuntimeKind::Claude => pioneer_protocol::CLAUDE_AGENT_AVATAR_REVISION,
-            }),
-            "timeline projection must carry the explicit runtime-executor discriminator consumed by desktop"
+            manual_author.and_then(|author| author.cli_runtime_kind),
+            Some(runtime_kind),
+            "timeline projection must carry provider identity independently of artwork"
         );
         let before_delivery = processor
             .task_runtime
@@ -30813,12 +31233,25 @@ async fn nested_cli_children_bootstrap_their_accepted_lineage_only_impl() {
     }
 
     let late_parent_marker = "LATE ROOT APPEND AFTER CHILD BASIS";
-    seed_completed_task_parent_with_history(
+    let root_cutoff = crud_store
+        .compaction_child_history_parent(&workspace_id, &lineages[0].child_thread_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .started_at
+        .timestamp()
+        + 1;
+    seed_completed_task_parent_with_inputs_at(
         &processor,
         workspace_id.as_str(),
         root_thread_id,
         "turn_nested_cli_late_root",
         late_parent_marker,
+        vec![UserInput::Text {
+            text: late_parent_marker.into(),
+            text_elements: vec![],
+        }],
+        root_cutoff,
     )
     .await;
     cli_session
@@ -43160,6 +43593,113 @@ async fn thread_read_rpc_is_monotonic_and_converges_all_principal_sessions() {
         assert_eq!(secondary_notification.cursor, response.cursor);
         assert_eq!(secondary_notification.unread_count, response.unread_count);
     }
+    // A workspace-only observer must learn about a final answer without a
+    // timeline subscription, then receive the same principal's read cursor.
+    processor
+        .session_manager
+        .set_connection_workspace(_secondary_connection_id, Some(workspace_id.clone()))
+        .await;
+    let answer = pioneer_protocol::TurnItem::AgentMessage {
+        id: pioneer_protocol::task_delivery_result_item_id("read-rpc-delivery"),
+        text: "Finished answer".into(),
+        phase: pioneer_protocol::AgentMessagePhase::FinalAnswer,
+        markdown: None,
+        markdown_version: None,
+    };
+    processor
+        .crud_store
+        .materialize_item_started(
+            pioneer_protocol::ItemStartedNotification {
+                workspace_id: workspace_id.clone(),
+                thread_id: THREAD_ID.into(),
+                turn_id: FIRST_TURN_ID.into(),
+                item: answer.clone(),
+            },
+            now_timestamp_secs(),
+        )
+        .await
+        .unwrap();
+    let streaming_request_id = generate_test_request_id("readreply", "stream");
+    let streaming = request_thread_timeline_page_for_test(
+        &processor,
+        primary_connection_id,
+        &mut primary_rx,
+        THREAD_ID,
+        &streaming_request_id,
+    )
+    .await;
+    assert!(streaming.blocks.iter().any(|block| matches!(&block.kind, pioneer_protocol::TimelineBlockKind::AssistantMessage { status: pioneer_protocol::TurnWorkItemStatus::Running, item_id, .. } if item_id == answer.item_id())), "canonical lifecycle status must survive Gateway batching");
+    processor
+        .crud_store
+        .materialize_item_completed(
+            pioneer_protocol::ItemCompletedNotification {
+                workspace_id: workspace_id.clone(),
+                thread_id: THREAD_ID.into(),
+                turn_id: FIRST_TURN_ID.into(),
+                item: answer.clone(),
+            },
+            now_timestamp_secs(),
+        )
+        .await
+        .unwrap();
+    processor
+        .notify_semantic_timeline_item_changed(
+            &workspace_id,
+            THREAD_ID,
+            FIRST_TURN_ID,
+            &answer,
+            Some("completed"),
+        )
+        .await;
+    let tree = recv_notification_by_method(&mut secondary_rx, events::THREAD_TREE_CHANGED).await;
+    assert_eq!(tree.params.unwrap()["workspace_id"], workspace_id);
+    let principal = authenticated_test_superuser().principal_id.clone();
+    assert_eq!(
+        processor
+            .crud_store
+            .unread_counts_for_threads(&principal, &[THREAD_ID.into()])
+            .await
+            .unwrap()
+            .get(THREAD_ID),
+        Some(&1)
+    );
+    let block_id = pioneer_crud::assistant_block_id(FIRST_TURN_ID, answer.item_id());
+    let canonical_request_id = generate_test_request_id("readreply", "final");
+    let canonical = request_thread_timeline_page_for_test(
+        &processor,
+        primary_connection_id,
+        &mut primary_rx,
+        THREAD_ID,
+        &canonical_request_id,
+    )
+    .await;
+    let sort_key = &canonical
+        .blocks
+        .iter()
+        .find(|block| block.block_id == block_id)
+        .unwrap()
+        .sort_key;
+    let read_request_id = generate_test_request_id("readreply", "exact");
+    processor.process_request_for_connection(primary_connection_id, &json!({
+        "jsonrpc": "2.0", "id": read_request_id, "method": "thread/read",
+        "params": { "thread_id": THREAD_ID, "through_turn_id": FIRST_TURN_ID, "through_block": { "block_id": block_id, "sort_key": sort_key } }
+    }).to_string()).await;
+    let (response, _) = recv_response_and_notification_by_id_method(
+        &mut primary_rx,
+        &read_request_id,
+        events::THREAD_READ_CURSOR_CHANGED,
+    )
+    .await;
+    let response: pioneer_protocol::ThreadReadResponse =
+        serde_json::from_value(response.result).unwrap();
+    assert_eq!(response.cursor.through_turn_id, FIRST_TURN_ID);
+    assert_eq!(response.unread_count, 0);
+    let peer =
+        recv_notification_by_method(&mut secondary_rx, events::THREAD_READ_CURSOR_CHANGED).await;
+    let peer: pioneer_protocol::ThreadReadCursorChangedNotification =
+        serde_json::from_value(peer.params.unwrap()).unwrap();
+    assert_eq!(peer.cursor, response.cursor);
+    assert_eq!(peer.unread_count, 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -45854,6 +46394,110 @@ async fn codex_thread_ops_name_sync_failure_does_not_break_pioneer_rename() {
     assert_eq!(name_sets.len(), 1);
     assert_eq!(name_sets[0].native_thread_id, "codex-native-rename");
     assert_eq!(name_sets[0].name, "After active rename");
+
+    drop(name_sets);
+    while rx.try_recv().is_ok() {}
+    // Freeze real persisted timestamps, so the race cannot be fixed by a
+    // seconds-resolution updated_at comparison. No clock sleeps are needed.
+    use sea_orm::ConnectionTrait as _;
+    crud_store
+        .database_connection()
+        .execute_unprepared(
+            "CREATE TRIGGER freeze_title_time AFTER UPDATE OF name ON thread BEGIN \
+         UPDATE thread SET updated_at = OLD.updated_at WHERE id = NEW.id; END",
+        )
+        .await
+        .unwrap();
+    let thread_id = "thread_codex_ops_rename";
+    crud_store.update_thread_name(thread_id, "").await.unwrap();
+    let read_completed = Arc::new(Notify::new());
+    let continue_publication = Arc::new(Notify::new());
+    *processor.thread_title_publication_barrier.lock().await =
+        Some((read_completed.clone(), continue_publication.clone()));
+    let automatic = async {
+        assert!(
+            processor
+                .accept_automatic_thread_title(thread_id, "Automatic name", None)
+                .await
+                .unwrap()
+        );
+    };
+    let manual = async {
+        read_completed.notified().await;
+        let gate = processor
+            .thread_title_publication_mutexes
+            .lock()
+            .await
+            .get(thread_id)
+            .unwrap()
+            .upgrade()
+            .unwrap();
+        assert!(
+            gate.try_lock().is_err(),
+            "automatic snapshot must retain its per-thread publication gate"
+        );
+        // Consume the automatic publisher's acquisition notification.
+        processor
+            .thread_title_publication_attempted
+            .notified()
+            .await;
+        let request = json!({
+            "jsonrpc":"2.0", "id":generate_test_request_id("rename", "publicationrace"), "method":"thread/update",
+            "params":{"workspace_id":workspace_id, "thread_id":thread_id, "name":"Manual winner"}
+        })
+        .to_string();
+        serde_json::from_str::<pioneer_protocol::JsonRpcRequest>(&request)
+            .expect("publication race request must match the protocol");
+        let mut rename =
+            Box::pin(processor.process_request_for_connection(connection_id, &request));
+        tokio::select! {
+            _ = &mut rename => panic!("manual rename passed an automatic snapshot awaiting publication"),
+            _ = processor.thread_title_publication_attempted.notified() => {}
+        }
+        assert_eq!(
+            crud_store
+                .get_thread_model(thread_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .name
+                .as_deref(),
+            Some("Automatic name")
+        );
+        continue_publication.notify_one();
+        rename.await;
+    };
+    timeout(Duration::from_secs(5), async {
+        tokio::join!(automatic, manual);
+    })
+    .await
+    .unwrap();
+    let persisted = crud_store
+        .get_thread_model(thread_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let memory = processor
+        .thread_manager
+        .thread_get(thread_id)
+        .await
+        .unwrap();
+    assert_eq!(persisted.name.as_deref(), Some("Manual winner"));
+    assert_eq!(memory.name, persisted.name);
+    let mut published = Vec::new();
+    while let Ok(Message::Text(payload)) = rx.try_recv() {
+        let value: JsonValue = serde_json::from_str(&payload).unwrap();
+        if value["method"] == events::THREAD_UPDATED {
+            let notification: pioneer_protocol::ThreadUpdatedNotification =
+                serde_json::from_value(value["params"].clone()).unwrap();
+            published.push(notification.thread);
+        }
+    }
+    assert_eq!(published.len(), 2);
+    assert_eq!(published[0].name.as_deref(), Some("Automatic name"));
+    assert_eq!(published[1].name.as_deref(), Some("Manual winner"));
+    assert_eq!(published[0].updated_at, persisted.updated_at);
+    assert_eq!(published[1].updated_at, persisted.updated_at);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -54563,6 +55207,7 @@ async fn materialize_cli_runtime_turn_with_execution(
             execution_principal.principal_id.clone(),
         );
         turn.author = Some(pioneer_protocol::TurnAuthorSnapshot {
+            cli_runtime_kind: None,
             actor: actor.clone(),
             display_name: "Superuser".into(),
             nickname: "superuser".into(),
@@ -55350,6 +55995,7 @@ async fn agent_skill_snapshot_failure_retries_the_gateway_path_without_overlay()
             &runtime_environment,
             &[],
             &mut overlay,
+            None,
         )
         .await
         .expect("optional Agent pin failure must preserve the base Gateway turn path");
@@ -55425,6 +56071,7 @@ async fn persist_agent_skill_snapshot_for_resolution_tests(
             &runtime_environment,
             &[],
             &mut overlay,
+            None,
         )
         .await
         .expect("Agent skill snapshot fixture must persist");
@@ -57511,6 +58158,7 @@ async fn turn_cancel_completed_turn_returns_completed_snapshot() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn thread_tree_returns_folders_and_placements_after_moves() {
+    use sea_orm::Statement;
     let (tx, mut rx) = mpsc::channel(32);
     let session_manager = Arc::new(SessionManager::new());
     let connection_id = register_authenticated_test_connection(session_manager.as_ref(), tx).await;
@@ -57619,6 +58267,81 @@ async fn thread_tree_returns_folders_and_placements_after_moves() {
         }),
         "thread/tree should include placement into folder"
     );
+    assert!(tree.running_task_thread_ids.is_empty());
+    // The connection now stays only in the list: activity must arrive without
+    // any thread/timeline subscription, and a fresh tree must restore it.
+    processor
+        .thread_manager
+        .thread_unsubscribe(connection_id, thread_id)
+        .await;
+    let db = processor.crud_store.database_connection();
+    db.execute_raw(Statement::from_sql_and_values(
+        db.get_database_backend(),
+        "INSERT INTO task(id,workspace_id,owner_kind,owner_id,executor_kind,status,title,goal)
+         VALUES('tree-activity-task',?,'thread',?,'tool','waiting','Activity','fixture')",
+        vec![workspace_id.clone().into(), thread_id.into()],
+    ))
+    .await
+    .unwrap();
+    db.execute_unprepared("INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind)
+        VALUES('tree-activity-run','tree-activity-task','tree-activity-run',1,1,'queued','tool')").await.unwrap();
+    let (_, event) = processor
+        .crud_store
+        .claim_task_run_for_dispatch_with_event("tree-activity-run", now_timestamp_secs())
+        .await
+        .unwrap()
+        .unwrap();
+    processor.emit_task_event(event).await.unwrap();
+    let notification = recv_notification_by_method(&mut rx, events::THREAD_TREE_CHANGED).await;
+    assert_eq!(notification.params.unwrap()["workspace_id"], workspace_id);
+    processor
+        .process_request_for_connection(connection_id, &tree_request.to_string())
+        .await;
+    let response = recv_response_by_id(&mut rx, "ddddddddddddddddddddd").await;
+    let tree: ThreadTreeResponse = serde_json::from_value(response.result).unwrap();
+    assert_eq!(tree.running_task_thread_ids, vec![thread_id]);
+    let event = processor
+        .crud_store
+        .append_task_event(
+            TaskEventPayload::RunCancelled {
+                task_id: "tree-activity-task".into(),
+                run_id: "tree-activity-run".into(),
+                reason: None,
+                cancelled_at: now_timestamp_secs(),
+            },
+            now_timestamp_secs(),
+        )
+        .await
+        .unwrap();
+    processor.emit_task_event(event).await.unwrap();
+    recv_notification_by_method(&mut rx, events::THREAD_TREE_CHANGED).await;
+    processor
+        .process_request_for_connection(connection_id, &tree_request.to_string())
+        .await;
+    let response = recv_response_by_id(&mut rx, "ddddddddddddddddddddd").await;
+    let tree: ThreadTreeResponse = serde_json::from_value(response.result).unwrap();
+    assert!(tree.running_task_thread_ids.is_empty());
+    // A service run with no user-tree authorization root creates neither a
+    // row indicator nor an unrelated tree refresh/loading spinner.
+    while rx.try_recv().is_ok() {}
+    db.execute_raw(Statement::from_sql_and_values(
+        db.get_database_backend(),
+        "INSERT INTO task(id,workspace_id,owner_kind,executor_kind,status,title,goal)
+         VALUES('tree-service-task',?,'system','system','waiting','Service','fixture')",
+        [workspace_id.clone().into()],
+    ))
+    .await
+    .unwrap();
+    db.execute_unprepared("INSERT INTO task_run(id,task_id,run_group_id,attempt_number,run_number,status,executor_kind)
+        VALUES('tree-service-run','tree-service-task','tree-service-run',1,1,'queued','system')").await.unwrap();
+    let (_, event) = processor
+        .crud_store
+        .claim_task_run_for_dispatch_with_event("tree-service-run", now_timestamp_secs())
+        .await
+        .unwrap()
+        .unwrap();
+    processor.emit_task_event(event).await.unwrap();
+    assert!(rx.try_recv().is_err());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -75205,6 +75928,7 @@ async fn compaction_failed_partial_writer_preserves_event_but_excludes_observati
             &std::collections::HashMap::new(),
             &history,
             &[],
+            None,
         )
         .await
         .unwrap();

@@ -3375,6 +3375,14 @@ async fn mark_started_is_idempotent_and_emits_one_started_event() {
         .filter(|event| matches!(event.payload, TaskEventPayload::RunStarted { .. }))
         .count();
     assert_eq!(started_count, 1);
+    assert_eq!(
+        events
+            .events
+            .iter()
+            .filter(|event| matches!(event.payload, TaskEventPayload::RunStarting { .. }))
+            .count(),
+        1
+    );
 }
 
 #[tokio::test]

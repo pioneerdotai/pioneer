@@ -1132,6 +1132,7 @@ mod tests {
                 attachments: Vec::new(),
                 mode: ThreadMode::Message,
                 author: Some(TurnAuthorSnapshot {
+                    cli_runtime_kind: None,
                     actor: PersistedActorRef::Principal(alice.clone()),
                     display_name: "Alice".to_owned(),
                     nickname: "alice".to_owned(),

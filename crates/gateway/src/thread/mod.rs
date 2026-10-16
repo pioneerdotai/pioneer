@@ -2060,6 +2060,7 @@ mod tests {
                     cli_runtime_options: None,
                 },
                 pioneer_protocol::TurnAuthorSnapshot {
+                    cli_runtime_kind: None,
                     actor: pioneer_protocol::PersistedActorRef::System,
                     display_name: "System".to_owned(),
                     nickname: "system".to_owned(),
@@ -2312,6 +2313,7 @@ mod tests {
             .expect("thread should start");
         let base_updated_at = started.response.thread.updated_at;
         let author = pioneer_protocol::TurnAuthorSnapshot {
+            cli_runtime_kind: None,
             actor: pioneer_protocol::PersistedActorRef::System,
             display_name: "System".to_owned(),
             nickname: "system".to_owned(),
@@ -2898,6 +2900,7 @@ mod tests {
                 },
                 pioneer_protocol::resolve_turn_permission_profile(None),
                 pioneer_protocol::TurnAuthorSnapshot {
+                    cli_runtime_kind: None,
                     actor: pioneer_protocol::PersistedActorRef::System,
                     display_name: "Child Agent".to_owned(),
                     nickname: "child-agent".to_owned(),
