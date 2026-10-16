@@ -2533,12 +2533,16 @@ fn native_preflight_counts_the_projected_history_that_will_be_sent() {
     let selected = ModelBudget::new(Some(context), None, Some(128));
     let old = super::background_history::completed_history_request_projection(
         old.request,
+        vec![],
         selected.clone(),
     )
     .unwrap();
-    let new =
-        super::background_history::completed_history_request_projection(new.request, selected)
-            .unwrap();
+    let new = super::background_history::completed_history_request_projection(
+        new.request,
+        vec![],
+        selected,
+    )
+    .unwrap();
     assert!(
         !old.fits,
         "legacy duplicated history must exceed this fixture budget"
@@ -27621,4 +27625,52 @@ async fn published_checkpoint_keeps_coverage_of_newly_hidden_service_event() {
         .unwrap();
     assert_eq!(after_operations, before_operations);
     assert!(f.provider.calls.lock().unwrap().is_empty());
+}
+
+#[test]
+fn completed_history_retains_media_estimates_for_candidate_projection() {
+    use pioneer_agent::compaction::request::{MediaEstimate, NativeRequestProjection};
+    use pioneer_provider::{ChatMessage, MessageAttachment, MessageContentPart};
+    let mut retained = ChatMessage::user("retained");
+    retained
+        .content_parts
+        .push(MessageContentPart::image(MessageAttachment::from_url(
+            "https://fixture.invalid/image",
+            "image/png",
+        )));
+    let request = ChatRequest {
+        model: "fixture".into(),
+        messages: vec![ChatMessage::user("old"), retained.clone()],
+        temperature: None,
+        max_tokens: Some(128),
+        tools: None,
+        tool_choice: None,
+        parallel_tool_calls: None,
+        reasoning: None,
+        compiled_prompt: None,
+    };
+    let media = vec![MediaEstimate {
+        message: 1,
+        part: 0,
+        input_tokens: 875,
+    }];
+    let budget = ModelBudget::new(Some(8192), None, Some(128));
+    let full = super::background_history::completed_history_request_projection(
+        request.clone(),
+        media.clone(),
+        budget.clone(),
+    )
+    .unwrap();
+    let candidate = NativeRequestProjection::new(request, [0], media, budget, false)
+        .unwrap()
+        .evaluate("summary")
+        .unwrap();
+    assert_eq!(full.request.messages[1], retained);
+    assert_eq!(candidate.request.messages[1], retained);
+    assert_eq!(
+        full.message_input_tokens[1],
+        candidate.message_input_tokens[1]
+    );
+    assert!(full.message_input_tokens[1] > 875);
+    assert!(full.message_input_tokens[1] < 1200);
 }
