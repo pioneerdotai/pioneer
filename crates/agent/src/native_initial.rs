@@ -70,6 +70,7 @@ pub(crate) struct InitialPhaseSnapshot {
 #[derive(Clone)]
 pub struct NativeInitialPreparation {
     execution_owner_generation: Option<u64>,
+    cancellation_runtime_generation: Option<u64>,
     pub(crate) inner: Arc<tokio::sync::Mutex<InitialPreparationState>>,
 }
 
@@ -134,6 +135,7 @@ impl NativeInitialPreparation {
         );
         Ok(Self {
             execution_owner_generation: None,
+            cancellation_runtime_generation: None,
             inner: Arc::new(tokio::sync::Mutex::new(InitialPreparationState {
                 snapshot,
                 encoded: encoded.to_owned(),
@@ -148,6 +150,17 @@ impl NativeInitialPreparation {
     pub fn with_execution_owner_generation(mut self, generation: u64) -> Self {
         self.execution_owner_generation = Some(generation);
         self
+    }
+
+    /// Original immutable cancellation identity, distinct from a new process's
+    /// local dependency generation. It is revalidated by checkpoint commit.
+    pub fn with_cancellation_runtime_generation(mut self, generation: Option<u64>) -> Self {
+        self.cancellation_runtime_generation = generation;
+        self
+    }
+
+    pub(crate) fn cancellation_runtime_generation(&self) -> Option<u64> {
+        self.cancellation_runtime_generation
     }
 
     pub(crate) fn execution_owner_generation(&self) -> Option<u64> {

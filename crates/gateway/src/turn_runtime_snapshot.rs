@@ -694,6 +694,31 @@ pub(crate) async fn restored_recovery_turn_request_from_snapshot(
         .await?
         .context("native dispatch execution owner unavailable")?
         .owner_generation;
+    let cancellation_runtime_generation = store
+        .native_cancellation_context(&snapshot.turn_id)
+        .await?
+        .map(|context| -> Result<u64> {
+            anyhow::ensure!(
+                context.preparation.workspace_id == snapshot.workspace_id
+                    && context.preparation.thread_id == snapshot.thread_id
+                    && context.preparation.turn_id == snapshot.turn_id
+                    && context.accepted_event_id.is_none(),
+                "native cancellation scope is unavailable for restore"
+            );
+            Ok(context.preparation.runtime_generation)
+        })
+        .transpose()?;
+    if let Some(phase) = snapshot.initial_phase_json.as_deref()
+        && pioneer_agent::NativeInitialPreparation::completed_for_resume(
+            phase,
+            pioneer_protocol::TURN_EXECUTION_REQUEST_MAX_BYTES,
+        )?
+    {
+        anyhow::ensure!(
+            cancellation_runtime_generation.is_some(),
+            "completed native initial phase has no immutable cancellation context"
+        );
+    }
     let azure_connection = if pioneer_provider::provider_definition(&snapshot.provider_name)
         .is_some_and(|definition| definition.name == "azure-openai")
     {
@@ -836,7 +861,8 @@ pub(crate) async fn restored_recovery_turn_request_from_snapshot(
                     .checked_add(snapshot.initial_phase_json.as_ref().map_or(0, String::len))
                     .context("native initial phase byte budget invalid")?,
             )?
-            .with_execution_owner_generation(execution_owner_generation),
+            .with_execution_owner_generation(execution_owner_generation)
+            .with_cancellation_runtime_generation(cancellation_runtime_generation),
         ),
         reasoning: snapshot
             .reasoning_effort

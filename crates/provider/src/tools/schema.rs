@@ -60,11 +60,11 @@ pub(super) fn validate(provider: &str, schema: &Value) -> anyhow::Result<usize> 
     if schema.get("type").is_some_and(|v| v != "object") {
         return Err(rejected());
     }
-    validate_node(provider, schema, true)?;
+    validate_node(provider, schema, true, schema)?;
     Ok(counter.0)
 }
 
-fn validate_node(provider: &str, node: &Value, root: bool) -> anyhow::Result<()> {
+fn validate_node(provider: &str, node: &Value, root: bool, document: &Value) -> anyhow::Result<()> {
     let object = node.as_object().ok_or_else(rejected)?;
     for (key, value) in object {
         // Controlled v1 function JSON profile: standard bounds also present on
@@ -142,10 +142,36 @@ fn validate_node(provider: &str, node: &Value, root: bool) -> anyhow::Result<()>
                     return Err(rejected());
                 }
             }
-            "properties" => {
+            "$ref" => {
+                let reference = value
+                    .as_str()
+                    .filter(|s| s.len() <= 512 && !s.contains('%'))
+                    .ok_or_else(rejected)?;
+                let local = reference.strip_prefix('#').ok_or_else(rejected)?;
+                let definition = local
+                    .strip_prefix("/$defs/")
+                    .or_else(|| local.strip_prefix("/definitions/"));
+                if !(local.is_empty()
+                    || definition.is_some_and(|name| !name.is_empty() && !name.contains('/')))
+                    || !document.pointer(local).is_some_and(Value::is_object)
+                {
+                    return Err(rejected());
+                }
+                // Definitions are validated once in their physical tree. Never
+                // expand refs: a recursive TaskValue must retain its semantics.
+            }
+            "properties" | "$defs" | "definitions" => {
                 let properties = value.as_object().ok_or_else(rejected)?;
+                if key != "properties"
+                    && (properties.len() > 256
+                        || properties
+                            .keys()
+                            .any(|name| name.is_empty() || name.len() > 256))
+                {
+                    return Err(rejected());
+                }
                 for property in properties.values() {
-                    validate_node(provider, property, false)?;
+                    validate_node(provider, property, false, document)?;
                 }
             }
             "required" => {
@@ -160,21 +186,21 @@ fn validate_node(provider: &str, node: &Value, root: bool) -> anyhow::Result<()>
             }
             "additionalProperties" => {
                 if !value.is_boolean() {
-                    validate_node(provider, value, false)?;
+                    validate_node(provider, value, false, document)?;
                 }
             }
-            "items" => validate_node(provider, value, false)?,
+            "items" => validate_node(provider, value, false, document)?,
             "anyOf" | "oneOf" | "allOf" => {
                 let entries = value
                     .as_array()
                     .filter(|a| !a.is_empty())
                     .ok_or_else(rejected)?;
                 for entry in entries {
-                    validate_node(provider, entry, false)?;
+                    validate_node(provider, entry, false, document)?;
                 }
             }
             "not" | "if" | "then" | "else" => {
-                validate_node(provider, value, false)?;
+                validate_node(provider, value, false, document)?;
             }
             "minimum" | "maximum" | "exclusiveMinimum" | "exclusiveMaximum" | "multipleOf" => {
                 if !value.is_number()
@@ -194,7 +220,7 @@ fn validate_node(provider: &str, node: &Value, root: bool) -> anyhow::Result<()>
                     return Err(rejected());
                 }
             }
-            // Includes all reference vocabularies and extensions. Never silently
+            // Includes external reference vocabularies and extensions. Never silently
             // discard an unsupported nested constraint or treat it as Supported.
             _ => return Err(rejected()),
         }
@@ -239,6 +265,27 @@ mod tests {
         assert!(validate("anthropic", &conditional).is_ok());
         assert!(validate("gemini", &conditional).is_err());
     }
+    #[test]
+    fn recursive_local_references_are_bounded_and_bound_to_schema_definitions() {
+        let schema = json!({"type":"object","properties":{"value":{"$ref":"#/$defs/Node"}},
+            "$defs":{"Node":{"type":"object","properties":{"next":{"anyOf":[{"$ref":"#/$defs/Node"},{"type":"null"}]}},"additionalProperties":false}}});
+        assert!(validate("openai", &schema).is_ok());
+        assert!(validate("gemini", &schema).is_err());
+        for reference in [
+            "https://invalid.example/schema",
+            "#/$defs/missing",
+            "#/$defs/Node/properties",
+            "#/%24defs/Node",
+        ] {
+            let mut invalid = schema.clone();
+            invalid["properties"]["value"]["$ref"] = json!(reference);
+            assert!(validate("openai", &invalid).is_err());
+        }
+        let mut unknown = schema;
+        unknown["$defs"]["Node"]["unknownConstraint"] = json!(true);
+        assert!(validate("openai", &unknown).is_err());
+    }
+
     #[test]
     fn schema_depth_cardinality_and_utf8_byte_limits_are_real() {
         let mut nested = json!({"type":"string"});

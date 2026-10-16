@@ -14422,6 +14422,25 @@ async fn followup_history_rejects_unavailable_accepted_artifact_before_provider(
         .expect("blocked artifact follow-up should remain queryable")
         .expect("blocked artifact follow-up should be persisted")
         .1;
+    if second_status != TurnStatus::Blocked {
+        eprintln!(
+            "missing historical artifact diagnostic: actor={:?}; owner={:?}; cancellation_generation={:?}",
+            processor
+                .agent_manager
+                .observe_turn(&thread.thread.id, second_turn_id)
+                .await,
+            processor
+                .crud_store
+                .get_turn_execution(second_turn_id)
+                .await,
+            processor
+                .crud_store
+                .native_cancellation_context(second_turn_id)
+                .await
+                .unwrap()
+                .map(|c| c.preparation.runtime_generation)
+        );
+    }
     assert_eq!(
         second_status,
         TurnStatus::Blocked,
@@ -23268,6 +23287,15 @@ async fn recovered_hidden_task_run_uses_preflight_before_restored_child_main_pro
         test_tool_loop_config(),
     ));
     recovery_processor.bind_task_bridge().await;
+    // A fresh facade's local service revision is not the original durable
+    // cancellation generation. Continuing the Turn must preserve the latter.
+    for _ in 0..32 {
+        recovery_processor
+            .agent_manager
+            .set_memory_provider(None)
+            .await;
+    }
+
     recovery_processor
         .task_runtime
         .start()
@@ -23305,6 +23333,24 @@ async fn recovered_hidden_task_run_uses_preflight_before_restored_child_main_pro
         .load_execution_for_run(run.id.as_str())
         .await
         .expect("diagnostic execution lookup should succeed");
+    if recovered_task_status != TaskStatus::Completed {
+        eprintln!(
+            "cold child restore diagnostic: actor={:?}; window={:?}; owner={:?}; cancellation_generation={:?}",
+            recovery_processor
+                .agent_manager
+                .observe_turn(&lineage.child_thread_id, &lineage.child_turn_id)
+                .await,
+            crud_store
+                .latest_turn_execution_window(&lineage.child_turn_id)
+                .await,
+            crud_store.get_turn_execution(&lineage.child_turn_id).await,
+            crud_store
+                .native_cancellation_context(&lineage.child_turn_id)
+                .await
+                .unwrap()
+                .map(|c| c.preparation.runtime_generation)
+        );
+    }
     assert_eq!(
         recovered_task_status,
         pioneer_protocol::TaskStatus::Completed,
@@ -66125,8 +66171,8 @@ async fn tool_retry_notification_is_persisted_for_history_replay_before_live() {
     let provider = Arc::new(SequencedToolProvider::new(
         vec![ProviderToolCall {
             id: "call_tool_retry_gateway".to_owned(),
-            name: "missing_gateway_tool".to_owned(),
-            arguments: "{}".to_owned(),
+            name: "exec_command".to_owned(),
+            arguments: json!({"command":["/pioneer-fixture-command-that-does-not-exist"], "workdir":std::env::temp_dir().display().to_string(), "timeout_ms":1000, "max_output_tokens":1000, "tty":false}).to_string(),
         }],
         "done after retry event",
     ));
@@ -66170,7 +66216,7 @@ async fn tool_retry_notification_is_persisted_for_history_replay_before_live() {
             "input": [
                 {
                     "type": "text",
-                    "text": "trigger a missing tool"
+                    "text": "run the admitted command and recover its execution failure"
                 }
             ]
         }
@@ -66198,7 +66244,7 @@ async fn tool_retry_notification_is_persisted_for_history_replay_before_live() {
             .expect("tool retry scheduled params should exist"),
     )
     .expect("tool retry scheduled notification should decode");
-    assert_eq!(scheduled.tool_name, "missing_gateway_tool");
+    assert_eq!(scheduled.tool_name, "exec_command");
 
     let history = crud_store
         .get_thread_history("thr_000000000000000199", Some(32))
@@ -66211,7 +66257,7 @@ async fn tool_retry_notification_is_persisted_for_history_replay_before_live() {
             tool_name,
             tool_retry_episode_id,
             ..
-        } if tool_name == "missing_gateway_tool"
+        } if tool_name == "exec_command"
             && tool_retry_episode_id == &scheduled.tool_retry_episode_id
     )));
 

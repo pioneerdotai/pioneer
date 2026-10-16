@@ -32,7 +32,7 @@ use pioneer_tools::{
     ToolRecoveryMetadata, ToolRetryClass, ToolSpec, dynamic_unknown_output_policy,
     normalize_tool_arguments_from_schema,
 };
-use schemars::{JsonSchema, schema_for};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
 use sha2::{Digest, Sha256};
@@ -4259,7 +4259,15 @@ fn tool_input_schema<T>() -> JsonValue
 where
     T: JsonSchema,
 {
-    let mut schema = serde_json::to_value(schema_for!(T)).expect("tool schema should serialize");
+    // Keep recursive TaskValue references and every input constraint. Convert
+    // schema booleans to equivalent objects for the native function surface.
+    let mut objects = schemars::transform::ReplaceBoolSchemas::default();
+    objects.skip_additional_properties = true;
+    let generated = schemars::generate::SchemaSettings::default()
+        .with(|settings| settings.transforms.push(Box::new(objects)))
+        .into_generator()
+        .into_root_schema_for::<T>();
+    let mut schema = serde_json::to_value(generated).expect("tool schema should serialize");
     if let Some(object) = schema.as_object_mut() {
         object.remove("$schema");
     }
@@ -5928,6 +5936,54 @@ mod tests {
     use super::*;
     use sea_orm::ConnectionTrait;
     use std::path::PathBuf;
+
+    #[tokio::test]
+    async fn task_catalog_crosses_the_real_native_wire_gate_with_nested_constraints() {
+        use pioneer_provider::{ChatMessage, ChatRequest, ToolDefinition};
+        let registry = pioneer_provider::ProviderRegistry::with_provider(
+            "echo",
+            Arc::new(pioneer_provider::providers::EchoProvider::new()),
+        );
+        let provider = registry
+            .get_or_create_for_workspace("task-schema-workspace", "echo")
+            .unwrap();
+        let request = ChatRequest {
+            model: "test-model".into(),
+            messages: vec![ChatMessage::user("schema admission")],
+            temperature: None,
+            max_tokens: Some(32),
+            tools: Some(
+                task_tool_specs()
+                    .into_iter()
+                    .map(|configured| ToolDefinition {
+                        name: configured.spec.name,
+                        description: configured.spec.description,
+                        parameters: configured.spec.parameters,
+                    })
+                    .collect(),
+            ),
+            tool_choice: None,
+            parallel_tool_calls: None,
+            reasoning: None,
+            compiled_prompt: None,
+        };
+        let response = provider
+            .chat(request)
+            .await
+            .expect("every current Task schema must cross the native manifest gate");
+        assert_eq!(response.text, "schema admission");
+        assert!(decode_tool_args::<TaskCreateToolInput>(task_tool_invocation(TASK_CREATE_TOOL,
+            json!({"title":"scheduled", "goal":"Check changes", "trigger":{"kind":"cron","cronExpr":"0 5 * * *","timezone":"UTC"}}))).is_ok());
+        assert!(decode_tool_args::<TaskCreateToolInput>(task_tool_invocation(TASK_CREATE_TOOL,
+            json!({"title":"scheduled", "goal":"Check changes", "trigger":{"kind":"not-a-trigger"}}))).is_err());
+        assert!(
+            decode_tool_args::<TaskCreateToolInput>(task_tool_invocation(
+                TASK_CREATE_TOOL,
+                json!({"title":"scheduled", "goal":"Check changes", "unexpectedPrivilege":true})
+            ))
+            .is_err()
+        );
+    }
 
     #[test]
     fn attached_task_launch_keeps_exact_inherited_capabilities_across_nested_launches() {

@@ -5506,6 +5506,10 @@ async fn execute_agent_provider_response(
     message_item_id: &str,
     event_tx: Arc<AgentEventHub>,
 ) -> Result<ChatTurnOutcome, ChatTurnError> {
+    let runtime_generation = initial_preparation
+        .as_ref()
+        .and_then(crate::NativeInitialPreparation::cancellation_runtime_generation)
+        .unwrap_or(runtime_generation);
     let mut window_stats = ChatExecutionWindowStats::new(execution_window_index);
     window_stats.started_at_unix_ms = preparation_started_at_unix_ms;
     emit_execution_window_started(

@@ -4950,7 +4950,9 @@ impl MessageProcessor {
                         .await
                 }
                 .await;
-                if commit.is_err() {
+                if let Err(_error) = &commit {
+                    #[cfg(test)]
+                    eprintln!("native semantic checkpoint fixture rejection: {_error:#}");
                     warn!("native semantic checkpoint commit rejected");
                 }
                 commit.is_ok()
@@ -5057,6 +5059,8 @@ impl MessageProcessor {
                             error = %format!("{error:#}"),
                             "failed to persist native terminal-effect preparation"
                         );
+                        #[cfg(test)]
+                        eprintln!("native terminal-effect fixture rejection: {error:#}");
                         return false;
                     }
                     true
