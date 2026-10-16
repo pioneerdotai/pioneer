@@ -61,6 +61,7 @@
             }
           },
           "unread": [],
+          "unread_by_folder_id": {},
           "workspace_id": "a"
         },
         "actions": {}
@@ -123,6 +124,7 @@
             }
           },
           "unread": [],
+          "unread_by_folder_id": {},
           "workspace_id": "b"
         },
         "actions": {}
@@ -187,6 +189,7 @@
             }
           },
           "unread": [],
+          "unread_by_folder_id": {},
           "workspace_id": "a"
         },
         "actions": {}
@@ -249,6 +252,7 @@
             }
           },
           "unread": [],
+          "unread_by_folder_id": {},
           "workspace_id": "b"
         },
         "actions": {}
