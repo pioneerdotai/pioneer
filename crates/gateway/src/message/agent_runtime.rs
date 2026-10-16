@@ -9068,9 +9068,56 @@ impl MessageProcessor {
             }
         }
 
+        // Validate artifacts while this Turn still owns an active native fence.
+        // An exact committed retry is checked by the finalization transaction.
+        let (workspace_id, already_completed) = match self
+            .crud_store
+            .get_turn(&thread_id, &turn_id)
+            .await
+        {
+            Ok(Some((workspace, turn))) => (workspace, turn.status == TurnStatus::Completed),
+            Ok(None) => return false,
+            Err(error) => {
+                warn!(thread_id, turn_id, error = %error, "failed to load native finalization target");
+                return false;
+            }
+        };
+        if !already_completed {
+            let candidate = match self
+                .crud_store
+                .turn_finalization_notification(&turn_id)
+                .await
+            {
+                Ok(Some(candidate))
+                    if candidate.thread_id == thread_id && candidate.turn_id == turn_id =>
+                {
+                    candidate
+                }
+                Ok(_) => return false,
+                Err(error) => {
+                    warn!(thread_id, turn_id, error = %error, "native finalization candidate unavailable");
+                    return false;
+                }
+            };
+            if candidate.workspace_id != workspace_id {
+                return false;
+            }
+            self.record_final_assistant_text_for_item(&candidate).await;
+            if self
+                .artifact_finalization_blocks_completion(&thread_id, &turn_id)
+                .await
+            {
+                return false;
+            }
+        }
+        let terminal_actor_generation = self
+            .agent_manager
+            .turn_owner_generation(&thread_id, &turn_id)
+            .await;
+        let event_timestamp = now_timestamp_secs();
         let committed = match self
             .crud_store
-            .commit_prepared_turn_finalization(turn_id.as_str(), now_timestamp_secs())
+            .commit_prepared_turn_finalization(turn_id.as_str(), event_timestamp)
             .await
         {
             Ok(TurnFinalizationCommitOutcome::Committed(committed)) => committed,
@@ -9111,12 +9158,30 @@ impl MessageProcessor {
         }
         self.record_final_assistant_text_for_item(&committed.final_item)
             .await;
-        self.kick_native_turn_event_deliveries();
 
-        // Reuse terminal cleanup/recovery/task reconciliation. Its canonical
-        // TurnCompleted write is now an exact idempotent replay of the already
-        // committed terminal half of the finalization transaction.
-        self.complete_turn(thread_id, turn_id, recovery).await
+        // The atomic result owns the exact terminal payload. Re-running the
+        // pre-commit gate or reconstructing another terminal notification here
+        // can reject an already successful Turn and strand its Task aggregate.
+        if let Err(error) = self
+            .thread_manager
+            .commit_terminal_turn(&thread_id, &committed.turn_completed.turn)
+            .await
+        {
+            warn!(thread_id, turn_id, error = %error, "failed to synchronize committed native Turn");
+            return false;
+        }
+        self.kick_native_turn_event_deliveries();
+        self.retire_execution_progress_state(&turn_id).await;
+        self.finalize_agent_execution_for_turn(&committed.turn_completed.turn, "completed")
+            .await;
+        self.reconcile_completed_turn(
+            thread_id,
+            turn_id,
+            recovery,
+            event_timestamp,
+            terminal_actor_generation,
+        )
+        .await
     }
 
     pub(super) async fn mark_turn_blocked(

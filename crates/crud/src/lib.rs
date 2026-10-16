@@ -15646,6 +15646,19 @@ impl CrudStore {
         .await
     }
 
+    /// Exact immutable candidate already accepted by the finalization owner.
+    /// Decode only after the bounded repository read releases DB capacity.
+    pub async fn turn_finalization_notification(
+        &self,
+        turn_id: &str,
+    ) -> Result<Option<pioneer_protocol::ItemCompletedNotification>> {
+        turn_finalization::find_by_turn_id(&self.connection, turn_id)
+            .await?
+            .as_ref()
+            .map(turn_finalization::notification_from_model)
+            .transpose()
+    }
+
     /// Returns whether this Turn participates in the atomic execution-success
     /// finalization protocol. Native providers and CLI runtimes prepare an
     /// intent before publishing success; only older workers retain the legacy
@@ -37972,6 +37985,21 @@ mod tests {
         // A fresh store models a process restart after the provider response
         // was acknowledged but before TurnCompleted was emitted.
         let restarted = CrudStore::new(store.database_connection());
+        assert_eq!(
+            restarted
+                .turn_finalization_notification("turn_native_finalize")
+                .await
+                .unwrap(),
+            Some(final_notification.clone()),
+            "the pre-commit artifact gate must recover the exact accepted candidate after restart"
+        );
+        assert!(
+            restarted
+                .turn_finalization_notification("missing")
+                .await
+                .unwrap()
+                .is_none()
+        );
         let reconciliation = restarted
             .reconcile_prepared_turn_finalizations(10, 1_700_000_101)
             .await
