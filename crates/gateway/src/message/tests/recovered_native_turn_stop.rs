@@ -1506,15 +1506,32 @@ async fn exercise(kind: TurnExecutorKind, scenario: Scenario, delivery_before_ro
                 })
                 .await
         );
-        assert!(
-            processor
-                .handle_durable_agent_event(AgentDurableEvent::TurnCompleted {
+        // Commit an actual fenced canonical completion while the restored
+        // actor is still awaiting its pre-start acknowledgement. A bare legacy
+        // TurnCompleted event cannot prove a completion of a loaded Blocked turn.
+        let mut completed = saved.clone();
+        completed.status = TurnStatus::Completed;
+        store
+            .with_critical_writes()
+            .accept_native_turn_event_without_projection_for_test(
+                pioneer_crud::CanonicalTurnEventPayload::TurnCompleted(TurnCompletedNotification {
+                    workspace_id: workspace.clone(),
                     thread_id: thread.into(),
-                    turn_id: turn.into(),
-                    recovery: None
-                })
-                .await
-        );
+                    turn: completed,
+                }),
+                now_timestamp_secs(),
+                processor.turn_execution_owner_id.as_ref(),
+            )
+            .await
+            .unwrap();
+        let projection = store
+            .with_maintenance_access()
+            .replay_due_turn_event_projections(now_timestamp_secs(), 64)
+            .await
+            .unwrap();
+        assert_eq!(projection.projected, 1);
+        assert_eq!(projection.failed, 0);
+        assert!(store.native_turn_has_accepted_terminal(turn).await.unwrap());
     }
     processor.release_completed_history_preparation_barrier();
     if matches!(
