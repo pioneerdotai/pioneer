@@ -56358,10 +56358,12 @@ async fn close_paused_native_fixture_window(processor: &MessageProcessor, turn: 
         .summarize_execution_window_provider_usage(turn, window.window_index)
         .await
         .unwrap();
-    payload.window.agent_round_count = payload.window.agent_round_count.max(rounds);
+    payload.window.agent_round_count = std::cmp::max(payload.window.agent_round_count, rounds);
     payload.provider_budget.agent_round_count = payload.window.agent_round_count;
-    payload.window.provider_token_count =
-        Some(payload.window.provider_token_count.unwrap_or(0).max(tokens));
+    payload.window.provider_token_count = Some(std::cmp::max(
+        payload.window.provider_token_count.unwrap_or(0),
+        tokens,
+    ));
     payload.provider_budget.provider_token_count = payload.window.provider_token_count;
     payload.provider_budget.provider_usage_available = available;
     payload.native_event_frontier = None;
