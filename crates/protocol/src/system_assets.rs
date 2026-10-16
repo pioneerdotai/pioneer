@@ -8,12 +8,16 @@ pub const PIONEER_AGENT_AVATAR_REVISION: &str =
 
 /// SHA-256 revision of the canonical Codex CLI Agent avatar served by Gateway.
 pub const CODEX_AGENT_AVATAR_REVISION: &str =
-    "e43667b51ae7671a502ee4265e59e90ae2878558b3502521331500192a7807b8";
+    "02112fc2b69eaccf74ee92f614450f9f82ca7f7d38326660f56748e410080dea";
 
 /// SHA-256 revision of the canonical Claude CLI Agent avatar served by Gateway.
 pub const CLAUDE_AGENT_AVATAR_REVISION: &str =
     "84646b62063741db93e9f1bd8fd80520f8439d41a3e2e8c6a08b83469f8f16ff";
 
-/// SHA-256 revision of the canonical OpenCode CLI Agent avatar served by Gateway.
-pub const OPENCODE_AGENT_AVATAR_REVISION: &str =
-    "0628d0293245bf3611ddfc2cd3900b2c9d9ebb1cbfb36d22a26a59fd86b8072a";
+/// SHA-256 revision of the OpenCode avatar for a light appearance.
+pub const OPENCODE_AGENT_AVATAR_LIGHT_REVISION: &str =
+    "bffac789518813b5862f9d0f4c239c4fdb6dd8c4027911a1d9e0c82211aa06a1";
+
+/// SHA-256 revision of the OpenCode avatar for a dark appearance.
+pub const OPENCODE_AGENT_AVATAR_DARK_REVISION: &str =
+    "6fbba60dcebe87c2e0f6ff0e3634fdb918c892e9c989f0d72cff6bb806f3ef4b";

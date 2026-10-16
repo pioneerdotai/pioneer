@@ -30408,13 +30408,9 @@ async fn detached_composer_work_runs_natively_in_codex_and_claude_and_delivers_i
             "foreground CLI presentation must identify the actual runtime executor, not generic Agent"
         );
         assert_eq!(
-            manual_author.and_then(|author| author.avatar_revision.as_deref()),
-            Some(match runtime_kind {
-                CLIAgentRuntimeKind::Codex => pioneer_protocol::CODEX_AGENT_AVATAR_REVISION,
-                CLIAgentRuntimeKind::Claude => pioneer_protocol::CLAUDE_AGENT_AVATAR_REVISION,
-                CLIAgentRuntimeKind::OpenCode => pioneer_protocol::OPENCODE_AGENT_AVATAR_REVISION,
-            }),
-            "timeline projection must carry the explicit runtime-executor discriminator consumed by desktop"
+            manual_author.and_then(|author| author.cli_runtime_kind),
+            Some(runtime_kind),
+            "timeline projection must carry provider identity independently of artwork"
         );
         let before_delivery = processor
             .task_runtime
@@ -54584,6 +54580,7 @@ async fn materialize_cli_runtime_turn_with_execution(
             execution_principal.principal_id.clone(),
         );
         turn.author = Some(pioneer_protocol::TurnAuthorSnapshot {
+            cli_runtime_kind: None,
             actor: actor.clone(),
             display_name: "Superuser".into(),
             nickname: "superuser".into(),

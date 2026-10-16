@@ -1021,6 +1021,7 @@ mod publication_tests {
                             attachments: vec![],
                             mode: ThreadMode::Message,
                             author: Some(TurnAuthorSnapshot {
+                                cli_runtime_kind: None,
                                 actor: PersistedActorRef::Principal(
                                     PrincipalId::new("PAAAAAAAAAAAAAAAAAAAA").unwrap(),
                                 ),

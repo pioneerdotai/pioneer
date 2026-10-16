@@ -3796,6 +3796,15 @@ impl MessageProcessor {
             }
 
             let (max_tools, max_total_schema_bytes) = self.mcp_service.projection_limit_values();
+            let mut projection_limits = crate::turn_mcp::McpProjectionLimits {
+                max_tools,
+                max_total_schema_bytes,
+                ..crate::turn_mcp::McpProjectionLimits::default()
+            };
+            if runtime_kind == CLIAgentRuntimeKind::OpenCode {
+                projection_limits =
+                    crate::cli_runtime::opencode_mcp::projection_limits(projection_limits);
+            }
             let mcp_projection = match scope_current_stage(
                 Stage::CliMcpResolve,
                 self.mcp_service.resolve_mcp_turn_projection(
@@ -3811,11 +3820,7 @@ impl MessageProcessor {
             {
                 Ok(projection) => Some(
                     projection
-                        .with_html_tools(crate::turn_mcp::McpProjectionLimits {
-                            max_tools,
-                            max_total_schema_bytes,
-                            ..crate::turn_mcp::McpProjectionLimits::default()
-                        })
+                        .with_html_tools(projection_limits)
                         .map_err(|error| TurnStartFailure::internal(error.to_string()))?,
                 ),
                 Err(error) => {

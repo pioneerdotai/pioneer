@@ -469,7 +469,8 @@ impl OpenCodeApiClient {
     ) -> Result<JsonValue> {
         let command = vec![
             helper_path.to_string_lossy().into_owned(),
-            "__cli-mcp-stdio".to_owned(),
+            pioneer_cli_mcp_bridge::helper::HIDDEN_HELPER_COMMAND.to_owned(),
+            pioneer_cli_mcp_bridge::helper::BOOTSTRAP_FILE_FLAG.to_owned(),
             bootstrap_path.to_string_lossy().into_owned(),
         ];
         self.json(
@@ -1673,19 +1674,28 @@ async fn map_opencode_event(
                 })]
             }
         }
-        _ => vec![RuntimeEvent::Raw(RuntimeRawEvent {
-            native_method: event_type,
-            reason: "OpenCode event has no canonical projection".to_owned(),
-            native_thread_id: state.native_thread_id.clone(),
-            native_turn_id: state.active_turn_id.clone(),
-            native_item_id: properties
-                .get("part")
-                .and_then(|part| part.get("id"))
-                .and_then(JsonValue::as_str)
-                .map(str::to_owned),
-            payload_redacted: Some(redact_opencode_json(&properties)),
-            raw_redacted: include_native.then(|| redact_opencode_json(&raw)),
-        })],
+        _ => {
+            // Catalog/plugin events are global server activity. Only native
+            // session evidence can attribute an unknown event to this turn.
+            let native_thread_id = session_id_from_properties(&properties);
+            let native_turn_id = native_thread_id
+                .as_deref()
+                .filter(|session| state.native_thread_id.as_deref() == Some(*session))
+                .and_then(|_| state.active_turn_id.clone());
+            vec![RuntimeEvent::Raw(RuntimeRawEvent {
+                native_method: event_type,
+                reason: "OpenCode event has no canonical projection".to_owned(),
+                native_thread_id,
+                native_turn_id,
+                native_item_id: properties
+                    .get("part")
+                    .and_then(|part| part.get("id"))
+                    .and_then(JsonValue::as_str)
+                    .map(str::to_owned),
+                payload_redacted: Some(redact_opencode_json(&properties)),
+                raw_redacted: include_native.then(|| redact_opencode_json(&raw)),
+            })]
+        }
     }
 }
 

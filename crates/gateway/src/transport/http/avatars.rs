@@ -6,8 +6,9 @@ use axum::http::header::{CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE, ETAG, IF_N
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::response::Response;
 use pioneer_protocol::{
-    CLAUDE_AGENT_AVATAR_REVISION, CODEX_AGENT_AVATAR_REVISION, OPENCODE_AGENT_AVATAR_REVISION,
-    PIONEER_AGENT_AVATAR_REVISION, PrincipalId, ProfileAvatarMediaType, RequestId,
+    CLAUDE_AGENT_AVATAR_REVISION, CODEX_AGENT_AVATAR_REVISION, OPENCODE_AGENT_AVATAR_DARK_REVISION,
+    OPENCODE_AGENT_AVATAR_LIGHT_REVISION, PIONEER_AGENT_AVATAR_REVISION, PrincipalId,
+    ProfileAvatarMediaType, RequestId,
 };
 use serde::Deserialize;
 
@@ -22,7 +23,10 @@ const AVATAR_CACHE_CONTROL: &str = "private, max-age=31536000, immutable";
 const PIONEER_AGENT_AVATAR_BYTES: &[u8] = include_bytes!("../../../assets/pioneer-avatar.png");
 const CODEX_AGENT_AVATAR_BYTES: &[u8] = include_bytes!("../../../assets/codex-avatar.png");
 const CLAUDE_AGENT_AVATAR_BYTES: &[u8] = include_bytes!("../../../assets/claude-avatar.png");
-const OPENCODE_AGENT_AVATAR_BYTES: &[u8] = include_bytes!("../../../assets/opencode-avatar.png");
+const OPENCODE_AGENT_AVATAR_LIGHT_BYTES: &[u8] =
+    include_bytes!("../../../assets/opencode-avatar-light.png");
+const OPENCODE_AGENT_AVATAR_DARK_BYTES: &[u8] =
+    include_bytes!("../../../assets/opencode-avatar-dark.png");
 const REQUEST_ID_HEADER: HeaderName = HeaderName::from_static("pioneer-request-id");
 const X_CONTENT_TYPE_OPTIONS: HeaderName = HeaderName::from_static("x-content-type-options");
 
@@ -91,7 +95,8 @@ pub(super) async fn agent_avatar_route(
         PIONEER_AGENT_AVATAR_REVISION => PIONEER_AGENT_AVATAR_BYTES,
         CODEX_AGENT_AVATAR_REVISION => CODEX_AGENT_AVATAR_BYTES,
         CLAUDE_AGENT_AVATAR_REVISION => CLAUDE_AGENT_AVATAR_BYTES,
-        OPENCODE_AGENT_AVATAR_REVISION => OPENCODE_AGENT_AVATAR_BYTES,
+        OPENCODE_AGENT_AVATAR_LIGHT_REVISION => OPENCODE_AGENT_AVATAR_LIGHT_BYTES,
+        OPENCODE_AGENT_AVATAR_DARK_REVISION => OPENCODE_AGENT_AVATAR_DARK_BYTES,
         _ => {
             record_avatar_hidden(&request_id, "invalid_revision");
             return Err(HttpError::not_found(request_id));
@@ -334,7 +339,14 @@ mod tests {
             (PIONEER_AGENT_AVATAR_BYTES, PIONEER_AGENT_AVATAR_REVISION),
             (CODEX_AGENT_AVATAR_BYTES, CODEX_AGENT_AVATAR_REVISION),
             (CLAUDE_AGENT_AVATAR_BYTES, CLAUDE_AGENT_AVATAR_REVISION),
-            (OPENCODE_AGENT_AVATAR_BYTES, OPENCODE_AGENT_AVATAR_REVISION),
+            (
+                OPENCODE_AGENT_AVATAR_LIGHT_BYTES,
+                OPENCODE_AGENT_AVATAR_LIGHT_REVISION,
+            ),
+            (
+                OPENCODE_AGENT_AVATAR_DARK_BYTES,
+                OPENCODE_AGENT_AVATAR_DARK_REVISION,
+            ),
         ] {
             assert_eq!(hex::encode(Sha256::digest(bytes)), revision);
             assert!(bytes.starts_with(b"\x89PNG\r\n\x1a\n"));

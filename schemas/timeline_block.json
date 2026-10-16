@@ -425,6 +425,14 @@
         "end"
       ]
     },
+    "CLIAgentRuntimeKind": {
+      "type": "string",
+      "enum": [
+        "codex",
+        "claude",
+        "opencode"
+      ]
+    },
     "CLIRuntimePendingRequest": {
       "type": "object",
       "properties": {
@@ -1489,6 +1497,17 @@
           "type": [
             "string",
             "null"
+          ]
+        },
+        "cli_runtime_kind": {
+          "description": "CLI provider identity projected from persisted execution bindings, independent of artwork.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CLIAgentRuntimeKind"
+            },
+            {
+              "type": "null"
+            }
           ]
         },
         "display_name": {

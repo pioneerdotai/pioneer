@@ -63,6 +63,11 @@ pub(crate) async fn restore_cli_mcp_session_launch(
     runtime_kind: CLIAgentRuntimeKind,
     limits: McpProjectionLimits,
 ) -> std::result::Result<CliMcpSessionLaunch, CliMcpSessionLaunchRestoreError> {
+    let limits = if runtime_kind == CLIAgentRuntimeKind::OpenCode {
+        crate::cli_runtime::opencode_mcp::projection_limits(limits)
+    } else {
+        limits
+    };
     let projection_record = crud_store
         .get_turn_mcp_projection(turn_binding.turn_id.as_str())
         .await

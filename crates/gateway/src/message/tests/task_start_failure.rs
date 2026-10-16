@@ -682,6 +682,7 @@ fn real_internal_completion_keeps_type_ownership_and_durable_agent_contract() {
             .await;
         let (sender, receiver) = tokio::sync::oneshot::channel();
         let author = pioneer_protocol::TurnAuthorSnapshot {
+            cli_runtime_kind: None,
             actor: pioneer_protocol::PersistedActorRef::System,
             display_name: "System".to_owned(),
             nickname: "system".to_owned(),

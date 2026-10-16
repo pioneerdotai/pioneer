@@ -5,7 +5,7 @@ use crate::cli_runtime::mcp::facade::{
     CliMcpFacadeBuildError, CliMcpFacadeProjection, CliMcpFacadeTool,
 };
 use crate::cli_runtime::mcp::limits::CliMcpFacadeProjectionLimits;
-use crate::turn_mcp::projection::ResolvedMcpTurnProjection;
+use crate::turn_mcp::projection::{McpProjectionLimits, ResolvedMcpTurnProjection};
 use pioneer_cli_agent_runtime::codex_attestation::sha256_json;
 use pioneer_cli_agent_runtime::event::RuntimeEvent;
 use serde_json::{Value as JsonValue, json};
@@ -14,6 +14,16 @@ use std::fmt;
 
 pub(crate) const OPENCODE_MCP_SERVER_NAME: &str = "pioneer";
 const OPENCODE_MCP_TOOL_PREFIX: &str = "pioneer_";
+
+pub(crate) fn projection_limits(mut limits: McpProjectionLimits) -> McpProjectionLimits {
+    // OpenCode adds the server prefix after the facade lists its tools. Reserve
+    // those bytes in the shared, collision-safe canonical name allocator.
+    let qualified_name_limit = McpProjectionLimits::default().max_callable_name_bytes;
+    limits.max_callable_name_bytes = limits
+        .max_callable_name_bytes
+        .min(qualified_name_limit.saturating_sub(OPENCODE_MCP_TOOL_PREFIX.len()));
+    limits
+}
 
 #[derive(Clone)]
 pub(crate) struct OpenCodeMcpSessionLaunchProjection {
@@ -208,8 +218,15 @@ pub(crate) fn build_opencode_mcp_session_launch_projection(
     if !is_sha256_hex(provider_contract_fingerprint.as_str()) {
         anyhow::bail!("invalid OpenCode executable/contract fingerprint");
     }
+    let max_callable_name_bytes =
+        projection_limits(McpProjectionLimits::default()).max_callable_name_bytes;
     let mut names = HashSet::with_capacity(projection.tools.len());
     for tool in &projection.tools {
+        anyhow::ensure!(
+            tool.canonical_callable_name.len() <= max_callable_name_bytes,
+            "OpenCode MCP callable name exceeds the qualified tool name limit: {}",
+            tool.canonical_callable_name
+        );
         if !names.insert(tool.canonical_callable_name.as_str()) {
             anyhow::bail!("duplicate OpenCode MCP callable name");
         }
