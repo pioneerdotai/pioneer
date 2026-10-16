@@ -608,6 +608,89 @@ async fn every_proven_terminal_projection_can_expire_unknown_or_mismatched_runne
     }
 }
 #[tokio::test]
+async fn pre_runner_failures_expire_through_existing_sweep_unless_counter_or_cli_root_holds() {
+    use pioneer_compaction::runner::{FailureKind, RunnerPhase};
+    for outcome in ["invalid_source_manifest", "deadline"] {
+        for retention in ["none", "attempt", "cli"] {
+            let store = fixture().await;
+            let h = header(&store, "origin", "ws", "thread", 1, 1).await;
+            // Cross the former 64-binding boundary in one existing positive
+            // case, without multiplying the outcome/retention matrix.
+            let bindings = if outcome == "deadline" && retention == "none" {
+                65
+            } else {
+                1
+            };
+            for i in 0..bindings {
+                let id = if i == 0 {
+                    "op".to_owned()
+                } else {
+                    format!("op-{i:02}")
+                };
+                operation(
+                    &store,
+                    &id,
+                    "failed",
+                    &h,
+                    RunnerPhase::Failed {
+                        kind: FailureKind::Deadline,
+                    },
+                )
+                .await;
+                // Model accumulated admission failures at worker startup.
+                sql(
+                    &store,
+                    "DELETE FROM compaction_runner_state WHERE operation_id=?1",
+                    vec![id.clone().into()],
+                )
+                .await;
+                sql(&store, "INSERT INTO compaction_runner_plan(operation_id,source_count,reference_count,descriptor,ready) VALUES(?1,1,0,'{}',0)", vec![id.clone().into()]).await;
+                sql(
+                    &store,
+                    "UPDATE compaction_operation SET outcome=?1,attempts=?2 WHERE id=?3",
+                    vec![
+                        outcome.into(),
+                        i64::from(retention == "attempt").into(),
+                        id.into(),
+                    ],
+                )
+                .await;
+            }
+            assert_eq!(n(&store, "SELECT count(*) AS n FROM compaction_operation_projection WHERE manifest_id=?1", "origin").await, bindings);
+            if retention == "cli" {
+                store
+                    .upsert_cli_runtime_thread_binding(binding(cursor(&h)))
+                    .await
+                    .unwrap();
+            }
+            let mut progress = FrozenStorageLifetimeProgress::default();
+            assert_eq!(drive(&store, &mut progress, 2500).await, 0);
+            let releases = retention == "none";
+            assert_eq!(
+                expired(&store, "origin").await,
+                i64::from(releases),
+                "{outcome}/{retention}"
+            );
+            assert_eq!(
+                physical(&store, "origin").await,
+                if releases { 0 } else { 2 },
+                "{outcome}/{retention}"
+            );
+            assert_eq!(
+                n(
+                    &store,
+                    "SELECT count(*) AS n FROM compaction_runner_state WHERE operation_id=?1",
+                    "op"
+                )
+                .await,
+                0
+            );
+            assert_eq!(n(&store,"SELECT count(*) AS n FROM compaction_operation_projection WHERE operation_id=?1 AND terminal_generation IS NULL","op").await,1);
+        }
+    }
+}
+
+#[tokio::test]
 async fn mutation_invalidates_derived_terminal_generation_before_resume_or_state_change() {
     use pioneer_compaction::runner::{FailureKind, RunnerPhase};
     let store = fixture().await;

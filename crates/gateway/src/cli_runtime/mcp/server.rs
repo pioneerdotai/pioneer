@@ -310,7 +310,8 @@ mod tests {
     use crate::cli_runtime::mcp::coordinator::CliMcpProjectionFingerprint;
     use crate::cli_runtime::mcp::facade::CliMcpFacadeTool;
     use crate::cli_runtime::mcp::grants::{
-        CliMcpConnectionId, CliMcpGrantError, CliMcpGrantScope, CliMcpManifestHash,
+        CliMcpConnectionId, CliMcpGrantError, CliMcpGrantRegistryState, CliMcpGrantScope,
+        CliMcpManifestHash,
     };
     use crate::cli_runtime::mcp::limits::CliMcpFacadeProjectionLimits;
     use crate::cli_runtime::session_instance::CliSessionInstanceId;
@@ -706,24 +707,22 @@ mod tests {
                 .is_err()
         );
 
-        let expired = coordinator
-            .issue_grant(exact_scope.clone(), expiry(1))
-            .await
-            .expect("grant");
-        tokio::time::sleep(Duration::from_millis(2)).await;
-        assert!(
-            coordinator
-                .attach(
-                    &AttachRequest {
-                        session_id: expired.bridge_session_id.clone(),
-                        generation: BridgeGeneration::new(1).expect("generation"),
-                        nonce: expired.nonce.clone(),
-                    },
-                    &exact_scope,
-                    CliMcpConnectionId::for_test(23),
-                )
-                .await
-                .is_err()
+        // The coordinator delegates expiry checks to this registry. Supply
+        // explicit times so a scheduler delay cannot expire the grant at issue.
+        let mut grants = CliMcpGrantRegistryState::default();
+        let expired = grants
+            .issue(exact_scope.clone(), 101, 100)
+            .expect("grant is valid when issued");
+        assert_eq!(
+            grants.attach(
+                &expired.bridge_session_id,
+                BridgeGeneration::new(1).expect("generation"),
+                &exact_scope,
+                &expired.nonce,
+                CliMcpConnectionId::for_test(23),
+                101,
+            ),
+            Err(CliMcpGrantError::Expired)
         );
 
         let facade_projection = projection();

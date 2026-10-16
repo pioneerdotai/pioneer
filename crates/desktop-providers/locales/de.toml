@@ -33,6 +33,8 @@ proxy_hint = "Optional workspace-scoped proxy for this provider."
 replace_hint = "Für %{provider} ist bereits ein Schlüssel konfiguriert. Beim Speichern wird er ersetzt."
 
 [providers.error]
+configure_failed = "Einstellungen für %{provider} konnten nicht gespeichert werden"
+disconnect_failed = "API-Schlüssel für %{provider} konnte nicht entfernt werden"
 gateway_not_connected = "Gateway ist nicht verbunden."
 workspace_not_selected = "Arbeitsbereich ist nicht ausgewählt."
 load_failed = "Anbieterkonfiguration konnte nicht geladen werden"
@@ -127,6 +129,12 @@ unsupported = "Unsupported"
 error = "Error"
 
 [providers.cli.error]
+settings_load_failed = "CLI-Anbietereinstellungen konnten nicht geladen werden"
+settings_forbidden = "Dieses Konto darf Gateway-Einstellungen nicht verwalten"
+login_failed = "Anmeldung für %{runtime} konnte nicht gestartet werden"
+proxy_failed = "Proxy für %{runtime} konnte nicht aktualisiert werden"
+save_failed = "Einstellungen für %{runtime} konnten nicht gespeichert werden"
+enabled_failed = "%{runtime} konnte nicht aktiviert oder deaktiviert werden"
 open_path_failed = "Open path failed"
 
 [providers.catalog.anthropic]

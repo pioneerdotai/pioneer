@@ -24,6 +24,13 @@ pub struct TimelineDemand {
     pub scroll_generation: u64,
     pub latest_user_turn_id: Option<String>,
     pub viewed_through_turn_id: Option<String>,
+    /// Actual viewability, separate from pagination/prefetch row demand.
+    #[serde(default)]
+    pub viewed_row_ids: Vec<String>,
+    // Resolved against the immutable canonical snapshot by ClientCore, never
+    // accepted from the shell's serialized demand.
+    #[serde(skip)]
+    pub viewed_through_block: Option<pioneer_protocol::ThreadReadPosition>,
     #[serde(default)]
     pub read_requires_unread: bool,
     pub prefetch_on_visibility: bool,
@@ -67,7 +74,29 @@ pub enum RetryState {
 pub struct TimelineReadRequest {
     pub thread_id: String,
     pub through_turn_id: String,
+    pub through_block: Option<pioneer_protocol::ThreadReadPosition>,
     pub generation: u64,
+}
+
+impl TimelineDemand {
+    fn read_key(&self) -> Option<String> {
+        self.viewed_through_block
+            .as_ref()
+            .map(|position| format!("block:{}\0{}", position.block_id, position.sort_key))
+            .or_else(|| {
+                self.viewed_through_turn_id
+                    .as_ref()
+                    .map(|turn| format!("turn:{turn}"))
+            })
+    }
+}
+impl TimelineReadRequest {
+    fn read_key(&self) -> String {
+        self.through_block
+            .as_ref()
+            .map(|position| format!("block:{}\0{}", position.block_id, position.sort_key))
+            .unwrap_or_else(|| format!("turn:{}", self.through_turn_id))
+    }
 }
 
 #[derive(Clone)]
@@ -91,11 +120,18 @@ pub struct TimelinePageRequest {
 }
 
 #[derive(Default)]
+struct PageFailure {
+    attempts: u8,
+    retry_at_ms: u64,
+    retryable: bool,
+}
+
+#[derive(Default)]
 pub struct ThreadTimelineController {
     pub(crate) in_flight: HashSet<PageKey>,
     pub(crate) pending: HashMap<PageKey, PageAction>,
     requests: HashMap<PageKey, (u64, PageAction)>,
-    failures: HashMap<PageKey, (u8, u64)>,
+    failures: HashMap<PageKey, PageFailure>,
     failed_refreshes: HashMap<String, PageAction>,
     demands: HashMap<(String, String), TimelineDemand>,
     retired: HashMap<(String, String), u64>,
@@ -193,7 +229,7 @@ impl ThreadTimelineController {
     pub(crate) fn page_retry_allowed(&self, key: &PageKey, now_ms: u64) -> bool {
         self.failures
             .get(key)
-            .is_none_or(|(attempt, deadline)| *attempt < MAX_ATTEMPTS && now_ms >= *deadline)
+            .is_none_or(|failure| failure.attempts < MAX_ATTEMPTS && now_ms >= failure.retry_at_ms)
     }
 
     pub(crate) fn finish(
@@ -226,12 +262,13 @@ impl ThreadTimelineController {
                 }
             } else {
                 let failure = self.failures.entry(key.clone()).or_default();
-                failure.0 = if retryable {
-                    failure.0.saturating_add(1)
+                failure.attempts = if retryable {
+                    failure.attempts.saturating_add(1)
                 } else {
                     MAX_ATTEMPTS
                 };
-                failure.1 = now_ms.saturating_add(backoff(failure.0));
+                failure.retry_at_ms = now_ms.saturating_add(backoff(failure.attempts));
+                failure.retryable = retryable;
                 if is_refresh {
                     // The retry obligation owns its exact action, independently
                     // of another anchor waiting in the ordinary pending slot.
@@ -254,7 +291,11 @@ impl ThreadTimelineController {
             // not turn a failure into an immediate request or reset the budget.
             next = None;
         }
-        if next.is_none() && self.refresh_deadline(key).is_none() {
+        // Exhaustion stops the clock, not a domain-owned reconciliation. Keep
+        // that ownership across viewport Exit until success or store retirement.
+        let failed_newest = matches!(key, PageKey::ThreadNewest { .. })
+            && self.has_failed_refresh(request_thread_id(key));
+        if next.is_none() && !failed_newest {
             self.durable_pages.remove(key);
         }
         next
@@ -268,8 +309,29 @@ impl ThreadTimelineController {
         }
         self.failures
             .get(key)
-            .filter(|(attempts, _)| *attempts < MAX_ATTEMPTS)
-            .map(|(_, deadline)| *deadline)
+            .filter(|failure| failure.attempts < MAX_ATTEMPTS)
+            .map(|failure| failure.retry_at_ms)
+    }
+
+    /// A new event can reopen an exhausted transient recovery once. Keep the
+    /// last failure's deadline as a cooldown; further events during Backoff or
+    /// Loading neither replenish the budget nor move that deadline.
+    pub(crate) fn rearm_exhausted_refresh(&mut self, thread: &str) -> bool {
+        if !self.has_failed_refresh(thread) || self.has_active_refresh(thread) {
+            return false;
+        }
+        let key = PageKey::ThreadNewest {
+            thread_id: thread.to_owned(),
+        };
+        let Some(failure) = self.failures.get_mut(&key) else {
+            return false;
+        };
+        if !failure.retryable || failure.attempts < MAX_ATTEMPTS {
+            return false;
+        }
+        failure.attempts = 0;
+        self.durable_pages.insert(key);
+        true
     }
 
     pub(crate) fn reset_page_retry(&mut self, key: &PageKey) {
@@ -277,21 +339,33 @@ impl ThreadTimelineController {
     }
 
     pub(crate) fn next_refresh_deadline(&self) -> Option<u64> {
+        self.next_refresh_deadline_where(|_| true)
+    }
+
+    pub(crate) fn next_refresh_deadline_where(
+        &self,
+        eligible: impl Fn(&str) -> bool,
+    ) -> Option<u64> {
         self.failed_refreshes
             .values()
             .map(semantic::semantic_timeline_request_key)
-            .filter(|key| !self.in_flight.contains(*key))
+            .filter(|key| eligible(request_thread_id(key)) && !self.in_flight.contains(*key))
             .filter_map(|key| self.refresh_deadline(key))
             .min()
     }
 
-    pub(crate) fn due_refreshes(&mut self, now_ms: u64) -> Vec<TimelinePageRequest> {
+    pub(crate) fn due_refreshes(
+        &mut self,
+        now_ms: u64,
+        eligible: impl Fn(&str) -> bool,
+    ) -> Vec<TimelinePageRequest> {
         let mut actions = self
             .failed_refreshes
             .values()
             .filter(|action| {
                 let key = semantic::semantic_timeline_request_key(action);
-                !self.in_flight.contains(key)
+                eligible(request_thread_id(key))
+                    && !self.in_flight.contains(key)
                     && self
                         .refresh_deadline(key)
                         .is_some_and(|deadline| deadline <= now_ms)
@@ -398,17 +472,17 @@ impl ThreadTimelineController {
             self.consumed_scroll
                 .insert(id.clone(), demand.scroll_generation);
         }
-        if let Some(turn) = demand
-            .viewed_through_turn_id
-            .as_ref()
-            .filter(|turn| Some(*turn) == demand.latest_user_turn_id.as_ref())
-        {
-            let read_key = (demand.thread_id.clone(), turn.clone());
+        if let Some(turn) = demand.viewed_through_turn_id.as_ref().filter(|turn| {
+            demand.viewed_through_block.is_some()
+                || Some(*turn) == demand.latest_user_turn_id.as_ref()
+        }) {
+            let read_key = (demand.thread_id.clone(), demand.read_key().unwrap());
             if !self.reads.contains_key(&read_key) {
                 self.clock = self.clock.saturating_add(1);
                 let request = TimelineReadRequest {
                     thread_id: read_key.0.clone(),
                     through_turn_id: turn.clone(),
+                    through_block: demand.viewed_through_block.clone(),
                     generation: self.clock,
                 };
                 self.reads.insert(
@@ -483,14 +557,14 @@ impl ThreadTimelineController {
         self.reads.retain(|(thread, turn), _| {
             self.demands
                 .values()
-                .any(|d| &d.thread_id == thread && d.viewed_through_turn_id.as_ref() == Some(turn))
+                .any(|d| &d.thread_id == thread && d.read_key().as_deref() == Some(turn.as_str()))
         });
         active
     }
 
     pub(crate) fn accepts_read(&self, request: &TimelineReadRequest) -> bool {
         self.reads
-            .get(&(request.thread_id.clone(), request.through_turn_id.clone()))
+            .get(&(request.thread_id.clone(), request.read_key()))
             .is_some_and(|r| r.request == *request && r.state == RetryState::Loading)
     }
 
@@ -515,7 +589,7 @@ impl ThreadTimelineController {
         }
         let read = self
             .reads
-            .get_mut(&(request.thread_id.clone(), request.through_turn_id.clone()))
+            .get_mut(&(request.thread_id.clone(), request.read_key()))
             .unwrap();
         read.state = if succeeded {
             RetryState::Ready
@@ -546,13 +620,6 @@ impl ThreadTimelineController {
         requests
     }
 
-    fn next_request_deadline(&self) -> Option<u64> {
-        [self.next_read_deadline(), self.next_refresh_deadline()]
-            .into_iter()
-            .flatten()
-            .min()
-    }
-
     pub(crate) fn next_read_deadline(&self) -> Option<u64> {
         self.reads
             .values()
@@ -577,7 +644,7 @@ impl ThreadTimelineController {
             .clone();
         self.reads.retain(|(id, turn), r| {
             id != thread
-                || demand.viewed_through_turn_id.as_ref() != Some(turn)
+                || demand.read_key().as_deref() != Some(turn.as_str())
                 || r.state != RetryState::Terminal
         });
         if let Some(keys) = self.demand_pages.get(&id) {
@@ -666,6 +733,8 @@ mod tests {
             presented_rows: false,
             scroll_generation: 1,
             latest_user_turn_id: Some("turn".into()),
+            viewed_row_ids: Vec::new(),
+            viewed_through_block: None,
             viewed_through_turn_id: Some("turn".into()),
             read_requires_unread: false,
             prefetch_on_visibility: true,
@@ -698,6 +767,59 @@ mod tests {
                 limit: Some(12),
             },
         }
+    }
+
+    #[test]
+    fn canonical_position_can_retry_after_a_speculative_live_position_failed() {
+        let mut policy = ThreadTimelineController::default();
+        let mut input = demand("mobile");
+        input.viewed_through_block = Some(pioneer_protocol::ThreadReadPosition {
+            block_id: "answer".into(),
+            sort_key: "old".into(),
+        });
+        let old = policy.update(input.clone(), Vec::new(), 0).reads.remove(0);
+        assert!(policy.finish_read(&old, false, 0));
+        input.source_revision += 1;
+        input.viewed_through_block.as_mut().unwrap().sort_key = "canonical".into();
+        let canonical = policy.update(input, Vec::new(), 1).reads.remove(0);
+        assert_eq!(
+            old.through_block.as_ref().unwrap().block_id,
+            canonical.through_block.as_ref().unwrap().block_id
+        );
+        assert!(!policy.accepts_read(&old));
+        assert!(
+            policy.due_reads(u64::MAX).is_empty(),
+            "old-position retries are retired"
+        );
+        assert!(policy.finish_read(&canonical, true, 1));
+    }
+
+    #[test]
+    fn separate_final_blocks_in_one_turn_are_read_and_deduplicated_by_block() {
+        let mut policy = ThreadTimelineController::default();
+        let mut input = demand("desktop");
+        input.viewed_through_block = Some(pioneer_protocol::ThreadReadPosition {
+            block_id: "turn:turn:assistant:first".into(),
+            sort_key: "1".into(),
+        });
+        let first = policy.update(input.clone(), Vec::new(), 0).reads.remove(0);
+        assert!(policy.finish_read(&first, true, 0));
+        input.source_revision += 1;
+        assert!(policy.update(input.clone(), Vec::new(), 1).reads.is_empty());
+        input.viewed_through_block = Some(pioneer_protocol::ThreadReadPosition {
+            block_id: "turn:turn:assistant:second".into(),
+            sort_key: "2".into(),
+        });
+        let second = policy.update(input.clone(), Vec::new(), 2).reads.remove(0);
+        assert_eq!(first.through_turn_id, second.through_turn_id);
+        assert_ne!(first.through_block, second.through_block);
+        assert!(!policy.accepts_read(&first));
+        assert!(policy.finish_read(&second, false, 2));
+        policy.exit("a", "desktop", input.generation);
+        assert!(
+            policy.due_reads(u64::MAX).is_empty(),
+            "background/retired view cannot retry reads"
+        );
     }
 
     #[test]
@@ -777,6 +899,97 @@ mod tests {
     }
 
     #[test]
+    fn exhausted_refresh_rearms_once_after_cooldown_and_keeps_a_bounded_budget() {
+        for retryable in [false, true] {
+            let mut policy = ThreadTimelineController::default();
+            let action = page();
+            let key = semantic::semantic_timeline_request_key(&action).clone();
+            assert_eq!(
+                policy
+                    .update(demand("desktop"), vec![action.clone()], 0)
+                    .pages
+                    .len(),
+                1
+            );
+            // A notification makes the scoped request a domain obligation.
+            policy.retain_domain_request(&key);
+            let old_generation = policy.request_generation(&key);
+            for now in [0, 1_000, 3_000] {
+                assert!(!policy.rearm_exhausted_refresh("a"));
+                for _ in 0..10 {
+                    assert!(policy.begin(action.clone()).is_none());
+                }
+                assert_eq!(policy.pending.len(), 1);
+                assert!(
+                    policy
+                        .finish_with_retry(&key, false, now < 3_000 || retryable, now)
+                        .is_none()
+                );
+                if now < 3_000 {
+                    assert!(!policy.rearm_exhausted_refresh("a"));
+                    assert!(policy.due_refreshes(now, |_| true).is_empty());
+                    let deadline = policy.next_refresh_deadline().unwrap();
+                    assert_eq!(policy.due_refreshes(deadline, |_| true).len(), 1);
+                }
+            }
+            assert_eq!(policy.next_refresh_deadline(), None);
+            assert!(policy.due_refreshes(u64::MAX, |_| true).is_empty());
+            assert!(policy.exit("a", "desktop", 1).cancelled.is_empty());
+            assert!(
+                policy.has_failed_refresh("a"),
+                "viewport Exit retains domain recovery"
+            );
+            assert_eq!(policy.rearm_exhausted_refresh("a"), retryable);
+            if !retryable {
+                // Protocol/auth/dispatch failures remain terminal for automatic triggers.
+                assert_eq!(policy.next_refresh_deadline(), None);
+                continue;
+            }
+            assert_eq!(policy.next_refresh_deadline(), Some(7_000));
+            assert!(!policy.rearm_exhausted_refresh("a"));
+            assert!(policy.due_refreshes(6_999, |_| true).is_empty());
+            assert!(policy.due_refreshes(u64::MAX, |_| false).is_empty());
+            assert_eq!(policy.next_refresh_deadline_where(|_| false), None);
+            // Other anchors share the key, but cannot consume/reset Newest recovery.
+            for anchor in [
+                pioneer_protocol::TimelinePageAnchor::Oldest,
+                pioneer_protocol::TimelinePageAnchor::Around {
+                    cursor: pioneer_protocol::TimelineCursor {
+                        value: "opaque".into(),
+                    },
+                },
+            ] {
+                let mut other = action.clone();
+                let PageAction::ThreadTimelinePage { params, .. } = &mut other else {
+                    unreachable!()
+                };
+                params.anchor = anchor;
+                policy.begin(other).unwrap();
+                assert_eq!(policy.next_refresh_deadline(), None);
+                assert!(policy.finish(&key, true, 6_000).is_none());
+                assert_eq!(policy.next_refresh_deadline(), Some(7_000));
+            }
+            let next = policy.due_refreshes(7_000, |_| true).remove(0);
+            assert_eq!(next.action, action);
+            assert!(next.generation > old_generation);
+            assert!(!policy.accepts(&key, old_generation));
+            for now in [7_000, 8_000, 10_000] {
+                assert!(!policy.rearm_exhausted_refresh("a"));
+                assert!(policy.due_refreshes(u64::MAX, |_| true).is_empty());
+                assert!(policy.finish(&key, false, now).is_none());
+                if now < 10_000 {
+                    assert!(!policy.rearm_exhausted_refresh("a"));
+                    let deadline = policy.next_refresh_deadline().unwrap();
+                    assert_eq!(policy.due_refreshes(deadline, |_| true).len(), 1);
+                }
+            }
+            assert_eq!(policy.next_refresh_deadline(), None);
+            assert!(policy.due_refreshes(u64::MAX, |_| true).is_empty());
+            assert!(policy.has_failed_refresh("a"));
+        }
+    }
+
+    #[test]
     fn persistent_read_failure_stops_at_three_attempts_until_explicit_retry() {
         let mut policy = ThreadTimelineController::default();
         let first = policy.update(demand("desktop"), vec![], 0).reads.remove(0);
@@ -790,7 +1003,7 @@ mod tests {
         assert!(policy.finish_read(&third, false, 3_000));
         assert!(policy.due_reads(u64::MAX).is_empty());
         assert_eq!(
-            policy.reads[&("a".into(), "turn".into())].state,
+            policy.reads[&("a".into(), first.read_key())].state,
             RetryState::Terminal
         );
         assert!(
@@ -864,7 +1077,7 @@ mod tests {
         policy.finish(key, false, 0);
         assert_eq!(policy.next_refresh_deadline(), Some(1_000));
         policy.invalidate(Some("a"));
-        assert!(policy.due_refreshes(u64::MAX).is_empty());
+        assert!(policy.due_refreshes(u64::MAX, |_| true).is_empty());
         assert_eq!(policy.next_refresh_deadline(), None);
         assert!(!policy.accepts_read(&a.reads[0]));
         assert!(policy.accepts_read(&b.reads[0]));
@@ -1028,8 +1241,59 @@ impl crate::core::ClientCore {
         if !registry.timeline_revision_matches(&demand.thread_id, demand.source_revision) {
             return TimelineEffectPlan::default();
         }
-        if demand.read_requires_unread && !registry.timeline_has_unread(&demand.thread_id) {
+        demand.viewed_through_block = None;
+        let semantic_ids = snapshot.timeline().semantic_row_ids();
+        let viewed_blocks = demand
+            .viewed_row_ids
+            .iter()
+            .filter_map(|id| semantic_ids.get(id))
+            .filter_map(|id| match id {
+                super::semantic::SemanticTimelineRowId::TopLevelBlock { block_id } => {
+                    Some(block_id)
+                }
+                _ => None,
+            })
+            .collect::<HashSet<_>>();
+        let semantic_rows = snapshot.timeline().semantic_rows();
+        let viewed = semantic_rows
+            .rows
+            .iter()
+            .filter_map(|row| match &row.kind {
+                super::semantic::SemanticTimelineRowKind::UserBlock { block } => Some(block),
+                super::semantic::SemanticTimelineRowKind::AssistantMessage { block }
+                    if matches!(
+                        &block.kind,
+                        pioneer_protocol::TimelineBlockKind::AssistantMessage {
+                            status: pioneer_protocol::TurnWorkItemStatus::Completed,
+                            ..
+                        }
+                    ) =>
+                {
+                    Some(block)
+                }
+                _ => None,
+            })
+            .filter(|block| viewed_blocks.contains(&block.block_id))
+            .max_by(|a, b| a.sort_key.cmp(&b.sort_key));
+        if let Some(block) = viewed {
+            demand.viewed_through_turn_id = block.turn_id.clone();
+            demand.viewed_through_block = Some(pioneer_protocol::ThreadReadPosition {
+                block_id: block.block_id.clone(),
+                sort_key: block.sort_key.clone(),
+            });
+        }
+        let already_read = demand.viewed_through_turn_id.as_ref().is_some_and(|turn| {
+            registry.timeline_read_is_confirmed(
+                &demand.thread_id,
+                turn,
+                demand.viewed_through_block.as_ref(),
+            )
+        });
+        if already_read
+            || (demand.read_requires_unread && !registry.timeline_has_unread(&demand.thread_id))
+        {
             demand.viewed_through_turn_id = None;
+            demand.viewed_through_block = None;
         }
         registry.timeline.reconcile_topology(
             &demand,
@@ -1059,8 +1323,7 @@ impl crate::core::ClientCore {
         self.thread_registry
             .lock()
             .expect("thread registry poisoned")
-            .timeline
-            .next_request_deadline()
+            .next_timeline_request_deadline()
             .map(|deadline| {
                 std::time::Duration::from_millis(deadline.saturating_sub(self.timeline_now_ms()))
             })
@@ -1078,8 +1341,7 @@ impl crate::core::ClientCore {
             .thread_registry
             .lock()
             .expect("thread registry poisoned")
-            .timeline
-            .due_refreshes(now_ms);
+            .due_timeline_refreshes(now_ms);
         for page in pages {
             self.schedule_planned_timeline_request(page);
         }
@@ -1095,24 +1357,55 @@ impl crate::core::ClientCore {
     }
 
     pub(crate) fn execute_timeline_read(&self, request: TimelineReadRequest) {
-        if self.is_stopped()
-            || !self
-                .thread_registry
-                .lock()
-                .expect("thread registry poisoned")
-                .timeline
-                .accepts_read(&request)
-        {
+        if self.is_stopped() {
             return;
         }
+        let Some(token) = self.thread_operation_token(&request.thread_id) else {
+            return;
+        };
+        let auth = self.current_auth_ticket();
+        {
+            let mut registry = self
+                .thread_registry
+                .lock()
+                .expect("thread registry poisoned");
+            if !registry.timeline.accepts_read(&request)
+                || !registry.timeline_operation_matches(&token)
+            {
+                return;
+            }
+            // Another session can advance the confirmed cursor while this
+            // request is queued or waiting for retry.
+            if registry.timeline_read_is_confirmed(
+                &request.thread_id,
+                &request.through_turn_id,
+                request.through_block.as_ref(),
+            ) {
+                registry
+                    .timeline
+                    .finish_read(&request, true, self.timeline_now_ms());
+                return;
+            }
+        }
         let result = self.read_thread_cursor(pioneer_protocol::ThreadReadParams {
+            through_block: request.through_block.clone(),
             thread_id: request.thread_id.clone(),
             through_turn_id: request.through_turn_id.clone(),
         });
+        let auth_is_current = self.current_auth_ticket() == auth;
         let mut registry = self
             .thread_registry
             .lock()
             .expect("thread registry poisoned");
+        if self.is_stopped() || !registry.timeline_operation_matches(&token) {
+            return;
+        }
+        if !auth_is_current {
+            registry
+                .timeline
+                .finish_read(&request, false, self.timeline_now_ms());
+            return;
+        }
         if let Ok(response) = &result {
             if response.thread_id != request.thread_id
                 || !registry.timeline_workspace_matches(&request.thread_id, &response.workspace_id)
@@ -1126,11 +1419,12 @@ impl crate::core::ClientCore {
                 return;
             }
         }
-        let accepted =
-            registry
-                .timeline
-                .finish_read(&request, result.is_ok(), self.timeline_now_ms());
-        if accepted && let Ok(response) = result {
+        registry
+            .timeline
+            .finish_read(&request, result.is_ok(), self.timeline_now_ms());
+        // read_thread_cursor already fences auth/thread lifetime. A successful
+        // server cursor stays authoritative even if the viewport has moved.
+        if let Ok(response) = result {
             self.apply_directory_read_locked(
                 &mut registry,
                 &response.workspace_id,

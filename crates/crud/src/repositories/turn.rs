@@ -789,6 +789,7 @@ pub fn collaboration_from_model(model: &turn::Model) -> Result<PersistedTurnColl
                 })
                 .transpose()?;
             let snapshot = TurnAuthorSnapshot {
+                cli_runtime_kind: None,
                 actor,
                 display_name: display_name.clone(),
                 nickname: nickname.clone(),
@@ -810,6 +811,7 @@ pub fn collaboration_from_model(model: &turn::Model) -> Result<PersistedTurnColl
                 PersistedActorRef::System => ("System".to_owned(), "system".to_owned()),
             };
             Some(TurnAuthorSnapshot {
+                cli_runtime_kind: None,
                 actor,
                 display_name,
                 nickname,
@@ -1570,6 +1572,24 @@ pub async fn find_turn_item<C: ConnectionTrait>(
         .one(db)
         .await
         .context("failed to query turn item row")
+}
+
+pub(crate) async fn is_completed_agent_message<C: ConnectionTrait>(
+    db: &C,
+    turn_id: &str,
+    item_id: &str,
+) -> Result<bool> {
+    // The canonical assistant block supplies final-answer placement. Check
+    // lifecycle state without fetching/parsing its potentially large payload.
+    Ok(turn_item::Entity::find()
+        .filter(turn_item::Column::TurnId.eq(turn_id.to_owned()))
+        .filter(turn_item::Column::ItemId.eq(item_id.to_owned()))
+        .filter(turn_item::Column::ItemType.eq("agent_message"))
+        .filter(turn_item::Column::Status.eq("completed"))
+        .count(db)
+        .await
+        .context("failed to validate completed response position")?
+        > 0)
 }
 
 pub async fn list_turn_items_by_ids<C: ConnectionTrait>(
@@ -2398,6 +2418,7 @@ mod tests {
             origin: pioneer_protocol::TurnOrigin::User,
             mode: ThreadMode::Message,
             author: Some(TurnAuthorSnapshot {
+                cli_runtime_kind: None,
                 actor: actor.clone(),
                 display_name: "System".to_owned(),
                 nickname: "system".to_owned(),

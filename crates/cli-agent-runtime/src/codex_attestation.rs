@@ -62,12 +62,8 @@ pub fn codex_executable_cache_identity(
 ) -> Result<CodexExecutableCacheIdentity> {
     validate_fingerprint("probe contract hash", probe_contract_hash)?;
     let provider_version = provider_version.trim();
-    if provider_version.is_empty()
-        || provider_version.len() > 256
-        || provider_version.contains('\0')
-    {
-        bail!("Codex provider version is unavailable or invalid");
-    }
+    // Empty metadata represents an unreported version in the existing cache schema.
+    // Executable identity and protocol checks do not depend on release strings.
     let realpath = resolve_executable(configured_executable)?;
     let metadata = fs::metadata(realpath.as_path()).with_context(|| {
         format!(
@@ -377,6 +373,20 @@ mod tests {
             &"a".repeat(64),
         )
         .expect("first attestation");
+        for version in ["", "0.1.0", "dev-build+local"] {
+            let other = attest_codex_executable(
+                executable.to_str().expect("UTF-8 fixture path"),
+                version,
+                &"a".repeat(64),
+            )
+            .expect("release metadata does not gate attestation");
+            assert_eq!(other.cache_identity.realpath, first.cache_identity.realpath);
+            assert_eq!(other.cache_identity.provider_version, version);
+            assert_ne!(
+                other.local_executable_fingerprint,
+                first.local_executable_fingerprint
+            );
+        }
         let changed_contract = attest_codex_executable(
             executable.to_str().expect("UTF-8 fixture path"),
             "0.144.1",

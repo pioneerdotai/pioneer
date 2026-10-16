@@ -355,7 +355,8 @@ pub use skills::{
     SkillsUploadFinishResponse, SkillsUploadStartParams, SkillsUploadStartResponse,
 };
 pub use system_assets::{
-    CLAUDE_AGENT_AVATAR_REVISION, CODEX_AGENT_AVATAR_REVISION, PIONEER_AGENT_AVATAR_REVISION,
+    CLAUDE_AGENT_AVATAR_REVISION, CODEX_AGENT_AVATAR_REVISION, OPENCODE_AGENT_AVATAR_DARK_REVISION,
+    OPENCODE_AGENT_AVATAR_LIGHT_REVISION, PIONEER_AGENT_AVATAR_REVISION,
 };
 pub use task::{
     PublicTask, PublicTaskAgendaItem, PublicTaskAgendaResponse, PublicTaskAgentConfiguration,
@@ -495,11 +496,11 @@ pub use turn::{
     TURN_MESSAGE_INPUT_MAX_ITEMS, TURN_MESSAGE_MENTION_MAX_COUNT,
     TURN_MESSAGE_REVISION_CURSOR_MAX_BYTES, TURN_MESSAGE_REVISION_PAGE_DEFAULT_LIMIT,
     TURN_MESSAGE_REVISION_PAGE_MAX_LIMIT, TextElement, ThreadReadCursor,
-    ThreadReadCursorChangedNotification, ThreadReadParams, ThreadReadResponse, TimelineLane,
-    TimelineOrigin, TimelineOriginKind, TimelineOutputPolicy, ToolCallStatus, ToolDisplayPayload,
-    ToolErrorClass, ToolLoopBudgetAction, ToolLoopBudgetLimitKind, ToolMetadata,
-    ToolMetadataRawKind, ToolMetadataValue, ToolObservation, ToolOutcome, ToolOutcomeStatus,
-    ToolOutputPolicySnapshot, ToolOutputSummary, ToolPermissionPolicySnapshot,
+    ThreadReadCursorChangedNotification, ThreadReadParams, ThreadReadPosition, ThreadReadResponse,
+    TimelineLane, TimelineOrigin, TimelineOriginKind, TimelineOutputPolicy, ToolCallStatus,
+    ToolDisplayPayload, ToolErrorClass, ToolLoopBudgetAction, ToolLoopBudgetLimitKind,
+    ToolMetadata, ToolMetadataRawKind, ToolMetadataValue, ToolObservation, ToolOutcome,
+    ToolOutcomeStatus, ToolOutputPolicySnapshot, ToolOutputSummary, ToolPermissionPolicySnapshot,
     ToolRecoveryIdempotencyMode, ToolRecoveryPolicySnapshot, ToolRecoveryRetryClass,
     ToolRecoveryView, ToolRetryBudgetKind, ToolRetryBudgetUsage, ToolRetryErrorClass,
     ToolRetryExhaustionKind, ToolRetryResolution, ToolStoragePayload, Turn,

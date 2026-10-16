@@ -303,14 +303,7 @@ impl CodexMcpSessionLaunchProjection {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct CodexNativeMcpItemBinding {
-    pub(crate) native_thread_id: String,
-    pub(crate) native_turn_id: String,
-    pub(crate) native_item_id: String,
-    pub(crate) canonical_callable_name: String,
-    pub(crate) arguments_fingerprint: String,
-}
+pub(crate) use crate::cli_runtime::mcp::native_correlation::NativeMcpItemBinding as CodexNativeMcpItemBinding;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CodexNativeMcpEventError {

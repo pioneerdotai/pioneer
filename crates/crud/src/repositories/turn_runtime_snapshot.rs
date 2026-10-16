@@ -55,6 +55,29 @@ pub struct NewTurnRuntimeSnapshot {
     pub updated_at: DateTimeWithTimeZone,
 }
 
+/// Recheck the request's bounded metadata in the same short writer transaction
+/// that attaches the live runtime root. The JSON is prepared before admission.
+pub(crate) async fn verify_source_epochs<C: ConnectionTrait>(
+    db: &C,
+    workspace: &str,
+    epochs_json: &str,
+) -> Result<()> {
+    let changed = db
+        .query_one_raw(super::compaction::sqlite_specific_sql(
+            "SELECT wanted.key FROM json_each(?) wanted \
+         LEFT JOIN thread t ON t.id=wanted.key AND t.workspace_id=? \
+         LEFT JOIN compaction_projection_epoch e ON e.thread_id=t.id \
+         WHERE t.id IS NULL OR COALESCE(e.version,0)<>wanted.value LIMIT 1",
+            [epochs_json.into(), workspace.into()],
+        ))
+        .await?;
+    anyhow::ensure!(
+        changed.is_none(),
+        "history changed before runtime publication"
+    );
+    Ok(())
+}
+
 fn validate_snapshot_storage_size(fields: &[&str]) -> Result<usize> {
     let mut remaining = pioneer_protocol::TURN_EXECUTION_REQUEST_MAX_BYTES;
     for field in fields {

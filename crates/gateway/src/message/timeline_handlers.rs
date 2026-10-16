@@ -92,6 +92,7 @@ struct UserMessageTimelineBatch {
 
 #[derive(Default)]
 struct AssistantMessageTimelineBatch {
+    statuses: HashMap<(String, String), TurnWorkItemStatus>,
     items: HashMap<(String, String), TurnItem>,
     html: HashMap<(String, String), Vec<pioneer_protocol::HtmlPublication>>,
     authors: HashMap<String, pioneer_protocol::TurnAuthorSnapshot>,
@@ -144,6 +145,9 @@ impl MessageProcessor {
         if authorization.thread_id() != thread_id
             || thread_id.is_empty()
             || through_turn_id.is_empty()
+            || params.through_block.as_ref().is_some_and(|position| {
+                position.block_id.trim().is_empty() || position.sort_key.is_empty()
+            })
         {
             log_thread_read_outcome(thread_id, through_turn_id, "rejected", 0, started);
             self.send_error(
@@ -157,6 +161,7 @@ impl MessageProcessor {
         let response_payload = match self
             .crud_store
             .mark_thread_read(pioneer_crud::MarkThreadReadRequest {
+                through_block: params.through_block.clone(),
                 workspace_id: authorization.workspace_id().to_owned(),
                 thread_id: thread_id.to_owned(),
                 principal_id: request_context.principal().principal_id.clone(),
@@ -1753,15 +1758,19 @@ impl MessageProcessor {
             HashMap::new()
         } else {
             self.crud_store
-                .list_turn_items_by_type_for_turns(item_turn_ids.as_slice(), "agent_message")
+                .list_turn_items_with_status_by_type_for_turns(
+                    item_turn_ids.as_slice(),
+                    "agent_message",
+                )
                 .await?
         };
         let mut items = HashMap::new();
+        let mut statuses = HashMap::new();
         let mut html = HashMap::new();
         for (turn_id, item_id) in &item_targets {
-            let item = turn_items
+            let (item, status) = turn_items
                 .get(turn_id.as_str())
-                .and_then(|items| items.iter().find(|item| item.item_id() == item_id))
+                .and_then(|items| items.iter().find(|(item, _)| item.item_id() == item_id))
                 .with_context(|| {
                     format!("assistant message item `{item_id}` for turn `{turn_id}` was not found")
                 })?;
@@ -1771,7 +1780,7 @@ impl MessageProcessor {
             let is_final = turn_items
                 .get(turn_id)
                 .and_then(|items| {
-                    items.iter().rev().find(|item| {
+                    items.iter().rev().find(|(item, _)| {
                         matches!(
                             item,
                             TurnItem::AgentMessage {
@@ -1781,8 +1790,9 @@ impl MessageProcessor {
                         )
                     })
                 })
-                .is_some_and(|final_item| final_item.item_id() == item_id);
-            if is_final {
+                .is_some_and(|(final_item, _)| final_item.item_id() == item_id);
+            if is_final || pioneer_protocol::task_delivery_id_from_result_item_id(item_id).is_some()
+            {
                 let publications = self
                     .html_publications_for_agent_response(
                         &rows[0].workspace_id,
@@ -1793,6 +1803,10 @@ impl MessageProcessor {
                     .await?;
                 html.insert((turn_id.clone(), item_id.clone()), publications);
             }
+            statuses.insert(
+                (turn_id.clone(), item_id.clone()),
+                parse_turn_work_item_status(status.as_deref().unwrap_or("running")),
+            );
             items.insert((turn_id.clone(), item_id.clone()), item.clone());
         }
 
@@ -1800,6 +1814,7 @@ impl MessageProcessor {
             .timeline_row_authors(&turns, turn_ids.as_slice())
             .await?;
         Ok(AssistantMessageTimelineBatch {
+            statuses,
             items,
             authors,
             html,
@@ -1823,6 +1838,8 @@ impl MessageProcessor {
             .into_iter()
             .map(|execution| (execution.turn_id.clone(), execution))
             .collect::<HashMap<_, _>>();
+        let runtime_kinds_by_turn =
+            pioneer_crud::load_cli_runtime_kinds_for_turns(&database, turn_ids).await?;
         let direct_authors_by_turn = turn_ids
             .iter()
             .filter_map(|turn_id| {
@@ -1903,18 +1920,6 @@ impl MessageProcessor {
                         )
                         .await?
                         .map(|presentation| {
-                            let runtime_marker = presentation
-                                .role_label
-                                .as_deref()
-                                .unwrap_or(presentation.nickname.as_str());
-                            let runtime_avatar_revision =
-                                if runtime_marker.eq_ignore_ascii_case("codex") {
-                                    Some(pioneer_protocol::CODEX_AGENT_AVATAR_REVISION.to_owned())
-                                } else if runtime_marker.eq_ignore_ascii_case("claude") {
-                                    Some(pioneer_protocol::CLAUDE_AGENT_AVATAR_REVISION.to_owned())
-                                } else {
-                                    presentation.avatar_revision.clone()
-                                };
                             pioneer_protocol::TurnAuthorSnapshot {
                                 // Foreground CLI turns have a real runtime executor but no
                                 // AgentExecution. Keep that distinction explicit instead of
@@ -1922,10 +1927,8 @@ impl MessageProcessor {
                                 actor: pioneer_protocol::PersistedActorRef::System,
                                 display_name: presentation.display_name,
                                 nickname: presentation.nickname,
-                                // Reserved runtime avatar revisions are the existing
-                                // cross-client presentation discriminator for a real
-                                // CLI executor without an AgentExecution association.
-                                avatar_revision: runtime_avatar_revision,
+                                avatar_revision: presentation.avatar_revision,
+                                cli_runtime_kind: None,
                                 agent: None,
                             }
                         })
@@ -1938,7 +1941,10 @@ impl MessageProcessor {
             } else {
                 None
             };
-            if let Some(author) = author {
+            if let Some(mut author) = author {
+                author.cli_runtime_kind = author
+                    .cli_runtime_kind
+                    .or_else(|| runtime_kinds_by_turn.get(turn_id).copied());
                 authors.insert(turn_id.clone(), author);
             }
         }
@@ -2191,7 +2197,10 @@ impl MessageProcessor {
                 .unwrap_or_default(),
             item_id: id,
             text,
-            status: TurnWorkItemStatus::Completed,
+            status: *batch
+                .statuses
+                .get(&(turn_id.to_owned(), item_id.to_owned()))
+                .context("assistant message status was not batched")?,
             markdown,
             author,
             route: action_projection.and_then(|projection| projection.route.clone()),
@@ -2651,9 +2660,9 @@ fn parse_turn_work_state(value: &str) -> TurnWorkState {
 
 fn parse_turn_work_item_status(value: &str) -> TurnWorkItemStatus {
     match value {
-        "running" => TurnWorkItemStatus::Running,
+        "running" | "in_progress" => TurnWorkItemStatus::Running,
         "blocked" => TurnWorkItemStatus::Blocked,
-        "failed" => TurnWorkItemStatus::Failed,
+        "failed" | "timed_out" => TurnWorkItemStatus::Failed,
         "cancelled" | "canceled" => TurnWorkItemStatus::Cancelled,
         "completed" => TurnWorkItemStatus::Completed,
         _ => TurnWorkItemStatus::Completed,

@@ -3390,42 +3390,8 @@ impl CodexProbe {
             }
         };
 
-        let account = account_response
-            .account
-            .as_ref()
-            .map(codex_account_snapshot_from_value);
-        let status = if account.is_some() {
-            CodexAccountProbeStatus::Ready
-        } else if account_response.requires_openai_auth {
-            CodexAccountProbeStatus::NeedsAuth
-        } else {
-            CodexAccountProbeStatus::Ready
-        };
-        let (message, diagnostics) = if status == CodexAccountProbeStatus::NeedsAuth {
-            let message = "Codex CLI is not authenticated".to_owned();
-            (
-                Some(message.clone()),
-                vec![CodexProbeDiagnostic {
-                    level: CodexProbeDiagnosticLevel::Warning,
-                    code: "codex_probe.needs_auth".to_owned(),
-                    message,
-                }],
-            )
-        } else {
-            (None, Vec::new())
-        };
-
         let stderr = shutdown_probe_process(&rpc, &mut process, &stderr_ring, &config).await;
-        CodexAccountProbeSnapshot {
-            status,
-            message,
-            user_agent,
-            version,
-            account,
-            requires_openai_auth: account_response.requires_openai_auth,
-            diagnostics,
-            stderr,
-        }
+        codex_account_probe_snapshot(account_response, user_agent, version, stderr)
     }
 
     pub async fn model_list(config: CodexAccountProbeConfig) -> CodexModelListProbeSnapshot {
@@ -3450,6 +3416,7 @@ impl CodexProbe {
                     message: Some(message.clone()),
                     user_agent: None,
                     version: None,
+                    account_probe: None,
                     models: Vec::new(),
                     requires_openai_auth: false,
                     diagnostics: vec![CodexProbeDiagnostic {
@@ -3476,6 +3443,7 @@ impl CodexProbe {
                     message: Some(message.clone()),
                     user_agent: None,
                     version: None,
+                    account_probe: None,
                     models: Vec::new(),
                     requires_openai_auth: false,
                     diagnostics: vec![CodexProbeDiagnostic {
@@ -3503,8 +3471,9 @@ impl CodexProbe {
                 return CodexModelListProbeSnapshot {
                     status: CodexModelListProbeStatus::Error,
                     message: Some(message.clone()),
-                    user_agent,
-                    version,
+                    user_agent: user_agent.clone(),
+                    version: version.clone(),
+                    account_probe: None,
                     models: Vec::new(),
                     requires_openai_auth: false,
                     diagnostics: vec![CodexProbeDiagnostic {
@@ -3523,8 +3492,14 @@ impl CodexProbe {
             return CodexModelListProbeSnapshot {
                 status: CodexModelListProbeStatus::NeedsAuth,
                 message: Some(message.clone()),
-                user_agent,
-                version,
+                user_agent: user_agent.clone(),
+                version: version.clone(),
+                account_probe: Some(codex_account_probe_snapshot(
+                    account_response.clone(),
+                    user_agent.clone(),
+                    version.clone(),
+                    stderr.clone(),
+                )),
                 models: Vec::new(),
                 requires_openai_auth: true,
                 diagnostics: vec![CodexProbeDiagnostic {
@@ -3545,8 +3520,14 @@ impl CodexProbe {
                 return CodexModelListProbeSnapshot {
                     status: CodexModelListProbeStatus::Error,
                     message: Some(message.clone()),
-                    user_agent,
-                    version,
+                    user_agent: user_agent.clone(),
+                    version: version.clone(),
+                    account_probe: Some(codex_account_probe_snapshot(
+                        account_response.clone(),
+                        user_agent.clone(),
+                        version.clone(),
+                        stderr.clone(),
+                    )),
                     models: Vec::new(),
                     requires_openai_auth: account_response.requires_openai_auth,
                     diagnostics: vec![CodexProbeDiagnostic {
@@ -3563,6 +3544,12 @@ impl CodexProbe {
         CodexModelListProbeSnapshot {
             status: CodexModelListProbeStatus::Ready,
             message: None,
+            account_probe: Some(codex_account_probe_snapshot(
+                account_response.clone(),
+                user_agent.clone(),
+                version.clone(),
+                stderr.clone(),
+            )),
             user_agent,
             version,
             models,
@@ -3738,6 +3725,49 @@ impl CodexProbe {
     }
 }
 
+fn codex_account_probe_snapshot(
+    account_response: CodexAccountReadResponse,
+    user_agent: Option<String>,
+    version: Option<String>,
+    stderr: Vec<String>,
+) -> CodexAccountProbeSnapshot {
+    let account = account_response
+        .account
+        .as_ref()
+        .map(codex_account_snapshot_from_value);
+    let status = if account.is_some() {
+        CodexAccountProbeStatus::Ready
+    } else if account_response.requires_openai_auth {
+        CodexAccountProbeStatus::NeedsAuth
+    } else {
+        CodexAccountProbeStatus::Ready
+    };
+    let (message, diagnostics) = if status == CodexAccountProbeStatus::NeedsAuth {
+        let message = "Codex CLI is not authenticated".to_owned();
+        (
+            Some(message.clone()),
+            vec![CodexProbeDiagnostic {
+                level: CodexProbeDiagnosticLevel::Warning,
+                code: "codex_probe.needs_auth".to_owned(),
+                message,
+            }],
+        )
+    } else {
+        (None, Vec::new())
+    };
+
+    CodexAccountProbeSnapshot {
+        status,
+        message,
+        user_agent,
+        version,
+        account,
+        requires_openai_auth: account_response.requires_openai_auth,
+        diagnostics,
+        stderr,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CodexAccountReadResponse {
@@ -3809,6 +3839,7 @@ impl fmt::Debug for CodexThreadResumeParams {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct CodexThreadOpenSnapshot {
+    pub name: Option<String>,
     pub native_thread_id: String,
     pub cwd: Option<String>,
     pub model: Option<String>,
@@ -4327,6 +4358,19 @@ struct CodexThreadGoalClearResponse {
     cleared: bool,
 }
 
+/// Read the optional Codex Thread.name only for the exact opened thread.
+pub fn thread_open_name(raw: &JsonValue, native_thread_id: &str) -> Option<String> {
+    // Codex 0.144.1 / 0.159.2 Thread.name is nullable. Invalid metadata
+    // must not break opening the working session.
+    (raw.pointer("/thread/id").and_then(JsonValue::as_str) == Some(native_thread_id))
+        .then(|| {
+            raw.pointer("/thread/name")
+                .and_then(JsonValue::as_str)
+                .map(str::to_owned)
+        })
+        .flatten()
+}
+
 fn decode_codex_thread_open_response(
     method: &str,
     raw: JsonValue,
@@ -4359,6 +4403,7 @@ fn decode_codex_thread_open_response(
         })?;
 
     Ok(CodexThreadOpenSnapshot {
+        name: thread_open_name(&raw, &native_thread_id),
         native_thread_id,
         cwd: cwd_from_thread.or(cwd),
         model: model_from_thread.or(model),
@@ -4485,6 +4530,8 @@ fn normalize_optional_string(value: Option<&str>) -> Option<String> {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct CodexModelListProbeSnapshot {
+    /// Account result from the same app-server session, before model discovery.
+    pub account_probe: Option<CodexAccountProbeSnapshot>,
     pub status: CodexModelListProbeStatus,
     pub message: Option<String>,
     pub user_agent: Option<String>,
@@ -4493,6 +4540,31 @@ pub struct CodexModelListProbeSnapshot {
     pub requires_openai_auth: bool,
     pub diagnostics: Vec<CodexProbeDiagnostic>,
     pub stderr: Vec<String>,
+}
+
+impl CodexModelListProbeSnapshot {
+    pub fn account_probe_snapshot(&self) -> CodexAccountProbeSnapshot {
+        self.account_probe
+            .clone()
+            .unwrap_or_else(|| CodexAccountProbeSnapshot {
+                status: match self.status {
+                    CodexModelListProbeStatus::MissingBinary => {
+                        CodexAccountProbeStatus::MissingBinary
+                    }
+                    CodexModelListProbeStatus::SpawnFailed => CodexAccountProbeStatus::SpawnFailed,
+                    CodexModelListProbeStatus::Ready => CodexAccountProbeStatus::Ready,
+                    CodexModelListProbeStatus::NeedsAuth => CodexAccountProbeStatus::NeedsAuth,
+                    CodexModelListProbeStatus::Error => CodexAccountProbeStatus::Error,
+                },
+                message: self.message.clone(),
+                user_agent: self.user_agent.clone(),
+                version: self.version.clone(),
+                account: None,
+                requires_openai_auth: self.requires_openai_auth,
+                diagnostics: self.diagnostics.clone(),
+                stderr: self.stderr.clone(),
+            })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4777,6 +4849,7 @@ fn shadow_home_model_list_probe_snapshot(
     error: CodexShadowHomeError,
 ) -> CodexModelListProbeSnapshot {
     CodexModelListProbeSnapshot {
+        account_probe: None,
         status: CodexModelListProbeStatus::Error,
         message: Some(error.to_string()),
         user_agent: None,
@@ -4828,6 +4901,7 @@ fn model_list_spawn_error_probe_snapshot(
     };
 
     CodexModelListProbeSnapshot {
+        account_probe: None,
         status,
         message: Some(message.clone()),
         user_agent: None,
@@ -10137,6 +10211,7 @@ while read line; do :; done
             json!({
                 "thread": {
                     "id": "codex-thread-started",
+                    "name": "Название Codex",
                     "cwd": "/tmp/project",
                     "model": "gpt-5"
                 }
@@ -10148,6 +10223,19 @@ while read line; do :; done
             .await
             .expect("thread start task should join")
             .expect("thread start should succeed");
+        assert_eq!(snapshot.name.as_deref(), Some("Название Codex"));
+        assert!(thread_open_name(&snapshot.raw, "another-native-thread").is_none());
+        for name in [JsonValue::Null, json!(17), json!({"invalid":true})] {
+            let opened = decode_codex_thread_open_response(
+                "thread/start",
+                json!({
+                    "thread": {"id":"native", "name":name}
+                }),
+            )
+            .unwrap();
+            assert!(opened.name.is_none());
+        }
+
         assert_eq!(snapshot.native_thread_id, "codex-thread-started");
         assert_eq!(snapshot.cwd.as_deref(), Some("/tmp/project"));
         assert_eq!(snapshot.model.as_deref(), Some("gpt-5"));
@@ -11019,7 +11107,7 @@ while read line; do :; done
         fake.write_result_response(
             request["id"].clone(),
             json!({
-                "threadId": "codex-thread-existing",
+                "thread": { "id": "codex-thread-existing", "name": "Resumed title" },
                 "cwd": "/tmp/project",
                 "model": "gpt-5.1"
             }),
@@ -11030,6 +11118,7 @@ while read line; do :; done
             .await
             .expect("thread resume task should join")
             .expect("thread resume should succeed");
+        assert_eq!(snapshot.name.as_deref(), Some("Resumed title"));
         assert_eq!(snapshot.native_thread_id, "codex-thread-existing");
         assert_eq!(snapshot.cwd.as_deref(), Some("/tmp/project"));
         assert_eq!(snapshot.model.as_deref(), Some("gpt-5.1"));

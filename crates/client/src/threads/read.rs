@@ -59,6 +59,7 @@ pub fn plan_mark_thread_read(context: MarkThreadReadContext<'_>) -> Option<Threa
     }
 
     Some(ThreadReadParams {
+        through_block: None,
         thread_id: thread_id.to_owned(),
         through_turn_id: through_turn_id.to_owned(),
     })
@@ -141,6 +142,7 @@ mod tests {
         assert_eq!(
             plan_mark_thread_read(ready),
             Some(ThreadReadParams {
+                through_block: None,
                 thread_id: "thread_a".to_owned(),
                 through_turn_id: "turn_7".to_owned(),
             })

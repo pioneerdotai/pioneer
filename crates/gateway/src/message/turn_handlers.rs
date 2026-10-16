@@ -660,6 +660,8 @@ struct PreparedCliRuntimeCombinedPreflight {
         Option<crate::cli_runtime::codex_mcp::CodexMcpSessionLaunchProjection>,
     claude_mcp_launch_projection:
         Option<crate::cli_runtime::claude_mcp::ClaudeMcpSessionLaunchProjection>,
+    opencode_mcp_launch_projection:
+        Option<crate::cli_runtime::opencode_mcp::OpenCodeMcpSessionLaunchProjection>,
     max_input_tokens: Option<u64>,
 }
 
@@ -685,6 +687,8 @@ struct CliRuntimeAdmissionPhase {
         Option<crate::cli_runtime::codex_mcp::CodexMcpSessionLaunchProjection>,
     claude_mcp_launch_projection:
         Option<crate::cli_runtime::claude_mcp::ClaudeMcpSessionLaunchProjection>,
+    opencode_mcp_launch_projection:
+        Option<crate::cli_runtime::opencode_mcp::OpenCodeMcpSessionLaunchProjection>,
     max_input_tokens: Option<u64>,
 }
 
@@ -3024,19 +3028,19 @@ impl MessageProcessor {
             .await;
             return Err(TurnStartFailure::unavailable(message));
         }
-        let history = {
+        let prepared_history = {
             let _startup_part = pioneer_observability::turn_startup::stage(
                 &outcome.started_notification.turn.id,
                 pioneer_observability::turn_startup::Stage::History,
             );
-            self.load_conversation_history_for_workspace(
+            self.load_prepared_conversation_history_for_workspace(
                 outcome.started_notification.workspace_id.as_str(),
                 outcome.started_notification.thread_id.as_str(),
                 outcome.started_notification.turn.id.as_str(),
             )
             .await
         };
-        let history = match history {
+        let prepared_history = match prepared_history {
             Ok(history) => history,
             Err(_) => {
                 let message =
@@ -3050,6 +3054,7 @@ impl MessageProcessor {
                 return Err(TurnStartFailure::unavailable(message));
             }
         };
+        let history = prepared_history.messages.clone();
         let workspace_skill_policies = match self
             .crud_store
             .list_workspace_skill_policies(outcome.started_notification.workspace_id.as_str())
@@ -3168,6 +3173,7 @@ impl MessageProcessor {
                 history.as_slice(),
                 &mut agent_skill_overlay,
                 &skill_catalog,
+                Some(&prepared_history),
             )
             .await;
         if let Err(error) = snapshot_result {
@@ -3386,8 +3392,8 @@ impl MessageProcessor {
         self.ensure_agent_listener_task(outcome.started_notification.thread_id.as_str())
             .await
             .map_err(|error| format!("failed to activate durable listener: {error:#}"))?;
-        let history = self
-            .load_conversation_history_for_workspace(
+        let prepared_history = self
+            .load_prepared_conversation_history_for_workspace(
                 outcome.started_notification.workspace_id.as_str(),
                 outcome.started_notification.thread_id.as_str(),
                 outcome.started_notification.turn.id.as_str(),
@@ -3396,6 +3402,7 @@ impl MessageProcessor {
             .map_err(|_| {
                 "Conversation history is unavailable; turn preparation paused".to_owned()
             })?;
+        let history = prepared_history.messages.clone();
         let workspace_skill_policies = self
             .crud_store
             .list_workspace_skill_policies(outcome.started_notification.workspace_id.as_str())
@@ -3447,6 +3454,7 @@ impl MessageProcessor {
             history.as_slice(),
             &mut agent_skill_overlay,
             &skill_catalog,
+            Some(&prepared_history),
         )
         .await
         .map_err(|error| format!("failed to persist child runtime snapshot: {error:#}"))?;
@@ -3805,6 +3813,15 @@ impl MessageProcessor {
             }
 
             let (max_tools, max_total_schema_bytes) = self.mcp_service.projection_limit_values();
+            let mut projection_limits = crate::turn_mcp::McpProjectionLimits {
+                max_tools,
+                max_total_schema_bytes,
+                ..crate::turn_mcp::McpProjectionLimits::default()
+            };
+            if runtime_kind == CLIAgentRuntimeKind::OpenCode {
+                projection_limits =
+                    crate::cli_runtime::opencode_mcp::projection_limits(projection_limits);
+            }
             let mcp_projection = match scope_current_stage(
                 Stage::CliMcpResolve,
                 self.mcp_service.resolve_mcp_turn_projection(
@@ -3820,11 +3837,7 @@ impl MessageProcessor {
             {
                 Ok(projection) => Some(
                     projection
-                        .with_html_tools(crate::turn_mcp::McpProjectionLimits {
-                            max_tools,
-                            max_total_schema_bytes,
-                            ..crate::turn_mcp::McpProjectionLimits::default()
-                        })
+                        .with_html_tools(projection_limits)
                         .map_err(|error| TurnStartFailure::internal(error.to_string()))?,
                 ),
                 Err(error) => {
@@ -3988,6 +4001,7 @@ impl MessageProcessor {
             };
             let mut codex_mcp_launch_projection = None;
             let mut claude_mcp_launch_projection = None;
+            let mut opencode_mcp_launch_projection = None;
             if let Some(projection) = plan.mcp_projection.as_ref() {
                 // Managed Claude always receives the reserved first-party
                 // filesystem facade, even when the user selected no external
@@ -4090,6 +4104,18 @@ impl MessageProcessor {
                                 ))
                             })?,
                         );
+                    } else if runtime_kind == CLIAgentRuntimeKind::OpenCode {
+                        opencode_mcp_launch_projection = Some(
+                            crate::cli_runtime::opencode_mcp::build_opencode_mcp_session_launch_projection(
+                                projection.clone(),
+                                readiness.contract_fingerprint,
+                            )
+                            .map_err(|error| {
+                                TurnStartFailure::internal(format!(
+                                    "failed to prepare OpenCode MCP schema projection: {error}"
+                                ))
+                            })?,
+                        );
                     }
                 }
             }
@@ -4097,6 +4123,7 @@ impl MessageProcessor {
                 plan,
                 codex_mcp_launch_projection,
                 claude_mcp_launch_projection,
+                opencode_mcp_launch_projection,
                 max_input_tokens,
             })
         }))
@@ -4485,7 +4512,7 @@ impl MessageProcessor {
             {
                 let recovered: anyhow::Result<Option<pioneer_crud::CliRuntimeThreadBindingRecord>> = async {
                     anyhow::ensure!(pending.runtime_id == runtime_id
-                        && pending.runtime_kind == "codex"
+                        && pending.runtime_kind == cli_runtime_protocol_kind_label(runtime_kind)
                         && pending.workspace_id == thread.workspace_id,
                         "pending CLI fork belongs to a different runtime or workspace");
                     let intent = crate::cli_runtime::thread_binding::pending_codex_fork_intent(pending)?
@@ -4506,12 +4533,12 @@ impl MessageProcessor {
                     let proxy_url = self.cli_runtime_proxy_url(thread.workspace_id.as_str(), runtime_id.as_str()).await;
                     let management = manager.existing_or_start_management(
                         session_key.clone(),
-                        crate::cli_runtime::manager::CLIAgentRuntimeSessionStartOptions {
+                        crate::cli_runtime::continuation::CliSessionLaunchSpec::management(crate::cli_runtime::manager::CLIAgentRuntimeSessionStartOptions {
                             cwd: Some(std::path::PathBuf::from(source.cwd.as_deref()
                                 .context("Codex fork source has no authorized working directory")?)),
                             env: crate::cli_runtime::config::proxy_env(proxy_url.as_deref()),
                             ..Default::default()
-                        },
+                        }, runtime_kind, source.native_thread_id.clone())?,
                     ).await?;
                     let found = management.session().find_marked_fork(
                         pending.native_thread_id.as_str(),
@@ -4925,6 +4952,7 @@ impl MessageProcessor {
                 plan: combined_preflight,
                 codex_mcp_launch_projection,
                 claude_mcp_launch_projection,
+                opencode_mcp_launch_projection,
                 max_input_tokens,
             } = match self
                 .prepare_cli_runtime_combined_preflight(
@@ -4992,7 +5020,11 @@ impl MessageProcessor {
                             .is_some_and(|source| source.cwd.is_some())));
             if persisted_context_binding.is_none()
                 && bounded_fork_available
-                && matches!(success_response, TurnStartSuccessResponse::TurnStart)
+                && matches!(
+                    success_response,
+                    TurnStartSuccessResponse::TurnStart
+                        | TurnStartSuccessResponse::VoiceSessionFinalizeAccepted { .. }
+                )
                 && let Some(source) = previous_cli_turn_binding.as_ref()
                 && source.thread_id == continuation_thread_id
                 && source.continuation_thread_id != continuation_thread_id
@@ -5051,12 +5083,12 @@ impl MessageProcessor {
                     let management = manager
                         .existing_or_start_management(
                             session_key.clone(),
-                            crate::cli_runtime::manager::CLIAgentRuntimeSessionStartOptions {
+                            crate::cli_runtime::continuation::CliSessionLaunchSpec::management(crate::cli_runtime::manager::CLIAgentRuntimeSessionStartOptions {
                                 cwd: Some(std::path::PathBuf::from(source.cwd.as_deref()
                                     .context("Codex fork source has no authorized working directory")?)),
                                 env: crate::cli_runtime::config::proxy_env(proxy_url.as_deref()),
                                 ..Default::default()
-                            },
+                            }, runtime_kind, source.native_thread_id.clone())?,
                         )
                         .await?;
                     let now = chrono::Utc::now().fixed_offset();
@@ -5069,7 +5101,7 @@ impl MessageProcessor {
                         thread_id: continuation_thread_id.clone(),
                         workspace_id: thread.workspace_id.clone(),
                         runtime_id: runtime_id.clone(),
-                        runtime_kind: "codex".to_owned(),
+                        runtime_kind: cli_runtime_protocol_kind_label(runtime_kind).to_owned(),
                         native_thread_id: source.native_thread_id.clone(),
                         native_session_id: None,
                         native_root_thread_id: Some(source.native_thread_id.clone()),
@@ -5240,6 +5272,7 @@ impl MessageProcessor {
                 combined_preflight,
                 codex_mcp_launch_projection,
                 claude_mcp_launch_projection,
+                opencode_mcp_launch_projection,
                 max_input_tokens,
             })
             }))
@@ -5258,6 +5291,7 @@ impl MessageProcessor {
                 combined_preflight,
                 codex_mcp_launch_projection,
                 claude_mcp_launch_projection,
+                opencode_mcp_launch_projection,
                 max_input_tokens,
             }) = admission_phase
             else {
@@ -5322,6 +5356,12 @@ impl MessageProcessor {
                 }
                 CLIAgentRuntimeKind::Claude => {
                     crate::cli_runtime::input_mapping::map_claude_turn_input_from_pioneer(
+                        params.input.as_slice(),
+                        resolved_artifacts.as_slice(),
+                    )
+                }
+                CLIAgentRuntimeKind::OpenCode => {
+                    crate::cli_runtime::input_mapping::map_opencode_turn_input_from_pioneer(
                         params.input.as_slice(),
                         resolved_artifacts.as_slice(),
                     )
@@ -5871,6 +5911,29 @@ impl MessageProcessor {
                                 .collect::<Vec<_>>()
                         })
                     })
+                    .or_else(|| {
+                        opencode_mcp_launch_projection.as_ref().map(|launch| {
+                            launch
+                                .canonical_projection
+                                .tools
+                                .iter()
+                                .map(|tool| {
+                                    crate::turn_mcp::persistence::TurnMcpProviderBindingIdentity {
+                                        canonical_callable_name: tool
+                                            .canonical_callable_name
+                                            .clone(),
+                                        provider_callable_name: format!(
+                                            "pioneer_{}",
+                                            tool.canonical_callable_name
+                                        ),
+                                        provider_schema_fingerprint: tool
+                                            .schema_fingerprint
+                                            .clone(),
+                                    }
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                    })
                     .unwrap_or_default();
                 let persisted = match self
                     .mcp_service
@@ -6067,8 +6130,11 @@ impl MessageProcessor {
                 return;
             };
             message_future(async move {
-            if matches!(runtime_kind, CLIAgentRuntimeKind::Codex) {
-                crate::cli_runtime::skills::prepend_codex_installed_skill_items(
+            if matches!(
+                runtime_kind,
+                CLIAgentRuntimeKind::Codex | CLIAgentRuntimeKind::OpenCode
+            ) {
+                crate::cli_runtime::skills::prepend_installed_skill_items(
                     &installed_skills,
                     &mut input_mapping,
                 );
@@ -6315,78 +6381,97 @@ impl MessageProcessor {
                 ));
                 return;
             }
-            let session_result = { let _startup_part = pioneer_observability::turn_startup::stage(&response_turn_id, pioneer_observability::turn_startup::Stage::CliAcquire); if runtime_kind == CLIAgentRuntimeKind::Codex {
-                let persisted_binding = match self
-                    .crud_store
-                    .get_cli_runtime_thread_binding(continuation_thread_id.as_str())
-                    .await
-                {
-                    Ok(binding) => binding,
-                    Err(error) => {
-                        self.mark_turn_blocked(
-                            outcome.started_notification.thread_id.clone(),
-                            outcome.started_notification.turn.id.clone(),
-                            format!("failed to load Codex continuation binding: {error:#}"),
-                        )
-                        .await;
-                        send_turn_start_failure!(format!(
-                            "failed to load Codex continuation binding: {error:#}"
-                        ));
-                        return;
-                    }
-                };
-                let native_thread_id = match persisted_binding {
-                    Some(binding)
-                        if binding.workspace_id == outcome.started_notification.workspace_id
-                            && binding.runtime_id == runtime_id
-                            && binding.runtime_kind
-                                == cli_runtime_protocol_kind_label(runtime_kind) =>
+            let session_result = { let _startup_part = pioneer_observability::turn_startup::stage(&response_turn_id, pioneer_observability::turn_startup::Stage::CliAcquire); match runtime_kind {
+                CLIAgentRuntimeKind::Codex | CLIAgentRuntimeKind::OpenCode => {
+                    let persisted_binding = match self
+                        .crud_store
+                        .get_cli_runtime_thread_binding(continuation_thread_id.as_str())
+                        .await
                     {
-                        (!bootstrap_provider_context).then_some(binding.native_thread_id)
-                    }
-                    Some(binding)
-                        if bootstrap_provider_context
-                            && binding.workspace_id == outcome.started_notification.workspace_id
-                            && binding.status == "active" =>
-                    {
-                        // A different CLI provider cannot resume this session.
-                        // The canonical Pioneer history is bootstrapped into a
-                        // fresh provider conversation below.
-                        None
-                    }
-                    Some(_) => {
-                        self.mark_turn_blocked(
-                            outcome.started_notification.thread_id.clone(),
-                            outcome.started_notification.turn.id.clone(),
-                            "persisted Codex continuation binding does not match the requested runtime"
-                                .to_owned(),
+                        Ok(binding) => binding,
+                        Err(error) => {
+                            self.mark_turn_blocked(
+                                outcome.started_notification.thread_id.clone(),
+                                outcome.started_notification.turn.id.clone(),
+                                format!("failed to load CLI continuation binding: {error:#}"),
+                            )
+                            .await;
+                            send_turn_start_failure!(format!(
+                                "failed to load CLI continuation binding: {error:#}"
+                            ));
+                            return;
+                        }
+                    };
+                    let native_thread_id = match persisted_binding {
+                        Some(binding)
+                            if binding.workspace_id == outcome.started_notification.workspace_id
+                                && binding.runtime_id == runtime_id
+                                && binding.runtime_kind
+                                    == cli_runtime_protocol_kind_label(runtime_kind) =>
+                        {
+                            (!bootstrap_provider_context).then_some(binding.native_thread_id)
+                        }
+                        Some(binding)
+                            if bootstrap_provider_context
+                                && binding.workspace_id == outcome.started_notification.workspace_id
+                                && binding.status == "active" => None,
+                        Some(_) => {
+                            self.mark_turn_blocked(
+                                outcome.started_notification.thread_id.clone(),
+                                outcome.started_notification.turn.id.clone(),
+                                "persisted CLI continuation binding does not match the requested runtime"
+                                    .to_owned(),
+                            )
+                            .await;
+                            send_turn_start_failure!(
+                                "persisted CLI continuation binding does not match the requested runtime"
+                                    .to_owned()
+                            );
+                            return;
+                        }
+                        None => None,
+                    };
+                    let launch_spec = match runtime_kind {
+                        CLIAgentRuntimeKind::Codex => {
+                            crate::cli_runtime::continuation::CliSessionLaunchSpec::codex(
+                                session_options,
+                                codex_mcp_launch_projection
+                                    .clone()
+                                    .map(
+                                        crate::cli_runtime::continuation::CliMcpSessionLaunch::Codex,
+                                    )
+                                    .unwrap_or(
+                                        crate::cli_runtime::continuation::CliMcpSessionLaunch::Disabled,
+                                    ),
+                                native_thread_id,
+                            )
+                        }
+                        CLIAgentRuntimeKind::OpenCode => {
+                            crate::cli_runtime::continuation::CliSessionLaunchSpec::opencode(
+                                session_options,
+                                opencode_mcp_launch_projection
+                                    .clone()
+                                    .map(
+                                        crate::cli_runtime::continuation::CliMcpSessionLaunch::OpenCode,
+                                    )
+                                    .unwrap_or(
+                                        crate::cli_runtime::continuation::CliMcpSessionLaunch::Disabled,
+                                    ),
+                                native_thread_id,
+                            )
+                        }
+                        CLIAgentRuntimeKind::Claude => unreachable!(
+                            "Claude cannot enter RPC/server continuation launch"
+                        ),
+                    };
+                    manager
+                        .get_or_start_with_launch_spec(
+                            session_key.clone(),
+                            launch_spec.with_native_event_budget(native_event_budget),
                         )
-                        .await;
-                        send_turn_start_failure!(
-                            "persisted Codex continuation binding does not match the requested runtime"
-                                .to_owned()
-                        );
-                        return;
-                    }
-                    None => None,
-                };
-                manager
-                    .get_or_start_with_launch_spec(
-                        session_key.clone(),
-                        crate::cli_runtime::continuation::CliSessionLaunchSpec::codex(
-                            session_options,
-                            codex_mcp_launch_projection
-                                .clone()
-                                .map(crate::cli_runtime::continuation::CliMcpSessionLaunch::Codex)
-                                .unwrap_or(
-                                    crate::cli_runtime::continuation::CliMcpSessionLaunch::Disabled,
-                                ),
-                            native_thread_id,
-                        )
-                        .with_native_event_budget(native_event_budget),
-                    )
-                    .await
-            } else {
+                        .await
+                }
+                CLIAgentRuntimeKind::Claude => {
                 let continuation =
                     match crate::cli_runtime::thread_binding::prepare_claude_provider_session(
                         self.crud_store.as_ref(),
@@ -6461,10 +6546,14 @@ impl MessageProcessor {
                     crate::cli_runtime::continuation::CliProviderContinuation::CodexRpcThread {
                         ..
                     } => unreachable!("Claude preparation returned a Codex continuation"),
+                    crate::cli_runtime::continuation::CliProviderContinuation::OpenCodeServerSession {
+                        ..
+                    } => unreachable!("Claude preparation returned an OpenCode continuation"),
                 };
                 manager
                     .get_or_start_with_launch_spec(session_key.clone(), launch_spec)
                     .await
+                }
             } };
             let session_handle = match session_result {
                 Ok(handle) => handle,
@@ -6530,6 +6619,17 @@ impl MessageProcessor {
                         return;
                     }
                 } };
+            if let Some(name) = native_thread.name.as_ref() {
+                self.handle_cli_runtime_event(
+                    session_handle.instance(),
+                    pioneer_cli_agent_runtime::event::RuntimeEvent::ThreadNameUpdated(
+                        pioneer_cli_agent_runtime::event::RuntimeThreadNameUpdated {
+                            native_thread_id: native_thread.binding.native_thread_id.clone(),
+                            name: name.clone(),
+                        },
+                    ),
+                ).await;
+            }
             let input_mapping_json = match pioneer_crud::serialize_cli_runtime_json(&input_mapping)
                 .and_then(|json| match sent_context_basis.as_ref() {
                     Some(basis) => crate::cli_runtime::thread_binding::persist_sent_context_basis_in_input_mapping(
@@ -7492,6 +7592,7 @@ impl MessageProcessor {
         let runtime_kind = match binding.runtime_kind.as_str() {
             "codex" => CLIAgentRuntimeKind::Codex,
             "claude" => CLIAgentRuntimeKind::Claude,
+            "opencode" => CLIAgentRuntimeKind::OpenCode,
             other => {
                 return CliRuntimeLaunchSpecRestore::InvalidBinding {
                     diagnostic: format!("unsupported durable CLI runtime kind `{other}`"),
@@ -7831,6 +7932,14 @@ impl MessageProcessor {
                 )
                 .with_native_event_budget(native_event_budget)
             }
+            CLIAgentRuntimeKind::OpenCode => {
+                crate::cli_runtime::continuation::CliSessionLaunchSpec::opencode(
+                    session_options,
+                    mcp,
+                    Some(binding.native_thread_id.clone()),
+                )
+                .with_native_event_budget(native_event_budget)
+            }
         };
         let session_key = match crate::cli_runtime::manager::CLIAgentRuntimeSessionKey::new(
             binding.workspace_id.as_str(),
@@ -8056,6 +8165,12 @@ impl MessageProcessor {
             .cli_runtime_manager
             .as_ref()
             .context("CLI runtime manager is unavailable")?;
+        let opencode = restored.runtime_kind == CLIAgentRuntimeKind::OpenCode;
+        if opencode {
+            // A recovery attempt owns a new native turn and a new MCP lease.
+            // Close/revoke the old process generation before reserving either.
+            manager.close_session(&restored.session_key).await?;
+        }
         let session_handle = manager
             .get_or_start_with_launch_spec(
                 restored.session_key.clone(),
@@ -8114,6 +8229,47 @@ impl MessageProcessor {
             return Err(error.into());
         }
 
+        if opencode {
+            let reservation: anyhow::Result<()> = async {
+                if let Some(metadata) = cli_session
+                    .prepare_mcp_turn(&prepared_binding.thread_id, &prepared_binding.turn_id)
+                    .await?
+                {
+                    self.crud_store
+                        .bind_cli_runtime_turn_mcp_activation(
+                            &prepared_binding.turn_id,
+                            pioneer_crud::CliRuntimeTurnMcpMetadata {
+                                adapter_kind: metadata.adapter_kind,
+                                manifest_hash: metadata.manifest_hash,
+                                projection_fingerprint: metadata.projection_fingerprint,
+                                provider_contract_fingerprint: metadata
+                                    .provider_contract_fingerprint,
+                                isolation_contract_fingerprint: metadata
+                                    .isolation_contract_fingerprint,
+                                session_generation: i64::try_from(metadata.session_generation)?,
+                                projection_activation_generation: i64::try_from(
+                                    metadata.projection_activation_generation,
+                                )?,
+                            },
+                        )
+                        .await?;
+                }
+                Ok(())
+            }
+            .await;
+            if let Err(error) = reservation {
+                let _ = cli_session
+                    .terminal_mcp_turn(&prepared_binding.turn_id)
+                    .await;
+                self.fail_cli_runtime_turn_attempt(
+                    &attempt.id,
+                    format!("failed to reserve recovery MCP lease: {error:#}"),
+                )
+                .await;
+                return Err(error.into());
+            }
+        }
+
         let native_turn = match cli_session
             .start_turn(
                 crate::cli_runtime::manager::CLIAgentRuntimeTurnStartParams {
@@ -8138,6 +8294,11 @@ impl MessageProcessor {
         {
             Ok(native_turn) => native_turn,
             Err(error) => {
+                if opencode {
+                    let _ = cli_session
+                        .terminal_mcp_turn(&prepared_binding.turn_id)
+                        .await;
+                }
                 self.fail_cli_runtime_turn_attempt(
                     attempt.id.as_str(),
                     format!("failed to start native CLI recovery turn: {error:#}"),
@@ -8167,12 +8328,43 @@ impl MessageProcessor {
                     Some(native_turn_id.as_str()),
                 )
                 .await;
+            if opencode {
+                let _ = cli_session
+                    .terminal_mcp_turn(&prepared_binding.turn_id)
+                    .await;
+            }
             self.fail_cli_runtime_turn_attempt(
                 attempt.id.as_str(),
                 format!("failed to persist native recovery owner: {error:#}"),
             )
             .await;
             return Err(error.into());
+        }
+        if opencode {
+            if let Err(error) = cli_session
+                .activate_mcp_turn(
+                    &prepared_binding.turn_id,
+                    &prepared_binding.native_thread_id,
+                    &native_turn_id,
+                )
+                .await
+            {
+                let _ = cli_session
+                    .interrupt_turn(
+                        Some(&prepared_binding.native_thread_id),
+                        Some(&native_turn_id),
+                    )
+                    .await;
+                let _ = cli_session
+                    .terminal_mcp_turn(&prepared_binding.turn_id)
+                    .await;
+                self.fail_cli_runtime_turn_attempt(
+                    &attempt.id,
+                    format!("failed to activate recovery MCP lease: {error:#}"),
+                )
+                .await;
+                return Err(error.into());
+            }
         }
         drop(_transition);
         if prepared_binding.runtime_kind == "codex" {
@@ -8841,7 +9033,7 @@ impl MessageProcessor {
                 result = &mut cancelled => Err(result.err().unwrap_or_else(|| anyhow::anyhow!("CLI history monitor ended unexpectedly"))),
                 _ = &mut deadline => anyhow::bail!("CLI history preparation exceeded the turn deadline"),
                 prepared = async {
-                    let mut prepared = self.capture_current_context_basis_prepared(
+                    let mut prepared = self.capture_running_context_basis_prepared(
                         &history_store, workspace_id, thread_id, active_turn_id, Some(active_turn_id),
                     ).await?;
                     // Use the shared projector before sizing or sending CLI history.
@@ -8910,6 +9102,7 @@ impl MessageProcessor {
             let transport = match runtime_kind {
                 CLIAgentRuntimeKind::Codex => pioneer_compaction::Transport::Codex,
                 CLIAgentRuntimeKind::Claude => pioneer_compaction::Transport::Claude,
+                CLIAgentRuntimeKind::OpenCode => pioneer_compaction::Transport::OpenCode,
             };
             let current = pioneer_compaction::ModelSelection {
                 transport,
@@ -8924,12 +9117,12 @@ impl MessageProcessor {
                 .map_err(|_| anyhow::anyhow!("workspace compaction settings unavailable"))?
                 .get(workspace_id)
                 .and_then(|workspace| workspace.cli_overrides.get(runtime_id).cloned());
-            let catalog_provider = if runtime_kind == CLIAgentRuntimeKind::Codex {
-                "openai-codex"
-            } else {
-                "anthropic"
+            let (catalog_provider, catalog_model) = match runtime_kind {
+                CLIAgentRuntimeKind::Codex => ("openai-codex", model),
+                CLIAgentRuntimeKind::Claude => ("anthropic", model),
+                CLIAgentRuntimeKind::OpenCode => model.split_once('/').unwrap_or(("opencode", model)),
             };
-            let limits = pioneer_provider::catalog::model_catalog()?.limits(catalog_provider, model);
+            let limits = pioneer_provider::catalog::model_catalog()?.limits(catalog_provider, catalog_model);
             let fraction = 2_u64.saturating_pow(attempt.saturating_add(1));
             let desired = limits
                 .context_window
@@ -11399,6 +11592,9 @@ fn cli_mcp_client_target(
     match runtime_kind {
         CLIAgentRuntimeKind::Codex => crate::cli_mcp_client_validation::CliMcpClientTarget::Codex,
         CLIAgentRuntimeKind::Claude => crate::cli_mcp_client_validation::CliMcpClientTarget::Claude,
+        CLIAgentRuntimeKind::OpenCode => {
+            crate::cli_mcp_client_validation::CliMcpClientTarget::OpenCode
+        }
     }
 }
 
@@ -11438,6 +11634,9 @@ fn cli_runtime_kind_matches_config(
         ) | (
             CLIAgentRuntimeKind::Claude,
             pioneer_config::GatewayCliAgentRuntimeKindConfig::Claude
+        ) | (
+            CLIAgentRuntimeKind::OpenCode,
+            pioneer_config::GatewayCliAgentRuntimeKindConfig::OpenCode
         )
     )
 }
@@ -11446,6 +11645,7 @@ fn cli_runtime_protocol_kind_label(kind: CLIAgentRuntimeKind) -> &'static str {
     match kind {
         CLIAgentRuntimeKind::Codex => "codex",
         CLIAgentRuntimeKind::Claude => "claude",
+        CLIAgentRuntimeKind::OpenCode => "opencode",
     }
 }
 
@@ -11453,6 +11653,7 @@ fn cli_runtime_context_label(kind: CLIAgentRuntimeKind) -> &'static str {
     match kind {
         CLIAgentRuntimeKind::Codex => "Codex CLI",
         CLIAgentRuntimeKind::Claude => "Claude CLI",
+        CLIAgentRuntimeKind::OpenCode => "OpenCode CLI",
     }
 }
 
@@ -11460,6 +11661,7 @@ fn cli_runtime_supports_durable_thread_resume(kind: CLIAgentRuntimeKind) -> bool
     match kind {
         CLIAgentRuntimeKind::Codex => true,
         CLIAgentRuntimeKind::Claude => false,
+        CLIAgentRuntimeKind::OpenCode => true,
     }
 }
 
@@ -11469,6 +11671,7 @@ fn cli_runtime_config_kind_label(
     match kind {
         pioneer_config::GatewayCliAgentRuntimeKindConfig::Codex => "codex",
         pioneer_config::GatewayCliAgentRuntimeKindConfig::Claude => "claude",
+        pioneer_config::GatewayCliAgentRuntimeKindConfig::OpenCode => "opencode",
     }
 }
 

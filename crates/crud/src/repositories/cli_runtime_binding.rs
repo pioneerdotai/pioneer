@@ -1188,6 +1188,33 @@ pub async fn find_turn_binding<C: ConnectionTrait>(
         .transpose()
 }
 
+/// Project provider identity for a bounded timeline page without loading native payloads.
+pub async fn load_runtime_kinds_for_turns<C: ConnectionTrait>(
+    db: &C,
+    turn_ids: &[String],
+) -> Result<std::collections::BTreeMap<String, pioneer_protocol::CLIAgentRuntimeKind>> {
+    if turn_ids.is_empty() {
+        return Ok(Default::default());
+    }
+    let rows = turn_cli_runtime_binding::Entity::find()
+        .select_only()
+        .columns([
+            turn_cli_runtime_binding::Column::TurnId,
+            turn_cli_runtime_binding::Column::RuntimeKind,
+        ])
+        .filter(turn_cli_runtime_binding::Column::TurnId.is_in(turn_ids.iter().cloned()))
+        .into_tuple::<(String, String)>()
+        .all(db)
+        .await?;
+    rows.into_iter()
+        .map(|(turn_id, kind)| {
+            let kind = serde_json::from_value(serde_json::Value::String(kind))
+                .context("invalid persisted CLI provider kind")?;
+            Ok((turn_id, kind))
+        })
+        .collect()
+}
+
 /// A receipt cannot rule out a newer dispatch (including an unknown RPC
 /// outcome). Use the continuation-owner index and return only one identifier;
 /// never load or parse the thread's older input mappings. Timestamp ties are

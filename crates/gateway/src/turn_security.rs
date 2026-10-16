@@ -43,6 +43,7 @@ pub(crate) enum TurnSecurityResolverExecutionBackend {
     NativeApiProvider { provider: String },
     CodexCli { runtime_id: String },
     ClaudeCli { runtime_id: String },
+    OpenCodeCli { runtime_id: String },
 }
 
 impl TurnSecurityResolverExecutionBackend {
@@ -52,6 +53,7 @@ impl TurnSecurityResolverExecutionBackend {
             Self::NativeApiProvider { .. } => TurnSecurityExecutionBackendKind::Native,
             Self::CodexCli { .. } => TurnSecurityExecutionBackendKind::CodexCli,
             Self::ClaudeCli { .. } => TurnSecurityExecutionBackendKind::ClaudeCli,
+            Self::OpenCodeCli { .. } => TurnSecurityExecutionBackendKind::OpenCodeCli,
         }
     }
 }
@@ -458,6 +460,16 @@ fn backend_snapshot_for(input: &TurnSecurityResolverInput) -> TurnSecurityBacken
                 cli_runtime_provider_capabilities(CLIAgentRuntimeProviderKind::Claude);
             TurnSecurityBackendSnapshot {
                 execution_backend: TurnSecurityExecutionBackendKind::ClaudeCli,
+                sandbox_backend: cli_provider_sandbox_backend(capabilities),
+                provider: Some(runtime_id.clone()),
+                capabilities: backend_capabilities_from_cli_provider(capabilities),
+            }
+        }
+        TurnSecurityResolverExecutionBackend::OpenCodeCli { runtime_id } => {
+            let capabilities =
+                cli_runtime_provider_capabilities(CLIAgentRuntimeProviderKind::OpenCode);
+            TurnSecurityBackendSnapshot {
+                execution_backend: TurnSecurityExecutionBackendKind::OpenCodeCli,
                 sandbox_backend: cli_provider_sandbox_backend(capabilities),
                 provider: Some(runtime_id.clone()),
                 capabilities: backend_capabilities_from_cli_provider(capabilities),
@@ -1192,6 +1204,9 @@ fn resolve_execution_backend(
                 }
                 CLIAgentRuntimeKind::Claude => {
                     Ok(TurnSecurityResolverExecutionBackend::ClaudeCli { runtime_id })
+                }
+                CLIAgentRuntimeKind::OpenCode => {
+                    Ok(TurnSecurityResolverExecutionBackend::OpenCodeCli { runtime_id })
                 }
             }
         }

@@ -805,6 +805,7 @@ impl TaskEventPayload {
             | Self::TaskScheduled { .. }
             | Self::TaskQueued { .. }
             | Self::RunCreated { .. }
+            | Self::RunStarting { .. }
             | Self::RunStarted { .. }
             | Self::RunCompleted { .. }
             | Self::RunFailed { .. }

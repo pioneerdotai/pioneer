@@ -337,6 +337,7 @@ fn cli_runtime_provider_instance_from_draft(
         let expected_transport = match draft.kind {
             CLIAgentRuntimeKind::Codex => ModelSelectionTransport::Codex,
             CLIAgentRuntimeKind::Claude => ModelSelectionTransport::Claude,
+            CLIAgentRuntimeKind::OpenCode => ModelSelectionTransport::OpenCode,
         };
         let original = match &draft.mode {
             CLIRuntimeProviderDraftMode::Edit { original_id } => original_id.as_str(),
@@ -601,8 +602,11 @@ pub fn cli_runtime_provider_default_shadow_home_placeholder(
     cli_runtime_provider_kind_defaults(kind).shadow_home_placeholder
 }
 
-pub const CLI_RUNTIME_PROVIDER_SUPPORTED_KINDS: [CLIAgentRuntimeKind; 2] =
-    [CLIAgentRuntimeKind::Codex, CLIAgentRuntimeKind::Claude];
+pub const CLI_RUNTIME_PROVIDER_SUPPORTED_KINDS: [CLIAgentRuntimeKind; 3] = [
+    CLIAgentRuntimeKind::Codex,
+    CLIAgentRuntimeKind::Claude,
+    CLIAgentRuntimeKind::OpenCode,
+];
 
 fn cli_runtime_provider_kind_defaults(kind: CLIAgentRuntimeKind) -> CLIRuntimeProviderKindDefaults {
     match kind {
@@ -621,6 +625,14 @@ fn cli_runtime_provider_kind_defaults(kind: CLIAgentRuntimeKind) -> CLIRuntimePr
             binary_path: "claude",
             home_path: "~/.claude",
             shadow_home_placeholder: "~/.pioneer/claude-work",
+        },
+        CLIAgentRuntimeKind::OpenCode => CLIRuntimeProviderKindDefaults {
+            id_base: "opencode",
+            kind_label: "OpenCode",
+            display_name: "OpenCode",
+            binary_path: "opencode",
+            home_path: "~/.config/opencode",
+            shadow_home_placeholder: "~/.pioneer/opencode-work",
         },
     }
 }
@@ -763,6 +775,28 @@ mod tests {
         assert_eq!(draft.binary_path, "claude");
         assert_eq!(draft.home_path, "~/.claude");
         assert!(draft.shadow_home_path.is_empty());
+    }
+
+    #[test]
+    fn create_opencode_draft_uses_server_runtime_defaults() {
+        let current = snapshot(vec![codex_instance("codex", "Codex")]);
+        let draft =
+            CLIRuntimeProviderDraft::create_for_kind(Some(&current), CLIAgentRuntimeKind::OpenCode);
+
+        assert_eq!(draft.kind, CLIAgentRuntimeKind::OpenCode);
+        assert_eq!(draft.id, "opencode");
+        assert_eq!(draft.display_name, "OpenCode");
+        assert_eq!(draft.binary_path, "opencode");
+        assert_eq!(draft.home_path, "~/.config/opencode");
+        assert!(draft.shadow_home_path.is_empty());
+        assert_eq!(
+            CLI_RUNTIME_PROVIDER_SUPPORTED_KINDS,
+            [
+                CLIAgentRuntimeKind::Codex,
+                CLIAgentRuntimeKind::Claude,
+                CLIAgentRuntimeKind::OpenCode,
+            ]
+        );
     }
 
     #[test]

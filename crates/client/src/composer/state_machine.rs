@@ -1017,6 +1017,7 @@ mod tests {
             item_id: "item-a".to_owned(),
             mode: ThreadMode::Message,
             author: Some(TurnAuthorSnapshot {
+                cli_runtime_kind: None,
                 actor: PersistedActorRef::Principal(
                     PrincipalId::new("PAAAAAAAAAAAAAAAAAAAA").expect("principal id"),
                 ),

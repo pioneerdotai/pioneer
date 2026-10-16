@@ -2563,6 +2563,46 @@ pub async fn load_current_agent_authors_for_executions<C: ConnectionTrait>(
     if execution_ids.len() > AGENT_PROJECTION_BATCH_LIMIT {
         bail!("Agent author projection batch exceeds its bounded limit");
     }
+    // A CLI occurrence's provider is an execution fact, not its avatar or label.
+    // DISTINCT bounds the result by execution/provider pairs, including retries.
+    let placeholders = vec!["?"; execution_ids.len()].join(",");
+    let runtime_rows = db
+        .query_all_raw(Statement::from_sql_and_values(
+            db.get_database_backend(),
+            format!(
+                "SELECT DISTINCT e.id AS execution_id, b.runtime_kind \
+                 FROM agent_execution e \
+                 JOIN agent_identity i ON i.id = e.agent_identity_id \
+                 JOIN task_run_execution r ON r.id = e.id AND r.task_id = e.parent_task_id \
+                 JOIN task_run_turn t ON t.run_id = r.task_run_id AND t.execution_id = r.id \
+                 JOIN turn_cli_runtime_binding b ON b.turn_id = t.turn_id \
+                 WHERE i.source_kind = 'cli_runtime_instance' \
+                 AND b.workspace_id = e.workspace_id AND b.runtime_id = i.source_id \
+                 AND e.id IN ({placeholders}) LIMIT ?"
+            ),
+            execution_ids
+                .iter()
+                .cloned()
+                .map(sea_orm::Value::from)
+                .chain(std::iter::once(sea_orm::Value::from(
+                    execution_ids.len() as i64 * 3 + 1,
+                ))),
+        ))
+        .await?;
+    let mut runtime_kinds = BTreeMap::new();
+    for row in runtime_rows {
+        let execution_id: String = row.try_get("", "execution_id")?;
+        let kind: String = row.try_get("", "runtime_kind")?;
+        let kind: pioneer_protocol::CLIAgentRuntimeKind =
+            serde_json::from_value(serde_json::Value::String(kind))
+                .context("invalid CLI provider kind in Agent execution binding")?;
+        if runtime_kinds
+            .insert(execution_id, kind)
+            .is_some_and(|old| old != kind)
+        {
+            bail!("Agent execution has conflicting CLI provider identities");
+        }
+    }
     let executions = agent_execution::Entity::find()
         .filter(agent_execution::Column::Id.is_in(execution_ids.iter().cloned()))
         .all(db)
@@ -2643,7 +2683,7 @@ pub async fn load_current_agent_authors_for_executions<C: ConnectionTrait>(
         let snapshot = snapshots_by_id
             .get(snapshot_id)
             .context("author AgentExecution presentation snapshot is missing")?;
-        let author = if let Some(current_snapshot) =
+        let mut author = if let Some(current_snapshot) =
             current_snapshots_by_identity_id.get(identity.id.as_str())
         {
             current_agent_author_from_rows(identity, &execution, snapshot, current_snapshot)?
@@ -2651,6 +2691,7 @@ pub async fn load_current_agent_authors_for_executions<C: ConnectionTrait>(
             agent_presentation_snapshot_from_rows(identity, &execution, snapshot)?
                 .to_turn_author_snapshot()
         };
+        author.cli_runtime_kind = runtime_kinds.get(&execution.id).copied();
         result.insert(
             execution.id,
             AgentExecutionAuthorProjection {

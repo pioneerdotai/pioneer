@@ -800,3 +800,133 @@ async fn thread_scope_from_model<C: ConnectionTrait>(
         creator_principal_id,
     }))
 }
+
+/// One bounded page of executing tasks, using the same causal root and admission
+/// checks as `resolve_task_authorization_scope`. No run history or payload JSON
+/// is loaded. Membership facts are read in the same statement as the scope.
+pub async fn list_running_task_scopes<C: ConnectionTrait>(
+    db: &C,
+    workspace_id: &str,
+    thread_ids: &[String],
+    principal_id: &PrincipalId,
+    after_task_id: &str,
+) -> Result<RunningTaskScopePage> {
+    use sea_orm::{Statement, Value};
+    if thread_ids.is_empty() {
+        return Ok(RunningTaskScopePage::default());
+    }
+    anyhow::ensure!(
+        thread_ids.len() <= 500,
+        "task activity candidate batch exceeds tree limit"
+    );
+    let placeholders = vec!["?"; thread_ids.len()].join(",");
+    let sql = format!(
+        r#"
+SELECT DISTINCT t.id AS task_id, rt.id AS root_thread_id, rt.access_class,
+       rt.created_by_actor_kind, rt.created_by_actor_id,
+       c.created_by_actor_kind AS cause_actor_kind, c.created_by_actor_id AS cause_actor_id,
+       r.owner_kind, r.owner_id, w.is_active,
+       EXISTS (SELECT 1 FROM workspace_membership wm
+               WHERE wm.workspace_id = w.id AND wm.principal_id = ?) AS workspace_member,
+       EXISTS (SELECT 1 FROM thread_membership tm
+               WHERE tm.thread_id = rt.id AND tm.principal_id = ?) AS thread_member
+FROM task_run tr
+JOIN task t ON t.id = tr.task_id
+JOIN task r ON r.id = COALESCE(t.root_task_id, t.id)
+           AND r.workspace_id = t.workspace_id AND r.root_task_id IS NULL
+JOIN workspace w ON w.id = t.workspace_id
+LEFT JOIN turn ct ON ct.id = r.created_by_turn_id
+JOIN thread c ON c.id = COALESCE(r.created_by_thread_id,
+                    CASE WHEN r.owner_kind = 'thread' THEN r.owner_id END, ct.thread_id)
+             AND c.workspace_id = t.workspace_id
+LEFT JOIN thread_lineage l ON l.child_thread_id = c.id
+JOIN thread rt ON rt.id = CASE WHEN c.access_class = 'internal' THEN l.root_thread_id ELSE c.id END
+              AND rt.workspace_id = t.workspace_id
+LEFT JOIN task_execution_admission a ON a.task_id = t.id
+WHERE tr.status IN ('starting', 'running') AND t.workspace_id = ? AND t.id > ?
+  AND rt.id IN ({placeholders}) AND rt.access_class IN ('private', 'workspace')
+  AND c.access_class IN ('private', 'workspace', 'internal')
+  AND (r.created_by_turn_id IS NULL OR ct.thread_id = c.id)
+  AND (a.task_id IS NULL OR a.root_thread_id = rt.id)
+ORDER BY t.id LIMIT 128
+"#
+    );
+    let mut values: Vec<Value> = vec![
+        principal_id.to_string().into(),
+        principal_id.to_string().into(),
+        workspace_id.to_owned().into(),
+        after_task_id.to_owned().into(),
+    ];
+    values.extend(thread_ids.iter().cloned().map(Into::into));
+    let rows = db
+        .query_all_raw(Statement::from_sql_and_values(
+            db.get_database_backend(),
+            sql,
+            values,
+        ))
+        .await
+        .context("failed to load running task scopes")?;
+    let mut page = RunningTaskScopePage::default();
+    for row in rows {
+        let task_id: String = row.try_get("", "task_id")?;
+        page.after_task_id = Some(task_id.clone());
+        let owner_kind: String = row.try_get("", "owner_kind")?;
+        let owner_id: Option<String> = row.try_get("", "owner_id")?;
+        let initiating_principal_id = if owner_kind == "user" {
+            let Some(id) = owner_id.and_then(|id| PrincipalId::new(id).ok()) else {
+                continue;
+            };
+            Some(id)
+        } else {
+            None
+        };
+        let mut creator_principal_id = None;
+        let mut valid_actors = true;
+        for (kind_column, id_column) in [
+            ("cause_actor_kind", "cause_actor_id"),
+            ("created_by_actor_kind", "created_by_actor_id"),
+        ] {
+            let kind: Option<String> = row.try_get("", kind_column)?;
+            let id: Option<String> = row.try_get("", id_column)?;
+            match actor_ref_from_db(kind.as_deref(), id.as_deref()) {
+                Ok(Some(PersistedActorRef::Principal(id))) => creator_principal_id = Some(id),
+                Ok(_) => creator_principal_id = None,
+                Err(_) => {
+                    valid_actors = false;
+                    break;
+                }
+            }
+        }
+        if !valid_actors {
+            continue;
+        }
+        let thread_id: String = row.try_get("", "root_thread_id")?;
+        let access_class: String = row.try_get("", "access_class")?;
+        let workspace_is_active = row.try_get("", "is_active")?;
+        page.scopes.push((
+            TaskAuthorizationScope {
+                workspace_id: workspace_id.to_owned(),
+                root_thread_id: Some(thread_id.clone()),
+                task_id,
+                workspace_is_active,
+                root_thread: Some(ThreadAuthorizationScope {
+                    workspace_id: workspace_id.to_owned(),
+                    thread_id,
+                    workspace_is_active,
+                    access_class: persisted_thread_access_class_from_db(&access_class)?,
+                    creator_principal_id,
+                }),
+                initiating_principal_id,
+            },
+            row.try_get("", "workspace_member")?,
+            row.try_get("", "thread_member")?,
+        ));
+    }
+    Ok(page)
+}
+
+#[derive(Default)]
+pub struct RunningTaskScopePage {
+    pub after_task_id: Option<String>,
+    pub scopes: Vec<(TaskAuthorizationScope, bool, bool)>,
+}

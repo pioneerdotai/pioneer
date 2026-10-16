@@ -30,6 +30,25 @@ struct SidebarThreadRow {
     unread_count: u64,
 }
 
+// Stock Spinner animation invalidates only this retained view. Virtualized
+// rows that are not painted do not keep the sidebar/tree rendering each frame.
+pub(super) struct TaskActivityIndicator;
+impl Render for TaskActivityIndicator {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .id("task-activity")
+            .flex_shrink_0()
+            .tooltip(|window, cx| {
+                tooltip::Tooltip::new(t!("sidebar.taskActivity").to_string()).build(window, cx)
+            })
+            .child(
+                spinner::Spinner::new()
+                    .small()
+                    .color(cx.theme().muted_foreground),
+            )
+    }
+}
+
 struct SidebarTreeModel {
     items: Vec<TreeItem>,
     visible_node_ids: Vec<String>,
@@ -53,6 +72,30 @@ actions!(sidebar_thread_menu, [SidebarThreadRename]);
 impl ThreadSidebarView {
     pub(super) fn rebuild_sidebar_tree_state(&mut self, cx: &mut Context<Self>) {
         cx.notify();
+        let mut active_nodes = std::collections::HashSet::new();
+        if let Some(input) = &self.input {
+            active_nodes.extend(
+                input
+                    .snapshot()
+                    .running_task_thread_ids
+                    .iter()
+                    .map(|id| thread_node_key(id)),
+            );
+            active_nodes.extend(
+                input
+                    .snapshot()
+                    .running_task_folder_ids
+                    .iter()
+                    .map(|id| client_thread_tree::sidebar_folder_node_id(id)),
+            );
+        }
+        self.task_activity_indicators
+            .retain(|id, _| active_nodes.contains(id));
+        for id in active_nodes {
+            self.task_activity_indicators
+                .entry(id)
+                .or_insert_with(|| cx.new(|_| TaskActivityIndicator));
+        }
         let model = self.build_sidebar_tree_model();
         let selected_ix = if matches!(
             self.main_content_view(),
@@ -102,6 +145,8 @@ impl ThreadSidebarView {
         let scoped_thread_capabilities = self.thread_scope_capabilities;
         let active_workspace_id = self.active_workspace_id().map(str::to_owned);
         let rows_by_thread_id = self.sidebar_rows_by_thread_id();
+        let task_activity_indicators = self.task_activity_indicators.clone();
+        let publication = self.input.clone();
         let folders_by_id: Arc<HashMap<String, ThreadFolder>> = Arc::new(
             active_workspace_id
                 .as_deref()
@@ -357,6 +402,7 @@ impl ThreadSidebarView {
                                                     |this| {
                                                         this.child(
                                                             div()
+                                                                .flex_shrink_0()
                                                                 .min_w_5()
                                                                 .h_5()
                                                                 .px_1()
@@ -371,6 +417,10 @@ impl ThreadSidebarView {
                                                                 )),
                                                         )
                                                     },
+                                                )
+                                                .when_some(
+                                                    task_activity_indicators.get(item_id).cloned(),
+                                                    |this, indicator| this.child(indicator),
                                                 ),
                                         ),
                                 ),
@@ -395,6 +445,11 @@ impl ThreadSidebarView {
                     render_agents_doc_file_row(item_id, entry.depth(), selected, open_listener, cx)
                 }
                 SidebarTreeNodeKey::Folder(folder_id) => {
+                    let unread_count = publication
+                        .as_ref()
+                        .and_then(|p| p.snapshot().unread_by_folder_id.get(folder_id))
+                        .copied()
+                        .unwrap_or(0);
                     let folder = folders_by_id.get(folder_id).cloned();
                     let folder_name = folder
                         .as_ref()
@@ -579,7 +634,8 @@ impl ThreadSidebarView {
                                         .child(
                                             h_flex()
                                                 .id(format!("thread-tree-folder-hover-{item_id}"))
-                                                .w_full()
+                                                .flex_1()
+                                                .min_w_0()
                                                 .h(px(TREE_ROW_CONTENT_HEIGHT_PX))
                                                 .items_center()
                                                 .gap(px(TREE_ROW_GAP_PX))
@@ -604,13 +660,36 @@ impl ThreadSidebarView {
                                                 )
                                                 .child(
                                                     div()
+                                                        .flex_1()
+                                                        .min_w_0()
+                                                        .overflow_hidden()
+                                                        .text_ellipsis()
                                                         .text_sm()
                                                         .text_color(cx.theme().foreground)
                                                         .line_height(relative(1.0))
                                                         .font_normal()
                                                         .opacity(SIDEBAR_MENU_ITEM_OPACITY)
                                                         .child(folder_name),
-                                                ),
+                                                )
+                                                .when(unread_count > 0, |this| {
+                                                    this.child(
+                                                        div()
+                                                            .min_w_5()
+                                                            .h_5()
+                                                            .px_1()
+                                                            .rounded_full()
+                                                            .flex()
+                                                            .flex_shrink_0()
+                                                            .items_center()
+                                                            .justify_center()
+                                                            .text_xs()
+                                                            .bg(cx.theme().muted)
+                                                            .child(div().opacity(0.8).child(
+                                                                unread_count.to_string(),
+                                                            )),
+                                                    )
+                                                })
+                                                .when_some(task_activity_indicators.get(item_id).cloned(), |this, indicator| this.child(indicator)),
                                         ),
                                 ),
                         )

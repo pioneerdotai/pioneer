@@ -1272,6 +1272,8 @@ pub enum GatewayCliAgentRuntimeKindConfig {
     #[default]
     Codex,
     Claude,
+    #[serde(rename = "opencode")]
+    OpenCode,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -2431,12 +2433,35 @@ fn default_claude_cli_agent_runtime_instance(
     }
 }
 
+fn default_opencode_cli_agent_runtime_instance(
+    defaults: &GatewayCliAgentRuntimeConfig,
+) -> EffectiveGatewayCliAgentRuntimeInstanceConfig {
+    EffectiveGatewayCliAgentRuntimeInstanceConfig {
+        id: "opencode".to_owned(),
+        kind: GatewayCliAgentRuntimeKindConfig::OpenCode,
+        display_name: "OpenCode".to_owned(),
+        enabled: defaults.enabled,
+        binary_path: "opencode".to_owned(),
+        home_path: "~/.config/opencode".to_owned(),
+        shadow_home_path: None,
+        custom_models: Vec::new(),
+        app_server_args: Vec::new(),
+        startup_probe_timeout_ms: defaults.startup_timeout_ms,
+        request_timeout_ms: defaults.request_timeout_ms,
+        idle_session_ttl_secs: defaults.idle_session_ttl_secs,
+        event_channel_capacity: defaults.event_channel_capacity,
+        stderr_ring_lines: defaults.stderr_ring_lines,
+        debug_native_events: defaults.debug_native_events,
+    }
+}
+
 fn default_cli_agent_runtime_instances(
     defaults: &GatewayCliAgentRuntimeConfig,
 ) -> Vec<EffectiveGatewayCliAgentRuntimeInstanceConfig> {
     vec![
         default_codex_cli_agent_runtime_instance(defaults),
         default_claude_cli_agent_runtime_instance(defaults),
+        default_opencode_cli_agent_runtime_instance(defaults),
     ]
 }
 
@@ -2489,6 +2514,7 @@ fn default_cli_agent_runtime_binary_path(kind: GatewayCliAgentRuntimeKindConfig)
     match kind {
         GatewayCliAgentRuntimeKindConfig::Codex => "codex".to_owned(),
         GatewayCliAgentRuntimeKindConfig::Claude => "claude".to_owned(),
+        GatewayCliAgentRuntimeKindConfig::OpenCode => "opencode".to_owned(),
     }
 }
 
@@ -2496,6 +2522,7 @@ fn default_cli_agent_runtime_home_path(kind: GatewayCliAgentRuntimeKindConfig) -
     match kind {
         GatewayCliAgentRuntimeKindConfig::Codex => "~/.codex".to_owned(),
         GatewayCliAgentRuntimeKindConfig::Claude => "~/.claude".to_owned(),
+        GatewayCliAgentRuntimeKindConfig::OpenCode => "~/.config/opencode".to_owned(),
     }
 }
 
@@ -3803,10 +3830,19 @@ kind = "claude"
             4
         );
 
-        assert_eq!(
-            config.gateway.effective_cli_agent_runtime_instances().len(),
-            2
-        );
+        let instances = config.gateway.effective_cli_agent_runtime_instances();
+        assert_eq!(instances.len(), 3);
+        for (id, kind) in [
+            ("codex", GatewayCliAgentRuntimeKindConfig::Codex),
+            ("claude", GatewayCliAgentRuntimeKindConfig::Claude),
+            ("opencode", GatewayCliAgentRuntimeKindConfig::OpenCode),
+        ] {
+            let instance = instances
+                .iter()
+                .find(|instance| instance.id == id)
+                .expect(id);
+            assert_eq!(instance.kind, kind);
+        }
 
         let _ = fs::remove_file(workspace_override);
     }
@@ -3851,7 +3887,12 @@ request_timeout_ms = 60000
                 .expect("load config with default CLI runtimes enabled");
         let instances = config.gateway.effective_cli_agent_runtime_instances();
 
-        assert_eq!(instances.len(), 2);
+        assert_eq!(instances.len(), 3);
+        assert_eq!(
+            instances[2].kind,
+            GatewayCliAgentRuntimeKindConfig::OpenCode
+        );
+        assert_eq!(instances[2].id, "opencode");
         assert_eq!(instances[0].id, "codex");
         assert_eq!(instances[0].kind, GatewayCliAgentRuntimeKindConfig::Codex);
         assert_eq!(instances[0].display_name, "Codex");
@@ -3903,7 +3944,8 @@ request_timeout_ms = 45000
         assert_eq!(config.gateway.cli_agent_runtimes.instances.len(), 1);
 
         let instances = config.gateway.effective_cli_agent_runtime_instances();
-        assert_eq!(instances.len(), 3);
+        assert_eq!(instances.len(), 4);
+        assert_eq!(instances[3].id, "opencode");
         let instance = &instances[0];
         assert_eq!(instance.id, "codex_personal");
         assert_eq!(instance.kind, GatewayCliAgentRuntimeKindConfig::Codex);
@@ -3957,7 +3999,8 @@ request_timeout_ms = 0
                 .expect("load config with multiple codex runtime instances");
         let instances = config.gateway.effective_cli_agent_runtime_instances();
 
-        assert_eq!(instances.len(), 4);
+        assert_eq!(instances.len(), 5);
+        assert_eq!(instances[4].id, "opencode");
         assert_eq!(instances[0].id, "codex_personal");
         assert_eq!(instances[0].display_name, "Codex Personal");
         assert!(instances[0].enabled);

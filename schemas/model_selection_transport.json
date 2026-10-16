@@ -5,6 +5,7 @@
   "enum": [
     "api",
     "codex",
-    "claude"
+    "claude",
+    "opencode"
   ]
 }

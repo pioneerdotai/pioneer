@@ -654,6 +654,11 @@ pub struct MessageProcessor {
     native_permission_approval_worker: Arc<Mutex<Option<JoinHandle<()>>>>,
     artifact_finalization_retry_turns: Arc<Mutex<HashSet<String>>>,
     title_job_runtime: Arc<Mutex<HashMap<String, ThreadTitleJobState>>>,
+    thread_title_publication_mutexes: Arc<Mutex<HashMap<String, Weak<Mutex<()>>>>>,
+    #[cfg(test)]
+    thread_title_publication_barrier: Arc<Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>>,
+    #[cfg(test)]
+    thread_title_publication_attempted: Arc<tokio::sync::Notify>,
     timeout_supervisor: Arc<TimeoutSupervisor>,
     recovery_coordinator: Arc<RecoveryCoordinator>,
     native_turn_event_delivery_kick_running: Arc<AtomicBool>,
@@ -676,7 +681,7 @@ pub struct MessageProcessor {
     #[cfg(test)]
     cli_runtime_skill_preflight_test_events: Arc<Mutex<Vec<String>>>,
     #[cfg(test)]
-    cli_mcp_readiness_overrides: [Option<pioneer_protocol::CliMcpAdapterReadiness>; 2],
+    cli_mcp_readiness_overrides: [Option<pioneer_protocol::CliMcpAdapterReadiness>; 3],
     skill_upload_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     skill_upload_owners: Arc<Mutex<HashMap<String, AuthenticatedTransferOwner>>>,
     pub(crate) task_agent_executor: Arc<task_agent_executor::TaskAgentExecutor>,
@@ -1302,6 +1307,11 @@ impl MessageProcessor {
             native_permission_approval_worker: Arc::new(Mutex::new(None)),
             artifact_finalization_retry_turns: Arc::new(Mutex::new(HashSet::new())),
             title_job_runtime: Arc::new(Mutex::new(HashMap::new())),
+            thread_title_publication_mutexes: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(test)]
+            thread_title_publication_barrier: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            thread_title_publication_attempted: Arc::new(tokio::sync::Notify::new()),
             timeout_supervisor,
             recovery_coordinator,
             native_turn_event_delivery_kick_running: Arc::new(AtomicBool::new(false)),
@@ -1328,7 +1338,7 @@ impl MessageProcessor {
             #[cfg(test)]
             cli_runtime_skill_preflight_test_events: Arc::new(Mutex::new(Vec::new())),
             #[cfg(test)]
-            cli_mcp_readiness_overrides: [None, None],
+            cli_mcp_readiness_overrides: [None, None, None],
             skill_upload_locks: Arc::new(Mutex::new(HashMap::new())),
             skill_upload_owners: Arc::new(Mutex::new(HashMap::new())),
             task_agent_executor,
@@ -1747,6 +1757,7 @@ impl MessageProcessor {
         let slot = match readiness.injection {
             pioneer_protocol::CliMcpInjectionKind::CodexManagedStdioMcp => 0,
             pioneer_protocol::CliMcpInjectionKind::ClaudeStrictStdioMcp => 1,
+            pioneer_protocol::CliMcpInjectionKind::OpenCodeDynamicStdioMcp => 2,
         };
         self.cli_mcp_readiness_overrides[slot] = Some(readiness);
         self
@@ -1760,6 +1771,7 @@ impl MessageProcessor {
         let slot = match runtime_kind {
             pioneer_protocol::CLIAgentRuntimeKind::Codex => 0,
             pioneer_protocol::CLIAgentRuntimeKind::Claude => 1,
+            pioneer_protocol::CLIAgentRuntimeKind::OpenCode => 2,
         };
         self.cli_mcp_readiness_overrides[slot].clone()
     }
@@ -4217,6 +4229,7 @@ impl MessageProcessor {
         history: &[ChatMessage],
         agent_skill_overlay: &[pioneer_skills::AgentSkillRuntimeEntry],
         skill_catalog: &pioneer_skills::SkillCatalogSnapshot,
+        accepted_history: Option<&crate::compaction::frozen::PreparedHistory>,
     ) -> anyhow::Result<()> {
         let canonical = history.iter().all(|message| message.provenance.is_some());
         let mut snapshot = crate::turn_runtime_snapshot::new_turn_runtime_snapshot(
@@ -4238,15 +4251,38 @@ impl MessageProcessor {
             skill_catalog,
         )?;
         let mut frozen_prepared = None;
-        if canonical {
-            let allowed = crate::compaction::frozen::execution_history_scopes(
-                self.crud_store.as_ref(),
-                workspace_id,
-                thread_id,
-                turn_id,
-                hook_runtime_context.conversation_thread_id.as_deref(),
-            )
-            .await?;
+        if let Some(prepared) = accepted_history {
+            anyhow::ensure!(
+                canonical && history == prepared.messages.as_slice(),
+                "runtime history does not match its accepted preparation"
+            );
+            anyhow::ensure!(
+                prepared.accepted_scopes.contains(thread_id),
+                "runtime preparation does not include its destination"
+            );
+            snapshot.history_json = serde_json::to_string(&prepared.descriptor)?;
+        } else if canonical {
+            let allowed =
+                if let Some(accepted) = self.crud_store.get_turn_runtime_snapshot(turn_id).await? {
+                    anyhow::ensure!(
+                        accepted.workspace_id == workspace_id && accepted.thread_id == thread_id,
+                        "runtime history scope identity mismatch"
+                    );
+                    crate::turn_runtime_snapshot::accepted_history_scopes_from_snapshot(
+                        self.crud_store.as_ref(),
+                        &accepted,
+                    )
+                    .await?
+                } else {
+                    crate::compaction::frozen::execution_history_scopes(
+                        self.crud_store.as_ref(),
+                        workspace_id,
+                        thread_id,
+                        turn_id,
+                        hook_runtime_context.conversation_thread_id.as_deref(),
+                    )
+                    .await?
+                };
             let prepared = crate::compaction::frozen::capture_prepared(
                 self.crud_store.as_ref(),
                 workspace_id,
@@ -4309,7 +4345,13 @@ impl MessageProcessor {
         });
         snapshot.validate_storage_size()?;
         self.crud_store
-            .insert_native_turn_runtime_snapshot(snapshot)
+            .insert_native_turn_runtime_snapshot_with_source_epochs(
+                snapshot,
+                accepted_history
+                    .or(frozen_prepared.as_ref())
+                    .map(|p| &p.source_epochs)
+                    .unwrap_or(&Default::default()),
+            )
             .await
             .with_context(|| format!("failed to persist runtime snapshot for turn `{turn_id}`"))?;
         drop(frozen_prepared);
@@ -4383,6 +4425,7 @@ impl MessageProcessor {
         history: &[ChatMessage],
         agent_skill_overlay: &[pioneer_skills::AgentSkillRuntimeEntry],
         skill_catalog: &pioneer_skills::SkillCatalogSnapshot,
+        accepted_history: Option<&crate::compaction::frozen::PreparedHistory>,
     ) -> anyhow::Result<()> {
         self.persist_turn_runtime_snapshot(
             thread_id,
@@ -4401,6 +4444,7 @@ impl MessageProcessor {
             history,
             agent_skill_overlay,
             skill_catalog,
+            accepted_history,
         )
         .await
     }
@@ -4977,6 +5021,11 @@ impl MessageProcessor {
             native_permission_approval_worker: Arc::new(Mutex::new(None)),
             artifact_finalization_retry_turns: Arc::new(Mutex::new(HashSet::new())),
             title_job_runtime: Arc::new(Mutex::new(HashMap::new())),
+            thread_title_publication_mutexes: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(test)]
+            thread_title_publication_barrier: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            thread_title_publication_attempted: Arc::new(tokio::sync::Notify::new()),
             timeout_supervisor,
             recovery_coordinator,
             native_turn_event_delivery_kick_running: Arc::new(AtomicBool::new(false)),
@@ -5003,7 +5052,7 @@ impl MessageProcessor {
             #[cfg(test)]
             cli_runtime_skill_preflight_test_events: Arc::new(Mutex::new(Vec::new())),
             #[cfg(test)]
-            cli_mcp_readiness_overrides: [None, None],
+            cli_mcp_readiness_overrides: [None, None, None],
             skill_upload_locks: Arc::new(Mutex::new(HashMap::new())),
             skill_upload_owners: Arc::new(Mutex::new(HashMap::new())),
             task_agent_executor,

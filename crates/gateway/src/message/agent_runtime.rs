@@ -1346,6 +1346,31 @@ impl MessageProcessor {
         turn: &str,
         excluded_turn: Option<&str>,
     ) -> Result<crate::compaction::frozen::PreparedHistory> {
+        self.capture_context_basis_prepared(store, workspace, thread, turn, excluded_turn, false)
+            .await
+    }
+
+    pub(crate) async fn capture_running_context_basis_prepared(
+        &self,
+        store: &pioneer_crud::CrudStore,
+        workspace: &str,
+        thread: &str,
+        turn: &str,
+        excluded_turn: Option<&str>,
+    ) -> Result<crate::compaction::frozen::PreparedHistory> {
+        self.capture_context_basis_prepared(store, workspace, thread, turn, excluded_turn, true)
+            .await
+    }
+
+    async fn capture_context_basis_prepared(
+        &self,
+        store: &pioneer_crud::CrudStore,
+        workspace: &str,
+        thread: &str,
+        turn: &str,
+        excluded_turn: Option<&str>,
+        reuse_runtime: bool,
+    ) -> Result<crate::compaction::frozen::PreparedHistory> {
         let authority =
             crate::authorization::ExecutionAuthorizationContext::load_for_turn(store, turn).await?;
         anyhow::ensure!(
@@ -1361,6 +1386,24 @@ impl MessageProcessor {
                 self.current_authorization_revision().await?,
             )
             .await?;
+        if reuse_runtime && let Some(snapshot) = store.get_turn_runtime_snapshot(turn).await? {
+            anyhow::ensure!(
+                snapshot.workspace_id == workspace && snapshot.thread_id == thread,
+                "accepted runtime destination changed"
+            );
+            return crate::compaction::frozen::prepare_runtime_history_for_execution(
+                store, &snapshot,
+            )
+            .await;
+        }
+        if reuse_runtime
+            && let Some(prepared) = crate::compaction::frozen::prepare_task_history_for_execution(
+                store, workspace, thread, turn,
+            )
+            .await?
+        {
+            return Ok(prepared);
+        }
         self.capture_authorized_task_basis_prepared(
             store,
             current.principal(),
@@ -3768,7 +3811,7 @@ impl MessageProcessor {
                     notification.thread_id.as_str(),
                     notification.turn_id.as_str(),
                     &notification.item,
-                    None,
+                    Some("completed"),
                 )
                 .await;
             }
@@ -6550,7 +6593,7 @@ impl MessageProcessor {
                             completed.thread_id.as_str(),
                             completed.turn_id.as_str(),
                             &completed.item,
-                            None,
+                            Some("completed"),
                         )
                         .await;
                     }
@@ -10908,10 +10951,21 @@ impl MessageProcessor {
             .insert(thread_id.to_owned(), state);
     }
 
-    async fn set_thread_title_if_changed(&self, thread_id: &str, title: &str) -> Result<bool> {
-        self.crud_store
-            .update_thread_name_if_changed(thread_id, title)
-            .await
+    pub(super) async fn accept_automatic_thread_title(
+        &self,
+        thread_id: &str,
+        title: &str,
+        fallback: Option<&str>,
+    ) -> Result<bool> {
+        let changed = self
+            .crud_store
+            .with_maintenance_access()
+            .update_automatic_thread_name(thread_id, title, fallback, None)
+            .await?;
+        if changed {
+            self.send_thread_updated_notification(thread_id).await;
+        }
+        Ok(changed)
     }
 
     async fn run_initial_thread_title_task(
@@ -10922,7 +10976,8 @@ impl MessageProcessor {
         self.record_title_job_state(thread_id, ThreadTitleJobState::Pending, 0)
             .await;
 
-        let Some(thread) = self.crud_store.get_thread_model(thread_id).await? else {
+        let background = self.crud_store.with_maintenance_access();
+        let Some(thread) = background.get_thread_model(thread_id).await? else {
             self.record_title_job_state(thread_id, ThreadTitleJobState::FailedNonRetriable, 0)
                 .await;
             return Ok(());
@@ -10933,8 +10988,7 @@ impl MessageProcessor {
             pioneer_protocol::ThreadOriginKind::User
                 | pioneer_protocol::ThreadOriginKind::Collaborative
                 | pioneer_protocol::ThreadOriginKind::DirectMessage
-        ) || self
-            .crud_store
+        ) || background
             .get_task_thread_lineage(thread_id)
             .await?
             .is_some()
@@ -10944,7 +10998,7 @@ impl MessageProcessor {
             return Ok(());
         }
 
-        let user_text = match self.crud_store.get_first_thread_user_text(thread_id).await {
+        let user_text = match background.get_first_thread_user_text(thread_id).await {
             Ok(Some(text)) => Some(text),
             Ok(None) => current_turn_first_user_text.map(str::to_owned),
             Err(error) => {
@@ -10964,13 +11018,21 @@ impl MessageProcessor {
         };
 
         let fallback_title = fallback_title_from_first_user_text(user_text.as_str());
+        if thread
+            .name
+            .as_deref()
+            .is_some_and(|name| !name.is_empty() && Some(name) != fallback_title.as_deref())
+        {
+            self.record_title_job_state(thread_id, ThreadTitleJobState::Succeeded, 0)
+                .await;
+            return Ok(());
+        }
         if let Some(fallback_title) = fallback_title.as_deref() {
             match self
-                .set_thread_title_if_changed(thread_id, fallback_title)
+                .accept_automatic_thread_title(thread_id, fallback_title, None)
                 .await
             {
-                Ok(true) => self.send_thread_updated_notification(thread_id).await,
-                Ok(false) => {}
+                Ok(_) => {}
                 Err(error) => {
                     warn!(
                         thread_id,
@@ -11058,6 +11120,7 @@ impl MessageProcessor {
         let generated_title = summary::generate_thread_title(
             &background,
             &self.provider_registry,
+            self,
             thread_id,
             user_text,
             &self.summary_config,
@@ -11074,18 +11137,44 @@ impl MessageProcessor {
             return Ok(TitleAttemptOutcome::Succeeded);
         }
 
-        if self
-            .set_thread_title_if_changed(thread_id, generated_title.as_str())
-            .await?
-        {
-            self.send_thread_updated_notification(thread_id).await;
-        }
+        self.accept_automatic_thread_title(thread_id, &generated_title, fallback_title)
+            .await?;
 
         Ok(TitleAttemptOutcome::Succeeded)
     }
 
+    // Both automatic publication and thread/update hold this per-thread gate
+    // from before reading/mutating durable metadata through client publication.
+    // The registry contains only weak references and is never held across I/O.
+    pub(super) async fn thread_title_publication_guard(
+        &self,
+        thread_id: &str,
+    ) -> tokio::sync::OwnedMutexGuard<()> {
+        let gate = {
+            let mut mutexes = self.thread_title_publication_mutexes.lock().await;
+            mutexes.retain(|_, gate| gate.strong_count() > 0);
+            match mutexes.get(thread_id).and_then(Weak::upgrade) {
+                Some(gate) => gate,
+                None => {
+                    let gate = Arc::new(Mutex::new(()));
+                    mutexes.insert(thread_id.into(), Arc::downgrade(&gate));
+                    gate
+                }
+            }
+        };
+        #[cfg(test)]
+        self.thread_title_publication_attempted.notify_one();
+        gate.lock_owned().await
+    }
+
     pub(super) async fn send_thread_updated_notification(&self, thread_id: &str) {
-        let thread = match self.crud_store.get_thread_model(thread_id).await {
+        let _publication = self.thread_title_publication_guard(thread_id).await;
+        let thread = match self
+            .crud_store
+            .with_maintenance_access()
+            .get_thread_model(thread_id)
+            .await
+        {
             Ok(Some(thread)) => thread,
             Ok(None) => {
                 warn!(
@@ -11104,6 +11193,15 @@ impl MessageProcessor {
             }
         };
 
+        #[cfg(test)]
+        {
+            let barrier = self.thread_title_publication_barrier.lock().await.take();
+            if let Some((read_completed, continue_publication)) = barrier {
+                read_completed.notify_one();
+                continue_publication.notified().await;
+            }
+        }
+
         self.thread_manager
             .sync_thread_metadata_from_persisted(&thread)
             .await;
@@ -11119,6 +11217,8 @@ impl MessageProcessor {
             &notification,
         )
         .await;
+        self.notify_thread_tree_changed(notification.thread.workspace_id)
+            .await;
     }
 }
 

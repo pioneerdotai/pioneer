@@ -24,6 +24,14 @@
         "$ref": "#/$defs/ThreadPlacement"
       }
     },
+    "running_task_thread_ids": {
+      "description": "Authorized visible threads with at least one Starting or Running TaskRun.",
+      "type": "array",
+      "default": [],
+      "items": {
+        "type": "string"
+      }
+    },
     "threads": {
       "type": "array",
       "default": [],
@@ -109,6 +117,14 @@
         "identity_source_revision",
         "display_name",
         "nickname"
+      ]
+    },
+    "CLIAgentRuntimeKind": {
+      "type": "string",
+      "enum": [
+        "codex",
+        "claude",
+        "opencode"
       ]
     },
     "PermissionBehavior": {
@@ -862,6 +878,17 @@
           "type": [
             "string",
             "null"
+          ]
+        },
+        "cli_runtime_kind": {
+          "description": "CLI provider identity projected from persisted execution bindings, independent of artwork.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CLIAgentRuntimeKind"
+            },
+            {
+              "type": "null"
+            }
           ]
         },
         "display_name": {

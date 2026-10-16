@@ -298,18 +298,33 @@ pub(crate) async fn prepare_completed_history_owned(
         .await?;
         super::history::normalize_task_input_copies(&store, workspace, &mut messages).await?;
         super::origins::validate_message_origins(&store, workspace, &messages).await?;
-        super::frozen::order_history_by_creation(&store, workspace, &mut messages).await?;
+        super::frozen::order_conversation_history(&store, workspace, &mut messages).await?;
         diagnostic.stage = "target_configuration".into();
         let catalog = match current.transport {
             Transport::Codex => "openai-codex".to_owned(),
             Transport::Claude => "anthropic".to_owned(),
+            Transport::OpenCode => current
+                .model
+                .split_once('/')
+                .map(|(provider, _)| provider)
+                .unwrap_or("opencode")
+                .to_owned(),
             Transport::Api => processor
                 .provider_registry()
                 .get_or_create_for_workspace(workspace, &current.instance)?
                 .name()
                 .to_owned(),
         };
-        let limits = pioneer_provider::catalog::model_catalog()?.limits(&catalog, &current.model);
+        let catalog_model = if current.transport == Transport::OpenCode {
+            current
+                .model
+                .split_once('/')
+                .map(|(_, model)| model)
+                .unwrap_or(&current.model)
+        } else {
+            &current.model
+        };
+        let limits = pioneer_provider::catalog::model_catalog()?.limits(&catalog, catalog_model);
         let budget = ModelBudget::new(
             Some(limits.context_window),
             limits.max_input,

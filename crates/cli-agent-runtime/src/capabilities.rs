@@ -4,6 +4,7 @@
 pub enum CLIAgentRuntimeProviderKind {
     Codex,
     Claude,
+    OpenCode,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,6 +48,7 @@ pub fn cli_runtime_provider_capabilities(
     match provider {
         CLIAgentRuntimeProviderKind::Codex => &CODEX_CAPABILITIES,
         CLIAgentRuntimeProviderKind::Claude => &CLAUDE_CAPABILITIES,
+        CLIAgentRuntimeProviderKind::OpenCode => &OPENCODE_CAPABILITIES,
     }
 }
 
@@ -97,6 +99,27 @@ const CLAUDE_CAPABILITIES: CLIRuntimeProviderCapabilities = CLIRuntimeProviderCa
         detailed_filesystem_sandbox: CLAUDE_DETAILED_SANDBOX_UNSUPPORTED,
         detailed_network_sandbox: CLAUDE_DETAILED_SANDBOX_UNSUPPORTED,
         detailed_process_sandbox: CLAUDE_DETAILED_SANDBOX_UNSUPPORTED,
+    },
+};
+
+const OPENCODE_DETAILED_SANDBOX_UNSUPPORTED: CLIRuntimeCapabilitySupport =
+    CLIRuntimeCapabilitySupport::Unsupported {
+        reason: "OpenCode server exposes permission rules but no proven detailed filesystem, network, or process sandbox",
+    };
+
+const OPENCODE_CAPABILITIES: CLIRuntimeProviderCapabilities = CLIRuntimeProviderCapabilities {
+    provider: CLIAgentRuntimeProviderKind::OpenCode,
+    approval: CLIRuntimeApprovalCapabilities {
+        permission_mode_mapping: CLIRuntimeCapabilitySupport::Supported,
+        request_permissions: CLIRuntimeCapabilitySupport::Supported,
+        turn_scope_approval: UNSUPPORTED_TURN_SCOPE_APPROVAL,
+        session_scope_approval: UNSUPPORTED_SESSION_SCOPE_APPROVAL,
+    },
+    sandbox: CLIRuntimeSandboxCapabilities {
+        provider_sandbox_policy: OPENCODE_DETAILED_SANDBOX_UNSUPPORTED,
+        detailed_filesystem_sandbox: OPENCODE_DETAILED_SANDBOX_UNSUPPORTED,
+        detailed_network_sandbox: OPENCODE_DETAILED_SANDBOX_UNSUPPORTED,
+        detailed_process_sandbox: OPENCODE_DETAILED_SANDBOX_UNSUPPORTED,
     },
 };
 

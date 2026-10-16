@@ -870,6 +870,63 @@ pub(crate) async fn restored_conversation_scope_from_snapshot(
     Ok((context, projection.messages))
 }
 
+/// The caller has loaded this exact execution's durable runtime record. Its
+/// published history is the accepted source grant, independent of the Task
+/// input that was used to prepare an earlier execution.
+pub(crate) async fn accepted_history_scopes_from_snapshot(
+    store: &CrudStore,
+    snapshot: &TurnRuntimeSnapshotRecord,
+) -> Result<std::collections::BTreeSet<String>> {
+    let context: AgentTurnHookRuntimeContext =
+        from_snapshot_json(&snapshot.hook_runtime_context_json, "hook runtime context")?;
+    let mut allowed = std::collections::BTreeSet::from([snapshot.thread_id.clone()]);
+    allowed.extend(context.conversation_thread_id.iter().cloned());
+    if snapshot.history_json.trim_start().starts_with('[') {
+        return Ok(allowed);
+    }
+    let descriptor: pioneer_compaction::frozen::FrozenHistoryRef =
+        from_snapshot_json(&snapshot.history_json, "frozen history reference")?;
+    let _hold = store
+        .compaction_acquire_frozen_history(&snapshot.workspace_id, &descriptor)
+        .await?;
+    let owner = store
+        .compaction_frozen_history_owner(&snapshot.workspace_id, &descriptor)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("runtime history manifest is unavailable"))?;
+    // Older accepted runtime records may still reference their parent-owned
+    // manifest. Authenticate that destination from the hook or the exact
+    // TaskRun relationship, without opening the Task's frozen input.
+    let owner_matches = if owner == snapshot.thread_id
+        || context.conversation_thread_id.as_deref() == Some(owner.as_str())
+    {
+        true
+    } else {
+        store
+            .compaction_task_basis_thread(
+                &snapshot.workspace_id,
+                &snapshot.thread_id,
+                &snapshot.turn_id,
+            )
+            .await?
+            .as_deref()
+            == Some(owner.as_str())
+    };
+    anyhow::ensure!(
+        owner_matches,
+        "runtime history manifest belongs to another destination"
+    );
+    allowed.extend(
+        crate::compaction::frozen::accepted_history_scopes(
+            store,
+            &snapshot.workspace_id,
+            &owner,
+            &snapshot.history_json,
+        )
+        .await?,
+    );
+    Ok(allowed)
+}
+
 pub(crate) async fn restored_conversation_scope_projection_from_snapshot(
     store: &CrudStore,
     snapshot: &TurnRuntimeSnapshotRecord,
@@ -886,21 +943,15 @@ pub(crate) async fn restored_conversation_scope_projection_from_snapshot(
         &snapshot.history_json,
     )
     .await?;
-    let allowed = crate::compaction::frozen::execution_history_scopes(
-        store,
-        &snapshot.workspace_id,
-        &snapshot.thread_id,
-        &snapshot.turn_id,
-        context.conversation_thread_id.as_deref(),
-    )
-    .await?;
-    let history = crate::compaction::frozen::restore_accepted_history_for_execution(
+    let allowed = accepted_history_scopes_from_snapshot(store, snapshot).await?;
+    let history = crate::compaction::frozen::restore_accepted_history_for_execution_with_order(
         store,
         &snapshot.workspace_id,
         context.conversation_thread_id.as_deref(),
         &snapshot.thread_id,
         &allowed,
         &snapshot.history_json,
+        true,
     )
     .await?;
     Ok((context, history))
