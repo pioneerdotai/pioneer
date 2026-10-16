@@ -27153,6 +27153,8 @@ fn cancelling_cli_history_transfer_stops_before_provider_start_and_releases_sess
 
 #[derive(Default)]
 struct PausedCliHeartbeatWriter {
+    /// `None` pauses the next write regardless of its workload.
+    workload: Option<pioneer_observability::DatabaseWorkload>,
     armed: std::sync::atomic::AtomicBool,
     entered: Notify,
     release: Arc<Notify>,
@@ -27167,7 +27169,11 @@ impl pioneer_sqlite::SqliteWriteObserver for PausedCliHeartbeatWriter {
         &self,
         class: pioneer_sqlite::SqliteWriteClass,
     ) -> Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>> {
-        if !self.armed.swap(false, Ordering::SeqCst) {
+        // Leave the pause armed when another workload acquires the writer.
+        if self.workload.is_some_and(|workload| {
+            crate::database::attribution::current_database_workload() != Some(workload)
+        }) || !self.armed.swap(false, Ordering::SeqCst)
+        {
             return None;
         }
         *self.acquired_class.lock().unwrap() = Some(class);
@@ -27208,7 +27214,10 @@ fn cli_deadline_drops_pending_monitor_before_compaction_cleanup() {
 async fn pending_cli_heartbeat_writer_is_dropped_before_compaction_cleanup_impl(cases: &[&str]) {
     for &case in cases {
         let outer_deadline = case == "outer-deadline";
-        let writer_pause = Arc::new(PausedCliHeartbeatWriter::default());
+        let writer_pause = Arc::new(PausedCliHeartbeatWriter {
+            workload: Some(pioneer_observability::DatabaseWorkload::AgentProgress),
+            ..Default::default()
+        });
         let (tx, mut rx) = mpsc::channel(128);
         let sessions = Arc::new(SessionManager::new());
         let connection = register_authenticated_test_connection(sessions.as_ref(), tx).await;
@@ -27337,6 +27346,14 @@ async fn pending_cli_heartbeat_writer_is_dropped_before_compaction_cleanup_impl(
             processor.release_completed_history_preparation_barrier();
         } else {
             writer_pause.armed.store(true, Ordering::SeqCst);
+            assert!(
+                pioneer_sqlite::SqliteWriteObserver::pause_execute_raw_after_acquire_for_test(
+                    writer_pause.as_ref(),
+                    pioneer_sqlite::SqliteWriteClass::Critical,
+                )
+                .is_none(),
+                "an unrelated writer must leave the heartbeat pause armed"
+            );
             processor.release_completed_history_preparation_barrier();
             timeout(Duration::from_secs(10), writer_pause.entered.notified())
                 .await
