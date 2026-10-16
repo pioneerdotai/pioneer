@@ -9338,7 +9338,7 @@ impl MessageProcessor {
                     )
                     .await?;
                     let history = self
-                        .materialize_historical_artifacts(
+                        .materialize_cli_historical_artifacts(
                             outcome.started_notification.workspace_id.as_str(),
                             accepted.messages.clone(),
                         )
@@ -9619,6 +9619,52 @@ impl MessageProcessor {
             history,
         )
         .await
+    }
+
+    async fn materialize_cli_historical_artifacts(
+        &self,
+        workspace_id: &str,
+        history: Vec<ChatMessage>,
+    ) -> anyhow::Result<Vec<ChatMessage>> {
+        // Native consumers retain owned bytes. CLI delivery uses its existing
+        // file transport, after the same bounded exact-version validation.
+        let mut history = self
+            .materialize_historical_artifacts(workspace_id, history)
+            .await?;
+        for message in &mut history {
+            for part in &mut message.content_parts {
+                let expected_kind = part.kind();
+                let attachment = match part {
+                    pioneer_provider::MessageContentPart::Image { image } => image,
+                    pioneer_provider::MessageContentPart::File { file } => file,
+                    pioneer_provider::MessageContentPart::Audio { audio } => audio,
+                    pioneer_provider::MessageContentPart::Video { video } => video,
+                    pioneer_provider::MessageContentPart::Text { .. } => continue,
+                };
+                let Some(artifact) = attachment.artifact.as_ref() else {
+                    continue;
+                };
+                let version = artifact
+                    .artifact_version_id
+                    .as_deref()
+                    .context("CLI historical artifact has no accepted version")?;
+                let resolved = self
+                    .artifact_service
+                    .resolve_provider_attachment(workspace_id, &artifact.artifact_id, Some(version))
+                    .await?;
+                anyhow::ensure!(
+                    resolved.artifact_id == artifact.artifact_id
+                        && resolved.version_id.as_deref() == Some(version)
+                        && resolved.content_type == expected_kind
+                        && resolved.attachment.sha256 == attachment.sha256
+                        && resolved.attachment.size_bytes == attachment.size_bytes
+                        && resolved.attachment.mime_type == attachment.mime_type,
+                    "CLI historical artifact changed after accepted validation"
+                );
+                *attachment = resolved.attachment;
+            }
+        }
+        Ok(history)
     }
 
     async fn persist_cli_runtime_prompt_manifest(
